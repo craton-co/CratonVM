@@ -9,7 +9,9 @@
 use std::cell::Cell;
 
 use cratonvm_jit::{DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitPICSlot, JitRuntimeHelpers};
-use cratonvm_native_api::NativeContext;
+use cratonvm_native_api::{
+    NativeClassAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess,
+};
 use cratonvm_types::{
     ArrayElementType, ClassId, ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,
@@ -69,27 +71,27 @@ use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot
 fn direct_static_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(
-        || match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         },
     )
 }
 
-// The virtual-call counterpart of the flag above. Kept OFF by default,
-// unlike the static/special one: virtual dispatch's receiver-class ↔ entry
-// pairing is exactly the mechanism the IVFKnn investigation's stale-mirror
-// bug lived in, and this path was not independently validated against that
-// repro the way the static path was against bintrees16 — see
-// `direct_static_compiled_callee_entry_enabled` above for the flag this
-// mirrors and why that one is default-ON. Opt in for measurement/bisection
-// with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=1`.
+// The virtual-call counterpart of the flag above. Default-ON now that every
+// compilation path owns MIC/PIC slots, cache publication rejects class-only
+// profile seeds, both entry ABIs are lowered, and the generated caller
+// republishes its active frame after a raw call. Opt out for diagnosis with
+// `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`.
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var_os("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY").is_some()
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +119,7 @@ pub mod mic_prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_MIC_PROF").is_some())
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
     }
 
     #[inline]
@@ -479,7 +481,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
-        if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
             if !ONCE.swap(true, Ordering::Relaxed) {
@@ -1340,7 +1342,7 @@ struct VirtualDispatchTarget {
 /// the hot dispatch path pays two slice compares + one bool load.
 pub(crate) fn cv_trace_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
 }
 
 /// Residual-6 diagnosis: does this invoke-info describe the
@@ -1433,7 +1435,15 @@ unsafe fn virtual_dispatch_class(
 /// `JitInvokeInfo` whose name fields are live `&str`s.
 unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> bool {
     let cm = vm.classes.class_manager.read();
-    let Some(class_id) = cm.find_class_by_name(info.class_name) else {
+    let class_id = if info.declaring_class_id == 0 {
+        cm.find_bootstrap_class_by_name(info.class_name)
+    } else {
+        cm.find_class_by_name_for_class(
+            info.class_name,
+            ClassId::new(info.declaring_class_id),
+        )
+    };
+    let Some(class_id) = class_id else {
         return false;
     };
     let store = cm.class_store();
@@ -1697,7 +1707,14 @@ unsafe fn try_resume_trapped_callee(
     // key) — mirrors the `callee_compiler` resolution recipe.
     let cached = {
         let cm = vm.classes.class_manager.read();
-        let class_id = cm.find_class_by_name(key_class)?;
+        let class_id = if info.declaring_class_id == 0 {
+            cm.find_bootstrap_class_by_name(key_class)?
+        } else {
+            cm.find_class_by_name_for_class(
+                key_class,
+                ClassId::new(info.declaring_class_id),
+            )?
+        };
         let store = cm.class_store();
         let (method, declaring_id) =
             crate::classloading::find_method_recursive(class_id, key_method, key_desc, store)?;
@@ -1758,7 +1775,7 @@ unsafe fn try_resume_trapped_callee(
         }
     };
 
-    if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
         eprintln!("[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}");
     }
 
@@ -2331,14 +2348,14 @@ pub unsafe extern "C" fn jit_post_tlab_init(
 }
 
 /// Cached `CRATONVM_DBG_JIT_ALLOC` class-id filter (`None` = unset or
-/// unparseable). PERF: the previous per-call `std::env::var` in the two
+/// unparseable). PERF: the previous per-call `cratonvm_types::flags::runtime_var` in the two
 /// allocation helpers was ~13% of binarytrees-18 wall time — getenv does a
 /// linear scan of `environ` on every call.
 fn dbg_jit_alloc_filter() -> Option<u32> {
     use std::sync::OnceLock;
     static F: OnceLock<Option<u32>> = OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_JIT_ALLOC")
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_ALLOC")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
     })
@@ -2357,7 +2374,7 @@ fn dbg_tlabmiss(reason: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some()) {
         return;
     }
     static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -4270,7 +4287,7 @@ unsafe fn jit_typecheck_resolve(
             .classes
             .class_manager
             .read()
-            .find_class_by_name(class_name);
+            .find_unique_class_by_name(class_name);
         if let Some(target) = resolved {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
                 cache.set(Some((
@@ -4536,7 +4553,7 @@ pub unsafe extern "C" fn jit_checkcast(
                 .get_class(obj_class_id)
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "<none>".into());
-            let target_cid = cm.find_class_by_name(class_name);
+            let target_cid = cm.find_unique_class_by_name(class_name);
             eprintln!(
                 "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
                 obj_ptr,
@@ -4736,7 +4753,7 @@ forwarding_ptr={fwd_ptr:#x}"
 fn aioobe3_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE3").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AIOOBE3").is_some())
 }
 
 /// RBC.6 — trace exception routing through `route_implicit_exc_through_callee`
@@ -4746,7 +4763,7 @@ fn aioobe3_dbg() -> bool {
 pub(crate) fn rbc6_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_RBC6").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some())
 }
 
 /// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
@@ -7325,7 +7342,7 @@ unsafe fn try_fast_lambda_int_to_double_apply(
 // info_ptr must point to a live JitInvokeInfo. args_ptr/num_args form a valid i64 slice.
 // mic_ptr must point to a live JitMICSlot used for monomorphic inline cache dispatch.
 // pic_ptr, when non-zero, must point to a live JitPICSlot co-allocated with the MIC at
-// the same call site; the helper populates its 3-way entries via `install` so the next
+// the same call site; the helper populates its 4-way entries via `install` so the next
 // invocation hits the inline cascade emitted in `jit/src/x64.rs`.
 // Transmutes within this function convert cached JIT entry pointers to function pointers
 // matching the compiled method's extern "C" calling convention.
@@ -7686,8 +7703,28 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         .load(std::sync::atomic::Ordering::Acquire);
 
     if crate::runtime::env_cache::jit_mic_dbg() {
+        let (pic_classes, pic_entries, pic_contexts) = if pic_ptr == 0 {
+            (
+                [0; cratonvm_jit::JIT_PIC_ENTRIES],
+                [0; cratonvm_jit::JIT_PIC_ENTRIES],
+                [false; cratonvm_jit::JIT_PIC_ENTRIES],
+            )
+        } else {
+            let pic = &*(pic_ptr as *const JitPICSlot);
+            (
+                std::array::from_fn(|i| {
+                    pic.class_ids[i].load(std::sync::atomic::Ordering::Acquire)
+                }),
+                std::array::from_fn(|i| {
+                    pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire)
+                }),
+                std::array::from_fn(|i| {
+                    pic.needs_context[i].load(std::sync::atomic::Ordering::Acquire)
+                }),
+            )
+        };
         eprintln!(
-            "[JIT_MIC] {}.{}{} cached_cid={} recv_cid={} entry={}",
+            "[JIT_MIC] {}.{}{} cached_cid={} recv_cid={} entry={} pic_ptr={:#x} pic_classes={:?} pic_entries={:?} pic_contexts={:?}",
             info.class_name,
             info.method_name,
             info.descriptor,
@@ -7695,7 +7732,36 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             receiver_cid,
             mic.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Acquire),
+            pic_ptr,
+            pic_classes,
+            pic_entries,
+            pic_contexts,
         );
+    }
+
+    // Megamorphic helper fast path. Generated code probes only the four-entry
+    // inline PIC; receiver types beyond that capacity land here. The PIC keeps
+    // a bounded secondary target cache so those misses still avoid repeated
+    // class hierarchy resolution and compile-cache probing.
+    if cached_cid != receiver_cid
+        && pic_ptr != 0
+        && direct_virtual_compiled_callee_entry_enabled()
+        && !redefine_jit_quiesced
+    {
+        let pic = &*(pic_ptr as *const JitPICSlot);
+        if let Some((entry, needs_context)) = pic.lookup_megamorphic(receiver_cid) {
+            if entry != 0 {
+                mic_prof::bump(&mic_prof::MIC_HIT_ENTRY);
+                if let Some(result) = try_call_compiled_entry_reentrant(
+                    entry as usize,
+                    needs_context,
+                    vm_ptr,
+                    args_slice,
+                ) {
+                    return result;
+                }
+            }
+        }
     }
 
     // --- Monomorphic Inline Cache: fast path ---
@@ -7850,7 +7916,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 mic.cached_needs_context
                     .store(needs_ctx, std::sync::atomic::Ordering::Release);
                 // CRIT-1 — also populate the co-allocated PIC so the
-                // inline 3-way cascade in `jit/src/x64.rs` hits on the
+                // inline 4-way cascade in `jit/src/x64.rs` hits on the
                 // next invocation. Without this the cascade's empty
                 // (class_id == 0) slots always fail and every dispatch
                 // pays the full helper cost. We only install when we
@@ -7991,7 +8057,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
         mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
-        // CRIT-1 — Populate the co-allocated PIC so the inline 3-way
+        // CRIT-1 — Populate the co-allocated PIC so the inline 4-way
         // cascade emitted in `jit/src/x64.rs` actually hits on subsequent
         // dispatches. Eager allocation made `pic_inline` always-true at
         // codegen, so the cascade is always emitted but stays cold until
@@ -8160,7 +8226,7 @@ impl DeoptimizationController {
         };
         let action = vm.record_deoptimization(&method_key, event, &tiered_key);
 
-        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
             eprintln!(
                 "[cratonvm-deopt] {} reason={:?} bci={} action={:?}",
                 method_key, reason, bci, action
@@ -8274,7 +8340,7 @@ impl DeoptimizationController {
                     enqueue_time_ms: now_ms,
                     osr_bci: None,
                 });
-            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] eager re-queue (RecompileAndReinterpret) {}",
                     method_key
@@ -10046,7 +10112,7 @@ pub unsafe extern "C" fn jit_safepoint_slow_path() {
     };
     if let Some((thread, _guard)) = jit_thread_mut() {
         let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if hit <= 16 && std::env::var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some() {
+        if hit <= 16 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some() {
             eprintln!(
                 "[jit-safepoint] cooperative slow-path hit={} thread_id={}",
                 hit, thread.thread_id.0

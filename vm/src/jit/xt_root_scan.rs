@@ -101,7 +101,7 @@ pub fn enabled() -> bool {
     }
     // On unless explicitly disabled.
     let on = !matches!(
-        std::env::var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
         Ok("0") | Ok("false") | Ok("off")
     );
     CACHE.store(on as u64, Ordering::Relaxed);
@@ -133,7 +133,7 @@ pub fn helper_window_scan_enabled() -> bool {
         return c == 1;
     }
     let on = !matches!(
-        std::env::var("CRATONVM_XT_HELPER_WINDOW_SCAN").as_deref(),
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_SCAN").as_deref(),
         Ok("0") | Ok("false") | Ok("off")
     );
     CACHE.store(on as u64, Ordering::Relaxed);
@@ -171,7 +171,7 @@ where
 
 #[inline]
 fn dbg() -> bool {
-    std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
 }
 
 /// Handles of peer threads that were suspended in JIT code and must be

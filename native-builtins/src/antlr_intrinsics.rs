@@ -6150,6 +6150,8 @@ pub(crate) fn register_antlr_prediction_context_intrinsics(registry: &mut Native
 
 #[cfg(test)]
 mod antlr_prediction_context_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_types::ArrayElementType;

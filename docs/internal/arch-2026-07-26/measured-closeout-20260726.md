@@ -122,37 +122,42 @@ compiled code; they do not isolate the nanosecond cost of one PIC hit.
 
 ## Findings and changes recommended
 
-### P0: remove loader-blind class lookup from production paths
+### P0: remove loader-blind class lookup from production paths — fixed
 
-The release build emits 47 deprecation warnings for
+The audited release build emitted 47 deprecation warnings for
 `ClassManager::find_class_by_name`, spread through interpreter, VM execution,
 utility, reflection, native, and invocation paths. The API explicitly says it
 is loader-blind. This is correctness debt in a VM supporting multiple class
 loaders, and it also prevents negative/positive lookup caches from having an
 unambiguous key.
 
-Replace each call with an operation that takes the initiating/defining loader
-or an already-resolved `ClassId`. Do not add a global fallback to make the
-warnings disappear. Turn this deprecation into a deny lint for production code
-after the migration. The open defect is tracked separately in
-`docs/known-issues/loader-blind-class-lookup-deprecation-debt-20260726.md`.
+Resolved on `codex/complete-architecture-remediation-20260726`: all 47 calls
+now take an initiating/defining class or loader, require bootstrap identity, or
+fail closed when a legacy metadata path genuinely has no context. The VM crate
+denies deprecated APIs, the all-feature check passes, and the release warning
+count is zero. Verification and rationale are in
+`docs/internal/loader-blind-class-lookup-fixed-20260726.md`.
 
-### P0: collapse the two interpreter semantic implementations
+### P0: collapse the package-selected interpreter implementations — fixed
 
-`interpreter.rs` contains two dispatch paths and routes many Spring/JDK classes
-to the slower one by class-name policy. Quickening is no longer the issue:
+The audited `interpreter.rs` routed many Spring/JDK classes to the decoded
+fallback by class-name policy. Quickening was not the issue:
 `QuickenedCode::resolve` uses an instruction-start bitmap, per-block cumulative
 counts, and popcount for O(1) PC mapping.
 
-The paired probe makes the remaining design visible: identical bytecode becomes
-substantially slower in CratonVM merely by moving it under
-`org.springframework.*`; HotSpot does not exhibit that class-name distinction.
+Resolved on `codex/complete-architecture-remediation-20260726`: package names
+no longer select execution policy, the `Frame::is_jdk_class` field and prefix
+classifier are removed, and every verified class uses the raw-byte handlers
+with unsupported/guarded cases falling through to the decoded handler.
 
-Create one authoritative opcode semantic layer. Generate direct-threaded,
-checked/debug, and specialized/superinstruction forms from those handlers.
-Move compatibility workarounds to explicit method capabilities or a narrow
-denylist with a reason, owner, and expiry test. Package names must never select
-the VM's fundamental execution engine.
+The migration also closed semantic drift found during the change: both paths
+now use heap-validated reference coercion and identical `aastore` recovery,
+and raw-byte returns emit the JVMTI `MethodExit` event that only decoded
+returns emitted before. A verifier-on/raw versus `--noverify`/decoded
+differential probe has identical output. The original two-million-iteration
+paired probe changed from 0.59s default / 1.47s Spring to 0.55s / 0.56s with
+the same checksum. Details are in
+`docs/internal/interpreter-package-routing-fixed-20260727.md`.
 
 ### P0: make roots an owned subsystem before moving objects by default
 
@@ -201,10 +206,19 @@ still fail to realize the intended compiled/PIC performance. Before tuning PIC
 assembly, record tier transitions and fallback reasons for the containing
 method; otherwise the work risks optimizing a path the workload never reaches.
 The existing method-statistics diagnostic could not provide that evidence
-because it is silent on normal VM exit; the reproducible defect is recorded in
-`docs/known-issues/jit-method-stats-normal-exit-inert-20260726.md`.
+because it was silent on normal VM exit. That diagnostic is now fixed and
+verified on both controlled shutdown paths; see
+`docs/internal/jit-method-stats-normal-exit-fixed-20260726.md`.
 
 ### P1: pack instance fields and then shrink the header
+
+Current-status correction (2026-07-27): descriptor-backed instance fields are
+already packed at natural 1/2/4/8-byte widths in the production allocators,
+interpreter, JIT helpers, and collectors. The remaining 16-byte-cell path is
+the required fallback for descriptor-less/padded synthetic slots. The last
+allocation hot-path registry lookup was removed by
+`../packed-object-fields-performance-20260727.md`; this section is retained as
+the recommendation that led to that verification, not as current-state truth.
 
 The 16-byte universal heap field slot dominates ordinary object size. Use
 class-computed byte offsets with 1/2/4/8-byte primitive storage, 8-byte
@@ -286,8 +300,9 @@ Track at least:
 
 ## Prioritized execution plan
 
-1. **Correctness gate:** migrate the 47 loader-blind calls; add a dual-loader
-   conformance corpus and deny the deprecated API in production.
+1. **Correctness gate — complete:** the 47 loader-blind calls are migrated,
+   dual-loader namespace tests pass, and the deprecated API is denied in
+   production.
 2. **Interpreter convergence:** one semantic handler set, generated variants,
    package routing removed; preserve checksum and exception tests.
 3. **Root ownership:** stable native handles, provider registration, exact JIT

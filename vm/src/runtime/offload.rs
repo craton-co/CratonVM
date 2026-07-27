@@ -3392,7 +3392,7 @@ pub(crate) mod h2d_trace {
     /// True if `CRATONVM_GPU_TRACE_BYTES=1`. The probe is cached.
     pub(crate) fn enabled() -> bool {
         *ENABLED.get_or_init(|| {
-            std::env::var("CRATONVM_GPU_TRACE_BYTES")
+            cratonvm_types::flags::runtime_var("CRATONVM_GPU_TRACE_BYTES")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false)
         })

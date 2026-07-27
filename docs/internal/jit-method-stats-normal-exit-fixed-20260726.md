@@ -1,8 +1,8 @@
-# JIT method statistics are not emitted on normal VM exit
+# JIT method statistics on controlled VM exit — fixed
 
-Status: open
+Status: fixed
 Found: 2026-07-26 architecture probe
-Base: `dev` at `3be41785e`
+Fixed: `codex/complete-architecture-remediation-20260726`
 
 ## Reproduction
 
@@ -43,10 +43,24 @@ fallback-dominated workloads is silent on the most ordinary process-exit path.
 This blocks evidence-based JIT triage and demonstrates why distributed direct
 environment reads cannot be kept consistent with the typed/grouped flag layer.
 
-## Required fix
+## Resolution
 
-1. Read one typed flag value, not the legacy environment variable.
-2. Put an idempotent diagnostic flush in a common shutdown guard used by
-   normal return, `System.exit`, launcher error, and controlled fatal exit.
-3. Add subprocess tests for normal return and `System.exit(0)` using only the
-   supported grouped spelling. Each must emit exactly one statistics record.
+`JitFlags::method_stats` is now populated from the same resolved `VmFlags`
+snapshot as other shared JIT settings. Both the legacy spelling and
+`CRATONVM_DBG=jit-method-stats` therefore reach one typed value.
+
+The launcher calls `maybe_dump_jit_method_stats` from the native
+`System.exit` pre-exit hook and after an ordinary `run()` return. Its atomic
+claim makes the operation idempotent if shutdown paths converge later.
+
+## Verification
+
+`tools/architecture-probe-20260726/check-jit-method-stats-20260726.sh`
+compiles a hot finite Java program and runs it twice: once returning normally
+and once calling `System.exit(0)`. On the fresh uniquely named release binary,
+both paths emitted exactly one statistics record using only the grouped flag:
+
+```text
+return: exactly one JIT method-statistics record
+exit: exactly one JIT method-statistics record
+```

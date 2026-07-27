@@ -101,6 +101,8 @@ mod tests {
     //! interpreter and is owned by the TESTS agent in
     //! `vm/tests/intrinsic_diff.rs` — it cannot run from a unit test in this
     //! leaf crate.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
 
     use super::{
         intrinsic_integer_int_value, intrinsic_integer_parse_int, intrinsic_integer_value_of,

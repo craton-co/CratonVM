@@ -6675,6 +6675,8 @@ fn s3_stub_response(ctx: &mut dyn NativeContext, status: i32, msg: &str) -> Meth
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeContext as _;
     use cratonvm_types::ClassId;

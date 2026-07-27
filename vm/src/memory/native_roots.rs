@@ -161,6 +161,236 @@ pub fn remap_all_native_roots(pointer_map: &HashMap<usize, usize>) {
     }
 }
 
+type VmScanFn = fn(&crate::vm::SharedVm, &mut Vec<ObjectRef>);
+type VmRemapFn = fn(&crate::vm::SharedVm, &HashMap<usize, usize>);
+
+#[derive(Clone, Copy)]
+struct VmRootSource {
+    name: &'static str,
+    scan: VmScanFn,
+    remap: VmRemapFn,
+}
+
+macro_rules! root_source {
+    ($name:literal, $scan:ident, $remap:ident) => {
+        VmRootSource {
+            name: $name,
+            scan: $scan,
+            remap: $remap,
+        }
+    };
+}
+
+fn scan_value_caches(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(shared.vm_identity, roots);
+}
+fn remap_value_caches(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::lang_math::gc_update_value_of_cache_refs(shared.vm_identity, map);
+}
+fn scan_unsafe(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::gc_scan_unsafe_side_store_roots(roots);
+}
+fn remap_unsafe(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::gc_update_unsafe_side_store_refs(map);
+}
+fn scan_lambda_callsites(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(roots);
+}
+fn remap_lambda_callsites(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(map);
+}
+fn scan_lambda_singletons(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    crate::runtime::invokedynamic::gc_scan_lambda_singleton_roots(shared.vm_identity, roots);
+}
+fn remap_lambda_singletons(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    crate::runtime::invokedynamic::gc_update_lambda_singleton_refs(shared.vm_identity, map);
+}
+fn scan_collection_overlays(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    let conditional = shared.config.gc_algorithm == crate::config::GcAlgorithm::Generational
+        && (cratonvm_gc::gc_quiescence::is_active()
+            || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
+            || cratonvm_gc::gc_quiescence::major_gc_requested());
+    if !conditional {
+        cratonvm_gc::external_roots::scan_external_roots(roots);
+    }
+}
+fn remap_collection_overlays(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_gc::external_roots::remap_external_roots(map);
+}
+fn scan_loaders_and_jmx(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(roots);
+    cratonvm_native_builtins::jmx::gc_scan_platform_mbean_server_root(roots);
+}
+fn remap_loaders_and_jmx(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(map);
+    cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(map);
+}
+fn scan_system(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::lang_system::gc_scan_system_singleton_roots(roots);
+}
+fn remap_system(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::lang_system::gc_update_system_singleton_refs(map);
+}
+fn scan_locale(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::gc_scan_locale_roots(roots);
+}
+fn remap_locale(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::gc_update_locale_refs(map);
+}
+fn scan_class_values(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::phases_late::gc_scan_classvalue_cache_roots(roots, &|addr| {
+        shared.mem.heap.metadata_pin_deferrable(addr)
+    });
+}
+fn remap_class_values(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::phases_late::gc_update_classvalue_cache_refs(map);
+}
+fn scan_msc(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::jboss_msc::gc_scan_msc_service_roots(roots);
+}
+fn remap_msc(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::jboss_msc::gc_update_msc_service_refs(map);
+}
+fn scan_logmanager(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::logmanager::gc_scan_logmanager_roots(roots);
+}
+fn remap_logmanager(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(map);
+}
+fn scan_annotations(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(roots);
+}
+fn remap_annotations(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::lang_class::gc_update_annotation_proxy_refs(map);
+}
+fn scan_http_handlers(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(roots);
+}
+fn remap_http_handlers(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::net_phase_e::gc_update_re10_handler_refs(map);
+}
+fn scan_inet_addresses(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::net_phase_e::gc_scan_inet_addr_roots(roots);
+}
+fn remap_inet_addresses(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::net_phase_e::gc_update_inet_addr_refs(map);
+}
+fn scan_nio(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_io::nio_selector::gc_scan_selector_roots(roots);
+    cratonvm_native_io::socket_channel::gc_scan_channel_roots(roots);
+    cratonvm_native_io::socket_channel::gc_scan_ss_back_ref_roots(roots);
+}
+fn remap_nio(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_io::nio_selector::sk_table_update_after_gc(map);
+    cratonvm_native_io::socket_channel::channel_fields_update_after_gc(map);
+    cratonvm_native_io::socket_channel::ss_back_ref_update_after_gc(map);
+}
+fn scan_server_ports(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_api::server_socket_ports::gc_scan_roots(roots);
+}
+fn remap_server_ports(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_api::server_socket_ports::gc_update_after_gc(map);
+}
+fn scan_scheduled(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::scheduled_pump::gc_scan_scheduled_roots(roots);
+}
+fn remap_scheduled(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::scheduled_pump::gc_update_scheduled_refs(map);
+}
+fn scan_xnio(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::xnio_async::gc_scan_xnio_future_roots(roots);
+}
+fn remap_xnio(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::xnio_async::gc_update_xnio_future_refs(map);
+}
+fn scan_panama(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::panama::gc_scan_upcall_target_roots(roots);
+}
+fn remap_panama(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::panama::gc_update_upcall_target_refs(map);
+}
+fn scan_tls(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_trust_manager_roots(roots);
+    cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_key_manager_roots(roots);
+    cratonvm_native_builtins::t27_tls::gc_scan_default_ssl_context_root(roots);
+}
+fn remap_tls(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_trust_manager_refs(map);
+    cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_key_manager_refs(map);
+    cratonvm_native_builtins::t27_tls::gc_update_default_ssl_context_ref(map);
+}
+fn scan_forkjoin(_: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    cratonvm_native_builtins::phases_early::gc_scan_forkjoin_roots(roots);
+}
+fn remap_forkjoin(_: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    cratonvm_native_builtins::phases_early::gc_update_forkjoin_refs(map);
+}
+fn scan_upcalls(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    shared.natives.upcall_table.lock().collect_roots(roots);
+}
+fn remap_upcalls(shared: &crate::vm::SharedVm, map: &HashMap<usize, usize>) {
+    shared.natives.upcall_table.lock().update_after_gc(map);
+}
+
+/// Compile-time inventory of every VM/native side table that owns movable
+/// references. Adding a source requires supplying scan and remap together.
+static VM_ROOT_SOURCES: &[VmRootSource] = &[
+    root_source!("boxed-value-caches", scan_value_caches, remap_value_caches),
+    root_source!("unsafe-side-store", scan_unsafe, remap_unsafe),
+    root_source!(
+        "lambda-callsites",
+        scan_lambda_callsites,
+        remap_lambda_callsites
+    ),
+    root_source!(
+        "lambda-singletons",
+        scan_lambda_singletons,
+        remap_lambda_singletons
+    ),
+    root_source!(
+        "collection-overlays",
+        scan_collection_overlays,
+        remap_collection_overlays
+    ),
+    root_source!(
+        "classloaders-and-jmx",
+        scan_loaders_and_jmx,
+        remap_loaders_and_jmx
+    ),
+    root_source!("system-singletons", scan_system, remap_system),
+    root_source!("locale", scan_locale, remap_locale),
+    root_source!("class-values", scan_class_values, remap_class_values),
+    root_source!("jboss-msc", scan_msc, remap_msc),
+    root_source!("logmanager", scan_logmanager, remap_logmanager),
+    root_source!("annotation-proxies", scan_annotations, remap_annotations),
+    root_source!("http-handlers", scan_http_handlers, remap_http_handlers),
+    root_source!("inet-addresses", scan_inet_addresses, remap_inet_addresses),
+    root_source!("nio", scan_nio, remap_nio),
+    root_source!("server-ports", scan_server_ports, remap_server_ports),
+    root_source!("scheduled-pump", scan_scheduled, remap_scheduled),
+    root_source!("xnio-futures", scan_xnio, remap_xnio),
+    root_source!("panama-upcalls", scan_panama, remap_panama),
+    root_source!("tls", scan_tls, remap_tls),
+    root_source!("forkjoin", scan_forkjoin, remap_forkjoin),
+    root_source!("vm-upcalls", scan_upcalls, remap_upcalls),
+];
+
+pub fn scan_all_roots(shared: &crate::vm::SharedVm, roots: &mut Vec<ObjectRef>) {
+    for source in VM_ROOT_SOURCES {
+        debug_assert!(!source.name.is_empty());
+        (source.scan)(shared, roots);
+    }
+    scan_all_native_roots(roots);
+}
+
+pub fn remap_all_roots(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
+    for source in VM_ROOT_SOURCES {
+        debug_assert!(!source.name.is_empty());
+        (source.remap)(shared, pointer_map);
+    }
+    remap_all_native_roots(pointer_map);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -168,6 +398,7 @@ pub fn remap_all_native_roots(pointer_map: &HashMap<usize, usize>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // The registry is process-global, so these tests register their OWN unique
@@ -285,5 +516,20 @@ mod tests {
             SRC3_SAW_EMPTY.load(Ordering::SeqCst),
             "remap_all must still fan out (callbacks self-guard the empty map)"
         );
+    }
+
+    #[test]
+    fn built_in_inventory_has_unique_named_scan_remap_pairs() {
+        let mut names = HashSet::new();
+        for source in VM_ROOT_SOURCES {
+            assert!(!source.name.is_empty());
+            assert!(
+                names.insert(source.name),
+                "duplicate built-in root source: {}",
+                source.name
+            );
+            assert_ne!(source.scan as usize, 0);
+            assert_ne!(source.remap as usize, 0);
+        }
     }
 }

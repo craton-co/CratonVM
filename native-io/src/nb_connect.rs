@@ -325,6 +325,8 @@ mod imp_windows {
 
     #[cfg(test)]
     mod tests {
+        #[allow(unused_imports)]
+        use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
         use super::{start, StartConnect};
         use std::net::TcpListener;
 
@@ -528,6 +530,8 @@ mod imp_unix {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::time::{Duration, Instant};

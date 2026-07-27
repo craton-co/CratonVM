@@ -4269,6 +4269,8 @@ mod tests {
     //! Hermetic tests built against a hand-rolled X.509 fixture. We never
     //! shell out to `openssl` — every cert byte here is produced by the
     //! `mk_cert` builder below so the suite passes on any host.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
 
     use super::*;
 

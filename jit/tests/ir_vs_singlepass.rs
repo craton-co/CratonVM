@@ -2117,8 +2117,19 @@ fn ir_vs_singlepass_invokevirtual_instance_call() {
         let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
         x + n
     }
+    unsafe extern "C" fn recv_mic_dispatch(
+        vm: i64,
+        info: i64,
+        args_ptr: i64,
+        num_args: i64,
+        _mic: i64,
+        _pic: i64,
+    ) -> i64 {
+        recv_dispatch(vm, info, args_ptr, num_args)
+    }
     let mut helpers = dummy_helpers();
     helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    helpers.invoke_virtual_mic = recv_mic_dispatch as *const () as usize;
     let code = vec![0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac];
     let cm = cached("f", "(Lpkg/Corpus;I)I", code, 2, 2);
     let resolver = |cp: u16| -> Option<(String, String, String)> {
@@ -2170,8 +2181,19 @@ fn ir_vs_singlepass_invokeinterface_instance_call() {
         let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
         x + n
     }
+    unsafe extern "C" fn recv_mic_dispatch(
+        vm: i64,
+        info: i64,
+        args_ptr: i64,
+        num_args: i64,
+        _mic: i64,
+        _pic: i64,
+    ) -> i64 {
+        recv_dispatch(vm, info, args_ptr, num_args)
+    }
     let mut helpers = dummy_helpers();
     helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    helpers.invoke_virtual_mic = recv_mic_dispatch as *const () as usize;
     // invokeinterface is 5 bytes: opcode, cp_hi, cp_lo, count(=2: receiver+int), 0.
     let code = vec![0x2a, 0x1b, 0xb9, 0x00, 0x02, 0x02, 0x00, 0xac];
     let cm = cached("f", "(Lpkg/Iface;I)I", code, 2, 2);

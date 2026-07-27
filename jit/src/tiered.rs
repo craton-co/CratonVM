@@ -196,11 +196,11 @@ impl CompilationPolicy {
     /// separate live knob, `CRATONVM_TIER_OSR_BACKEDGE`, read VM-side because it
     /// is consulted on the default path too, not only under the tiered manager.)
     pub fn from_env() -> Self {
-        Self::with_overrides(|name| std::env::var(name).ok())
+        Self::with_overrides(|name| cratonvm_types::flags::runtime_var(name).ok())
     }
 
     /// Testable core of [`from_env`]: apply the `CRATONVM_TIER_*` overrides
-    /// resolved through `get` (production passes `std::env::var`). Each numeric
+    /// resolved through `get` (production passes `cratonvm_types::flags::runtime_var`). Each numeric
     /// knob is parsed as `u32` and clamped to `>= 1` — a `0` threshold would
     /// compile/OSR on the first observation, defeating warmup. An absent or
     /// unparseable value leaves the [`Default`].
@@ -1496,7 +1496,7 @@ impl TieredCompilationManager {
 
         // `self.core.enqueue` takes the queue lock (distinct from `methods`,
         // which the caller still holds) and wakes the background worker.
-        if std::env::var_os("CRATONVM_DBG_TIER_ENQUEUE").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TIER_ENQUEUE").is_some() {
             eprintln!(
                 "[cratonvm-tier] enqueue {}.{}{} tier={:?} invocations={} elapsed_ms={}",
                 state.method_key.class_name,

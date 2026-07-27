@@ -22,6 +22,30 @@ use cratonvm_vm::vm::{
 use cratonvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
+/// Claim and emit the process-wide JIT method summary once.
+///
+/// `System.exit` never unwinds Rust frames, so it calls this from the native
+/// pre-exit hook. A normal Java-main return calls it from the launcher thread.
+/// The atomic makes those paths safe to share and prevents future shutdown
+/// convergence from printing the summary twice.
+fn maybe_dump_jit_method_stats() {
+    static DUMPED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    if cratonvm_types::flags().jit.method_stats
+        && DUMPED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        cratonvm_jit::tiered::dump_method_stats_to_stderr();
+    }
+}
+
 /// CratonVM - A Java Virtual Machine implemented in Rust.
 ///
 /// Executes Java programs by loading and interpreting `.class` files.
@@ -1821,6 +1845,12 @@ fn resolve_watchdog_timeout(
     }
 }
 
+fn launcher_nojit_requested(argv: &[String]) -> bool {
+    argv.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--nojit")
+}
+
 fn run() -> Result<()> {
     // Install the pre-`std::process::exit` hook on `native_system_exit` /
     // `native_runtime_exit`. A silent `System.exit(N)` during real app boot
@@ -1859,13 +1889,7 @@ fn run() -> Result<()> {
             eprintln!("=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ===");
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
         }
-        if std::env::var("CRATONVM_DBG_JIT_METHOD_STATS")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            cratonvm_jit::tiered::dump_method_stats_to_stderr();
-        }
+        maybe_dump_jit_method_stats();
     });
 
     // `java`-launcher positional semantics: insert a `--` separator right
@@ -1977,21 +2001,6 @@ fn run() -> Result<()> {
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
-
-    // --nojit: surface as the CRATONVM_DISABLE_JIT env var so the
-    // already-existing kill-switch in `vm/src/runtime/env_cache.rs`
-    // observes it on first read. Must happen *before* any code path
-    // that calls `env_cache::disable_jit()` (interpreter / JIT
-    // dispatcher) — the cache uses `OnceLock`, so a late `set_var`
-    // would be ignored. Setting it here, immediately after clap
-    // parsing, is well before `Vm::new(config)` runs any bytecode.
-    //
-    // We're still on the main thread with no cratonvm-spawned threads
-    // yet, so the documented `set_var` race against concurrent readers
-    // (which is why it became unsafe in edition 2024) cannot fire here.
-    if args.nojit {
-        std::env::set_var("CRATONVM_DISABLE_JIT", "1");
-    }
 
     // --enable-native-access: open the process-wide Panama FFI gate
     // (`native-builtins/src/panama.rs::NATIVE_ACCESS_ENABLED`), which is
@@ -3960,6 +3969,24 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // Install the immutable runtime configuration before crash handlers or
+    // any other subsystem can read a CratonVM flag. `--nojit` is detected
+    // from the launcher portion of the expanded argv (never from Java program
+    // arguments) and applied as a typed overlay. `run()` performs the full
+    // parse again; this early pass exists solely to close the configuration
+    // ordering boundary.
+    let early_argv =
+        insert_program_args_separator(expand_argfiles(std::env::args().collect::<Vec<_>>()));
+    let mut flag_overrides = cratonvm_types::MapSource::empty();
+    if launcher_nojit_requested(&early_argv) {
+        flag_overrides = flag_overrides.with("CRATONVM_DISABLE_JIT", "1");
+    }
+    let runtime_flags = cratonvm_types::VmFlags::from_env_with_overrides(flag_overrides);
+    if cratonvm_types::install_flags(runtime_flags).is_err() {
+        eprintln!("[cratonvm] runtime flags were read before launcher configuration");
+        std::process::exit(1);
+    }
+
     // Expand the ten grouped configuration variables (`CRATONVM_JIT=-bce,unroll`
     // and friends) into the per-knob keys the rest of the VM reads.
     //
@@ -4206,7 +4233,11 @@ fn main() {
             // (Display AND Debug) and flush stderr so a startup failure that ends the
             // process is never invisible. Additive logging only — no behaviour change.
             use std::io::Write as _;
-            match run() {
+            let result = run();
+            // A normal Java-main return never reaches the System.exit hook.
+            // Flush controlled-exit diagnostics before rendering the outcome.
+            maybe_dump_jit_method_stats();
+            match result {
                 Ok(()) => {
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();
@@ -4497,6 +4528,22 @@ mod tests {
         // After the program selector these are program args.
         assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--", "-version"])).is_none());
         assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--"])).is_none());
+    }
+
+    #[test]
+    fn early_nojit_scan_ignores_java_program_arguments() {
+        assert!(launcher_nojit_requested(&tokens(&[
+            "cratonvm",
+            "--nojit",
+            "Main",
+            "--"
+        ])));
+        assert!(!launcher_nojit_requested(&tokens(&[
+            "cratonvm",
+            "Main",
+            "--",
+            "--nojit"
+        ])));
     }
 
     /// The whole point of routing version output through our own banner:

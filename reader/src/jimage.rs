@@ -1414,7 +1414,7 @@ mod tests {
     /// full JDK still build clean.
     #[test]
     fn smoke_test_real_lib_modules() {
-        let Ok(java_home) = std::env::var("JAVA_HOME") else {
+        let Ok(java_home) = cratonvm_types::flags::runtime_var("JAVA_HOME") else {
             eprintln!("JAVA_HOME unset; skipping real lib/modules smoke test");
             return;
         };

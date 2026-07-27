@@ -5098,7 +5098,7 @@ fn os_default_zone_id() -> String {
     // `TZ` env var is the POSIX convention — the user can override
     // the platform default with it, and if it's present we honor it
     // verbatim. Empty values are ignored.
-    if let Ok(tz) = std::env::var("TZ") {
+    if let Ok(tz) = cratonvm_types::flags::runtime_var("TZ") {
         if !tz.is_empty() {
             return tz;
         }
@@ -5832,6 +5832,8 @@ pub(crate) fn register_t25_natives(registry: &mut NativeMethodRegistry) {
 // ===========================================================================
 #[cfg(test)]
 mod t25_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
