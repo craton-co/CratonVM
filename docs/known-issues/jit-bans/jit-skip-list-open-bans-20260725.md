@@ -195,10 +195,8 @@ High-value (wide blast radius or already well-isolated in comments):
   7 specific ATN config-context methods but keeps a package-level ban as
   the "surgical per-method ban of those 7 is the future minimal fix."
   Doing that narrowing is concrete, scoped work.
-- **KC26-PIC.1/.2, KC26-CFG.1, KC26-RX.1** — Keycloak/picocli/smallrye/
-  RxJava3 hangs, already narrowed once (picocli itself un-banned, a
-  specific interceptor fan-out class stays banned). Testable via the
-  Keycloak suite (`apps/keycloak`).
+- ~~**KC26-PIC.1/.2, KC26-RX.1**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`.
+  (**KC26-CFG.1** is a separate entry and is not affected by that lift.)
 - **JUNIT.1** — generic `JUnitCore.main` ban; if liftable, improves JIT
   coverage across every suite's test-running machinery, not just one
   class. Comment notes a `DBG bypass` already exists to force-compile it

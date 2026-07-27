@@ -265,14 +265,31 @@ fn alloc_coder_result(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
 /// (Tomcat `MessageBytes.toBytes` → wrong bytes / 288 test failures). The
 /// named read matches what `cb_write_hb` / `alloc_*_buffer` actually populate.
 /// Indexed slots are kept as a fallback for synthetic-mode-only consumers.
-fn buf_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32)> {
+/// Resolve a heap `Buffer` to `(backing array, array offset, position, limit)`.
+///
+/// `position`/`limit` stay RELATIVE (that is what `set_pos` writes back); index
+/// the array with `offset + position`. The real JDK `HeapByteBuffer`/
+/// `HeapCharBuffer` layout carries a non-zero `offset` for every buffer that
+/// views a region of a larger array — `wrap(array, off, len)`, `slice()`,
+/// `duplicate()` of a positioned buffer, and every pooled Netty `ByteBuf`,
+/// which hands out windows onto a shared arena. Ignoring it made every
+/// encode/decode read and write at the array's absolute start instead of the
+/// buffer's own window: `core.io.buffer.DataBufferTests` saw a byte written
+/// through a pooled heap `ByteBuf` come back as whatever happened to sit at
+/// index 0 of the arena.
+fn buf_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32, i32)> {
     if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
         let pos = ctx
             .get_field_by_name(this, "position")
             .as_int()
             .unwrap_or(0);
         let lim = ctx.get_field_by_name(this, "limit").as_int().unwrap_or(0);
-        return Some((a, pos, lim));
+        let off = ctx
+            .get_field_by_name(this, "offset")
+            .as_int()
+            .unwrap_or(0)
+            .max(0);
+        return Some((a, off, pos, lim));
     }
     let arr = match ctx.get_field(this, BUF_FIELD_ARRAY) {
         Value::Object(Some(a)) => a,
@@ -280,7 +297,9 @@ fn buf_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32
     };
     let pos = ctx.get_field(this, BUF_FIELD_POS).as_int().unwrap_or(0);
     let lim = ctx.get_field(this, BUF_FIELD_LIMIT).as_int().unwrap_or(0);
-    Some((arr, pos, lim))
+    // The synthetic slot layout has no separate offset — its array IS the
+    // buffer's window.
+    Some((arr, 0, pos, lim))
 }
 
 fn set_pos(ctx: &dyn NativeContext, obj: ObjectRef, pos: i32) {
@@ -546,6 +565,74 @@ pub(crate) fn clear_bom_state(ctx: &dyn NativeContext, this: ObjectRef) {
 ///     bytes and continue) instead of always REPORTing — matching the real
 ///     `java.nio.charset.CharsetEncoder.encode` orchestrator this shadows, and
 ///     symmetric to `native_decoder_decode`.
+/// Where an encode's output bytes actually live.
+///
+/// `buf_state` only resolves a *heap* `ByteBuffer` (backing `hb` array, or the
+/// synthetic slot layout). A real-JDK **direct** `ByteBuffer` has no backing
+/// array at all — its bytes sit at the native `address` — so every encode into
+/// one used to fall straight into the `None` arm and answer `OVERFLOW` having
+/// written nothing and consumed nothing.
+///
+/// That is an infinite loop for any caller that grows its buffer and retries on
+/// OVERFLOW, which is exactly what `CharsetEncoder.encode`'s documented
+/// contract invites. Spring's `DataBuffer.write(CharSequence, Charset)` does
+/// it, so `core.io.buffer.DataBufferTests.writeIsoString` hung the whole class
+/// (294 tests) on a `NettyDataBuffer`, whose `asByteBuffer` is direct.
+enum ByteSink {
+    Heap(ObjectRef),
+    Direct(u64),
+}
+
+/// Resolve an output `ByteBuffer` to `(sink, array offset, position, limit)`,
+/// covering both
+/// the heap layouts `buf_state` handles and a real-JDK direct buffer.
+fn byte_sink(ctx: &dyn NativeContext, bb: ObjectRef) -> Option<(ByteSink, i32, i32, i32)> {
+    if let Some((arr, off, pos, lim)) = buf_state(ctx, bb) {
+        return Some((ByteSink::Heap(arr), off, pos, lim));
+    }
+    // Real-JDK direct buffer. Require `position`/`limit` to resolve by name
+    // too, so an unrelated object's stale long is never treated as a pointer
+    // (same guard as `t27_tls.rs::bb_view`).
+    if let Value::Long(addr) = ctx.get_field_by_name(bb, "address") {
+        if addr > 0 {
+            let pos = ctx.get_field_by_name(bb, "position").as_int()?;
+            let lim = ctx.get_field_by_name(bb, "limit").as_int()?;
+            let cap = ctx
+                .get_field_by_name(bb, "capacity")
+                .as_int()
+                .unwrap_or(lim);
+            if cap > 0 {
+                // A direct buffer addresses its own window; no array offset.
+                return Some((ByteSink::Direct(addr as u64), 0, pos.min(cap), lim.min(cap)));
+            }
+        }
+    }
+    None
+}
+
+/// Write `bytes` at absolute byte offset `at`, returning how many landed.
+fn sink_write(
+    ctx: &mut dyn NativeContext,
+    sink: &ByteSink,
+    at: usize,
+    bytes: &[u8],
+) -> usize {
+    match sink {
+        ByteSink::Heap(arr) => write_byte_array(ctx, *arr, at, bytes),
+        // Arena-aware write: direct-buffer addresses can be tagged handles, so
+        // a raw dereference is unsound (see `t27_tls.rs::bb_put_bytes`).
+        ByteSink::Direct(addr) => {
+            if bytes.is_empty() {
+                0
+            } else if ctx.copy_to_native_memory((*addr as usize + at) as i64, bytes) {
+                bytes.len()
+            } else {
+                0
+            }
+        }
+    }
+}
+
 fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = arg_obj(args, 0)?;
     let cb = arg_obj(args, 1)?;
@@ -553,7 +640,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // args[3] = boolean endOfInput (passed as Int 0/1).
     let end_of_input = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
 
-    let (carr, cpos, clim) = match buf_state(ctx, cb) {
+    let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
         None => {
             return Ok(Some(Value::Object(Some(alloc_coder_result(
@@ -562,7 +649,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             )))))
         }
     };
-    let (barr, bpos, blim) = match buf_state(ctx, bb) {
+    let (bsink, boff, bpos, blim) = match byte_sink(ctx, bb) {
         Some(s) => s,
         None => {
             return Ok(Some(Value::Object(Some(alloc_coder_result(
@@ -573,7 +660,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
 
     let name = enc_name(ctx, this);
-    let chars = read_char_array(ctx, carr, cpos as usize, (clim - cpos).max(0) as usize);
+    let chars = read_char_array(ctx, carr, (coff + cpos) as usize, (clim - cpos).max(0) as usize);
     if chars.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
         return Ok(Some(Value::Object(Some(r))));
@@ -600,7 +687,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             if bom_pending {
                 mark_bom_written(ctx, this);
             }
-            let written = write_byte_array(ctx, barr, bpos as usize, &final_bytes);
+            let written = sink_write(ctx, &bsink, (boff + bpos) as usize, &final_bytes);
             set_pos(ctx, bb, bpos + written as i32);
             set_pos(ctx, cb, cpos + chars.len() as i32);
             let r = alloc_coder_result(ctx, CR_UNDERFLOW);
@@ -708,7 +795,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         i += atom_units;
     }
 
-    let written = write_byte_array(ctx, barr, bpos as usize, &out);
+    let written = sink_write(ctx, &bsink, (boff + bpos) as usize, &out);
     set_pos(ctx, bb, bpos + written as i32);
     // `i` is the exact number of input units consumed; on a REPORT error or an
     // incomplete trailing surrogate it points at the offending unit (left
@@ -729,7 +816,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // input), not MALFORMED — matching java.nio.charset.CharsetDecoder.decode.
     let end_of_input = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
 
-    let (barr, bpos, blim) = match buf_state(ctx, bb) {
+    let (barr, boff, bpos, blim) = match buf_state(ctx, bb) {
         Some(s) => s,
         None => {
             return Ok(Some(Value::Object(Some(alloc_coder_result(
@@ -738,7 +825,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             )))))
         }
     };
-    let (carr, cpos, clim) = match buf_state(ctx, cb) {
+    let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
         None => {
             return Ok(Some(Value::Object(Some(alloc_coder_result(
@@ -749,7 +836,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     };
 
     let name = enc_name(ctx, this);
-    let bytes = read_byte_array(ctx, barr, bpos as usize, (blim - bpos).max(0) as usize);
+    let bytes = read_byte_array(ctx, barr, (boff + bpos) as usize, (blim - bpos).max(0) as usize);
     if bytes.is_empty() {
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
         return Ok(Some(Value::Object(Some(r))));
@@ -767,7 +854,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let mut units: Vec<u16> = Vec::new();
         let (consumed, status) =
             engine::utf8_decode(&bytes, end_of_input, action, &mut units, avail);
-        let written = write_char_array(ctx, carr, cpos as usize, &units);
+        let written = write_char_array(ctx, carr, (coff + cpos) as usize, &units);
         set_pos(ctx, cb, cpos + written as i32);
         set_pos(ctx, bb, bpos + consumed as i32);
         let tag = match status {
@@ -819,7 +906,7 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     let avail = (clim - cpos).max(0) as usize;
     let to_write = decoded.len().min(avail);
-    let written = write_char_array(ctx, carr, cpos as usize, &decoded[..to_write]);
+    let written = write_char_array(ctx, carr, (coff + cpos) as usize, &decoded[..to_write]);
     set_pos(ctx, cb, cpos + written as i32);
 
     if to_write < decoded.len() {
@@ -865,11 +952,11 @@ fn native_charset_encode_charbuf(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(b))) => *b,
         _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let (carr, cpos, clim) = match buf_state(ctx, cb) {
+    let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
         None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let chars = read_char_array(ctx, carr, cpos as usize, (clim - cpos).max(0) as usize);
+    let chars = read_char_array(ctx, carr, (coff + cpos) as usize, (clim - cpos).max(0) as usize);
     let bytes = encode_with_charset(ctx, this, &chars);
     // Advance the input position — matches HotSpot's contract that
     // Charset.encode(CharBuffer) consumes the buffer.
@@ -894,11 +981,11 @@ fn native_charset_decode_bytebuf(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // native.
     let mut bytes: Vec<u8> = Vec::new();
     let mut read_buffer_state = false;
-    if let Some((barr, bpos, blim)) = buf_state(ctx, bb) {
+    if let Some((barr, boff, bpos, blim)) = buf_state(ctx, bb) {
         read_buffer_state = true;
         let want = (blim - bpos).max(0) as usize;
         if want > 0 {
-            bytes = read_byte_array(ctx, barr, bpos as usize, want);
+            bytes = read_byte_array(ctx, barr, (boff + bpos) as usize, want);
             set_pos(ctx, bb, blim);
         }
     }
@@ -1156,11 +1243,11 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
 fn read_and_consume_bytebuffer(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut read_buffer_state = false;
-    if let Some((barr, bpos, blim)) = buf_state(ctx, bb) {
+    if let Some((barr, boff, bpos, blim)) = buf_state(ctx, bb) {
         read_buffer_state = true;
         let want = (blim - bpos).max(0) as usize;
         if want > 0 {
-            bytes = read_byte_array(ctx, barr, bpos as usize, want);
+            bytes = read_byte_array(ctx, barr, (boff + bpos) as usize, want);
             set_pos(ctx, bb, blim);
         }
     }
@@ -1281,11 +1368,11 @@ fn native_charset_encode_charbuf_via_encoder(
         Some(Value::Object(Some(b))) => *b,
         _ => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let (carr, cpos, clim) = match buf_state(ctx, cb) {
+    let (carr, coff, cpos, clim) = match buf_state(ctx, cb) {
         Some(s) => s,
         None => return Ok(Some(Value::Object(Some(alloc_byte_buffer(ctx, &[]))))),
     };
-    let chars = read_char_array(ctx, carr, cpos as usize, (clim - cpos).max(0) as usize);
+    let chars = read_char_array(ctx, carr, (coff + cpos) as usize, (clim - cpos).max(0) as usize);
     let name = enc_name(ctx, this);
     let malformed = coding_action(ctx, this, "malformedInputAction");
     let unmappable = coding_action(ctx, this, "unmappableCharacterAction");
@@ -1488,7 +1575,7 @@ mod tests {
     }
 
     fn bb_bytes(ctx: &dyn NativeContext, bb: ObjectRef) -> Vec<u8> {
-        let (arr, _pos, _lim) = buf_state(ctx, bb).expect("byte buffer state");
+        let (arr, _off, _pos, _lim) = buf_state(ctx, bb).expect("byte buffer state");
         let upto = ctx.get_field(bb, BUF_FIELD_POS).as_int().unwrap_or(0) as usize;
         (0..upto)
             .map(|i| (ctx.get_array_element(arr, i).as_int().unwrap_or(0) & 0xFF) as u8)

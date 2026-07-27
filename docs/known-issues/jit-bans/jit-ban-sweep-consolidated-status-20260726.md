@@ -32,6 +32,31 @@ retain full evidence/repro details; this file is the summary.
 | SPB.9c | `context/annotation/`,`context/support/`,`core/io/support/`,`beans/factory/` | real spring-context-7.0.7.jar |
 | SPB.2 | `org/springframework/core/` | real spring-core-7.0.7.jar, hang-safe timeout wrappers |
 
+## Removed 2026-07-27 (continuation session, real spring-boot-4.0.6 suite)
+
+| Ban | Package/class | Evidence |
+|---|---|---|
+| SPB.4 / SPB.4b / SPB.4c | `org/springframework/boot/context/properties/bind/`, `org/springframework/boot/context/`, `org/springframework/boot/` umbrella (excl. `boot/loader/`) | real spring-boot-4.0.6.jar, 10-scenario suite at `/data/data/spring-boot-tomcat-crossmodule-20260717/cratonvm-suite`, baseline vs. allow-listed byte-identical across all 10 scenarios |
+
+Also fixed as a downstream consequence: `SPRINGBOOT-WITHOUT-JACKSON.2`'s
+test previously documented a real shadow from SPB.4c under Conservative;
+with SPB.4c now gone that class (`ModifiedClassPathClassLoader.loadClass`)
+is unconditionally JIT-eligible, test updated accordingly.
+
+Two NEW findings surfaced while re-testing, both independent of these
+bans (confirmed to reproduce identically whether the bans are active or
+lifted):
+
+- `docs/known-issues/springboot/configproxy-cglib-singleton-regression-20260727.md`
+  -- `S03_ConfigProxy` scenario regressed 8/8 -> 4/8 since 2026-06-11;
+  confirmed NOT JIT-related (reproduces with `CRATONVM_DISABLE_JIT=1` too)
+  -- a CGLIB `@Configuration` proxy singleton-cache bug.
+- `docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md`
+  -- real `ClassCastException` (`ResolvableType[]` cast to `ResolvableType`)
+  in `Profiles.<clinit>`, but only under `CRATONVM_JIT_THRESHOLD=1`
+  (a `<clinit>` essentially never reaches real JIT tiers otherwise) --
+  low real-world priority, tracked for a future session.
+
 ## Already moot / dead-code (no action needed, confirmed this session)
 
 - **NETTY.1** — already lifted 2026-06-11, predates this week; no active `io/netty/` ban remains, only historical archetype references.
@@ -45,8 +70,7 @@ retain full evidence/repro details; this file is the summary.
 
 ## Blocked — real, still-open, NOT this session's to fix (architectural)
 
-- **Keycloak class-resolution loader-blindness** — `ClassManager::find_class_bytes_delegated` (classloading/src/class_manager.rs) only checks bootstrap/extension/application, no path to a custom `ClassLoader`'s own `findClass`. Blocks the real Keycloak 26.6.1 boot past `Version.<clinit>` (now fixed) at a NEW class-resolution point. 149 call sites of `load_class` across the VM — genuinely too large a refactor for a single pass. `docs/known-issues/keycloak-boot-blocked-version-null-20260726.md`.
-- **KC26-PIC.1 / KC26-RX.1 / KC26.LR** — all blocked by the above; the real Keycloak boot never reaches these code paths. Cannot be independently tested until the class-resolution bug is fixed.
+- ~~**Keycloak class-resolution loader-blindness**~~ / ~~**KC26-PIC.1 / KC26-RX.1 / KC26.LR**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`. (The original entries claimed `ClassManager::find_class_bytes_delegated` needed a fourth loader path across "149 call sites"; that file was never touched. The defect was ordering: a fabricated stub is registered globally under `Application`, which poisons the binary name so the owning custom loader can never define the real class.)
 - **SuppressWarnings annotation bug** — any source containing `@SuppressWarnings("...")` fails in-process javac compilation (unrelated to any JIT ban, reproduces with JIT fully disabled). `docs/known-issues/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
 
 ## Blocked — genuinely missing fixture, confirmed absent (double-checked)

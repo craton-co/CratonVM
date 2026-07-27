@@ -19511,6 +19511,32 @@ pub(crate) fn resolve_class_loader_aware(
     // additive — only fires on what would already be a resolution failure, so
     // it never changes a previously-successful (or differently-failing)
     // resolution.
+    // A name the global path can only answer with a *fabricated synthetic
+    // stub* must be offered to the referencing class's own loader FIRST.
+    // `load_class_concurrent` would otherwise register that stub globally
+    // under `Application`, after which the real loader can never define its
+    // own copy -- and a stub has no `Code` and implements no interfaces, so
+    // the first real use fails (`VerifyError`, or a `ClassCastException` on
+    // an interface the real class does implement). Quarkus's fast-jar
+    // `RunnerClassLoader` serving `lib/quarkus/generated-bytecode.jar` is the
+    // case this was written for: `new ValueRegistry_..._Synthetic_Bean()` from
+    // generated Arc bytecode resolved to a stub, which then could not be cast
+    // to `io.quarkus.arc.InjectableBean`. Strictly additive -- it only
+    // pre-empts an answer that was going to be fake.
+    if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+        && shared
+            .classes
+            .class_manager
+            .read()
+            .would_fabricate_synthetic_stub(name)
+    {
+        if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name) {
+            if dbg_trace {
+                eprintln!("[LOADER-TRACE] name={name} resolved via would-stub loader drive {id:?}");
+            }
+            return Ok(id);
+        }
+    }
     match shared.load_class_concurrent(name) {
         Ok(id) => {
             if dbg_trace {
@@ -19539,7 +19565,7 @@ pub(crate) fn resolve_class_loader_aware(
 /// loader's `loadClass` does not produce a class — in every such case the caller
 /// falls back to global resolution, so this can only ever resolve MORE classes,
 /// never fail one that global resolution would have answered.
-fn drive_defining_loader_load(
+pub(crate) fn drive_defining_loader_load(
     shared: &SharedVm,
     thread: &mut JvmThread,
     referencing_class_id: ClassId,

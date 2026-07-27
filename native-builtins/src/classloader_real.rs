@@ -1019,6 +1019,19 @@ pub(crate) fn no_class_def_found_error(
 /// Reached when the receiver does NOT override `loadClass(String,boolean)`, and
 /// via `super.loadClass(name, resolve)` (the base native) from a subclass that
 /// wants standard parent-first delegation as its fallback.
+/// Legacy escape hatch for the "no fabricated stubs from `loadClass`" rule in
+/// [`cl_real_load_class_base`]: `CRATONVM_CL_STUB_DELEGATION=1` lets parent
+/// delegation answer with a synthetic stub again, as it did before 2026-07-27.
+fn stub_may_answer_load_class() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CRATONVM_CL_STUB_DELEGATION")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1262,7 +1275,36 @@ fn cl_real_load_class_base(
     // 1. Standard VM class loading (skipped when deferring to a custom findClass,
     //    or when the loader's chain cannot reach a built-in loader, or when a
     //    user-defined parent already authoritatively refused above).
-    if !parent_user_defined_authoritative_miss && !defer_to_find_class && !scoped_user_chain {
+    // `ClassLoader.loadClass` must never answer with a FABRICATED synthetic
+    // stub. The stub mechanism exists so enterprise *bytecode* can link
+    // against classes that are genuinely absent (`is_enterprise_stub_prefix`:
+    // `io/quarkus/`, `org/jboss/`, `io/smallrye/`, ...); HotSpot's
+    // `loadClass` has no such notion and throws `ClassNotFoundException`.
+    // Returning one here breaks every loader that *depends* on the parent
+    // refusing:
+    //
+    //   Quarkus's fast-jar `RunnerClassLoader` lists `io.quarkus.value.registry`
+    //   (among 40 packages) as PARENT-FIRST. It calls
+    //   `getParent().loadClass(name)` inside `try { } catch
+    //   (ClassNotFoundException)` and, on the expected refusal, falls through
+    //   to its own index -- which has the class, in
+    //   `lib/quarkus/generated-bytecode.jar`. CratonVM's app loader instead
+    //   answered with a stub, so Arc's generated `ValueRegistry_..._Synthetic_Bean`
+    //   became a method-less, interface-less class registered globally under
+    //   `Application`, and `ArcContainerImpl` died casting it to
+    //   `InjectableBean`.
+    //
+    // The stub is still minted by CratonVM's own constant-pool / `Class.forName`
+    // fallbacks when nothing else can supply the name -- this only stops the
+    // explicit `loadClass` API from manufacturing one mid-delegation.
+    // `CRATONVM_CL_STUB_DELEGATION=1` restores the legacy behaviour.
+    let stub_would_answer_delegation =
+        !stub_may_answer_load_class() && ctx.would_fabricate_synthetic_stub(&internal);
+    if !parent_user_defined_authoritative_miss
+        && !defer_to_find_class
+        && !scoped_user_chain
+        && !stub_would_answer_delegation
+    {
         match load_class_visible_to(ctx, this, &internal) {
             ClassLookup::Found(mirror) => return Ok(Some(mirror)),
             ClassLookup::DependencyMissing(missing) => {

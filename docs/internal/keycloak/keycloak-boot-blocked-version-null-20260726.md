@@ -1,6 +1,12 @@
-# KC26-PIC.1 / KC26-RX.1 — blocked by a classloading bug, NOT a missing fixture
+# KC26-PIC.1 / KC26-RX.1 — Keycloak boot blocked by classloader stub fabrication
 
-**Status: still banned, blocked by a separate boot-time bug found this session, not by "no fixture" (a prior doc's claim that Keycloak has no fixture on this host was wrong — see below).**
+**Status: ✅ RESOLVED 2026-07-27.** The Keycloak 26.6.1 server boots under
+CratonVM, and both JIT bans this doc existed to unblock (KC26-PIC.1 and
+KC26-RX.1) were re-measured against it and **lifted**. Full closure, root
+cause and the measurement table are in the final section, "CLOSED 2026-07-27".
+The sections below are the original investigation, kept in chronological order
+— including a recommendation that turned out to be wrong about where the fix
+belonged (see the closure section).
 
 ## Correction to a prior finding
 
@@ -241,3 +247,117 @@ too). Recommend a dedicated session/investigation rather than folding it
 into a JIT-ban sweep. `KC26-PIC.1`/`KC26-RX.1` remain banned/blocked, now
 specifically by this new class-resolution gap rather than the (now
 fixed) resource bug.
+
+## CLOSED 2026-07-27 — the whole loader-blindness family is fixed; Keycloak 26.6.1 boots
+
+**Status: RESOLVED.** The real `keycloak-quarkus-dist-26.6.1` server now boots
+under CratonVM all the way to `io.quarkus.runtime.Quarkus.waitForExit()` —
+through Picocli CLI parsing, SmallRye config mapping, the Quarkus augmentation
+step, BouncyCastle/JCA provider registration, Hibernate ORM + Liquibase
+bootstrap, Arc (CDI) container init and RESTEasy Reactive deployment. Verified
+by the watchdog stack dump (`CRATONVM_DEFAULT_WATCHDOG_SEC=420`), whose main
+thread sits in `ApplicationLifecycleManager.waitForExit → awaitUninterruptibly`
+— the normal "started, waiting for shutdown" state.
+
+### The recommendation in the section above was wrong about *where* the fix goes
+
+It proposed teaching `ClassManager::find_class_bytes_delegated` a fourth,
+custom-`ClassLoader` path and called that "a materially bigger and riskier
+change ... 149 call sites". None of that was needed. `find_class_bytes_delegated`
+is untouched. The real defect was **ordering**, in four much smaller places:
+
+CratonVM fabricates a *synthetic stub* (a class with no `Code` on any method)
+for any name under a recognized enterprise prefix — `io/quarkus/`, `org/jboss/`,
+`io/smallrye/`, `org/infinispan/`, ... — that none of the three built-in loaders
+can find (`is_enterprise_stub_prefix` / `create_synthetic_stub`). That stub is
+registered **globally, under `Application`**. So the stub does not merely give
+one bad answer: it *poisons the binary name*, and the custom loader that owns
+the real class can never define its own copy afterwards. Every symptom in this
+doc's history is that one mechanism firing at a different call site.
+
+### The four fixes (all in this session's commit)
+
+1. **`ClassManager::would_fabricate_synthetic_stub(name)`** (new, non-destructive)
+   — mirrors `load_class`'s own fallback branches and answers "this name would
+   only produce a stub" *without* creating one. Every fix below is gated on it,
+   which is what keeps them strictly additive: they can only change an answer
+   that was going to be fabricated.
+
+2. **`NativeContextImpl::{load_class, ensure_class_initialized,
+   new_object_initialized}`** (`vm/src/vm/vm_exec.rs`) — the name-based entry
+   points natives use now consult the *calling class's* own `ClassLoader` (JNI
+   `FindClass` semantics) when the global answer would be a stub, and again
+   after a genuine miss. This fixed two boot blockers:
+   - `Class.getGenericInterfaces()` on a SmallRye `@ConfigMapping` interface
+     resolved the type argument `io.quarkus.runtime.configuration.MemorySize`
+     (only in `lib/main/io.quarkus.quarkus-core-3.33.1.jar`) to a stub →
+     `VerifyError: non-abstract non-native method must have Code attribute` out
+     of `io.quarkus.runtime.generated.SharedConfig.<clinit>`.
+   - the JCA provider chain instantiates SPI classes by name
+     (`build_jca_impl` → `new_object_initialized`), so BouncyCastle's
+     `PKCS12KeyStoreSpi$BCPKCS12KeyStore` — registered by a provider loaded from
+     a `RunnerClassLoader` jar — surfaced as `ClassNotFoundException` in
+     `KeyStore.getInstance` during `JavaKeystoreKeyProviderFactory.init`.
+
+3. **`resolve_class_loader_aware`** (`vm/src/runtime/interpreter.rs`) — the same
+   rule for constant-pool resolution: a `new`/`checkcast`/`ldc` naming a
+   would-be-stub is offered to the referencing class's defining loader first.
+
+4. **`cl_real_load_class_base`** (`native-builtins/src/classloader_real.rs`) —
+   **`ClassLoader.loadClass` must never answer with a fabricated stub.** This
+   was the last and most interesting one. Quarkus's `RunnerClassLoader` lists
+   `io.quarkus.value.registry` among 40 **parent-first** packages: it calls
+   `getParent().loadClass(name)` inside `try { } catch (ClassNotFoundException)`
+   and, on the expected refusal, falls through to its own index — which has the
+   class, in `lib/quarkus/generated-bytecode.jar`. CratonVM's app loader instead
+   returned a stub, so Arc's generated `ValueRegistry_…_Synthetic_Bean` became a
+   method-less, interface-less class and `ArcContainerImpl.<init>` died with
+   `ClassCastException: … cannot be cast to io.quarkus.arc.InjectableBean`.
+   HotSpot's `loadClass` has no notion of stubs; ours now doesn't either.
+   `CRATONVM_CL_STUB_DELEGATION=1` restores the legacy behaviour.
+   The stub is still minted by constant-pool / `Class.forName` fallbacks when
+   nothing else can supply the name — only the explicit `loadClass` API stopped
+   manufacturing one mid-delegation.
+
+### Isolated reproducer
+
+`docs/known-issues/repros/keycloak-runner-loader-20260727/RunnerLoaderProbe.java`
+builds the real `RunnerClassLoader` from `quarkus-application.dat` and asks it
+for five classes. Before the fix, two of them came back defined by
+`jdk.internal.loader.ClassLoaders$AppClassLoader` (the stub) instead of
+`RunnerClassLoader`; after it, all five match HotSpot exactly. It runs in ~2
+seconds, versus ~7 minutes for a full boot — the reason the last two blockers
+were found quickly. Sibling probes (`DirMapProbe`, `GenSetProbe`,
+`ResourceDataProbe`, `JdkPkgProbe`) narrowed it from "the loader can't find the
+class" to "the loader never asks its own index, because the parent answered" by
+ruling out the `HashMap`/`HashSet`/jar-read layers one at a time.
+
+### New diagnostics added (all env-gated, all cached — no hot-path cost)
+
+- `CRATONVM_DBG_STUB_BT=<substring>` — Rust backtrace where a synthetic stub is
+  fabricated for a matching name. A stub is silent until something *runs* it, by
+  which point the resolver that asked for it is long gone from the stack.
+- `CRATONVM_DBG_RTERR=<substring>` — VM-raised runtime errors (`Debug` form
+  matched against the substring) with the Java stack at the raise point. The
+  VM-side raise path never goes through `athrow`, so `CRATONVM_DBG_ATHROW`
+  cannot see these.
+- `CRATONVM_DBG_LINKAGE_BT=1` — Rust backtrace at every linkage-error raise.
+- `CRATONVM_DBG_STUBLOADER=1` — traces the "would-stub → ask the caller's own
+  loader" fallback.
+
+### Verification
+
+- `RunnerLoaderProbe`: CratonVM output now byte-identical to HotSpot.
+- Full `kc.sh start-dev` boot reaches `waitForExit` (see above).
+- `cargo test --release -p cratonvm-vm --lib skip_list`: 68 passed, 0 failed.
+- `regression-suite/run.sh`: 13 passed, 0 failed.
+
+### Known residual (NOT a boot blocker, out of this doc's scope)
+
+Arc logs `No matching bean found for type class …` for the RESTEasy Reactive
+handler/exception-mapper beans, and the process ends up with only 3 live threads
+(no Vert.x event loop), so the HTTP listener never opens and the
+"Keycloak … started in Ns / Listening on http://…" banner is not printed. The
+lifecycle itself completes normally. That is a separate CDI/Arc-registration
+gap, tracked on its own; it does not block the JIT-ban testing this doc existed
+to unblock.
