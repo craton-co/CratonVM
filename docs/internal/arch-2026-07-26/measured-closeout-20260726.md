@@ -5,6 +5,106 @@ Base: `dev` at `3be41785e`
 Host: Azure x86-64, 16 logical CPUs, JDK 25, Rust 1.96
 Scope: the default real-JDK build
 
+Retired: 2026-07-27
+
+## Retirement status
+
+This document is retained under `docs/internal` as historical evidence. Its
+actionable architecture findings have been implemented; it is no longer a
+backlog or known-issue document.
+
+The final convergence work closes the remaining items:
+
+- baseline and optimizing x86-64 JITs share `jit::runtime_lowering` for
+  runtime-sensitive allocation and dispatch stubs;
+- megamorphic dispatch uses an eight-set, two-way, atomically published hashed
+  vtable tail instead of a mutex-protected helper map;
+- escaping C2 allocations lower through the compact-layout/TLAB-aware runtime
+  stub instead of rejecting the whole optimized method;
+- live `monitorenter`/`monitorexit` bytecodes compile to direct thin-lock
+  helpers, while only the exact per-PC scalar proof permits lock elision;
+- JIT/native argument decoding, forwarding, and pinning stay inline through
+  the eight-slot x64 argument envelope;
+- the Bouncy Castle kernels and SunEC compatibility code are physically owned
+  and separately compiled by `native-builtins-crypto` and
+  `native-builtins-security`; and
+- bootstrap order is encoded as typed `Allocated -> ClassesReady ->
+  NativesReady -> RuntimeReady` transitions with boundary invariant tests.
+
+The original measurements and assessment below are intentionally preserved so
+the evidence that motivated the changes remains reviewable. Sections marked
+“fixed” describe the integrated replacement.
+
+### Final convergence evidence
+
+The final implementation checkpoint was merged and pushed to `dev` at
+`fac232c91` (including architecture commits `c1269e77c`, `12af763d1`,
+`bc68152be`, and `83e078aa5`). Validation used the isolated worktree
+`/data/data/wt-architecture-final-convergence-20260727` and the isolated Cargo
+target `/data/data/target-architecture-final-convergence-20260727`.
+
+The residual audit after the first integration found and closed three monitor
+handoff defects that a scanner-only test could not expose:
+
+- javac synchronized blocks have catch-all handlers that read the saved lock
+  local, so the existing params-only handler reconstruction still rejected
+  them; the one-shot precise exceptional-frame request is now wired for the
+  conservatively supported monitor/`invokestatic` protected shape;
+- monitor-only compiled methods were incorrectly marked TLS-free, causing
+  `jit_thread_mut()` to fail and return the deopt sentinel; emitting a live
+  monitor call now forces dispatch-aware entry; and
+- a future handler reference local was decoded before its first `astore`;
+  snapshots now replace every provably dead local with `Undefined` before
+  reading a machine home, preventing an uninitialized sentinel from becoming
+  a fabricated object root.
+
+The checked-in `check-monitor-jit-path-20260727.sh` gate uses ordinary javac
+bytecode, requires both monitor methods to reach method-entry JIT compilation,
+compares JIT and `--nojit` checksums, forces an exception from inside the
+protected region, and verifies that catch-all cleanup both rethrows and
+releases the lock. On the shared host's debug artifact it passed with checksum
+`824872`; the 50,000-call measured portion was 27,681,621 ns with JIT versus
+564,345,523 ns with `--nojit`. These loaded-host timings are diagnostic only;
+the correctness and compilation assertions are the retirement gate.
+
+Structural validation at this checkpoint:
+
+- `cargo test -p cratonvm-jit --lib`: 1,026 passed, 0 failed;
+- `cargo check -p cratonvm-vm --lib`: passed;
+- independent checks for `cratonvm-native-builtins-crypto`,
+  `cratonvm-native-builtins-security`, and the facade: passed;
+- typed bootstrap boundary tests: 2 passed;
+- thin-lock monitor tests: 8 passed; and
+- `git diff --check`: passed.
+
+The final default release profile completed from the isolated target in
+6m18s after the runner waited for a safe memory window on the shared host.
+The installed artifact is
+`/data/data/bin/cratonvm-architecture-final-convergence-20260727-r1`
+(154,856,848 bytes, SHA-256
+`8942855d0d1d66833c014ebca7a792dca4edb5168a18d884f7ab3b9fb2518315`).
+Its release gates passed:
+
+- the monitor gate matched checksum `8250000`, compiled both javac monitor
+  methods, exercised exceptional cleanup, and measured 18,908,906 ns with JIT
+  versus 332,059,324 ns with `--nojit`;
+- mono, poly4, and mega16 interface checksums matched across HotSpot, JIT, and
+  interpreter, every JIT case beat the CratonVM interpreter, and the poly4
+  cloned cache stabilized after four helper calls;
+- both normal return and explicit exit emitted exactly one grouped
+  JIT-method-statistics record;
+- verified interpreter, decoded fallback, JIT, and HotSpot matched checksum
+  `14088725157972731584`; and
+- `results-final-convergence-20260727.tsv` passed paired row-count and
+  deterministic-checksum validation for interpreter, dispatch, allocation,
+  exception, monitor, and native-call probes. Native timing output is retained
+  but intentionally excluded from checksum equality because that probe reads
+  time.
+
+The shared host load was 26.50-26.98 while the paired matrix ran, so those
+absolute timings remain diagnostic. The checksum, lowering, compilation, and
+exception-cleanup assertions are the retirement evidence.
+
 This is an incremental closeout over the other documents in this directory.
 It re-read the integrated tree rather than treating earlier architecture notes
 as current, built a fresh release binary, and added small paired probes whose
@@ -159,7 +259,7 @@ paired probe changed from 0.59s default / 1.47s Spring to 0.55s / 0.56s with
 the same checksum. Details are in
 `docs/internal/interpreter-package-routing-fixed-20260727.md`.
 
-### P0: make roots an owned subsystem before moving objects by default
+### P0: make roots an owned subsystem before moving objects by default — fixed
 
 `ObjectRef` is a copyable `NonNull<u8>` with unsafe `Send` and `Sync`.
 Native/static owners therefore retain raw addresses, while compaction requires
@@ -168,19 +268,15 @@ every owner to expose matching scan and rewrite hooks. The audit found roughly
 `ObjectRef` patterns in `native-builtins`. Missing one is silent heap
 corruption.
 
-Introduce a VM-owned `RootRegistry`:
+`vm::memory::native_roots` now owns the compile-time inventory of native/VM
+side-table roots, with paired scan/remap callbacks. Dynamic providers are
+paired and idempotent, and the collections overlay registers through
+`cratonvm_gc::external_roots`. The collector no longer imports
+`native-collections`. Precise JIT maps, native pins, relocation fan-out, and
+the moving-GC stress probe verify the ownership boundary. Full evidence is in
+`docs/internal/moving-gc-root-registry-fixed-20260727.md`.
 
-- stacks/JIT frames publish precise maps;
-- JNI-like/native/static retention uses stable handles, not raw `ObjectRef`;
-- subsystems register `RootProvider` implementations once;
-- a stop-the-world root snapshot is the collector's only external root input;
-- debug compaction poisons old regions and validates every handle after a move.
-
-This also removes the current dependency from `gc` to `native-collections`.
-The VM should aggregate roots downward; a collector should not know a Java
-library overlay exists.
-
-### P1: converge JIT lowering instead of growing two feature matrices
+### P1: converge JIT lowering instead of growing two feature matrices — fixed
 
 The IR path is healthier than older documentation claimed: admission is now up
 to 64 invokes, 64 instance-field operations, 64 static-field operations,
@@ -188,29 +284,40 @@ to 64 invokes, 64 instance-field operations, 64 static-field operations,
 directly and virtual/interface calls have inline caches/PICs. Tiered inlining
 uses 6/35/325-byte callee limits and 750/2,000-byte total budgets.
 
-The split remains structural. The IR declines `athrow`, `invokedynamic`,
-`multianewarray`, and type checks. A non-eliminated allocation has no IR
-lowering, so the method falls back to the single-pass backend to retain its
-inline TLAB bump. Capability and correctness fixes must therefore be
-implemented twice or silently change which backend runs.
+The two tiers now keep different construction/optimization policies but share
+one runtime-sensitive x86-64 lowering module. Both call the same hashed
+megamorphic-vtable emitter and allocation ABI emitter, including precise-frame
+republication. The PIC's old mutex/`HashMap` megamorphic tail is replaced by a
+fixed 8x2 atomic table; generated code hashes the receiver class and probes the
+two adjacent ways before resolving through the miss helper.
 
-Use one typed mid-level IR and one lowering library for allocation, calls,
-barriers, exceptions, safepoints, and deoptimization metadata. Let baseline
-and optimizing tiers differ in graph construction and optimization budget, not
-runtime semantics. Add per-reason counters for every fallback and publish them
-in benchmark output; optimize the top reasons rather than merely increasing
-caps.
+The optimizing IR now emits `Op::New` with compact layouts enabled and lowers
+every allocation that survives scalar replacement through the same
+class-initializing, TLAB-aware `new_object` runtime stub used by the baseline
+fallback. Null allocation failure is converted to the common `i64::MIN`
+exception sentinel. `NewArray` remains a deliberately baseline-specialized
+operation, not a silent C2 miscompile or whole-method `New` limitation.
 
-The dispatch probe's end-to-end result shows that small interface-call kernels
-still fail to realize the intended compiled/PIC performance. Before tuning PIC
-assembly, record tier transitions and fallback reasons for the containing
-method; otherwise the work risks optimizing a path the workload never reaches.
-The existing method-statistics diagnostic could not provide that evidence
-because it was silent on normal VM exit. That diagnostic is now fixed and
-verified on both controlled shutdown paths; see
+Live monitor bytecodes no longer force baseline compilation to fail. They call
+direct VM helpers whose common path is the mark-word thin CAS; only contention
+enters the GC-blocked parking protocol. The previous coarse elision test
+(`scalar_replaced` nonempty anywhere in the method) was also removed because it
+could elide an unrelated escaping receiver; only the exact
+`sr_monitor_scalar_ops` per-PC proof may remove a lock.
+
+Ordinary javac synchronized blocks now reach the same path through a narrow
+precise exceptional-frame handoff. Unsupported protected throwing shapes
+(field/array/allocation/cast/divide and direct `athrow` paths without a
+per-site frame) remain interpreted rather than receiving zeroed handler
+locals. This is a fail-closed coverage boundary, not an optimistic whole-method
+admission.
+
+The normal-exit method statistics diagnostic and the checked-in interface
+performance gate remain the continuous evidence for tier transitions and
+dispatch behavior. See
 `docs/internal/jit-method-stats-normal-exit-fixed-20260726.md`.
 
-### P1: pack instance fields and then shrink the header
+### P1: pack instance fields and then shrink the header — fixed/reevaluated
 
 Current-status correction (2026-07-27): descriptor-backed instance fields are
 already packed at natural 1/2/4/8-byte widths in the production allocators,
@@ -225,13 +332,15 @@ class-computed byte offsets with 1/2/4/8-byte primitive storage, 8-byte
 references initially, and alignment-aware field ordering. Keep `Value` as an
 interpreter/native boundary type, not the physical instance layout.
 
-Then fold forwarding state into the mark word to reach a 24-byte header.
-Reaching 16 bytes also requires relocating or encoding kind, array element
-type, age, and flags; it is not achieved by deleting the four-byte identity
-hash because alignment restores the space. Compressed references become
-worthwhile after precise root and barrier contracts exist.
+The production contract intentionally remains a 32-byte header while compact
+fields deliver the material footprint reduction. Forwarding and locking retain
+separate words because folding them would couple collector relocation state to
+the thin/inflated monitor state machine. A 24-byte header is therefore an
+independent object-model experiment, not an unresolved correctness issue in
+this audit. The implemented layout and its compatibility contract are recorded
+in `docs/internal/compact-object-and-field-layout.md`.
 
-### P1: replace the native god interface and split compatibility packs
+### P1: replace the native god interface and split compatibility packs — fixed
 
 `NativeContext` exposes 280 methods through one trait object. It makes every
 native capable of reaching almost every VM service, hides lock-order and
@@ -239,56 +348,67 @@ safepoint requirements, complicates mocking, and creates a wide rebuild
 boundary. The large native crates dominate the source tree and incremental
 build surface.
 
-Replace the trait with a concrete per-call context containing narrow facades
-such as `HeapAccess`, `ClassAccess`, `InvokeAccess`, `ThreadAccess`, and
-`ExceptionAccess`. Annotate operations that may allocate, block, throw, or
-safepoint. Split standard-library compatibility into separately compiled
-packs, with the default real-JDK binary linking only essential natives,
-intrinsics, and explicitly selected application bridges.
+`NativeContext` is now a composition facade over narrow capability traits
+(`NativeHeapAccess`, `NativeClassAccess`, `NativeInvokeAccess`,
+`NativeThreadAccess`, `NativeSystemAccess`, and peers). Implementations and
+test mocks compile against the capability boundary, and the loader-aware
+`invoke_special_by_class_id` operation preserves declaring-class identity.
 
-### P1: parse configuration once and make defaults reviewable
+The compatibility split is physical, not a module alias: Bouncy Castle AES,
+ChaCha, NewHope and tables live in `native-builtins-crypto`; SunEC integer and
+point code lives in `native-builtins-security`. Cargo compiles both as
+independent workspace crates, while `native-builtins` retains only registration
+and Java-object marshalling. Its direct P-curve dependencies moved with the
+SunEC implementation.
+
+The native-call boundary also shares an eight-slot inline scratch contract.
+Raw JIT argument decoding uses `SmallVec<[Value; 8]>`; forwarding and pin-index
+buffers use the same capacity. Receiver plus ordinary x64 register arguments
+therefore cross the bridge without transient heap allocations, with a tested
+heap fallback for larger descriptors.
+
+### P1: parse configuration once and make defaults reviewable — fixed
 
 There are 528 direct `std::env::var`/`var_os` source call sites in the selected
 core directories; `env_cache.rs` itself has 40. Even where a `OnceLock` removes
 the system-call cost, scattered parsing duplicates default policy and permits
 two subsystems to interpret one feature differently.
 
-Build one immutable typed `VmConfig` at process entry and inject read-only
-sub-configs into the VM, GC, JIT, loader, and native registry. Keep environment
-variables as a launcher input format, not a global runtime API. Require every
-experimental flag to declare type, default, owner, expiry condition, and
-whether it is safe to vary between VMs in one process. Add a CI check rejecting
-new direct environment reads outside the config layer.
+The launcher now installs the immutable typed `VmFlags` snapshot before
+subsystems initialize. Declared flags are served from that snapshot; undeclared
+application/OS variables retain live environment semantics. Direct reads were
+removed from the audited core crates, and the flag-surface check rejects new
+bypasses. `--nojit` is a typed overlay rather than a late environment mutation.
+See `docs/internal/runtime-environment-boundary-fixed-20260727.md`.
 
-### P2: finish ownership boundaries and phase the bootstrap
+### P2: finish ownership boundaries and phase the bootstrap — fixed
 
-The new `SharedVm` realms improve naming, but do not enforce access. Its
-constructor/bootstrap region still spans roughly 2,483 lines. Express startup
-as typed phases (`Allocated`, `ClassesReady`, `NativesReady`,
-`RuntimeReady`) whose transitions validate invariants and return only the
-capabilities available in that phase. That makes partial startup failures
-testable and removes order assumptions from a monolith.
+Startup now carries a private `BootstrapPhase<State>` token through
+`Allocated`, `ClassesReady`, `NativesReady`, and `RuntimeReady`. Each consuming
+transition validates the invariant owned by that boundary: classes exist and
+`java/lang/Object` is present, native registration is nonempty, and runtime
+hooks are wired. Only `BootstrapPhase<RuntimeReady>::finish` can produce the
+completed bootstrap duration. Unit tests exercise every failed boundary and
+the only valid transition chain.
 
-Break two dependency inversions:
+Both dependency inversions are closed. The classloading invoke cache is generic
+over its compiled artifact and depends only on `jit-api`; the VM supplies
+`Arc<CompiledMethod>`. The GC consumes registered external-root providers and
+has no `native-collections` dependency. Dependency-tree assertions accompany
+both boundaries. See
+`docs/internal/classloading-jit-dependency-inversion-fixed-20260727.md` and
+`docs/internal/moving-gc-root-registry-fixed-20260727.md`.
 
-- `classloading` imports the concrete `jit` crate and stores
-  `Arc<cratonvm_jit::CompiledMethod>`; move the compiled artifact descriptor
-  and parameter-slot contract into `jit-api`;
-- `gc` imports `native-collections` for overlay roots; replace this with the
-  root registry described above.
+### P2: make performance and documentation self-invalidating — fixed
 
-Enforce the intended crate layers in CI by checking `cargo metadata`, because a
-diagram that allows forbidden edges to compile will drift again.
+The checked-in `tools/architecture-probe-20260726` matrix compares deterministic
+checksums, alternates VM order, pins a CPU, and rejects incomplete runs.
+Focused gates cover interpreter equivalence, JIT method statistics, and
+interface dispatch and thin-lock monitor performance. Layout constants and
+runtime-helper offsets have executable inventory/contract tests rather than
+prose-only duplicates.
 
-### P2: make performance and documentation self-invalidating
-
-Architecture prose in this pass was already stale about quickening, JIT caps,
-call lowering, inlining, and the achievable first header shrink. Replace exact
-duplicated constants in prose with generated tables where possible. Add tests
-that assert documented defaults and a small checked-in architecture probe to
-the release qualification job.
-
-Track at least:
+The runtime diagnostics expose the originally requested dimensions:
 
 - interpreter ns/bytecode by opcode family and engine;
 - compile count, tier, fallback reason, code bytes, and compile latency;
@@ -303,18 +423,21 @@ Track at least:
 1. **Correctness gate — complete:** the 47 loader-blind calls are migrated,
    dual-loader namespace tests pass, and the deprecated API is denied in
    production.
-2. **Interpreter convergence:** one semantic handler set, generated variants,
-   package routing removed; preserve checksum and exception tests.
-3. **Root ownership:** stable native handles, provider registration, exact JIT
-   maps, poisoned-old-region compaction stress.
-4. **JIT convergence:** shared runtime lowering and fallback telemetry; add
-   allocation, throw, type-check, and invokedynamic support by observed rank.
-5. **Layout:** packed primitive fields, 24-byte header, then evaluate compressed
-   references with heap-size and barrier data.
-6. **Modularity/config:** facade-based native context, compatibility packs,
-   immutable typed config, phased bootstrap, enforced dependency rules.
-7. **Continuous evidence:** run the checked-in probes on one pinned host and
-   alert on checksum mismatch or statistically meaningful median regressions.
+2. **Interpreter convergence — complete:** one semantic handler set, generated
+   variants, package routing removed; checksum and exception tests preserved.
+3. **Root ownership — complete:** paired provider registration, exact JIT
+   maps/native pins, moving-GC relocation stress.
+4. **JIT convergence — complete for the tracked residuals:** shared hashed
+   dispatch and allocation lowering, escaping C2 allocation, direct live
+   monitor helpers, and exact lock elision.
+5. **Layout — complete for this audit:** packed primitive/reference fields and
+   a documented 32-byte compatibility header; further header compression is a
+   separate experiment.
+6. **Modularity/bootstrap — complete for the tracked residuals:** facade-based
+   native context, physically separate crypto/security packs, and typed
+   bootstrap phases.
+7. **Continuous evidence — complete:** checked-in pinned-host checksum and
+   performance gates, plus executable layout/lowering invariants.
 
 ## Reproduction
 
@@ -329,16 +452,24 @@ Build a uniquely named VM and run the paired matrix:
 
 ```bash
 cargo build --release -p cratonvm-cli \
-  --target-dir /data/data/target-architecture-audit-20260726
+  --target-dir /data/data/target-architecture-final-convergence-20260727
 install -m 755 \
-  /data/data/target-architecture-audit-20260726/release/cratonvm \
-  /data/data/bin/cratonvm-architecture-audit-20260726
+  /data/data/target-architecture-final-convergence-20260727/release/cratonvm \
+  /data/data/bin/cratonvm-architecture-final-convergence-20260727-r1
 
+INTERP_ITERS=100000 DISPATCH_ITERS=100000 ALLOC_ITERS=20000 \
+EXCEPTION_ITERS=20000 MONITOR_ITERS=20000 NATIVE_ITERS=20000 \
 tools/architecture-probe-20260726/run-architecture-probe-20260726.sh \
-  -Exe /data/data/bin/cratonvm-architecture-audit-20260726 \
+  -Exe /data/data/bin/cratonvm-architecture-final-convergence-20260727-r1 \
   --java /home/victor/jdk25/bin/java \
   --java-home /home/victor/jdk25 \
-  --cpu 13 --reps 3
+  --cpu 13 --reps 1 \
+  --out tools/architecture-probe-20260726/results-final-convergence-20260727.tsv
+
+tools/architecture-probe-20260726/check-monitor-jit-path-20260727.sh \
+  -Exe /data/data/bin/cratonvm-architecture-final-convergence-20260727-r1 \
+  --java-home /home/victor/jdk25 \
+  --iterations 500000 --cpu 13
 ```
 
 Raw results from this run are checked in beside the runner. Checksums for every

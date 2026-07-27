@@ -1814,8 +1814,14 @@ unsafe fn try_resume_trapped_callee(
     })
 }
 
+/// Inline capacity shared with `safe_native_call_impl`. It covers receiver
+/// plus the full x64 register envelope and keeps ordinary JIT-to-native
+/// dispatch free of temporary heap allocations.
+pub(crate) const INLINE_JIT_NATIVE_ARGS: usize = 8;
+type JitDecodedArgs = smallvec::SmallVec<[Value; INLINE_JIT_NATIVE_ARGS]>;
+
 /// Decode a JIT dispatch helper's raw `i64` argument slice into the
-/// `Vec<Value>` the interpreter expects.  Centralised so that the slow
+/// `Value` slice the interpreter expects. Centralised so that the slow
 /// path in `jit_invoke_dispatch` and the three `try_call_compiled_entry`
 /// overflow bailouts (DISPATCH_CACHE hit, JIT-cache hit, post-compile)
 /// all reconstruct args the same way — round-5 CRIT-1 fix.
@@ -1834,8 +1840,8 @@ unsafe fn decode_dispatch_values(
     vm: &SharedVm,
     info: &JitInvokeInfo,
     args_slice: &[i64],
-) -> Vec<Value> {
-    let mut values = Vec::with_capacity(args_slice.len());
+) -> JitDecodedArgs {
+    let mut values = JitDecodedArgs::with_capacity(args_slice.len());
     let mut desc_iter = DescriptorParamIter::new(info.descriptor);
 
     if info.invoke_kind != 3 {
@@ -2724,6 +2730,77 @@ fn jit_init_primitive_fields(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
 // component_class_id_raw is the ClassId of the array's component type. length is non-negative.
 // Returns a raw heap pointer to a newly allocated reference array.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
+/// JIT monitorenter helper. The common path is the mark-word thin-lock CAS in
+/// `MonitorTable::enter_or_contend`; only actual contention enters the
+/// GC-blocked parking protocol. Returning the possibly remapped receiver gives
+/// generated code an unambiguous non-sentinel success value.
+pub unsafe extern "C" fn jit_monitor_enter(vm_ptr: i64, obj_ptr: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if obj_ptr == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    jit_safepoint_flush_satb(vm_ptr);
+    let vm = &*(vm_ptr as *const SharedVm);
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return i64::MIN;
+    };
+    let obj = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
+    crate::vm::vm_exec::monitor_enter_blocking(vm, thread, obj).as_ptr() as i64
+}
+
+#[cold]
+fn stash_jit_monitor_error(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    err: crate::error::MethodCallFailed,
+) {
+    use crate::error::{MethodCallFailed, VmError};
+    match err {
+        MethodCallFailed::ExceptionThrown(exc) => set_jit_pending_exception(exc),
+        MethodCallFailed::InternalError(VmError::Runtime(runtime)) => {
+            if let MethodCallFailed::ExceptionThrown(exc) =
+                crate::runtime::exceptions::throw_runtime_error(vm, thread, runtime)
+            {
+                set_jit_pending_exception(exc);
+            }
+        }
+        MethodCallFailed::InternalError(other) => {
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm,
+                thread,
+                "java/lang/InternalError",
+                Some(&format!("JIT monitor operation failed: {other}")),
+            ) {
+                set_jit_pending_exception(exc);
+            }
+        }
+    }
+}
+
+/// JIT monitorexit helper. A successful thin unlock is one release CAS. An
+/// ownership failure becomes the ordinary catchable
+/// `IllegalMonitorStateException` and is reported with the common JIT sentinel.
+pub unsafe extern "C" fn jit_monitor_exit(vm_ptr: i64, obj_ptr: i64) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if obj_ptr == 0 {
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    let vm = &*(vm_ptr as *const SharedVm);
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return i64::MIN;
+    };
+    let obj = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
+    match vm.threads.monitors.exit(obj, thread.thread_id) {
+        Ok(()) => 1,
+        Err(err) => {
+            stash_jit_monitor_error(vm, thread, err);
+            i64::MIN
+        }
+    }
+}
+
 pub unsafe extern "C" fn jit_anewarray_object(
     vm_ptr: i64,
     component_class_id_raw: i64,
@@ -5895,8 +5972,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             if values.is_empty() {
                 return 0;
             }
-            let receiver_ref = match &values[0] {
-                Value::Object(Some(obj)) => *obj,
+            let receiver_ref = match values[0] {
+                Value::Object(Some(obj)) => obj,
                 // JVM semantics: invokevirtual/invokeinterface on a null
                 // receiver throws NullPointerException. Signal it like the
                 // array helpers — set the pending-NPE flag and return the
@@ -7483,8 +7560,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // (one heap alloc + a descriptor parse) on every call — including pure
     // cache hits — was a measured contributor to JIT'd call-heavy code
     // running slower than the interpreter.
-    let decode_values = || -> Vec<Value> {
-        let mut values = Vec::with_capacity(args_slice.len());
+    let decode_values = || -> JitDecodedArgs {
+        let mut values = JitDecodedArgs::with_capacity(args_slice.len());
         values.push(Value::Object(Some(receiver_ref)));
         let mut desc_iter = DescriptorParamIter::new(info.descriptor);
         for &raw in &args_slice[1..] {
@@ -7660,7 +7737,6 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             Err(error) => return handle_jit_dispatch_error(vm, thread, error, info),
         }
         let values = decode_values();
-        let rest: Vec<Value> = values[1..].to_vec();
         match crate::runtime::interpreter::try_lambda_dispatch(
             vm,
             thread,
@@ -7668,7 +7744,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             receiver_class_id,
             info.method_name,
             info.descriptor,
-            &rest,
+            &values[1..],
         ) {
             Ok(Some(result)) => {
                 return match result {
@@ -8497,6 +8573,15 @@ pub unsafe extern "C" fn jit_uncommon_trap(vm_ptr: i64, reason: i64, bci: i64) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_dispatch_scratch_stays_inline_through_register_envelope() {
+        let mut args = JitDecodedArgs::with_capacity(INLINE_JIT_NATIVE_ARGS);
+        args.resize(INLINE_JIT_NATIVE_ARGS, Value::Int(0));
+        assert!(!args.spilled(), "eight native arguments must stay inline");
+        args.push(Value::Int(0));
+        assert!(args.spilled(), "larger descriptors may use heap fallback");
+    }
 
     #[test]
     fn virtual_dispatch_target_uses_cp_class_for_cid0_non_object_method() {
@@ -9910,6 +9995,10 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     cratonvm_jit::set_integer_value_of_direct_fn(jit_integer_value_of_direct as *const () as usize);
     cratonvm_jit::set_integer_int_value_direct_fn(
         jit_integer_int_value_direct as *const () as usize,
+    );
+    cratonvm_jit::set_monitor_direct_fns(
+        jit_monitor_enter as *const () as usize,
+        jit_monitor_exit as *const () as usize,
     );
     cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
     cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
