@@ -18,13 +18,14 @@ Measured end-to-end on the post-[24](../../internal/fixed-suite-bugs/tomcat/24-s
 from the class's own printout:
 
 ```
-.MessageBytes conversion took :3820342393100ns      (CratonVM, one 100M loop)
+.MessageBytes conversion took :3820342393100ns      (CratonVM, 1st 100M loop)
+MessageBytes conversion took :3092470156300ns       (CratonVM, 2nd 100M loop)
 MessageBytes conversion took :6573830400ns          (HotSpot, same loop)
 ```
 
-**3820 s vs 6.6 s for the same 100M iterations — ~580x.** Six such loops put
-phase 1 alone at ~6.4 hours, so the class cannot finish inside any suite
-timeout. Before the bug-24 fix this was masked: the run died with a spurious
+**3100-3800 s vs 6.6 s for the same 100M iterations — ~470-580x**, stable
+across loops rather than a warm-up artefact. Six such loops put phase 1 alone
+at ~5-6 hours, so the class cannot finish inside any suite timeout. Before the bug-24 fix this was masked: the run died with a spurious
 OOM at ~150-600 s and never reached a timeout.
 
 That same run is also the end-to-end confirmation for bug 24 — it cleared
@@ -138,12 +139,20 @@ above and are worth their own investigation:
   is empty (2338 vs 162 ns), even though the C2 artifact compiles cleanly and
   does not deopt (`CRATONVM_DBG_DEOPT=1` shows compile-time map emission
   only); and
-* a C2/OSR loop that mixes an allocation with another helper-call op can enter
-  an **endless OSR recompile loop** — the `allocPutOld` probe logged
-  **200 `OSR-compile` events for 200 000 iterations**, alternating between two
-  code buffers, i.e. one full C2 compile per 1 000 iterations, with the loop
-  running interpreted in between. `allocBare` (same loop without the second
-  op) compiles once and reuses.
+* ~~a C2/OSR loop that mixes an allocation with another helper-call op can
+  enter an **endless OSR recompile loop**~~ — **FIXED** (`fix(jit): stop the
+  OSR recompile loop on a permanently un-enterable entry pc`). The
+  `allocPutOld` probe logged **200 `OSR-compile` events for 200 000
+  iterations**; the new `OSR-recompile reason=` trace attributed 199 of them to
+  `cached-cannot-enter-at-pc`. The back-edge path treated "published artifact
+  that cannot be entered at this pc" as *still compiling* and re-requested a
+  compile forever, instead of consuming the bounded per-pc rejection budget
+  that already exists for it. Enterability is a pure function of the bytecode
+  and the entry pc — the codegen writes `-1` for a pc strictly inside a
+  LICM-hoisted loop body, whose pre-header an OSR entry would skip — so the
+  retries were guaranteed to reproduce it. Now 200 -> **1** compile, with
+  legitimate OSR (compile-then-reuse) unaffected. The loop still runs
+  interpreted; this removed the wasted compiles, not the interpretation.
 
 ## What a fix would involve
 
@@ -152,9 +161,8 @@ silent-corruption bug, and the corruption they prevent is invisible (wrong
 results, not crashes). Plausible directions, roughly in order of
 value/risk:
 
-1. **Make the OSR recompile loop stop** (the `allocPutOld` lead). Whatever
-   causes the artifact to be discarded every ~1000 iterations is pure waste;
-   fixing it does not require relaxing any safety property.
+1. ~~**Make the OSR recompile loop stop**~~ — **done**, see the struck lead
+   above. It was pure waste elimination and needed no safety property relaxed.
 2. **Link `invokedynamic` in compiled code** instead of lowering it to an
    unconditional trap. That removes RBC.7's premise rather than its check.
 3. **Narrow RBC.6** — but see
