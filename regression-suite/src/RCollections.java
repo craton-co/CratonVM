@@ -133,6 +133,41 @@ public class RCollections {
         remove.removeAll(new TinySet("a", "z"));
         check(remove.equals(new HashSet<>(Arrays.asList("b"))), "removeAll(foreign)");
 
+        // ---- Foreign OPEN-ADDRESSED Set argument: null holes in the probed
+        // slots (WildFly/MSC IdentityHashSet). HoleySet's field layout is
+        // exactly the (Object[] table, int size) shape CratonVM's
+        // collection-layout heuristic reads as "dense arr[0..size) prefix", but
+        // its live elements sit at hash positions with nulls in between. The
+        // heuristic therefore returns the right element COUNT made of mostly
+        // nulls, which looks plausible and only fails when a caller
+        // dereferences one: HashSet.addAll(mscIdentityHashSet) produced
+        // {null} from a 3-element set, so WildFly's ContainerStateMonitor
+        // iterated a null ServiceController and every boot with a failed
+        // service died on a NullPointerException instead of logging a report.
+        Set<String> holey = new HoleySet("a", "b", "c");
+        check(holey.size() == 3, "HoleySet size");
+        Set<String> copied = new HashSet<>();
+        copied.addAll(holey);
+        check(!copied.contains(null), "addAll(open-addressed foreign) has no null holes");
+        check(copied.equals(new HashSet<>(Arrays.asList("a", "b", "c"))), "addAll(open-addressed foreign)");
+        check(new HashSet<>(holey).equals(copied), "HashSet(open-addressed foreign) ctor");
+        Object[] holeyArr = holey.toArray();
+        check(holeyArr.length == 3, "open-addressed foreign toArray length");
+        for (Object o : holeyArr) { check(o != null, "open-addressed foreign toArray non-null"); }
+        check(copied.containsAll(holey), "containsAll(open-addressed foreign)");
+        Set<String> retainHoley = new HashSet<>(Arrays.asList("a", "z"));
+        retainHoley.retainAll(holey);
+        check(retainHoley.equals(new HashSet<>(Arrays.asList("a"))), "retainAll(open-addressed foreign)");
+        Set<String> removeHoley = new HashSet<>(Arrays.asList("a", "z"));
+        removeHoley.removeAll(holey);
+        check(removeHoley.equals(new HashSet<>(Arrays.asList("z"))), "removeAll(open-addressed foreign)");
+        // A List may legitimately hold nulls at any index, so the guard above
+        // must not "repair" one.
+        List<String> withNulls = new ArrayList<>(Arrays.asList("a", null, "b"));
+        check(new ArrayList<>(withNulls).equals(withNulls), "List with null elements preserved");
+        check(withNulls.toArray().length == 3 && withNulls.toArray()[1] == null,
+                "List toArray keeps null element");
+
         System.out.println("PASS RCollections (" + checks + " checks)");
     }
 
@@ -149,6 +184,35 @@ public class RCollections {
         public boolean contains(Object o) { return element1.equals(o) || element2.equals(o); }
         public Iterator<String> iterator() {
             return Arrays.asList(element1, element2).iterator();
+        }
+    }
+
+    /**
+     * A minimal open-addressed Set: {@code (Object[] table, int size)} — the
+     * exact field shape CratonVM's collection-layout heuristic treats as a
+     * dense {@code table[0..size)} prefix — but with the live elements scattered
+     * across hash positions and NULL holes in between. Deliberately shaped like
+     * {@code org.jboss.msc.service.IdentityHashSet} (and Kafka's
+     * {@code ImplicitLinkedHashCollection}) so a heuristic snapshot of it is
+     * wrong in the silent way: right count, mostly nulls.
+     */
+    static final class HoleySet extends AbstractSet<String> {
+        private final Object[] table;
+        private final int size;
+        HoleySet(String... elements) {
+            this.table = new Object[16];
+            for (String e : elements) {
+                int i = (e.hashCode() & 0x7fffffff) % table.length;
+                while (table[i] != null) { i = (i + 1) % table.length; }
+                table[i] = e;
+            }
+            this.size = elements.length;
+        }
+        public int size() { return size; }
+        public Iterator<String> iterator() {
+            List<String> live = new ArrayList<>(size);
+            for (Object o : table) { if (o != null) { live.add((String) o); } }
+            return live.iterator();
         }
     }
 }

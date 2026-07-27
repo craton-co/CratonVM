@@ -53,37 +53,79 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 // inner-JAR bytes are extracted on demand.
 // ---------------------------------------------------------------------------
 
-/// Cache of outer JAR file path -> raw bytes (kept alive for the process
-/// lifetime).  Spring Boot fat JARs are at most ~150 MB; caching one is
-/// cheap relative to the disk re-reads it saves.
-fn outer_jar_bytes_cache() -> &'static Mutex<HashMap<String, Arc<Vec<u8>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+/// Identity stamp for an on-disk archive: (last-modified, length).
+///
+/// **Why every jar/war byte cache in the VM is keyed on this and not on the
+/// path alone.** The caches below are keyed by absolute path and were
+/// originally never invalidated, on the assumption that a classpath jar is
+/// immutable for the VM's lifetime. That assumption is false for an
+/// application *server*: Tomcat's auto-deployer replaces
+/// `<appBase>/<app>.war` in place and redeploys, and its own test suite does
+/// exactly that — `HostConfigAutomaticDeploymentBaseTest.createWar()` writes a
+/// DIFFERENT war to the SAME `<appBase>/myapp.war` for each `@Test` method in
+/// the class. Every method after the first therefore saw the FIRST method's
+/// archive: `TestHostConfigAutomaticDeploymentUnpackWAR.testUnpackWARTTF`
+/// read `unpackWAR="false"` out of a war whose `META-INF/context.xml` says
+/// `"true"`, so the webapp was never expanded and the test failed — while
+/// passing in isolation, and passing on HotSpot, which has no such cache.
+///
+/// A `metadata()` call per lookup is orders of magnitude cheaper than the
+/// multi-MB re-read + zip re-parse these caches exist to avoid, so correctness
+/// here costs effectively nothing.
+pub(crate) fn archive_stamp(path: &str) -> (u64, u64) {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            (mtime, m.len())
+        }
+        // Unreadable: stamp (0,0). A later successful stat produces a
+        // different stamp, so the entry is refreshed rather than pinned.
+        Err(_) => (0, 0),
+    }
+}
+
+/// Cache of outer JAR (path, [`archive_stamp`]) -> raw bytes (kept alive for
+/// the process lifetime). Spring Boot fat JARs are at most ~150 MB; caching
+/// one is cheap relative to the disk re-reads it saves.
+fn outer_jar_bytes_cache() -> &'static Mutex<HashMap<(String, u64, u64), Arc<Vec<u8>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u64, u64), Arc<Vec<u8>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Cache of nested JAR entry (outer_jar + "!" + inner_entry) -> raw bytes.
-fn nested_jar_bytes_cache() -> &'static Mutex<HashMap<String, Arc<Vec<u8>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+/// Cache of nested JAR entry (outer_jar + "!" + inner_entry, outer's
+/// [`archive_stamp`]) -> raw bytes.
+fn nested_jar_bytes_cache() -> &'static Mutex<HashMap<(String, u64, u64), Arc<Vec<u8>>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u64, u64), Arc<Vec<u8>>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn cached_outer_jar(path: &str) -> std::io::Result<Arc<Vec<u8>>> {
+    let (mtime, len) = archive_stamp(path);
+    let key = (path.to_string(), mtime, len);
     {
         let cache = outer_jar_bytes_cache().lock();
-        if let Some(b) = cache.get(path) {
+        if let Some(b) = cache.get(&key) {
             return Ok(b.clone());
         }
     }
     let bytes = std::fs::read(path)?;
     let arc = Arc::new(bytes);
-    outer_jar_bytes_cache()
-        .lock()
-        .insert(path.to_string(), arc.clone());
+    let mut cache = outer_jar_bytes_cache().lock();
+    // Drop any stale generation of the same path so a long-lived server that
+    // redeploys repeatedly does not accumulate every past version's bytes.
+    cache.retain(|(p, _, _), _| p != path);
+    cache.insert(key, arc.clone());
     Ok(arc)
 }
 
 fn cached_nested_jar(outer: &str, inner_entry: &str) -> std::io::Result<Arc<Vec<u8>>> {
-    let key = format!("{outer}!{inner_entry}");
+    let (mtime, len) = archive_stamp(outer);
+    let key = (format!("{outer}!{inner_entry}"), mtime, len);
     {
         let cache = nested_jar_bytes_cache().lock();
         if let Some(b) = cache.get(&key) {
@@ -102,7 +144,10 @@ fn cached_nested_jar(outer: &str, inner_entry: &str) -> std::io::Result<Arc<Vec<
         .read_to_end(&mut buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     let arc = Arc::new(buf);
-    nested_jar_bytes_cache().lock().insert(key, arc.clone());
+    let mut cache = nested_jar_bytes_cache().lock();
+    let key_name = key.0.clone();
+    cache.retain(|(k, _, _), _| *k != key_name);
+    cache.insert(key, arc.clone());
     Ok(arc)
 }
 
@@ -861,6 +906,24 @@ fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed 
     .into()
 }
 
+/// Classify a UDP `recv` failure the way the JDK does: an expired `SO_TIMEOUT`
+/// (`WSAETIMEDOUT` on Windows, `EAGAIN`/`EWOULDBLOCK` on Unix) is
+/// `java.net.SocketTimeoutException`, everything else a plain IOException.
+/// Polling receivers distinguish the two — see `native-io::net::udp_recv_error`
+/// for the Tribes membership case a bare IOException broke.
+fn udp_recv_ex(e: std::io::Error) -> cratonvm_types::error::MethodCallFailed {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        return RuntimeError::SocketTimeoutException {
+            message: "Receive timed out".into(),
+        }
+        .into();
+    }
+    ioex(format!("UDP recv: {e}"))
+}
+
 /// Throw the concrete `java.net.UnknownHostException` (a subclass of
 /// IOException). Code that catches `UnknownHostException` specifically (e.g.
 /// Tomcat `NetMask`) misses a bare IOException, so host-resolution failures
@@ -1118,6 +1181,12 @@ fn file_url_path(url: &str) -> Option<String> {
     };
     Some(path)
 }
+
+/// Carrier class `URL.openConnection()` hands out for `jrt:` URLs -- the same
+/// class the real JDK's jrt protocol handler returns, so callers that test
+/// `instanceof HttpURLConnection` (Spring's `AbstractFileResolvingResource`)
+/// correctly see a plain `URLConnection`.
+const JRT_URL_CONNECTION: &str = "sun/net/www/protocol/jrt/JavaRuntimeURLConnection";
 
 fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) -> i64 {
     if let Some(path) = file_url_path(url) {
@@ -1923,6 +1992,15 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
         }),
         None => h,
     }
+}
+
+/// True when `p` looks like a Windows absolute path with a drive letter
+/// (`C:/…` or `C:\…`), i.e. a `file:` URL path whose leading `/` has already
+/// been trimmed. Used to decide whether a leading slash is the POSIX root
+/// (keep it) or the `file:`-URL artefact before a drive letter (drop it).
+pub(crate) fn is_windows_drive_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'/' || b[2] == b'\\')
 }
 
 /// Percent-decode a URI component the way `java.net.URI` getters do: each
@@ -5855,16 +5933,38 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // the trimmed form first, then the raw form — mirrors the
             // existence-check fallback already used by `jar_url_entry_size`
             // and `JarURLConnection.getJarFile` below for the same ambiguity.
+            //
+            // The existence probe must run on the PERCENT-DECODED jar path.
+            // Probing the raw URL form made every percent-escaped path fail the
+            // check — a directory literally named `dir with spaces` appears in
+            // the URL as `dir%20with%20spaces`, which never `exists()` — so the
+            // code fell through to `raw_rest` and handed Windows the
+            // drive-letter path with its `file:` leading slash still attached
+            // (`/C:/…`), i.e. `os error 123` ("The filename, directory name, or
+            // volume label syntax is incorrect"). That is the residual half of
+            // the `%20` decoding fix: decoding was added below at
+            // `outer_jar_raw`, but the slash-trimming decision above still
+            // looked at the encoded string. (`TestDeployTask.bug58086a`.)
             let raw_rest = rest;
             let trimmed_rest = rest.trim_start_matches('/');
-            let rest =
-                if std::path::Path::new(trimmed_rest.split("!/").next().unwrap_or(trimmed_rest))
-                    .exists()
-                {
-                    trimmed_rest
-                } else {
-                    raw_rest
-                };
+            let exists_decoded = |p: &str| {
+                let jar_part = p.split("!/").next().unwrap_or(p);
+                std::path::Path::new(uri_percent_decode(jar_part).as_str()).exists()
+            };
+            let rest = if exists_decoded(trimmed_rest) {
+                trimmed_rest
+            } else if exists_decoded(raw_rest) {
+                raw_rest
+            } else if is_windows_drive_path(trimmed_rest) {
+                // Neither probe found the file (it may legitimately not exist
+                // yet, or live inside a WAR). A `X:/…` path is unusable on
+                // Windows with the leading slash still on it, so prefer the
+                // trimmed form and let the real open surface a proper
+                // FileNotFound rather than a syntax error.
+                trimmed_rest
+            } else {
+                raw_rest
+            };
             let (outer_jar_raw, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
                 None => {
@@ -6326,6 +6426,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 )?;
                 return Ok(Some(Value::Object(Some(conn))));
             }
+            // `jrt:` (JEP 220 runtime image) URLs get their own carrier, exactly
+            // as the real JDK does (`sun.net.www.protocol.jrt.JavaRuntimeURLConnection`).
+            // Handing these the generic HttpURLConnection carrier made
+            // `con instanceof HttpURLConnection` true for a runtime-image
+            // resource, so Spring's `AbstractFileResolvingResource.isReadable`
+            // took its HTTP branch and fired a HEAD request at a jrt URL --
+            // `ClassPathResource("java/beans/Introspector.class").isReadable()`
+            // was false even though `openStream()` served the right 23755
+            // bytes (core.io.ModuleResourceTests.existingClassFileResource).
+            if ext.starts_with("jrt:") {
+                let conn = alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16);
+                ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
+                ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
+                ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+                return Ok(Some(Value::Object(Some(conn))));
+            }
             // For `jar:` URLs, retain the JarURLConnection carrier so callers
             // that cast it continue to work. All other schemes need the
             // concrete HttpURLConnection carrier, including `file:`. The
@@ -6599,6 +6715,68 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // to the real-JDK setter, which probes the (uninitialised) connected
     // field and throws IllegalStateException. Make them no-ops on both
     // URLConnection and HttpURLConnection (registered separately).
+    // The `jrt:` carrier handed out by `URL.openConnection` above. Its
+    // methods are the same URLConnection bodies registered just below, but
+    // native lookup is by EXACT class, so the base-class registrations never
+    // reach a subclass carrier -- they have to be repeated here (the same
+    // reason `setUseCaches` is registered on both URLConnection and
+    // HttpURLConnection).
+    r.register(JRT_URL_CONNECTION, "connect", "()V", |_ctx, _args| Ok(None));
+    r.register(JRT_URL_CONNECTION, "setUseCaches", "(Z)V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.register(
+        JRT_URL_CONNECTION,
+        "setDefaultUseCaches",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        JRT_URL_CONNECTION,
+        "getContentLength",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            let len = synthetic_resource_url_content_len(ctx, &url);
+            let v = if len < 0 || len > i32::MAX as i64 {
+                -1
+            } else {
+                len as i32
+            };
+            Ok(Some(Value::Int(v)))
+        },
+    );
+    r.register(
+        JRT_URL_CONNECTION,
+        "getContentLengthLong",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            Ok(Some(Value::Long(synthetic_resource_url_content_len(
+                ctx, &url,
+            ))))
+        },
+    );
+    r.register(JRT_URL_CONNECTION, "getLastModified", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let url = huc_url_string(ctx, this);
+        Ok(Some(Value::Long(synthetic_resource_url_last_modified(&url))))
+    });
+    r.register(
+        JRT_URL_CONNECTION,
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url_obj = match ctx.get_field(this, HUC_URL) {
+                Value::Object(Some(o)) => o,
+                _ => return Err(ioex("JavaRuntimeURLConnection.getInputStream: no URL")),
+            };
+            ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[])
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "setUseCaches",
@@ -10527,7 +10705,7 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => o,
                 _ => data_arr,
             };
-            let (n, origin) = recv_result.map_err(|e| ioex(format!("UDP recv: {e}")))?;
+            let (n, origin) = recv_result.map_err(udp_recv_ex)?;
             copy_bytes_into_java_array(ctx, data_arr, 0, &buf[..n])?;
             ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
             if let Some((oh, op)) = origin.rsplit_once(':') {

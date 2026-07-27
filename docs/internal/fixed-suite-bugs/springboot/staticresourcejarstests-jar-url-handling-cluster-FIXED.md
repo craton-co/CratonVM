@@ -92,3 +92,29 @@ caused by this change:
   at an earlier `dev` commit (`cf3a44e2a`); this is a **new regression** on
   current `dev` unrelated to `File(URI)`/`JarURLConnection` (no jar/URI
   resource on the classpath under test), flagged separately for follow-up.
+
+## Regression — confirmed still failing 2026-07-23 (craton-rerun-20260723), identical 3 failures
+
+Re-broken on `dev` as of the 2026-07-23 rerun. `StaticResourceJarsTests`:
+`SBRUNNER_RESULT tests=7 failed=3 skipped=1`, and all 3 failures are **the
+exact same** shape as originally documented above, verified against the
+fresh log (not assumed):
+
+- `closesJarFromNonCachedConnection()`: `AssertionError: Expecting code to
+  raise a throwable.`
+- `includeJarWithStaticResourcesWithUrlEncodedSpaces()`: `AssertionError:
+  Expected size: 1 but was: 0 in: []`
+- `includeJarWithStaticResourcesWithPlusInItsPath()`: `AssertionError:
+  Expected size: 1 but was: 0 in: []`
+
+Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard4/logs/module_spring-boot-web-server.org.springframework.boot.web.server.servlet.StaticResourceJarsTests.out.log`.
+Not re-investigated further this session (out of the assigned scope) — but
+given the symptom is byte-for-byte identical to the original (not a new
+failure mode), this looks like either a direct revert/regression of the
+`net_phase_e.rs`/`phases_late.rs` `File(URI)` percent-decoding and
+`JarURLConnection` caching fixes described above, or a dev-tip rebuild that
+picked up a binary predating this fix. Worth checking `git log` on
+`native-builtins/src/net_phase_e.rs`/`phases_late.rs` for the relevant
+`uri_percent_decode`/`HUC_JAR_FILE` logic before assuming a fresh
+regression.

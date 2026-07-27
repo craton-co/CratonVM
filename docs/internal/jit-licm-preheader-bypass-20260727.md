@@ -146,10 +146,11 @@ but the build host was at load average 40-100 from concurrent sessions and the
 run-to-run spread within a single binary (1355-3212 ms) swamped any difference —
 no usable signal, and none is claimed.
 
-**Known remaining limitation (pre-existing, not widened):** exception-handler
-edges are invisible to the JIT here (`compile_with_param_slots` is not handed
-the exception table), so a handler landing inside a hoisted loop body without
-passing the header would still bypass its pre-header.
+**~~Known remaining limitation~~ — CLOSED 2026-07-27 (follow-up, see below):**
+exception-handler edges were invisible to the JIT here
+(`compile_with_param_slots` was not handed the exception table), so a handler
+landing inside a hoisted loop body without passing the header would still
+bypass its pre-header.
 
 ## Verification
 
@@ -221,3 +222,158 @@ Suites: `regression-suite/run.sh` 13/13; `cargo test --release -p cratonvm-jit`
   with a second entry edge is skipped outright, and `licm` additionally bails
   when the classified pre-header is `NO_NODE` or lies inside the body. Sound by
   construction; no change needed.
+
+---
+
+## Follow-up 2026-07-27: the exception-handler edge is closed (pre-emptively)
+
+The limitation noted above is now handled. `find_bypassable_loop_headers` takes
+the method's exception table as `(start_pc, end_pc, handler_pc)` triples, staged
+by `try_compile` through a one-shot thread-local (`set_pending_exception_ranges`,
+the same idiom as `set_pending_verified_max_stack`) and taken at backend entry so
+a bailed compile cannot leak it into the next method on that worker.
+
+**The predicate is the branch-edge rule with the throwing site standing in for
+the branch source** — an entry into the loop body whose source is outside the
+loop:
+
+    handler_pc ∈ [header, loop_end)  AND  (start_pc < header OR end_pc > loop_end)
+
+The second clause matters. A protected range lying *wholly inside* the loop is
+sound and keeps its hoist: the throw can only have happened after the header was
+entered, so the pre-header had already run. That is exactly what javac emits for
+`while (…) { try { … } catch { … } }`, the overwhelmingly common try-in-a-loop —
+a blunter "any handler inside the loop" rule would have dropped LICM for all of
+those for no correctness gain. Only a range reaching before the header (or past
+the loop) can deliver control into the body from code the pre-header never
+covered.
+
+### Honest status: this is hardening, not an observed bug fix
+
+**No runtime witness exists today, and cannot.** Methods with a non-empty
+exception table are not admitted to this backend at all, so
+`find_bypassable_loop_headers` never sees a handler in the first place.
+Measured with `CRATONVM_DBG_DUMP_JIT=LIST` on dev at `d134f7104`:
+
+| probe | exception table | compiled? |
+|---|---|---|
+| `LicmEntryProbe.shapeA/shapeB` | none | **yes** — both listed |
+| `TryCatchHot.f` (try/catch in a hot loop, 200 000 calls) | yes | **no** |
+| `HandlerLoopProbe.shape` (the witness below, 400 000 calls) | yes | **no** |
+
+So the change is provably inert on the current tree: with an empty table the new
+loop body never executes and codegen is byte-identical. It is landed because the
+admission gate has already been relaxed once (RBC.6 admitted explicit `athrow`),
+`precise_exception_frames` exists to relax it further, and the day handler-
+bearing methods reach the backend this hazard is live and silent — a wrong loop
+bound or, worse, a speculative-BCE guard elided but never run.
+
+### Dormant witness, ready for that day
+
+`docs/known-issues/repros/jit-licm-handler-edge/GenHandlerLoop.java`
+emits `HandlerLoopProbe.class` via ASM — a shape javac cannot express: the
+handler PC sits inside the loop body while its protected range lies entirely
+before the loop header, and the normal path **falls through** into the header so
+there is no `goto` edge for the existing rule to catch. That isolates the
+exception edge as the only external entry:
+
+```
+ 0: iconst_1; 1: iload_2; 2: idiv; 3: pop     <-- protected [0,7), implicit throw
+ 4: bipush 25; 6: istore_3                        (explicit athrow is not admitted)
+ 7: iload_3; 8: iload_1; 9: iconst_5; 10: imul   <-- header 7; n*5 is the hoist
+11: if_icmpge 31
+14: goto 24
+17: pop; 18: bipush 25; 20: istore_3; 21: goto 7  <-- handler 17, INSIDE [7,31)
+24: iload_3; 25: iconst_2; 26: imul; 27: istore_3
+28: goto 7                                        <-- back edge
+31: iload_3; 32: ireturn
+```
+
+`HandlerLoopDriver.java` alternates the two entries 200 000 times; both set
+`max = 25`, so both must return 50. Real HotSpot: `badNormal=0 badHandler=0`.
+CratonVM today: also clean — because `shape` is never compiled. When the
+exception-table gate is relaxed, run this driver first; it is the direct witness
+for this edge.
+
+Unit test: `handler_reachable_from_outside_a_hoisted_loop_is_bypassable` in
+`jit/src/x64.rs` covers all four cases on hand-written bytecode — no handler,
+range wholly inside (must KEEP the hoist), range starting before the header, and
+handler outside the loop.
+
+## Re-confirmed on the Hibernate ORM harness (2026-07-27, later the same day)
+
+The same signature was re-reported from
+`/data/data/apps/hibernate-orm-harness/`, aborting
+`org.hibernate.orm.test.hql.{ASTParserLoadingTest, BulkManipulationTest,
+ScrollableCollectionFetchingTest, TreatKeywordTest}` "right after JAXB
+ContextFactory initialization during SessionFactory bootstrap". It was the same
+bug: the binaries that produced it were built from a `dev` snapshot that
+predates this fix.
+
+| | |
+|---|---|
+| that A/B worktree branched from `dev` at | `c042e794f`, 07:57 UTC |
+| this fix merged into `dev` at | `c11305865`, 11:29 UTC |
+| the aborting runs executed | 17:48-18:47 UTC, on the 07:57 binaries |
+
+`git merge-base --is-ancestor 613b10f4c c042e794f` is false, so *neither arm* of
+that A/B had the fix — which is also why the abort reproduced with the JIT ban
+list in its default state and with `org/antlr/v4/runtime/` unbanned. The ban was
+never the variable.
+
+### `component 6` is a ClassId, not a `newarray` atype — read it correctly
+
+The report read `anewarray component 6 length 1677721600` as *T_FLOAT*, i.e. a
+6.7 GB `float[]`, and looked for a corrupted length word. That is a misreading
+the message format invites, and it sends the investigation to the wrong place:
+
+* the field is `component_class_id_raw` — a raw `ClassId` — see
+  `vm/src/jit/helpers.rs::jit_anewarray_object`;
+* that helper is reference-arrays-only: it hardcodes
+  `ArrayElementType::Reference`. Primitive arrays go through `jit_newarray`,
+  a different helper with a different message;
+* `ClassId 6` here is `java/lang/String`. `AttrsCorruptProbe`'s only
+  `anewarray` is `String[]` and it emits this exact text;
+* the length is already narrowed and sign-extended (`length as i32 as i64`)
+  precisely to defend against stale-upper-half slot reads, and `1677721600`
+  is a positive `i32` anyway.
+
+So it is `new String[1677721600]`, and the constant is not corruption but
+arithmetic: **`25 * 2^26`**, the `while (max < n * 5) max *= 2;` growth loop
+doubling from its initial 25 against the un-written hoist slot.
+
+### Why JAXB is where it surfaces
+
+JAXB 4's `SAXOutput` does not use the JDK's `org.xml.sax.helpers.AttributesImpl`
+— it uses its own `org.glassfish.jaxb.runtime.util.AttributesImpl`
+(jaxb-runtime-4.0.9). `javap -p -c` on the two shows `ensureCapacity` is a
+verbatim fork: same `goto 44` into the loop header at 44, same `iload_2;
+iconst_2; imul` doubling at 51-55, same `anewarray java/lang/String` at 59. Both
+copies hit this defect identically, and `find_bypassable_loop_headers` covers
+both because the predicate is bytecode-shape-based.
+
+Note this matters for coverage: at the 07:57 base the `org/glassfish/jaxb/` ban
+was still in `skip_list.rs` (4 occurrences), so the JAXB copy was not
+JIT-eligible then and those aborts came from the JDK copy. Current `dev` has
+that ban lifted *and* this fix, so the JAXB copy is JIT-eligible for the first
+time — hence the re-verification below rather than an assertion from ancestry.
+
+### Verification, binary built from `dev` @ `c1ea5ac6d`
+
+Strictly serial, one VM at a time, host load average 14-26.
+
+| probe / class | runs | OOM |
+|---|---:|---:|
+| `AttrsCorruptProbe 20000 60` (11/20 pre-fix) | 25 | **0** |
+| `AttributesImplGrowthProbe 20000` (6/20 pre-fix) | 15 | **0** |
+| `org.hibernate.orm.test.hql.ASTParserLoadingTest` | 4 | **0** |
+| `org.hibernate.orm.test.hql.BulkManipulationTest` | 3 | **0** |
+
+`BulkManipulationTest` was 50 ok / 0 failed / 1 skipped on all 3.
+`ASTParserLoadingTest` was 106/106 on 3 of 4; the 4th reported `failed=1`, but
+that run's `@@FAIL` line was not captured, so the failing test is **not
+identified here** — it is not an OOM, and the same class produced a
+`TimeoutException: testJpaTypeOperator ... timed out after 120 seconds` on both
+arms of the earlier A/B (the harness sets
+`junit.jupiter.execution.timeout.default=120s`), which is the likely but
+unconfirmed candidate.

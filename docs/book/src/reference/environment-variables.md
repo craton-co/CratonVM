@@ -149,6 +149,4 @@ from a parent shell.
 
 The 342 tokens in `CRATONVM_DBG` are **internal developer switches** (tracing,
 GC stress, JIT bisection, and the like). They are not a supported configuration
-surface and may change or disappear without notice. They are enumerated, with
-call sites and a debug / semantics-changing / test-only / dead classification,
-in `docs/internal/flag-census.md`.
+surface and may change or disappear without notice.
