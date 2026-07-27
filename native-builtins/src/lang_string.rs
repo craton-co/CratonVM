@@ -699,7 +699,7 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     );
     registry.register(class, "capacity", "()I", native_sb_capacity);
     registry.register(class, "ensureCapacity", "(I)V", native_sb_ensure_cap);
-    registry.register(class, "trimToSize", "()V", native_noop_with_this);
+    registry.register(class, "trimToSize", "()V", native_sb_trim_to_size);
     // Java 21: StringBuilder.repeat(CharSequence, int) / repeat(int codePoint, int count)
     registry.register(
         class,
@@ -3352,6 +3352,63 @@ pub(crate) fn native_sb_ensure_cap(
         let needed = min_cap.saturating_sub(count as usize);
         let _ = sb_ensure_capacity(ctx, this, needed);
     }
+    Ok(None)
+}
+
+/// `trimToSize()` — shrink the backing `char[]` to exactly `count`.
+///
+/// This was `native_noop_with_this` on the assumption that capacity is not
+/// observable. It IS observable on this VM: `native_sb_capacity` (registered
+/// on the same class, three lines above `trimToSize`) answers
+/// `array_length(value)`, so after a no-op trim `capacity()` still reported
+/// the pre-trim buffer size — a directly visible divergence from
+/// `AbstractStringBuilder.trimToSize`, which reallocates `value` to exactly
+/// `count`. The buffer is also the only thing holding the surplus memory
+/// alive, so the no-op defeated the method's entire purpose.
+///
+/// Mirrors `sb_ensure_capacity`'s discipline for the reverse direction:
+/// allocating the replacement array can move `this`, so root it in a
+/// `NativeHandleScope`, re-read the receiver, and bulk-copy the live prefix
+/// out of the OLD buffer read back through the (post-GC) receiver.
+///
+/// A receiver on the real JDK 9+ 3-slot layout (`value: byte[]`) is left
+/// untouched: `sb_state` only recognises a `char[]` payload and yields `None`,
+/// and the compact byte[] representation is not managed by these natives.
+pub(crate) fn native_sb_trim_to_size(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType;
+
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let (buf, count) = sb_state(ctx, this);
+    let Some(buf) = buf else {
+        return Ok(None);
+    };
+    let old_cap = ctx.array_length(buf);
+    let count = (count.max(0) as usize).min(old_cap);
+    if count == old_cap {
+        // Already exact — `trimToSize` is defined to be a no-op in that case,
+        // and skipping the copy keeps the common path allocation-free.
+        return Ok(None);
+    }
+
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let new_buf = scope.new_array(ArrayElementType::Char, count);
+    let this = scope.get(&this_handle);
+
+    if let Value::Object(Some(old_buf)) = scope.get_field(this, 0) {
+        if scope.object_is_array(old_buf)
+            && scope.heap_element_type_of(old_buf) == ArrayElementType::Char
+        {
+            let _ = scope.bulk_array_copy(old_buf, 0, new_buf, 0, count);
+        }
+    }
+    scope.set_field(this, 0, Value::Object(Some(new_buf)));
     Ok(None)
 }
 

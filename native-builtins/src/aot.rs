@@ -1508,8 +1508,13 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- Leyden <init> ---
-    // Leyden helper class — synthetic object with no backing state; the
-    // constructor is an intentional no-op. NEW-6: documented.
+    // Pure static-holder: `jdk/internal/misc/Leyden` is a CratonVM-side helper
+    // class and EVERY other native registered on it above (isAOTEnabled,
+    // isTrainingMode, isProductionMode, getAOTCache*Path, notify*, lookup*,
+    // store/loadAOTProfile) is static and reads only process-wide AOT state —
+    // none of them touches an instance slot. There is therefore no instance
+    // state for a no-arg constructor to establish, so an empty body IS the
+    // implementation rather than a stub. KEEP. NEW-6: documented.
     r.register(LEYDEN, "<init>", "()V", native_noop_with_this);
     r.set_category(__prev_cat);
 }

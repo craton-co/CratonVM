@@ -584,36 +584,21 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    r.register(
-        "java/util/zip/DeflaterOutputStream",
-        "write",
-        "(I)V",
-        native_noop_with_this,
-    );
-    r.register(
-        "java/util/zip/DeflaterOutputStream",
-        "write",
-        "([BII)V",
-        native_noop_with_this,
-    );
-    r.register(
-        "java/util/zip/DeflaterOutputStream",
-        "finish",
-        "()V",
-        native_noop_with_this,
-    );
-    r.register(
-        "java/util/zip/DeflaterOutputStream",
-        "flush",
-        "()V",
-        native_noop_with_this,
-    );
-    r.register(
-        "java/util/zip/DeflaterOutputStream",
-        "close",
-        "()V",
-        native_noop_with_this,
-    );
+    // `DeflaterOutputStream` is the concrete superclass of `ZipOutputStream`
+    // and `GZIPOutputStream`, so anything those two do NOT declare themselves
+    // resolves here via the superclass walk. These five were no-ops, which
+    // silently discarded the payload — the exact failure the `ZipOutputStream`
+    // `write` overrides above were bolted on to dodge, and one that still bit
+    // `ZipOutputStream.flush()` (never declared there) and every user
+    // subclass. This module only runs under `--synthetic-jdk`, where there is
+    // no `java.util.zip` bytecode to fall back to, so the behaviour has to
+    // live here.
+    let dos = "java/util/zip/DeflaterOutputStream";
+    r.register(dos, "write", "(I)V", dos_write_int);
+    r.register(dos, "write", "([BII)V", dos_write_bytes);
+    r.register(dos, "finish", "()V", dos_finish);
+    r.register(dos, "flush", "()V", dos_flush);
+    r.register(dos, "close", "()V", dos_close);
     r.set_category(__prev_cat);
 }
 
@@ -914,6 +899,188 @@ pub(crate) fn zo_write_zip(
     // Reset count to prevent double-write
     ctx.set_field(this, 4, Value::Int(0));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DeflaterOutputStream (synthetic-JDK bridge)
+//
+// Real layout inherits `out` from `FilterOutputStream`; the synthetic
+// `ZipOutputStream` layout in this file keeps its sink in slot 0 instead. The
+// uncompressed payload lives Rust-side rather than in a heap field because
+// `DeflaterOutputStream` has no `<init>` bridge of its own — the receivers that
+// reach these natives are always subclasses whose slot layout belongs to the
+// subclass.
+// ---------------------------------------------------------------------------
+
+/// Per-stream deflate state, keyed by identity hash.
+pub(crate) struct DosState {
+    /// Bytes written but not yet deflated.
+    pending: Vec<u8>,
+    /// `finish()` already emitted this stream's deflate trailer.
+    finished: bool,
+}
+
+pub(crate) static DOS_STREAM_STATE: std::sync::OnceLock<StdMutex<ZoHashMap<u64, DosState>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn dos_state() -> &'static StdMutex<ZoHashMap<u64, DosState>> {
+    DOS_STREAM_STATE.get_or_init(|| StdMutex::new(ZoHashMap::new()))
+}
+
+/// Resolve the stream this `DeflaterOutputStream` wraps.
+fn dos_underlying(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "out") {
+        return Some(o);
+    }
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// Identity-hash keying, for the same reason `zo_buf_key` uses it: the payload
+/// accumulates across many `write()` calls whose intervening Java allocations
+/// can relocate `this` under a moving young GC.
+fn dos_append(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
+    let key = zo_buf_key(ctx, this);
+    let mut states = dos_state().lock().unwrap_or_else(|e| e.into_inner());
+    states
+        .entry(key)
+        .or_insert_with(|| DosState {
+            pending: Vec::new(),
+            finished: false,
+        })
+        .pending
+        .extend_from_slice(bytes);
+}
+
+pub(crate) fn dos_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
+    dos_append(ctx, this, &[b]);
+    Ok(None)
+}
+
+pub(crate) fn dos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let src = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    // Validate the signed off/len against the array BEFORE widening — a
+    // negative len would sign-extend into a huge usize, and
+    // `OutputStream.write([BII)` contractually throws here (same guard as
+    // `ZipOutputStream.write([BII)V`).
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let arr_len = ctx.array_length(src) as i64;
+    if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: if off < 0 { off } else { off.wrapping_add(len) },
+        }
+        .into());
+    }
+    let mut bytes = vec![0u8; len as usize];
+    let copied = ctx.read_byte_array_into(src, off as usize, &mut bytes);
+    bytes.truncate(copied);
+    dos_append(ctx, this, &bytes);
+    Ok(None)
+}
+
+/// Deflate everything buffered so far and hand it to the underlying stream.
+///
+/// `new DeflaterOutputStream(out)` uses a default `Deflater`, i.e. the ZLIB
+/// wrapper (2-byte header + Adler-32 trailer) rather than a raw deflate block,
+/// so the emitted bytes must carry it or `InflaterInputStream` cannot read them
+/// back. Emitting twice would corrupt the stream, hence the `finished` latch.
+pub(crate) fn dos_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = zo_buf_key(ctx, this);
+    let pending = {
+        let mut states = dos_state().lock().unwrap_or_else(|e| e.into_inner());
+        let st = states.entry(key).or_insert_with(|| DosState {
+            pending: Vec::new(),
+            finished: false,
+        });
+        if st.finished {
+            return Ok(None);
+        }
+        st.finished = true;
+        std::mem::take(&mut st.pending)
+    };
+
+    let compressed = {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
+        if let Err(e) = encoder.write_all(&pending) {
+            return Err(RuntimeError::IOException {
+                message: format!("DeflaterOutputStream: deflate failed: {e}"),
+            }
+            .into());
+        }
+        match encoder.finish() {
+            Ok(buf) => buf,
+            Err(e) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("DeflaterOutputStream: deflate failed: {e}"),
+                }
+                .into())
+            }
+        }
+    };
+
+    let underlying = match dos_underlying(ctx, this) {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+    // Pin across `new_array` — a moving young GC there would relocate the sink
+    // (native stale-local family).
+    let u_pin = ctx.pin_native_root(underlying);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, compressed.len());
+    ctx.write_byte_array_from(arr, 0, &compressed);
+    let underlying = ctx.read_native_pin(u_pin, underlying);
+    let _ = ctx.invoke_virtual(
+        underlying,
+        "write",
+        "([BII)V",
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(compressed.len() as i32),
+        ],
+    );
+    ctx.unpin_native_roots(u_pin);
+    Ok(None)
+}
+
+/// `flush()` deflates pending input only for a `syncFlush` stream; the
+/// public constructors leave that false, so the spec-correct behaviour is to
+/// flush the sink and leave the deflater buffer alone.
+pub(crate) fn dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Some(underlying) = dos_underlying(ctx, this) {
+        let _ = ctx.invoke_virtual(underlying, "flush", "()V", &[]);
+    }
+    Ok(None)
+}
+
+pub(crate) fn dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let this_pin = ctx.pin_native_root(this);
+    let _ = dos_finish(ctx, args)?;
+    let this = ctx.read_native_pin(this_pin, this);
+    let key = zo_buf_key(ctx, this);
+    dos_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+    if let Some(underlying) = dos_underlying(ctx, this) {
+        let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
+    }
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
 }
 
 pub(crate) fn p58_crc32(data: &[u8]) -> u32 {

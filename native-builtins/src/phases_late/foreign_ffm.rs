@@ -406,10 +406,461 @@ pub(crate) fn p67_layout_with_order(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+// -- jdk.internal.foreign.MemorySessionImpl — the session model --------------
+//
+// Every session native is force-dispatched over real bytecode
+// (`interpreter::force_native_over_real_jdk_bytecode`), so this model is the
+// ONLY lifetime bookkeeping FFM has in either mode. Slots, as written by
+// [`p67_memory_session`]:
+//
+//   0 = state: `Int(1)` open, `Int(0)` closed
+//   1 = acquire count (`Int`): clients currently inside `whileAlive`/`acquire0`
+//   2 = owning `Thread` of a confined session, null for shared/global/implicit
+//   3 = close actions: `Object[]` of `Runnable`/`ResourceCleanup`, or null
+// The synthetic `java.lang.foreign.Arena` (an instance of the INTERFACE class —
+// in real-JDK mode `Arena.ofConfined()` never reaches `jdk.internal.foreign
+// .ArenaImpl`, because this file's factories are what run). Slot 1 carries the
+// arena's own session, so `scope()` has a stable identity to hand out and
+// `close()` has something to close.
+const P67_ARENA_OPEN: usize = 0;
+const P67_ARENA_SESSION: usize = 1;
+const P67_ARENA_SLOTS: usize = 2;
+
+/// Slot 2 of a synthetic `MemorySegment` is its owning `Arena` — the convention
+/// `panama.rs` already established for its 6-field segments ("no arena" at
+/// field 2). Reading it is how `MemorySegment.scope()` returns the SAME session
+/// object as the arena that allocated the segment.
+const P67_SEGMENT_ARENA: usize = 2;
+
+const P67_SESSION_STATE: usize = 0;
+const P67_SESSION_ACQUIRES: usize = 1;
+const P67_SESSION_OWNER: usize = 2;
+const P67_SESSION_ACTIONS: usize = 3;
+const P67_SESSION_SLOTS: usize = 4;
+
 pub(crate) fn p67_memory_session(ctx: &mut dyn NativeContext) -> Value {
-    let obj = alloc_concurrent_synthetic(ctx, "jdk/internal/foreign/MemorySessionImpl", 1);
-    ctx.set_field(obj, 0, Value::Int(1));
+    let obj = alloc_concurrent_synthetic(
+        ctx,
+        "jdk/internal/foreign/MemorySessionImpl",
+        P67_SESSION_SLOTS,
+    );
+    ctx.set_field(obj, P67_SESSION_STATE, Value::Int(1));
+    ctx.set_field(obj, P67_SESSION_ACQUIRES, Value::Int(0));
+    ctx.set_field(obj, P67_SESSION_OWNER, Value::Object(None));
+    ctx.set_field(obj, P67_SESSION_ACTIONS, Value::Object(None));
     Value::Object(Some(obj))
+}
+
+/// The session a segment or arena already owns, or a fresh one if it has none.
+///
+/// `scope()` has to return the SAME session object every time it is asked: a
+/// freshly minted one is always open, so `segment.scope().isAlive()` would keep
+/// answering true long after the owning arena closed, and the validity checks
+/// below would never fire on the session that was actually closed. A real-JDK
+/// receiver carries it in a named field (`AbstractMemorySegmentImpl.scope`,
+/// `ArenaImpl.session`) — and that field holds one of OUR sessions, because the
+/// `createConfined`/`createShared` factories are force-dispatched here. A
+/// synthetic receiver has no such field; there, a fresh session is all there is.
+fn p67_receiver_session(ctx: &mut dyn NativeContext, receiver: ObjectRef) -> Value {
+    // A real-JDK receiver carries it in a named field.
+    for name in ["scope", "session"] {
+        if let Value::Object(Some(session)) = ctx.get_field_by_name(receiver, name) {
+            return Value::Object(Some(session));
+        }
+    }
+    // The receiver is itself a synthetic Arena.
+    if let Some(session) = p67_arena_session(ctx, receiver) {
+        return Value::Object(Some(session));
+    }
+    // The receiver is a synthetic MemorySegment: slot 2 names the arena that
+    // allocated it, and the answer is that arena's session — this is what makes
+    // `arena.scope() == segment.scope()` hold.
+    if ctx.object_num_fields(receiver) > P67_SEGMENT_ARENA {
+        if let Value::Object(Some(arena)) = ctx.get_field(receiver, P67_SEGMENT_ARENA) {
+            if let Some(session) = p67_arena_session(ctx, arena) {
+                return Value::Object(Some(session));
+            }
+        }
+    }
+    p67_memory_session(ctx)
+}
+
+/// The session stored on a synthetic Arena, if this object is one.
+///
+/// Self-validating rather than shape-guessing: the slot must actually hold a
+/// session we modelled, so a segment (whose slot 1 is a `Long` address) and any
+/// other 2+-slot object answer `None`.
+fn p67_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(arena) <= P67_ARENA_SESSION {
+        return None;
+    }
+    match ctx.get_field(arena, P67_ARENA_SESSION) {
+        Value::Object(Some(session)) if p67_session_modelled(ctx, session) => Some(session),
+        _ => None,
+    }
+}
+
+/// Allocate a synthetic Arena together with the session that gives it a
+/// lifetime. `confined` records the calling thread as the session owner, which
+/// is what lets an off-thread access raise `WrongThreadException`; a shared or
+/// automatic arena leaves the owner null.
+fn p67_new_arena(ctx: &mut dyn NativeContext, confined: bool) -> ObjectRef {
+    let arena = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", P67_ARENA_SLOTS);
+    // The session allocation below can move the fresh arena (native stale-local
+    // family).
+    let arena_pin = ctx.pin_native_root(arena);
+    let session_value = p67_memory_session(ctx);
+    let arena = ctx.read_native_pin(arena_pin, arena);
+    ctx.unpin_native_roots(arena_pin);
+    ctx.set_field(arena, P67_ARENA_OPEN, Value::Int(1));
+    ctx.set_field(arena, P67_ARENA_SESSION, session_value);
+    if confined {
+        if let Value::Object(Some(session)) = session_value {
+            let owner = ctx.current_thread_object();
+            ctx.set_field(session, P67_SESSION_OWNER, Value::Object(Some(owner)));
+        }
+    }
+    arena
+}
+
+/// Allocate a synthetic segment owned by `arena`.
+///
+/// Three slots, not the historical two: slot 2 records the owning arena so
+/// `segment.scope()` can answer with the arena's session. The extra slot is
+/// invisible to the existing readers, which discriminate the segment layouts by
+/// field count at `>= 4` and `>= 6` (`p67_segment_parts`,
+/// `p67_segment_byte_size`, `p67_segment_address`, and `panama_libffi
+/// ::segment_address`) — a 3-field segment takes the same branches a 2-field
+/// one did.
+fn p67_arena_segment(ctx: &mut dyn NativeContext, arena: ObjectRef, size: i64) -> ObjectRef {
+    let arena_pin = ctx.pin_native_root(arena);
+    let segment = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 3);
+    let arena = ctx.read_native_pin(arena_pin, arena);
+    ctx.unpin_native_roots(arena_pin);
+    ctx.set_field(segment, 0, Value::Long(size));
+    ctx.set_field(segment, 1, Value::Long(0)); // address
+    p67_stamp_segment_arena(ctx, segment, arena);
+    segment
+}
+
+/// Stamp `arena` onto a freshly allocated synthetic segment so the segment can
+/// report the arena's session as its scope. Silently does nothing for a segment
+/// too small to carry the slot, which keeps the older 2-field callers valid.
+fn p67_stamp_segment_arena(ctx: &dyn NativeContext, segment: ObjectRef, arena: ObjectRef) {
+    if ctx.object_num_fields(segment) > P67_SEGMENT_ARENA {
+        ctx.set_field(segment, P67_SEGMENT_ARENA, Value::Object(Some(arena)));
+    }
+}
+
+/// Whether `session` is a REAL, JDK-bytecode-backed session rather than the
+/// stand-in [`p67_memory_session`] builds.
+///
+/// Two independent signals, both required:
+///
+///  * the class declares the JDK's own named `state` field (`MemorySessionImpl`
+///    has exactly `resourceList`, `owner`, `state`, `acquireCount`), and
+///  * it is not the abstract base itself — every real session is a CONCRETE
+///    subclass (`ConfinedSession`, `SharedSession`, `GlobalSession`,
+///    `ImplicitSession`), whereas our stand-in is an instance of the abstract
+///    class and has no `justClose`/`acquire0` body to run.
+fn p67_session_is_real(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(session);
+    ctx.resolve_field_index_by_class_id(class_id, "state")
+        .is_some()
+        && ctx.class_name_of_id(class_id).as_deref()
+            != Some("jdk/internal/foreign/MemorySessionImpl")
+}
+
+/// Hand a session call back to the receiver's own JDK bytecode when the
+/// receiver is a real session; `None` means "not a real session, use the model
+/// below".
+///
+/// These natives are force-dispatched over bytecode
+/// (`force_native_over_real_jdk_bytecode`), so in real-JDK mode they are the
+/// ONLY thing that runs — and the object they are handed is a real
+/// `ConfinedSession`/`SharedSession` built by `Arena.ofConfined()`'s own
+/// bytecode, whose `state`/`acquireCount`/`resourceList` are real fields with a
+/// real lifecycle. Re-implementing that lifecycle on top of a foreign layout
+/// would be guesswork; running the JDK's own body is exact. This is the same
+/// real-receiver escape `ThreadPoolExecutor.execute` uses, and
+/// `invoke_virtual_bytecode_only` is the primitive built for it: it goes
+/// straight to `interpreter::execute` and does NOT re-enter this native.
+///
+/// The neighbouring segment natives already work this way — `p67_segment_parts`
+/// reads a real segment's `min`/`length` BY NAME — which is why raw segment
+/// access works in real-JDK mode while the session lifecycle did not.
+fn p67_session_delegate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method_name: &str,
+    descriptor: &str,
+) -> Option<MethodCallResult> {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return None;
+    };
+    if !p67_session_is_real(ctx, this) {
+        return None;
+    }
+    Some(ctx.invoke_virtual_bytecode_only(this, method_name, descriptor, &args[1..]))
+}
+
+/// Raise the JDK's own `IllegalStateException` if `segment`'s scope has been
+/// closed.
+///
+/// Once the session natives actually close a session, the arena's
+/// `resourceList.cleanup()` really does free the off-heap block — so the
+/// unchecked raw load/store in [`p67_segment_get_width`]/
+/// [`p67_segment_set_width`] would turn a use-after-close from a harmless wrong
+/// answer into a use-after-FREE. Real segments carry their session in the named
+/// `scope` field (`AbstractMemorySegmentImpl.scope`); synthetic ones have no
+/// such field and are unaffected.
+fn p67_segment_check_scope(
+    ctx: &mut dyn NativeContext,
+    segment: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if let Value::Object(Some(scope)) = ctx.get_field_by_name(segment, "scope") {
+        if p67_session_is_real(ctx, scope) {
+            ctx.invoke_virtual_bytecode_only(scope, "checkValidState", "()V", &[])?;
+        }
+        return Ok(());
+    }
+    // Synthetic segment: slot 2 names the owning arena. Deliberately NOT
+    // `p67_receiver_session`, which mints a fresh (always-open) session when it
+    // finds nothing — that would make every check trivially pass.
+    if ctx.object_num_fields(segment) > P67_SEGMENT_ARENA {
+        if let Value::Object(Some(arena)) = ctx.get_field(segment, P67_SEGMENT_ARENA) {
+            if let Some(session) = p67_arena_session(ctx, arena) {
+                p67_session_check_valid(ctx, session)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `session` carries the layout [`p67_memory_session`] writes.
+///
+/// The session natives are force-dispatched, so a session that real
+/// `ConfinedSession`/`SharedSession` bytecode constructed can reach them too —
+/// and there slot 0 is a genuine reference field, not our state word. Anything
+/// we did not build is left strictly alone: it is neither interpreted (so we
+/// never throw on a shape we misread) nor overwritten (so we never corrupt a
+/// real object's fields).
+fn p67_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
+    ctx.object_num_fields(session) >= P67_SESSION_SLOTS
+        && matches!(ctx.get_field(session, P67_SESSION_STATE), Value::Int(_))
+}
+
+fn p67_session_state(ctx: &dyn NativeContext, session: ObjectRef) -> i32 {
+    match ctx.get_field(session, P67_SESSION_STATE) {
+        Value::Int(state) => state,
+        _ => 1,
+    }
+}
+
+fn p67_session_acquires(ctx: &dyn NativeContext, session: ObjectRef) -> i32 {
+    match ctx.get_field(session, P67_SESSION_ACQUIRES) {
+        Value::Int(count) => count,
+        _ => 0,
+    }
+}
+
+/// `java.lang.WrongThreadException` for a confined session touched off-owner.
+/// Built as the real class so `catch (WrongThreadException)` matches; if that
+/// class cannot be constructed we still fail (with `IllegalStateException`)
+/// rather than letting the wrong-thread access through.
+fn p67_wrong_thread(ctx: &mut dyn NativeContext) -> MethodCallFailed {
+    const MESSAGE: &str = "Attempted access outside owning thread";
+    let detail = ctx.create_string(MESSAGE);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/lang/WrongThreadException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalStateException {
+        message: MESSAGE.to_string(),
+    }
+    .into()
+}
+
+/// `MemorySessionImpl.checkValidStateRaw()`. Thread confinement is checked
+/// before liveness — the JDK's order, so a confined session touched from the
+/// wrong thread reports the thread error even once it has been closed.
+fn p67_session_check_valid(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if !p67_session_modelled(ctx, session) {
+        return Ok(());
+    }
+    let owner = match ctx.get_field(session, P67_SESSION_OWNER) {
+        Value::Object(Some(owner)) => Some(owner),
+        _ => None,
+    };
+    if let Some(owner) = owner {
+        if ctx.current_thread_object() != owner {
+            return Err(p67_wrong_thread(ctx));
+        }
+    }
+    if p67_session_state(ctx, session) == 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Already closed".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn p67_session_acquire(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    p67_session_check_valid(ctx, session)?;
+    if p67_session_modelled(ctx, session) {
+        let count = p67_session_acquires(ctx, session);
+        ctx.set_field(
+            session,
+            P67_SESSION_ACQUIRES,
+            Value::Int(count.saturating_add(1)),
+        );
+    }
+    Ok(())
+}
+
+/// The release half of `acquire0`/`whileAlive`. Deliberately total: it runs on
+/// the unwind path of a throwing callback, where raising a second exception
+/// would mask the first.
+fn p67_session_release(ctx: &mut dyn NativeContext, session: ObjectRef) {
+    if !p67_session_modelled(ctx, session) {
+        return;
+    }
+    let count = p67_session_acquires(ctx, session);
+    ctx.set_field(
+        session,
+        P67_SESSION_ACQUIRES,
+        Value::Int((count - 1).max(0)),
+    );
+}
+
+/// Append one close action to the session's `Object[]`, growing it by one.
+///
+/// Close actions are rare and few (one per allocated segment at worst), so the
+/// copy-on-append array costs less than standing up a synthetic `ArrayList`
+/// and keeps the whole list walkable by the GC as an ordinary reference array.
+fn p67_session_push_action(ctx: &mut dyn NativeContext, session: ObjectRef, action: ObjectRef) {
+    let previous = match ctx.get_field(session, P67_SESSION_ACTIONS) {
+        Value::Object(Some(actions)) => Some(actions),
+        _ => None,
+    };
+    let len = match previous {
+        Some(actions) => ctx.array_length(actions),
+        None => 0,
+    };
+    // `new_array` can trigger a moving young collection, which relocates all
+    // three of these references (native stale-local family).
+    let session_pin = ctx.pin_native_root(session);
+    let action_pin = ctx.pin_native_root(action);
+    let previous_pin = match previous {
+        Some(actions) => Some(ctx.pin_native_root(actions)),
+        None => None,
+    };
+    let grown = ctx.new_array(ArrayElementType::Reference, len + 1);
+    let session = ctx.read_native_pin(session_pin, session);
+    let action = ctx.read_native_pin(action_pin, action);
+    if let (Some(actions), Some(pin)) = (previous, previous_pin) {
+        let actions = ctx.read_native_pin(pin, actions);
+        for index in 0..len {
+            ctx.set_array_element(grown, index, ctx.get_array_element(actions, index));
+        }
+    }
+    ctx.set_array_element(grown, len, Value::Object(Some(action)));
+    ctx.set_field(session, P67_SESSION_ACTIONS, Value::Object(Some(grown)));
+    ctx.unpin_native_roots(session_pin);
+}
+
+/// Run the registered close actions newest-first — the order the JDK's
+/// `ResourceList` unwinds in. The list is detached before the first callback so
+/// a cleanup that re-enters `close()` cannot run it a second time, and the
+/// first failure is remembered and rethrown only after every remaining cleanup
+/// has had its turn (a leaked cleanup is worse than a late exception).
+fn p67_session_run_close_actions(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    if !p67_session_modelled(ctx, session) {
+        return Ok(());
+    }
+    let actions = match ctx.get_field(session, P67_SESSION_ACTIONS) {
+        Value::Object(Some(actions)) => actions,
+        _ => return Ok(()),
+    };
+    ctx.set_field(session, P67_SESSION_ACTIONS, Value::Object(None));
+    // Each `run()` re-enters the interpreter and can move the array.
+    let actions_pin = ctx.pin_native_root(actions);
+    let mut failure: Option<MethodCallFailed> = None;
+    let mut index = ctx.array_length(actions);
+    while index > 0 {
+        index -= 1;
+        let actions = ctx.read_native_pin(actions_pin, actions);
+        let Value::Object(Some(action)) = ctx.get_array_element(actions, index) else {
+            continue;
+        };
+        // `ResourceCleanup implements Runnable` in the JDK, so `run()` covers
+        // both the `addCloseAction` and the `addInternal` flavours.
+        if let Err(err) = ctx.invoke_virtual(action, "run", "()V", &[]) {
+            if failure.is_none() {
+                failure = Some(err);
+            }
+        }
+    }
+    ctx.unpin_native_roots(actions_pin);
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// `MemorySessionImpl.justClose()`: validate and flip the state word, without
+/// running the resource list — `close()` is `justClose()` plus the cleanup run.
+fn p67_session_just_close(
+    ctx: &mut dyn NativeContext,
+    session: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    p67_session_check_valid(ctx, session)?;
+    if !p67_session_modelled(ctx, session) {
+        return Ok(());
+    }
+    let acquired = p67_session_acquires(ctx, session);
+    if acquired > 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!("Session is acquired by {acquired} clients"),
+        }
+        .into());
+    }
+    ctx.set_field(session, P67_SESSION_STATE, Value::Int(0));
+    Ok(())
+}
+
+/// Shared body of `addCloseAction` / `addOrCleanupIfFail` / `addInternal` for a
+/// SYNTHETIC session: all three register one action to run at close, and all
+/// three reject a session that is already closed (registering on a dead session
+/// would leak it). Each registration handles the real-receiver case itself,
+/// because delegation has to name the exact method and descriptor it was
+/// entered through.
+fn p67_session_add_action_synthetic(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    p67_session_check_valid(ctx, this)?;
+    let Some(Value::Object(Some(action))) = args.get(1) else {
+        return Ok(None);
+    };
+    if p67_session_modelled(ctx, this) {
+        p67_session_push_action(ctx, this, *action);
+    }
+    Ok(None)
 }
 
 pub(crate) fn p67_layout_width_obj(ctx: &dyn NativeContext, layout: ObjectRef) -> i32 {
@@ -670,6 +1121,7 @@ pub(crate) fn p67_segment_get_width(
         Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
         _ => false,
     };
+    p67_segment_check_scope(ctx, seg)?;
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
         return Ok(Some(if width == 8 {
             Value::Long(0)
@@ -737,6 +1189,7 @@ pub(crate) fn p67_segment_set_width(
         Some(Value::Object(Some(layout))) => p67_layout_is_little(ctx, *layout),
         _ => false,
     };
+    p67_segment_check_scope(ctx, seg)?;
     let Some((addr, _size)) = p67_segment_parts(ctx, seg, offset, width) else {
         return Ok(None);
     };
@@ -1017,61 +1470,46 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "([JII)V",
         lucene_buffered_checksum_update_longs,
     );
-    // Arena = 1-field (open=0 Int)
+    // Arena = 2-field (open=0 Int, session=1). See `p67_new_arena`: the session
+    // is what gives the arena a lifetime, so `scope()` returns one stable object
+    // and `close()` has something to close.
     let arena = "java/lang/foreign/Arena";
     r.register(
         arena,
         "ofConfined",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 1);
-            ctx.set_field(obj, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, true))))),
     );
     r.register(
         arena,
         "ofAuto",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 1);
-            ctx.set_field(obj, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
     );
     r.register(
         arena,
         "ofShared",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 1);
-            ctx.set_field(obj, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
     );
     r.register(
         arena,
         "global",
         "()Ljava/lang/foreign/Arena;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/foreign/Arena", 1);
-            ctx.set_field(obj, 0, Value::Int(1));
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        |ctx, _args| Ok(Some(Value::Object(Some(p67_new_arena(ctx, false))))),
     );
     r.register(
         arena,
         "allocate",
         "(J)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let size = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
-            ctx.set_field(seg, 0, Value::Long(size));
-            ctx.set_field(seg, 1, Value::Long(0)); // address
-            Ok(Some(Value::Object(Some(seg))))
+            let segment = p67_arena_segment(ctx, this, size);
+            Ok(Some(Value::Object(Some(segment))))
         },
     );
     r.register(
@@ -1079,14 +1517,13 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "allocate",
         "(JJ)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let size = match args.get(1) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
-            ctx.set_field(seg, 0, Value::Long(size));
-            ctx.set_field(seg, 1, Value::Long(0));
-            Ok(Some(Value::Object(Some(seg))))
+            let segment = p67_arena_segment(ctx, this, size);
+            Ok(Some(Value::Object(Some(segment))))
         },
     );
     r.register(
@@ -1094,41 +1531,77 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "allocateFrom",
         "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
             let len = match args.get(1) {
                 Some(Value::Object(Some(s))) => {
                     ctx.read_string(*s).map(|t| t.len() as i64 + 1).unwrap_or(1)
                 }
                 _ => 1,
             };
-            let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 2);
-            ctx.set_field(seg, 0, Value::Long(len));
-            ctx.set_field(seg, 1, Value::Long(0));
-            Ok(Some(Value::Object(Some(seg))))
+            Ok(Some(Value::Object(Some(p67_arena_segment(ctx, this, len)))))
         },
     );
     r.register(arena, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Int(0));
+        // Close the arena's session FIRST: a second `close()` must surface the
+        // session's IllegalStateException rather than silently re-clearing the
+        // flag, and the cleanups have to run while the arena is still open.
+        if let Some(session) = p67_arena_session(ctx, this) {
+            p67_session_just_close(ctx, session)?;
+            p67_session_run_close_actions(ctx, session)?;
+        }
+        ctx.set_field(this, P67_ARENA_OPEN, Value::Int(0));
         Ok(None)
     });
     r.register(
         arena,
         "scope",
         "()Ljava/lang/foreign/MemorySegment$Scope;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(p67_receiver_session(ctx, this)))
+        },
     );
     let session = "jdk/internal/foreign/MemorySessionImpl";
     r.register(
         session,
         "toMemorySession",
         "(Ljava/lang/foreign/Arena;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, args| {
+            // Static: arg 0 is the Arena whose session is being unwrapped.
+            let arena = obj_arg(args, 0)?;
+            Ok(Some(p67_receiver_session(ctx, arena)))
+        },
     );
     r.register(
         session,
         "createConfined",
         "(Ljava/lang/Thread;)Ljdk/internal/foreign/MemorySessionImpl;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, args| {
+            // Record the confining thread: it is what lets `checkValidStateRaw`
+            // raise WrongThreadException for an off-owner access, as the JDK
+            // does. Every other factory here yields an unconfined session.
+            let owner = match args.first() {
+                Some(Value::Object(Some(owner))) => Some(*owner),
+                _ => None,
+            };
+            let owner_pin = match owner {
+                // The allocation below can move the Thread argument.
+                Some(owner) => Some(ctx.pin_native_root(owner)),
+                None => None,
+            };
+            let value = p67_memory_session(ctx);
+            if let (Value::Object(Some(new_session)), Some(owner), Some(pin)) =
+                (value, owner, owner_pin)
+            {
+                let owner = ctx.read_native_pin(pin, owner);
+                ctx.set_field(new_session, P67_SESSION_OWNER, Value::Object(Some(owner)));
+            }
+            if let Some(pin) = owner_pin {
+                ctx.unpin_native_roots(pin);
+            }
+            Ok(Some(value))
+        },
     );
     r.register(
         session,
@@ -1152,56 +1625,190 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         session,
         "addCloseAction",
         "(Ljava/lang/Runnable;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            if let Some(real) =
+                p67_session_delegate(ctx, args, "addCloseAction", "(Ljava/lang/Runnable;)V")
+            {
+                return real;
+            }
+            p67_session_add_action_synthetic(ctx, args)
+        },
     );
     r.register(
         session,
         "addOrCleanupIfFail",
         "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            if let Some(real) = p67_session_delegate(
+                ctx,
+                args,
+                "addOrCleanupIfFail",
+                "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
+            ) {
+                return real;
+            }
+            p67_session_add_action_synthetic(ctx, args)
+        },
     );
     r.register(
         session,
         "addInternal",
         "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            if let Some(real) = p67_session_delegate(
+                ctx,
+                args,
+                "addInternal",
+                "(Ljdk/internal/foreign/MemorySessionImpl$ResourceList$ResourceCleanup;)V",
+            ) {
+                return real;
+            }
+            p67_session_add_action_synthetic(ctx, args)
+        },
     );
-    r.register(session, "release0", "()V", native_noop_with_this);
-    r.register(session, "acquire0", "()V", native_noop_with_this);
+    r.register(session, "release0", "()V", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "release0", "()V") {
+            return real;
+        }
+        let this = obj_arg(args, 0)?;
+        p67_session_release(ctx, this);
+        Ok(None)
+    });
+    r.register(session, "acquire0", "()V", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "acquire0", "()V") {
+            return real;
+        }
+        let this = obj_arg(args, 0)?;
+        p67_session_acquire(ctx, this)?;
+        Ok(None)
+    });
     r.register(
         session,
         "whileAlive",
         "(Ljava/lang/Runnable;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            if let Some(real) =
+                p67_session_delegate(ctx, args, "whileAlive", "(Ljava/lang/Runnable;)V")
+            {
+                return real;
+            }
+            let this = obj_arg(args, 0)?;
+            let action = obj_arg(args, 1)?;
+            // The acquire count is what keeps the session alive across the
+            // callback: a nested `close()` sees a non-zero count and refuses,
+            // exactly as the JDK's `whileAlive` does. Released even when the
+            // action throws, or the session could never be closed afterwards.
+            p67_session_acquire(ctx, this)?;
+            let this_pin = ctx.pin_native_root(this);
+            let result = ctx.invoke_virtual(action, "run", "()V", &[]);
+            let this = ctx.read_native_pin(this_pin, this);
+            ctx.unpin_native_roots(this_pin);
+            p67_session_release(ctx, this);
+            result?;
+            Ok(None)
+        },
     );
     r.register(
         session,
         "ownerThread",
         "()Ljava/lang/Thread;",
-        |ctx, _args| Ok(Some(Value::Object(Some(ctx.current_thread_object())))),
+        |ctx, args| {
+            if let Some(real) =
+                p67_session_delegate(ctx, args, "ownerThread", "()Ljava/lang/Thread;")
+            {
+                return real;
+            }
+            let this = obj_arg(args, 0)?;
+            if p67_session_modelled(ctx, this) {
+                if let Value::Object(Some(owner)) = ctx.get_field(this, P67_SESSION_OWNER) {
+                    return Ok(Some(Value::Object(Some(owner))));
+                }
+            }
+            // Unconfined session: keep the historical "current thread" answer
+            // rather than the JDK's null, which callers here do not expect.
+            Ok(Some(Value::Object(Some(ctx.current_thread_object()))))
+        },
     );
     r.register(
         session,
         "isAccessibleBy",
         "(Ljava/lang/Thread;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            if let Some(real) =
+                p67_session_delegate(ctx, args, "isAccessibleBy", "(Ljava/lang/Thread;)Z")
+            {
+                return real;
+            }
+            let this = obj_arg(args, 0)?;
+            if p67_session_modelled(ctx, this) {
+                if let Value::Object(Some(owner)) = ctx.get_field(this, P67_SESSION_OWNER) {
+                    let accessible =
+                        matches!(args.get(1), Some(Value::Object(Some(t))) if *t == owner);
+                    return Ok(Some(Value::Int(i32::from(accessible))));
+                }
+            }
+            Ok(Some(Value::Int(1)))
+        },
     );
-    r.register(session, "isAlive", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    r.register(session, "isAlive", "()Z", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "isAlive", "()Z") {
+            return real;
+        }
+        let this = obj_arg(args, 0)?;
+        let alive = !p67_session_modelled(ctx, this) || p67_session_state(ctx, this) == 1;
+        Ok(Some(Value::Int(i32::from(alive))))
     });
-    r.register(session, "checkValidStateRaw", "()V", native_noop_with_this);
-    r.register(session, "checkValidState", "()V", native_noop_with_this);
+    r.register(session, "checkValidStateRaw", "()V", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "checkValidStateRaw", "()V") {
+            return real;
+        }
+        let this = obj_arg(args, 0)?;
+        p67_session_check_valid(ctx, this)?;
+        Ok(None)
+    });
+    r.register(session, "checkValidState", "()V", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "checkValidState", "()V") {
+            return real;
+        }
+        let this = obj_arg(args, 0)?;
+        p67_session_check_valid(ctx, this)?;
+        Ok(None)
+    });
     r.register(
         session,
         "checkValidState",
         "(Ljava/lang/foreign/MemorySegment;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // The segment argument only names what is being accessed; validity
+            // is a property of the session receiver.
+            let this = obj_arg(args, 0)?;
+            p67_session_check_valid(ctx, this)?;
+            Ok(None)
+        },
     );
-    r.register(session, "isCloseable", "()Z", |_ctx, _args| {
+    r.register(session, "isCloseable", "()Z", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "isCloseable", "()Z") {
+            return real;
+        }
         Ok(Some(Value::Int(1)))
     });
-    r.register(session, "close", "()V", native_noop_with_this);
-    r.register(session, "justClose", "()V", native_noop_with_this);
+    r.register(session, "close", "()V", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "close", "()V") {
+            return real;
+        }
+        let this = obj_arg(args, 0)?;
+        p67_session_just_close(ctx, this)?;
+        p67_session_run_close_actions(ctx, this)?;
+        Ok(None)
+    });
+    r.register(session, "justClose", "()V", |ctx, args| {
+        if let Some(real) = p67_session_delegate(ctx, args, "justClose", "()V") {
+            return real;
+        }
+        let this = obj_arg(args, 0)?;
+        p67_session_just_close(ctx, this)?;
+        Ok(None)
+    });
 
     // MemorySegment = 2-field (byteSize=0 Long, address=1 Long)
     let ms = "java/lang/foreign/MemorySegment";
@@ -1312,7 +1919,10 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         ms,
         "scope",
         "()Ljava/lang/foreign/MemorySegment$Scope;",
-        |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(p67_receiver_session(ctx, this)))
+        },
     );
     r.register(
         ms,
@@ -1369,7 +1979,10 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             ms_impl,
             "scope",
             "()Ljava/lang/foreign/MemorySegment$Scope;",
-            |ctx, _args| Ok(Some(p67_memory_session(ctx))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(p67_receiver_session(ctx, this)))
+            },
         );
     }
 
