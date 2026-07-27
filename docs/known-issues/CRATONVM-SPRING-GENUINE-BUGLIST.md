@@ -133,9 +133,9 @@ Verified in isolation against `cratonvm-sprfinal-v15.bin` (branch merged to
 | `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | 0/2 | Both are JUnit-parallel-execution × Spring `ApplicationEvents`. `rejectTestsInParallelWithInstancePerClassAndRecordApplicationEvents` runs a nested `EngineTestKit` engine with `CONCURRENT` mode and expects exactly one FAILED event; CratonVM produces zero, i.e. the guard Spring is supposed to trip never fires — most likely because the nested engine is not actually executing concurrently |
 | `web.reactive.result.view.FragmentViewResolutionResultHandlerTests` | 2/6 | All four failures are the `FluxSubscribeOn` variants; the two non-flux ones pass. `renderFragmentStream` alone: HotSpot passes, CratonVM times out on the 60 s `block(...)`, identically with `--nojit`. Reactor's schedulers themselves are fine (`probes/BoundedElasticProbe.java` — `parallel`/`single`/`boundedElastic` all match HotSpot), so the hang is in the SSE render path executed on the elastic worker, not in the scheduler. **Was 5/6 in the previous session's baseline and was already 2/6 in this session's pre-fix baseline — a regression from `origin/dev` drift, not from these fixes** |
 | `web.reactive.function.client.WebClientIntegrationTests` | 165/170 | Four `VerifySubscriber timed out` across the Reactor-Netty / JDK / Jetty parameterisations. Needs a re-measure on a quiet host before being treated as a VM defect — the host ran at load 25–100 throughout |
-| `test.context.aot.AotIntegrationTests` | 1/4 (2 skipped) | `endToEndTestsForBeanOverrides`: `IllegalArgumentException: Unable to adapt value of type ContextConfiguration[] to …` — the same array-class-identity family as the row below |
-| `test.context.aot.TestContextAotGeneratorIntegrationTests` | 2/4 | **Root-caused, not fixed.** Both failures end in `IllegalStateException: Attribute 'method' in annotation …RequestMapping should be compatible with …RequestMethod[] but a …RequestMethod[] value was returned` — two same-named-but-different `RequestMethod[]` array classes. Enum VALUES already resolve through the container loader; what does not is the ARRAY class, because `synthesize_array_class` caches ONE array class GLOBALLY per descriptor name (and deliberately pins `loader_id == Bootstrap`, guarded by a `debug_assert_eq!` from a Round-7 audit). Fixing it means either per-(loader, name) array-class caching or wiring up the permanently-`None` `array_info` field — read that audit's history first. Was a SIGSEGV before this session's fixes |
-| `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | not re-measured to completion this session |
+| `test.context.aot.AotIntegrationTests` | 1/4 (2 skipped) | `endToEndTestsForBeanOverrides`: `IllegalArgumentException: Unable to adapt value of type ContextConfiguration[] to …` — the same array-class-identity family as the row below, so expect both to close together |
+| `test.context.aot.TestContextAotGeneratorIntegrationTests` | 2/4 | **Root-caused; half-fixed.** Both failures end in `IllegalStateException: Attribute 'method' in annotation …RequestMapping should be compatible with …RequestMethod[] but a …RequestMethod[] value was returned` — two same-named-but-different `RequestMethod[]` array classes. Half of it is fixed (`11bc9045d`): the annotation array VALUE's COMPONENT was resolved loader-blind and now goes through the declaring loader like the scalar `Enum`/`Class` arms already did, so both components are now the same class. What remains is that the two ARRAY MIRRORS are still distinct objects, and `Class.isInstance`'s array branch (`array_is_assignable`, purely name-based, so `[LX; == [LX;` should be true) still answers false — so `mirror_class_name` is evidently not returning the array descriptor for at least one of the two mirrors even though `Class.getName()` does. **Next step: instrument `native_class_is_instance`'s array branch to print `mirror_class_name(this)` vs `array_descriptor_for(target)`; `probes/ForkArrProbe.java` is a 40-line repro that needs no Spring.** Was a SIGSEGV before this session |
+| `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | measured: no `RESULT` line at a 1500 s ceiling |
 
 Two more that were on the list are **not** CratonVM bugs and need no further work:
 
@@ -144,11 +144,34 @@ Two more that were on the list are **not** CratonVM bugs and need no further wor
 - `aot.nativex.FileNativeConfigurationWriterTests` — fixture artifact, see the
   archived history.
 
-Not re-run this session because the previous session closed them and nothing
-here touches their area: `beans.factory.aot.BeanRegistrationsAotContributionTests`
-(the separately tracked ~227×-vs-HotSpot interpreter throughput defect, which
-also SIGSEGVs under batch load) and
-`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`.
+The last two were re-measured after the table above was first written, so they
+belong in it — the count of 8 already includes them:
+
+- `beans.factory.aot.BeanRegistrationsAotContributionTests` — TIMEOUT, no
+  `RESULT` line at a 1500 s ceiling. This is the separately tracked
+  ~227×-vs-HotSpot interpreter throughput defect; it SIGSEGV'd under batch load
+  earlier the same day, so treat a crash there as a symptom of the same
+  slowness, not a second bug.
+- `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`
+  — LOADERR after 948 s: `NoClassDefFoundError:
+  org/junit/platform/commons/util/ExceptionUtils`, a core JUnit-Platform class
+  that is unconditionally on the classpath. The archived history guessed
+  memory pressure; that is now ruled out. Re-run under
+  `CRATONVM_DBG_LINKAGE_BT=1` against `cratonvm-sprfinal-v16.bin` (so it
+  carries every fix above), it reproduces, and the raise site is:
+
+  ```
+  raise_no_class_def_found            runtime/exceptions.rs:1795
+  ensure_class_initialized_shared     vm/vm_util.rs:499
+  execute_invokestatic                runtime/interpreter.rs:32060
+  ```
+
+  i.e. an ordinary `invokestatic` whose target class fails to INITIALISE —
+  not to be found. So the next question is what `ensure_class_initialized`
+  is unhappy about for a class that is plainly on the classpath (a `<clinit>`
+  that threw and was swallowed into a load failure is the obvious candidate);
+  the raise fires repeatedly through the run, so a breakpoint there catches it
+  immediately.
 
 ## Reproducing
 

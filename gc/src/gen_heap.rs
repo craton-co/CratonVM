@@ -12221,6 +12221,68 @@ mod tests {
         }
     }
 
+    /// Regression guard for the GC-overhead productivity metric (consumed by
+    /// `vm/src/runtime/interpreter.rs::note_gc_productivity`).
+    ///
+    /// The non-moving young sweep reclaims dead objects into the from-space
+    /// free list WITHOUT retreating the bump cursor, so `allocated_bytes()`
+    /// scores a fully-productive sweep as "freed 0"; eight of those in a row
+    /// latch `gc_overhead_limit_exceeded` and every subsequent allocation
+    /// throws `OutOfMemoryError` on a heap that is almost entirely garbage.
+    /// `live_bytes_estimate()` is the only metric that sees the reclaim.
+    ///
+    /// This has been regressed once already — a9c580aff fixed it, d8092acba
+    /// ("fix-tests-real-jdk-contracts") reverted the `interpreter.rs` hunk the
+    /// same day while leaving the accessor in place and caller-less, and
+    /// Tomcat's `TestMethodPerformance` OOM'd from then on. Pin the invariant
+    /// here so a third revert fails a unit test instead of a suite class.
+    #[test]
+    fn live_bytes_estimate_sees_non_moving_sweep_that_allocated_bytes_misses() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        // One live object plus a pile of garbage, all in young.
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        heap.set_field(live, 0, Value::Int(1));
+        for i in 0..16 {
+            let dead = heap.alloc_object(ClassId::new(9), 1);
+            heap.set_field(dead, 0, Value::Int(i));
+        }
+
+        let allocated_before = heap.allocated_bytes();
+        let live_before = heap.live_bytes_estimate();
+
+        // Force the non-moving path (the production default whenever any
+        // thread holds a live JIT frame), exactly as
+        // `non_moving_sweep_when_jit_active` does.
+        crate::gc_quiescence::publish_moving_young_enabled(false);
+        crate::gc_quiescence::enter();
+        let mut roots = vec![live];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+        crate::gc_quiescence::leave();
+
+        assert!(
+            result.stats.bytes_freed > 0,
+            "the sweep must actually have reclaimed the dead objects"
+        );
+
+        let freed_by_allocated = allocated_before.saturating_sub(heap.allocated_bytes());
+        let live_after = heap.live_bytes_estimate();
+        let freed_by_live = live_before.saturating_sub(live_after);
+
+        assert_eq!(
+            freed_by_allocated, 0,
+            "allocated_bytes cannot see a non-moving sweep (the bump cursor \
+             never retreats) — this is precisely why it must not be used as \
+             the GC-overhead productivity metric"
+        );
+        assert!(
+            freed_by_live > 0,
+            "live_bytes_estimate must report the reclaimed bytes \
+             (before={live_before}, after={live_after})"
+        );
+    }
+
     #[test]
     fn non_moving_old_sweep_reclaims_dead_promotions_without_relocation() {
         let heap = GenerationalHeap::with_sizes(4 * 1024, 16 * 1024);
