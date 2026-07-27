@@ -213,7 +213,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
     // Reference objects; post-GC enqueue writes both endpoints.
     let watch_addrs = watched_reference_liveness;
 
-    if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
+    if crate::runtime::env_cache::dbg_watchref() {
         eprintln!(
             "[watchref] publishing {} watched referent(s): {:x?}",
             watch_addrs.len(),
@@ -3038,7 +3038,7 @@ pub(crate) fn alloc_object_shared(
     // death-spiral (a sliver freed each cycle would otherwise let allocation
     // limp on, GC-thrashing). The catch site / drain surfaces the singleton.
     if gc_overhead_limit_exceeded(shared) {
-        maybe_dump_heap_on_oom(shared);
+        maybe_dump_heap_on_oom(shared, thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
@@ -3069,7 +3069,7 @@ pub(crate) fn alloc_object_shared(
         })
         .ok_or_else(|| {
             // T1.7.7 — write an HPROF dump on OOM if `-XX:+HeapDumpOnOutOfMemoryError`.
-            maybe_dump_heap_on_oom(shared);
+            maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
             }))
@@ -3084,7 +3084,7 @@ pub(crate) fn alloc_object_shared(
 /// The dump runs at most once per VM lifetime (gated by an atomic
 /// flag on the shared VM) so a tight allocation loop doesn't write
 /// thousands of dumps.
-fn maybe_dump_heap_on_oom(shared: &SharedVm) {
+fn maybe_dump_heap_on_oom(shared: &SharedVm, thread: &JvmThread) {
     use std::sync::atomic::Ordering;
     if !shared.config.heap_dump_on_oom {
         return;
@@ -3103,7 +3103,9 @@ fn maybe_dump_heap_on_oom(shared: &SharedVm) {
         .clone()
         .unwrap_or_else(|| format!("./java_pid{}.hprof", std::process::id()));
     let arc = shared.get_arc();
-    match crate::runtime::hprof::dump_heap(&arc, &path) {
+    // obsaudit D11: pass this thread's id so dump_heap can request a real
+    // stop-the-world pause for the walk instead of racing live mutators.
+    match crate::runtime::hprof::dump_heap(&arc, &path, thread.thread_id) {
         Ok(bytes) => tracing::error!(
             "wrote {} byte HPROF heap dump to {} on OutOfMemoryError",
             bytes,
@@ -3134,7 +3136,7 @@ fn gc_alloc_array(
     // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
     // GC-thrashing rather than spinning on slivers.
     if gc_overhead_limit_exceeded(shared) {
-        maybe_dump_heap_on_oom(shared);
+        maybe_dump_heap_on_oom(shared, thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
@@ -3157,7 +3159,7 @@ fn gc_alloc_array(
         .heap
         .try_alloc_array(class_id, element_type, length)
         .ok_or_else(|| {
-            maybe_dump_heap_on_oom(shared);
+            maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
             }))
@@ -5025,7 +5027,7 @@ pub fn execute(
     method_descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
-    if std::env::var_os("CRATONVM_EXEC_FRAME_TRACE").is_some()
+    if crate::runtime::env_cache::exec_frame_trace()
         && method_name == "aotContributedInitializerStartsManagementContext"
     {
         let (cname, loader) = {
@@ -6200,6 +6202,7 @@ pub fn execute(
                                 num_jit_args,
                                 return_type,
                                 invoke_kind,
+                                declaring_class_id: class_id.as_u32(),
                             });
                             let info_ptr: *const _ = &*info;
                             owned_jit_invoke_infos.push(info);
@@ -6262,6 +6265,7 @@ pub fn execute(
                             num_jit_args: pcount + 1, // receiver + params
                             return_type: b'V',
                             invoke_kind: 1,
+                            declaring_class_id: class_id.as_u32(),
                         });
                         let info_ptr: *const _ = &*info;
                         owned_jit_invoke_infos.push(info);
@@ -14900,7 +14904,7 @@ fn execute_instruction(
             let b = thread.frames[frame_idx].stack.pop()?;
             let a = thread.frames[frame_idx].stack.pop()?;
             let eq = refs_equal(&a, &b);
-            if std::env::var_os("CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE").is_some() {
+            if crate::runtime::env_cache::active_profiles_identity_trace() {
                 let class_name = |value: &Value| match value {
                     Value::Object(Some(mirror)) => crate::vm::class_id_from_mirror(shared, *mirror)
                         .and_then(|cid| {
@@ -16019,7 +16023,7 @@ fn execute_instruction(
             // (not tied to a construction-site guess or a GC-move-fragile
             // address watch list). See docs/known-issues/h2/
             // bug-h2-suite-residual-fail-triage.md.
-            if std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some() {
+            if crate::runtime::env_cache::dbg_field_watch() {
                 let decl_name = shared
                     .classes
                     .class_manager
@@ -18128,7 +18132,7 @@ pub(crate) fn aastore_element_assignable(
             .find_class_by_name(comp_name)
     })
     .unwrap_or_else(
-        || match shared.classes.class_manager.write().load_class(comp_name) {
+        || match shared.classes.class_manager_write().load_class(comp_name) {
             Ok(id) => id,
             Err(_) => ClassId::new(0),
         },
@@ -19251,7 +19255,9 @@ pub(crate) fn resolve_class_loader_aware(
             || name.contains("DefaultCacheAwareContextLoaderDelegate")
             || name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
             || name.contains("PathRequestTests")
-            || name.contains("ManagementWebSecurityAutoConfigurationTests"));
+            || name.contains("ManagementWebSecurityAutoConfigurationTests")
+            || name.contains("WebSocketMessaging")
+            || name.contains("Jackson2WebSocketMessageConverterConfiguration"));
     if dbg_trace {
         let cm = shared.classes.class_manager.read();
         let ref_name = cm
@@ -19351,6 +19357,34 @@ pub(crate) fn resolve_class_loader_aware(
             return Ok(id);
         }
         if isolated_url_definition {
+            if crate::runtime::env_cache::dbg_isolated_cnf() {
+                let (ref_name, ref_loader) = {
+                    let cm = shared.classes.class_manager.read();
+                    (
+                        cm.get_class(referencing_class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default(),
+                        cm.get_loader_id(referencing_class_id),
+                    )
+                };
+                let global = shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .find_class_by_name(name);
+                eprintln!(
+                    "[ISOLATED-CNF] name={name} referencing={referencing_class_id:?}/{ref_name} (loader={ref_loader:?}) global_would_be={global:?}"
+                );
+                for (i, f) in thread.frames.iter().enumerate().rev().take(14) {
+                    eprintln!(
+                        "[ISOLATED-CNF]   [{i}] {}.{}{} pc={}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.pc
+                    );
+                }
+            }
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         let fallback = shared.load_class_concurrent(name);
@@ -19435,6 +19469,9 @@ fn drive_defining_loader_load(
     }
     let key = referencing_class_id.as_u32();
     if IN_FLIGHT.with(|s| s.borrow().iter().any(|(c, n)| *c == key && n == name)) {
+        if crate::runtime::env_cache::dbg_isolated_cnf() {
+            eprintln!("[ISOLATED-CNF] drive declined: IN_FLIGHT re-entry name={name} cid={key}");
+        }
         return None;
     }
     let cache_loader = shared
@@ -19505,6 +19542,27 @@ fn drive_defining_loader_load(
             }
             return Some(id);
         }
+        if crate::runtime::env_cache::dbg_isolated_cnf() {
+            eprintln!("[ISOLATED-CNF] drive declined: mirror had no ClassId name={name}");
+        }
+        return None;
+    }
+    if crate::runtime::env_cache::dbg_isolated_cnf() {
+        let shape = match &result {
+            Ok(Some(Value::Object(None))) => "Ok(null)".to_string(),
+            Ok(None) => "Ok(void)".to_string(),
+            Ok(Some(v)) => format!("Ok(non-object {v:?})"),
+            Err(MethodCallFailed::ExceptionThrown(exc)) => {
+                let cm = shared.classes.class_manager.read();
+                let cid = Some(shared.mem.heap.class_id_of(*exc));
+                let cname = cid
+                    .and_then(|c| cm.get_class(c).map(|k| k.name.to_string()))
+                    .unwrap_or_default();
+                format!("Err(thrown {cname})")
+            }
+            Err(e) => format!("Err({e:?})"),
+        };
+        eprintln!("[ISOLATED-CNF] drive declined: loadClass -> {shape} name={name}");
     }
     None
 }
@@ -19918,7 +19976,7 @@ fn retarget_instance_field_to_receiver(
         || receiver_class_id == field.declaring_class_id
         || !should_use_loader_initiated_resolution(shared, current_class_id)
     {
-        if std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some()
+        if crate::runtime::env_cache::dbg_field_watch()
             && !field.is_static
             && receiver_class_id != ClassId::new(0)
             && receiver_class_id != field.declaring_class_id
@@ -19964,7 +20022,7 @@ fn retarget_instance_field_to_receiver(
         return None;
     }
 
-    let dbg = std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some()
+    let dbg = crate::runtime::env_cache::dbg_field_watch()
         && (resolved_decl.name.contains("Page") || resolved_decl.name.contains("RootReference"));
     let cached_field_index = field.field_index;
     let cached_decl_name = resolved_decl.name.to_string();
@@ -29602,6 +29660,23 @@ fn redefine_immune_forced_native(
         || redefine_immune_jfr_native(class_name, method_name, method_descriptor)
         || is_bc_crypto_math_native_override(class_name, method_name, method_descriptor)
         || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
+        // java.util.logging.FileHandler's registered natives store their
+        // filename/closed bookkeeping in an identity-hash side table
+        // (jul_file_handler_state_table, native-builtins/src/
+        // logging_shims.rs) rather than real instance field slots. Real
+        // FileHandler bytecode (loaded from java.base) is concrete, so
+        // without this entry the default rule ran its REAL <init>()V /
+        // <init>(String)V -- which try to actually open/lock a real log
+        // file via NIO and throw NoSuchFileException -- instead of the
+        // registered native. Keep in sync with vm_exec.rs's
+        // invoke_on_class_shared_inner check_override entry for the same
+        // triples; see
+        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+        || (class_name == "java/util/logging/FileHandler"
+            && matches!(
+                method_name,
+                "<init>" | "publish" | "flush" | "close"
+            ))
 }
 
 pub(crate) fn should_force_registered_native_over_bytecode(
@@ -33670,6 +33745,7 @@ fn compile_osr_artifact(
                         num_jit_args,
                         return_type,
                         invoke_kind,
+                        declaring_class_id: class_id.as_u32(),
                     });
                     let info_ptr: *const _ = &*info;
                     owned_jit_invoke_infos2.push(info);
@@ -33768,6 +33844,7 @@ fn compile_osr_artifact(
                     num_jit_args: param_count,
                     return_type,
                     invoke_kind: 3,
+                    declaring_class_id: class_id.as_u32(),
                 });
                 let info_ptr: *const _ = &*info;
                 owned_jit_invoke_infos2.push(info);
@@ -33810,6 +33887,7 @@ fn compile_osr_artifact(
                     num_jit_args: pcount + 1, // receiver + params
                     return_type: b'V',
                     invoke_kind: 1,
+                    declaring_class_id: class_id.as_u32(),
                 });
                 let info_ptr: *const _ = &*info;
                 owned_jit_invoke_infos2.push(info);
@@ -37907,7 +37985,7 @@ fn execute_jit_call(
     let args_slice = &jit_args[..np];
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
 
-    if std::env::var_os("CRATONVM_DBG_ASSERTEQ").is_some()
+    if crate::runtime::env_cache::dbg_asserteq()
         && cached.class_name.as_ref() == "junit/framework/Assert"
         && cached.method_name.as_ref() == "assertEquals"
     {
@@ -39767,7 +39845,19 @@ fn execute_invokevirtual_cached(
     // Keep Spring's loader-split Adapt identity bridge in the slow dispatcher.
     // The cache can predate the receiver loader's enum copy and otherwise
     // bypasses that narrowly scoped reconciliation entirely.
-    if crate::runtime::env_cache::loader_aware_resolution() {
+    //
+    // PERF (H2 TestFileSystem.testConcurrent, 2026-07-26): `loader_aware_
+    // resolution()` is default-ON, so this ran a full `resolve_method_ref`
+    // — resolution-cache `RwLock` read, hash probe, four `Arc` clone/drop
+    // pairs — on EVERY invokevirtual/-interface/-special in the VM, purely to
+    // compare the owner against one hard-coded Spring class name. `adapt_isin_
+    // seen()` is a relaxed atomic load that stays `false` until
+    // `resolve_method_metadata` has actually resolved a CP entry naming that
+    // method, which is a strict prerequisite for this site to matter: the
+    // check's only effect is to return `CacheMiss`, and an unresolved call
+    // site has no inline-cache entry to bypass in the first place, so it
+    // returns `CacheMiss` from the lookup below anyway.
+    if crate::runtime::env_cache::loader_aware_resolution() && adapt_isin_seen() {
         if let Ok((owner, method, descriptor, _)) =
             resolve_method_ref(shared, caller_class_id, cp_index)
         {
@@ -39830,7 +39920,7 @@ fn execute_invokevirtual_cached(
         }
         None => {
             dbg_invoke_stats_record(1);
-            if std::env::var_os("CRATONVM_DBG_GSE").is_some() {
+            if crate::runtime::env_cache::dbg_gse() {
                 if let Ok((_, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
                     if mn.as_ref() == "getSyntaxError" {
                         let cm = shared.classes.class_manager.read();
@@ -39844,7 +39934,7 @@ fn execute_invokevirtual_cached(
             return Ok(CachedCallResult::CacheMiss);
         }
     };
-    if std::env::var_os("CRATONVM_DBG_GSE").is_some() {
+    if crate::runtime::env_cache::dbg_gse() {
         if let Ok((_, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
             if mn.as_ref() == "getSyntaxError" {
                 let cm = shared.classes.class_manager.read();
@@ -39923,7 +40013,18 @@ fn execute_invokevirtual_cached(
         // #1's correct, uncached dispatch), it was never evicted --
         // call #2 onward silently ran the native (real, empty-buffer)
         // implementation instead of Mockito's woven advice.
-        if matches!(&target, CachedInvokeTarget::Native { .. }) {
+        //
+        // PERF (H2 TestFileSystem.testConcurrent, 2026-07-26): every one of the
+        // four conditions below is `false` unless `native_shadow_suppressed_by_
+        // redefine` is `true`, and that helper's own first line is
+        // `if !any_class_redefined() { return false }` — a relaxed atomic load.
+        // Hoisting it above the `resolve_method_ref` skips a resolution-cache
+        // `RwLock` read, a hash probe and four `Arc` clone/drop pairs on every
+        // cached NATIVE invoke in a process where nothing has ever been
+        // redefined, which is every run without an inline mock maker.
+        if matches!(&target, CachedInvokeTarget::Native { .. })
+            && crate::classloading::any_class_redefined()
+        {
             if let Ok((mcn, mn, desc, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
                 // Mirror `receiver_redefined` (populate_virtual_invoke_cache /
                 // execute_invokevirtual_vtable_fast): a plain
@@ -40511,16 +40612,35 @@ fn execute_invokevirtual_cached(
                     // cached callback; otherwise an earlier stub result can
                     // keep the same receiver ClassId pinned to its fallback
                     // `toString()` forever.
-                    if let Ok((_owner, method_name, descriptor, _)) =
-                        resolve_method_ref(shared, caller_class_id, cp_index)
+                    //
+                    // PERF (H2 TestFileSystem.testConcurrent, 2026-07-26):
+                    // this used to run `resolve_method_ref` — a resolution-
+                    // cache `RwLock` read, a hash probe and four `Arc` clone/
+                    // drop pairs — on EVERY cached virtual-native call, before
+                    // discovering (as it almost always does) that the receiver
+                    // is not a real-protected stub class at all. The predicate
+                    // it feeds, `synthetic_stub_should_yield_to_real_bytecode`,
+                    // is `kind_of(...) == SyntheticStub && real_protected_stub_class(class)`,
+                    // and the class term depends only on the RECEIVER name —
+                    // which needs neither the method ref nor the 128-bit
+                    // native-registry triple hash. Test that term first, so the
+                    // expensive half runs only for the handful of classes
+                    // (`ReentrantLock`, `EnumSet`, `Instant`, …) that can
+                    // actually yield. Same predicate, same order of the two
+                    // surviving terms inside the helper — just hoisted out of
+                    // the resolve.
+                    let receiver_name = shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(actual_class_id)
+                        .map(|class| class.name.clone());
+                    if let Some(receiver_name) =
+                        receiver_name.filter(|n| real_protected_stub_class(n))
                     {
-                        let receiver_name = shared
-                            .classes
-                            .class_manager
-                            .read()
-                            .get_class(actual_class_id)
-                            .map(|class| class.name.clone());
-                        if let Some(receiver_name) = receiver_name {
+                        if let Ok((_owner, method_name, descriptor, _)) =
+                            resolve_method_ref(shared, caller_class_id, cp_index)
+                        {
                             if synthetic_stub_should_yield_to_real_bytecode(
                                 shared,
                                 &receiver_name,
@@ -41812,6 +41932,24 @@ fn populate_virtual_invoke_cache(
         .put(caller_class_id, cp_index, false, target);
 }
 
+/// Spring's `MergedAnnotation$Adapt.isIn` loader-split bridge (see the guard
+/// at the top of `execute_invokevirtual_cached`) applies only to call sites
+/// whose constant pool actually names that method. This latches the first
+/// time [`resolve_method_metadata`] resolves such an entry, so the guard costs
+/// one relaxed atomic load per invoke instead of a full method-ref resolution
+/// in every process that has never loaded Spring.
+static ADAPT_ISIN_SEEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The class whose `isIn` call sites [`ADAPT_ISIN_SEEN`] arms for.
+const SPRING_MERGED_ANNOTATION_ADAPT: &str =
+    "org/springframework/core/annotation/MergedAnnotation$Adapt";
+
+#[inline]
+fn adapt_isin_seen() -> bool {
+    ADAPT_ISIN_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Resolve the metadata for a constant-pool method reference.
 ///
 /// Besides the symbolic names and parameter count, this stores the exact
@@ -41882,6 +42020,13 @@ fn resolve_method_metadata(
     let method_name: Arc<str> = Arc::from(method_name_str);
     let method_descriptor: Arc<str> = Arc::from(method_descriptor_str);
     let num_params = count_method_params(&method_descriptor);
+
+    // Arm the `execute_invokevirtual_cached` fast-path guard the first time a
+    // constant pool names Spring's loader-split `Adapt.isIn` bridge. Cold
+    // path: this runs once per (class, cp_index), not per call.
+    if &*class_name == SPRING_MERGED_ANNOTATION_ADAPT && &*method_name == "isIn" {
+        ADAPT_ISIN_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // Module access check (JPMS §5.4.4): verify accessor can reach the target class's module.
     if let Some(target_id) = cm.get_loaded_class_id(&class_name) {

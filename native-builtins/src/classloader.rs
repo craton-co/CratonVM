@@ -6009,6 +6009,17 @@ pub(crate) fn ucl_try_define_local_class(
     loader: ObjectRef,
     internal_name: &str,
 ) -> Option<MethodCallResult> {
+    if std::env::var("CRATONVM_DBG_UCLTRACE").is_ok() {
+        let loader_cid = ctx.class_id_of_object(loader);
+        let loader_class = ctx.class_name_of_id(loader_cid).unwrap_or_default();
+        let paths = loader_constructor_url_paths(ctx, loader);
+        eprintln!(
+            "[UCLTRACE] name={internal_name} loader_ptr={:?} loader_class={loader_class} n_paths={} paths={:?}",
+            loader.as_ptr(),
+            paths.len(),
+            paths,
+        );
+    }
     if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
         return Some(Ok(Some(Value::Object(Some(mirror)))));
     }
@@ -6045,6 +6056,26 @@ pub(crate) fn ucl_try_define_local_class(
         if timeout.timed_out() {
             break;
         }
+    }
+    // Double-checked probe under the define lock. The pre-lock
+    // `find_loaded_class_for_loader` above can miss and this thread still lose
+    // the race: another thread may define `(loader, internal_name)` and CLEAR
+    // `in_progress` in the window between that probe and our acquiring the
+    // mutex, so the `while *in_progress` wait loop (which does re-probe) never
+    // runs even once. Defining again then fails with
+    // `IncompatibleClassChangeError: already defined by user-defined(N)
+    // loader`, which this function reports as `ClassFormatError` -- and for an
+    // isolated loader `resolve_class_loader_aware` turns any `findClass`
+    // failure into a hard `NoClassDefFoundError` with no global fallback. Seen
+    // as a nondeterministic `NoClassDefFoundError:
+    // org.springframework.boot.autoconfigure.condition.ConditionOutcome` under
+    // Spring Boot's `ModifiedClassPathClassLoader`, where
+    // `OnClassCondition$ThreadedOutcomesResolver` evaluates half the
+    // auto-configuration conditions on a second thread and races the main one
+    // for exactly these classes. HotSpot has no such window: `loadClass`
+    // re-checks `findLoadedClass` after taking `getClassLoadingLock(name)`.
+    if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
+        return Some(Ok(Some(Value::Object(Some(mirror)))));
     }
     *in_progress = true;
     drop(in_progress);
@@ -6163,6 +6194,22 @@ pub(crate) fn ucl_try_define_local_class(
             Ok(Some(Value::Object(Some(mirror))))
         }
         Ok(Err(msg)) => {
+            // Backstop for the same race as the double-checked probe above,
+            // covering definers that do NOT go through this function's lock
+            // (`Lookup`/`Unsafe.defineClass`, `preload_isolated_loader_super`
+            // `types`, a parent loader's own defining path). If the class is
+            // now defined under this loader, the "already defined" error means
+            // we merely LOST the race -- JVMS SS5.3.5 says the loser observes
+            // the winner's class, not a linkage error. Returning it is what
+            // HotSpot's `defineClass`-under-`getClassLoadingLock` does.
+            if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
+                tracing::debug!(
+                    "URLClassLoader.findClass({internal_name}) lost a define race ({msg}); \
+                     returning the winning definition"
+                );
+                ctx.unpin_native_roots(loader_pin);
+                return Some(Ok(Some(Value::Object(Some(mirror)))));
+            }
             tracing::warn!("URLClassLoader.findClass({internal_name}) define failed: {msg}");
             Err(cratonvm_types::error::LinkageError::ClassFormatError {
                 class_name: internal_name.to_string(),

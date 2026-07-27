@@ -1498,11 +1498,77 @@ pub(crate) fn sb_state(
 /// (matching the `class_num_total_fields` idiom used elsewhere to avoid
 /// hard-coding a layout — see the `Timestamp` nanos-field fix), so branch
 /// on it instead of assuming either shape.
+/// Helper: write the StringBuilder count in the layout-appropriate slot.
+///
+/// CratonVM's own synthetic StringBuilder/StringBuffer layout is 2 slots:
+/// `value: char[]` @0, `count: int` @1 (see `instance_fields(2)` in
+/// `classloading/src/class_manager.rs`) — this is the layout every object
+/// actually gets allocated with unless real `AbstractStringBuilder`
+/// bytecode itself constructs one (e.g. during Byte Buddy
+/// retransformation), which uses the real JDK 9+ 3-slot layout `value:
+/// byte[]` @0, `coder: byte` @1, `count: int` @2 instead.
+///
+/// A prior version of this helper unconditionally wrote slot 1 = 0 (as a
+/// LATIN1 `coder` placeholder) and mirrored `count` into slot 2, on the
+/// assumption every StringBuilder has the 3-slot real layout. Every
+/// StringBuilder actually allocated through CratonVM's own 2-slot
+/// synthetic path (i.e. essentially all of them) instead had its *real*
+/// count slot (slot 1) stomped to 0 on every append/insert/setLength call,
+/// and the slot-2 mirror silently dropped by the `gen_heap` OOB-write
+/// guard (num_slots=2 < index 2) — so `StringBuilder.length()` always
+/// read back 0 immediately after the write that was supposed to grow it.
+/// Java code with a growth loop keyed on `sb.length()` (e.g.
+/// `while (sb.length() < n) sb.append(c);`, seen during real
+/// `java.desktop`/`java.beans` clinit) never observed the length increase
+/// and spun forever, hammering the OOB guard on every iteration.
+///
+/// `object_num_fields` reports the object's *actual* allocated slot count
+/// (matching the `class_num_total_fields` idiom used elsewhere to avoid
+/// hard-coding a layout — see the `Timestamp` nanos-field fix), so branch
+/// on it instead of assuming either shape.
+///
+/// # The by-name mirror (2026-07-26)
+///
+/// The 3-slot branch's `@2` is the JDK 9 layout `value/coder/count`. JDK 25's
+/// `AbstractStringBuilder` declares FOUR instance fields —
+/// `value @0, coder @1, maybeLatin1 @2, count @3` — so on a real JDK 25 image
+/// slot 2 is `maybeLatin1` and the field genuinely named `count` was never
+/// written at all.
+///
+/// That stayed invisible while CratonVM's own natives were the only readers:
+/// they agree with each other on whichever slot this helper picked. It becomes
+/// visible the moment real `AbstractStringBuilder` bytecode runs against one of
+/// these objects — which is exactly what happens once Mockito's inline mock
+/// maker redefines `StringBuilder`/`AbstractStringBuilder` in place. From then
+/// on `length()` cedes to the woven advice (deliberately, so a MOCK's advice
+/// can run), and the advice's "not mocked" fallthrough is the original
+/// `getfield count:I`: it read the real, never-written `count` and returned
+/// **0** for a genuinely real builder. That is the "KNOWN REMAINING GAP" the
+/// 2026-07-23 MockitoBean session documented and left open.
+///
+/// It is not academic: `org.springframework.cglib.core.TypeUtils.map` does
+/// `type.substring(0, type.length() - sb.length() * 2)`, so a zero
+/// `sb.length()` left the trailing `[]` unstripped and
+/// `MethodInterceptorGenerator`'s `static final GET_DECLARED_METHODS` signature
+/// came out as the malformed `()[Ljava/lang/reflect/Method[];`. That field
+/// initialises once per class, so ONE Mockito mock anywhere in the process
+/// poisoned every cglib proxy generated afterwards, each dying in
+/// `CGLIB$STATICHOOK1` with `NoSuchMethodError: java.lang.Class
+/// .getDeclaredMethods` — what `AotIntegrationTests
+/// #endToEndTestsForBeanOverrides` aborted on.
+///
+/// So mirror the count into the field actually NAMED `count` as well. The
+/// index-based writes stay exactly as they were (every native in this file
+/// reads them back, and the unit-test `NativeContext` mock has no class model
+/// to resolve names against), and the extra by-name write is a no-op when no
+/// such field exists.
 fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, count: i32) {
     if ctx.object_num_fields(this) >= 3 {
         // Real JDK 9+ layout: value@0, coder@1, count@2.
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(count));
+        // …plus wherever THIS JDK actually puts `count` (JDK 25: slot 3).
+        ctx.set_field_by_name(this, "count", Value::Int(count));
     } else {
         // CratonVM synthetic layout: value(char[])@0, count@1.
         ctx.set_field(this, 1, Value::Int(count));

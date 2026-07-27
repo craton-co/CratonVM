@@ -732,6 +732,13 @@ cached_is_ok!(dbg_arrlen, "CRATONVM_DBG_ARRLEN");
 /// the call sites; they are equivalent here (the flag is never set to
 /// non-UTF-8), so one predicate serves both.
 cached_is_ok!(dbg_loader_trace, "CRATONVM_DBG_LOADER_TRACE");
+/// `CRATONVM_DBG_ISOLATED_CNF` — narrow trace for the isolated-URLClassLoader
+/// "class not found" hard-fail in [`resolve_class_loader_aware`]: prints the
+/// name, the referencing class, and the Java frames whenever an isolating
+/// loader's own `loadClass` declined a name and the VM therefore refuses to
+/// fall back to the global store. Fires at most a handful of times per run,
+/// unlike `dbg_loader_trace`.
+cached_is_ok!(dbg_isolated_cnf, "CRATONVM_DBG_ISOLATED_CNF");
 cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
@@ -954,6 +961,48 @@ impl RealSelector {
         false
     }
 }
+
+// ── Ad-hoc debug traces on interpreter hot paths ────────────────────────
+//
+// Each of these was an inline `std::env::var_os(...)` sitting on a path the
+// interpreter runs per invoke / per putfield / per `if_acmpne`. An
+// `LD_PRELOAD` `getenv` tally over `RrwlSingle` (300k uncontended
+// `ReentrantReadWriteLock`/`ReentrantLock` lock-unlock pairs, the reduced form
+// of H2 `TestFileSystem.testConcurrent`) counted **6.9 million** `getenv`
+// calls — about 23 per lock/unlock — with these six names accounting for
+// 6,900,696 of them:
+//
+// ```text
+// 4501107  CRATONVM_DBG_GSE                          (invoke-cache lookup, twice per lookup)
+// 1101202  CRATONVM_DBG_FIELD_WATCH                  (every putfield + every field retarget)
+//  599999  CRATONVM_DBG_WATCHREF
+//  398881  CRATONVM_DBG_ASSERTEQ                     (every JIT-ABI invoke)
+//  199000  CRATONVM_EXEC_FRAME_TRACE                 (every frame entry)
+//  100507  CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE   (every if_acmpne)
+// ```
+//
+// `perf record -F 999` attributed ~3.5% of the run to `getenv` and its
+// callers. This is the same defect class as the 2026-07-23 fix for
+// `callee_saved_gpr_local_homes_enabled()` in `vm/src/jit/skip_list.rs` — see
+// `docs/known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md`,
+// which is where that one was found and where these were.
+//
+// NOTE: like every other helper in this module, these read the legacy
+// per-flag variable directly rather than through
+// `cratonvm_types::flags()`, so the grouped `CRATONVM_DBG=gse` spelling does
+// not reach them. That is pre-existing behaviour for all 30 helpers here, not
+// something this change introduced; the direct `CRATONVM_DBG_GSE=1` spelling
+// works exactly as before.
+
+cached_is_set!(dbg_gse, "CRATONVM_DBG_GSE");
+cached_is_set!(dbg_field_watch, "CRATONVM_DBG_FIELD_WATCH");
+cached_is_set!(dbg_watchref, "CRATONVM_DBG_WATCHREF");
+cached_is_set!(dbg_asserteq, "CRATONVM_DBG_ASSERTEQ");
+cached_is_set!(exec_frame_trace, "CRATONVM_EXEC_FRAME_TRACE");
+cached_is_set!(
+    active_profiles_identity_trace,
+    "CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE"
+);
 
 /// Once-initialized accessor for the `CRATONVM_REAL` / `CRATONVM_REAL_JCA`
 /// differential switch. Parses the env vars exactly once; every subsequent

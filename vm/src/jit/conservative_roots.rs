@@ -1086,6 +1086,39 @@ fn jit_range_scan_legacy() -> bool {
     *ON.get_or_init(|| std::env::var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some())
 }
 
+/// Read the safepoint id a live compiled frame published into
+/// `[rbp - cm.sp_id_slot_off]`. `None` when the method reserves no such slot.
+fn active_safepoint_id(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<u32> {
+    let sp_id_off = cm.sp_id_slot_off;
+    if sp_id_off == 0 {
+        return None;
+    }
+    let id_addr = rbp.checked_sub(sp_id_off as usize)?;
+    if id_addr & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: aligned safepoint-id slot in a live JIT frame on this thread.
+    Some((unsafe { (id_addr as *const usize).read() }) as u32)
+}
+
+/// The exclusive frame-offset bound of the LIVE part of this frame at its
+/// active safepoint (`OopMapEntry::live_frame_hi`). `None` when the bound is
+/// unknown — no sp-id slot, no matching map, or a map recorded without a
+/// paired pre-safepoint spill — in which case the caller must scan the whole
+/// region. When several maps share the safepoint id, the largest (most
+/// conservative) bound wins.
+fn moving_young_frame_live_hi(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> Option<i32> {
+    let sp_id = active_safepoint_id(rbp, cm)?;
+    let mut hi = 0i32;
+    for map in cm.oop_maps.iter().filter(|m| m.bytecode_pc == sp_id) {
+        if map.live_frame_hi <= 0 {
+            return None;
+        }
+        hi = hi.max(map.live_frame_hi);
+    }
+    (hi > 0).then_some(hi)
+}
+
 fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
@@ -1237,7 +1270,7 @@ fn published_shadow_values(window: Option<(usize, usize)>) -> std::collections::
 /// result so the fallback histogram can distinguish "an oop was missed" from
 /// "the frame could not be inspected at all".
 pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> bool {
-    if !moving_young_enabled() {
+    if !moving_young_enabled() || band_verify_disabled() {
         return false;
     }
     let scanner_sp = current_stack_pointer();
@@ -1282,7 +1315,11 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                     unverified = true;
                     break;
                 }
-                if band_has_unpublished_young_word(rbp - frame_size, rbp, &published) {
+                let live_hi = moving_young_frame_live_hi(rbp, cm);
+                if band_has_unpublished_young_word(rbp, frame_size, cm, live_hi, &published) {
+                    if band_dbg() {
+                        report_unpublished_band_words(rbp, frame_size, cm, live_hi, &published);
+                    }
                     unpublished = true;
                     break;
                 }
@@ -1325,40 +1362,150 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
     false
 }
 
-/// Scan one compiled frame's spill band `[lo, hi)` for a word that lands in a
-/// published young semispace and is absent from `published`.
+/// `CRATONVM_MOVING_YOUNG_BAND_DBG` — dump the frame offset of every word the
+/// band scan rejected, so the storage class responsible can be named instead of
+/// guessed at. Latched once; the scan runs on every collection.
+fn band_dbg() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some())
+}
+
+fn report_unpublished_band_words(
+    rbp: usize,
+    frame_size: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    live_hi: Option<i32>,
+    published: &std::collections::HashSet<usize>,
+) {
+    let lo = rbp - frame_size;
+    let mut addr = (lo + 7) & !7usize;
+    let mut hits = 0usize;
+    while addr + 8 <= rbp && hits < 32 {
+        // SAFETY: same bounded, aligned walk as `band_has_unpublished_word_with`.
+        let w = unsafe { (addr as *const usize).read() };
+        // Cast: a compiled frame is far smaller than i32::MAX bytes.
+        let off = (rbp - addr) as i32;
+        if band_slot_is_verifiable(off, &cm.frame_layout, live_hi)
+            && cratonvm_gc::gen_heap::addr_in_published_young_regions(w)
+            && !published.contains(&w)
+        {
+            hits += 1;
+            eprintln!(
+                "[moving-young-band] {} off={off} region={} value=0x{w:x} published={} \
+                 live_hi={live_hi:?} layout={:?}",
+                cm.method_label,
+                cm.frame_layout.region_name(off),
+                published.len(),
+                cm.frame_layout,
+            );
+        }
+        addr += 8;
+    }
+}
+
+/// `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY` — drop the frame-band verification
+/// entirely and take the codegen's `moving_young_coverage_complete` bit at its
+/// word. A MEASUREMENT INSTRUMENT: it is how "does the codegen model actually
+/// cover this workload?" is asked, and it is unsafe to run with if the answer
+/// is no. Not a supported configuration.
+fn band_verify_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some())
+}
+
+/// Scan one compiled frame's band `[rbp - frame_size, rbp)` for a word that
+/// lands in a published young semispace and is absent from `published`.
+///
+/// Slots that are only ever an IMAGE of a register are skipped
+/// ([`cratonvm_jit::FrameLayout::is_register_image`]): the prologue's
+/// callee-saved GPR/XMM save area holds the CALLER's values, and the
+/// per-safepoint blind GPR spill is write-only. Neither is a place the owning
+/// frame resumes from, and both are full of DEAD register values — scanning
+/// them yields "an oop was missed" on every collection, which is a false
+/// verdict that costs every moving cycle. The genuine storage classes (Java
+/// locals, operand spills, LICM hoist slots, scalar-replacement fields,
+/// outgoing stack args) are all still scanned.
 fn band_has_unpublished_young_word(
-    lo: usize,
-    hi: usize,
+    rbp: usize,
+    frame_size: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    live_hi: Option<i32>,
     published: &std::collections::HashSet<usize>,
 ) -> bool {
     band_has_unpublished_word_with(
-        lo,
-        hi,
+        rbp,
+        frame_size,
+        &cm.frame_layout,
+        live_hi,
         published,
         cratonvm_gc::gen_heap::addr_in_published_young_regions,
     )
+}
+
+/// Whether the verifier must inspect the word at `[rbp - off]`.
+///
+/// Skipped:
+///
+///   * everything at or beyond `callee_saved_lo` — the prologue's callee-saved
+///     GPR/XMM save area, the write-only per-safepoint blind GPR spill, the
+///     frame-deopt `SavedRegisters` block, the ABI shadow space and the
+///     outgoing stack-arg reserve. Register IMAGES and outgoing arguments, not
+///     storage this frame resumes from, and full of dead register values;
+///   * operand-spill slots above the safepoint's live cursor. The cursor
+///     reclaims by moving, so those slots keep whatever the deepest earlier
+///     operand stack left in them — in allocation-heavy code, a stale object
+///     pointer. Nothing reads them again.
+///
+/// Scanned: Java locals, the reserved-locals tail, LICM hoist slots,
+/// scalar-replacement fields and the live operand-spill slots — every place a
+/// compiled frame actually keeps a reference it will use after the call.
+fn band_slot_is_verifiable(
+    off: i32,
+    layout: &cratonvm_jit::FrameLayout,
+    live_hi: Option<i32>,
+) -> bool {
+    if layout.callee_saved_lo > 0 && off >= layout.callee_saved_lo {
+        return false;
+    }
+    if layout.is_register_image(off) {
+        return false;
+    }
+    if let Some(hi) = live_hi {
+        if layout.spill_hi > layout.spill_lo && off >= layout.spill_lo && off >= hi {
+            return false;
+        }
+    }
+    true
 }
 
 /// Predicate-injected core of [`band_has_unpublished_young_word`], so the scan
 /// itself is unit-testable without mutating the process-global published
 /// region-bounds table (which parallel tests share).
 fn band_has_unpublished_word_with(
-    lo: usize,
-    hi: usize,
+    rbp: usize,
+    frame_size: usize,
+    layout: &cratonvm_jit::FrameLayout,
+    live_hi: Option<i32>,
     published: &std::collections::HashSet<usize>,
     is_relocatable: impl Fn(usize) -> bool,
 ) -> bool {
-    if hi <= lo {
+    if frame_size == 0 || frame_size > rbp {
         return false;
     }
+    let lo = rbp - frame_size;
     let mut addr = (lo + 7) & !7usize;
     // Same guard as `scan_one_frame`: a stale bound must never walk into
     // unmapped pages. A compiled frame is orders of magnitude smaller than
     // this, so the clamp is unreachable in practice.
     const MAX_SCAN_BYTES: usize = 1024 * 1024;
-    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    let hi = rbp.min(addr.saturating_add(MAX_SCAN_BYTES));
     while addr + 8 <= hi {
+        // Cast: a compiled frame is far smaller than i32::MAX bytes.
+        let off = (rbp - addr) as i32;
+        if !band_slot_is_verifiable(off, layout, live_hi) {
+            addr += 8;
+            continue;
+        }
         // SAFETY: aligned read inside the calling thread's own live compiled
         // frame, bounded by the frame size recorded at compile time.
         let w = unsafe { (addr as *const usize).read() };
@@ -2991,48 +3138,151 @@ mod tests {
 
         let relocatable = move |w: usize| w == published_oop || w == hoisted_oop;
 
+        let flat = cratonvm_jit::FrameLayout::default();
+
         let mut published = std::collections::HashSet::new();
         published.insert(published_oop);
         assert!(
-            band_has_unpublished_word_with(lo, hi, &published, &relocatable),
+            band_has_unpublished_word_with(hi, hi - lo, &flat, None, &published, &relocatable),
             "a young-resident word absent from the shadow window is un-rewritable: \
              the cycle MUST NOT relocate",
         );
 
         published.insert(hoisted_oop);
         assert!(
-            !band_has_unpublished_word_with(lo, hi, &published, &relocatable),
+            !band_has_unpublished_word_with(hi, hi - lo, &flat, None, &published, &relocatable),
             "once every relocatable word in the band is on the shadow stack, the \
              frame really is fully covered and the moving cycle may proceed",
+        );
+    }
+
+    /// A word that is only an IMAGE of a register — the prologue's callee-saved
+    /// save area, or the write-only per-safepoint blind GPR spill — is not
+    /// independent oop storage, and both areas are routinely full of DEAD
+    /// register values. Scanning them reports "an oop was missed" on frames
+    /// that are in fact fully covered, which costs every moving cycle. That is
+    /// the measured reason moving-young engaged zero times on bt18.
+    #[test]
+    fn frame_band_scan_skips_register_images() {
+        let stale_oop = 0xbeef_0000usize;
+        // [0] = a genuine slot, [1..3] = a register-image band, [4] = genuine.
+        let band: Vec<usize> = vec![0, stale_oop, stale_oop, stale_oop, 0];
+        let lo = band.as_ptr() as usize;
+        let hi = lo + band.len() * 8;
+        let published = std::collections::HashSet::new();
+        let relocatable = move |w: usize| w == stale_oop;
+
+        // `off` counts back from `rbp` (= `hi`): band[4] is off 8, band[0] off 40.
+        let images = cratonvm_jit::FrameLayout {
+            reg_spill_lo: 16,
+            reg_spill_hi: 40,
+            ..Default::default()
+        };
+        assert!(
+            !band_has_unpublished_word_with(hi, hi - lo, &images, None, &published, &relocatable),
+            "every relocatable word lives in the register-image band, so the frame \
+             proves nothing against it and the cycle may still relocate",
+        );
+        assert!(
+            band_has_unpublished_word_with(
+                hi,
+                hi - lo,
+                &cratonvm_jit::FrameLayout::default(),
+                None,
+                &published,
+                &relocatable
+            ),
+            "without the exclusion the very same band diverts — this is the \
+             false-positive floor the exclusion removes",
         );
     }
 
     /// The scan must not divert on a frame full of primitives — otherwise
     /// moving-young could never engage at all and the fix would be a disguised
     /// default-off landing.
+    /// The operand-spill reserve is sized for `max_stack` and reclaimed by
+    /// moving a cursor, never by clearing. A slot above the cursor therefore
+    /// holds a stale object pointer from a deeper earlier stack — dead, never
+    /// read again, and the measured reason bt18 reported an unpublished oop on
+    /// every collection while being fully covered.
+    #[test]
+    fn frame_band_scan_ignores_reclaimed_spill_slots() {
+        let stale_oop = 0xbeef_0000usize;
+        let live_oop = 0xdead_0000usize;
+        let band: Vec<usize> = vec![0, stale_oop, live_oop, 0, 0];
+        let lo = band.as_ptr() as usize;
+        let hi = lo + band.len() * 8;
+        let published = std::collections::HashSet::new();
+        let relocatable = move |w: usize| w == stale_oop || w == live_oop;
+        // `off` counts back from `rbp` (= `hi`): band[4] is off 8 ... band[0]
+        // off 40. Make the whole band the operand-spill region.
+        let layout = cratonvm_jit::FrameLayout {
+            spill_lo: 8,
+            spill_hi: 48,
+            callee_saved_lo: 48,
+            ..Default::default()
+        };
+
+        // Cursor at 32 => band[1] (off 32, the stale word) is reclaimed,
+        // band[2] (off 24, the live word) is not.
+        assert!(
+            band_has_unpublished_word_with(hi, hi - lo, &layout, Some(32), &published, &relocatable),
+            "a LIVE unpublished spill slot must still divert the cycle",
+        );
+        let mut published = published;
+        published.insert(live_oop);
+        assert!(
+            !band_has_unpublished_word_with(
+                hi,
+                hi - lo,
+                &layout,
+                Some(32),
+                &published,
+                &relocatable
+            ),
+            "with the live slot published, the reclaimed slot above the cursor \
+             must not divert: nothing reads it again",
+        );
+        assert!(
+            band_has_unpublished_word_with(hi, hi - lo, &layout, None, &published, &relocatable),
+            "an unknown cursor must fall back to scanning the whole region",
+        );
+    }
+
     #[test]
     fn frame_band_scan_ignores_words_outside_the_young_regions() {
         let band: Vec<usize> = vec![0, 1, u64::MAX as usize, 42, 0x7fff_ffff];
         let lo = band.as_ptr() as usize;
         let hi = lo + band.len() * 8;
         let published = std::collections::HashSet::new();
-        assert!(!band_has_unpublished_word_with(lo, hi, &published, |_| {
-            false
-        }));
+        assert!(!band_has_unpublished_word_with(
+            hi,
+            hi - lo,
+            &cratonvm_jit::FrameLayout::default(),
+            None,
+            &published,
+            |_| { false }
+        ));
     }
 
     #[test]
     fn frame_band_scan_handles_an_empty_or_inverted_band() {
         let published = std::collections::HashSet::new();
+        let flat = cratonvm_jit::FrameLayout::default();
+        // A frame size larger than RBP itself cannot name a real band.
         assert!(!band_has_unpublished_word_with(
-            0x2000,
             0x1000,
+            0x2000,
+            &flat,
+            None,
             &published,
             |_| true
         ));
         assert!(!band_has_unpublished_word_with(
             0x1000,
-            0x1000,
+            0,
+            &flat,
+            None,
             &published,
             |_| true
         ));
@@ -3125,7 +3375,14 @@ mod tests {
         let band: Vec<usize> = vec![0x1111];
         let lo = band.as_ptr() as usize;
         assert!(
-            band_has_unpublished_word_with(lo, lo + 8, &published, |w| w == 0x1111),
+            band_has_unpublished_word_with(
+                lo + 8,
+                8,
+                &cratonvm_jit::FrameLayout::default(),
+                None,
+                &published,
+                |w| w == 0x1111
+            ),
             "a frame that published nothing cannot prove coverage of a live oop",
         );
     }
@@ -3181,6 +3438,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         });
         cm.fully_oop_covered = true;
 
@@ -3288,18 +3546,21 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-8],
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16, -24],
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
             bytecode_pc: 0,
             frame_slot_offsets: vec![],
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         });
 
         // Exact-match lookups succeed regardless of insertion order.
@@ -3353,6 +3614,7 @@ mod tests {
             bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         });
         assert!(cm.has_precise_oop_maps());
 

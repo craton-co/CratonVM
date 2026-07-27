@@ -2400,24 +2400,42 @@ pub(crate) fn any_cipher_mappable(ciphers: &[String]) -> bool {
 
 /// A `ClientCertVerifier` that accepts any structurally-valid, correctly
 /// SIGNED client certificate WITHOUT validating its chain against a trust
-/// anchor. Used exclusively when Tomcat's `trustManagerClassName` mechanism
-/// is configured: that feature's whole point is to delegate the trust
-/// decision to a Java `TrustManager` class INSTEAD OF a keystore-backed
-/// truststore, so there is no CA data here for `WebPkiClientVerifier` to
-/// build a `RootCertStore` from.
+/// anchor.
 ///
-/// Accepting a certificate here does NOT mean the connection is ultimately
-/// trusted — it only means the client proved possession of the leaf
-/// certificate's private key (`verify_tls12/13_signature` still do real
-/// cryptographic signature verification via the same webpki primitives
-/// `WebPkiClientVerifier` uses). The actual trust decision is made
-/// afterwards, synchronously, by `engine_run_trust_check` calling the real
-/// Java `TrustManager.checkClientTrusted` once the handshake completes —
-/// which aborts the connection (`SSLHandshakeException`) on rejection. This
-/// verifier must therefore ONLY be selected when a Java `TrustManager` is
-/// actually registered for the owning engine (see `engine_begin`'s
-/// `use_passthrough_client_verifier` check) — never as a general fallback for
-/// "no truststore configured", which would be a fail-open regression.
+/// Two callers select this:
+///
+/// 1. Tomcat's `trustManagerClassName` mechanism: that feature's whole point
+///    is to delegate the trust decision to a Java `TrustManager` class
+///    INSTEAD OF a keystore-backed truststore, so there is no CA data here
+///    for `WebPkiClientVerifier` to build a `RootCertStore` from. Trust is
+///    enforced afterwards, synchronously, by `engine_run_trust_check` calling
+///    the real Java `TrustManager.checkClientTrusted` once the handshake
+///    completes — which aborts the connection (`SSLHandshakeException`) on
+///    rejection.
+/// 2. Optional (`ClientAuth.WANT`/`setWantClientAuth(true)`) client auth with
+///    no trust source configured at all (no truststore, no custom
+///    `TrustManager`). Real JSSE does NOT fail the handshake here even when
+///    the presented certificate fails trust verification against its default
+///    (system cacerts) trust manager — confirmed empirically against a real
+///    JDK: the handshake completes, only the SERVER's own
+///    `getPeerPrincipal()`/`getPeerCertificates()` throw
+///    `SSLPeerUnverifiedException` afterward. rustls's `WebPkiClientVerifier`
+///    has no such soft-fail path (verification failure is always a fatal
+///    alert), so this verifier is the closest achievable approximation:
+///    accept the cert structurally (proves key possession via
+///    `verify_tls12/13_signature`, same webpki primitives
+///    `WebPkiClientVerifier` uses) without asserting CA trust. No Java
+///    `TrustManager` runs afterward in this case (none is registered), so
+///    unlike case 1 there is no later enforcement step — this only matters
+///    for callers that read `SSLSession.getPeerCertificates()` expecting an
+///    authoritative trust decision, which real JSSE would also leave
+///    unresolved here (it simply drops the unverified identity instead of
+///    exposing it, a difference this approximation does not fully capture).
+///
+/// Mandatory (`ClientAuth.NEED`/`setNeedClientAuth(true)`) client auth is
+/// UNCHANGED by case 2 above and still requires a real trust source — see
+/// `default_engine_server_config`'s own
+/// "setNeedClientAuth(true) requires javax.net.ssl.trustStore" error.
 #[derive(Debug)]
 struct PassthroughClientCertVerifier {
     mandatory: bool,
@@ -6706,13 +6724,30 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                                     .unwrap_or(false)
                             })
                             .unwrap_or(false);
+                    let optional_client_cert = (state.want_client_auth || speculative_optional_auth)
+                        && !state.need_client_auth;
+                    // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
+                    // optional client auth (WANT) with no trust source at all
+                    // (no truststore, no custom TrustManager) used to fall
+                    // into the `else` branch below with `client_ca=None`,
+                    // where `build_server_config_single_cert_ex_ciphers`
+                    // treats a missing CA as a hard config-build error even
+                    // for the optional case -- real JSSE does not fail the
+                    // handshake in this scenario (see the doc comment on
+                    // `PassthroughClientCertVerifier`, case 2), so use the
+                    // same passthrough verifier already used for the
+                    // custom-trust-manager case. NEED (mandatory) mode is
+                    // untouched: `optional_client_cert` is false whenever
+                    // `state.need_client_auth` is true.
+                    let use_passthrough_verifier =
+                        has_custom_trust_managers || (client_ca.is_none() && optional_client_cert);
                     if crate::nbflags().dbg_tls_auth_ok {
                         eprintln!(
-                            "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={}",
-                            request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers
+                            "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={} use_passthrough_verifier={}",
+                            request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers, use_passthrough_verifier
                         );
                     }
-                    let built = if has_custom_trust_managers {
+                    let built = if use_passthrough_verifier {
                         build_server_config_single_cert_passthrough_client_auth(
                             cert,
                             key,
@@ -6726,8 +6761,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             key,
                             &alpn_strs,
                             state.need_client_auth,
-                            (state.want_client_auth || speculative_optional_auth)
-                                && !state.need_client_auth,
+                            optional_client_cert,
                             client_ca.as_deref(),
                             &state.enabled_ciphers,
                         )

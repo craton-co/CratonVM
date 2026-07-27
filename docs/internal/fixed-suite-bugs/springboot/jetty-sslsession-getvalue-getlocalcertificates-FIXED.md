@@ -103,7 +103,7 @@ Full `module/spring-boot-jetty` (15 classes) rerun,
 
 | Class | Before this fix | After |
 |---|---:|---:|
-| `JettyReactiveWebServerFactoryTests` | 8 FAIL / 35 (`AbstractMethodError`/400) | **1 FAIL** (already-tracked AssertJ `representation` NPE, unrelated — see `micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md`) |
+| `JettyReactiveWebServerFactoryTests` | 8 FAIL / 35 (`AbstractMethodError`/400) | **1 FAIL** (was the AssertJ `representation` NPE, unrelated; since fixed — see `micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals-FIXED.md`. That class now fails only on an unrelated graceful-shutdown awaitility timeout.) |
 | `JettyServletWebServerFactoryTests` | HANG at 300s (25 FAIL / 113 once given a 1500s budget) | 832.7s, **12 FAIL** (all the same already-tracked AssertJ NPE) |
 
 The other 13 classes in the module were unaffected (12 PASS, 1 —

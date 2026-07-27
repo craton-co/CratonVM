@@ -658,7 +658,8 @@ pub struct GcFlags {
     /// old/pinned) before and after every `collect_garbage()` call, and a
     /// fuller breakdown (incl. humongous) right before the "out of heap
     /// space" abort. Diagnostic aid for tracing G1 region-pool exhaustion;
-    /// see docs/known-issues/bug-g1-native-alloc-no-safepoint-oom.md.
+    /// see docs/internal/fixed-suite-bugs/
+    /// g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
     /// `CRATONVM_G1_DBG_PINS`
     pub g1_dbg_pins: bool,
@@ -825,6 +826,9 @@ pub struct LoaderFlags {
     pub dbg_dupclass: bool,
     /// `CRATONVM_DBG_DUPCLASS_BT`
     pub dbg_dupclass_bt: bool,
+    /// `CRATONVM_DBG_DUPCLASS_FILTER` -- [`parse::utf8`]. Restricts the
+    /// `CRATONVM_DBG_DUPCLASS` trace to class names containing this substring.
+    pub dbg_dupclass_filter: Option<String>,
     /// `CRATONVM_DBG_FBCGLIB`
     pub dbg_fbcglib: bool,
     /// `CRATONVM_DBG_GETRESOURCES` — [`parse::non_empty_non_zero`].
@@ -869,6 +873,7 @@ impl LoaderFlags {
             dbg_define: present_utf8(src, "CRATONVM_DBG_DEFINE"),
             dbg_dupclass: present_utf8(src, "CRATONVM_DBG_DUPCLASS"),
             dbg_dupclass_bt: present(src, "CRATONVM_DBG_DUPCLASS_BT"),
+            dbg_dupclass_filter: utf8(src, "CRATONVM_DBG_DUPCLASS_FILTER"),
             dbg_fbcglib: present(src, "CRATONVM_DBG_FBCGLIB"),
             dbg_getresources: non_empty_non_zero(src, "CRATONVM_DBG_GETRESOURCES"),
             dbg_layout: present(src, "CRATONVM_DBG_LAYOUT"),
@@ -1500,7 +1505,11 @@ impl NativeFlags {
             bd_debug: present(src, "CRATONVM_BD_DEBUG"),
             canon_openfile: present(src, "CRATONVM_CANON_OPENFILE"),
             cl_bootstrap_scoped: on_unless_zero(src, "CRATONVM_CL_BOOTSTRAP_SCOPED"),
-            dbg: present(src, "CRATONVM_DBG"),
+            // Was the bare `CRATONVM_DBG`. That name is now the debug *group*
+            // variable (`CRATONVM_DBG=topic,topic`), so this one call site —
+            // `quarkus_staticinit.rs` — gets an ordinary topic of its own:
+            // `CRATONVM_DBG=quarkus-staticinit`.
+            dbg: present(src, "CRATONVM_DBG_QUARKUS_STATICINIT"),
             dbg_annproxy_wrap: present(src, "CRATONVM_DBG_ANNPROXY_WRAP"),
             dbg_aqs_trace: present(src, "CRATONVM_DBG_AQS_TRACE"),
             dbg_arraycopy: exactly_one(src, "CRATONVM_DBG_ARRAYCOPY"),
@@ -1683,8 +1692,14 @@ impl VmFlags {
     ///
     /// Snapshots `environ` once via [`MapSource::from_process_env`] instead of
     /// calling `getenv` per field; the values are identical.
+    ///
+    /// The snapshot is passed through [`crate::flag_groups::resolve`] first, so
+    /// the ten grouped variables (`CRATONVM_JIT=-bce,unroll` and friends) reach
+    /// every field below. Legacy per-flag names are what the grouped tokens
+    /// expand *to*, so setting one directly still works unchanged.
     pub fn from_env() -> Self {
-        Self::from_source(&MapSource::from_process_env())
+        let raw = MapSource::from_process_env();
+        Self::from_source(&crate::flag_groups::resolve(&raw))
     }
 }
 

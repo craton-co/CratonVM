@@ -105,6 +105,6 @@ much longer timeouts resolved the picture for both:
   `run-spring-boot-suite.ps1`.
 - `ConfigurationPropertiesBeanRegistrationAotProcessorTests` is a genuine,
   still-open hang — it never completed even at a 7200s (2-hour) ceiling.
-  See `docs/known-issues/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang.md`
-  for the full diagnostic trail; not fixed by this change or anything else
-  found in this investigation.
+  See `docs/internal/fixed-suite-bugs/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang-FIXED.md`
+  for the full diagnostic trail; not fixed by this change, but fully resolved
+  as of 2026-07-26 (unrelated JIT fix, see that doc's Closure section).

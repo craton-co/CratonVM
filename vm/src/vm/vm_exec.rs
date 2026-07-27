@@ -3486,7 +3486,7 @@ impl<'a> NativeContextImpl<'a> {
             cls.name.to_string()
         };
         {
-            let mut cm = self.shared.classes.class_manager.write();
+            let mut cm = self.shared.classes.class_manager_write();
             let options = RedefineOptions {
                 preserve_original_bytes: preserve_original,
                 ..RedefineOptions::default()
@@ -6410,6 +6410,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .find_class_by_name(name)
     }
 
+    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .resolve_fast_path_class_id(name)
+    }
+
     fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
         let cm = self.shared.classes.class_manager.read();
         if let Some(loader) = cm.get_loader_id(near) {
@@ -7738,7 +7746,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn current_thread_object(&mut self) -> ObjectRef {
         if let Some(obj) = self.thread.java_thread_obj {
-            if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
+            if crate::runtime::env_cache::dbg_watchref() {
                 debug_log_thread_mirror_identity(self.shared, self.thread.thread_id.0, obj);
             }
             return obj;
@@ -8157,6 +8165,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .threads
             .thread_registry
             .register_with_daemon(tid, name, None, daemon);
+        // obsaudit D1: this runs on the newly-spawned OS thread itself (see
+        // the raw `join_handle_ptr` claim below), so binding the JVMTI
+        // thread-attribution TLS here correctly attributes every class this
+        // `Thread.start()` worker loads to its own `jthread`.
+        cratonvm_classloading::set_current_thread_id(tid.0);
         // Claim the raw pointer for exactly-once consumption BEFORE
         // reconstructing the Box: if this exact pointer were ever passed twice
         // (a duplicated handle), the second `Box::from_raw` would double-free
@@ -9075,8 +9088,43 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // enclosing class was defined by a child / bytecode-enhancing loader
             // on that loader's copy of the impl class, not the global one (see
             // `lambda_impl_dispatch_override`).
-            let impl_override =
-                crate::runtime::interpreter::lambda_impl_dispatch_override(self.shared, &lcs);
+            //
+            // Uses the DRIVEN variant, not the passive `lambda_impl_dispatch_override`.
+            // This `NativeContextImpl::invoke_virtual` path is the lambda dispatcher
+            // used when a *native* helper calls back into a lambda — most notably
+            // `native-collections`' Stream pipeline (`stream_process_chain` ->
+            // `invoke_deferred_stream_lambda`). A method reference evaluated only
+            // from inside such a native callback (e.g. `.map(Foo::new)` reached via
+            // `Stream.toList()`) can be the VERY FIRST reference to `Foo` from an
+            // isolated loader's namespace, so the passive cache-only lookup misses
+            // and the `NewInvokeSpecial`/`Invoke*` arms below fall back to the
+            // loader-BLIND `class_manager.load_class(name)` / `invoke_or_native(name)`,
+            // minting an Application-loader copy of a class the isolated loader owns.
+            //
+            // Concrete failure (docs/known-issues/springboot/
+            // micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md):
+            // Spring Boot's `OpenTelemetryEventPublisherBeansApplicationListener`
+            // builds its wrappers with
+            // `getBeansOfType(EventPublisher.class).values().stream()
+            //     .map(EventPublishingContextWrapper::new).toList()`. Under
+            // `@ForkedClassPath`'s `ModifiedClassPathClassLoader` the listener is
+            // child-loader-defined, but the constructor reference resolved
+            // `EventPublishingContextWrapper` (and hence its anonymous
+            // `ContextStorage` subclass `EventPublishingContextWrapper$1`) under the
+            // Application loader. That subclass then inherited the APPLICATION copy
+            // of `io.opentelemetry.context.ContextStorage`, whose default `root()`
+            // returns the Application `ArrayBasedContext.ROOT` — so `Context.current()`
+            // handed back a foreign-loader `Context`, `makeCurrent()` attached to the
+            // Application `ContextStorage` (which has no event-publishing wrapper),
+            // and no `EventPublisher` events were ever published: MDC `traceId`
+            // stayed null and `OtelEventListener.events` stayed empty.
+            // Mirrors the same fix already applied to the sibling `interpreter.rs`
+            // lambda dispatcher (`try_lambda_dispatch`).
+            let impl_override = crate::runtime::interpreter::lambda_impl_dispatch_override_driven(
+                self.shared,
+                self.thread,
+                &lcs,
+            );
             // Dispatch by method handle kind.
             let raw_result = match lcs.impl_handle.kind {
                 MethodHandleKind::InvokeStatic => {
@@ -10405,7 +10453,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_class_hidden(&mut self, class_id: ClassId) {
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             class.hidden = true;
         }
@@ -10423,7 +10471,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // inherit the lookup class's nest host and nest members. We copy
         // the relevant fields onto the target so that member access
         // checks see the hidden class as a legitimate nestmate.
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         // Grab the nest info from the source class first (release the
         // immutable borrow before we take a mutable one).
         let (nest_host, nest_members) = match cm.get_class(source_class) {
@@ -10602,7 +10650,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         match cm.define_class(name, bytes, ClassLoaderId::Application) {
             Ok(cid) => {
                 // Release the ClassManager write lock before calling
@@ -10640,7 +10688,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     ) -> Result<ClassId, String> {
         use cratonvm_classloading::DefineClassOptions;
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         let options = DefineClassOptions {
             override_name: Some(stored_name.to_string()),
             hidden: true,
@@ -10676,7 +10724,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         loader_id: u32,
     ) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
             Ok(cid) => {
                 drop(cm);
@@ -10753,7 +10801,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
 
         let cid = {
-            let mut cm = self.shared.classes.class_manager.write();
+            let mut cm = self.shared.classes.class_manager_write();
             cm.define_class_with_options(name, bytes, cl_id, define_opts)
                 .map_err(|e| format!("{e:?}"))?
         };
@@ -12331,6 +12379,49 @@ pub fn invoke_special_shared(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    invoke_special_shared_impl(shared, thread, None, class_name, method_name, descriptor, args)
+}
+
+/// [`invoke_special_shared`] with the owning class ALREADY resolved.
+///
+/// The name-resolving form calls `load_class_concurrent(class_name)`, which
+/// consults the global binary-name map and therefore cannot tell two loaders'
+/// definitions of the same name apart. A caller that knows the resolution
+/// (because it resolved through the referencing class's own loader) passes it
+/// here instead. `class_name` is still required — the native-override probe
+/// and the diagnostics are name-keyed.
+///
+/// See `JitInvokeInfo::declaring_class_id` for the H2 `TestUpgrade` failure
+/// that motivated this split.
+pub fn invoke_special_shared_on_class(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    class_id: ClassId,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    invoke_special_shared_impl(
+        shared,
+        thread,
+        Some(class_id),
+        class_name,
+        method_name,
+        descriptor,
+        args,
+    )
+}
+
+fn invoke_special_shared_impl(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    pre_resolved: Option<ClassId>,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
     // Native override always wins -- same priority order as invoke_or_native.
     // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
     // loaded bytecode: invokespecial is how constructors and super-calls
@@ -12367,13 +12458,18 @@ pub fn invoke_special_shared(
         }
     }
 
-    // Resolve and initialize the class.
-    let class_id = match shared.load_class_concurrent(class_name) {
-        Ok(cid) => cid,
-        Err(e) => {
-            thread.native_pin_roots.truncate(pin_base);
-            return Err(e.into());
-        }
+    // Resolve and initialize the class. A caller that already resolved it
+    // through the referencing class's loader passes the answer in; only the
+    // name-keyed entry point falls back to the global map.
+    let class_id = match pre_resolved {
+        Some(cid) => cid,
+        None => match shared.load_class_concurrent(class_name) {
+            Ok(cid) => cid,
+            Err(e) => {
+                thread.native_pin_roots.truncate(pin_base);
+                return Err(e.into());
+            }
+        },
     };
     if let Err(e) = super::ensure_class_initialized_shared(shared, thread, class_id) {
         thread.native_pin_roots.truncate(pin_base);
@@ -18158,7 +18254,35 @@ fn invoke_on_class_shared_inner(
                         // native's memoized `computeValue` dispatch must win).
                         || (class_name == "java/lang/ClassValue"
                             && method_name == "get"
-                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;");
+                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;")
+                        // java.util.logging.FileHandler's registered natives
+                        // (native-builtins/src/phases_late.rs,
+                        // register_p61_logging) store their filename/closed
+                        // bookkeeping in an identity-hash side table
+                        // (jul_file_handler_state_table, logging_shims.rs)
+                        // rather than real instance field slots -- see
+                        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                        // Without this override, real FileHandler bytecode
+                        // (loaded from java.base) is concrete/non-abstract,
+                        // so the default rule above ran its REAL
+                        // <init>()V / <init>(String)V -- which try to
+                        // actually open/lock a real log file via NIO and
+                        // throw NoSuchFileException when the parent
+                        // directory for the lock file isn't set up the way
+                        // real JUL's openFiles() expects -- instead of our
+                        // native override, so apply_jul_config_entries's
+                        // new_object_initialized call (logmanager.rs)
+                        // failed with that exception and the handler was
+                        // silently treated as "uninstantiable, skip it".
+                        || (class_name == "java/util/logging/FileHandler"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "()V")
+                                    | ("<init>", "(Ljava/lang/String;)V")
+                                    | ("publish", "(Ljava/util/logging/LogRecord;)V")
+                                    | ("flush", "()V")
+                                    | ("close", "()V")
+                            ));
                     if check_override
                         && shared
                             .natives
@@ -21327,7 +21451,7 @@ mod tests {
         let shared = test_shared();
         // Register a synthetic stub so field_at_index resolves.
         let cid = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             cm.ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2)
         };
         // Sanity: that class is a stub.
@@ -21374,7 +21498,7 @@ mod tests {
             .collect();
         let num_fields = fields.len();
 
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.class_store.next_id();
         cm.class_store.add(Class {
             id,
@@ -21422,7 +21546,7 @@ mod tests {
             &["Ljava/lang/Runnable;"],
         );
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let cls = cm
                 .get_class_mut(thread_cid)
                 .expect("test thread layout class registered");

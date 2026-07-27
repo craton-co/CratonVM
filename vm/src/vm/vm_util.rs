@@ -511,7 +511,7 @@ pub fn ensure_class_initialized_shared(
                 // Use a write lock to prevent two threads from both entering
                 // initialize_class_shared (TOCTOU race).
                 let claimed = {
-                    let mut cm = shared.classes.class_manager.write();
+                    let mut cm = shared.classes.class_manager_write();
                     if let Some(class) = cm.get_class_mut(class_id) {
                         if class.initializing_thread.is_some() {
                             // Another thread claimed it between our read and this write
@@ -718,7 +718,7 @@ fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
 /// `NoClassDefFoundError`.
 fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassState) {
     {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             class.state = new_state;
             class.initializing_thread = None;
@@ -806,7 +806,7 @@ fn initialize_class_shared(
 
     // Step 2: Structural verification (Loaded -> Verifying -> Verified)
     {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Loaded {
                 class.state = ClassState::Verifying;
@@ -888,7 +888,7 @@ fn initialize_class_shared(
         }
     }
     {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Verifying {
                 class.state = ClassState::Verified;
@@ -898,7 +898,7 @@ fn initialize_class_shared(
 
     // Step 3: Preparation (Verified -> Preparing -> Prepared)
     {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Verified {
                 class.state = ClassState::Preparing;
@@ -907,7 +907,7 @@ fn initialize_class_shared(
     }
     prepare_class_shared(shared, class_id)?;
     {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Preparing {
                 class.state = ClassState::Prepared;
@@ -953,7 +953,7 @@ fn initialize_class_shared(
     // steps above that may have changed it to Verified/Prepared.
     let current_thread_id = thread.thread_id.0;
     {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             class.state = ClassState::Initializing;
             class.initializing_thread = Some(current_thread_id);
@@ -3908,7 +3908,7 @@ mod tests {
     #[test]
     fn hierarchy_direct_superclass_uses_linked_class_edge() {
         let shared = test_shared();
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         cm.load_class("java/lang/String").unwrap();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
@@ -4041,7 +4041,7 @@ mod tests {
 
         let shared = test_shared();
         let class_id = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id,
@@ -4221,7 +4221,7 @@ mod tests {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let class_id = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id = cm.class_store.next_id();
             let mut c = make_malformed_class("java/lang/EvilString", ClassLoaderId::Application);
             c.id = id;
@@ -4252,7 +4252,7 @@ mod tests {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let class_id = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id = cm.class_store.next_id();
             // FINAL+ABSTRACT user-classpath class -> verification runs and fails.
             let mut c = make_malformed_class("com/example/Boom", ClassLoaderId::Application);
@@ -4314,7 +4314,7 @@ mod tests {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let class_id = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id = cm.class_store.next_id();
             let mut c = make_malformed_class("java/lang/String", ClassLoaderId::Bootstrap);
             c.id = id;

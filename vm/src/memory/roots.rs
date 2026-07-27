@@ -158,12 +158,25 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     }
 
     // 2. Static fields — all classes
+    //
+    // The `metadata_pin_deferrable` guard (SPB.1 residual fix) additionally
+    // requires the value to already be in old gen before deferring to
+    // `metadata_pin` — see that method's doc for why: the Generational
+    // backend's `metadata_pin` consumer runs only inside the old-gen BFS, so
+    // a still-young static value deferred here would never be marked by
+    // anything and could be reclaimed mid-`<clinit>`. Same reasoning applies
+    // to the class-lock (`3.`) and CONSTANT_Dynamic (`13.`) sections below.
     {
         let statics = shared.classes.statics.read();
         for (&class_id, fields) in statics.iter() {
             for val in fields {
                 if let Value::Object(Some(obj_ref)) = val {
-                    if conditional_metadata {
+                    if conditional_metadata
+                        && shared
+                            .mem
+                            .heap
+                            .metadata_pin_deferrable(obj_ref.as_ptr() as usize)
+                    {
                         if let Some(loader) =
                             cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                         {
@@ -184,7 +197,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     {
         let class_locks = shared.classes.class_locks.read();
         for (&class_id, obj_ref) in class_locks.iter() {
-            if conditional_metadata {
+            if conditional_metadata
+                && shared
+                    .mem
+                    .heap
+                    .metadata_pin_deferrable(obj_ref.as_ptr() as usize)
+            {
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
@@ -326,7 +344,20 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                         crate::classloading::ClassLoaderId::UserDefined(_)
                     )
                 });
-                if is_user_defined {
+                // SPB.1 residual fix (see `metadata_pin_deferrable`'s doc):
+                // `mirror_pin`'s consumer (`gen_heap.rs`/`g1.rs`/`zgc.rs`) only
+                // propagates liveness to OLD-GEN mirrors under the
+                // Generational backend. Skipping a still-YOUNG mirror here
+                // relies on it being "already live as a major-GC root" some
+                // other way, which is not actually guaranteed (e.g. a
+                // freshly-created array/nested-class mirror with no Java
+                // local yet holding it) — root it directly instead.
+                if is_user_defined
+                    && shared
+                        .mem
+                        .heap
+                        .metadata_pin_deferrable(obj_ref.as_ptr() as usize)
+                {
                     continue;
                 }
                 roots.push(*obj_ref);
@@ -543,7 +574,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     {
         let cache = shared.classes.resolution_cache.read();
         cache.for_each_condy_root(|class_id, object| {
-            if conditional_metadata {
+            if conditional_metadata
+                && shared.mem.heap.metadata_pin_deferrable(object.as_ptr() as usize)
+            {
                 if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
@@ -777,7 +810,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      reclaim/relocate a cached value while a later `ClassValue.get()`
     //      keeps handing back the stale `ObjectRef`. Remap companion in
     //      `gc.rs` (`gc_update_classvalue_cache_refs`).
-    cratonvm_native_builtins::phases_late::gc_scan_classvalue_cache_roots(&mut roots);
+    cratonvm_native_builtins::phases_late::gc_scan_classvalue_cache_roots(&mut roots, &|addr| {
+        shared.mem.heap.metadata_pin_deferrable(addr)
+    });
 
     // 19. JBoss MSC container-held service objects. The `ServiceContainer` Rust
     //     state machine references Java objects (the `Service` instance whose

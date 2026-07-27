@@ -1099,6 +1099,19 @@ impl SharedVm {
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
                 cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
                 cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
+                // java.util.logging.FileHandler's natives are registered
+                // (as part of register_p61_logging) only under
+                // register_synthetic_overrides, which is
+                // #[cfg(feature = "synthetic-jdk")]-gated and never runs in
+                // real-JDK mode -- so Spring Boot's logging-file.properties
+                // (handlers=java.util.logging.FileHandler,...), which only
+                // ever exercises real-JDK mode, silently fell through to the
+                // real FileHandler() bytecode instead (which throws
+                // NoSuchFileException trying to actually lock a real log
+                // file). Register just the FileHandler natives directly here.
+                // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
+
                 // LinkedBlockingQueue.drainTo(Collection, int) - needed by SLF4J/Spring
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
                 // between synthetic natives and real JDK classes
@@ -1513,6 +1526,19 @@ impl SharedVm {
             // drainTo natives (SLF4J replayEvents, Spring thread pools).
             cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
             cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
+            // java.util.logging.FileHandler's natives are registered
+            // (as part of register_p61_logging) only under
+            // register_synthetic_overrides, which is
+            // #[cfg(feature = "synthetic-jdk")]-gated and never runs in
+            // real-JDK mode -- so Spring Boot's logging-file.properties
+            // (handlers=java.util.logging.FileHandler,...), which only
+            // ever exercises real-JDK mode, silently fell through to the
+            // real FileHandler() bytecode instead (which throws
+            // NoSuchFileException trying to actually lock a real log
+            // file). Register just the FileHandler natives directly here.
+            // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+            cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
+
             fn real_jdk_lbq_drain_to_bounded(
                 ctx: &mut dyn cratonvm_native_api::NativeContext,
                 args: &[cratonvm_types::Value],
@@ -2570,6 +2596,8 @@ impl SharedVm {
                 oom_dump_written: std::sync::atomic::AtomicBool::new(false),
                 missing_natives_log: parking_lot::Mutex::new(Vec::new()),
                 flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
+                jfr_dump_on_exit: parking_lot::Mutex::new(None),
+                jcmd_processor: parking_lot::Mutex::new(None),
                 #[cfg(feature = "experimental-debug")]
                 debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
                 #[cfg(feature = "experimental-debug")]
@@ -3633,7 +3661,7 @@ impl SharedVm {
         }
 
         // Actually load the class (this takes the global write lock briefly)
-        let mut cm_guard = self.classes.class_manager.write();
+        let mut cm_guard = self.classes.class_manager_write();
         let result = cm_guard.load_class(name);
         drop(cm_guard);
 
@@ -3649,19 +3677,17 @@ impl SharedVm {
             }
         }
 
-        // Fire JVMTI ClassLoad event on successful load
+        // obsaudit D14 (2026-07-26): the hand-written real-env ClassLoad
+        // notification that used to live here was removed. It fired on
+        // every successful `Ok(class_id)` unconditionally — including a
+        // cache hit against an already-loaded class, which is not a new
+        // ClassLoad and should not re-fire one. ClassLoad now reaches the
+        // real env exactly once per class, from
+        // `JvmtiEventManager::fire_class_load`'s bridge (see
+        // `install_real_agent_env_bridge` in `runtime/jvmti.rs`), which is
+        // driven by `ClassManager::define_class_shared_with_options` and so
+        // only runs when the class is actually newly defined.
         if let Ok(class_id) = &result {
-            #[cfg(feature = "experimental-debug")]
-            {
-                let env = self.debug.jvmti_env.lock();
-                if env
-                    .event_manager
-                    .is_enabled(crate::jvmti::JvmtiEvent::ClassLoad)
-                {
-                    crate::jvmti::notify_class_load(&env, class_id.as_u32() as u64, name);
-                }
-            }
-
             // T5.4.4 — class hierarchy change invalidation.
             //
             // When a new class is loaded, any JIT-compiled method
@@ -4403,7 +4429,7 @@ impl SharedVm {
         // present (pure synthetic-jdk mode) the load fails harmlessly
         // and we fall back to the 1-field synthetic stub below.
         let _ = self.load_class_concurrent("java/io/PrintStream");
-        let ps_class_id = self.classes.class_manager.write().ensure_synthetic_class(
+        let ps_class_id = self.classes.class_manager_write().ensure_synthetic_class(
             "java/io/PrintStream",
             1, // 1 field: fd_id — used only when the real class isn't loaded
         );
@@ -4732,13 +4758,17 @@ impl SharedVm {
         self.classes.class_manager.read()
     }
 
-    /// Acquire `class_manager` (L10) for write. See
-    /// [`Self::class_manager_read_ranked`] for why this is a plain alias.
+    /// Acquire `class_manager` (L10) for write, through the hook-draining
+    /// guard (obsaudit D1) — see
+    /// [`crate::vm::realms::class_realm::ClassRealm::class_manager_write`].
+    /// No longer a bare alias: unlike the read side, this must route
+    /// through the draining wrapper like every other write-lock site, or
+    /// JVMTI ClassLoad/ClassPrepare events queued under it would never fire.
     #[inline]
     pub fn class_manager_write_ranked(
         &self,
-    ) -> crate::runtime::lock_order::OrderedPlRwLockWriteGuard<'_, ClassManager> {
-        self.classes.class_manager.write()
+    ) -> crate::vm::realms::class_realm::ClassManagerWriteGuard<'_> {
+        self.classes.class_manager_write()
     }
 
     /// Acquire `ref_processor` (L7).
@@ -4903,6 +4933,89 @@ impl Vm {
         // ignored, which matches the global vtable hook pattern.
         set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
 
+        // obsaudit D14 (2026-07-26): bridge `runtime::jvmti::JvmtiEventManager`
+        // (interpreter/GC/classloading-sourced events) to the real,
+        // native-agent-facing `shared.debug.jvmti_env` — see the notes above
+        // `install_real_agent_env_bridge` in `runtime/jvmti.rs`. Same `Weak`,
+        // idempotent, last-writer-wins shape as the two hooks just above.
+        crate::runtime::jvmti::install_real_agent_env_bridge(&shared);
+
+        // obsaudit D15 (2026-07-26) — open the real attach-API socket and
+        // register the *live* (real-VM-state-backed) jcmd command set. See
+        // the LIVENESS block and `AttachListener`'s doc comment in
+        // `runtime/serviceability.rs`: this must be `new_with_vm_state`,
+        // never the argument-less `JcmdProcessor::new()` (that one reports
+        // fabricated data for several commands). `shared.clone()` coerces
+        // to `Arc<dyn VmDiagnosticState>` via the `impl VmDiagnosticState
+        // for SharedVm` in this file.
+        *shared.debug.jcmd_processor.lock() = Some(
+            crate::runtime::serviceability::JcmdProcessor::new_with_vm_state(shared.clone()),
+        );
+
+        // obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording`. Before
+        // this, vm-cli never called `start_recording` (see the retracted
+        // claim this comment replaces), so `cratonvm_jfr::is_enabled()` was
+        // permanently false and the ~30 wired `emit_*` call sites never
+        // captured anything. `config.jfr_start_recording` is `None` unless
+        // the flag was passed, so this is a no-op — same cost as before —
+        // on every VM that doesn't request it.
+        if let Some(jfr_cfg) = shared.config.jfr_start_recording.clone() {
+            let mut settings = cratonvm_jfr::RecordingSettings::new("cratonvm");
+            settings.max_age = jfr_cfg.max_age;
+            settings.max_size = jfr_cfg.max_events;
+            settings.duration = jfr_cfg.duration;
+            settings.dump_on_exit = jfr_cfg.dump_on_exit;
+            let recording_id = {
+                let mut fr = shared.debug.flight_recorder.lock();
+                let id = fr.new_recording(settings);
+                fr.start_recording(id);
+                id
+            };
+            if jfr_cfg.dump_on_exit {
+                let filename = jfr_cfg.filename.clone().unwrap_or_else(|| {
+                    format!("./cratonvm-recording-{}.jfr", std::process::id())
+                });
+                *shared.debug.jfr_dump_on_exit.lock() = Some((recording_id, filename));
+            }
+            // obsaudit D12 — the reclamation half of the fix. Before this,
+            // `ThreadRingRegistry::reclaim_retired_shards` only ran from
+            // inside `drain_all`, which only ran at dump time — harmless
+            // only because the disabled gate above kept ordinary threads
+            // from ever registering a shard. A recording that now actually
+            // runs continuously needs its per-thread rings drained
+            // periodically, both to keep events flowing into the
+            // repository (rather than only at final dump) and to let
+            // retired+empty shards from thread churn actually get
+            // reclaimed instead of accumulating in the registry `Vec` for
+            // the recording's whole lifetime. One drain per second is
+            // frequent enough that a 1024-capacity ring on a
+            // moderately-busy thread will not silently drop events
+            // between drains, and cheap enough (an empty repository drain
+            // is a handful of shard-list iterations) to run indefinitely.
+            let weak_shared = Arc::downgrade(&shared);
+            let duration = jfr_cfg.duration;
+            std::thread::Builder::new()
+                .name("JFR-Periodic-Drain".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let Some(shared) = weak_shared.upgrade() else {
+                            break; // VM torn down (e.g. an in-process test) — stop.
+                        };
+                        let mut fr = shared.debug.flight_recorder.lock();
+                        fr.drain_per_thread_into_repository();
+                        if let Some(d) = duration {
+                            if started.elapsed() >= d {
+                                fr.stop_recording(recording_id);
+                                break;
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
+
         // KC16-watchdog: install the wait-site frame dumper so a thread
         // parked in `Object.wait()` (e.g. AsyncFutureTask.await) can emit
         // its frame chain when the stack-dump watchdog fires. Without
@@ -4932,6 +5045,11 @@ impl Vm {
             .threads
             .thread_registry
             .register(ThreadId(0), "main", None);
+        // obsaudit D1: bind this OS thread's JVMTI thread-attribution TLS so
+        // ClassLoad/ClassPrepare events fired while bootstrapping on the
+        // main thread report the real `jthread` instead of the "unknown"
+        // sentinel. See `cratonvm_classloading::set_current_thread_id`.
+        cratonvm_classloading::set_current_thread_id(0);
         // Share the interrupted flag so cross-thread interrupt works on the main thread
         shared
             .threads
@@ -11862,7 +11980,7 @@ mod tests {
 
         // Load a class so there's class info available
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let _ = cm.load_class("java/lang/Object");
         }
 

@@ -463,6 +463,11 @@ pub fn attach_foreign_thread(
         .threads
         .thread_registry
         .register_with_daemon(tid, &name, None, daemon);
+    // obsaudit D1: `attach_foreign_thread` runs synchronously on the
+    // attaching OS thread, so bind the JVMTI thread-attribution TLS here —
+    // classes this thread loads after attaching now report the real
+    // `jthread` instead of the "unknown" sentinel.
+    cratonvm_classloading::set_current_thread_id(tid.0);
     shared
         .threads
         .thread_registry
@@ -3845,7 +3850,7 @@ extern "C" fn jni_define_class(
         // from the class file's `this_class` entry; use the empty string as a
         // placeholder that `define_class` overrides from the bytes.
         let define_name = class_name.as_deref().unwrap_or("");
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let cid = cm
             .define_class(
                 define_name,

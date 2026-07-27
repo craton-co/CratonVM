@@ -4145,9 +4145,15 @@ impl GenerationalHeap {
         // (genuinely corrupt header), the moving collector is unsound this
         // cycle — divert to the non-moving sweep, which tolerates a partial
         // view (conservative over-marking, never relocates).
-        let mut young_object_starts: FxHashSet<usize> = FxHashSet::default();
         let young_base = young_from.base_ptr() as usize;
         let young_used = young_from.used();
+        // One bit per 8 bytes of from-space rather than one hash-table entry
+        // per object. The set's size tracks the young space, not the live set,
+        // so on bt18 at -Xmx8g the old `FxHashSet` made `HashMap::insert` +
+        // `reserve_rehash` 49% of the whole process and one moving cycle cost
+        // ~6.1 s. See `ObjectStartBits`.
+        let mut young_object_starts =
+            crate::young_mark::ObjectStartBits::new(young_base, young_used);
         let mut start_walk_complete = true;
         // Merge the free-block list with un-retired TLAB tails (reserved,
         // never on the free list — the exact gap class this walk was
@@ -4224,7 +4230,22 @@ impl GenerationalHeap {
                     break;
                 }
             }
-            young_object_starts.insert(obj_ptr as usize);
+            if !young_object_starts.insert(obj_ptr as usize) {
+                // Only reachable if an object start is not 8-byte aligned, which
+                // `gen_object_total_size`'s rounding makes impossible — but a
+                // bitmap cannot represent it, and silently aliasing a
+                // neighbour's bit would make `forward_object` relocate through
+                // an interior word. Fail closed, like every other way this walk
+                // can fail to complete.
+                tracing::warn!(
+                    young_cursor,
+                    young_used,
+                    "GC: young object-start walk hit a misaligned object start — \
+                     diverting this cycle to the non-moving sweep"
+                );
+                start_walk_complete = false;
+                break;
+            }
             young_cursor += size;
         }
         if !start_walk_complete {
@@ -8818,7 +8839,7 @@ impl GenerationalHeap {
     #[allow(clippy::too_many_arguments)]
     fn forward_object(
         young_from: &Arena,
-        young_object_starts: &FxHashSet<usize>,
+        young_object_starts: &crate::young_mark::ObjectStartBits,
         young_to: &mut Arena,
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
@@ -8854,7 +8875,7 @@ impl GenerationalHeap {
     #[allow(clippy::too_many_arguments)]
     fn forward_object_impl(
         young_from: &Arena,
-        young_object_starts: &FxHashSet<usize>,
+        young_object_starts: &crate::young_mark::ObjectStartBits,
         young_to: &mut Arena,
         old_gen: &mut OldGen,
         old_ptr: *mut u8,
@@ -8863,7 +8884,7 @@ impl GenerationalHeap {
         promoted_worklist: &mut Vec<*mut u8>,
         force_promote_all: bool,
     ) -> *mut u8 {
-        if !young_object_starts.contains(&(old_ptr as usize)) {
+        if !young_object_starts.contains(old_ptr as usize) {
             // Exact pre-GC membership rejects aligned interior words from
             // conservative roots before forwarding writes through them.
             return old_ptr;

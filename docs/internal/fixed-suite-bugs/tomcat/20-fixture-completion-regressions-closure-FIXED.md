@@ -5,7 +5,7 @@
 interpreter/dispatch throughput ceiling
 ([`04-embedded-server-throughput-wall-OPEN.md`](04-embedded-server-throughput-wall-OPEN.md)),
 not new or independently-fixable bugs. Closes
-`../../../known-issues/tomcat/regressions-revealed-by-fixture-completion-20260723.md`.
+`../../tomcat/regressions-revealed-by-fixture-completion-20260723.md`.
 
 Work done on branch `fix/tcfixregr-resume-20260723` (base `origin/dev` @
 `85b8b981e`), Azure host worktree `/data/wt-tcfixregr-resume-20260723`,
@@ -182,7 +182,7 @@ narrowing WHY, and confirmed neither is a new or independently-fixable bug:
   `T19_H6_CAS_DIAG cas_long` diagnostic and `STW cross-thread JIT takeover ...
   pending=8 taken=0` signature already investigated and characterized as
   "severe slowness, not a deadlock" in
-  [`../../../known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md`](../../../known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md)
+  [`../../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`](../../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md)
   (that doc explicitly documents `cas_long FAIL` as expected/benign
   `AbstractQueuedLongSynchronizer` CAS-retry noise, not a bug, and profiled the
   real cost to interpreted `ReentrantReadWriteLock`/AQS dispatch overhead

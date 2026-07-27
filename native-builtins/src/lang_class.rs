@@ -1261,6 +1261,36 @@ pub(crate) fn native_class_get_resource_as_stream(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
+    // T24 delegation fix: a class defined through a genuine user-defined
+    // (non-builtin, non-URLClassLoader-fixed-up) ClassLoader -- e.g. a
+    // from-scratch loader overriding only findResource, like Quarkus's
+    // RunnerClassLoader -- must have its resource lookups go through that
+    // loader's real (possibly overridden) getResourceAsStream, not just
+    // CratonVM's static -cp scan below. Without this, any resource whose
+    // backing jar isn't on the process's own -cp (but IS indexed by the
+    // custom loader itself) silently resolves to null. Mirrors the
+    // identical delegation `cl_get_resource_as_stream` already performs
+    // when ClassLoader.getResourceAsStream is called directly.
+    if let Ok(Some(Value::Object(Some(loader)))) =
+        native_class_get_class_loader(ctx, &[Value::Object(Some(this))])
+    {
+        let loader_class_id = ctx.class_id_of_object(loader);
+        let loader_class_name = ctx.class_name_of_id(loader_class_id).unwrap_or_default();
+        if crate::classloader::object_extends(ctx, loader, "java/net/URLClassLoader")
+            || !crate::classloader::is_builtin_loader_class(&loader_class_name)
+        {
+            let pin = ctx.pin_native_root(loader);
+            let name_arg = Value::Object(Some(ctx.create_string(&resource_name)));
+            let loader = ctx.read_native_pin(pin, loader);
+            ctx.unpin_native_roots(pin);
+            return ctx.invoke_virtual(
+                loader,
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+                &[name_arg],
+            );
+        }
+    }
     // A package-directory resource has a URL but no byte content to read.
     // In particular, `SomeClass.class.getResourceAsStream("")` resolves to
     // `SomeClass`'s package directory and HotSpot returns a non-null stream.
@@ -1322,6 +1352,31 @@ pub(crate) fn native_class_get_resource(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
+
+    // T24 delegation fix: see the identical block in
+    // native_class_get_resource_as_stream for the full rationale -- a
+    // genuine user-defined (non-builtin) ClassLoader must have its own
+    // getResource override consulted, not just the static -cp scan below.
+    if let Ok(Some(Value::Object(Some(loader)))) =
+        native_class_get_class_loader(ctx, &[Value::Object(Some(this))])
+    {
+        let loader_class_id = ctx.class_id_of_object(loader);
+        let loader_class_name = ctx.class_name_of_id(loader_class_id).unwrap_or_default();
+        if crate::classloader::object_extends(ctx, loader, "java/net/URLClassLoader")
+            || !crate::classloader::is_builtin_loader_class(&loader_class_name)
+        {
+            let pin = ctx.pin_native_root(loader);
+            let name_arg = Value::Object(Some(ctx.create_string(&resource_name)));
+            let loader = ctx.read_native_pin(pin, loader);
+            ctx.unpin_native_roots(pin);
+            return ctx.invoke_virtual(
+                loader,
+                "getResource",
+                "(Ljava/lang/String;)Ljava/net/URL;",
+                &[name_arg],
+            );
+        }
+    }
 
     // Prefer the structured URL (jar:file:/... or jrt:/... or file:/...) so
     // getResource returns a URL whose `toURI()`/`new File(...)` round-trip
@@ -14657,7 +14712,11 @@ pub(crate) fn native_class_get_package(
     // HotSpot. `Class.getModule()` already returns a valid (unnamed) module.
     let module_val = match ctx.invoke_virtual(this, "getModule", "()Ljava/lang/Module;", &[]) {
         Ok(Some(v @ Value::Object(Some(_)))) => v,
-        _ => Value::Object(None),
+        // `getModule()` can still answer null for a mirror with no class-store
+        // entry (synthetic lambda proxies, hand-built test mirrors). Leaving
+        // `module` unset is never acceptable -- see `canonical_unnamed_module`
+        // -- so fall back to the canonical unnamed module.
+        _ => Value::Object(Some(canonical_unnamed_module(ctx))),
     };
     if matches!(module_val, Value::Object(Some(_))) {
         let pkg = ctx.read_native_pin(pkg_pin, pkg);
@@ -14753,6 +14812,60 @@ pub(crate) fn i2_classloader_get_defined_packages(
     Ok(Some(Value::Object(Some(empty))))
 }
 
+/// The single canonical **unnamed** `java.lang.Module` mirror for this VM.
+///
+/// Every application-classpath class reports the unnamed module from
+/// `Class.getModule()`, and the JDK compares `Module`s by identity (it has no
+/// `equals` override), so there must be exactly ONE such object. The
+/// `Class.getModule()` override in `lib.rs::register_essential_natives` already
+/// publishes it under the `None` module-name key; this helper is that same
+/// get-or-create, exposed so the `java.lang.Package` builders below and
+/// `ClassLoader.getUnnamedModule()` can all hand back the same instance.
+///
+/// Why every synthesised `Package` MUST carry a non-null `module`: real
+/// `Package.getPackageInfo()` (JDK 25, `Package.java:417`) does
+/// `module().getClassLoader()` with no null check, so a module-less `Package`
+/// NPEs the instant anything asks it for an annotation. TestNG's
+/// `IgnoreListener.findAnnotation(Package)` walks a test class's package chain
+/// with the deprecated static `Package.getPackage(String)` ->
+/// `ClassLoader.getPackage` -> `getDefinedPackage` (overridden below), which
+/// returned exactly such a module-less `Package` -- taking out TestNG-engine
+/// discovery for the whole `org.springframework.test.context.testng` package
+/// with `JUnitException: TestEngine with ID 'testng' failed to discover tests`.
+///
+/// `loader` is wired to the application class loader because that is what
+/// HotSpot reports for an unnamed module (`Module.getClassLoader()` returns the
+/// defining loader, never null, for the classpath's unnamed module). Besides
+/// matching the JDK, it makes `getPackageInfo()`'s
+/// `Class.forName(<pkg>.package-info, false, loader)` resolve against the
+/// classpath instead of the bootstrap loader, so package-level annotations
+/// (JSpecify `@NullMarked`, TestNG `@Ignore`, ...) are actually visible on a
+/// `Package` obtained through any path other than `Class.getPackage()`.
+pub(crate) fn canonical_unnamed_module(ctx: &mut dyn NativeContext) -> ObjectRef {
+    if let Some(cached) = ctx.get_cached_module_mirror(None) {
+        return cached;
+    }
+    let m = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+    let pin = ctx.pin_native_root(m);
+    // Unnamed: BOTH the synthetic 2-field contract's slot 0 and the real
+    // `name` field stay null, so `Module.isNamed()` reports false whichever
+    // shape the reader assumes (see `module_name_of_mirror` in `lib.rs`).
+    ctx.set_field(m, 0, Value::Object(None));
+    ctx.set_field_by_name(m, "name", Value::Object(None));
+    // `get_or_create_app_loader` allocates (and can therefore move `m`), so
+    // re-read the pin before the write. It is a Rust-side singleton with no
+    // path back into `Class.getModule()`, so there is no re-entrancy here.
+    let loader = crate::classloader::get_or_create_app_loader(ctx);
+    let m = ctx.read_native_pin(pin, m);
+    ctx.set_field_by_name(m, "loader", Value::Object(Some(loader)));
+    ctx.unpin_native_roots(pin);
+    // Publish so `Class.getModule()`, `ClassLoader.getUnnamedModule()` and the
+    // Package builders all observe one identity. The VM keeps the cached
+    // mirror as a permanent GC root.
+    ctx.cache_module_mirror(None, m);
+    m
+}
+
 /// Internal helper: synthesise a `java/lang/Package` whose `name` slot is
 /// set to the requested package name (dotted). Mirrors the layout used by
 /// `native_class_get_package` so callers that subsequently invoke
@@ -14764,6 +14877,31 @@ fn i2_alloc_synthetic_package(ctx: &mut dyn NativeContext, name: &str) -> Object
     let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.set_field(pkg, 0, Value::Object(Some(name_str)));
     ctx.set_field_by_name(pkg, "name", Value::Object(Some(name_str)));
+    // Always wire a non-null `module`. Real `Package.getPackageInfo()` derefs
+    // it unconditionally, so a module-less Package is a latent NPE for every
+    // `getAnnotation` / `getDeclaredAnnotations` / `isAnnotationPresent` caller
+    // -- see `canonical_unnamed_module` for the TestNG-discovery blowup this
+    // caused. Callers that KNOW the real module (`definePackage(String,Module)`,
+    // `getNamedPackage`) overwrite this immediately after.
+    let module = canonical_unnamed_module(ctx);
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
+    ctx.set_field_by_name(pkg, "module", Value::Object(Some(module)));
+    // Same reasoning for `versionInfo`: the real `Package(String, Module)`
+    // constructor always stores `Package$VersionInfo.NULL_VERSION_INFO`, and
+    // `getSpecificationTitle()` / `getImplementationVersion()` / `isSealed()`
+    // all deref it without a null check. `native_class_get_package` already
+    // does this; the ClassLoader-side builders did not, so a Package reached
+    // through `Package.getPackage(String)` NPEd on those accessors.
+    if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
+        if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
+            let null_version_info = ctx.get_static_field(vi_cid, idx);
+            if matches!(null_version_info, Value::Object(Some(_))) {
+                let pkg = ctx.read_native_pin(pkg_pin, pkg);
+                ctx.set_field_by_name(pkg, "versionInfo", null_version_info);
+            }
+        }
+    }
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.unpin_native_roots(pkg_pin);
     pkg
 }
@@ -14929,6 +15067,15 @@ fn native_package_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if this.as_ptr() == other.as_ptr() {
         return Ok(Some(Value::Int(1)));
     }
+    // `equals(Object)` takes ANY object: without this class check a non-Package
+    // argument whose slot 0 happens to hold a String equal to our package name
+    // would compare equal. (This check lived only in a second, duplicate
+    // `Package.equals` registration that the registry's last-registration-wins
+    // rule silently shadowed with this body -- see the registration site.)
+    let other_cid = ctx.class_id_of_object(other);
+    if ctx.class_name_of_id(other_cid).unwrap_or_default() != "java/lang/Package" {
+        return Ok(Some(Value::Int(0)));
+    }
     let this_name = package_name_from_package_obj(ctx, this);
     let other_name = package_name_from_package_obj(ctx, other);
     Ok(Some(Value::Int(
@@ -15010,39 +15157,13 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
     // equal, where HotSpot's interned-per-loader objects would not), but it
     // fixes the common case without the GC-safety complexity of interning
     // `Package` objects in a side-table (cf. `system_props_singleton`).
-    r.register(
-        "java/lang/Package",
-        "equals",
-        "(Ljava/lang/Object;)Z",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            let other = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            if this == other {
-                return Ok(Some(Value::Int(1)));
-            }
-            let other_cid = ctx.class_id_of_object(other);
-            let other_class_name = ctx.class_name_of_id(other_cid).unwrap_or_default();
-            if other_class_name != "java/lang/Package" {
-                return Ok(Some(Value::Int(0)));
-            }
-            let this_name = ctx.get_field_by_name(this, "name");
-            let other_name = ctx.get_field_by_name(other, "name");
-            let eq = match (this_name, other_name) {
-                (Value::Object(Some(a)), Value::Object(Some(b))) => {
-                    ctx.read_string(a).unwrap_or_default() == ctx.read_string(b).unwrap_or_default()
-                }
-                (Value::Object(None), Value::Object(None)) => true,
-                _ => false,
-            };
-            Ok(Some(Value::Int(eq as i32)))
-        },
-    );
+    //
+    // Registered ONCE. There used to be two `Package.equals` registrations
+    // here -- an inline closure with the class check, immediately followed by
+    // `native_package_equals` without it. `NativeMethodRegistry::register` is
+    // last-registration-wins, so the closure (and its class check) was dead
+    // code from the moment it was written. The check now lives in
+    // `native_package_equals` itself; do not re-add a second registration.
     r.register(
         "java/lang/Package",
         "equals",
@@ -16089,6 +16210,67 @@ pub(crate) fn native_class_get_nest_host(
 /// nest" fallback below, even for classes that do belong to a larger nest.
 /// The returned array always includes `this` (JDK contract), plus the host
 /// and every other resolved member.
+/// Resolve `name` through `this_args[0]`'s own defining `ClassLoader`
+/// FIRST, falling back to the global loader-blind `class_id_by_name` only
+/// when no Java-level loader object is available (bootstrap-loaded `this`)
+/// or the loader invocation fails.
+///
+/// **Why loader-first, not loader-as-fallback:** the previous ordering
+/// (global lookup first, own-loader `loadClass` only on a miss) silently
+/// accepted WHICHEVER loader in the process happened to already have a
+/// same-named class loaded — correct for the overwhelmingly common
+/// single-loader-per-name case, but wrong under any isolating/forked test
+/// classloader (e.g. JUnit5's `ModifiedClassPathExtension`'s
+/// `ModifiedClassPathClassLoader`, or Spring's `@ClassPathExclusions`).
+/// There, a same-named class legitimately exists as two distinct,
+/// reference-INEQUAL `Class` objects — one per loader — and JVMS requires
+/// nest members / permitted subclasses to resolve relative to the SAME
+/// defining loader as the nest host / sealed class asking. Silently
+/// handing back an unrelated loader's copy breaks identity-sensitive
+/// callers downstream (`HashMap<Class<?>, V>` keyed by one of these
+/// classes, `==` comparisons) with no visible error — exactly the
+/// `DialectOverridesAnnotationHelper.OVERRIDE_MAP` miss this was found
+/// through (see the redis-hangs known-issues doc's residual section).
+///
+/// This isn't a fast/slow-path split: `ClassLoader.loadClass` itself
+/// checks `findLoadedClass` before delegating/defining, so calling it on
+/// an already-loaded class is cheap — always asking "the right loader"
+/// costs no more than asking "any loader" did.
+fn resolve_nestmate_via_defining_loader(
+    ctx: &mut dyn NativeContext,
+    this_args: &[Value],
+    name: &str,
+    loader_obj: &mut Option<ObjectRef>,
+    loader_resolved: &mut bool,
+) -> Option<ClassId> {
+    if !*loader_resolved {
+        *loader_resolved = true;
+        *loader_obj = match native_class_get_class_loader(ctx, this_args) {
+            Ok(Some(Value::Object(Some(l)))) => Some(l),
+            _ => None,
+        };
+    }
+    if let Some(loader) = *loader_obj {
+        let dotted = name.replace('/', ".");
+        let name_obj = ctx.create_string(&dotted);
+        if let Ok(Some(Value::Object(Some(mirror_obj)))) = ctx.invoke_virtual(
+            loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name_obj))],
+        ) {
+            if let Some(id) = ctx.class_id_from_mirror(mirror_obj) {
+                return Some(id);
+            }
+        }
+    }
+    // No Java-level loader object (bootstrap-loaded `this`) or the
+    // invocation failed/threw — global lookup is the best available
+    // fallback, and is safe here since a null loader means isolation
+    // cannot be in play to begin with.
+    ctx.class_id_by_name(name)
+}
+
 pub(crate) fn native_class_get_nest_members(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -16103,43 +16285,22 @@ pub(crate) fn native_class_get_nest_members(
         }
     };
 
-    // Lazily resolved on cache miss, same pattern as
-    // `native_class_get_permitted_subclasses`: nest members are commonly
-    // annotation-only or otherwise-untouched nested types that nothing
-    // else has caused to load yet, so a passive `class_id_by_name`
-    // registry lookup silently drops any member not already loaded —
     // `this` class's own defining loader is authoritative for resolving
-    // its nestmates (compiled together, always visible to that loader).
+    // its nestmates (compiled together, always visible to that loader) —
+    // see `resolve_nestmate_via_defining_loader`'s doc comment for why
+    // this must be tried BEFORE any loader-blind global lookup, not after.
     let mut loader_obj: Option<ObjectRef> = None;
     let mut loader_resolved = false;
 
     let host_class_id = match ctx.nest_host_name(class_id) {
-        Some(host_name) => ctx
-            .class_id_by_name(&host_name)
-            .or_else(|| {
-                if !loader_resolved {
-                    loader_resolved = true;
-                    loader_obj = match native_class_get_class_loader(ctx, args) {
-                        Ok(Some(Value::Object(Some(l)))) => Some(l),
-                        _ => None,
-                    };
-                }
-                let loader = loader_obj?;
-                let dotted = host_name.replace('/', ".");
-                let name_obj = ctx.create_string(&dotted);
-                match ctx.invoke_virtual(
-                    loader,
-                    "loadClass",
-                    "(Ljava/lang/String;)Ljava/lang/Class;",
-                    &[Value::Object(Some(name_obj))],
-                ) {
-                    Ok(Some(Value::Object(Some(mirror_obj)))) => {
-                        ctx.class_id_from_mirror(mirror_obj)
-                    }
-                    _ => None,
-                }
-            })
-            .unwrap_or(class_id),
+        Some(host_name) => resolve_nestmate_via_defining_loader(
+            ctx,
+            args,
+            &host_name,
+            &mut loader_obj,
+            &mut loader_resolved,
+        )
+        .unwrap_or(class_id),
         None => class_id,
     };
 
@@ -16154,29 +16315,13 @@ pub(crate) fn native_class_get_nest_members(
         let host_mirror = ctx.get_class_mirror(host_class_id);
         let mut mirrors: Vec<ObjectRef> = vec![host_mirror];
         for member_name in &members {
-            let resolved = ctx.class_id_by_name(member_name).or_else(|| {
-                if !loader_resolved {
-                    loader_resolved = true;
-                    loader_obj = match native_class_get_class_loader(ctx, args) {
-                        Ok(Some(Value::Object(Some(l)))) => Some(l),
-                        _ => None,
-                    };
-                }
-                let loader = loader_obj?;
-                let dotted = member_name.replace('/', ".");
-                let name_obj = ctx.create_string(&dotted);
-                match ctx.invoke_virtual(
-                    loader,
-                    "loadClass",
-                    "(Ljava/lang/String;)Ljava/lang/Class;",
-                    &[Value::Object(Some(name_obj))],
-                ) {
-                    Ok(Some(Value::Object(Some(mirror_obj)))) => {
-                        ctx.class_id_from_mirror(mirror_obj)
-                    }
-                    _ => None,
-                }
-            });
+            let resolved = resolve_nestmate_via_defining_loader(
+                ctx,
+                args,
+                member_name,
+                &mut loader_obj,
+                &mut loader_resolved,
+            );
             if let Some(member_id) = resolved {
                 if member_id != host_class_id {
                     mirrors.push(ctx.get_class_mirror(member_id));
@@ -16347,37 +16492,21 @@ pub(crate) fn native_class_get_permitted_subclasses(
 
     let subs = ctx.permitted_subclasses(class_id);
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, subs.len());
-    // Lazily resolved on first cache miss: the same ClassLoader that defines
-    // `this` sealed class is authoritative for resolving its own permitted
-    // subclasses (they are compiled together, always visible to that
-    // loader). Reuses `native_class_get_class_loader`'s existing
-    // defining-loader / app-loader-fallback resolution so both plain
-    // single-loader apps (the common case) and isolating/forked test
-    // loaders get the SAME loader's copy as `this`.
+    // The same ClassLoader that defines `this` sealed class is authoritative
+    // for resolving its own permitted subclasses (they are compiled
+    // together, always visible to that loader) — see
+    // `resolve_nestmate_via_defining_loader`'s doc comment for why this must
+    // be tried BEFORE any loader-blind global lookup, not after.
     let mut loader_obj: Option<ObjectRef> = None;
     let mut loader_resolved = false;
     for (i, sub_name) in subs.iter().enumerate() {
-        let resolved = ctx.class_id_by_name(sub_name).or_else(|| {
-            if !loader_resolved {
-                loader_resolved = true;
-                loader_obj = match native_class_get_class_loader(ctx, args) {
-                    Ok(Some(Value::Object(Some(l)))) => Some(l),
-                    _ => None,
-                };
-            }
-            let loader = loader_obj?;
-            let dotted = sub_name.replace('/', ".");
-            let name_obj = ctx.create_string(&dotted);
-            match ctx.invoke_virtual(
-                loader,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;",
-                &[Value::Object(Some(name_obj))],
-            ) {
-                Ok(Some(Value::Object(Some(mirror_obj)))) => ctx.class_id_from_mirror(mirror_obj),
-                _ => None,
-            }
-        });
+        let resolved = resolve_nestmate_via_defining_loader(
+            ctx,
+            args,
+            sub_name,
+            &mut loader_obj,
+            &mut loader_resolved,
+        );
         if let Some(sub_id) = resolved {
             let mirror = ctx.get_class_mirror(sub_id);
             ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
