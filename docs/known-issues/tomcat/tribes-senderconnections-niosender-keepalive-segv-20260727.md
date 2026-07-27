@@ -78,15 +78,34 @@ reference was already dangling on the interpreter operand stack — a missing
 root, not staleness after a move.
 
 **The JIT is required.** `--nojit`: **16 runs, 0 crashes.** Every crash report
-carries `jit: guarded compiled frames live process-wide: YES` together with
-`gc young-gen policy: non-moving (STW mark-sweep young)` — a young sweep running
-while JIT frames are live and conservatively scanned (the BUG-03
-forcibly-stopped-peer path). Something an interpreter frame owns is missing from
-that root set.
+also carries `gc young-gen policy: non-moving (STW mark-sweep young)`. Note the
+JIT-frame state is *not* constant: some reports say
+`jit: guarded compiled frames live process-wide: YES (quiescence depth=4)` and
+others `no (quiescence depth=0)`, so "a sweep caught peers inside JIT code" is
+**not** a sufficient description — compiled code merely has to have run.
 
 This is most likely the long-running "JIT corruptor" family rather than a new
 bug; compare `reference_osr_main_corruptor` (many apparent JIT corruptors are
 really the non-moving young sweep) and the fork6 GC-stress corruption notes.
+
+### Already ruled out
+
+**The RBC.6 precise-handler-frame re-gating does not fix this.** Dev's
+`f09c9dff1` / `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`
+describes a very similar shape (a live local dropped from a reconstructed
+handler frame is a root the collector cannot see, JIT-only, needs a GC at the
+wrong moment) and closes the gate by default. Rebuilding on top of it changes
+nothing here: **24 runs, 4 crashes**, at `load_and_forward` (×2) and
+`invoke_on_class_shared_inner` (×2). Worth knowing before spending a build on
+that hypothesis again.
+
+Crash counts across the three builds, 24 runs each, 4-way parallel:
+
+| build | CRASH | other non-PASS |
+|---|---|---|
+| dev `39b1258fa` | 4 (3 of them `run_finalizers`) | 4 |
+| + finalizable-roots fix | 6 (0 `run_finalizers`) | 1 |
+| + latest dev incl. the RBC.6 re-gate | 4 | 1 |
 
 ### Where to pick it up
 
