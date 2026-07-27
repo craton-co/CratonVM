@@ -163,7 +163,7 @@ public class BnfProbe {
 ```
 
 ## Related
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md` — the fix that exposed this.
+- The `HttpURLConnection` keep-alive-pooling fix (2026-07-xx, since archived) is what first let this NPE get exposed at all — it unblocked the suite run far enough to reach `TestWeb.testWebApp()`.
 - `apps/h2database/h2/src/main/org/h2/bnf/RuleElement.java`, `RuleList.java`, `Bnf.java` — where the NPE originates.
 - `apps/h2database/h2/src/main/org/h2/server/web/WebSession.java:119` (`loadBnf`) — where it's silently swallowed.
 

@@ -15593,6 +15593,53 @@ fn execute_instruction(
                     }
                 }
             } // end `if any_field_diag()` — consolidated getfield diagnostics
+            // Read side of the [PUTFIELD-WATCH] ledger further down: with both
+            // halves on one filter a "the constructor stored it but the reader
+            // sees null" question is answerable from a single log, without
+            // guessing which of the two sides is wrong. Same class filter
+            // (`CRATONVM_DBG_FIELD_WATCH=<substr>[,<substr>…]`).
+            if crate::runtime::env_cache::dbg_field_watch() {
+                let decl_name = shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(field.declaring_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                if crate::runtime::env_cache::field_watch_class_matches(&format!(
+                    "{}.{}",
+                    decl_name,
+                    field_name.as_deref().unwrap_or("?")
+                )) {
+                    let watched = if field.is_volatile {
+                        shared
+                            .mem
+                            .heap
+                            .get_field_volatile(obj_ref, field.field_index)
+                    } else {
+                        shared.mem.heap.get_field(obj_ref, field.field_index)
+                    };
+                    let fr = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[GETFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} value={:?} in {}.{} pc={} thread={}",
+                        obj_ref.as_ptr(),
+                        decl_name,
+                        field_name,
+                        field.field_index,
+                        watched,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
+                        thread.thread_id.0,
+                    );
+                    // A watched field almost always raises a "who did this?"
+                    // question next, and the answer is the Java call chain.
+                    for f in thread.frames.iter().rev().take(24) {
+                        eprintln!("    at {}.{} pc={}", f.class_name(), f.method_name(), f.pc);
+                    }
+                }
+            }
               // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
               // records only is_reference/is_volatile, so we re-read the first
               // byte of the descriptor from the constant pool to choose the
@@ -16131,16 +16178,31 @@ fn execute_instruction(
                     .get_class(field.declaring_class_id)
                     .map(|c| c.name.to_string())
                     .unwrap_or_default();
-                if decl_name.contains("Page") || decl_name.contains("RootReference") {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                if crate::runtime::env_cache::field_watch_class_matches(&format!(
+                    "{}.{}",
+                    decl_name,
+                    field_name.as_deref().unwrap_or("?")
+                )) {
+                    let fr = &thread.frames[frame_idx];
                     eprintln!(
-                        "[PUTFIELD-WATCH] obj={:p} decl_class={} field_index={} old={:?} new={:?} thread={}",
+                        "[PUTFIELD-WATCH] obj={:p} decl_class={} field={:?} field_index={} old={:?} new={:?} in {}.{} pc={} thread={}",
                         obj_ref.as_ptr(),
                         decl_name,
+                        field_name,
                         field.field_index,
                         old_value,
                         value,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.pc,
                         thread.thread_id.0,
                     );
+                    // A watched field almost always raises a "who did this?"
+                    // question next, and the answer is the Java call chain.
+                    for f in thread.frames.iter().rev().take(24) {
+                        eprintln!("    at {}.{} pc={}", f.class_name(), f.method_name(), f.pc);
+                    }
                 }
             }
             if field.is_volatile {
@@ -20119,7 +20181,7 @@ fn retarget_instance_field_to_receiver(
                 .get_class(receiver_class_id)
                 .map(|c| c.name.to_string())
                 .unwrap_or_default();
-            if decl_name.contains("Page") || decl_name.contains("RootReference") {
+            if crate::runtime::env_cache::field_watch_class_matches(&decl_name) {
                 eprintln!(
                     "[RETARGET-SKIP] cp_index={} cached_decl={}({:?}) actual_recv={}({:?}) cached_field_index={} loader_initiated_gate=false",
                     cp_index, decl_name, field.declaring_class_id, recv_name, receiver_class_id, field.field_index
@@ -20148,7 +20210,7 @@ fn retarget_instance_field_to_receiver(
     }
 
     let dbg = crate::runtime::env_cache::dbg_field_watch()
-        && (resolved_decl.name.contains("Page") || resolved_decl.name.contains("RootReference"));
+        && crate::runtime::env_cache::field_watch_class_matches(&resolved_decl.name);
     let cached_field_index = field.field_index;
     let cached_decl_name = resolved_decl.name.to_string();
     let recv_name_for_dbg = receiver_class.name.to_string();
@@ -21150,8 +21212,16 @@ fn execute_invoke_kind(
             args.get(1).map(describe).unwrap_or_default(),
         );
     }
+    // Register the freshly constructed receiver with the software watchpoint
+    // ONLY when its class is in the watch filter. Registering every
+    // constructed object (the original shape) makes each heap field write take
+    // the watch mutex and scan the registry, and buries the interesting lines
+    // under millions of unrelated ones — the flag was effectively unusable on
+    // anything larger than the H2 repro it was written for.
     if let Value::Object(Some(o)) = &args[0] {
-        cratonvm_types::field_watch::watch(*o);
+        if crate::runtime::env_cache::field_watch_class_matches(&method_class_name) {
+            cratonvm_types::field_watch::watch(*o);
+        }
     }
     if crate::runtime::env_cache::dbg_loader_trace()
         && method_class_name.contains("RootReference")
@@ -21185,8 +21255,16 @@ fn execute_invoke_kind(
             args.get(3).map(describe).unwrap_or_default(),
         );
     }
+    // Register the freshly constructed receiver with the software watchpoint
+    // ONLY when its class is in the watch filter. Registering every
+    // constructed object (the original shape) makes each heap field write take
+    // the watch mutex and scan the registry, and buries the interesting lines
+    // under millions of unrelated ones — the flag was effectively unusable on
+    // anything larger than the H2 repro it was written for.
     if let Value::Object(Some(o)) = &args[0] {
-        cratonvm_types::field_watch::watch(*o);
+        if crate::runtime::env_cache::field_watch_class_matches(&method_class_name) {
+            cratonvm_types::field_watch::watch(*o);
+        }
     }
     // Spring's loader-fork test infrastructure can expose two physical copies
     // of this private enum while representing one logical annotation operation.
@@ -41220,8 +41298,11 @@ fn execute_invokevirtual_cached(
                     args_slice.get(1).map(describe).unwrap_or_default(),
                 );
             }
+            // Same class-filter gate as the slow path above.
             if let Value::Object(Some(o)) = &args_slice[0] {
-                cratonvm_types::field_watch::watch(*o);
+                if crate::runtime::env_cache::field_watch_class_matches(&cached.class_name) {
+                    cratonvm_types::field_watch::watch(*o);
+                }
             }
             if crate::runtime::env_cache::dbg_loader_trace()
                 && cached.class_name.contains("RootReference")
@@ -41255,8 +41336,11 @@ fn execute_invokevirtual_cached(
                     args_slice.get(3).map(describe).unwrap_or_default(),
                 );
             }
+            // Same class-filter gate as the slow path above.
             if let Value::Object(Some(o)) = &args_slice[0] {
-                cratonvm_types::field_watch::watch(*o);
+                if crate::runtime::env_cache::field_watch_class_matches(&cached.class_name) {
+                    cratonvm_types::field_watch::watch(*o);
+                }
             }
 
             if let Some(res) = intercept_classloader_set_default_assertion_status(

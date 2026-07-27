@@ -85,3 +85,29 @@ where `AttributesImpl` cannot compile at all.
   under; now removed.
 - `docs/known-issues/repros/jitban-remaining-20260726/JaxbQNameProbe.java` —
   the reproducer, kept as the regression witness for all three.
+
+---
+
+## Fixing commit (added 2026-07-27 by a second session)
+
+"Does not reproduce on dev" above now has an exact attribution:
+**`82b78bca5` — "fix(jit): String field intrinsics read compact primitive
+fields 4 bytes high"** (2026-07-26 13:14 UTC).
+
+Bisected with this doc's own reproducer (`JaxbQNameProbe`, real
+`jakarta.xml.bind` / `org.glassfish.jaxb` 4.0.7, JDK 25): dev `95e4d9929`
+(07-26 12:15Z) fails deterministically at iteration 27 with the documented
+shape — `< ="w27"><>type5_27</>…</>` — and dev `82b78bca5` and every later
+tree is clean.
+
+This confirms the correction stated above: `Writer.write(char[])` was never
+miscompiled. The JIT's `java/lang/String` field intrinsic read the primitive
+`coder`/`hash` field four bytes above its real offset on a compact-layout
+`String`, so the *name* strings were already empty by the time they reached
+the write. That is also why `CRATONVM_JIT_BISECT_ONLY=java/io/Writer` still
+reproduced — the intrinsic fires inside `Writer`'s own compiled body — and why
+`BISECT_SKIP=java/io/Writer.write` cleared it without the defect being in
+`write`.
+
+The same commit is the root cause of the `org/glassfish/jaxb/` JIT ban; see
+`jaxb-jit-ban-removed-20260727.md` in this directory.

@@ -906,7 +906,9 @@ fn should_skip_jit_internal(
     // every configuration. No longer reproduces on current dev.
     // `JettyWsIoProbe.java` is the regression witness.
 
-    // HIB-LONGTAIL.1 (2026-07-15, narrowed 2026-07-20): Hibernate's H2-backed
+    // HIB-LONGTAIL.1 (2026-07-15; narrowed 2026-07-20, again 2026-07-27 — it
+    // covers `org/h2/` ONLY now, see the removal note just above the `if`):
+    // Hibernate's H2-backed
     // collection loading runs correctly in the interpreter, but JITting the H2
     // SQL/MVStore and ANTLR-runtime together turned ordinary 9-second HotSpot
     // tests into multi-minute CratonVM runs. Originally this also blanket-banned
@@ -993,15 +995,26 @@ fn should_skip_jit_internal(
     // Full evidence, repro commands and the residual-4 measurement:
     // `docs/known-issues/h2/h2-jitban-residuals-20260726.md`.
     //
-    // The `org/antlr/v4/runtime/` half is NOT held by any of that — the H2
-    // suite never exercises ANTLR. A concurrent session isolated it against
-    // Hibernate ORM's own HQL suite (which does, heavily) and came back clean;
-    // see `docs/known-issues/hib-antlr-1-removed-shadowed-20260726.md`. That
-    // half is the better-evidenced candidate for narrowing this rule.
-    if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
-        || (class_name.starts_with("org/antlr/v4/runtime/")
-            && !package_allowed("org/antlr/v4/runtime/", allow_packages))
-    {
+    // 2026-07-27: the `org/antlr/v4/runtime/` half is REMOVED — this rule is
+    // now `org/h2/` only. Nothing above ever held the ANTLR half: every piece
+    // of evidence this ban still rests on comes from the H2 suite, which never
+    // loads an `org/antlr/` class at all (the H2 parser is hand-written). The
+    // ANTLR half was isolated against the one real fixture that does exercise
+    // it heavily — Hibernate ORM 8.0's own HQL suite, where every query goes
+    // through `org/antlr/v4/runtime/` — as a same-binary A/B over all 57
+    // `org.hibernate.orm.test.hql` classes with `org/hibernate/` still banned
+    // (HIB-TEMPORAL.1) so ANTLR was the only variable: byte-identical
+    // per-class ok/failed/aborted counts, 0 failures either way, and the
+    // ban-removed binary re-confirmed the same. That also covers this rule's
+    // ancestor claim (HIB-ANTLR.1: a JIT-compiled parse leaving
+    // `ATNState.transitions` null and corrupting the *next* parse in the same
+    // process) — CratonRunner runs every class in one process, so hundreds of
+    // consecutive HQL parses shared one ATN, and nothing degraded.
+    // Evidence: `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`.
+    // The narrow `PredictionContext` equality/hash guard
+    // (`is_antlr_prediction_context_miscompile`, ANTLR-COLDPATH.1 below) is
+    // unaffected and still applies to both the shaded and unshaded runtimes.
+    if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }
 
@@ -1886,13 +1899,19 @@ fn should_skip_jit_internal(
         // needed via a real 218-class H2 suite run finding a
         // "Schema not found" DB-reconnect corruption -- a different,
         // reconnect-specific trigger this HQL-parsing test batch does not
-        // exercise). This removal is therefore redundant/shadowed, not an
-        // independent unban: default (Conservative) behavior for
-        // org/antlr/v4/runtime/ classes is UNCHANGED -- they stay
-        // interpreted via HIB-LONGTAIL.1 regardless. Same pattern as
-        // SPRINGBOOT-WITHOUT-JACKSON.2s removal earlier this session. The
-        // real, positive, non-shadowed finding here is narrower: this
-        // bans own specific correctness claim no longer reproduces.
+        // exercise). At the time this check was deleted it was therefore a
+        // redundant/shadowed removal, not an independent unban -- default
+        // (Conservative) behavior for org/antlr/v4/runtime/ classes was
+        // UNCHANGED, they stayed interpreted via HIB-LONGTAIL.1 regardless.
+        //
+        // 2026-07-27 FOLLOW-UP: that shadow is gone. HIB-LONGTAIL.1 was
+        // narrowed to `org/h2/` only (see its own comment above), on a
+        // same-binary A/B over all 57 org.hibernate.orm.test.hql classes
+        // plus a ban-removed rebuild. org/antlr/v4/runtime/ is now genuinely
+        // JIT-eligible under Conservative; only the narrow
+        // is_antlr_prediction_context_miscompile guard (ANTLR-COLDPATH.1)
+        // still forces specific PredictionContext methods to the
+        // interpreter, in both the shaded and unshaded runtimes.
 
         // SPB.6 (Session 113 r1) — provisional blanket ban for the
         // Netflix Eureka discovery client. `com/netflix/discovery/
@@ -1956,24 +1975,37 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SPB.8b (Session 113 r2) — companion blanket ban for the WildFly
-        // server boot path (`org/jboss/as/`). Once JBoss Modules is
-        // unblocked by SPB.8, the next downstream consumer is the JBoss AS
-        // server bootstrap (`org/jboss/as/server`, `org/jboss/as/controller`,
-        // `org/jboss/as/jmx`, etc.), which exhibits the same
-        // allocate-then-putfield pattern: `ServerLogger_$logger_en_US`
-        // ctors store i18n message slots, `PluggableMBeanServerImpl`
-        // delegates allocate fresh `Subject` / `ClassLoader` references
-        // per invocation, and `ServerEnvironment.<init>` resolves dozens
-        // of `-Djboss.*` properties via `Long.parseLong` /
-        // `Boolean.parseBoolean`. Pre-emptive to avoid a second iteration
-        // if the next gap surfaces in this layer. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/`.
-        if class_name.starts_with("org/jboss/as/")
-            && !package_allowed("org/jboss/as/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.8b — `org/jboss/as/` blanket ban REMOVED 2026-07-27.
+        //
+        // Added Session 113 r2 as a pre-emptive companion to SPB.8 (never
+        // driven by a failure of its own), then re-confirmed on 2026-07-26 by
+        // a real `standalone.sh` boot that died on
+        // `NullPointerException: ... "this.validTypes" is null` in
+        // `ModelTypeValidator` with the ban lifted and JIT on, and booted with
+        // the ban lifted and `--nojit` — a differential that read as a JIT
+        // miscompile. It was not one. The NPE was a *consequence* of the boot
+        // being torn down mid-flight: `Runtime.addShutdownHook` was a no-op
+        // stub, so WildFly's `BootstrapImpl$ShutdownHook` — which holds the MSC
+        // `ServiceContainer` — became unreachable the moment `Main.main`
+        // returned, MSC 1.5's leak-detector `Cleaner` called
+        // `container.shutdown()`, and `AbstractControllerService.stop` reset
+        // `controller` to null under the still-running boot thread. WHEN that
+        // collection happened depended on GC timing, which the JIT changes;
+        // hence the clean-looking `--nojit` differential.
+        //
+        // With that root fixed (plus the `HashSet.addAll(<foreign
+        // open-addressed set>)` null-hole fix that unmasked the boot's own
+        // failure reporting), WildFly 32.0.1.Final boots to `WFLYSRV0026` with
+        // this package JIT-compiled, at the same rate as with the ban in place:
+        // 4/6 vs 5/6 over a 6+6 A/B on the Azure host, and every failure in
+        // BOTH arms is the same pre-existing flaky
+        // `NoSuchMethodError: java/lang/Object.hasNext()Z` from
+        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
+        // The full write-up (root causes, the A/B, and the per-package results
+        // for the four sibling bans, which stay in place) is the retired
+        // `modeltypevalidator-validtypes-npe` doc — archived with the rest of
+        // docs/internal. The residual it hands off to is
+        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
 
         // SPB.8c (Session 113 r2) — companion blanket ban for the WildFly
         // security-manager package (`org/wildfly/`). The
@@ -2533,21 +2565,34 @@ fn is_known_miscompile_clq_family(class_name: &str, method_name: &str) -> bool {
 }
 
 fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -> bool {
+    // Matched on the suffix so BOTH copies of the ANTLR 4 runtime are covered:
+    // Groovy's shaded `groovyjarjarantlr4/` fork (where the equality/hash
+    // miscompile was originally found) and the ordinary unshaded
+    // `org/antlr/v4/runtime/` artifact that Hibernate and Keycloak depend on.
+    // The two are the same bytecode under different package names, so the same
+    // 7 methods are at risk in both.
+    //
+    // The unshaded half used to be pinned to the interpreter only INCIDENTALLY,
+    // by HIB-LONGTAIL.1's second `org/antlr/v4/runtime/` prefix. That prefix
+    // was dropped 2026-07-27 (see its comment in `should_skip_jit_internal`)
+    // once a real Hibernate HQL A/B showed the broad ban was unnecessary --
+    // which would have silently un-pinned this narrow cluster too. Naming both
+    // prefixes here keeps the narrow, evidence-backed guard exactly as strong
+    // as it was while the broad package ban goes away. Mirrors what
+    // `is_antlr_prediction_context_native_override` (interpreter.rs) already
+    // does for the native-dispatch side.
+    let Some(rest) = class_name
+        .strip_prefix("groovyjarjarantlr4/v4/runtime/")
+        .or_else(|| class_name.strip_prefix("org/antlr/v4/runtime/"))
+    else {
+        return false;
+    };
     matches!(
-        (class_name, method_name),
-        (
-            "groovyjarjarantlr4/v4/runtime/atn/PredictionContext",
-            "calculateHashCode" | "hashCode"
-        ) | (
-            "groovyjarjarantlr4/v4/runtime/atn/PredictionContext$IdentityEqualityComparator",
-            "hashCode"
-        ) | (
-            "groovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext",
-            "equals" | "isEmpty" | "size"
-        ) | (
-            "groovyjarjarantlr4/v4/runtime/misc/ObjectEqualityComparator",
-            "equals"
-        )
+        (rest, method_name),
+        ("atn/PredictionContext", "calculateHashCode" | "hashCode")
+            | ("atn/PredictionContext$IdentityEqualityComparator", "hashCode")
+            | ("atn/SingletonPredictionContext", "equals" | "isEmpty" | "size")
+            | ("misc/ObjectEqualityComparator", "equals")
     )
 }
 
@@ -3687,36 +3732,54 @@ mod tests {
     }
 
     #[test]
-    fn hibernate_unshaded_antlr_runtime_stays_interpreted_via_hib_longtail_1() {
-        // HIB-ANTLR.1's own specific check was removed 2026-07-26 (see the
-        // removal comment above should_skip_jit_internal), but
-        // org/antlr/v4/runtime/ classes stay interpreted under Conservative
-        // regardless -- HIB-LONGTAIL.1 (a separate, still-active,
-        // already-confirmed-needed ban covering the same prefix) already
-        // catches them. This test now documents THAT shadowing relationship
-        // rather than HIB-ANTLR.1's own removed check.
-        assert_eq!(
-            check(
-                "org/antlr/v4/runtime/atn/ParserATNSimulator",
-                "computeTargetState",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "org/antlr/v4/runtime/ must still be interpreted under Conservative via HIB-LONGTAIL.1"
-        );
+    fn hibernate_unshaded_antlr_runtime_is_jit_eligible_after_hib_longtail_1_narrowing() {
+        // HIB-ANTLR.1's own check was removed 2026-07-26; the last thing still
+        // forcing org/antlr/v4/runtime/ to the interpreter was HIB-LONGTAIL.1's
+        // second prefix, dropped 2026-07-27 after a same-binary A/B over all 57
+        // org.hibernate.orm.test.hql classes (the only real fixture on record
+        // that parses HQL through this runtime) came back byte-identical, and a
+        // ban-removed rebuild re-confirmed it. Every remaining justification for
+        // HIB-LONGTAIL.1 comes from the H2 suite, which never loads an
+        // org/antlr/ class -- so the two halves were independent all along.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                    "computeTargetState",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/antlr/v4/runtime/ must be JIT-eligible now that HIB-LONGTAIL.1 is org/h2/-only"
+            );
+        }
+        // ...but the narrow PredictionContext equality/hash guard
+        // (ANTLR-COLDPATH.1) still covers the unshaded runtime too, and is
+        // deliberately not lifted by CRATONVM_JIT_ALLOW_PACKAGES.
         assert_eq!(
             check_with(
-                "org/antlr/v4/runtime/atn/ParserATNSimulator",
-                "computeTargetState",
+                "org/antlr/v4/runtime/atn/PredictionContext",
+                "calculateHashCode",
                 false,
                 true,
                 SkipPolicy::Conservative,
                 &["org/antlr/v4/runtime/"],
             ),
-            None,
-            "CRATONVM_JIT_ALLOW_PACKAGES=org/antlr/v4/runtime/ lifts HIB-LONGTAIL.1 (same prefix) too"
+            Some(SkipReason::RustJvmTestFixture),
+            "ANTLR-COLDPATH.1 still pins the PredictionContext cluster in the unshaded runtime"
+        );
+        // The org/h2/ half of HIB-LONGTAIL.1 is untouched by that narrowing.
+        assert_eq!(
+            check(
+                "org/h2/mvstore/MVStore",
+                "commit",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "org/h2/ must still be interpreted under Conservative via HIB-LONGTAIL.1"
         );
     }
 

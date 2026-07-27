@@ -6,9 +6,15 @@ set +e
 CP_FILE="$1"; shift
 OUT="$1"; shift
 CP="$(cat "$CP_FILE")"
-ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
+if [ -z "${ROOT:-}" ]; then
+    ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null)"
+    if [ -z "$ROOT" ]; then
+        echo "error: not inside a git checkout and \$ROOT is unset; set ROOT=<repo root>" >&2
+        exit 2
+    fi
+fi
 RJVM="${RJVM:-$ROOT/target/release/cratonvm.exe}"
-JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
+JDK="${JDK:-${JAVA_HOME:?set JDK or JAVA_HOME to a JDK 25 home}}"
 # NOTE: assertions (-ea) are intentionally NOT enabled by default. The native
 # `desiredAssertionStatus` honours CRATONVM_ENABLE_ASSERTIONS, but turning it on
 # globally fires asserts inside CratonVM's synthetic MethodHandle/MemberName
