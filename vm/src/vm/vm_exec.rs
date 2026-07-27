@@ -5337,6 +5337,30 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         )
     }
 
+    fn invoke_special_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Same primitive the JIT's invokespecial resolution uses
+        // (`invoke_special_shared_on_class`) — reused here for reflective
+        // `Method.invoke` dispatch of private / cross-package package-private
+        // instance methods, which has the identical loader-identity
+        // requirement. See the trait method's doc comment.
+        invoke_special_shared_on_class(
+            self.shared,
+            self.thread,
+            class_id,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
     fn invoke_special_bytecode_only(
         &mut self,
         class_name: &str,
