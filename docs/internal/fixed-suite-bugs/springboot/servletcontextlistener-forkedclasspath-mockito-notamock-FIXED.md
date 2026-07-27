@@ -242,18 +242,37 @@ every time `resolve_fast_path_class_id` rejects an existing
 Pre-fix that fired for ~100 `org.mockito.*` classes; post-fix `MockUtil` has
 no application copy at all.
 
-## Residual observations (not fixed, not fatal here)
+## Residual observations — audited 2026-07-27, mostly NOT defects
 
-The pre-fix trace showed a handful of *other* Mockito classes acquiring an
-application-loader copy while the fork was running — `PremainAttach`,
-`ModuleHandler`/`ModuleHandler$ModuleSystemFound`, `Java8LocationImpl` +
-`Location`, `ReflectionMemberAccessor` + `MemberAccessor`, `MockAccess`. Each
-appears as a subtype+supertype pair defined globally right after the fork
-defined the subtype, with no `resolve_class_loader_aware` or `loadClass`
-trace — i.e. some other path reaching `load_class_concurrent` directly. These
-persist post-fix (11 application-loader `org.mockito.*` defines remain, down
-from ~104) and do **not** affect these tests, but they are the obvious next
-thread to pull if another fork-loader identity bug surfaces.
+An earlier revision of this doc flagged the `org.mockito.*` classes that still
+acquire an application-loader copy during a fork run (`PremainAttach`,
+`ModuleHandler`/`$ModuleSystemFound`, `MemberAccessor`, `MockMethodInterceptor`,
+`MockAccess`, `Location`, `MockMethodDispatcher`, …) as a suspicious residual.
+**That framing was wrong.** Running the same test on real HotSpot with
+`-Xlog:class+load=info` shows HotSpot loads those same classes **2–3 times
+itself** — once per loader — because `ModifiedClassPathClassLoader` is a
+genuinely isolating loader and each fork defines its own copy. CratonVM
+matches. Specifically:
+
+| Class | HotSpot loads | Verdict |
+|---|---:|---|
+| `internal/PremainAttach` | 3 | multiple copies expected |
+| `bytebuddy/ModuleHandler` | 2 | expected |
+| `plugins/MemberAccessor` | 2 | expected |
+| `bytebuddy/access/MockMethodInterceptor` | 2 | expected |
+| `bytebuddy/access/MockAccess` | 2 | expected |
+| `invocation/Location` | 2 | expected |
+| `bytebuddy/inject/MockMethodDispatcher` | 1, from `mockitoboot*.jar` | bootstrap-appended → one global copy is **correct** |
+
+"An application-loader copy exists" is therefore not by itself evidence of a
+loader-identity bug in this scenario.
+
+Two classes ARE a genuine divergence — but not a classloader one:
+`Java8LocationImpl` and `ReflectionMemberAccessor` are loaded on CratonVM and
+**never** on HotSpot, because Mockito silently selects its *fallback*
+`Location`/`MemberAccessor` implementations. Split out into
+[`../../../known-issues/springboot/mockito-silently-selects-fallback-location-and-memberaccessor.md`](../../../known-issues/springboot/mockito-silently-selects-fallback-location-and-memberaccessor.md)
+with the full ruled-out list.
 
 ## Regression check
 
