@@ -15289,6 +15289,93 @@ pub(crate) fn i2_classloader_check_certs(
     Ok(None)
 }
 
+/// JVMS nesting kind of a class, read off its own `InnerClasses` entry (see
+/// `own_inner_class_entry`). This is the classification behind
+/// `Class.isAnonymousClass()` / `isLocalClass()` / `isMemberClass()`, which
+/// are mutually exclusive: at most one of the three is ever true.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NestingKind {
+    /// Not nested at all — a genuine top-level class, an array, a primitive,
+    /// or any class with no `InnerClasses` entry of its own (a
+    /// dynamically-generated proxy, a lambda hidden class). All three
+    /// predicates are false.
+    TopLevel,
+    /// `inner_name_index == 0` — anonymous (`new Runnable() {...}`, and also
+    /// an enum constant's class body).
+    Anonymous,
+    /// Named, but `outer_class_info_index == 0` — local, i.e. declared inside
+    /// a method/constructor/initializer.
+    Local,
+    /// Both set — a member (nested) class.
+    Member,
+}
+
+/// Classify `class_id`. Arrays and primitives are never
+/// anonymous/local/member: HotSpot reports `false` for all three on
+/// `Member[].class` and `Anon[].class` even though the COMPONENT type is a
+/// member/anonymous class, because `Class.isLocalOrAnonymousClass()` and
+/// `getDeclaringClass0()` consult attributes an array class does not have.
+fn class_nesting_kind(ctx: &mut dyn NativeContext, class_id: ClassId) -> NestingKind {
+    let Some(name) = ctx.class_name_of_id(class_id) else {
+        return NestingKind::TopLevel;
+    };
+    if name.starts_with('[') {
+        return NestingKind::TopLevel;
+    }
+    match own_inner_class_entry(ctx, class_id, &name) {
+        None => NestingKind::TopLevel,
+        Some((_, inner_name)) if inner_name.is_empty() => NestingKind::Anonymous,
+        Some((outer_class, _)) if outer_class.is_empty() => NestingKind::Local,
+        Some(_) => NestingKind::Member,
+    }
+}
+
+/// Shared body of the three nesting predicates: `true` iff the receiver's
+/// nesting kind is exactly `want`.
+fn class_nesting_predicate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    want: NestingKind,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let Some(class_id) = mirror_class_id(ctx, this) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let matches = class_nesting_kind(ctx, class_id) == want;
+    Ok(Some(Value::Int(i32::from(matches))))
+}
+
+/// `Class.isAnonymousClass()`. Was hardcoded to `false` in
+/// `register_synthetic_overrides`, so under the `synthetic-jdk` feature every
+/// anonymous class claimed to be a normal named one.
+pub(crate) fn native_class_is_anonymous_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_nesting_predicate(ctx, args, NestingKind::Anonymous)
+}
+
+/// `Class.isLocalClass()`. Was hardcoded to `false` — see
+/// `native_class_is_anonymous_class`.
+pub(crate) fn native_class_is_local_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_nesting_predicate(ctx, args, NestingKind::Local)
+}
+
+/// `Class.isMemberClass()`. Was hardcoded to `false`, which is the most
+/// visible of the three: every nested class in the program reported `false`.
+pub(crate) fn native_class_is_member_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    class_nesting_predicate(ctx, args, NestingKind::Member)
+}
+
 pub(crate) fn native_class_is_enum(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -18582,6 +18669,87 @@ mod tests {
         assert_eq!(ctx.read_string(obj).unwrap(), "Local");
         let r = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Class.isAnonymousClass / isLocalClass / isMemberClass
+    //
+    // These only *matter* under `synthetic-jdk` (real-JDK mode runs
+    // `java.lang.Class`'s own bytecode, which is already correct), but they
+    // are compiled unconditionally: the registration site is not gated.
+    // -----------------------------------------------------------------------
+
+    /// `(isAnonymousClass, isLocalClass, isMemberClass)` for a class whose own
+    /// `InnerClasses` entry is `entry` (`None` = no entry of its own).
+    fn nesting_predicates(name: &str, entry: Option<(&str, &str)>) -> (i32, i32, i32) {
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized(name).unwrap();
+        if let Some((outer, inner_name)) = entry {
+            ctx.set_inner_classes(
+                cid,
+                vec![(
+                    name.to_string(),
+                    outer.to_string(),
+                    inner_name.to_string(),
+                    0,
+                )],
+            );
+        }
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), name);
+        let args = [Value::Object(Some(mirror))];
+        let flag = |r: MethodCallResult| match r.unwrap() {
+            Some(Value::Int(v)) => v,
+            other => panic!("expected Int, got {other:?}"),
+        };
+        (
+            flag(native_class_is_anonymous_class(&mut ctx, &args)),
+            flag(native_class_is_local_class(&mut ctx, &args)),
+            flag(native_class_is_member_class(&mut ctx, &args)),
+        )
+    }
+
+    #[test]
+    fn class_nesting_predicates_anonymous() {
+        // inner_name_index == 0 AND outer_class_info_index == 0.
+        assert_eq!(nesting_predicates("P3$1", Some(("", ""))), (1, 0, 0));
+    }
+
+    #[test]
+    fn class_nesting_predicates_local() {
+        // Named, but outer_class_info_index == 0.
+        assert_eq!(
+            nesting_predicates("P3$1Local", Some(("", "Local"))),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn class_nesting_predicates_member() {
+        assert_eq!(
+            nesting_predicates("P3$Member", Some(("P3", "Member"))),
+            (0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn class_nesting_predicates_top_level_and_generated() {
+        // A genuine top-level class has no entry of its own...
+        assert_eq!(nesting_predicates("P3", None), (0, 0, 0));
+        // ...and neither does a generated class whose binary name merely
+        // contains `$` (proxies, lambda hidden classes) -- it must NOT be
+        // mistaken for a nested class.
+        assert_eq!(nesting_predicates("P3$$Lambda/0x80000000", None), (0, 0, 0));
+    }
+
+    #[test]
+    fn class_nesting_predicates_arrays_are_never_nested() {
+        // HotSpot reports false for all three on an array even when the
+        // COMPONENT is a member/anonymous class.
+        assert_eq!(
+            nesting_predicates("[LP3$Member;", Some(("P3", "Member"))),
+            (0, 0, 0)
+        );
+        assert_eq!(nesting_predicates("[LP3$1;", Some(("", ""))), (0, 0, 0));
     }
 
     // -----------------------------------------------------------------------
