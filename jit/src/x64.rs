@@ -2874,6 +2874,25 @@ pub fn set_precise_exception_frame_request(on: bool) {
 }
 
 thread_local! {
+    /// One-shot `(start_pc, end_pc, handler_pc)` list for the next method
+    /// compile on this thread. Consumed at `compile_with_param_slots` entry.
+    ///
+    /// The back-end otherwise never sees the exception table, and the liveness
+    /// scan that feeds the deopt/exceptional-frame snapshot needs it: without
+    /// exception edges a local that only the handler reads is computed dead
+    /// throughout the protected range, and the snapshot then drops it.
+    static PENDING_EXCEPTION_HANDLER_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Stage this method's exception table for the next compile on this thread.
+/// Empty (the default) keeps the historical exception-blind behaviour for call
+/// sites that have no table to give.
+pub fn set_pending_exception_handler_ranges(ranges: Vec<(usize, usize, usize)>) {
+    PENDING_EXCEPTION_HANDLER_RANGES.with(|c| *c.borrow_mut() = ranges);
+}
+
+thread_local! {
     /// OSR-tier sibling of [`KERNEL_REG_HOMES_REQUEST`] — set (only) by the
     /// interpreter's `compile_osr_artifact` (perf/halfgap-20260717).
     static KERNEL_REG_HOMES_OSR_REQUEST: std::cell::Cell<bool> =
@@ -8267,6 +8286,12 @@ struct Compiler {
     /// the OSR-compiled code already committed
     /// (`docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
     local_liveness: Vec<u64>,
+    /// Parallel coverage bitmap for [`Self::local_liveness`]: `false` at a pc
+    /// no basic block covers, where the liveness answer is the `0` default
+    /// ("nothing live") rather than a computed result. Treating that as "every
+    /// local is dead" would discard the whole frame, so the snapshot builder
+    /// falls back to "everything live" there.
+    local_liveness_covered: Vec<bool>,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -9324,6 +9349,7 @@ impl Compiler {
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
             local_liveness: Vec::new(),
+            local_liveness_covered: Vec::new(),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
@@ -9734,7 +9760,10 @@ impl Compiler {
             // can overwrite it. `Undefined` maps to an inert zero and is sound
             // precisely because liveness proves no path reads the old value
             // before its next definition.
-            if i < 64 {
+            // Only act on a COMPUTED liveness answer. An uncovered pc (no
+            // basic block reaches it) reads as 0 = "nothing live", and acting
+            // on that would drop every local in the frame.
+            if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
                 let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
                 if live_here & (1u64 << i) == 0 {
                     locals.push(FrameValue::Undefined);
@@ -28728,6 +28757,10 @@ pub fn compile_with_param_slots(
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    // One-shot like the requests above: taken here so a bail below cannot leak
+    // this method's ranges into the next compile on this worker thread.
+    let exception_handler_ranges: Vec<(usize, usize, usize)> =
+        PENDING_EXCEPTION_HANDLER_RANGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
     // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
     // but the published artifact KEEPS its OSR entries — the trampoline's
     // register-seeded entry contract is exactly what the assignments
@@ -29535,7 +29568,17 @@ pub fn compile_with_param_slots(
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
         // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
-        compiler.local_liveness = super::regalloc::live_locals_per_pc(code, code_len, num_params);
+        // The exception table MUST be modelled: these snapshots are taken at
+        // pcs inside protected ranges, and a local only the handler reads is
+        // otherwise computed dead exactly there.
+        let (liveness, covered) = super::regalloc::live_locals_per_pc_with_handlers(
+            code,
+            code_len,
+            num_params,
+            &exception_handler_ranges,
+        );
+        compiler.local_liveness = liveness;
+        compiler.local_liveness_covered = covered;
     }
 
     // Emit prologue

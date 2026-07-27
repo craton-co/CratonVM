@@ -8019,10 +8019,29 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             if !mic_callee_has_exception_table(vm, receiver_class_id, info)
                 && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
             {
-                mic.cached_entry_ptr
-                    .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
-                mic.cached_needs_context
-                    .store(needs_ctx, std::sync::atomic::Ordering::Release);
+                // Publish through `update`, never with raw stores. `update`
+                // does two things this site used to skip:
+                //
+                //  * it takes a STRONG owner (`Arc<CompiledMethod>`) for the
+                //    entry. Without it the artifact was retained by nothing:
+                //    once it was superseded by a tier-up (a `JitCache::put`
+                //    that replaces the shard entry, which — unlike
+                //    `invalidate_matching` — never walks the slots), the last
+                //    `Arc` dropped, the `ExecutableBuffer` was unmapped, and
+                //    this slot kept handing that address to the inline MIC
+                //    cascade in `jit/src/x64.rs`. Calling it then either
+                //    SIGSEGVs on the unmapped page or, once the OS hands the
+                //    same address to a later compile, silently runs a
+                //    DIFFERENT method. That is the shape
+                //    `docs/known-issues/jit-segv/nodeconnections-retired-jit-code-jump-20260727.md`
+                //    is chasing (an indirect call into a retired code buffer),
+                //    and this site was the one publisher that took no owner.
+                //  * it reserves the slot with the INSTALLING CAS before
+                //    publishing, so a concurrent retarget cannot pair one
+                //    receiver's class guard with another receiver's entry —
+                //    the hazard `update`'s own comment describes, which raw
+                //    stores here reintroduced.
+                mic.update(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
                 // CRIT-1 — also populate the co-allocated PIC so the
                 // inline 4-way cascade in `jit/src/x64.rs` hits on the
                 // next invocation. Without this the cascade's empty
