@@ -3787,11 +3787,136 @@ fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectR
             .all(|(&byte, unit)| byte == unit[0] && unit[1] == 0)
 }
 
+impl<'a> NativeContextImpl<'a> {
+    /// JNI-`FindClass`-style loader fidelity for name-based class lookups made
+    /// from *native* code.
+    ///
+    /// [`SharedVm::load_class_concurrent`] only consults the three built-in
+    /// loader levels (bootstrap -> extension -> application) and, for a name
+    /// under a recognized enterprise prefix (`io/quarkus/`, `org/jboss/`,
+    /// `io/smallrye/`, `org/infinispan/`, ...), *fabricates a synthetic stub*
+    /// when none of them has the bytes. A stub has no `Code` attribute on any
+    /// method, so the first real use of that answer dies with a `VerifyError`
+    /// ("non-abstract non-native method must have Code attribute").
+    ///
+    /// That is exactly wrong whenever the class genuinely exists but lives
+    /// only behind a custom `ClassLoader` invisible to the process's own
+    /// `-cp` -- Quarkus's fast-jar `RunnerClassLoader` (`lib/main/*.jar`),
+    /// Tomcat's `WebappClassLoader` (`WEB-INF/lib`), JBoss Modules, ... .
+    /// HotSpot has no such failure mode: JNI `FindClass` resolves through the
+    /// loader associated with the *calling* class, and the reflective
+    /// signature/generics resolvers use the declaring class's own loader.
+    ///
+    /// Worse, the mis-resolution is *destructive*: the fabricated stub is
+    /// registered globally under `Application`, so a later, correct
+    /// `RunnerClassLoader.loadClass` for the same binary name finds the stub
+    /// through parent delegation and never defines the real class. The
+    /// consultation therefore has to happen BEFORE the fabrication, which is
+    /// what `ClassManager::would_fabricate_synthetic_stub` is for.
+    ///
+    /// Strictly additive: it only ever fires where the alternative answer is a
+    /// fabricated stub -- never where any loader actually defined a class --
+    /// so deployments that legitimately rely on stubs (no user loader on the
+    /// stack, or that loader cannot find the name either) are unaffected.
+    ///
+    /// Found via Keycloak 26.6.1 boot: `Class.getGenericInterfaces()` on a
+    /// SmallRye Config mapping interface resolved the type argument
+    /// `io.quarkus.runtime.configuration.MemorySize` -- present only in
+    /// `lib/main/io.quarkus.quarkus-core-*.jar` behind `RunnerClassLoader` --
+    /// to a synthetic stub, and the `MethodHandle` constructor call SmallRye
+    /// then made against that mirror threw `VerifyError` out of
+    /// `io.quarkus.runtime.generated.SharedConfig.<clinit>`.
+    /// Resolve `name` the way a native's *calling class* would: try the
+    /// built-in loaders, but let the calling class's own `ClassLoader` answer
+    /// (a) before a synthetic stub would be fabricated for the name, and
+    /// (b) after a genuine miss. Both are cases where the built-in answer is
+    /// either fake or absent, so this can only ever resolve MORE classes --
+    /// it never overrides a class a built-in loader really defined.
+    fn resolve_class_loader_faithful(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
+        if let Some(cid) = self.class_via_caller_loader_before_stub(name) {
+            return Ok(cid);
+        }
+        match self.shared.load_class_concurrent(name) {
+            Ok(cid) => Ok(cid),
+            Err(e) => match self.class_via_caller_loader(name) {
+                Some(cid) => Ok(cid),
+                None => Err(e.into()),
+            },
+        }
+    }
+
+    fn class_via_caller_loader_before_stub(&mut self, name: &str) -> Option<ClassId> {
+        // Cheap bail-out: no user-defined loader has ever defined a class in
+        // this process, so no better answer can exist. Single atomic load.
+        if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+            return None;
+        }
+        if !self
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .would_fabricate_synthetic_stub(name)
+        {
+            return None;
+        }
+        self.class_via_caller_loader(name)
+    }
+
+    /// Drive the `loadClass` of the nearest Java frame whose defining class
+    /// came from a real user `ClassLoader` -- the native's "calling class" in
+    /// JNI terms. Only the innermost such frame is consulted; walking further
+    /// out would cross loader namespaces. `None` when there is no such frame,
+    /// or that loader cannot supply `name` either.
+    fn class_via_caller_loader(&mut self, name: &str) -> Option<ClassId> {
+        if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+            return None;
+        }
+        // `cratonvm/...` is CratonVM's own internal helper namespace (stream
+        // ops, collector shims). No application ClassLoader can supply those,
+        // and the stub IS the intended answer -- don't spend a Java
+        // `loadClass` call per lookup asking.
+        if name.starts_with("cratonvm/") {
+            return None;
+        }
+        let frame_classes: Vec<ClassId> =
+            self.thread.frames.iter().rev().map(|f| f.class_id).collect();
+        let dbg = crate::runtime::env_cache::dbg_stub_loader();
+        for cid in frame_classes {
+            if cratonvm_native_builtins::classloader::defining_loader_for(cid.as_u32()).is_none() {
+                continue;
+            }
+            let driven = crate::runtime::interpreter::drive_defining_loader_load(
+                self.shared,
+                self.thread,
+                cid,
+                name,
+            );
+            if dbg {
+                let cm = self.shared.classes.class_manager.read();
+                eprintln!(
+                    "[DBG_STUBLOADER] {name}: drove {} -> {:?}",
+                    cm.get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default(),
+                    driven.and_then(|d| cm.get_class(d).map(|c| c.name.to_string())),
+                );
+            }
+            return driven;
+        }
+        None
+    }
+}
+
 impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
 
     fn load_class(&mut self, name: &str) -> MethodCallResult {
-        let class_id = self.shared.load_class_concurrent(name)?;
+        // See `class_via_caller_loader_before_stub`: a name that would only
+        // resolve to a fabricated synthetic stub must first be offered to the
+        // calling class's own ClassLoader, before the stub is minted and
+        // globally registered under `Application`.
+        let class_id = self.resolve_class_loader_faithful(name)?;
         let mirror = super::get_or_create_class_mirror(self.shared, class_id);
         Ok(Some(Value::Object(Some(mirror))))
     }
@@ -3807,6 +3932,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
         self.shared.mem.heap.class_id_of(obj)
+    }
+
+    fn would_fabricate_synthetic_stub(&self, name: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .would_fabricate_synthetic_stub(name)
     }
 
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
@@ -3900,7 +4033,9 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
     }
 
     fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
-        let class_id = self.shared.load_class_concurrent(name)?;
+        // Same loader fidelity as `load_class` -- this is the other name-based
+        // entry point natives reach for. See `resolve_class_loader_faithful`.
+        let class_id = self.resolve_class_loader_faithful(name)?;
         super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
         Ok(class_id)
     }
@@ -5114,8 +5249,20 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         loader_id: u32,
     ) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let mut cm = self.shared.classes.class_manager_write();
-        match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
+        match cm.define_class(name, bytes, cl_id) {
             Ok(cid) => {
                 drop(cm);
                 let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
@@ -5142,14 +5289,38 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let cm = self.shared.classes.class_manager.read();
-        cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
+        cm.find_class_by_name_in_loader(name, cl_id)
     }
 
     fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let cm = self.shared.classes.class_manager.read();
-        cm.class_defined_by_loader_exact(name, ClassLoaderId::UserDefined(loader_id))
+        cm.class_defined_by_loader_exact(name, cl_id)
     }
 
     fn define_class_full(
@@ -5164,10 +5335,34 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2).
         use cratonvm_classloading::{CodeSource, DefineClassOptions};
         use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
+        // Must be the exact inverse of `loader_id_of_class`'s encoding
+        // (Bootstrap=0, Extension=1, Application=2, UserDefined(id)=id).
+        // This used to only special-case `0` (as Application, the
+        // pre-existing default-sentinel convention some callers rely on)
+        // and fell through everything else -- including `2` -- to
+        // `UserDefined(loader_id)`. A caller that round-trips a REAL
+        // loader id via `loader_id_of_class` (e.g. the CGLIB
+        // `@Configuration` enhancer fetching its superclass's own loader
+        // so the generated subclass is defined by the SAME loader) got
+        // `UserDefined(2)` back for the Application loader instead of
+        // `Application` -- a different `ClassLoaderId` that
+        // `same_runtime_package`'s `loader_id` equality check correctly
+        // treats as a DIFFERENT runtime package from the superclass's
+        // `Application` tag. That silently defeated package-private
+        // method-override detection for the whole generated class: every
+        // package-private `@Bean` override was treated as an unrelated,
+        // independent method in a fresh vtable slot rather than a true
+        // override of the inherited slot, so virtual dispatch to it from
+        // ordinary (non-invokespecial) call sites kept resolving to the
+        // superclass's original method body forever, breaking `@Bean`
+        // inter-method singleton-sharing (calling one `@Bean` method from
+        // another on `this` re-ran the real factory body instead of
+        // returning the container's cached instance).
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Application,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
         };
         let code_source =
             if opts.code_source_url.is_none() && opts.code_source_certificates.is_empty() {
@@ -5248,10 +5443,17 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn list_initiated_class_ids(&self, loader_id: u32) -> Vec<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
         };
         let cm = self.shared.classes.class_manager.read();
         cm.class_store
@@ -5318,6 +5520,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             args,
         )
     }
+
 
     fn invoke_special(
         &mut self,
@@ -6338,7 +6541,12 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
         let pin_base = self.thread.native_pin_roots.len();
         let arg_pins = pin_native_object_values(self.thread, init_args);
         let result = (|| {
-            let class_id = self.shared.load_class_concurrent(class_name)?;
+            // Loader fidelity (see `resolve_class_loader_faithful`): the JCA
+            // provider chain instantiates SPI classes by NAME here, and a
+            // provider registered from a custom-ClassLoader jar (BouncyCastle
+            // under Quarkus's fast-jar RunnerClassLoader) names classes the
+            // process `-cp` cannot see.
+            let class_id = self.resolve_class_loader_faithful(class_name)?;
             let num_fields = self
                 .shared
                 .classes
@@ -9512,6 +9720,30 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
 
     fn thread_interrupt(&mut self, thread_obj: ObjectRef) {
         let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
+        // CRATONVM_DBG_INTERRUPT: name the Java frame that raised an interrupt.
+        // A spurious interrupt is invisible at the point it is CONSUMED (the
+        // victim only sees a flag), so the only way to attribute one is to
+        // record the producer. Kept permanently and env-gated for the same
+        // reason CRATONVM_DBG_CCE_BT is.
+        if std::env::var_os("CRATONVM_DBG_INTERRUPT").is_some() {
+            eprintln!(
+                "CRATONVM_DBG_INTERRUPT: target_obj=0x{:x} target_tid={:?} by_tid={}",
+                thread_obj.as_ptr() as usize,
+                tid.map(|t| t.0),
+                self.thread.thread_id.0
+            );
+            for (i, f) in self.thread.frames.iter().enumerate().rev().take(12) {
+                let cn = self
+                    .shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(f.class_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                eprintln!("  INT-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+            }
+        }
         if let Some(tid) = tid {
             // Set the interrupted flag via the registry (cross-thread safe)
             self.shared

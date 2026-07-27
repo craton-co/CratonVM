@@ -19,8 +19,7 @@ interpreter frame walk. A full forensic campaign (worktree
 that: frames are scanned and remapped correctly in every captured event. The family's true members:
 
 1. **Producer #11 — `Properties.load` re-entrant natives (FIXED, commit `8e1162cfa`).** The fatal
-   `MechanismDatabase.<init>` Reader NSME — see
-   `docs/internal/fixed-suite-bugs/wildfly-boot-stale-reader-nsme-mechanismdatabase-FIXED.md`.
+   `MechanismDatabase.<init>` Reader NSME, since fixed and archived.
    0/320 boots post-fix (was the only fatal member).
 2. **Frozen-in-JIT peer interpreter-frame coverage (HARDENED, commit `ec883f519`).** A peer frozen
    mid-JIT by the cross-thread STW takeover was covered only by its last root-snapshot deposit +
@@ -191,8 +190,8 @@ A fresh 320-boot campaign (`out/results.tsv`, waves 1-80) came back with 3 `STAL
   `WFLYCTL0043: An attribute named 'hornetq-store-enable-async-io' is already registered at
   location '/subsystem=transactions'` — a genuine DUPLICATE attribute registration, i.e. some
   extension-initialization code path ran twice. This smells like a class/loader-identity duplication
-  bug (the same family as `docs/internal/aot-beanoverride-double-context-refresh-rootcaused-*`'s
-  fork-loader ClassId instability) rather than a stale-pointer read. **Not yet root-caused; not
+  bug (the same family as the AOT bean-override double-context-refresh fork-loader ClassId
+  instability) rather than a stale-pointer read. **Not yet root-caused; not
   confirmed related to this doc's family** — flagged here only because it was in the same
   1.2%-tail sample as the other three.
 
@@ -466,8 +465,8 @@ during this investigation and found sound.
 ## 2026-07-27: a FATAL member with a precise, repeatable site — `NoSuchMethodError: java/lang/Object.hasNext()Z`
 
 Found while closing
-`docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md`
-(the `org/jboss/as/` JIT-ban lift). Once that doc's two root causes were fixed,
+the retired `modeltypevalidator-validtypes-npe` write-up
+(the `org/jboss/as/` JIT-ban lift; archived with docs/internal). Once that doc's two root causes were fixed,
 WildFly 32.0.1.Final boots to `WFLYSRV0026` — but only in roughly 4 out of every
 6 attempts. **Every** failing boot in a 6+6 interleaved A/B (ban in place vs ban
 lifted, JIT on, identical harness) died on this, and nothing else:
@@ -526,5 +525,6 @@ described above.
   frames; the equivalent print does not exist on the *invoke* path, which is
   where this one surfaces. Adding it there is the obvious first step.
 
-Harness: see the "Reproduction" section of
-`docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md`.
+Harness: fake-JDK-home `bin/java` + `CRATONVM_JAVA_HOME=/home/victor/jdk25`,
+`bash standalone.sh -Djboss.server.base.dir=<copy of standalone/configuration
+plus an empty deployments/>`, 900 s timeout.

@@ -739,6 +739,10 @@ cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
 cached_is_ok!(athrow_dbg, "CRATONVM_DBG_ATHROW");
+/// `CRATONVM_DBG_STUBLOADER` -- trace the "would fabricate a synthetic stub,
+/// ask the calling class's own ClassLoader first" fallback in
+/// `NativeContextImpl::load_class`.
+cached_is_ok!(dbg_stub_loader, "CRATONVM_DBG_STUBLOADER");
 cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
 /// `CRATONVM_DBG_MODSTATIC` — JBoss-Modules `<clinit>`/static-dispatch
 /// diagnostic. This was read with an UNCACHED `cratonvm_types::flags::runtime_var(...).is_ok()`

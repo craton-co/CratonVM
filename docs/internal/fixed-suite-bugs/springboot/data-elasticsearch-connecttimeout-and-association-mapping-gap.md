@@ -192,3 +192,43 @@ connect/refusal behavior.
 |---|---|
 | `module/spring-boot-data-elasticsearch` | `org.springframework.boot.data.elasticsearch.health.DataElasticsearchReactiveHealthIndicatorTests` (Case 1, 1 of 5 tests) |
 | `module/spring-boot-data-elasticsearch` | `org.springframework.boot.data.elasticsearch.autoconfigure.DataElasticsearchAutoConfigurationTests` (Case 2, 1 of 8 tests) |
+
+## Confirmed still failing 2026-07-23 — but the symptom has shifted, Case 1's stated mechanism needs re-verification
+
+`DataElasticsearchReactiveHealthIndicatorTests.elasticsearchIsDown` still
+fails 1/5 (`RunName=craton-rerun-20260723`), but **not** with Case 1's
+documented `ConnectTimeoutException`-vs-"Connection refused"-text mismatch.
+Current failure:
+
+```
+16:19:45.910 [elasticsearch-rest-client-2-thread-1] WARN ... DataElasticsearchReactiveHealthIndicator -- Elasticsearch health check failed
+co.elastic.clients.transport.rest5_client.low_level.ResponseException: method [GET], host [http://localhost:49999], URI [/_cluster/health], status line [500]
+...
+=> java.lang.IllegalStateException: Timeout on blocking read for 5000000000 NANOSECONDS
+     reactor.core.publisher.Mono.block(Mono.java:1800)
+     org.springframework.boot.data.elasticsearch.health.DataElasticsearchReactiveHealthIndicatorTests.elasticsearchIsDown(DataElasticsearchReactiveHealthIndicatorTests.java:95)
+```
+
+Log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard8/logs/module_spring-boot-data-elasticsearch.org.springframework.boot.data.elasticsearch.health.DataE-5bb7f2032047.out.log`.
+
+The test source itself looks different from what Case 1 describes: the
+current `elasticsearchIsDown()` (`.java:91-99`) calls
+`this.server.shutdown()` (an OkHttp `MockWebServer`, not a raw connect to a
+closed port like `localhost:65088`) and then blocks on
+`this.healthIndicator.health().block(TIMEOUT)` — the failure is now a flat
+5-second block-timeout (`Mono.block` never completes), preceded by a WARN
+log showing a `ResponseException`/HTTP 500 from `http://localhost:49999`
+*after* the server was supposedly shut down. This does not obviously match
+Case 1's root-cause hypothesis (Windows `WSAPoll` not surfacing a refused
+connect promptly, `native-io/src/nb_connect.rs`) — a 500 status response
+implies something *did* respond, and the subsequent hang is a different
+shape than an immediate-refusal-vs-timeout text mismatch. **Flagging this
+explicitly rather than assuming Case 1's stated mechanism still applies**:
+either the upstream Spring Boot test source changed between the 2026-07-17
+baseline and now (plausible — this suite tracks a `-SNAPSHOT` version) in a
+way that exercises a materially different code path, or there's a second,
+distinct bug (a `MockWebServer.shutdown()` / reactor-netty client
+interaction returning a stale 500 instead of a connection failure, then
+never completing the resulting `Mono`) layered on top of or instead of
+Case 1's original gap. Re-diagnosis from the current test source is needed
+before assuming this is the same bug — not done in this session.

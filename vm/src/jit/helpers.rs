@@ -83,11 +83,32 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 // profile seeds, both entry ABIs are lowered, and the generated caller
 // republishes its active frame after a raw call. Opt out for diagnosis with
 // `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`.
+//
+// What the default-OFF period cost, measured independently on 2026-07-27 (H2
+// `org/h2/` ban residuals): this flag gates the ONLY write of
+// `mic.cached_entry_ptr`, so with it off the inline MIC/PIC cascade the codegen
+// emits can never open and every virtual call out of compiled code falls back
+// through `invoke_or_native` into the INTERPRETER. Compiling a method therefore
+// made its callees slower, and compiling more of a program made it slower
+// overall. On H2 `TestFreeSpace` -- `org/h2/mvstore/FreeSpaceBitSet.toString`
+// compiled, its `java/util/BitSet.nextClearBit` callee compiled too -- the
+// `toString` scan loop cost 5582 ms per 2000 calls with this off and 169 ms
+// with it on, and the off-cost grew with the callee's working set while the
+// on-cost did not.
+//
+// Consequence for anything verified while it was off: a JIT ban whose mechanism
+// is compiled-to-compiled virtual dispatch could not reproduce during a
+// default-OFF run, because the dispatch it guards was inert. JASPER-JDT.2/.3
+// (`org/eclipse/jdt/internal/compiler/parser/` and `ast/`) were removed on
+// 2026-07-26 on exactly such runs and had to be restored -- see their entry in
+// `skip_list.rs`. Re-verify any similar removal with this ON.
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(
-        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY") {
+        || match cratonvm_types::flags::runtime_var(
+            "CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY",
+        ) {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         },
@@ -4653,13 +4674,24 @@ pub unsafe extern "C" fn jit_checkcast(
         // throwing would turn tolerated stale-reference reads into new
         // failures.
         if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
-            let obj_cls_name = vm
-                .classes
-                .class_manager
-                .read()
-                .get_class(obj_class_id)
-                .map(|c| c.name.replace('/', "."))
-                .unwrap_or_else(|| "<unknown>".into());
+            // Render an array receiver by its own descriptor. The header of a
+            // reference array carries the COMPONENT class id, so the plain
+            // `get_class(obj_class_id).name` lookup reports `java.lang.String`
+            // for a `String[]` -- the self-cast text
+            // `java.lang.String cannot be cast to java.lang.String` that cost
+            // a session of misdiagnosis on TestObjectDataType. HotSpot prints
+            // `[Ljava.lang.String;`.
+            let obj_cls_name = match crate::runtime::interpreter::array_descriptor_of(vm, obj_ref)
+            {
+                Some(desc) => desc.replace('/', "."),
+                None => vm
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(obj_class_id)
+                    .map(|c| c.name.replace('/', "."))
+                    .unwrap_or_else(|| "<unknown>".into()),
+            };
             let msg = format!(
                 "class {} cannot be cast to class {}",
                 obj_cls_name,

@@ -3,8 +3,7 @@
 Status (2026-07-26): **CORRECT behind `CRATONVM_MOVING_YOUNG`, still
 default-off — now for THROUGHPUT reasons, not correctness.** XL, GC-coupled.
 
-The heap corruption that blocked this feature is fixed
-(`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`):
+The heap corruption that blocked this feature is fixed:
 five `jit/src/x64.rs` sites pushed an object reference onto the operand stack
 without an oop tag, so it reached neither the precise oop map nor the shadow
 stack while the safepoint still certified complete coverage. bt18 is now
@@ -15,8 +14,7 @@ stack while the safepoint still certified complete coverage. bt18 is now
 interleaved rounds, minimum: default **1363 ms**, `CRATONVM_MOVING_YOUNG=1`
 **2905 ms** — **2.1×**. It was 5.0× until the pre-cycle from-space walk stopped
 building an `FxHashSet` of every object start (49% of the whole process) and
-started using an exact bitmap; see
-`docs/internal/moving-young-throughput-20260726.md`.
+started using an exact bitmap.
 Of the remaining 1.5 s, roughly 370 ms is codegen moving-young forces, 300 ms
 the shadow push/reload, and 870 ms one Cheney copy.
 
@@ -31,9 +29,10 @@ printed for each.
 Also still open before a flip: `refresh_moving_young_coverage_for_collection`
 treats any cycle with a peer thread in JIT as unproven, so moving-young engages
 only when the initiator is alone in compiled code; and the A5
-`native_stack_has_jit_frame` probe over-detects. Neither is a correctness risk
-— both only cost compaction. See
-`docs/internal/arch-2026-07-26/moving-young-precise-roots.md` "Remaining work".
+`native_stack_has_jit_frame` probe over-detects (it should validate that a
+candidate return address is actually preceded by a `call` instruction rather
+than treating any stack word inside a JIT code range as a hit). Neither is a
+correctness risk — both only cost compaction.
 
 The 2026-07-01 "FINISHED" validation table at the end of this document remains
 **suspect**: it declared the feature correct without reporting
@@ -83,8 +82,7 @@ live, while preserving the Binary-Trees-18 correctness invariant
   68332206), *not* to enable safe moving. The original moving-via-precise-roots
   attempt is recorded as **incomplete** (68199090, a partial fix toward
   68332206, not the answer). Background: `MEMORY.md` "precise JIT stack maps"
-  project entry and `docs/internal/app-jvm-bugs/precise-jit-stack-maps-{design,
-  findings,followups}.md`.
+  project entry.
 
 Net: the *correctness* problem (bt18 checksum) is already solved by the
 non-moving sweep + selective promotion. The *performance* problem — non-moving
@@ -213,8 +211,8 @@ Two conclusions, both against the design premise:
    time is 46–50 s — the GC choice does not move the needle at all. A moving
    young gen would replace 2 cheap non-moving sweeps with 2 semispace copies,
    saving at most a few percent of a 48 s run. The 48 s gap vs HotSpot's 0.65 s
-   is **per-node mutator cost**, not GC (confirms
-   `docs/internal/gaps/gap-bintrees18-gc-throughput.md`).
+   is **per-node mutator cost**, not GC — confirmed independently by the
+   binary-trees throughput investigation that root-caused the same gap.
 
 2. **The Route-A prerequisite is not met — moving silently corrupts the
    checksum.** `FORCE_MOVING + SHADOW_STACK` still yields **67674804** (the

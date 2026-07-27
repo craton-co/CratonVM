@@ -1,10 +1,9 @@
 # WildFly boot: `applicationKS` fails with `no KeyStore JKS implementation for provider` — `Security.getProviders(<filter>)` returns null and `Provider$Service` has no `aliases`
 
 **Status:** OPEN, 2026-07-27. Not a regression and not JIT-related — reproduces
-with `--nojit` and with every JIT ban configuration. Found while closing
-`docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md`;
-this is the only thing standing between a real WildFly 32 boot and a clean
-`WFLYSRV0025`.
+with `--nojit` and with every JIT ban configuration. Found while closing the `org/jboss/as/` JIT ban (the retired
+`modeltypevalidator-validtypes-npe` write-up); this is the only thing standing
+between a real WildFly 32 boot and a clean `WFLYSRV0025`.
 
 ## Symptom
 
@@ -113,6 +112,6 @@ VMs, rather than from a side-by-side boot.
 
 ## Reproduction of the boot
 
-See the "Reproduction" section of
-`docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md` —
-identical harness, no JIT flags needed.
+Fake-JDK-home `bin/java` + `CRATONVM_JAVA_HOME=/home/victor/jdk25`, then
+`bash standalone.sh -Djboss.server.base.dir=<copy of standalone/configuration
+plus an empty deployments/>`. No JIT flags needed.

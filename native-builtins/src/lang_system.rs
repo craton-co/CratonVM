@@ -40,8 +40,7 @@ use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 // becomes unreachable (its leak detector). With the hook dropped on the floor
 // that whole chain became garbage the moment `Main.main` returned, the leak
 // detector fired mid-boot, `AbstractControllerService.stop` reset `controller`
-// to null, and the boot thread died on `WFLYCTL0085` / `WFLYSRV0056`. See
-// `docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md`.
+// to null, and the boot thread died on `WFLYCTL0085` / `WFLYSRV0056`.
 //
 // Handles rather than raw addresses: the global-ref table is remapped by the
 // moving collector, so a stored `ObjectRef` would go stale while a handle stays

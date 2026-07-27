@@ -5084,11 +5084,15 @@ pub(crate) fn transition_real_executor_to_shutdown(
         let shutdown = current & 0x1fff_ffff;
         let ctl = ctx.read_native_pin(ctl_pin, ctl);
         let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(shutdown)]);
-        // A graceful ThreadPoolExecutor shutdown must wake idle workers so
+        // A graceful ThreadPoolExecutor shutdown must wake IDLE workers so
         // they observe SHUTDOWN and leave getTask().  Merely updating ctl
         // leaks every worker blocked in LinkedBlockingQueue.take().
+        //
+        // Only the idle ones: this is `shutdown()`, not `shutdownNow()`, and a
+        // worker in the middle of a task must be allowed to finish it. See
+        // `interrupt_executor_workers_filtered`.
         let executor = ctx.read_native_pin(executor_pin, executor);
-        let _ = interrupt_executor_workers(ctx, executor);
+        let _ = crate::interrupt_executor_workers_filtered(ctx, executor, /* only_idle */ true);
         // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue.
         // Its real `onShutdown()` removes cancelled delayed tasks (including
         // JUnit's cancelled timeout watchdog); without it, the queue stays

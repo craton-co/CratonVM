@@ -25841,7 +25841,19 @@ fn objects_values_equal(
 ) -> Result<bool, MethodCallFailed> {
     match (a, b) {
         (Value::Object(None), Value::Object(None)) => Ok(true),
-        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
+        (Value::Object(None), _) => Ok(false),
+        // `Objects.equals` is `(a == b) || (a != null && a.equals(b))` — a
+        // non-null `a` gets `a.equals(null)` dispatched, it is NOT short-
+        // circuited to false. Classes whose `equals` accepts null are rare but
+        // real and load-bearing: Spring's `NullBean` (the placeholder for a
+        // `@Bean` method that returned null) is defined as
+        // `return (this == obj || obj == null)` precisely so that
+        // `getBean(name)` compares equal to null.
+        (Value::Object(Some(ra)), Value::Object(None)) => {
+            let r = ctx.invoke_virtual(*ra, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(None)])?;
+            Ok(matches!(r, Some(Value::Int(v)) if v != 0))
+        }
+        (_, Value::Object(None)) => Ok(false),
         (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
             if ra.as_ptr() == rb.as_ptr() {
                 return Ok(true);
@@ -28981,7 +28993,14 @@ pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
         Some(e) => &bytes[body_start..body_start + e],
         None => &bytes[body_start..],
     };
-    match b64_decode(body, B64_VARIANT_BASIC) {
+    // MIME, not BASIC: a PEM body is line-wrapped by definition (RFC 7468
+    // caps it at 64 chars per line), and even a one-line body carries the
+    // newline that precedes `-----END`. The BASIC decoder rejects EVERY
+    // non-alphabet byte including whitespace (see `b64_decode`), so with it
+    // this function could never decode any real PEM — it always fell through
+    // to the "hand the original bytes back" arm and returned the armored text
+    // as if it were DER. MIME is exactly the whitespace-skipping variant.
+    match b64_decode(body, B64_VARIANT_MIME) {
         Ok(der) if !der.is_empty() => der,
         // Not valid base64 (or empty) — hand the original bytes back so the
         // caller's existing DER path / mirror fallback runs exactly as before.
@@ -31149,6 +31168,31 @@ pub(crate) fn executor_has_real_workers(ctx: &mut dyn NativeContext, exec: Objec
 }
 
 pub(crate) fn interrupt_executor_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
+    interrupt_executor_workers_filtered(ctx, exec, /* only_idle */ false)
+}
+
+/// `interrupt_executor_workers` with the `shutdown()` vs `shutdownNow()`
+/// distinction the JDK draws.
+///
+/// `shutdownNow()` interrupts EVERY worker (`interruptWorkers()`), which is what
+/// `only_idle == false` does. `shutdown()` must interrupt only the IDLE ones
+/// (`interruptIdleWorkers()`): a worker that is currently RUNNING a task holds
+/// its own `Worker` lock, so `w.tryLock()` fails for it and the JDK leaves it
+/// alone -- that is the whole meaning of "orderly shutdown: previously
+/// submitted tasks are executed".
+///
+/// Interrupting a running task instead is observable, not cosmetic. H2
+/// `MVStore.close()` -> `Utils.shutdownExecutor` -> `shutdown()` runs while the
+/// buffer-save worker sits inside `FileChannel.write`; an interrupt there makes
+/// `AbstractInterruptibleChannel.begin()` take its `me.isInterrupted()` branch
+/// and abort the write, which H2 turns into an `MVStoreException` wrapping
+/// `NullPointerException: ... Interruptible.interrupt ... this.interruptor is
+/// null` and a failed `TestStreamStore` (2026-07-26).
+pub(crate) fn interrupt_executor_workers_filtered(
+    ctx: &mut dyn NativeContext,
+    exec: ObjectRef,
+    only_idle: bool,
+) -> bool {
     // Unwrap Executors$DelegatedExecutorService / AutoShutdownDelegated...
     // (field `e` -> the inner executor) if present.
     let dbg = crate::nbflags().dbg_exec;
@@ -31192,6 +31236,31 @@ pub(crate) fn interrupt_executor_workers(ctx: &mut dyn NativeContext, exec: Obje
             Ok(Some(Value::Object(Some(w)))) => w,
             _ => break,
         };
+        // `shutdown()`: skip workers that are running a task. `Worker` extends
+        // AQS and `runWorker` holds `w.lock()` for the duration of each task, so
+        // a successful `tryLock()` means "idle" exactly as it does in
+        // `ThreadPoolExecutor.interruptIdleWorkers`. Unlock immediately after,
+        // as the JDK does, so the worker can take its next task.
+        //
+        // Fail OPEN: if `tryLock` cannot be invoked at all (a synthetic worker
+        // with no AQS body), interrupt anyway rather than leave a worker blocked
+        // in `getTask()` forever -- an unwoken idle worker turns
+        // `awaitTermination(1, DAYS)` into a hang, which is worse than an
+        // over-eager interrupt.
+        if only_idle {
+            match ctx.invoke_virtual(worker, "tryLock", "()Z", &[]) {
+                Ok(Some(Value::Int(0))) => {
+                    if dbg {
+                        eprintln!("[EXEC] worker is running a task -> not interrupted");
+                    }
+                    continue;
+                }
+                Ok(Some(Value::Int(_))) => {
+                    let _ = ctx.invoke_virtual(worker, "unlock", "()V", &[]);
+                }
+                _ => {}
+            }
+        }
         if let Value::Object(Some(t)) = ctx.get_field_by_name(worker, "thread") {
             // Mirror the foundation interrupt: set the VM atomic AND the Java
             // Thread.interrupted field so getTask()'s Condition.await wakes and
