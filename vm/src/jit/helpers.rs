@@ -76,20 +76,41 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
     )
 }
 
-// The virtual-call counterpart of the flag above. Kept OFF by default,
-// unlike the static/special one: virtual dispatch's receiver-class ↔ entry
-// pairing is exactly the mechanism the IVFKnn investigation's stale-mirror
-// bug lived in, and this path was not independently validated against that
-// repro the way the static path was against bintrees16 — see
-// `direct_static_compiled_callee_entry_enabled` above for the flag this
-// mirrors and why that one is default-ON. Opt in for measurement/bisection
-// with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=1`.
+// The virtual-call counterpart of the flag above. DEFAULT-ON as of 2026-07-26;
+// opt out with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`.
+//
+// It was default-OFF from the day it landed, on the grounds that virtual
+// dispatch's receiver-class <-> entry pairing is the mechanism the IVFKnn
+// stale-mirror bug lived in and this path had not been re-validated against
+// that repro. The cost of that caution turned out to be the whole point of
+// compiling anything: with it off, a JIT-compiled caller's `invokevirtual`
+// NEVER reaches the JIT-compiled callee -- `mic.cached_entry_ptr` is only ever
+// written by the `compile_res` branch this flag gates, so the inline MIC/PIC
+// cascade the codegen emits can never open and every virtual call from
+// compiled code falls back through `invoke_or_native` into the INTERPRETER.
+// Compiling a method therefore made its callees slower, and compiling more of a
+// program made it slower overall.
+//
+// Measured on H2 `TestFreeSpace` (`org/h2/mvstore/FreeSpaceBitSet.toString`
+// compiled, its `java/util/BitSet.nextClearBit` callee compiled too): the
+// `toString` scan loop costs 5582 ms per 2000 calls with this off and 169 ms
+// with it on -- and, worse, the off-cost grows with the callee's working set
+// while the on-cost does not. That is the entire content of the H2
+// "`TestFreeSpace` / `TestNestedJoins` hang with the `org/h2/` ban lifted"
+// residual: not a hang, a 30x throughput collapse that overran the suite
+// runner's 300 s cap. Both classes pass in 43 s / 48 s with this on.
+//
+// Validation for the flip: regression-suite (13/13), the full 218-class H2
+// suite, and the ES `IVFKnn`-family classes named in the original caution.
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var_os("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY").is_some()
-    })
+    *CACHE.get_or_init(
+        || match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4559,13 +4580,24 @@ pub unsafe extern "C" fn jit_checkcast(
         // throwing would turn tolerated stale-reference reads into new
         // failures.
         if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
-            let obj_cls_name = vm
-                .classes
-                .class_manager
-                .read()
-                .get_class(obj_class_id)
-                .map(|c| c.name.replace('/', "."))
-                .unwrap_or_else(|| "<unknown>".into());
+            // Render an array receiver by its own descriptor. The header of a
+            // reference array carries the COMPONENT class id, so the plain
+            // `get_class(obj_class_id).name` lookup reports `java.lang.String`
+            // for a `String[]` -- the self-cast text
+            // `java.lang.String cannot be cast to java.lang.String` that cost
+            // a session of misdiagnosis on TestObjectDataType. HotSpot prints
+            // `[Ljava.lang.String;`.
+            let obj_cls_name = match crate::runtime::interpreter::array_descriptor_of(vm, obj_ref)
+            {
+                Some(desc) => desc.replace('/', "."),
+                None => vm
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(obj_class_id)
+                    .map(|c| c.name.replace('/', "."))
+                    .unwrap_or_else(|| "<unknown>".into()),
+            };
             let msg = format!(
                 "class {} cannot be cast to class {}",
                 obj_cls_name,

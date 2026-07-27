@@ -5299,6 +5299,18 @@ impl JitCache {
             descriptor,
             declaring_class_id,
         };
+        // CRATONVM_DBG_JIT_COMPILED: one line per successfully published
+        // compilation. The cheapest way to answer "is this method actually
+        // running compiled?" -- an A/B whose only visible difference is
+        // throughput can otherwise cost a whole session to attribute (the
+        // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
+        // stopped being compiled once org/h2/ became JIT-eligible).
+        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+            eprintln!(
+                "CRATONVM_DBG_JIT_COMPILED: put {}.{}{}",
+                key.class_name, key.method_name, key.descriptor
+            );
+        }
         Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
         cratonvm_types::jit_activation::register_executable_owner(
@@ -5361,6 +5373,18 @@ impl JitCache {
             descriptor,
             declaring_class_id,
         };
+        // CRATONVM_DBG_JIT_COMPILED: one line per successfully published
+        // compilation. The cheapest way to answer "is this method actually
+        // running compiled?" -- an A/B whose only visible difference is
+        // throughput can otherwise cost a whole session to attribute (the
+        // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
+        // stopped being compiled once org/h2/ became JIT-eligible).
+        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+            eprintln!(
+                "CRATONVM_DBG_JIT_COMPILED: osr {}.{}{}",
+                key.class_name, key.method_name, key.descriptor
+            );
+        }
         Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
         cratonvm_types::jit_activation::register_executable_owner(

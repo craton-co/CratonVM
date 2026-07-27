@@ -1,22 +1,50 @@
 ﻿# Known issues вЂ” index & bug map
 
-## 2026-07-26 H2 — both H2 JIT/perf docs retired; three residuals carried forward
+## 2026-07-27 H2 — three of the four `org/h2/` ban residuals CLOSED; the cause was a JIT dispatch default, not H2
 
-The `Schema  not found` reconnect corruption and the `TestFileSystem`
-per-invoke costs are fixed and their docs are archived under
-`../internal/fixed-suite-bugs/h2-suite-bugs/`. What is still open — three
-classes that stop passing when the `org/h2/` JIT ban is lifted, one
-`TestFileSystem` performance wall, and one cosmetic `ClassCastException`
-message defect — is in
 [`h2/h2-jitban-residuals-20260726.md`](h2/h2-jitban-residuals-20260726.md).
-Two general x64 JIT defects were fixed on the way there and are worth knowing
-about outside H2: an array reported itself an instance of its component type
-(`String[] instanceof String` was true), and JIT invokespecial resolved its
-target by name, ignoring the caller's class loader.
+Residuals 1-3 fixed; residual 4 re-measured and still open; the ban STAYS on
+new, stronger evidence.
 
-This folder collects CratonVM-only defects found while running upstream Java
-suites. The docs had grown to describe the **same underlying bug from several
-angles**; this index is the consolidated map. Read it first.
+The finding worth knowing outside H2: **a JIT-compiled caller's
+`invokevirtual` never reached a JIT-compiled callee.**
+`direct_virtual_compiled_callee_entry_enabled()` (`vm/src/jit/helpers.rs`) was
+default-OFF and gates the only code that ever writes `mic.cached_entry_ptr`, so
+the inline MIC/PIC cascade the codegen emits could never open and every virtual
+call out of compiled code fell through into the interpreter. Compiling a method
+made its callees slower; compiling more of a program made the program slower.
+That is what the two H2 "300s hangs" were — not hangs, a 30x throughput
+collapse that showed up only when lifting the `org/h2/` ban made the *callers*
+compiled. Now default-ON (`CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`
+opts out); +4 net PASS across the 218-class H2 suite with no regressions.
+
+Three more general defects fixed on the way:
+
+* `ThreadPoolExecutor.shutdown()` interrupted RUNNING workers, not just idle
+  ones. `shutdown()` is an orderly shutdown — the JDK separates the two with
+  `w.tryLock()` in `interruptIdleWorkers`. Witness:
+  `regression-suite/src/RExecutorShutdown.java`.
+* `AbstractInterruptibleChannel.interruptor` was **always** null on CratonVM
+  (the `FileChannelImpl` bridge never runs the JDK constructor), so any channel
+  operation on a thread whose interrupt flag happened to be set died with an NPE
+  instead of the specified asynchronous close. Witness:
+  `regression-suite/src/RChannelInterrupt.java`. Still present for
+  `SocketChannel`/`ServerSocketChannel` — see the doc for why that one is not
+  a drive-by fix.
+* `ClassCastException` named an array receiver by its *component* class
+  (`java.lang.String cannot be cast to java.lang.String` for a `String[]`).
+  Fixed in the interpreter and the JIT helper; asserted in
+  `regression-suite/src/RJitArrayTypecheck.java`.
+
+Two permanent env-gated diagnostics came out of it: `CRATONVM_DBG_INTERRUPT`
+(the Java frame stack of every `Thread.interrupt()` — a spurious interrupt is
+invisible where it is consumed) and `CRATONVM_DBG_JIT_COMPILED` (one line per
+published compilation — the only way to answer "is this method actually
+running compiled?").
+
+Methodology note carried forward: three concurrent 218-class suite runs on the
+Azure host produced two false per-class regressions, both of which evaporated on
+isolated re-runs. Run comparison arms one at a time.
 
 ## 2026-07-26 SPB.1 (`org/springframework/util/`) ban REMOVED — the "allocate-then-putfield" crash was a GC-root-scanning gap, not a JIT bug — FIXED, moved to internal
 

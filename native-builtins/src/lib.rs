@@ -31118,6 +31118,31 @@ pub(crate) fn executor_has_real_workers(ctx: &mut dyn NativeContext, exec: Objec
 }
 
 pub(crate) fn interrupt_executor_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
+    interrupt_executor_workers_filtered(ctx, exec, /* only_idle */ false)
+}
+
+/// `interrupt_executor_workers` with the `shutdown()` vs `shutdownNow()`
+/// distinction the JDK draws.
+///
+/// `shutdownNow()` interrupts EVERY worker (`interruptWorkers()`), which is what
+/// `only_idle == false` does. `shutdown()` must interrupt only the IDLE ones
+/// (`interruptIdleWorkers()`): a worker that is currently RUNNING a task holds
+/// its own `Worker` lock, so `w.tryLock()` fails for it and the JDK leaves it
+/// alone -- that is the whole meaning of "orderly shutdown: previously
+/// submitted tasks are executed".
+///
+/// Interrupting a running task instead is observable, not cosmetic. H2
+/// `MVStore.close()` -> `Utils.shutdownExecutor` -> `shutdown()` runs while the
+/// buffer-save worker sits inside `FileChannel.write`; an interrupt there makes
+/// `AbstractInterruptibleChannel.begin()` take its `me.isInterrupted()` branch
+/// and abort the write, which H2 turns into an `MVStoreException` wrapping
+/// `NullPointerException: ... Interruptible.interrupt ... this.interruptor is
+/// null` and a failed `TestStreamStore` (2026-07-26).
+pub(crate) fn interrupt_executor_workers_filtered(
+    ctx: &mut dyn NativeContext,
+    exec: ObjectRef,
+    only_idle: bool,
+) -> bool {
     // Unwrap Executors$DelegatedExecutorService / AutoShutdownDelegated...
     // (field `e` -> the inner executor) if present.
     let dbg = crate::nbflags().dbg_exec;
@@ -31161,6 +31186,31 @@ pub(crate) fn interrupt_executor_workers(ctx: &mut dyn NativeContext, exec: Obje
             Ok(Some(Value::Object(Some(w)))) => w,
             _ => break,
         };
+        // `shutdown()`: skip workers that are running a task. `Worker` extends
+        // AQS and `runWorker` holds `w.lock()` for the duration of each task, so
+        // a successful `tryLock()` means "idle" exactly as it does in
+        // `ThreadPoolExecutor.interruptIdleWorkers`. Unlock immediately after,
+        // as the JDK does, so the worker can take its next task.
+        //
+        // Fail OPEN: if `tryLock` cannot be invoked at all (a synthetic worker
+        // with no AQS body), interrupt anyway rather than leave a worker blocked
+        // in `getTask()` forever -- an unwoken idle worker turns
+        // `awaitTermination(1, DAYS)` into a hang, which is worse than an
+        // over-eager interrupt.
+        if only_idle {
+            match ctx.invoke_virtual(worker, "tryLock", "()Z", &[]) {
+                Ok(Some(Value::Int(0))) => {
+                    if dbg {
+                        eprintln!("[EXEC] worker is running a task -> not interrupted");
+                    }
+                    continue;
+                }
+                Ok(Some(Value::Int(_))) => {
+                    let _ = ctx.invoke_virtual(worker, "unlock", "()V", &[]);
+                }
+                _ => {}
+            }
+        }
         if let Value::Object(Some(t)) = ctx.get_field_by_name(worker, "thread") {
             // Mirror the foundation interrupt: set the VM atomic AND the Java
             // Thread.interrupted field so getTask()'s Condition.await wakes and
