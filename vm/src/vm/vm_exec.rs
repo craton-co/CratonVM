@@ -8161,6 +8161,21 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             resolve_field_descriptor_byte_cached(self.shared, class_id, index)
         };
         let swapped = self.shared.threads.monitors.with_cas_lock(obj, || {
+            // The CAS mutex provides the operation's per-object
+            // linearization point, but ordinary volatile readers and writers
+            // use the collector's stripe lock to prevent tearing the 16-byte
+            // `Value` slot.  Hold that stripe once across the whole
+            // read/compare/write rather than calling `get_field_volatile_as`
+            // and `set_field_volatile_as`, which acquire it twice and insert
+            // four SeqCst fences for one successful Unsafe CAS.  The single
+            // pair of fences below retains the full volatile/CAS ordering, and
+            // the shared stripe keeps this raw slot access atomic with every
+            // non-CAS volatile access.
+            let volatile_guard = (!is_array)
+                .then(|| cratonvm_gc::collector::volatile_stripe_lock(obj, index));
+            if volatile_guard.is_some() {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            }
             let current = if is_array {
                 self.shared
                     .mem
@@ -8168,11 +8183,11 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                     .get_array_element(obj, index)
                     .unwrap_or(Value::Object(None))
             } else if let Some(desc) = descriptor {
-                self.shared.mem.heap.get_field_volatile_as(obj, index, desc)
+                self.shared.mem.heap.get_field_as(obj, index, desc)
             } else {
-                self.shared.mem.heap.get_field_volatile(obj, index)
+                self.shared.mem.heap.get_field(obj, index)
             };
-            if values_equal_for_cas(&current, &expected) {
+            let swapped = if values_equal_for_cas(&current, &expected) {
                 // Task #42 (deferred from #25): SATB pre-barrier on
                 // the CAS-putfield / CAS-aastore path.  Without it,
                 // a successful CAS that overwrites an old ref slot
@@ -8193,17 +8208,18 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
                 if is_array {
                     let _ = self.shared.mem.heap.set_array_element(obj, index, new_val);
                 } else if let Some(desc) = descriptor {
-                    self.shared
-                        .mem
-                        .heap
-                        .set_field_volatile_as(obj, index, new_val, desc);
+                    self.shared.mem.heap.set_field_as(obj, index, new_val, desc);
                 } else {
-                    self.shared.mem.heap.set_field_volatile(obj, index, new_val);
+                    self.shared.mem.heap.set_field(obj, index, new_val);
                 }
                 true
             } else {
                 false
+            };
+            if volatile_guard.is_some() {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
             }
+            swapped
         });
         if swapped {
             if crate::runtime::env_cache::dbg_loader_trace() {

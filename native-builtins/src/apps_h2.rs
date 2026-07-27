@@ -152,6 +152,12 @@ pub fn register_h2_parser_fastpaths(registry: &mut NativeMethodRegistry) {
         h2_parser_add_expected_int,
     );
     registry.register(
+        "org/h2/command/ParserBase",
+        "testToken",
+        "(Ljava/lang/String;Lorg/h2/command/Token;)Z",
+        h2_parser_test_token_fast,
+    );
+    registry.register(
         "org/h2/command/Tokenizer",
         "eq",
         "(Ljava/lang/String;Ljava/lang/String;II)Z",
@@ -2466,6 +2472,42 @@ fn h2_parser_add_expected_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         cratonvm_native_collections::native_al_add(ctx, &[Value::Object(Some(expected)), token]);
     ctx.unpin_native_roots(expected_pin);
     result.map(|_| None)
+}
+
+/// The overwhelmingly common H2 token is an IdentifierToken, whose `quoted`
+/// and `identifier` fields can be read directly.  Keep the uncommon token
+/// shapes on H2's own `asIdentifier()` path, but avoid interpreted token and
+/// String dispatch for the normal parser branch.
+fn h2_parser_test_token_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
+    let expected = match args.get(1) { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
+    let token = match args.get(2) { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
+    if matches!(ctx.get_field_by_name(token, "quoted"), Value::Int(value) if value != 0) {
+        return Ok(Some(Value::Int(0)));
+    }
+    let identifier = match ctx.get_field_by_name(token, "identifier") {
+        Value::Object(Some(value)) => value,
+        _ => {
+            let expected_pin = ctx.pin_native_root(expected);
+            let token_pin = ctx.pin_native_root(token);
+            let token = ctx.read_native_pin(token_pin, token);
+            let result = ctx.invoke_virtual(token, "asIdentifier", "()Ljava/lang/String;", &[])?;
+            let expected = ctx.read_native_pin(expected_pin, expected);
+            ctx.unpin_native_roots(token_pin);
+            ctx.unpin_native_roots(expected_pin);
+            match result { Some(Value::Object(Some(value))) => value, _ => return Ok(Some(Value::Int(0))) }
+        }
+    };
+    if matches!(ctx.get_field_by_name(this, "identifiersToUpper"), Value::Int(value) if value != 0) {
+        return crate::lang_string::native_string_equals(
+            ctx,
+            &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
+        );
+    }
+    crate::lang_string::native_string_equals_ignore_case(
+        ctx,
+        &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
+    )
 }
 
 /// Exact UTF-16-code-unit comparison used by H2's tokenizer for case-insensitive

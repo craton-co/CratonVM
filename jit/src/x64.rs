@@ -18336,19 +18336,41 @@ impl Compiler {
     /// SHA-512 word == `0x8000_0000_0000_0000` would otherwise be misread as a
     /// deopt and the caller would silently bail mid-method).
     fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
+        // The simulated operand stack at this point is the state *after* the
+        // instruction which made the fallible call: every invoke lowering has
+        // already removed its receiver and arguments before emitting the ABI
+        // call above.  A frame-deopt snapshot must therefore resume at that
+        // instruction's successor, not at `dbg_last_pc` itself.  Resuming at
+        // the invoke would make the interpreter try to consume the already
+        // removed operands (TransactionUtil.wrapInTransaction's
+        // `Consumer.accept` was the concrete failure: the reconstructed frame
+        // resumed pc=25 with an empty stack, and the virtual dispatch cache
+        // underflowed after advancing to pc=30).
+        //
+        // Every caller invokes this helper after lowering a bytecode operation.
+        // `dbg_last_op` provides the exact encoded width for the only variable
+        // length invoke forms; all other supported fallible helpers here use
+        // the ordinary three-byte CP form or a one-byte operation.  Keeping the
+        // original PC for non-invoke operations avoids changing their exception
+        // routing semantics.
+        let deopt_resume_bci = match self.dbg_last_op {
+            0xb9 | 0xba => self.dbg_last_pc.saturating_add(5),
+            0xb6 | 0xb7 | 0xb8 => self.dbg_last_pc.saturating_add(3),
+            _ => self.dbg_last_pc,
+        };
         // The bytecode compiler has just emitted the dispatch, so its local
         // homes still describe the point at which an exception from that call
         // is caught. A params-only handler reconstruction is insufficient for
         // this method; retain a typed snapshot and branch to its frame-deopt
         // exit instead of the shared sentinel-only exit below.
         if self.precise_exception_frames
-            && !self.deopt_box_ptr_by_bci.contains_key(&self.dbg_last_pc)
+            && !self.deopt_box_ptr_by_bci.contains_key(&deopt_resume_bci)
         {
             let box_ptr = self.build_and_record_deopt_point(
-                self.dbg_last_pc,
+                deopt_resume_bci,
                 crate::deopt::DeoptReason::ReceiverTypeChanged,
             );
-            self.deopt_box_ptr_by_bci.insert(self.dbg_last_pc, box_ptr);
+            self.deopt_box_ptr_by_bci.insert(deopt_resume_bci, box_ptr);
         }
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
@@ -18376,7 +18398,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
@@ -18390,7 +18412,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
