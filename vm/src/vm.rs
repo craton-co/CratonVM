@@ -73181,7 +73181,8 @@ public class SkippedTest {
 
         let tmp = std::env::temp_dir().join("cratonvm_s42_vm_test.hprof");
         let path = tmp.to_str().unwrap();
-        let size = crate::runtime::hprof::dump_heap(&vm, path).expect("dump_heap should succeed");
+        let size = crate::runtime::hprof::dump_heap(&vm, path, ThreadId(0))
+            .expect("dump_heap should succeed");
         assert!(size > 0);
 
         let data = std::fs::read(&tmp).unwrap();

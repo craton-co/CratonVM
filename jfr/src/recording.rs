@@ -33,38 +33,39 @@ pub enum RecordingState {
 /// Settings for a recording.
 ///
 /// ---------------------------------------------------------------------------
-/// UNENFORCED FIELDS (observability audit, 2026-07-26)
+/// FIELD STATUS (observability audit, 2026-07-26; retention fixed same day)
 /// ---------------------------------------------------------------------------
-/// Only [`Self::enabled_events`] and [`Self::event_thresholds`] are read by
-/// any code — `Recording::record_event` and `Recording::passes_filter` consult
-/// them. The remaining five are **inert**: setting them changes nothing.
+/// [`Self::enabled_events`] and [`Self::event_thresholds`] are read by
+/// `Recording::record_event` / `Recording::passes_filter`, as before.
 ///
-///  * `max_age`, `max_size` — no retention policy exists. A recording's
-///    memory bound comes solely from `EventRepository::default()`'s fixed
-///    100_000-event ring, which evicts oldest-first regardless of these
-///    values. An operator setting `max_size` to cap a recording's footprint
-///    gets the same 100_000 events either way, and one setting `max_age` to
-///    keep the last 60 seconds gets whatever 100_000 events happen to be
-///    newest. Both are honest-looking knobs that do nothing.
-///  * `disk` — there is no disk-backed repository; recordings are memory-only
-///    until an explicit `dump_recording` call.
-///  * `dump_on_exit` — nothing hooks VM shutdown to dump.
-///  * `duration` — nothing schedules an automatic stop.
-///
-/// These are left in place because they are the right shape for the eventual
-/// implementation, but they must not be surfaced to users (as a CLI option, a
-/// jcmd argument, or a `jdk.jfr` API) until they are enforced.
+///  * `max_age`, `max_size` — FIXED: `Recording::new` now constructs its
+///    repository via `EventRepository::with_max_age`, so both are real
+///    retention bounds enforced on every push (see `EventRepository::push`).
+///    `max_size` unset keeps the historical 100_000-event default; `max_age`
+///    unset keeps age-based eviction off. Age is measured against each
+///    pushed event's own `start_time`, not wall-clock `SystemTime::now()` —
+///    see `EventRepository::with_max_age`'s doc comment for why.
+///  * `disk` — still **inert**. There is no disk-backed repository;
+///    recordings remain memory-only until an explicit `dump_recording` call.
+///    Not surfaced by the `-XX:StartFlightRecording` CLI flag (see
+///    `vm-cli/src/main.rs`) for this reason.
+///  * `dump_on_exit` — FIXED: `SharedVm`'s shutdown path dumps any recording
+///    with this set before the process exits (see `vm/src/vm/vm_init.rs`).
+///  * `duration` — FIXED: `Vm::new` spawns a watcher thread when a
+///    `-XX:StartFlightRecording` recording sets this, which stops the
+///    recording once the duration elapses (see `vm/src/vm/vm_init.rs`).
 pub struct RecordingSettings {
     pub name: String,
-    /// Inert — see the type-level note. No retention policy reads this.
+    /// Enforced by `EventRepository::with_max_age` — see the type-level note.
     pub max_age: Option<Duration>,
-    /// Inert — see the type-level note. No retention policy reads this.
+    /// Enforced by `EventRepository::with_max_age` — see the type-level note.
     pub max_size: Option<usize>,
     /// Inert — see the type-level note. Recordings are memory-only.
     pub disk: bool,
-    /// Inert — see the type-level note. Nothing hooks VM shutdown.
+    /// Enforced by the VM shutdown path — see the type-level note.
     pub dump_on_exit: bool,
-    /// Inert — see the type-level note. Nothing schedules an automatic stop.
+    /// Enforced by a watcher thread started alongside the recording — see
+    /// the type-level note.
     pub duration: Option<Duration>,
     /// T10.9.B: FxHashSet — EventTypeId is internal JFR definition.
     pub enabled_events: FxHashSet<EventTypeId>,
@@ -132,13 +133,23 @@ pub struct Recording {
 
 impl Recording {
     pub fn new(id: u64, settings: RecordingSettings) -> Self {
+        // obsaudit D12 (2026-07-26): max_size/max_age are now enforced —
+        // see the UNENFORCED FIELDS note above, and
+        // `EventRepository::with_max_age`. `max_size` unset keeps the
+        // historical 100_000-event default; `max_age` unset keeps
+        // age-based eviction off, exactly as before this fix for a
+        // recording that never sets it.
+        let repository = EventRepository::with_max_age(
+            settings.max_size.unwrap_or(100_000),
+            settings.max_age.map(|d| d.as_nanos() as u64),
+        );
         Self {
             id,
             settings,
             state: RecordingState::New,
             start_time: None,
             stop_time: None,
-            repository: EventRepository::default(),
+            repository,
             events_filtered_out: AtomicU64::new(0),
         }
     }
@@ -700,13 +711,16 @@ mod tests {
         assert_eq!(s.max_age.unwrap(), Duration::from_secs(60));
     }
 
-    /// Observability audit (2026-07-26) contract pin: `max_size` and `max_age`
-    /// are stored but never enforced. This test asserts the *current* (inert)
-    /// behaviour so that implementing retention makes it fail — at which point
-    /// the "UNENFORCED FIELDS" note on `RecordingSettings` must be updated in
-    /// the same change rather than silently going stale.
+    /// obsaudit D12 (2026-07-26): `max_size`/`max_age` are now enforced —
+    /// renamed from `obsaudit_max_size_and_max_age_are_not_enforced`, which
+    /// pinned the opposite (inert) behaviour. With `max_age` set to 1ns and
+    /// events spaced 1 second apart, every push's age-based eviction pass
+    /// clears everything older than (this event's time - 1ns) — which is
+    /// every prior event, since 1s >> 1ns — so only the just-pushed event
+    /// ever survives. `max_size = Some(2)` is strictly looser than that and
+    /// never binds first.
     #[test]
-    fn obsaudit_max_size_and_max_age_are_not_enforced() {
+    fn obsaudit_max_size_and_max_age_are_enforced() {
         let mut settings = RecordingSettings::new("capped");
         settings.max_size = Some(2); // "keep at most 2 events"
         settings.max_age = Some(Duration::from_nanos(1)); // "keep only the newest"
@@ -725,9 +739,31 @@ mod tests {
 
         assert_eq!(
             rec.event_count(),
-            10,
-            "max_size/max_age are inert; the only bound is the repository ring"
+            1,
+            "max_age=1ns evicts every event older than the one just pushed"
         );
+    }
+
+    /// obsaudit D12: `max_size` alone (age unset) behaves like a smaller
+    /// version of the default ring — a plain, size-only cap.
+    #[test]
+    fn obsaudit_max_size_alone_caps_without_age_eviction() {
+        let mut settings = RecordingSettings::new("size-capped");
+        settings.max_size = Some(3);
+
+        let mut rec = Recording::new(1, settings);
+        rec.start();
+        for i in 0..10u64 {
+            rec.record_event(EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i * 1_000_000_000,
+                end_time: i * 1_000_000_000 + 1,
+                thread_id: 1,
+                fields: smallvec::SmallVec::new(),
+            });
+        }
+
+        assert_eq!(rec.event_count(), 3);
     }
 
     /// The bound that *does* apply: `EventRepository::default()`'s fixed ring.

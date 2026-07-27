@@ -76,11 +76,48 @@ pub trait VmDiagnosticState: Send + Sync {
 // Attach API infrastructure
 // ---------------------------------------------------------------------------
 
-/// Listener for diagnostic attach requests (domain socket based).
+/// Listener for diagnostic attach requests (Unix domain socket based).
+///
+/// obsaudit D15 (2026-07-26), FIXED: `start_listening` now opens a real
+/// socket at `socket_path` and serves the HotSpot Attach API wire protocol,
+/// so `jcmd <pid> ...` / `jstack <pid>` / `jmap <pid> ...` from a real,
+/// unmodified JDK installation can connect and run commands. The protocol
+/// was not reverse-engineered from memory: verified empirically against a
+/// real OpenJDK 21 `jcmd`/`jstack`/`jmap` on the audit host (2026-07-26) by
+/// standing up a bare Python socket listener at `/tmp/.java_pid<pid>` for a
+/// live dummy process and logging the raw bytes each tool sent. Findings:
+///
+///  * Each attach opens the socket **twice**: a first connection that sends
+///    zero bytes (the client's own "is a listener already up?" readiness
+///    probe — HotSpot's real client normally creates a `.attach_pid<pid>`
+///    file and sends `SIGQUIT` to *trigger* this probe to eventually
+///    succeed; since this implementation listens from VM boot, the socket
+///    already exists and the probe succeeds immediately, so the SIGQUIT /
+///    `.attach_pid` dance is never needed here), followed by a second
+///    connection carrying the real request. Both must be handled — the
+///    first is not an error, just a no-op.
+///  * The real request is five NUL-terminated fields:
+///    `<protocol-version>\0<operation>\0<arg1>\0<arg2>\0<arg3>\0` — e.g.
+///    `jcmd <pid> VM.version` sends `1\0jcmd\0VM.version\0\0\0`; `jstack`
+///    sends `1\0threaddump\0\0\0\0`; `jmap -histo` sends
+///    `1\0inspectheap\0-all\0\0\0`; `jmap -dump:file=X` sends
+///    `1\0dumpheap\0X\0-all\0`.
+///  * The response is a decimal result code, a newline, then the raw
+///    command output; the connection close signals EOF to the client. No
+///    length prefix, no other framing.
+///
+/// See `handle_attach_connection` for the server-side implementation of
+/// this protocol, and the module LIVENESS block at the top of this file.
 pub struct AttachListener {
     pub socket_path: String,
     pub is_listening: bool,
-    pub commands: Vec<DiagnosticCommand>,
+    /// `Arc<RwLock<_>>` rather than a plain `Vec` (as before this fix) so
+    /// the background accept thread spawned by `start_listening` can hold
+    /// its own handle to the live command set without borrowing `self`.
+    /// Also means commands may be registered before *or* after
+    /// `start_listening` is called with no race — every dispatch reads the
+    /// list fresh through the shared lock.
+    pub commands: Arc<parking_lot::RwLock<Vec<DiagnosticCommand>>>,
 }
 
 impl AttachListener {
@@ -88,29 +125,264 @@ impl AttachListener {
         Self {
             socket_path: socket_path.to_string(),
             is_listening: false,
-            commands: Vec::new(),
+            commands: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }
     }
 
+    /// Open the real attach socket and start serving requests in a
+    /// detached background thread. Idempotent — a second call while
+    /// already listening is a no-op. See the struct doc comment for the
+    /// wire protocol.
+    ///
+    /// obsaudit D15: Unix-only (`std::os::unix::net`), matching HotSpot's
+    /// own per-OS split (Unix domain socket on Linux/macOS, a named pipe on
+    /// Windows — implementing the Windows side is a separate undertaking
+    /// this pass did not attempt). On a non-Unix target this still just
+    /// flips `is_listening`, exactly as the whole function did before this
+    /// fix, so existing callers that only check the flag are unaffected.
+    #[cfg(unix)]
+    pub fn start_listening(&mut self) {
+        if self.is_listening {
+            return;
+        }
+        // A stale socket file can be left behind by a crashed prior process
+        // that reused this PID (PIDs recycle) — `bind` fails with
+        // `AddrInUse` against a leftover path, so clear it first. Safe: a
+        // Unix domain socket path is just a filesystem name, not a live
+        // listener, once its owning process is gone.
+        let _ = std::fs::remove_file(&self.socket_path);
+        let listener = match std::os::unix::net::UnixListener::bind(&self.socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    "AttachListener: failed to bind attach socket at {}: {e}",
+                    self.socket_path
+                );
+                return;
+            }
+        };
+        // Owner-only permissions, matching HotSpot's attachListener.cpp.
+        // This is a local IPC channel that can trigger a heap dump of the
+        // whole process on request — it must not be reachable by other
+        // users on the host.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &self.socket_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+
+        let commands = Arc::clone(&self.commands);
+        std::thread::Builder::new()
+            .name("Attach-Listener".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(conn) => {
+                            let commands = Arc::clone(&commands);
+                            // One thread per connection: attach requests are
+                            // rare (an operator running a diagnostic
+                            // command) and some handlers (GC.heap_dump) can
+                            // take a while — a single-threaded accept loop
+                            // would otherwise serialize unrelated attaches
+                            // behind a slow one.
+                            std::thread::Builder::new()
+                                .name("Attach-Connection".into())
+                                .spawn(move || handle_attach_connection(conn, &commands))
+                                .ok();
+                        }
+                        Err(_) => break, // listener socket gone (e.g. unlinked externally)
+                    }
+                }
+            })
+            .ok();
+        self.is_listening = true;
+    }
+
+    #[cfg(not(unix))]
     pub fn start_listening(&mut self) {
         self.is_listening = true;
     }
 
+    /// Best-effort: removes the socket file and clears the flag. Does not
+    /// signal or join the background accept thread (it has no way to be
+    /// woken from a blocking `accept()` short of a poke connection, and
+    /// nothing in this codebase calls `stop_listening` outside tests today
+    /// — the listener's real lifetime is the VM process's own). A stray
+    /// accept-loop thread from a `stop_listening` call is harmless: with
+    /// the socket file removed, no new client can reach it, and the VM
+    /// process exiting reaps it like any other thread.
     pub fn stop_listening(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
         self.is_listening = false;
     }
 
     pub fn register_command(&mut self, cmd: DiagnosticCommand) {
-        self.commands.push(cmd);
+        self.commands.write().push(cmd);
     }
 
-    pub fn find_command(&self, name: &str) -> Option<&DiagnosticCommand> {
-        self.commands.iter().find(|c| c.name == name)
+    pub fn list_commands(&self) -> Vec<String> {
+        self.commands
+            .read()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
     }
 
-    pub fn list_commands(&self) -> Vec<&str> {
-        self.commands.iter().map(|c| c.name.as_str()).collect()
+    /// Look up `name` and execute it with `args` under a single read-lock
+    /// acquisition. Returns `None` for an unregistered command name.
+    pub fn dispatch_command(&self, name: &str, args: &[String]) -> Option<CommandResult> {
+        self.commands
+            .read()
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.execute(args))
     }
+}
+
+/// obsaudit D15: server side of the Attach API wire protocol — see the
+/// `AttachListener` doc comment for the format, empirically verified
+/// against a real OpenJDK 21 `jcmd`/`jstack`/`jmap`.
+#[cfg(unix)]
+fn handle_attach_connection(
+    mut conn: std::os::unix::net::UnixStream,
+    commands: &parking_lot::RwLock<Vec<DiagnosticCommand>>,
+) {
+    use std::io::{Read, Write};
+
+    // A 5-second read timeout bounds how long a connection thread can be
+    // stuck on a peer that opens the socket and then never sends anything
+    // (or sends a truncated request) — without this, `read` blocks forever
+    // and the thread (and its `Arc<RwLock<..>>` clone) leaks for the life
+    // of the process.
+    let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
+    // obsaudit D15: read until the 5-field request is complete (five NUL
+    // bytes seen), NOT until EOF. The real client does not close its write
+    // side after sending the request — it immediately starts reading the
+    // response — so a read-until-EOF loop here deadlocks: this thread
+    // blocks waiting for a close the peer will only do *after* seeing a
+    // response, and the peer blocks waiting for a response this thread
+    // never sends. Confirmed by instrumenting this function and running a
+    // real OpenJDK 21 `jcmd` against it: the first request logged a clean
+    // 20-byte read matching `1 jcmd VM.version   `, then hung — jcmd
+    // eventually gave up and closed, this code finally saw the resulting
+    // EOF, and by then jcmd had already reported "Premature EOF" to the
+    // operator. Every subsequent attach from the same client then reported
+    // "Connection refused", consistent with the client-side attach API
+    // treating the process as wedged after one failed round-trip.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match conn.read(&mut chunk) {
+            Ok(0) => break, // peer closed before completing a request — the readiness probe, or a truncated one
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.iter().filter(|&&b| b == 0).count() >= 5 {
+                    break; // all five NUL-terminated fields have arrived
+                }
+                // Bound how much a misbehaving/hostile local peer can make
+                // this thread buffer while still short of 5 NULs.
+                if buf.len() > 64 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    if buf.is_empty() {
+        // The client's own readiness probe (see the struct doc comment) —
+        // nothing to respond to, and no real client waits for a response
+        // on this connection.
+        return;
+    }
+
+    let fields: Vec<&[u8]> = buf.split(|&b| b == 0).collect();
+    let field = |i: usize| -> String {
+        fields
+            .get(i)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default()
+    };
+    // fields[0] is the protocol version ("1" for every JDK this was tested
+    // against) — not currently branched on; every operation below is
+    // version-1 shaped and there is no version-2-only feature in play.
+    let operation = field(1);
+    let arg1 = field(2);
+    let arg2 = field(3);
+
+    let (name, args): (String, Vec<String>) = match operation.as_str() {
+        // `jcmd <pid> <command...>` — arg1 is the *entire* diagnostic
+        // command line (e.g. "GC.heap_dump /tmp/x.hprof"), exactly what
+        // `JcmdProcessor::process_command` already parses.
+        "jcmd" => {
+            let mut parts = arg1.splitn(2, ' ');
+            let name = parts.next().unwrap_or("").to_string();
+            let rest = parts.next().unwrap_or("");
+            (
+                name,
+                rest.split_whitespace().map(String::from).collect(),
+            )
+        }
+        // `jstack <pid>`.
+        "threaddump" => ("Thread.print".to_string(), Vec::new()),
+        // `jmap -histo <pid>` (arg1 is "-all" or "-live"; this
+        // implementation's histogram does not distinguish the two).
+        "inspectheap" => ("GC.class_histogram".to_string(), Vec::new()),
+        // `jmap -dump:file=<path> <pid>` (arg1 is the path, arg2 is
+        // "-all"/"-live").
+        "dumpheap" => (
+            "GC.heap_dump".to_string(),
+            if arg1.is_empty() {
+                Vec::new()
+            } else {
+                vec![arg1.clone()]
+            },
+        ),
+        // `jinfo -sysprops <pid>` / `jcmd <pid> VM.system_properties`'s
+        // sibling entry point.
+        "properties" => ("VM.system_properties".to_string(), Vec::new()),
+        other => {
+            let _ = write_attach_response(
+                &mut conn,
+                1,
+                &format!("Unrecognized attach operation: {other}
+"),
+            );
+            return;
+        }
+    };
+
+    let result = commands
+        .read()
+        .iter()
+        .find(|c| c.name == name)
+        .map(|c| c.execute(&args));
+    let write_result = match result {
+        Some(r) if r.success => write_attach_response(&mut conn, 0, &r.output),
+        Some(r) => write_attach_response(
+            &mut conn,
+            1,
+            r.error.as_deref().unwrap_or("command failed"),
+        ),
+        None => write_attach_response(&mut conn, 1, &format!("Unknown command: {name}
+")),
+    };
+    let _ = write_result;
+    let _ = arg2; // consumed above for dumpheap's "-all"/"-live"; unused otherwise
+}
+
+#[cfg(unix)]
+fn write_attach_response(
+    conn: &mut std::os::unix::net::UnixStream,
+    code: i32,
+    body: &str,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    conn.write_all(format!("{code}\n").as_bytes())?;
+    conn.write_all(body.as_bytes())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -234,9 +506,19 @@ pub struct JcmdProcessor {
     pub attach_listener: AttachListener,
 }
 
+/// obsaudit D15: process-wide counter so every `JcmdProcessor::new()` gets
+/// a distinct socket path. Before this fix `start_listening` only flipped a
+/// bool, so a hardcoded shared path was harmless; now it binds a real Unix
+/// socket, and this file's own test suite constructs `JcmdProcessor::new()`
+/// upwards of a dozen times, often running in parallel (`cargo test`'s
+/// default) — a shared path would make those binds race each other.
+static TEST_JCMD_SOCKET_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl JcmdProcessor {
     pub fn new() -> Self {
-        let mut listener = AttachListener::new("/tmp/cratonvm_attach");
+        let n = TEST_JCMD_SOCKET_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = format!("/tmp/cratonvm_attach_test_{}_{}", std::process::id(), n);
+        let mut listener = AttachListener::new(&path);
         listener.start_listening();
 
         // Register all standard commands
@@ -248,8 +530,16 @@ impl JcmdProcessor {
     }
 
     /// Create a JcmdProcessor backed by live VM state.
+    ///
+    /// obsaudit D15: the socket path is `/tmp/.java_pid<pid>` — not a
+    /// placeholder. This is the exact path real HotSpot tooling
+    /// (`jcmd`/`jstack`/`jmap`) probes for on Linux; verified empirically
+    /// against a real OpenJDK 21 `jcmd` (see the `AttachListener` doc
+    /// comment). Do not change this without re-verifying against a real
+    /// client — the path is load-bearing, not cosmetic.
     pub fn new_with_vm_state(vm_state: Arc<dyn VmDiagnosticState>) -> Self {
-        let mut listener = AttachListener::new("/tmp/cratonvm_attach");
+        let path = format!("/tmp/.java_pid{}", std::process::id());
+        let mut listener = AttachListener::new(&path);
         listener.start_listening();
         Self::register_live_commands(&mut listener, vm_state);
         Self {
@@ -774,10 +1064,9 @@ impl JcmdProcessor {
             return CommandResult::ok(self.help(), 0);
         }
 
-        match self.attach_listener.find_command(cmd_name) {
-            Some(cmd) => {
-                let start = Instant::now();
-                let mut result = cmd.execute(&args);
+        let start = Instant::now();
+        match self.attach_listener.dispatch_command(cmd_name, &args) {
+            Some(mut result) => {
                 result.execution_time_ms = start.elapsed().as_millis() as u64;
                 result
             }
@@ -788,7 +1077,7 @@ impl JcmdProcessor {
     /// Generate help text listing all available commands.
     pub fn help(&self) -> String {
         let mut lines = vec!["Available commands:".to_string()];
-        for cmd in &self.attach_listener.commands {
+        for cmd in self.attach_listener.commands.read().iter() {
             lines.push(format!(
                 "  {} - {} [impact: {}]",
                 cmd.name, cmd.description, cmd.impact
@@ -2268,12 +2557,15 @@ mod tests {
         let listener = AttachListener::new("/tmp/test_attach");
         assert_eq!(listener.socket_path, "/tmp/test_attach");
         assert!(!listener.is_listening);
-        assert!(listener.commands.is_empty());
+        assert!(listener.commands.read().is_empty());
     }
 
     #[test]
     fn test_attach_listener_start_stop() {
-        let mut listener = AttachListener::new("/tmp/test");
+        // obsaudit D15: a unique path — start_listening() now binds a real
+        // socket, so a path shared with another test risks a parallel-test
+        // bind race (see the comment on TEST_JCMD_SOCKET_COUNTER).
+        let mut listener = AttachListener::new("/tmp/cratonvm_test_start_stop");
         assert!(!listener.is_listening);
         listener.start_listening();
         assert!(listener.is_listening);
@@ -2292,12 +2584,17 @@ mod tests {
             vec![],
             Box::new(|_| CommandResult::ok("ok".to_string(), 0)),
         ));
-        assert_eq!(listener.commands.len(), 1);
-        assert_eq!(listener.commands[0].name, "Test.cmd");
+        assert_eq!(listener.commands.read().len(), 1);
+        assert_eq!(listener.commands.read()[0].name, "Test.cmd");
     }
 
     #[test]
-    fn test_attach_listener_find_command() {
+    fn test_attach_listener_dispatch_command() {
+        // obsaudit D15: renamed from test_attach_listener_find_command —
+        // find_command was removed (it could not return a reference into
+        // the now-lock-guarded `commands` without a dangling-guard
+        // lifetime issue), replaced by dispatch_command, which looks up
+        // and executes under a single lock acquisition.
         let mut listener = AttachListener::new("/tmp/test");
         listener.register_command(DiagnosticCommand::new(
             "Test.cmd",
@@ -2307,8 +2604,8 @@ mod tests {
             vec![],
             Box::new(|_| CommandResult::ok("ok".to_string(), 0)),
         ));
-        assert!(listener.find_command("Test.cmd").is_some());
-        assert!(listener.find_command("Nonexistent").is_none());
+        assert!(listener.dispatch_command("Test.cmd", &[]).is_some());
+        assert!(listener.dispatch_command("Nonexistent", &[]).is_none());
     }
 
     #[test]
@@ -2331,7 +2628,7 @@ mod tests {
             Box::new(|_| CommandResult::ok("ok".to_string(), 0)),
         ));
         let names = listener.list_commands();
-        assert_eq!(names, vec!["A.cmd", "B.cmd"]);
+        assert_eq!(names, vec!["A.cmd".to_string(), "B.cmd".to_string()]);
     }
 
     // --- DiagnosticCommand tests ---
@@ -2414,22 +2711,22 @@ mod tests {
         let jcmd = JcmdProcessor::new();
         let names = jcmd.attach_listener.list_commands();
         assert_eq!(names.len(), 16);
-        assert!(names.contains(&"Thread.print"));
-        assert!(names.contains(&"GC.heap_dump"));
-        assert!(names.contains(&"GC.run"));
-        assert!(names.contains(&"GC.heap_info"));
-        assert!(names.contains(&"GC.class_histogram"));
-        assert!(names.contains(&"VM.version"));
-        assert!(names.contains(&"VM.flags"));
-        assert!(names.contains(&"VM.system_properties"));
-        assert!(names.contains(&"VM.uptime"));
-        assert!(names.contains(&"VM.info"));
-        assert!(names.contains(&"VM.command_line"));
-        assert!(names.contains(&"Thread.dump_to_file"));
-        assert!(names.contains(&"Compiler.queue"));
-        assert!(names.contains(&"JFR.start"));
-        assert!(names.contains(&"JFR.stop"));
-        assert!(names.contains(&"JFR.dump"));
+        assert!(names.contains(&"Thread.print".to_string()));
+        assert!(names.contains(&"GC.heap_dump".to_string()));
+        assert!(names.contains(&"GC.run".to_string()));
+        assert!(names.contains(&"GC.heap_info".to_string()));
+        assert!(names.contains(&"GC.class_histogram".to_string()));
+        assert!(names.contains(&"VM.version".to_string()));
+        assert!(names.contains(&"VM.flags".to_string()));
+        assert!(names.contains(&"VM.system_properties".to_string()));
+        assert!(names.contains(&"VM.uptime".to_string()));
+        assert!(names.contains(&"VM.info".to_string()));
+        assert!(names.contains(&"VM.command_line".to_string()));
+        assert!(names.contains(&"Thread.dump_to_file".to_string()));
+        assert!(names.contains(&"Compiler.queue".to_string()));
+        assert!(names.contains(&"JFR.start".to_string()));
+        assert!(names.contains(&"JFR.stop".to_string()));
+        assert!(names.contains(&"JFR.dump".to_string()));
     }
 
     #[test]
@@ -2605,15 +2902,35 @@ mod tests {
     /// socket behaviour they must also revisit the LIVENESS block at the top
     /// of this module and the fabricated-data audit notes it points at.
     #[test]
-    fn obsaudit_attach_listener_creates_no_socket() {
-        let path = "cratonvm-obsaudit-attach-socket-that-must-not-exist";
+    fn obsaudit_attach_listener_creates_a_real_socket() {
+        // obsaudit D15 (2026-07-26), FIXED: renamed from
+        // obsaudit_attach_listener_creates_no_socket, which pinned the
+        // opposite (no-socket) behaviour this fix replaced. start_listening
+        // now binds a real Unix domain socket at `socket_path` — see the
+        // struct doc comment for the wire protocol, verified empirically
+        // against a real OpenJDK 21 jcmd/jstack/jmap.
+        let path = "/tmp/cratonvm-obsaudit-attach-socket-pin-test";
         let mut l = AttachListener::new(path);
         l.start_listening();
-        assert!(l.is_listening, "the flag is all `start_listening` sets");
+        assert!(l.is_listening);
+        assert!(
+            std::path::Path::new(path).exists(),
+            "AttachListener must create a real socket file at socket_path"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            assert!(
+                meta.file_type().is_socket(),
+                "the file at socket_path must actually be a Unix domain socket, \
+                 not e.g. a stray regular file"
+            );
+        }
+        l.stop_listening();
         assert!(
             !std::path::Path::new(path).exists(),
-            "AttachListener still creates no real socket; if that changed, the \
-             module-level LIVENESS block is now stale"
+            "stop_listening must remove the socket file"
         );
     }
 
@@ -2642,7 +2959,7 @@ mod tests {
         assert!(help.contains("Available commands"));
         // Should list all 16 commands
         for name in jcmd.attach_listener.list_commands() {
-            assert!(help.contains(name));
+            assert!(help.contains(&name));
         }
     }
 
@@ -3034,7 +3351,7 @@ mod tests {
     #[test]
     fn test_jcmd_default_trait() {
         let jcmd = JcmdProcessor::default();
-        assert_eq!(jcmd.attach_listener.commands.len(), 16);
+        assert_eq!(jcmd.attach_listener.commands.read().len(), 16);
     }
 
     #[test]

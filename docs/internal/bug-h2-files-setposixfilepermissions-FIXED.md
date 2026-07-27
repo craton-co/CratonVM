@@ -11,7 +11,7 @@ class was hiding behind the first one (see "Residual chain fixed
 further than before but still does not reach a clean PASS — it now hangs in
 `testConcurrent` against the `async:` filesystem, a genuinely separate,
 deeper JIT/threading bug tracked in its own new doc,
-[`bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md).
+[`bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`](fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md).
 Kept in `docs/known-issues/` per this repo's convention (a doc stays open as
 long as any affected test class has an open sub-item — `TestFileSystem`
 still does, just for a different reason now). Originally opened 2026-07-21 as
@@ -204,7 +204,7 @@ narrows this to the JIT's on-stack-replacement (`CompilationPolicy` mutex)
 subsystem interacting with a `LinkedHashMap.put()` eviction callback under
 real multi-thread contention — a genuinely separate, deeper bug, **not**
 part of this doc's scope. Tracked in its own doc:
-[`bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`](../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md).
+[`bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`](fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md).
 
 ## Verification
 - Standalone repro (`Files.createTempFile` → read/clear/restore permissions

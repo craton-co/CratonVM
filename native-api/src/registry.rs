@@ -1766,6 +1766,31 @@ pub trait NativeContext {
         self.class_id_by_name(name)
     }
 
+    /// Resolve `name` the way a requester-less **parent-delegation** loader
+    /// would: bootstrap -> extension -> application only, never collapsing
+    /// onto some unrelated user-defined loader's private copy of the same
+    /// name -- unless that copy is the ONLY possible answer (no
+    /// ordinary-classpath bytes exist for `name`, the in-memory
+    /// `Proxy`-generated / webapp-private-jar case).
+    ///
+    /// [`Self::class_id_by_name`] is loader-BLIND: after missing in the
+    /// built-in chain it scans every user-defined loader and returns an
+    /// unambiguous same-named match. That is a guess, and it is wrong
+    /// whenever an isolating loader (Spring Boot's
+    /// `ModifiedClassPathClassLoader`, a Groovy `InnerLoader`, a forked test
+    /// loader) happens to have loaded its own copy FIRST: the caller --
+    /// running under the ordinary application loader -- silently gets the
+    /// isolated loader's class, whose `Class` identity is unequal to every
+    /// other reference to "the same" class in the caller's world (JVMS
+    /// SS5.3: the defining loader is part of a class's identity).
+    ///
+    /// Use this instead of `class_id_by_name` for any lookup performed ON
+    /// BEHALF of ordinary application code with no loader context to key on
+    /// -- notably resolving a Spring bean definition's `beanClassName`.
+    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
+        self.class_id_by_name(name)
+    }
+
     /// Resolve `name` to a `ClassId`, LOADING it through
     /// `referencing_class_id`'s own defining classloader if it isn't loaded
     /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/

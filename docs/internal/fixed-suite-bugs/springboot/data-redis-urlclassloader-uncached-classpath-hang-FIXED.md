@@ -86,7 +86,7 @@ bugs — see "Residuals unmasked" below).
   completes in ~215s, 22/23 tests pass — the one remaining failure
   (pre-existing, unrelated, previously masked by the class-level hang) is
   **also now FIXED 2026-07-23**, see
-  `../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`.
+  `data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`.
   Full class now 23/23 PASS.
 - Regression sweep: 82 classes (all `module/spring-boot-data-redis` +
   71 classes across the codebase using `@ClassPathExclusions`/
@@ -98,8 +98,14 @@ bugs — see "Residuals unmasked" below).
 
 ### Residuals unmasked (not new — previously hidden behind the 300s HANG on these specific classes)
 
-- `DataJpaRepositoriesAutoConfigurationTests`: HANG(300s) → FAIL(96s). **Partially triaged 2026-07-26, still FAILING** — see below.
-- `WebSocketMessagingAutoConfigurationTests`: HANG(300s) → FAIL(184s). **Triaged 2026-07-26, still FAILING** — see below.
+**Status 2026-07-27: every residual tracked by this document is now CLOSED**
+(`DataRedisAutoConfigurationTests` perf, `DataJpaRepositoriesAutoConfigurationTests`,
+and both `WebSocketMessagingAutoConfigurationTests` failures plus its
+nondeterministic `NoClassDefFoundError`). Re-verify against a full suite run
+rather than assuming this stays fixed as `dev` continues to move.
+
+- `DataJpaRepositoriesAutoConfigurationTests`: HANG(300s) → FAIL(96s). **RESOLVED 2026-07-26 — now 9/9 PASS** (re-confirmed 2026-07-27, 9/9 in 51s) — see below.
+- `WebSocketMessagingAutoConfigurationTests`: HANG(300s) → FAIL(184s). **RESOLVED 2026-07-27 — now 13/13 PASS** — see below.
 
 Both were already broken before this fix (confirmed via the 2026-07-23
 baseline); the classloading fix just lets them run to completion fast
@@ -218,7 +224,7 @@ class carries `@ClassPathExclusions("spring-data-envers-*.jar")`, which
 routes the *entire* test class through JUnit5's
 `ModifiedClassPathExtension` — a nested `Launcher` re-runs the whole test
 under a **second**, `ModifiedClassPathClassLoader` instance (see
-`modifiedclasspath-aether-network-hang-cluster.md` in
+`modifiedclasspath-aether-network-hang-cluster-FIXED.md` in
 `docs/internal/fixed-suite-bugs/springboot/` for the mechanism). Every
 diagnostic above was traced against whichever load actually printed —
 never confirmed *which* classloader's copy of
@@ -379,119 +385,130 @@ the third):
    `webSocketMessageBrokerConfigurerOrdering` now passes; 3 repeated runs
    all showed the same 2 remaining failures below, never this one again.
 
-2. **Root-caused via live `gdb` attach (2026-07-26 continuation, see below)
-   — TCCL-leak hypothesis REFUTED; real cause is a loader-blind
-   "resolve globally first" fallback reusing an isolated loader's class —
-   NOT fixed.** `shouldUseJackson2WhenPreferred` fails with
-   `IllegalArgumentException: argument type mismatch` constructing
-   `WebSocketMessagingAutoConfiguration$Jackson2WebSocketMessageConverterConfiguration(ObjectMapper)`.
-   See the "gdb investigation" subsection immediately below for the full
-   trace methodology and evidence; summary:
-   - `Thread.contextClassLoader` is **correctly** set-then-restored around
-     each of the two `@ClassPathExclusions("jackson-*-3*")` methods'
-     nested-`Launcher` runs (confirmed directly: a `gdb` breakpoint on
-     `native_thread_set_context_class_loader`'s field write,
-     `native-builtins/src/lib.rs:4539`, shows the main thread's
-     `contextClassLoader` cleanly alternating isolated-loader →
-     original-loader → isolated-loader → original-loader across the run,
-     matching `ModifiedClassPathExtension.interceptMethod`'s real
-     `try { setContextClassLoader(modified); runTest(); } finally {
-     setContextClassLoader(original); }` source exactly). The original
-     TCCL-leak-between-methods theory from the prior pass is **refuted**.
-   - The real problem: `WebSocketMessagingAutoConfigurationTests` itself
-     genuinely has two distinct copies alive in the one process — `ClassId
-     411` (default/Application loader, used by all 11 non-excluded test
-     methods) and a second id (isolated `ModifiedClassPathClassLoader`,
-     used by the 2 excluded methods) — confirmed via a `gdb` breakpoint on
-     `resolve_class_loader_aware` (`vm/src/runtime/interpreter.rs:19187`)
-     filtered to the nested `WebSocketMessagingConfiguration` config class:
-     only ever these two `referencing_class_id`s appear, exactly as
-     expected. But `WebSocketMessagingAutoConfiguration` (imported via
-     `@ImportAutoConfiguration({..., WebSocketMessagingAutoConfiguration.class,
-     ...})` on the *nested* `WebSocketMessagingConfiguration` test-helper
-     class) — and hence its nested `Jackson2WebSocketMessageConverterConfiguration`
-     — resolves to the **exact same** `ClassId` (confirmed `near=6066`/`6067`
-     across separate runs, byte-identical every time) for BOTH the isolated
-     test's construction call and `shouldUseJackson2WhenPreferred`'s. A `gdb`
-     breakpoint at the constructor-argument check itself
-     (`native-builtins/src/lang_class.rs:3928`/`:3931`,
-     `coerce_arg_strict`) proves this directly: `expected_cid` is **5009 on
-     both calls** (the shared Jackson2Config's declared `ObjectMapper`
-     parameter, resolved via the isolated loader), while `arg_cid` is 5009
-     on the passing (isolated) call and **1521** (the default loader's own
-     `ObjectMapper`, from `registerBean(ObjectMapper.class)` — a plain
-     `ldc` in `shouldUseJackson2WhenPreferred`'s own, correctly-loader-2
-     bytecode) on the failing call.
-   - For `referencing_class_id = 411` (the default-loader test copy, used
-     by `shouldUseJackson2WhenPreferred`), `resolve_class_loader_aware`
-     shows `user_loader = None` (correctly: 411 is not itself isolated) —
-     so resolution takes the "gate-off" branch, which tries
-     `shared.load_class_concurrent(name)` (the **global, loader-blind**
-     table) *before* falling back to 411's own defining loader. The
-     intent (per that branch's own doc comment) is that this is safe
-     because the global table is only supposed to contain built-in-loader
-     classes — an isolated `ModifiedClassPathClassLoader`'s classes are
-     not supposed to leak into it. `resolve_fast_path_class_id`
-     (`classloading/src/class_manager.rs:2902`) is SUPPOSED to guard this
-     exact case: it only accepts an existing `UserDefined`-loader answer
-     as a substitute for the "global" one when
-     `find_class_bytes_delegated(name).is_err()` (i.e. the class doesn't
-     ALSO exist on the ordinary Bootstrap/Extension/Application classpath
-     — the JSTL/`WebappClassLoader`-only-class case the comment
-     describes). `WebSocketMessagingAutoConfigurationTests$WebSocketMessagingConfiguration`
-     genuinely DOES exist on the ordinary Application classpath (it's a
-     compiled test class under `build/classes/java/test`, on the same
-     `-cp` SbRunner was launched with) — so by that guard's own logic,
-     `find_class_bytes_delegated` should succeed and this fast path should
-     correctly refuse the isolated loader's candidate, falling through to
-     define a genuinely fresh, loader-411-owned copy instead. It
-     evidently does not (or something downstream of it re-collapses back
-     to the isolated copy) — **the exact point where this guard fails
-     to fire, or gets bypassed, was not confirmed before this pass ran out
-     of session budget** (the next breakpoint needed —
-     `class_manager.rs:2911`/`:2926`, filtered to
-     `WebSocketMessagingConfiguration` — was *designed* but never run: it
-     sits on `resolve_fast_path_class_id`, an extremely hot path called on
-     nearly every class-name resolution process-wide, and the two
-     `gdb`-under-`hc0053dbg`-profile runs earlier in this pass needed
-     45-55 minutes each with far fewer, more targeted breakpoints. Running
-     it needs either a `gdb` session with `scheduler-locking on`/a longer
-     time budget, or (more efficiently) temporarily instrumenting
-     `resolve_fast_path_class_id` and `find_class_bytes_delegated` with an
-     `eprintln!` gated on `name.contains("WebSocketMessagingConfiguration")`
-     and rebuilding once, since by this point the exact function and exact
-     two lines to check are already known precisely).
-   - **Debugging technique note for whoever continues this**: `gdb`
-     against the default release profile is nearly useless here —
-     `debug = "line-tables-only"` plus fat LTO optimizes away most local
-     variables (`<optimized out>`). Build with `cargo build --profile
-     hc0053dbg` instead (already defined in the repo's `Cargo.toml` for
-     exactly this purpose — full debuginfo, `opt-level = 1` overall,
-     `opt-level = 0` for `native-builtins`/`native-io` specifically) — this
-     is what made `expected_cid`/`arg_cid` readable at all. Even so, some
-     locals in the `vm` crate (`opt-level = 1`) still show `<optimized
-     out>` (e.g. `resolve_class_loader_aware`'s `known` binding) — when
-     that happens, either move the breakpoint a few lines later to a
-     point where the value is about to be *used* (works reliably for
-     `native-builtins`, which is fully `opt-level = 0`), or breakpoint one
-     frame up at the call site instead. A `gdb.execute("finish")` called
-     from inside a Python `Breakpoint.stop()` handler to capture a return
-     value directly does **not** work in this multi-threaded inferior
-     ("Cannot execute this command while the selected thread is running") —
-     use the call-site-local-variable approach instead. Filter breakpoints
-     in Python (`Breakpoint.stop()` returning `False` to silently
-     auto-continue) rather than with a `condition` string — GDB's Rust
-     support cannot reliably evaluate `&str` content comparisons in a
-     plain breakpoint condition, but reading the value via
-     `frame.read_var(...)` and comparing with plain Python `in` works
-     fine and is fast enough once restricted to a non-hot-path function.
-3. **Likely the same root cause, not separately investigated —
-   `basicMessagingWithJsonResponse` fails with `AssertionError: Response
-   was not received within 30 seconds`** (a STOMP round-trip that silently
-   never completes, rather than a startup exception) — consistent with the
-   Jackson2 message converter configuration failing to apply correctly
-   under the same loader confusion, so the JSON payload is never converted/
-   delivered, rather than the context refresh itself throwing.
+2. **FIXED 2026-07-27 — `shouldUseJackson2WhenPreferred` and (3) below were
+   BOTH the same bug: CratonVM's native `AbstractBeanDefinition`
+   `.resolveBeanClass` shim resolved bean-definition class names through a
+   loader-BLIND global lookup.** The prior pass's `gdb` work was correct as
+   far as it went (`Thread.contextClassLoader` is properly set-and-restored
+   around each isolated method — the TCCL-leak theory really is refuted; and
+   `coerce_arg_strict` really does see `expected_cid` = the isolated loader's
+   `ObjectMapper` against `arg_cid` = the application loader's). What it did
+   not find is *where* the isolated loader's class entered an application-loader
+   context, because it was looking in the wrong layer: the answer is not in
+   `resolve_class_loader_aware` / `resolve_fast_path_class_id` at all.
+
+   `resolve_class_id_with_nested_retry` in
+   `native-builtins/src/spring_startup_bootstrap.rs` — which backs CratonVM's
+   native override of Spring's `AbstractBeanDefinition.resolveBeanClass` — ran
+
+   ```rust
+   if let Some(c) = resolve_class_id_via_tccl(ctx, internal) { return Some(c); }
+   if let Some(c) = ctx.class_id_by_name(internal) { return Some(c); }   // <-- BUG
+   if let Ok(c) = ctx.ensure_class_initialized(internal) { return Some(c); }
+   ```
+
+   `class_id_by_name` is loader-blind: after missing in the built-in
+   delegation chain it scans every user-defined loader and returns an
+   unambiguous same-named match. `ModifiedClassPathClassLoader` defines its
+   own `WebSocketMessagingAutoConfiguration$Jackson2WebSocketMessageConverter`
+   `Configuration` while running the two `@ClassPathExclusions("jackson-*-3*")`
+   methods; every LATER, non-isolated method's bean definition for that name
+   then resolved to the isolated copy. The TCCL branch above correctly
+   declines for those methods (their context classloader is the plain
+   application loader), so the blind scan was the only thing answering.
+
+   This is why the previous pass's `Class.forName` / `getDeclaredClasses` /
+   `class_id_by_name_near` instrumentation all came up empty — **Spring never
+   calls them here**; the native shim replaces `resolveBeanClass` wholesale.
+   A `CRATONVM_FORNAME_TRACE=1` run shows 2068 `Class.forName` calls and not
+   one for `Jackson2WebSocketMessageConverterConfiguration`. If you find
+   yourself hunting a Spring bean-class identity bug, check the natives in
+   `spring_startup_bootstrap.rs` BEFORE the ordinary JDK reflection surface.
+
+   Fixed by adding `NativeContext::class_id_by_name_delegated` (default impl
+   = `class_id_by_name`; real impl = `ClassManager::resolve_fast_path_class_id`)
+   and using it for both the plain and the dot-vs-dollar nested-retry lookup.
+   It is the requester-less parent-delegation answer, and still returns a
+   user-defined loader's copy when that is the only possible answer (no
+   ordinary-classpath bytes for the name — in-memory `Proxy`-generated
+   classes, webapp-private jars), so it can only ever be more correct.
+
+3. **FIXED 2026-07-27, same fix — `basicMessagingWithJsonResponse`.** The
+   guess recorded here previously ("likely the same root cause") was right:
+   with the loader-blind lookup gone, the Jackson2 message-converter
+   configuration applies to the correct loader's `ObjectMapper` and the STOMP
+   round-trip completes. No separate change was needed.
+
+4. **Also FIXED 2026-07-27 — the nondeterministic
+   `NoClassDefFoundError` on the two `@ClassPathExclusions` methods** (recorded
+   above only as "the OTHER 1-2 non-deterministic `NoClassDefFoundError`/
+   timeout failures vary run to run"). This is a **`URLClassLoader.findClass`
+   duplicate-definition race**, and it reproduces on pristine `dev` too (1 of 4
+   runs on an unmodified binary), so it is not a regression from any of the
+   above:
+
+   - `OnClassCondition$ThreadedOutcomesResolver` evaluates half of Spring
+     Boot's auto-configuration conditions **on a second thread**, so the main
+     thread and that thread race to load the same classes through the isolated
+     loader. Under host load the loser's
+     `ucl_try_define_local_class` (`native-builtins/src/classloader.rs`) called
+     `define_class_full` for a class the winner had *just* finished defining
+     and got back `IncompatibleClassChangeError: class ... already defined by
+     user-defined(N) loader`, which that function reported as
+     `ClassFormatError`. For an isolated loader,
+     `resolve_class_loader_aware` turns ANY `findClass` failure into a hard
+     `NoClassDefFoundError` with no global fallback — hence
+     `NoClassDefFoundError: org.springframework.boot.autoconfigure.condition`
+     `.ConditionOutcome` mid-`refresh()`.
+   - The function's per-`(loader, name)` define lock did not close the
+     window: it probes `find_loaded_class_for_loader` BEFORE taking the lock
+     and again inside the `while *in_progress` wait loop, but a thread that
+     arrives after the winner has already cleared `in_progress` skips the
+     wait loop entirely and never re-probes. HotSpot has no such window —
+     `loadClass` re-checks `findLoadedClass` after acquiring
+     `getClassLoadingLock(name)`.
+   - Fixed with the matching double-checked probe under the lock, plus a
+     backstop in the `define_class_full` error arm: if the class is defined
+     under this loader by the time the error comes back, we merely LOST the
+     race, and JVMS §5.3.5 says the loser observes the winner's class rather
+     than a linkage error — so return it.
+
+**Verification (2026-07-27)** — Azure Linux host, worktree
+`/data/data/wt-wsloader-20260726`, branch
+`fix/websocket-loader-collapse-20260726`, binary
+`cratonvm-wsloader-20260726`, forked from `origin/dev` @ `3be41785e`.
+A pristine-`dev` binary (`cratonvm-wsbase-20260726`) was built from the SAME
+worktree via `git stash` so the two differ only by these changes:
+
+- `WebSocketMessagingAutoConfigurationTests`: **13/13 PASS**. Over 4 runs
+  each, `shouldUseJackson2WhenPreferred` + `basicMessagingWithJsonResponse`
+  fail 3/4 on pristine `dev` and **0/4** with the fix.
+- Duplicate-definition race: 12 runs in 3 concurrent streams (deliberate
+  contention — it does not reproduce on an idle host) hit it in 7/12 runs
+  before the fix and **0/12** after; the only remaining
+  `CRATONVM_DBG_ISOLATED_CNF` trace lines are the correct
+  `ClassNotFoundException` for `org/apache/logging/log4j/MarkerManager`,
+  which genuinely is not on this classpath.
+- Regression sweep: 79 classes (every `@ClassPathExclusions`/
+  `@ClassPathOverrides` user in the Spring Boot checkout, plus the
+  data-redis and data-jpa classes this doc tracks), run twice under
+  identical host load with the pristine and fixed binaries — **every class
+  reports a byte-identical `SBRUNNER_RESULT` except
+  `WebSocketMessagingAutoConfigurationTests` (`failed=3` → `failed=0`).
+  Zero regressions.**
+- `cargo test -p cratonvm-classloading -p cratonvm-native-api --lib`:
+  212 passed, 0 failed.
+
+**Debugging aids left behind** (all env-gated, no behaviour change):
+`CRATONVM_DBG_DUPCLASS_FILTER=<substring>` narrows the existing
+`CRATONVM_DBG_DUPCLASS` trace to one class name and
+`resolve_fast_path_class_id` now traces all three outcomes;
+`[BLINDPICK]` reports when `find_class_by_name`'s user-loader scan is what
+answered a lookup (with `CRATONVM_DBG_DUPCLASS_BT=1` for a backtrace); and
+`CRATONVM_DBG_ISOLATED_CNF=1` prints the name, referencing class, Java
+frames and the exact reason an isolated `URLClassLoader` refused a name in
+`resolve_class_loader_aware`. That last one is what turned this from a
+`gdb` problem into a five-minute read.
 
 **Reproduction**: run the whole `WebSocketMessagingAutoConfigurationTests`
 class (SbRunner or the suite runner) against the
@@ -527,6 +544,12 @@ Original fix: `C:\craton\CratonVM-data-redis-fix-20260723`, branch
 2026-07-26 `gdb` investigation (Azure Linux host, no code changes — pure
 root-cause tracing): `/data/data/wt-ws-tcclgdb-20260726`, branch
 `fix/websocket-tcclleak-20260726`, forked from `origin/dev` @ `ce3adcf7f`.
+
+2026-07-27 fix (Azure Linux host): `/data/data/wt-wsloader-20260726`,
+branch `fix/websocket-loader-collapse-20260726`, binary
+`cratonvm-wsloader-20260726`, forked from `origin/dev` @ `3be41785e`.
+Pristine-`dev` comparison binary `cratonvm-wsbase-20260726` built from the
+same worktree with the changes stashed.
 Debug binary built with `cargo build --profile hc0053dbg`, frozen as
 `target/hc0053dbg/cratonvm-tcclgdb-20260726` (this worktree's `target/`
 was removed after this pass; rebuild with the same profile to resume).

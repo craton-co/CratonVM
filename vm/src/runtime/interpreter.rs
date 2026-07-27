@@ -3024,7 +3024,7 @@ pub(crate) fn alloc_object_shared(
     // death-spiral (a sliver freed each cycle would otherwise let allocation
     // limp on, GC-thrashing). The catch site / drain surfaces the singleton.
     if gc_overhead_limit_exceeded(shared) {
-        maybe_dump_heap_on_oom(shared);
+        maybe_dump_heap_on_oom(shared, thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
@@ -3055,7 +3055,7 @@ pub(crate) fn alloc_object_shared(
         })
         .ok_or_else(|| {
             // T1.7.7 — write an HPROF dump on OOM if `-XX:+HeapDumpOnOutOfMemoryError`.
-            maybe_dump_heap_on_oom(shared);
+            maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
             }))
@@ -3070,7 +3070,7 @@ pub(crate) fn alloc_object_shared(
 /// The dump runs at most once per VM lifetime (gated by an atomic
 /// flag on the shared VM) so a tight allocation loop doesn't write
 /// thousands of dumps.
-fn maybe_dump_heap_on_oom(shared: &SharedVm) {
+fn maybe_dump_heap_on_oom(shared: &SharedVm, thread: &JvmThread) {
     use std::sync::atomic::Ordering;
     if !shared.config.heap_dump_on_oom {
         return;
@@ -3089,7 +3089,9 @@ fn maybe_dump_heap_on_oom(shared: &SharedVm) {
         .clone()
         .unwrap_or_else(|| format!("./java_pid{}.hprof", std::process::id()));
     let arc = shared.get_arc();
-    match crate::runtime::hprof::dump_heap(&arc, &path) {
+    // obsaudit D11: pass this thread's id so dump_heap can request a real
+    // stop-the-world pause for the walk instead of racing live mutators.
+    match crate::runtime::hprof::dump_heap(&arc, &path, thread.thread_id) {
         Ok(bytes) => tracing::error!(
             "wrote {} byte HPROF heap dump to {} on OutOfMemoryError",
             bytes,
@@ -3120,7 +3122,7 @@ fn gc_alloc_array(
     // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
     // GC-thrashing rather than spinning on slivers.
     if gc_overhead_limit_exceeded(shared) {
-        maybe_dump_heap_on_oom(shared);
+        maybe_dump_heap_on_oom(shared, thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
@@ -3143,7 +3145,7 @@ fn gc_alloc_array(
         .heap
         .try_alloc_array(class_id, element_type, length)
         .ok_or_else(|| {
-            maybe_dump_heap_on_oom(shared);
+            maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
             }))
@@ -19211,7 +19213,9 @@ pub(crate) fn resolve_class_loader_aware(
             || name.contains("DefaultCacheAwareContextLoaderDelegate")
             || name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
             || name.contains("PathRequestTests")
-            || name.contains("ManagementWebSecurityAutoConfigurationTests"));
+            || name.contains("ManagementWebSecurityAutoConfigurationTests")
+            || name.contains("WebSocketMessaging")
+            || name.contains("Jackson2WebSocketMessageConverterConfiguration"));
     if dbg_trace {
         let cm = shared.classes.class_manager.read();
         let ref_name = cm
@@ -19311,6 +19315,34 @@ pub(crate) fn resolve_class_loader_aware(
             return Ok(id);
         }
         if isolated_url_definition {
+            if crate::runtime::env_cache::dbg_isolated_cnf() {
+                let (ref_name, ref_loader) = {
+                    let cm = shared.classes.class_manager.read();
+                    (
+                        cm.get_class(referencing_class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default(),
+                        cm.get_loader_id(referencing_class_id),
+                    )
+                };
+                let global = shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .find_class_by_name(name);
+                eprintln!(
+                    "[ISOLATED-CNF] name={name} referencing={referencing_class_id:?}/{ref_name} (loader={ref_loader:?}) global_would_be={global:?}"
+                );
+                for (i, f) in thread.frames.iter().enumerate().rev().take(14) {
+                    eprintln!(
+                        "[ISOLATED-CNF]   [{i}] {}.{}{} pc={}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.pc
+                    );
+                }
+            }
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         let fallback = shared.load_class_concurrent(name);
@@ -19395,6 +19427,9 @@ fn drive_defining_loader_load(
     }
     let key = referencing_class_id.as_u32();
     if IN_FLIGHT.with(|s| s.borrow().iter().any(|(c, n)| *c == key && n == name)) {
+        if crate::runtime::env_cache::dbg_isolated_cnf() {
+            eprintln!("[ISOLATED-CNF] drive declined: IN_FLIGHT re-entry name={name} cid={key}");
+        }
         return None;
     }
     let cache_loader = shared
@@ -19465,6 +19500,27 @@ fn drive_defining_loader_load(
             }
             return Some(id);
         }
+        if crate::runtime::env_cache::dbg_isolated_cnf() {
+            eprintln!("[ISOLATED-CNF] drive declined: mirror had no ClassId name={name}");
+        }
+        return None;
+    }
+    if crate::runtime::env_cache::dbg_isolated_cnf() {
+        let shape = match &result {
+            Ok(Some(Value::Object(None))) => "Ok(null)".to_string(),
+            Ok(None) => "Ok(void)".to_string(),
+            Ok(Some(v)) => format!("Ok(non-object {v:?})"),
+            Err(MethodCallFailed::ExceptionThrown(exc)) => {
+                let cm = shared.classes.class_manager.read();
+                let cid = Some(shared.mem.heap.class_id_of(*exc));
+                let cname = cid
+                    .and_then(|c| cm.get_class(c).map(|k| k.name.to_string()))
+                    .unwrap_or_default();
+                format!("Err(thrown {cname})")
+            }
+            Err(e) => format!("Err({e:?})"),
+        };
+        eprintln!("[ISOLATED-CNF] drive declined: loadClass -> {shape} name={name}");
     }
     None
 }
