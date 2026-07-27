@@ -262,10 +262,9 @@ public static void rootArray(double[] src, double[] dst) {
 `test_classes/gpu/annotations/`. `jit-cuda/src/lowering.rs`'s
 `ptxas_round_trip_math_intrinsics` test round-trips a kernel using this table
 through `ptxas` as part of the 2026-07-11 evening validation pass, alongside
-five other lowering shapes — see
-`docs/internal/gpu-offload-followups-20260711.md` item 1 for the
-`ptxas`-validation story that motivated adding these round-trip tests in the
-first place.)
+five other lowering shapes — the reduction epilogue's `ptxas` rejection
+(`atom.global.add`'s 2-operand form) is what motivated adding these
+round-trip tests in the first place; see [`reductions.md`](reductions.md).)
 
 ## `@GpuExclude`
 

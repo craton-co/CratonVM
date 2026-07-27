@@ -5395,6 +5395,14 @@ fn handle_jit_dispatch_error(
         MethodCallFailed::InternalError(VmError::ClassFile(ClassFileError::ClassNotFound {
             ref class_name,
         })) => {
+            // `CRATONVM_DBG_LINKAGE_BT=1` -- the third place a
+            // `NoClassDefFoundError` reaches Java (see the matching hooks in
+            // `runtime::exceptions`). Only the Rust backtrace names the JIT
+            // dispatch site that could not resolve the class.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some() {
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("[DBG_LINKAGE_BT] jit NoClassDefFoundError {class_name}\n{bt}");
+            }
             if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
@@ -5763,7 +5771,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         *count == crate::runtime::env_cache::jit_invocation_threshold()
                     });
                     if should_compile {
-                        if let Some((entry, needs_context)) =
+                        if let Some((_callee_pin, entry, needs_context)) =
                             crate::runtime::interpreter::try_jit_compile_callee(
                                 vm,
                                 &target.class_name,
@@ -5772,16 +5780,25 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                 true,
                             )
                         {
-                            VIRTUAL_DISPATCH_CACHE.with(|dc| {
-                                dc.borrow_mut().insert(
-                                    key,
-                                    DispatchCache {
-                                        entry,
-                                        needs_context,
-                                        _owner: cratonvm_jit::pin_jit_entry(entry),
-                                    },
-                                );
-                            });
+                            // `_callee_pin` keeps the callee mapped across the
+                            // cache publication and the direct call below.
+                            // Only publish a raw entry we can keep alive:
+                            // `_owner` is the sole keep-alive for this
+                            // thread-local pointer, so caching with `None`
+                            // would let a later tier-up `put` unmap the body
+                            // under it.
+                            if let Some(owner) = cratonvm_jit::pin_jit_entry(entry) {
+                                VIRTUAL_DISPATCH_CACHE.with(|dc| {
+                                    dc.borrow_mut().insert(
+                                        key,
+                                        DispatchCache {
+                                            entry,
+                                            needs_context,
+                                            _owner: Some(owner),
+                                        },
+                                    );
+                                });
+                            }
                             if let Some(rc) = try_call_compiled_entry_reentrant(
                                 entry,
                                 needs_context,
@@ -5934,23 +5951,27 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         });
     if should_compile {
         // Try to compile the callee and cache it
-        if let Some((entry, needs_ctx)) = try_compile_callee(vm, info) {
+        if let Some((_callee_pin, entry, needs_ctx)) = try_compile_callee(vm, info) {
             if crate::runtime::env_cache::jit_dispatch_dbg() {
                 eprintln!(
                     "[JIT_DISPATCH_ARM/compile] {}.{} entry=0x{:x}",
                     info.class_name, info.method_name, entry,
                 );
             }
-            DISPATCH_CACHE.with(|dc| {
-                dc.borrow_mut().insert(
-                    info_key,
-                    DispatchCache {
-                        entry,
-                        needs_context: needs_ctx,
-                        _owner: cratonvm_jit::pin_jit_entry(entry),
-                    },
-                );
-            });
+            // See the virtual-dispatch sibling above: an unowned raw entry
+            // must not be cached.
+            if let Some(owner) = cratonvm_jit::pin_jit_entry(entry) {
+                DISPATCH_CACHE.with(|dc| {
+                    dc.borrow_mut().insert(
+                        info_key,
+                        DispatchCache {
+                            entry,
+                            needs_context: needs_ctx,
+                            _owner: Some(owner),
+                        },
+                    );
+                });
+            }
             // SAFETY: entry was just produced by try_compile_callee, which returns a validated
             // JIT entry pointer. CRIT round-5 fix: bail explicitly to the interpreter on
             // >ARG_REGS args via `bail_to_interpreter` (matches the MIC fast-path).
@@ -6298,9 +6319,15 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 // SAFETY: Caller must ensure vm is a valid SharedVm reference and info points to a live
 // JitInvokeInfo. Delegates to try_jit_compile_callee which accesses the class manager
 // and JIT compiler; no raw pointer dereferences occur within this function itself.
-unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usize, bool)> {
+#[allow(clippy::type_complexity)]
+unsafe fn try_compile_callee(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     use crate::runtime::interpreter::try_jit_compile_callee;
-    // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
+    // JIT-dispatch callee compile — optimized (C2-equivalent) tier. The
+    // artifact comes back with the entry so the caller can keep it mapped for
+    // as long as it calls or caches that address.
     try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor, true)
 }
 
@@ -7503,13 +7530,15 @@ unsafe fn try_fast_lambda_int_to_double_apply(
         Err(_) => return Ok(None),
     };
     let box_args = [value.to_bits() as i64];
-    if let Some((entry, needs_context)) = crate::runtime::interpreter::try_jit_compile_callee(
-        vm,
-        "java/lang/Double",
-        "valueOf",
-        "(D)Ljava/lang/Double;",
-        true,
-    ) {
+    if let Some((_callee_pin, entry, needs_context)) =
+        crate::runtime::interpreter::try_jit_compile_callee(
+            vm,
+            "java/lang/Double",
+            "valueOf",
+            "(D)Ljava/lang/Double;",
+            true,
+        )
+    {
         if let Some(boxed) =
             try_call_compiled_entry_reentrant(entry, needs_context, vm_ptr, &box_args)
         {
@@ -8094,7 +8123,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // machine-code cascade would bypass it. Keep dispatch on the
         // `invoke_or_native` path so the exception routes through the callee's
         // own table.
-        if let Some((entry_ptr, needs_ctx)) = compile_res {
+        if let Some((_callee_pin, entry_ptr, needs_ctx)) = compile_res {
+            // `_callee_pin` holds the callee artifact across the publications
+            // below: `update`/`install` take their own keep-alive by resolving
+            // the entry, and that resolution can only succeed while the
+            // artifact is alive.
             // jit-invokedynamic-groovy-regression fix: also never publish an
             // artifact containing an unconditional invokedynamic trap — the
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
@@ -8103,10 +8136,25 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             if !mic_callee_has_exception_table(vm, receiver_class_id, info)
                 && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
             {
-                mic.cached_entry_ptr
-                    .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
-                mic.cached_needs_context
-                    .store(needs_ctx, std::sync::atomic::Ordering::Release);
+                // Publish through `update`, never with a raw store: `update` is
+                // the only writer that also resolves and RETAINS the callee's
+                // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
+                //
+                // Until 2026-07-27 this branch stored `cached_entry_ptr`
+                // directly, so a slot reached through the "class cached, target
+                // unresolved" shape (what `prepopulate` seeds and what
+                // `clear_compiled_entry` leaves behind after every
+                // invalidation) ended up holding a RAW entry pointer with no
+                // keep-alive. The next tier-up `put` for that callee replaced
+                // its shard snapshot, dropped the last `Arc`, and `munmap`ped
+                // the body — while the inline `MOV R11,[mic+8]; CALL R11`
+                // cascade emitted by `jit/src/x64.rs` still called it. That is
+                // the ElasticSearch `NodeConnectionsServiceTests` SIGSEGV
+                // (`rip == r11 ==` first byte of a retired code mapping) and,
+                // once the address was recycled by a later allocation, the
+                // json-smart "re-parse returned another method's result"
+                // corruption.
+                mic.update(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
                 // CRIT-1 — also populate the co-allocated PIC so the
                 // inline 4-way cascade in `jit/src/x64.rs` hits on the
                 // next invocation. Without this the cascade's empty
@@ -8224,9 +8272,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             true,
         )
     };
-    let (entry_ptr, needs_ctx) = match compile_res {
-        Some((ptr, nc)) => (ptr as u64, nc),
-        None => (0, false),
+    // `_callee_pin` must outlive the `mic.update` / `pic.install` below — see
+    // the matching note in the cache-hit branch.
+    let (_callee_pin, entry_ptr, needs_ctx) = match compile_res {
+        Some((pin, ptr, nc)) => (Some(pin), ptr as u64, nc),
+        None => (None, 0, false),
     };
 
     // BUG-H: never publish a direct compiled entry for a callee that declares a

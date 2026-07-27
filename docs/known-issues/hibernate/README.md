@@ -2,7 +2,70 @@
 
 ## Open
 
-(none currently tracked)
+- [`action.queue` GRAPH-default proof tests — LEGACY compatibility trade-off](actionqueue-graph-default-tests-legacy-tradeoff-20260727.md)
+  (WON'T-FIX, expected) — `ActionQueueDefaultTest` and
+  `InsertOrderingReferenceSeveralDifferentSubclassTest` fail because
+  CratonVM intentionally defaults real-JDK `hibernate.flush.queue.type` to
+  `legacy` (commit `0e87935f2`, fixing the `CycleBreaker` DFS hang). Confirmed
+  by A/B repro: both pass clean with `-Dhibernate.flush.queue.type=graph`.
+- [`bulkid.*MutationStrategy*Test` — `testInsertSelect` last-row duplicate](bulkid-mutationstrategy-insertselect-lastrow-duplicate-20260727.md)
+  (OPEN, genuine bug) — 11 classes, all failing on the same shared
+  temp-table `row_number()`-based multi-table `INSERT ... SELECT` machinery
+  (the `SqmMutationStrategy` under test only governs UPDATE/DELETE, not
+  INSERT). Confirmed by HotSpot diff (CratonVM fails / HotSpot 6/6 clean),
+  confirmed not a suite-subset/ordering artifact (fails alone, fresh
+  process), confirmed not JIT-specific (`--nojit` fails identically). Root
+  cause narrowed to a duplicate-iteration defect over the last row of a
+  small in-memory result set, not fully pinned to a source line.
+- [ordered-set aggregate as a window function — stuck on first partition's value](orderedsetaggregate-window-partition-value-staleness-20260727.md)
+  (OPEN, genuine bug) — `CriteriaOrderedSetAggregateTest` (2/10 tests):
+  `percentile_disc(...) over(partition by ...)` and
+  `listagg(...) over(partition by ...)` return the *first* partition's
+  computed value for every row instead of each row's own partition value.
+  Confirmed by HotSpot diff (byte-identical SQL/params, HotSpot correct,
+  CratonVM wrong). Possibly related substrate/family to the bulkid
+  `row_number() over()` bug above (both are `OVER(...)` window-function
+  row-buffering defects); not merged since concrete symptoms differ and
+  neither is root-caused to a source line.
+- [parameterized `OFFSET ? ROWS` silently not applied on grouped/ranked query](parameterized-offset-ignored-groupby-having-20260727.md)
+  (OPEN, genuine bug) — `CriteriaOrderedSetAggregateTest` +
+  `OrderedSetAggregateTest` (Criteria and HQL twins of the same
+  `rank(...) ... group by ... having ... order by ... offset ?` query), both
+  fail identically. HAVING filters correctly; the bound `OFFSET` parameter
+  is simply not honored (first post-having row is not skipped). Confirmed by
+  HotSpot diff (byte-identical SQL/params, HotSpot correct, CratonVM wrong).
+- [two-predicate `AND` in `HAVING` returns zero rows](having-clause-and-conjunction-empty-result-20260727.md)
+  (OPEN, genuine bug) — `CriteriaMultiselectGroupByAndOrderByTest` (2/6
+  tests: `...AndHaving` and `...Subquery...AndHaving`) +
+  `CriteriaFunctionParametersBindingTest::testPredicateArray` (1/2 tests).
+  A `GROUP BY ... HAVING pred1 AND pred2` query returns an empty result set
+  on CratonVM where HotSpot returns the correct single matching row —
+  byte-identical SQL/bound-params both sides. Single-predicate `HAVING` and
+  single-predicate `WHERE` parameter binding both work fine; only the
+  two-predicate `AND`-in-`HAVING` shape is affected, across two unrelated
+  fixtures/entity models.
+- [dynamic-instantiation grouped join — one `VARCHAR` column reads the other row's value](dynamicinstantiation-groupby-join-varchar-column-row-swap-20260727.md)
+  (OPEN, genuine bug) — `DynamicInstantiationWithJoinAndGroupAndOrderByByTest`
+  (its only test). `id`/`sum` columns extract correctly for both rows of a
+  2-row grouped join; only the `name` (VARCHAR) column on row 1 comes back
+  as row 2's value. Confirmed by HotSpot diff (byte-identical SQL, HotSpot
+  correct, CratonVM wrong).
+- [`OVER(...)` window functions — partition/row-id correlation broken](windowfunction-partition-rowid-lookup-miss-shift-20260727.md)
+  (OPEN, genuine bug) — 3 classes (`FormulaWithPartitionByTest`,
+  `CriteriaWindowFunctionTest`, `WindowFunctionTest`). Not an H2-dialect
+  capability gap (H2 2.4.240 genuinely supports window functions, confirmed
+  clean on HotSpot). H2's internal per-partition row-id → value `HashMap`
+  lookup loses correlation under CratonVM: a miss trips H2's own
+  unreachable-by-design `"Feature not supported: Window function"` fallback,
+  a bad hit produces an off-by-one/wraparound wrong value, and some queries
+  return zero rows entirely. Same broad substrate family as the
+  `bulkid`/`orderedsetaggregate` window-function docs below.
+- [HQL `size(collection)` as a `GROUP BY` aggregate — every group reads the *last* group's value](size-groupby-aggregate-last-group-value-leak-20260727.md)
+  (OPEN, genuine bug) — `ManyToManySizeTest` + `OneToManySizeTest` (11 of 16
+  `@Test` methods). `size()` used in the `SELECT` list under `GROUP BY`
+  collapses to the true count of the last-processed group for every row;
+  `size()` used as a `WHERE`/restriction predicate is unaffected. Confirmed
+  by HotSpot diff (byte-identical SQL, HotSpot correct, CratonVM wrong).
 
 ## Resolved (2026-07-27)
 
@@ -11,8 +74,7 @@ single digits) cleared after merging `origin/dev` commit `13055f75c` ("fix(jit):
 compact-layout field offsets and the branch-join reload mirror") and rebuilding:
 
 - `MappingXsdSupport.<clinit>` `StringIndexOutOfBoundsException` cluster (113 classes) — root-caused
-  and FIXED, see
-  [docs/internal/fixed-suite-bugs/hibernate/mappingxsdsupport-clinit-siobe-compact-ref-fields-jit-regression-FIXED.md](../../internal/fixed-suite-bugs/hibernate/mappingxsdsupport-clinit-siobe-compact-ref-fields-jit-regression-FIXED.md).
+  and FIXED (compact-ref-fields JIT regression in the class-init path).
   112/113 confirmed passing after the fix; the 1 straggler (`ScannerTest`) now fails on an
   unrelated pre-existing timeout, not this bug.
 - `TableGroupJoinProducer.createTableGroupJoin` `NullPointerException` cluster (20 classes) — never

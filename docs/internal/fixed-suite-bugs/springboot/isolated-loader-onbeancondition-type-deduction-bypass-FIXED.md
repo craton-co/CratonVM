@@ -138,3 +138,88 @@ Add a temporary trace (e.g. `tracing::warn!`) in
 probe) to see which branch actually resolves `tools/jackson/core/TreeCodec`
 successfully. That will confirm or refute the caching-bypass hypothesis
 above and point at the exact line to fix.
+
+## Regression note — confirmed still failing 2026-07-23 (craton-rerun-20260723), but with a NEW, different symptom
+
+`EhCache3CacheAutoConfigurationTests` (the "possibly related" class noted
+above) is FAILing again as of the 2026-07-23 rerun, but **not** with this
+doc's `@ConditionalOnMissingBean did not specify a bean` symptom — both its
+test methods now fail with a JUnit Platform `DiscoveryIssueException`
+("`UniqueIdSelector [...] could not be resolved`") during test *discovery*,
+before either test body runs. Root-caused as a new doc:
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md).
+`OnBeanConditionTypeDeductionFailureTests` itself was not part of this
+session's assigned batch and was not re-checked.
+
+## Regression note (2026-07-23) — "FIXED" was never a real fix; the underlying `OnBeanCondition`/isolated-loader gap is back
+
+**`OnBeanConditionTypeDeductionFailureTests.conditionalOnMissingBeanWithDeducedTypeThatIsPartiallyMissingFromClassPath`
+fails again** in the `RunName=craton-rerun-20260723` rerun
+(`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard1/logs/core_spring-boot-autoconfigure.org.springframework.boot.autoconfigure.condition.OnBeanConditio-ef3749960ee5.out.log`).
+This doc's own status line already flagged the risk: "resolved as a side
+effect of the drift merge, exact fixing commit not identified" — i.e. it was
+never actually root-caused or fixed at the code level, just observed passing
+after an unrelated ~106-commit merge. 4 days and presumably more `dev` drift
+later, it fails again — **not silently re-filed, treated as this doc's
+original bug recurring.**
+
+The *current* symptom is narrower than originally described, worth noting
+explicitly since the doc's stated mechanism may no longer be the accurate
+description: back in 2026-07-19, `new ObjectMapper()` **silently succeeded**
+(no exception at all). Now, an exception **is** raised — but it's the wrong
+shape for the test's `.satisfies(...)` assertions:
+
+```
+16:13:52.600 [main] WARN ... AnnotationConfigApplicationContext -- Exception encountered during context initialization ...
+  org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'objectMapper' ...:
+  Failed to instantiate [tools.jackson.databind.ObjectMapper]: Factory method 'objectMapper' threw exception with message: tools.jackson.databind.ObjectMapper
+=> org.assertj.core.error.AssertJMultipleFailuresError
+```
+
+The test expects a nested `OnBeanCondition.BeanTypeDeductionException` (from
+`OnBeanCondition`'s own reflective return-type deduction, thrown *before*
+the factory method is ever invoked) wrapping a `NoClassDefFoundError`. What
+actually happens now is different: `OnBeanCondition`'s deduction apparently
+succeeds (no `BeanTypeDeductionException` in the chain at all — the failure
+is a plain `BeanCreationException`/"Factory method ... threw exception"),
+meaning the `objectMapper()` factory method itself gets invoked and *some*
+exception is thrown from inside real `ObjectMapper` construction — but its
+message is suspiciously just the bare string `"tools.jackson.databind.ObjectMapper"`,
+i.e. `ObjectMapper`'s **own** class name, not the missing/excluded
+`jackson-core` class it should be failing to resolve. That message shape
+does not match either engine's expected `NoClassDefFoundError` text
+(HotSpot would name the actually-missing class, e.g. `tools/jackson/core/TreeCodec`)
+and is not investigated further here — flagged as a narrower, possibly
+distinct-mechanism variant of this doc's original gap, not assumed identical
+without confirmation.
+
+**A second, related class regressed too:**
+`module/spring-boot-security-oauth2-authorization-server`'s
+`OAuth2AuthorizationServerAutoConfigurationTests.autoConfigurationDoesNotCauseUserDetailsServiceToBackOff`
+now fails with exactly the symptom this doc's "Possibly related residuals"
+section already flagged for `EhCache3CacheAutoConfigurationTests` (deduced
+bean type set comes back empty, not a raised-then-uncaught exception):
+
+```
+Caused by: java.lang.IllegalStateException: @ConditionalOnMissingBean did not specify a bean using type, name or annotation
+     at org.springframework.boot.autoconfigure.condition.OnBeanCondition$Spec.validate(OnBeanCondition.java:655)
+     at org.springframework.boot.autoconfigure.condition.OnBeanCondition$Spec.<init>(OnBeanCondition.java:603)
+     at org.springframework.boot.autoconfigure.condition.OnBeanCondition.getMatchOutcome(OnBeanCondition.java:147)
+```
+
+Log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard8/logs/module_spring-boot-security-oauth2-authorization-server.org.springframework.boot.security.oaut-9461ed871e55.out.log`.
+This class was **not** previously listed as affected by this doc or its
+sibling `isolated-loader-objectprovider-generic-identity-mismatch-FIXED.md`
+(both docs' "Affected classes"/regression scope predate this class's
+appearance in this exact failure shape) — added here as the same
+`OnBeanCondition` type-deduction family, not confirmed to share the exact
+same code-level cause as the primary class above (different symptom:
+deduction returns empty vs. deduction+construction throwing the wrong
+exception shape), but clearly the same general "isolated-loader +
+`OnBeanCondition` reflective deduction" gap this doc already tracks as
+unresolved.
+
+**Net effect: this doc's "FIXED" status is not trustworthy for either class
+going forward** — both should be treated as OPEN until someone does the
+`tracing::warn!`-based investigation the "Suggested next step" above already
+called for, which never happened.

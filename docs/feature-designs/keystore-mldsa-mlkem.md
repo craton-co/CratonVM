@@ -38,7 +38,7 @@ pattern already used for EC:
 ## Current state (cited)
 
 - **`java_security` is the lowest JCK row and names both gaps.**
-  `docs/internal/jck-compliance.md` (`api/java_security`, **68%**): "SHA-2,
+  `docs/jck-compliance.md` (`api/java_security`, **68%**): "SHA-2,
   SHA-3, HMAC, AES-GCM/CBC/CTR, ChaCha20-Poly1305, Ed25519 all shipped. RSA +
   ECDSA partial. `KeyStore.getInstance("PKCS12")` is a known gap."
 - **KeyStore parsing exists; the `getInstance` routing is the gap.**
