@@ -299,3 +299,81 @@ Unit test: `handler_reachable_from_outside_a_hoisted_loop_is_bypassable` in
 `jit/src/x64.rs` covers all four cases on hand-written bytecode — no handler,
 range wholly inside (must KEEP the hoist), range starting before the header, and
 handler outside the loop.
+
+## Re-confirmed on the Hibernate ORM harness (2026-07-27, later the same day)
+
+The same signature was re-reported from
+`/data/data/apps/hibernate-orm-harness/`, aborting
+`org.hibernate.orm.test.hql.{ASTParserLoadingTest, BulkManipulationTest,
+ScrollableCollectionFetchingTest, TreatKeywordTest}` "right after JAXB
+ContextFactory initialization during SessionFactory bootstrap". It was the same
+bug: the binaries that produced it were built from a `dev` snapshot that
+predates this fix.
+
+| | |
+|---|---|
+| that A/B worktree branched from `dev` at | `c042e794f`, 07:57 UTC |
+| this fix merged into `dev` at | `c11305865`, 11:29 UTC |
+| the aborting runs executed | 17:48-18:47 UTC, on the 07:57 binaries |
+
+`git merge-base --is-ancestor 613b10f4c c042e794f` is false, so *neither arm* of
+that A/B had the fix — which is also why the abort reproduced with the JIT ban
+list in its default state and with `org/antlr/v4/runtime/` unbanned. The ban was
+never the variable.
+
+### `component 6` is a ClassId, not a `newarray` atype — read it correctly
+
+The report read `anewarray component 6 length 1677721600` as *T_FLOAT*, i.e. a
+6.7 GB `float[]`, and looked for a corrupted length word. That is a misreading
+the message format invites, and it sends the investigation to the wrong place:
+
+* the field is `component_class_id_raw` — a raw `ClassId` — see
+  `vm/src/jit/helpers.rs::jit_anewarray_object`;
+* that helper is reference-arrays-only: it hardcodes
+  `ArrayElementType::Reference`. Primitive arrays go through `jit_newarray`,
+  a different helper with a different message;
+* `ClassId 6` here is `java/lang/String`. `AttrsCorruptProbe`'s only
+  `anewarray` is `String[]` and it emits this exact text;
+* the length is already narrowed and sign-extended (`length as i32 as i64`)
+  precisely to defend against stale-upper-half slot reads, and `1677721600`
+  is a positive `i32` anyway.
+
+So it is `new String[1677721600]`, and the constant is not corruption but
+arithmetic: **`25 * 2^26`**, the `while (max < n * 5) max *= 2;` growth loop
+doubling from its initial 25 against the un-written hoist slot.
+
+### Why JAXB is where it surfaces
+
+JAXB 4's `SAXOutput` does not use the JDK's `org.xml.sax.helpers.AttributesImpl`
+— it uses its own `org.glassfish.jaxb.runtime.util.AttributesImpl`
+(jaxb-runtime-4.0.9). `javap -p -c` on the two shows `ensureCapacity` is a
+verbatim fork: same `goto 44` into the loop header at 44, same `iload_2;
+iconst_2; imul` doubling at 51-55, same `anewarray java/lang/String` at 59. Both
+copies hit this defect identically, and `find_bypassable_loop_headers` covers
+both because the predicate is bytecode-shape-based.
+
+Note this matters for coverage: at the 07:57 base the `org/glassfish/jaxb/` ban
+was still in `skip_list.rs` (4 occurrences), so the JAXB copy was not
+JIT-eligible then and those aborts came from the JDK copy. Current `dev` has
+that ban lifted *and* this fix, so the JAXB copy is JIT-eligible for the first
+time — hence the re-verification below rather than an assertion from ancestry.
+
+### Verification, binary built from `dev` @ `c1ea5ac6d`
+
+Strictly serial, one VM at a time, host load average 14-26.
+
+| probe / class | runs | OOM |
+|---|---:|---:|
+| `AttrsCorruptProbe 20000 60` (11/20 pre-fix) | 25 | **0** |
+| `AttributesImplGrowthProbe 20000` (6/20 pre-fix) | 15 | **0** |
+| `org.hibernate.orm.test.hql.ASTParserLoadingTest` | 4 | **0** |
+| `org.hibernate.orm.test.hql.BulkManipulationTest` | 3 | **0** |
+
+`BulkManipulationTest` was 50 ok / 0 failed / 1 skipped on all 3.
+`ASTParserLoadingTest` was 106/106 on 3 of 4; the 4th reported `failed=1`, but
+that run's `@@FAIL` line was not captured, so the failing test is **not
+identified here** — it is not an OOM, and the same class produced a
+`TimeoutException: testJpaTypeOperator ... timed out after 120 seconds` on both
+arms of the earlier A/B (the harness sets
+`junit.jupiter.execution.timeout.default=120s`), which is the likely but
+unconfirmed candidate.

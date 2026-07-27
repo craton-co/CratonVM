@@ -144,11 +144,34 @@ Two more that were on the list are **not** CratonVM bugs and need no further wor
 - `aot.nativex.FileNativeConfigurationWriterTests` — fixture artifact, see the
   archived history.
 
-Not re-run this session because the previous session closed them and nothing
-here touches their area: `beans.factory.aot.BeanRegistrationsAotContributionTests`
-(the separately tracked ~227×-vs-HotSpot interpreter throughput defect, which
-also SIGSEGVs under batch load) and
-`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`.
+The last two were re-measured after the table above was first written, so they
+belong in it — the count of 8 already includes them:
+
+- `beans.factory.aot.BeanRegistrationsAotContributionTests` — TIMEOUT, no
+  `RESULT` line at a 1500 s ceiling. This is the separately tracked
+  ~227×-vs-HotSpot interpreter throughput defect; it SIGSEGV'd under batch load
+  earlier the same day, so treat a crash there as a symptom of the same
+  slowness, not a second bug.
+- `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`
+  — LOADERR after 948 s: `NoClassDefFoundError:
+  org/junit/platform/commons/util/ExceptionUtils`, a core JUnit-Platform class
+  that is unconditionally on the classpath. The archived history guessed
+  memory pressure; that is now ruled out. Re-run under
+  `CRATONVM_DBG_LINKAGE_BT=1` against `cratonvm-sprfinal-v16.bin` (so it
+  carries every fix above), it reproduces, and the raise site is:
+
+  ```
+  raise_no_class_def_found            runtime/exceptions.rs:1795
+  ensure_class_initialized_shared     vm/vm_util.rs:499
+  execute_invokestatic                runtime/interpreter.rs:32060
+  ```
+
+  i.e. an ordinary `invokestatic` whose target class fails to INITIALISE —
+  not to be found. So the next question is what `ensure_class_initialized`
+  is unhappy about for a class that is plainly on the classpath (a `<clinit>`
+  that threw and was swallowed into a load failure is the obvious candidate);
+  the raise fires repeatedly through the run, so a breakpoint there catches it
+  immediately.
 
 ## Reproducing
 

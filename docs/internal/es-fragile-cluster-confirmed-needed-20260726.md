@@ -75,3 +75,38 @@ once the specific corrupting method(s) are identified.
   repo's convention of not silently erasing a prior claim.
 - `docs/known-issues/repros/jitban-remaining-20260726/es-test-list-sample.txt`
   — the 18-class sample list used, for reproducibility.
+
+## SUPERSEDED 2026-07-27 — ban REMOVED
+
+The single measurement that kept this ban — `FloatFieldBlockLoaderTests` going
+from 38 to 41 failures with the package JIT-eligible — was a symptom of a VM
+defect, not of ElasticSearch code. `try_jit_compile_callee` returned a bare
+compiled-entry address and dropped its `Arc<CompiledMethod>`, so a concurrent
+tier-up `JitCache::put` could unmap the body before the caller called, cached or
+baked that address. The same defect was SIGSEGV-ing
+`cluster.NodeConnectionsServiceTests` at 4/20 runs in the same window; see
+`docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`.
+
+Re-measured on the fixed build, ban-on vs ban-lifted:
+
+- the 19-class spread sample (every ~150th compiled test class, plus
+  `FloatFieldBlockLoaderTests`) — **identical line for line**;
+- an 8-class second sample over the vector/codec classes that originally
+  motivated the ban — identical except for two classes that were re-run
+  uncontended, 3 runs each way (below);
+- `FloatFieldBlockLoaderTests` — 120 tests, **31 failures both ways** (down
+  from 38 on 2026-07-26 through unrelated work since);
+- `TextFieldMapperTests` — 149 tests, 24 failures, on **3 runs each way**,
+  uncontended (348–581 s per run; the "hang" seen in the contended sample was
+  simply the 600 s cutoff);
+- `FloatHierarchicalKMeansTests` — **the ban was causing a hang.** With the ban
+  ON it times out 3/3 at 900 s; with it lifted it completes in 43–58 s, 9 tests
+  / 7 failures, 3/3. Lifting removes a hang here rather than introducing one.
+  (The 7 failures are present in both the contended sample and these runs and
+  are not new; they were simply unobservable while the class hung.)
+
+The ban's own recommendation — "the true failure surface is likely larger, not
+yet fully characterized" — still holds in the sense that only ~27 of 2555
+classes were sampled. What changed is that the one measured regression is gone
+and none of the sampled classes now differ, so the blanket ban no longer has
+evidence behind it.
