@@ -5412,6 +5412,202 @@ fn plan_scalar_replacement(
     }
 }
 
+/// Loop headers whose LICM / speculative **pre-header would be bypassed** by at
+/// least one control-flow edge that enters the loop from outside it.
+///
+/// Every pre-header this backend emits — aaload / integer / FP LICM hoists,
+/// speculative-BCE range guards, SIMD batch preheaders — is emitted inline *at*
+/// the loop-header PC, and `pc_to_native[header]` is then set to the position
+/// **after** it so the in-loop back edge does not re-run it (see the
+/// `osr_entry_native` field doc). That contract silently assumes the only way
+/// into the loop is the linear fall-through, which runs the pre-header first.
+///
+/// The assumption breaks for a loop whose header (or any body PC) is also the
+/// target of a *forward* branch from before the loop:
+///
+/// ```text
+///   0: iload_1; ifeq 10
+///   4: bipush 25; istore_2
+///   7: goto 13          <-- enters the loop header directly, skipping the
+///  10: bipush 30; istore_2     pre-header emitted just before it
+///  13: iload_2; iload_0; iconst_5; imul; if_icmpge 27   <-- loop header
+///  20: iload_2; iconst_2; imul; istore_2
+///  24: goto 13
+/// ```
+///
+/// That is exactly `org.xml.sax.helpers.AttributesImpl.ensureCapacity` (and
+/// `LicmEntryProbe.shapeB`, the regression witness). Taking the `goto 13` edge
+/// lands after the pre-header, so the arith-LICM slot caching `n * 5` is never
+/// written and the loop compares `max` against whatever the previous call left
+/// at that frame offset: a small leftover exits the loop immediately (the
+/// probe's `max` stays 25 instead of growing to 400), a large positive leftover
+/// doubles `max` up to ~1.6e9 and the following `new String[max]` dies with
+/// `OutOfMemoryError: Java heap space (anewarray component 6 length
+/// 1677721600)` — the HIB-LONGTAIL.2 signature.
+///
+/// Routing external entries to a second entry point would mean carrying the
+/// source PC through all 21 `forward_patches` sites plus every immediate
+/// backward-branch resolution. Instead this predicate refuses to speculate on
+/// such headers at all: the caller drops every hoist/guard whose header is
+/// listed here, which can only ever *remove* an optimisation. Loops with a
+/// single fall-through entry — the overwhelming majority, including every
+/// javac `for`/`while`/`do` whose header is not also a branch target from
+/// outside — keep hoisting unchanged.
+///
+/// Fail-closed on opaque control flow: a method containing `jsr`/`ret` gets
+/// every loop header marked, because `ret` returns to a value-carried address
+/// this walk cannot resolve.
+///
+/// Exception-handler edges are invisible here (the JIT is not handed the
+/// exception table), so a handler landing inside a hoisted loop body without
+/// passing the header would have the same defect. That is a pre-existing
+/// limitation of the pre-header placement contract, not one this predicate
+/// widens.
+fn find_bypassable_loop_headers(
+    code: &[u8],
+    code_len: usize,
+    loops: &[(usize, usize)],
+) -> FxHashSet<usize> {
+    let mut bypassable: FxHashSet<usize> = FxHashSet::default();
+    if loops.is_empty() {
+        return bypassable;
+    }
+
+    // (src_pc, target_pc) for every explicit branch edge. Decoding mirrors
+    // `compute_branch_targets` (same opcode set, same switch padding rule) but
+    // keeps the source PC so an edge can be classified as internal/external.
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    let mut opaque = false;
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        let mut push_edge = |src: usize, t: isize, edges: &mut Vec<(usize, usize)>| {
+            // Cast: non-negative index into the code array
+            if t >= 0 && (t as usize) < code_len {
+                edges.push((src, t as usize)); // Cast: non-negative index to usize
+            }
+        };
+        match op {
+            // ret — the return address came from a `jsr` and lives in a local;
+            // its successors are not statically known here.
+            0xA9 => opaque = true,
+            // Conditional branches + goto + jsr: 2-byte signed offset from `pc`.
+            0x99..=0xA8 | 0xC6 | 0xC7 => {
+                if op == 0xA8 {
+                    opaque = true;
+                }
+                if pc + 2 < code_len {
+                    // Cast: signed branch displacement to isize
+                    let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                    push_edge(pc, pc as isize + off, &mut edges); // Cast: pc to isize
+                }
+            }
+            // goto_w / jsr_w: 4-byte signed offset from `pc`.
+            0xC8 | 0xC9 => {
+                if op == 0xC9 {
+                    opaque = true;
+                }
+                if pc + 4 < code_len {
+                    let off = i32::from_be_bytes([
+                        code[pc + 1],
+                        code[pc + 2],
+                        code[pc + 3],
+                        code[pc + 4],
+                        // Cast: signed branch displacement to isize
+                    ]) as isize;
+                    push_edge(pc, pc as isize + off, &mut edges); // Cast: pc to isize
+                }
+            }
+            // tableswitch: default + (high-low+1) offsets, all relative to `pc`.
+            0xAA => {
+                let mut p = pc + 1;
+                while p % 4 != 0 {
+                    p += 1;
+                }
+                if p + 12 > code_len {
+                    opaque = true;
+                    break;
+                }
+                let read_off = |at: usize| -> isize {
+                    // Cast: signed branch displacement to isize
+                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+                };
+                push_edge(pc, pc as isize + read_off(p), &mut edges); // default
+                                                                     // Cast: table bound to i32
+                let low = read_off(p + 4) as i32;
+                // Cast: table bound to i32
+                let high = read_off(p + 8) as i32;
+                let count = checked_tableswitch_count(low, high).unwrap_or(0);
+                let mut jp = p + 12;
+                for _ in 0..count {
+                    if jp + 4 > code_len {
+                        opaque = true;
+                        break;
+                    }
+                    push_edge(pc, pc as isize + read_off(jp), &mut edges); // Cast: pc to isize
+                    jp += 4;
+                }
+            }
+            // lookupswitch: default + npairs (match, offset) pairs.
+            0xAB => {
+                let mut p = pc + 1;
+                while p % 4 != 0 {
+                    p += 1;
+                }
+                if p + 8 > code_len {
+                    opaque = true;
+                    break;
+                }
+                let read_off = |at: usize| -> isize {
+                    // Cast: signed branch displacement to isize
+                    i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+                };
+                push_edge(pc, pc as isize + read_off(p), &mut edges); // default
+                let npairs =
+                    i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0)
+                        as usize; // Cast: non-negative count to usize
+                let mut jp = p + 8;
+                for _ in 0..npairs {
+                    if jp + 8 > code_len {
+                        opaque = true;
+                        break;
+                    }
+                    // pair is (match:i32, offset:i32); the offset is at jp+4.
+                    push_edge(pc, pc as isize + read_off(jp + 4), &mut edges); // Cast: pc to isize
+                    jp += 8;
+                }
+            }
+            _ => {}
+        }
+        let len = bytecode_len_at(code, pc);
+        if len == 0 {
+            opaque = true;
+            break;
+        }
+        pc += len;
+    }
+
+    if opaque {
+        for &(header, _) in loops {
+            bypassable.insert(header);
+        }
+        return bypassable;
+    }
+
+    for &(header, back_edge) in loops {
+        let loop_end = back_edge + bytecode_len_at(code, back_edge);
+        for &(src, target) in &edges {
+            let target_inside = target >= header && target < loop_end;
+            let src_inside = src >= header && src < loop_end;
+            if target_inside && !src_inside {
+                bypassable.insert(header);
+                break;
+            }
+        }
+    }
+    bypassable
+}
+
 /// Detect natural loops by finding backward branches in bytecode.
 /// Returns a list of `(header_pc, back_edge_pc)` pairs.
 fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
@@ -28588,6 +28784,14 @@ pub fn compile_with_param_slots(
 
     // LICM: detect loops and find invariant aaload sequences to hoist
     let loops = detect_loops(code, code_len);
+    // Pre-header placement soundness: a loop header that can be entered by a
+    // branch from outside the loop would run the loop body with an
+    // uninitialised hoist slot / an unrun speculative guard, because
+    // `pc_to_native[header]` deliberately points PAST the pre-header. Drop
+    // every speculating transform for such headers — see
+    // `find_bypassable_loop_headers` for the full derivation and the
+    // `AttributesImpl.ensureCapacity` witness.
+    let bypassable_headers = find_bypassable_loop_headers(code, code_len, &loops);
     let hoist_info =
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
             Vec::new()
@@ -28614,6 +28818,10 @@ pub fn compile_with_param_slots(
             !despec
         })
         .collect();
+    let hoist_info: Vec<LoopHoist> = hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
 
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
@@ -28624,6 +28832,10 @@ pub fn compile_with_param_slots(
         } else {
             find_arith_loop_hoists(code, code_len, &loops)
         };
+    let arith_hoist_info: Vec<ArithLoopHoist> = arith_hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
     if !arith_hoist_info.is_empty()
         && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
     {
@@ -28786,6 +28998,10 @@ pub fn compile_with_param_slots(
 
     // FP LICM: detect loop-invariant FP loads to hoist
     let fp_hoist_info = find_fp_loop_hoists(code, code_len, &loops);
+    let fp_hoist_info: Vec<FpLoopHoist> = fp_hoist_info
+        .into_iter()
+        .filter(|h| !bypassable_headers.contains(&h.loop_header))
+        .collect();
 
     // FP strength reduction: detect dmul-by-2.0 → dadd-self inside loops
     let fp_strength_reduction_pcs =
@@ -29061,6 +29277,22 @@ pub fn compile_with_param_slots(
             !despec
         })
         .collect();
+    // Same obligation as the de-spec drop above, for a header whose pre-header
+    // an outside-the-loop branch can skip: the guard would not have run, so the
+    // elisions it justified must go back to per-access checks (an elide with no
+    // guard is a silent out-of-bounds access).
+    let speculative_bce_guards: Vec<SpeculativeBCEGuard> = speculative_bce_guards
+        .into_iter()
+        .filter(|g| {
+            let bypassable = bypassable_headers.contains(&g.loop_header);
+            if bypassable {
+                for covered_pc in &g.covered_pcs {
+                    bounds_safe_pcs.remove(covered_pc);
+                }
+            }
+            !bypassable
+        })
+        .collect();
     compiler.bounds_safe_pcs = bounds_safe_pcs;
 
     // SIMD gating: a SIMD loop transform replaces the per-element accesses of
@@ -29106,6 +29338,20 @@ pub fn compile_with_param_slots(
                 && simd_covered(e.header_pc, e.a_local, e.bound_local, e.iv_local)
                 && simd_covered(e.header_pc, e.b_local, e.bound_local, e.iv_local)
         })
+        .collect();
+    // A SIMD batch pre-header is emitted under the same placement contract as
+    // the LICM hoists, so a bypassable header must not carry one either.
+    let simd_loops: Vec<SimdIntArraySum> = simd_loops
+        .into_iter()
+        .filter(|s| !bypassable_headers.contains(&s.header_pc))
+        .collect();
+    let simd_fp_loops: Vec<SimdFpArraySum> = simd_fp_loops
+        .into_iter()
+        .filter(|s| !bypassable_headers.contains(&s.header_pc))
+        .collect();
+    let simd_element_wise_loops: Vec<SimdArrayElementWise> = simd_element_wise_loops
+        .into_iter()
+        .filter(|e| !bypassable_headers.contains(&e.header_pc))
         .collect();
     // Index the speculative guards by loop-header PC once, so the per-header
     // emit loop does an O(1) map lookup instead of an O(guards) filtered scan
@@ -36162,6 +36408,92 @@ mod tests {
                 .expect("test JIT call")
         }; // Cast: JIT ABI convention
         assert_eq!(result, 15); // 1+2+3+4+5
+    }
+
+    /// A loop whose header is reached only by fall-through + its own back edge
+    /// keeps its pre-header (and therefore its LICM hoists / speculative
+    /// guards).
+    ///
+    /// ```text
+    ///  0: iconst_0        2: iload_1        7: iinc 1, 1
+    ///  1: istore_1        3: iload_0       10: goto 2
+    ///                     4: if_icmpge 13  13: return
+    /// ```
+    #[test]
+    fn single_entry_loop_header_is_not_bypassable() {
+        let code: &[u8] = &[
+            0x03, // 0: iconst_0
+            0x3c, // 1: istore_1
+            0x1b, // 2: iload_1        <- loop header (back-edge target)
+            0x1a, // 3: iload_0
+            0xa2, 0x00, 0x09, // 4: if_icmpge 13
+            0x84, 0x01, 0x01, // 7: iinc 1, 1
+            0xa7, 0xff, 0xf8, // 10: goto 2
+            0xb1, // 13: return
+        ];
+        let loops = detect_loops(code, code.len());
+        assert_eq!(loops, vec![(2, 10)], "expected one loop with header 2");
+        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops);
+        assert!(
+            bypassable.is_empty(),
+            "a fall-through-only loop header must keep its pre-header, got {bypassable:?}"
+        );
+    }
+
+    /// `org.xml.sax.helpers.AttributesImpl.ensureCapacity`'s shape (and
+    /// `LicmEntryProbe.shapeB`): the loop header at 13 is ALSO the target of
+    /// the forward `goto 13` at pc 7, which lands after the pre-header the
+    /// emitter places at the header. Hoisting `n * 5` there left the cache slot
+    /// unwritten on that edge — HIB-LONGTAIL.2's
+    /// `anewarray ... length 1677721600`. The header must be reported
+    /// bypassable so every speculating transform is dropped for it.
+    ///
+    /// ```text
+    ///  0: iload_1          7: goto 13       17: if_icmpge 27
+    ///  1: ifeq 10         10: bipush 30     20: iload_2
+    ///  4: bipush 25       12: istore_2      21: iconst_2
+    ///  6: istore_2        13: iload_2       22: imul
+    ///                     14: iload_0       23: istore_2
+    ///                     15: iconst_5      24: goto 13
+    ///                     16: imul          27: iload_2 / 28: ireturn
+    /// ```
+    #[test]
+    fn forward_goto_into_loop_header_is_bypassable() {
+        let code: &[u8] = &[
+            0x1b, // 0: iload_1
+            0x99, 0x00, 0x09, // 1: ifeq 10
+            0x10, 0x19, // 4: bipush 25
+            0x3d, // 6: istore_2
+            0xa7, 0x00, 0x06, // 7: goto 13   <- skips the pre-header at 13
+            0x10, 0x1e, // 10: bipush 30
+            0x3d, // 12: istore_2
+            0x1c, // 13: iload_2   <- loop header
+            0x1a, // 14: iload_0
+            0x08, // 15: iconst_5
+            0x68, // 16: imul
+            0xa2, 0x00, 0x0a, // 17: if_icmpge 27
+            0x1c, // 20: iload_2
+            0x05, // 21: iconst_2
+            0x68, // 22: imul
+            0x3d, // 23: istore_2
+            0xa7, 0xff, 0xf5, // 24: goto 13
+            0x1c, // 27: iload_2
+            0xac, // 28: ireturn
+        ];
+        let loops = detect_loops(code, code.len());
+        assert_eq!(loops, vec![(13, 24)], "expected one loop with header 13");
+        // The invariant `n * 5` run IS matched — i.e. without the bypassable
+        // gate this method really would get a hoist at header 13.
+        assert!(
+            !find_arith_loop_hoists(code, code.len(), &loops).is_empty(),
+            "expected arith-LICM to match the `n * 5` run at this header"
+        );
+        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops);
+        assert!(
+            bypassable.contains(&13),
+            "header 13 is entered by the forward `goto` at pc 7 and must be \
+             reported bypassable, got {bypassable:?}"
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@ retain full evidence/repro details; this file is the summary.
 
 ## Kept — confirmed still needed, with real evidence
 
-- **JAXB** (`org/glassfish/jaxb/`) — real QName-compare corruption reproduces. `docs/known-issues/jaxb-still-needed-20260726.md`.
+- ~~**JAXB** (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27.** The QName-compare corruption no longer reproduces, including on a pre-fix binary under this session's own exact 2026-07-26 configuration, so it was closed by general JIT work landed between the two dates. What the 4000-iteration probe was still dying on was a separate general bug in a **JDK** class, now fixed. `docs/internal/jaxb-jit-ban-removed-20260727.md`.
 - **ES fragile cluster** (`org/elasticsearch/`) — real ES 9.6.0-SNAPSHOT checkout, 18-class sample found a real regression (`FloatFieldBlockLoaderTests`). `docs/known-issues/es-fragile-cluster-confirmed-needed-20260726.md`.
 - **HIB-TEMPORAL.1** (`org/hibernate/`) — real Hibernate ORM 8.0 harness, lifting causes a full `StrategySelectionException` bootstrap cascade. `docs/known-issues/hib-temporal-1-still-needed-20260726.md`.
 
@@ -61,7 +61,8 @@ retain full evidence/repro details; this file is the summary.
 
 ## Found, not a ban, new VM bugs discovered this session
 
-- **`java.io.Writer.write(char[])` silently drops output under JIT** — general VM correctness bug, unrelated to any specific app ban. `docs/known-issues/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
+- ~~**`java.io.Writer.write(char[])` silently drops output under JIT**~~ — **CLOSED 2026-07-27**, does not reproduce on dev. Two corrections to the original writeup: the compiled overload was `write(String)`, not `write(char[])` (`BISECT_SKIP` matches by method *name*), and the bug is unrelated to the LICM defect found while closing it. `docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
+- **JIT LICM / speculative pre-header bypassed by a forward branch into the loop header** — found 2026-07-27 while closing the two entries above, **FIXED**. A general x86-64 codegen defect: any hoist or speculative guard emitted at a loop header is skipped by an edge that enters the header from outside the loop, so the loop runs against an uninitialised cache slot (and, in the speculative-BCE case, against elided bounds checks whose guard never ran). This is also what **HIB-LONGTAIL.2** (`AttributesImpl.ensureCapacity`, removed from the skip list on 2026-07-26 as "no longer reproduces") really was — it was ~30%-per-run flaky and had been under-sampled, not fixed. `docs/internal/jit-licm-preheader-bypass-20260727.md`.
 - **`Class.getResourceAsStream`/`getResource` classloader-blindness** — FIXED this session (see removal list logic above; this was a real fix, not a ban).
 
 ## Flagged, not yet investigated (real, high-value, explicitly recommended for a future session)
