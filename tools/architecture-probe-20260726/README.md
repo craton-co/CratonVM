@@ -1,0 +1,48 @@
+# Architecture probes (2026-07-26)
+
+These small probes support the corresponding architecture review. They are not
+a general benchmark suite and their absolute timings should not be published as
+product claims. Use the relative shapes to validate specific architecture
+questions.
+
+The Java runner measures:
+
+- identical no-JIT bytecode in a default-package class and an
+  `org.springframework.*` class, exposing CratonVM's package-selected dual
+  interpreter paths;
+- one, four, and sixteen receiver types at one interface call site;
+- retained allocation of objects with eight primitive instance fields;
+- preallocated exception throw/catch, uncontended monitor, and native-call
+  boundary costs.
+
+Every case runs in a fresh process, pins one CPU, alternates HotSpot and
+CratonVM within each repetition, and records the checksum. Runs are invalid if
+deterministic checksums differ.
+
+Build CratonVM under a unique name and run:
+
+```bash
+CARGO_TARGET_DIR=/data/data/target-architecture-audit-20260726 \
+  cargo build --release -p cratonvm-cli --bin cratonvm
+install -m 755 \
+  /data/data/target-architecture-audit-20260726/release/cratonvm \
+  /data/data/bin/cratonvm-architecture-audit-20260726
+
+tools/architecture-probe-20260726/run-architecture-probe-20260726.sh \
+  -Exe /data/data/bin/cratonvm-architecture-audit-20260726 \
+  --java /home/victor/jdk25/bin/java \
+  --java-home /home/victor/jdk25 \
+  --cpu 13 --reps 3
+```
+
+Run the Rust layout probe as its own uniquely named binary:
+
+```bash
+CARGO_TARGET_DIR=/data/data/target-architecture-layout-probe-20260726 \
+  cargo run --release -p cratonvm-types \
+  --example cratonvm_architecture_layout_probe_20260726
+```
+
+The defaults are intentionally short enough for a shared probe host. Increase
+individual workloads with `INTERP_ITERS`, `DISPATCH_ITERS`, `ALLOC_ITERS`,
+`EXCEPTION_ITERS`, `MONITOR_ITERS`, and `NATIVE_ITERS` after checking host load.
