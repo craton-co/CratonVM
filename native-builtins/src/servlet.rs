@@ -2253,9 +2253,124 @@ pub(crate) const RUSTLS_SOCK_ID_BASE: i32 = 0x4000_0000;
 /// collide; see `t27_tls::{stash_pending_layered_socket, drive_pending_layered_handshake}`.
 pub(crate) const PENDING_LAYERED_SOCK_ID_BASE: i32 = 0x2000_0000;
 
+// ---------------------------------------------------------------------------
+// Plaintext readahead for TLS streams
+// ---------------------------------------------------------------------------
+//
+// FIX (tls-handshake-enforcement-gap, doc 21 — `TestSsl` class-level hang).
+// `SSLSocketInputStream.read()I` (phases_late/ssl_security.rs) is a native
+// call that reads exactly ONE byte, bracketed by
+// `begin_blocking_region`/`end_blocking_region` and, for native-tls ids, a
+// registry-lock lookup. Real JSSE's `SSLSocketInputStream` serves single-byte
+// reads out of a plain Java `byte[]`, so a caller that reads a large body one
+// byte at a time (`TestSsl.testPost` — 8 threads x 16 MiB, i.e. ~134 MILLION
+// calls) costs HotSpot a few seconds and cost CratonVM ~7.4 minutes, which is
+// most of why that whole class timed out.
+//
+// The buffer is keyed by STREAM ID rather than by the Java `InputStream`
+// object: `SSLSocket.getInputStream()` mints a fresh synthetic stream object
+// on every call, and unrelated code reads the same id straight through
+// `s2_tls_read`, so a per-object buffer could strand already-read bytes.
+// Keying by id and draining at the top of `s2_tls_read` keeps every reader of
+// a stream consistent no matter which entry point it uses.
+//
+// Semantics are unchanged: a refill does exactly ONE underlying `read`, which
+// returns as soon as any plaintext is available, so this never blocks waiting
+// to "fill" the buffer — identical to wrapping the stream in a
+// `BufferedInputStream`, which is effectively what the real JDK path is.
+const TLS_READAHEAD_CAP: usize = 32 * 1024;
+
+struct TlsReadahead {
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+fn tls_readahead() -> &'static parking_lot::Mutex<HashMap<i32, TlsReadahead>> {
+    static T: OnceLock<parking_lot::Mutex<HashMap<i32, TlsReadahead>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Move up to `out.len()` already-buffered plaintext bytes for `id` into
+/// `out`. Returns 0 when nothing is buffered (the caller must then do a real,
+/// blocking read).
+fn tls_readahead_drain(id: i32, out: &mut [u8]) -> usize {
+    let mut table = tls_readahead().lock();
+    let Some(entry) = table.get_mut(&id) else {
+        return 0;
+    };
+    let avail = entry.buf.len() - entry.pos;
+    if avail == 0 {
+        table.remove(&id);
+        return 0;
+    }
+    let n = avail.min(out.len());
+    out[..n].copy_from_slice(&entry.buf[entry.pos..entry.pos + n]);
+    entry.pos += n;
+    if entry.pos == entry.buf.len() {
+        table.remove(&id);
+    }
+    n
+}
+
+/// Number of plaintext bytes currently buffered for `id` — `available()` must
+/// count these, since they have already been taken off the socket.
+pub(crate) fn s2_tls_buffered_len(id: i32) -> usize {
+    tls_readahead()
+        .lock()
+        .get(&id)
+        .map(|e| e.buf.len() - e.pos)
+        .unwrap_or(0)
+}
+
+/// Pop one buffered plaintext byte without any blocking-region bookkeeping.
+/// `None` means "nothing buffered" — the caller must fall back to
+/// [`s2_tls_fill_readahead`] inside a blocking region.
+pub(crate) fn s2_tls_pop_buffered_byte(id: i32) -> Option<u8> {
+    let mut out = [0u8; 1];
+    (tls_readahead_drain(id, &mut out) == 1).then_some(out[0])
+}
+
+/// Do ONE real read into the readahead buffer for `id`. Returns the number of
+/// bytes buffered (0 = EOF). MUST be called inside a blocking region — it
+/// performs genuine blocking socket I/O.
+pub(crate) fn s2_tls_fill_readahead(id: i32) -> std::io::Result<usize> {
+    let mut buf = vec![0u8; TLS_READAHEAD_CAP];
+    let n = s2_tls_read_direct(id, &mut buf)?;
+    if n == 0 {
+        return Ok(0);
+    }
+    buf.truncate(n);
+    tls_readahead()
+        .lock()
+        .insert(id, TlsReadahead { buf, pos: 0 });
+    Ok(n)
+}
+
+/// Drop any readahead for `id` — called when the stream is closed so a
+/// recycled id can never inherit a dead stream's bytes.
+pub(crate) fn s2_tls_discard_readahead(id: i32) {
+    tls_readahead().lock().remove(&id);
+}
+
 /// NEW-13: read from a TLS stream registered via `s2_tls_connect` (native-tls),
 /// or — for ids ≥ `RUSTLS_SOCK_ID_BASE` — the rustls client/server stream table.
+///
+/// Serves any readahead buffered by [`s2_tls_fill_readahead`] first so every
+/// reader of a stream observes the same byte sequence regardless of entry
+/// point.
 pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+    if !buf.is_empty() {
+        let n = tls_readahead_drain(id, buf);
+        if n > 0 {
+            return Ok(n);
+        }
+    }
+    s2_tls_read_direct(id, buf)
+}
+
+/// The unbuffered read — bypasses the readahead entirely. Only
+/// [`s2_tls_read`] (after draining) and [`s2_tls_fill_readahead`] may call it.
+fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     if id >= RUSTLS_SOCK_ID_BASE {
         return crate::t27_tls::rustls_stream_read(id - RUSTLS_SOCK_ID_BASE, buf);
     }
@@ -2317,6 +2432,7 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
 /// NEW-13: perform a graceful TLS shutdown (close_notify) and drop the stream.
 /// Idempotent: closing an unknown id is a no-op.
 pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
+    s2_tls_discard_readahead(id);
     if id >= RUSTLS_SOCK_ID_BASE {
         crate::t27_tls::rustls_stream_close(id - RUSTLS_SOCK_ID_BASE);
         return Ok(());
