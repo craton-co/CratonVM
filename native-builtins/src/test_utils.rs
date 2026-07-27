@@ -9,7 +9,9 @@
 
 use cratonvm_native_api::registry::GpuFutureResult;
 use cratonvm_native_api::{
-    AnnotationData, FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry,
+    AnnotationData, FieldMetadata, MethodMetadata, NativeClassAccess, NativeContext,
+    NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess,
+    NativeSystemAccess, NativeThreadAccess, StackTraceEntry,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
@@ -1187,79 +1189,12 @@ impl MockNativeContext {
     }
 }
 
-impl NativeContext for MockNativeContext {
-    // Mirror the production NativeContext memory bridge for REAL pointers:
-    // vm_exec falls through to a raw copy when the address is not a tagged
-    // Unsafe-arena handle. The t27_tls direct-buffer tests hand this mock
-    // genuine malloc pointers (Vec backing stores), so the arena-aware
-    // accessors (bb_get_byte & co.) must be able to reach them here too.
-    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
-        if addr <= 0 {
-            return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(addr as usize as *const u8, out.as_mut_ptr(), out.len());
-        }
-        true
-    }
+impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
 
-    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
-        if addr <= 0 {
-            return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
-        }
-        true
-    }
-
-    fn supports_real_proxy_generation(&self) -> bool {
-        false
-    }
 
     fn load_class(&mut self, _name: &str) -> MethodCallResult {
         Ok(None)
     }
-
-    fn new_object(&mut self, class_name: &str) -> MethodCallResult {
-        let cid = self.ensure_class_initialized(class_name)?;
-        let obj = self.alloc_entry(HeapEntry::Object {
-            class_id: cid,
-            fields: vec![Value::Int(0); 4],
-        });
-        Ok(Some(Value::Object(Some(obj))))
-    }
-
-    fn invoke(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        if class_name == "java/lang/Class"
-            && method_name == "getName"
-            && descriptor == "()Ljava/lang/String;"
-        {
-            if let Some(Value::Object(Some(mirror))) = args.first() {
-                if let Value::Int(raw_id) = self.get_field(*mirror, 0) {
-                    let class_name = self
-                        .class_name_of_id(ClassId::new(raw_id as u32))
-                        .unwrap_or_default()
-                        .replace('/', ".");
-                    let name_obj = self.create_string(&class_name);
-                    return Ok(Some(Value::Object(Some(name_obj))));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-        obj.as_ptr() as i32
-    }
-
-    fn record_printed_value(&mut self, _value: Value) {}
 
     fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
         self.class_names.get(&class_id.as_u32()).cloned()
@@ -1280,247 +1215,8 @@ impl NativeContext for MockNativeContext {
         }
     }
 
-    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
-        Vec::new()
-    }
-
-    fn get_stack_trace(&self, _throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
-        None
-    }
-
-    fn frame_class_ids(&self) -> Vec<ClassId> {
-        // SAFETY: single-threaded test code.
-        unsafe { (*self.frame_class_ids_override.get()).clone() }
-    }
-
-    fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
-        let idx = self.entry_index(obj);
-        match &self.heap_ref()[idx] {
-            HeapEntry::Object { fields, .. } => fields.get(index).copied().unwrap_or(Value::Int(0)),
-            _ => Value::Int(0),
-        }
-    }
-
-    fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
-        let idx = self.entry_index(obj);
-        match &mut self.heap_mut()[idx] {
-            HeapEntry::Object { fields, .. } => {
-                if index >= fields.len() {
-                    fields.resize(index + 1, Value::Int(0));
-                }
-                fields[index] = value;
-            }
-            _ => {}
-        }
-    }
-
-    fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
-        // Mock: no class hierarchy parse. Tests that use
-        // `make_field_mirror` write the synthetic 7-slot Field layout
-        // directly; map the JDK Field field names to the corresponding
-        // synthetic slot so the production code's `get_field_by_name`
-        // path still reads the right value. Unknown names are treated as
-        // absent (returning `Int(0)` rather than silently shadowing slot
-        // 0, which would corrupt slot-0 test state).
-        let class_name = self.class_name_of_id(self.class_id_of_object(obj));
-        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
-            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
-        } else {
-            mock_classloader_field_slot(class_name.as_deref(), field_name)
-                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_jdk_field_slot(field_name))
-        };
-        match slot {
-            Some(slot) => self.get_field(obj, slot),
-            None => Value::Int(0),
-        }
-    }
-
-    fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
-        let class_name = self.class_name_of_id(self.class_id_of_object(obj));
-        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
-            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
-        } else {
-            mock_classloader_field_slot(class_name.as_deref(), field_name)
-                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
-                .or_else(|| mock_jdk_field_slot(field_name))
-        };
-        if let Some(slot) = slot {
-            self.set_field(obj, slot, value);
-        }
-        // Unknown name → silently ignore (matches real-JDK mode when
-        // the field doesn't exist in the class hierarchy).
-    }
-
-    fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
-        mock_undertow_exchange_field_slot(Some(class_name), field_name)
-    }
-
-    fn resolve_field_index_by_class_id(
-        &self,
-        class_id: ClassId,
-        field_name: &str,
-    ) -> Option<usize> {
-        mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
-    }
-
     fn method_exists(&self, _class_name: &str, _method_name: &str, _descriptor: &str) -> bool {
         false
-    }
-
-    fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
-        self.alloc_entry(HeapEntry::Array {
-            elements: vec![Value::Int(0); length],
-            element_type,
-        })
-    }
-
-    fn new_ref_array(&mut self, _class_id: ClassId, length: usize) -> ObjectRef {
-        self.alloc_entry(HeapEntry::Array {
-            elements: vec![Value::Object(None); length],
-            element_type: ArrayElementType::Reference,
-        })
-    }
-
-    fn array_length(&self, obj: ObjectRef) -> usize {
-        let idx = self.entry_index(obj);
-        match &self.heap_ref()[idx] {
-            HeapEntry::Array { elements, .. } => elements.len(),
-            _ => 0,
-        }
-    }
-
-    fn object_is_array(&self, obj: ObjectRef) -> bool {
-        let idx = self.entry_index(obj);
-        matches!(&self.heap_ref()[idx], HeapEntry::Array { .. })
-    }
-
-    fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
-        let idx = self.entry_index(obj);
-        match &self.heap_ref()[idx] {
-            HeapEntry::Array { elements, .. } => {
-                elements.get(index).copied().unwrap_or(Value::Int(0))
-            }
-            _ => Value::Int(0),
-        }
-    }
-
-    fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
-        let idx = self.entry_index(obj);
-        match &mut self.heap_mut()[idx] {
-            HeapEntry::Array { elements, .. } => {
-                if index < elements.len() {
-                    elements[index] = value;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn heap_kind_of(&self, obj: ObjectRef) -> ObjectKind {
-        let idx = self.entry_index(obj);
-        match &self.heap_ref()[idx] {
-            HeapEntry::Object { .. } => ObjectKind::Object,
-            HeapEntry::Array { .. } => ObjectKind::Array,
-        }
-    }
-
-    fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
-        let idx = self.entry_index(obj);
-        match &self.heap_ref()[idx] {
-            HeapEntry::Array { element_type, .. } => *element_type,
-            _ => ArrayElementType::Reference,
-        }
-    }
-
-    fn create_string(&mut self, text: &str) -> ObjectRef {
-        // Create char array
-        let chars: Vec<u16> = text.encode_utf16().collect();
-        let arr = self.alloc_entry(HeapEntry::Array {
-            elements: chars.iter().map(|&c| Value::Int(c as i32)).collect(),
-            element_type: ArrayElementType::Char,
-        });
-        // Resolve the canonical String class id so callers that inspect the
-        // object's class (e.g. ObjectOutputStream's String fast-path) see
-        // `java/lang/String` rather than the class-0 ("Object") default.
-        let sid = self
-            .ensure_class_initialized("java/lang/String")
-            .map(|c| c.as_u32())
-            .unwrap_or(0);
-        // Create string object: field 0 = char[], field 1 = hash (0)
-        self.alloc_entry(HeapEntry::Object {
-            class_id: ClassId::new(sid),
-            fields: vec![Value::Object(Some(arr)), Value::Int(0)],
-        })
-    }
-
-    fn read_string(&self, obj: ObjectRef) -> Option<String> {
-        let arr_ref = match self.get_field(obj, 0) {
-            Value::Object(Some(arr)) => arr,
-            _ => return None,
-        };
-        let len = self.array_length(arr_ref);
-        let mut chars = Vec::with_capacity(len);
-        for i in 0..len {
-            match self.get_array_element(arr_ref, i) {
-                Value::Int(v) => chars.push(v as u16),
-                _ => chars.push(0),
-            }
-        }
-        String::from_utf16(&chars).ok()
-    }
-
-    fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
-        let name = self
-            .class_names
-            .get(&class_id.as_u32())
-            .cloned()
-            .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
-        let name_obj = self.create_string(&name);
-        self.alloc_entry(HeapEntry::Object {
-            class_id: ClassId::new(0),
-            fields: vec![
-                Value::Int(class_id.as_u32() as i32),
-                Value::Object(Some(name_obj)),
-            ],
-        })
-    }
-
-    fn record_printed_line(&mut self, _text: String) {}
-
-    fn get_system_stream(&self, _name: &str) -> Option<ObjectRef> {
-        None
-    }
-
-    fn get_system_property(&self, key: &str) -> Option<String> {
-        self.properties.get(key).cloned()
-    }
-
-    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
-        self.properties.insert(key.to_string(), value.to_string())
-    }
-
-    fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        self.alloc_entry(HeapEntry::Object {
-            class_id,
-            fields: vec![Value::Int(0); num_fields],
-        })
     }
 
     fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
@@ -1576,12 +1272,6 @@ impl NativeContext for MockNativeContext {
         supers.get(&class_id.as_u32()).copied()
     }
 
-    fn is_interface_class(&self, class_id: ClassId) -> bool {
-        // SAFETY: single-threaded test code.
-        let map = unsafe { &*self.is_interface_override.get() };
-        map.get(&class_id.as_u32()).copied().unwrap_or(false)
-    }
-
     fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
         self.name_to_id.get(name).map(|&id| ClassId::new(id))
     }
@@ -1610,143 +1300,6 @@ impl NativeContext for MockNativeContext {
 
     fn permitted_subclasses(&self, _class_id: ClassId) -> Vec<String> {
         Vec::new()
-    }
-
-    fn object_num_fields(&self, obj: ObjectRef) -> usize {
-        let idx = self.entry_index(obj);
-        match &self.heap_ref()[idx] {
-            HeapEntry::Object { fields, .. } => fields.len(),
-            _ => 0,
-        }
-    }
-
-    fn thread_id(&self) -> u64 {
-        1
-    }
-
-    fn monitor_wait(&mut self, _obj: ObjectRef, _timeout_ms: Option<u64>) -> MethodCallResult {
-        Ok(None)
-    }
-
-    fn monitor_notify(&mut self, _obj: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-
-    fn monitor_notify_all(&mut self, _obj: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-
-    fn thread_start(&mut self, _thread_obj: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-
-    fn thread_join(&mut self, _thread_obj: ObjectRef) -> MethodCallResult {
-        Ok(None)
-    }
-
-    fn thread_is_alive(&self, _thread_obj: ObjectRef) -> bool {
-        false
-    }
-
-    fn current_thread_object(&mut self) -> ObjectRef {
-        self.alloc_object(ClassId::new(0), 2)
-    }
-
-    fn thread_interrupt(&mut self, _thread_obj: ObjectRef) {}
-
-    fn register_native_thread(&mut self, name: &str, daemon: bool, join_handle_ptr: usize) -> u64 {
-        // Drop the JoinHandle if one was passed — the mock context
-        // doesn't model a real registry that can `.join()` on it,
-        // and leaking it would prevent the OS thread from being
-        // reaped at process exit.
-        if join_handle_ptr != 0 {
-            // SAFETY: caller built this via Box::into_raw; we
-            // reconstruct and drop it.
-            let _ = unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
-        }
-        // SAFETY: single-threaded test code.
-        let next = unsafe { &mut *self.next_native_tid.get() };
-        let tid = *next;
-        *next += 1;
-        // SAFETY: same.
-        unsafe {
-            (*self.registered_native_threads.get()).push((name.to_string(), daemon, true));
-        }
-        tid
-    }
-
-    fn unregister_native_thread(&mut self, thread_id: u64) {
-        if thread_id == 0 {
-            return;
-        }
-        // FIX(test-isolation): index relative to this instance's tid
-        // base (see `native_tid_slot`), not `thread_id - 1` — the base
-        // is now shifted per instance for global uniqueness.
-        let idx = match self.native_tid_slot(thread_id) {
-            Some(i) => i,
-            None => return,
-        };
-        // SAFETY: single-threaded test code.
-        unsafe {
-            let v = &mut *self.registered_native_threads.get();
-            if let Some(entry) = v.get_mut(idx) {
-                entry.2 = false;
-            }
-        }
-    }
-
-    fn attach_join_handle_to_native_thread(
-        &mut self,
-        thread_id: u64,
-        join_handle_ptr: usize,
-    ) -> bool {
-        if thread_id == 0 || join_handle_ptr == 0 {
-            return false;
-        }
-        // SAFETY: caller built via Box::into_raw; we drop the box
-        // (mock doesn't model joining).
-        let _ = unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
-        // FIX(test-isolation): base-relative index (see native_tid_slot).
-        let idx = match self.native_tid_slot(thread_id) {
-            Some(i) => i,
-            None => return false,
-        };
-        // SAFETY: single-threaded test code.
-        unsafe {
-            let v = &*self.registered_native_threads.get();
-            v.get(idx).is_some()
-        }
-    }
-
-    fn set_native_thread_java_obj(&mut self, thread_id: u64, java_thread_obj: ObjectRef) -> bool {
-        if thread_id == 0 {
-            return false;
-        }
-        // FIX(test-isolation): base-relative index (see native_tid_slot).
-        let idx = match self.native_tid_slot(thread_id) {
-            Some(i) => i,
-            None => return false,
-        };
-        // SAFETY: single-threaded test code.
-        unsafe {
-            let v = &*self.registered_native_threads.get();
-            if v.get(idx).is_none() {
-                return false;
-            }
-            (*self.native_thread_java_objs.get())
-                .insert(thread_id, java_thread_obj.as_ptr() as usize);
-        }
-        true
-    }
-
-    fn is_interrupted(&self, clear: bool) -> bool {
-        // SAFETY: single-threaded test code; no aliasing.
-        let slot = unsafe { &mut *self.interrupted_flag.get() };
-        let val = *slot;
-        if val && clear {
-            *slot = false;
-        }
-        val
     }
 
     fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
@@ -1809,45 +1362,6 @@ impl NativeContext for MockNativeContext {
         overrides.get(&class_id.as_u32()).copied().unwrap_or(0)
     }
 
-    fn static_field_index_by_name(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
-        let fields = unsafe { &*self.declared_fields_override.get() };
-        if let Some(slot) = fields.get(&class_id.as_u32()).and_then(|fields| {
-            fields
-                .iter()
-                .find(|f| f.is_static && f.name == field_name)
-                .map(|f| f.slot_index)
-        }) {
-            return Some(slot);
-        }
-
-        let overrides = unsafe { &*self.enum_values_override.get() };
-        if field_name == "$VALUES" && overrides.contains_key(&class_id.as_u32()) {
-            Some(0)
-        } else {
-            None
-        }
-    }
-
-    fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value {
-        let statics = unsafe { &*self.static_fields_override.get() };
-        if let Some(value) = statics.get(&(class_id.as_u32(), field_index)) {
-            return *value;
-        }
-
-        let overrides = unsafe { &*self.enum_values_override.get() };
-        if field_index == 0 {
-            if let Some(&arr) = overrides.get(&class_id.as_u32()) {
-                return Value::Object(Some(arr));
-            }
-        }
-        Value::Int(0)
-    }
-
-    fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
-        let statics = unsafe { &mut *self.static_fields_override.get() };
-        statics.insert((class_id.as_u32(), field_index), value);
-    }
-
     fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
         // FIX(class_id-0 name shadow): give the mirror a real, distinct
         // class id via `ensure_class_initialized` (idempotent per name)
@@ -1861,60 +1375,6 @@ impl NativeContext for MockNativeContext {
             class_id: ClassId::new(0),
             fields: vec![Value::Int(class_id as i32), Value::Object(Some(name_obj))],
         })
-    }
-
-    fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
-        // Leak a static table for testing — tests won't actually use file I/O
-        use std::sync::OnceLock;
-        static FD_TABLE: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> =
-            OnceLock::new();
-        FD_TABLE.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
-    }
-
-    // -- WP0.2 ObjectStreamClass cache overrides --
-
-    fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
-        // SAFETY: single-threaded test code.
-        unsafe { (*self.osc_cache_map.get()).get(&class_id.as_u32()).copied() }
-    }
-
-    fn osc_cache_put(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
-        // SAFETY: single-threaded test code.
-        let map = unsafe { &mut *self.osc_cache_map.get() };
-        *map.entry(class_id.as_u32()).or_insert(desc)
-    }
-
-    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
-        self.get_field(obj, index)
-    }
-
-    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
-        self.set_field(obj, index, value)
-    }
-
-    fn compare_and_swap_field(
-        &mut self,
-        obj: ObjectRef,
-        index: usize,
-        expected: Value,
-        new_val: Value,
-    ) -> bool {
-        let current = self.get_field(obj, index);
-        if current == expected {
-            self.set_field(obj, index, new_val);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn park(&mut self, _timeout: Option<std::time::Duration>) {}
-
-    fn unpark(&self, _thread_obj: ObjectRef) {}
-
-    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
-        let cid = self.ensure_class_initialized(class_name).ok()?;
-        Some(self.alloc_object(cid, 4))
     }
 
     fn class_annotations(&self, _class_id: ClassId) -> Vec<AnnotationData> {
@@ -1980,147 +1440,6 @@ impl NativeContext for MockNativeContext {
                 .cloned()
                 .unwrap_or_default()
         }
-    }
-
-    fn invoke_virtual(
-        &mut self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        if let Some(hook) = unsafe { *self.invoke_virtual_hook.get() } {
-            if let Some(result) = hook(self, receiver, method_name, descriptor, args) {
-                return result;
-            }
-        }
-        let result = unsafe { &mut *self.invoke_virtual_result.get() };
-        if let Some(r) = result.take() {
-            r
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
-        let roots = unsafe { &mut *self.native_pin_roots.get() };
-        let idx = roots.len();
-        roots.push(obj);
-        idx
-    }
-
-    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
-        unsafe { (&*self.native_pin_roots.get()).get(handle).copied() }.unwrap_or(fallback)
-    }
-
-    fn unpin_native_roots(&mut self, base: usize) {
-        let roots = unsafe { &mut *self.native_pin_roots.get() };
-        if base < roots.len() {
-            roots.truncate(base);
-        }
-    }
-
-    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
-        let next = unsafe { &mut *self.next_global_root.get() };
-        let handle = *next;
-        *next = next.saturating_add(1).max(1);
-        unsafe { &mut *self.global_roots.get() }.insert(handle, obj);
-        handle
-    }
-
-    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
-        unsafe { &*self.global_roots.get() }.get(&handle).copied()
-    }
-
-    fn remove_global_root(&mut self, handle: usize) -> bool {
-        unsafe { &mut *self.global_roots.get() }
-            .remove(&handle)
-            .is_some()
-    }
-
-    fn get_scoped_value(&self, _key_id: u64) -> Option<Value> {
-        None
-    }
-
-    fn push_scoped_value(&mut self, _key_id: u64, _value: Value) {}
-
-    fn pop_scoped_value(&mut self) {}
-
-    fn scoped_value_depth(&self) -> usize {
-        0
-    }
-
-    fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
-        let align = align.max(1);
-        let size = size.max(1);
-        let layout = std::alloc::Layout::from_size_align(size, align).ok()?;
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            return None;
-        }
-        let allocs = unsafe { &mut *self.native_allocs.get() };
-        let id_ref = unsafe { &mut *self.next_alloc_id.get() };
-        let id = *id_ref;
-        *id_ref += 1;
-        allocs.insert(id, (ptr, layout));
-        Some((id, ptr))
-    }
-
-    fn free_native_memory(&mut self, alloc_id: i64) {
-        let allocs = unsafe { &mut *self.native_allocs.get() };
-        if let Some((ptr, layout)) = allocs.remove(&alloc_id) {
-            unsafe { std::alloc::dealloc(ptr, layout) };
-        }
-    }
-
-    fn load_native_library(&mut self, _path: &str) -> Result<i64, MethodCallFailed> {
-        Ok(0)
-    }
-
-    fn find_native_symbol(&self, _lib_index: i64, name: &str) -> Option<usize> {
-        // For testing, resolve symbols from the C runtime via platform-specific lookup
-        #[cfg(target_os = "windows")]
-        {
-            use std::ffi::CString;
-            let c_name = CString::new(name).ok()?;
-            // Try msvcrt first, then ucrtbase
-            let libs = ["msvcrt.dll\0", "ucrtbase.dll\0"];
-            for lib in &libs {
-                let handle = unsafe { winapi_GetModuleHandleA(lib.as_ptr() as *const i8) };
-                if !handle.is_null() {
-                    let addr = unsafe { winapi_GetProcAddress(handle, c_name.as_ptr()) };
-                    if !addr.is_null() {
-                        return Some(addr as usize);
-                    }
-                }
-            }
-            None
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            use std::ffi::CString;
-            let c_name = CString::new(name).ok()?;
-            let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
-            if addr.is_null() {
-                None
-            } else {
-                Some(addr as usize)
-            }
-        }
-    }
-
-    fn register_upcall(&mut self, entry: cratonvm_native_api::ffi::UpcallEntry) -> usize {
-        let entries = unsafe { &mut *self.upcall_entries.get() };
-        let slot = entries.len();
-        entries.push(entry);
-        slot
-    }
-
-    fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
-        let entries = unsafe { &*self.upcall_entries.get() };
-        entries
-            .get(slot)
-            .map(|e| (e.target, e.param_kinds.clone(), e.return_kind))
     }
 
     fn module_name_of_class(&self, _class_id: ClassId) -> Option<String> {
@@ -2253,18 +1572,6 @@ impl NativeContext for MockNativeContext {
         }
     }
 
-    fn discover_reference(
-        &mut self,
-        _ref_type: u8,
-        _reference_obj: ObjectRef,
-        _referent: ObjectRef,
-        _queue: Option<ObjectRef>,
-    ) {
-    }
-
-    fn monitor_enter(&mut self, _obj: ObjectRef) {}
-    fn monitor_exit(&mut self, _obj: ObjectRef) {}
-
     fn define_class_with_loader(
         &mut self,
         _name: &str,
@@ -2280,36 +1587,6 @@ impl NativeContext for MockNativeContext {
 
     fn allocate_loader_id(&mut self) -> u32 {
         0
-    }
-
-    fn active_thread_count(&self) -> i32 {
-        1
-    }
-
-    fn enumerate_threads(&self, _max: usize) -> Vec<ObjectRef> {
-        Vec::new()
-    }
-
-    fn heap_allocated_bytes(&self) -> usize {
-        0
-    }
-
-    fn loaded_class_count(&self) -> usize {
-        0
-    }
-
-    fn gc_collection_count(&self) -> u64 {
-        0
-    }
-
-    fn force_gc(&mut self) {}
-
-    fn begin_blocking_region(&mut self) {
-        self.blocking_begin_count += 1;
-    }
-
-    fn end_blocking_region(&mut self) {
-        self.blocking_end_count += 1;
     }
 
     fn method_parameter_annotations(
@@ -2387,6 +1664,487 @@ impl NativeContext for MockNativeContext {
     ) -> Result<(), String> {
         Ok(())
     }
+}
+
+impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
+
+
+    fn invoke(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        if class_name == "java/lang/Class"
+            && method_name == "getName"
+            && descriptor == "()Ljava/lang/String;"
+        {
+            if let Some(Value::Object(Some(mirror))) = args.first() {
+                if let Value::Int(raw_id) = self.get_field(*mirror, 0) {
+                    let class_name = self
+                        .class_name_of_id(ClassId::new(raw_id as u32))
+                        .unwrap_or_default()
+                        .replace('/', ".");
+                    let name_obj = self.create_string(&class_name);
+                    return Ok(Some(Value::Object(Some(name_obj))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn invoke_virtual(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        if let Some(hook) = unsafe { *self.invoke_virtual_hook.get() } {
+            if let Some(result) = hook(self, receiver, method_name, descriptor, args) {
+                return result;
+            }
+        }
+        let result = unsafe { &mut *self.invoke_virtual_result.get() };
+        if let Some(r) = result.take() {
+            r
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
+
+
+    fn new_object(&mut self, class_name: &str) -> MethodCallResult {
+        let cid = self.ensure_class_initialized(class_name)?;
+        let obj = self.alloc_entry(HeapEntry::Object {
+            class_id: cid,
+            fields: vec![Value::Int(0); 4],
+        });
+        Ok(Some(Value::Object(Some(obj))))
+    }
+
+    fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        obj.as_ptr() as i32
+    }
+
+    fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Object { fields, .. } => fields.get(index).copied().unwrap_or(Value::Int(0)),
+            _ => Value::Int(0),
+        }
+    }
+
+    fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        let idx = self.entry_index(obj);
+        match &mut self.heap_mut()[idx] {
+            HeapEntry::Object { fields, .. } => {
+                if index >= fields.len() {
+                    fields.resize(index + 1, Value::Int(0));
+                }
+                fields[index] = value;
+            }
+            _ => {}
+        }
+    }
+
+    fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
+        // Mock: no class hierarchy parse. Tests that use
+        // `make_field_mirror` write the synthetic 7-slot Field layout
+        // directly; map the JDK Field field names to the corresponding
+        // synthetic slot so the production code's `get_field_by_name`
+        // path still reads the right value. Unknown names are treated as
+        // absent (returning `Int(0)` rather than silently shadowing slot
+        // 0, which would corrupt slot-0 test state).
+        let class_name = self.class_name_of_id(self.class_id_of_object(obj));
+        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
+            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
+        } else {
+            mock_classloader_field_slot(class_name.as_deref(), field_name)
+                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_jdk_field_slot(field_name))
+        };
+        match slot {
+            Some(slot) => self.get_field(obj, slot),
+            None => Value::Int(0),
+        }
+    }
+
+    fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
+        let class_name = self.class_name_of_id(self.class_id_of_object(obj));
+        let slot = if class_name.as_deref() == Some("java/lang/reflect/Parameter") {
+            mock_parameter_field_slot(field_name).or_else(|| mock_jdk_field_slot(field_name))
+        } else {
+            mock_classloader_field_slot(class_name.as_deref(), field_name)
+                .or_else(|| mock_buffer_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_charset_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_lucene_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_concurrent_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_infinispan_dcm_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_h2_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_liquibase_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_stamped_lock_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_undertow_exchange_field_slot(class_name.as_deref(), field_name))
+                .or_else(|| mock_jdk_field_slot(field_name))
+        };
+        if let Some(slot) = slot {
+            self.set_field(obj, slot, value);
+        }
+        // Unknown name → silently ignore (matches real-JDK mode when
+        // the field doesn't exist in the class hierarchy).
+    }
+
+    fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
+        mock_undertow_exchange_field_slot(Some(class_name), field_name)
+    }
+
+    fn resolve_field_index_by_class_id(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Option<usize> {
+        mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
+    }
+
+    fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
+        self.alloc_entry(HeapEntry::Array {
+            elements: vec![Value::Int(0); length],
+            element_type,
+        })
+    }
+
+    fn new_ref_array(&mut self, _class_id: ClassId, length: usize) -> ObjectRef {
+        self.alloc_entry(HeapEntry::Array {
+            elements: vec![Value::Object(None); length],
+            element_type: ArrayElementType::Reference,
+        })
+    }
+
+    fn array_length(&self, obj: ObjectRef) -> usize {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Array { elements, .. } => elements.len(),
+            _ => 0,
+        }
+    }
+
+    fn object_is_array(&self, obj: ObjectRef) -> bool {
+        let idx = self.entry_index(obj);
+        matches!(&self.heap_ref()[idx], HeapEntry::Array { .. })
+    }
+
+    fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Array { elements, .. } => {
+                elements.get(index).copied().unwrap_or(Value::Int(0))
+            }
+            _ => Value::Int(0),
+        }
+    }
+
+    fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
+        let idx = self.entry_index(obj);
+        match &mut self.heap_mut()[idx] {
+            HeapEntry::Array { elements, .. } => {
+                if index < elements.len() {
+                    elements[index] = value;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn heap_kind_of(&self, obj: ObjectRef) -> ObjectKind {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Object { .. } => ObjectKind::Object,
+            HeapEntry::Array { .. } => ObjectKind::Array,
+        }
+    }
+
+    fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Array { element_type, .. } => *element_type,
+            _ => ArrayElementType::Reference,
+        }
+    }
+
+    fn create_string(&mut self, text: &str) -> ObjectRef {
+        // Create char array
+        let chars: Vec<u16> = text.encode_utf16().collect();
+        let arr = self.alloc_entry(HeapEntry::Array {
+            elements: chars.iter().map(|&c| Value::Int(c as i32)).collect(),
+            element_type: ArrayElementType::Char,
+        });
+        // Resolve the canonical String class id so callers that inspect the
+        // object's class (e.g. ObjectOutputStream's String fast-path) see
+        // `java/lang/String` rather than the class-0 ("Object") default.
+        let sid = self
+            .ensure_class_initialized("java/lang/String")
+            .map(|c| c.as_u32())
+            .unwrap_or(0);
+        // Create string object: field 0 = char[], field 1 = hash (0)
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(sid),
+            fields: vec![Value::Object(Some(arr)), Value::Int(0)],
+        })
+    }
+
+    fn read_string(&self, obj: ObjectRef) -> Option<String> {
+        let arr_ref = match self.get_field(obj, 0) {
+            Value::Object(Some(arr)) => arr,
+            _ => return None,
+        };
+        let len = self.array_length(arr_ref);
+        let mut chars = Vec::with_capacity(len);
+        for i in 0..len {
+            match self.get_array_element(arr_ref, i) {
+                Value::Int(v) => chars.push(v as u16),
+                _ => chars.push(0),
+            }
+        }
+        String::from_utf16(&chars).ok()
+    }
+
+    fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
+        let name = self
+            .class_names
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_else(|| format!("unknown_{}", class_id.as_u32()));
+        let name_obj = self.create_string(&name);
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(0),
+            fields: vec![
+                Value::Int(class_id.as_u32() as i32),
+                Value::Object(Some(name_obj)),
+            ],
+        })
+    }
+
+    fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        self.alloc_entry(HeapEntry::Object {
+            class_id,
+            fields: vec![Value::Int(0); num_fields],
+        })
+    }
+
+    fn object_num_fields(&self, obj: ObjectRef) -> usize {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Object { fields, .. } => fields.len(),
+            _ => 0,
+        }
+    }
+
+    // -- WP0.2 ObjectStreamClass cache overrides --
+
+    fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.osc_cache_map.get()).get(&class_id.as_u32()).copied() }
+    }
+
+    fn osc_cache_put(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
+        // SAFETY: single-threaded test code.
+        let map = unsafe { &mut *self.osc_cache_map.get() };
+        *map.entry(class_id.as_u32()).or_insert(desc)
+    }
+
+    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field(obj, index)
+    }
+
+    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field(obj, index, value)
+    }
+
+    fn compare_and_swap_field(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        expected: Value,
+        new_val: Value,
+    ) -> bool {
+        let current = self.get_field(obj, index);
+        if current == expected {
+            self.set_field(obj, index, new_val);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
+        let cid = self.ensure_class_initialized(class_name).ok()?;
+        Some(self.alloc_object(cid, 4))
+    }
+
+    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        let idx = roots.len();
+        roots.push(obj);
+        idx
+    }
+
+    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        unsafe { (&*self.native_pin_roots.get()).get(handle).copied() }.unwrap_or(fallback)
+    }
+
+    fn unpin_native_roots(&mut self, base: usize) {
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        if base < roots.len() {
+            roots.truncate(base);
+        }
+    }
+
+    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
+        let next = unsafe { &mut *self.next_global_root.get() };
+        let handle = *next;
+        *next = next.saturating_add(1).max(1);
+        unsafe { &mut *self.global_roots.get() }.insert(handle, obj);
+        handle
+    }
+
+    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
+        unsafe { &*self.global_roots.get() }.get(&handle).copied()
+    }
+
+    fn remove_global_root(&mut self, handle: usize) -> bool {
+        unsafe { &mut *self.global_roots.get() }
+            .remove(&handle)
+            .is_some()
+    }
+
+    fn discover_reference(
+        &mut self,
+        _ref_type: u8,
+        _reference_obj: ObjectRef,
+        _referent: ObjectRef,
+        _queue: Option<ObjectRef>,
+    ) {
+    }
+
+    fn heap_allocated_bytes(&self) -> usize {
+        0
+    }
+}
+
+impl cratonvm_native_api::NativeThreadAccess for MockNativeContext {
+
+
+    fn thread_id(&self) -> u64 {
+        1
+    }
+
+    fn monitor_wait(&mut self, _obj: ObjectRef, _timeout_ms: Option<u64>) -> MethodCallResult {
+        Ok(None)
+    }
+
+    fn monitor_notify(&mut self, _obj: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+
+    fn monitor_notify_all(&mut self, _obj: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+
+    fn thread_start(&mut self, _thread_obj: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+
+    fn thread_join(&mut self, _thread_obj: ObjectRef) -> MethodCallResult {
+        Ok(None)
+    }
+
+    fn thread_is_alive(&self, _thread_obj: ObjectRef) -> bool {
+        false
+    }
+
+    fn current_thread_object(&mut self) -> ObjectRef {
+        self.alloc_object(ClassId::new(0), 2)
+    }
+
+    fn thread_interrupt(&mut self, _thread_obj: ObjectRef) {}
+
+    fn is_interrupted(&self, clear: bool) -> bool {
+        // SAFETY: single-threaded test code; no aliasing.
+        let slot = unsafe { &mut *self.interrupted_flag.get() };
+        let val = *slot;
+        if val && clear {
+            *slot = false;
+        }
+        val
+    }
+
+    fn park(&mut self, _timeout: Option<std::time::Duration>) {}
+
+    fn unpark(&self, _thread_obj: ObjectRef) {}
+
+    fn get_scoped_value(&self, _key_id: u64) -> Option<Value> {
+        None
+    }
+
+    fn push_scoped_value(&mut self, _key_id: u64, _value: Value) {}
+
+    fn pop_scoped_value(&mut self) {}
+
+    fn scoped_value_depth(&self) -> usize {
+        0
+    }
+
+    fn monitor_enter(&mut self, _obj: ObjectRef) {}
+    fn monitor_exit(&mut self, _obj: ObjectRef) {}
+
+    fn active_thread_count(&self) -> i32 {
+        1
+    }
+
+    fn enumerate_threads(&self, _max: usize) -> Vec<ObjectRef> {
+        Vec::new()
+    }
+
+    fn begin_blocking_region(&mut self) {
+        self.blocking_begin_count += 1;
+    }
+
+    fn end_blocking_region(&mut self) {
+        self.blocking_end_count += 1;
+    }
+}
+
+impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
+
+
+    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+
+    fn get_stack_trace(&self, _throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
+        None
+    }
+
+    fn frame_class_ids(&self) -> Vec<ClassId> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.frame_class_ids_override.get()).clone() }
+    }
+}
+
+impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
+
 
     /// 2026-07-11: honour any test-provided `gpu_future_take_result_override`;
     /// defaults to the trait's default (`None`, "no GPU offload") when no
@@ -2421,6 +2179,278 @@ impl NativeContext for MockNativeContext {
         }
     }
 }
+
+impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
+
+    // Mirror the production NativeContext memory bridge for REAL pointers:
+    // vm_exec falls through to a raw copy when the address is not a tagged
+    // Unsafe-arena handle. The t27_tls direct-buffer tests hand this mock
+    // genuine malloc pointers (Vec backing stores), so the arena-aware
+    // accessors (bb_get_byte & co.) must be able to reach them here too.
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as usize as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
+        }
+        true
+    }
+
+    fn supports_real_proxy_generation(&self) -> bool {
+        false
+    }
+
+    fn record_printed_value(&mut self, _value: Value) {}
+
+    fn record_printed_line(&mut self, _text: String) {}
+
+    fn get_system_stream(&self, _name: &str) -> Option<ObjectRef> {
+        None
+    }
+
+    fn get_system_property(&self, key: &str) -> Option<String> {
+        self.properties.get(key).cloned()
+    }
+
+    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
+        self.properties.insert(key.to_string(), value.to_string())
+    }
+
+    fn is_interface_class(&self, class_id: ClassId) -> bool {
+        // SAFETY: single-threaded test code.
+        let map = unsafe { &*self.is_interface_override.get() };
+        map.get(&class_id.as_u32()).copied().unwrap_or(false)
+    }
+
+    fn register_native_thread(&mut self, name: &str, daemon: bool, join_handle_ptr: usize) -> u64 {
+        // Drop the JoinHandle if one was passed — the mock context
+        // doesn't model a real registry that can `.join()` on it,
+        // and leaking it would prevent the OS thread from being
+        // reaped at process exit.
+        if join_handle_ptr != 0 {
+            // SAFETY: caller built this via Box::into_raw; we
+            // reconstruct and drop it.
+            let _ = unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
+        }
+        // SAFETY: single-threaded test code.
+        let next = unsafe { &mut *self.next_native_tid.get() };
+        let tid = *next;
+        *next += 1;
+        // SAFETY: same.
+        unsafe {
+            (*self.registered_native_threads.get()).push((name.to_string(), daemon, true));
+        }
+        tid
+    }
+
+    fn unregister_native_thread(&mut self, thread_id: u64) {
+        if thread_id == 0 {
+            return;
+        }
+        // FIX(test-isolation): index relative to this instance's tid
+        // base (see `native_tid_slot`), not `thread_id - 1` — the base
+        // is now shifted per instance for global uniqueness.
+        let idx = match self.native_tid_slot(thread_id) {
+            Some(i) => i,
+            None => return,
+        };
+        // SAFETY: single-threaded test code.
+        unsafe {
+            let v = &mut *self.registered_native_threads.get();
+            if let Some(entry) = v.get_mut(idx) {
+                entry.2 = false;
+            }
+        }
+    }
+
+    fn attach_join_handle_to_native_thread(
+        &mut self,
+        thread_id: u64,
+        join_handle_ptr: usize,
+    ) -> bool {
+        if thread_id == 0 || join_handle_ptr == 0 {
+            return false;
+        }
+        // SAFETY: caller built via Box::into_raw; we drop the box
+        // (mock doesn't model joining).
+        let _ = unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
+        // FIX(test-isolation): base-relative index (see native_tid_slot).
+        let idx = match self.native_tid_slot(thread_id) {
+            Some(i) => i,
+            None => return false,
+        };
+        // SAFETY: single-threaded test code.
+        unsafe {
+            let v = &*self.registered_native_threads.get();
+            v.get(idx).is_some()
+        }
+    }
+
+    fn set_native_thread_java_obj(&mut self, thread_id: u64, java_thread_obj: ObjectRef) -> bool {
+        if thread_id == 0 {
+            return false;
+        }
+        // FIX(test-isolation): base-relative index (see native_tid_slot).
+        let idx = match self.native_tid_slot(thread_id) {
+            Some(i) => i,
+            None => return false,
+        };
+        // SAFETY: single-threaded test code.
+        unsafe {
+            let v = &*self.registered_native_threads.get();
+            if v.get(idx).is_none() {
+                return false;
+            }
+            (*self.native_thread_java_objs.get())
+                .insert(thread_id, java_thread_obj.as_ptr() as usize);
+        }
+        true
+    }
+
+    fn static_field_index_by_name(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+        let fields = unsafe { &*self.declared_fields_override.get() };
+        if let Some(slot) = fields.get(&class_id.as_u32()).and_then(|fields| {
+            fields
+                .iter()
+                .find(|f| f.is_static && f.name == field_name)
+                .map(|f| f.slot_index)
+        }) {
+            return Some(slot);
+        }
+
+        let overrides = unsafe { &*self.enum_values_override.get() };
+        if field_name == "$VALUES" && overrides.contains_key(&class_id.as_u32()) {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value {
+        let statics = unsafe { &*self.static_fields_override.get() };
+        if let Some(value) = statics.get(&(class_id.as_u32(), field_index)) {
+            return *value;
+        }
+
+        let overrides = unsafe { &*self.enum_values_override.get() };
+        if field_index == 0 {
+            if let Some(&arr) = overrides.get(&class_id.as_u32()) {
+                return Value::Object(Some(arr));
+            }
+        }
+        Value::Int(0)
+    }
+
+    fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
+        let statics = unsafe { &mut *self.static_fields_override.get() };
+        statics.insert((class_id.as_u32(), field_index), value);
+    }
+
+    fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
+        // Leak a static table for testing — tests won't actually use file I/O
+        use std::sync::OnceLock;
+        static FD_TABLE: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> =
+            OnceLock::new();
+        FD_TABLE.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
+    }
+
+    fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
+        let align = align.max(1);
+        let size = size.max(1);
+        let layout = std::alloc::Layout::from_size_align(size, align).ok()?;
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return None;
+        }
+        let allocs = unsafe { &mut *self.native_allocs.get() };
+        let id_ref = unsafe { &mut *self.next_alloc_id.get() };
+        let id = *id_ref;
+        *id_ref += 1;
+        allocs.insert(id, (ptr, layout));
+        Some((id, ptr))
+    }
+
+    fn free_native_memory(&mut self, alloc_id: i64) {
+        let allocs = unsafe { &mut *self.native_allocs.get() };
+        if let Some((ptr, layout)) = allocs.remove(&alloc_id) {
+            unsafe { std::alloc::dealloc(ptr, layout) };
+        }
+    }
+
+    fn load_native_library(&mut self, _path: &str) -> Result<i64, MethodCallFailed> {
+        Ok(0)
+    }
+
+    fn find_native_symbol(&self, _lib_index: i64, name: &str) -> Option<usize> {
+        // For testing, resolve symbols from the C runtime via platform-specific lookup
+        #[cfg(target_os = "windows")]
+        {
+            use std::ffi::CString;
+            let c_name = CString::new(name).ok()?;
+            // Try msvcrt first, then ucrtbase
+            let libs = ["msvcrt.dll\0", "ucrtbase.dll\0"];
+            for lib in &libs {
+                let handle = unsafe { winapi_GetModuleHandleA(lib.as_ptr() as *const i8) };
+                if !handle.is_null() {
+                    let addr = unsafe { winapi_GetProcAddress(handle, c_name.as_ptr()) };
+                    if !addr.is_null() {
+                        return Some(addr as usize);
+                    }
+                }
+            }
+            None
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            use std::ffi::CString;
+            let c_name = CString::new(name).ok()?;
+            let addr = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr()) };
+            if addr.is_null() {
+                None
+            } else {
+                Some(addr as usize)
+            }
+        }
+    }
+
+    fn register_upcall(&mut self, entry: cratonvm_native_api::ffi::UpcallEntry) -> usize {
+        let entries = unsafe { &mut *self.upcall_entries.get() };
+        let slot = entries.len();
+        entries.push(entry);
+        slot
+    }
+
+    fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
+        let entries = unsafe { &*self.upcall_entries.get() };
+        entries
+            .get(slot)
+            .map(|e| (e.target, e.param_kinds.clone(), e.return_kind))
+    }
+
+    fn loaded_class_count(&self) -> usize {
+        0
+    }
+
+    fn gc_collection_count(&self) -> u64 {
+        0
+    }
+
+    fn force_gc(&mut self) {}
+}
+
+
+
 
 impl Drop for MockNativeContext {
     fn drop(&mut self) {

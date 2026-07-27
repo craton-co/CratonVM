@@ -98,6 +98,8 @@ thread_local! {
 
 #[cfg(test)]
 mod test_fixtures {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     pub(crate) const CA_CRT_PEM: &str = include_str!("t27_certs/ca.crt");
     pub(crate) const SERVER_CRT_PEM: &str = include_str!("t27_certs/server.crt");
     pub(crate) const SERVER_KEY_PEM: &str = include_str!("t27_certs/server.key");
@@ -4546,6 +4548,8 @@ fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::test_fixtures::*;
     use super::*;
     use cratonvm_native_api::NativeContext;

@@ -172,7 +172,7 @@ static COMPACT_ENABLED: OnceLock<bool> = OnceLock::new();
 /// uniform 16-byte-cell layout for A/B runs.
 #[inline]
 pub fn compact_ref_fields_enabled() -> bool {
-    *COMPACT_ENABLED.get_or_init(|| match std::env::var("CRATONVM_COMPACT_REF_FIELDS") {
+    *COMPACT_ENABLED.get_or_init(|| match crate::flags::runtime_var("CRATONVM_COMPACT_REF_FIELDS") {
         Ok(value) => {
             let value = value.trim();
             !matches!(
@@ -335,6 +335,112 @@ pub fn unregister_class_layout(class_id: u32) {
 pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
     let v = CLASS_LAYOUTS.read().unwrap();
     v.get(class_id as usize).and_then(|o| o.clone())
+}
+
+const CURRENT_CACHE_LEN: usize = 8;
+
+struct CurrentLayoutCache {
+    entries: [Option<(u32, u64, Option<Arc<CompactLayout>>)>; CURRENT_CACHE_LEN],
+    next: std::cell::Cell<usize>,
+    mru: std::cell::Cell<usize>,
+}
+
+impl CurrentLayoutCache {
+    const fn new() -> Self {
+        Self {
+            entries: [None, None, None, None, None, None, None, None],
+            next: std::cell::Cell::new(0),
+            mru: std::cell::Cell::new(0),
+        }
+    }
+
+    #[inline]
+    fn find(&self, class_id: u32, generation: u64) -> Option<usize> {
+        let matches = |entry: &Option<(u32, u64, Option<Arc<CompactLayout>>)>| {
+            matches!(entry, Some((cid, gen, _)) if *cid == class_id && *gen == generation)
+        };
+        let mru = self.mru.get();
+        if self.entries.get(mru).is_some_and(matches) {
+            return Some(mru);
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            if matches(entry) {
+                self.mru.set(index);
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn install(
+        &mut self,
+        class_id: u32,
+        generation: u64,
+        resolved: Option<Arc<CompactLayout>>,
+    ) -> usize {
+        let slot = self.next.get() % CURRENT_CACHE_LEN;
+        self.next.set(self.next.get().wrapping_add(1));
+        self.mru.set(slot);
+        self.entries[slot] = Some((class_id, generation, resolved));
+        slot
+    }
+}
+
+thread_local! {
+    static CURRENT_LAYOUT_CACHE: std::cell::RefCell<CurrentLayoutCache> =
+        const { std::cell::RefCell::new(CurrentLayoutCache::new()) };
+}
+
+/// Run `f` against the currently published layout for `class_id`.
+///
+/// Allocation and compiled/interpreted field-resolution paths ask for the
+/// current class recipe millions of times. Returning an owned `Arc` from
+/// [`class_layout`] paid an `RwLock` acquisition plus an atomic clone/drop on
+/// every object allocation. This generation-validated per-thread working set
+/// retains the handles and borrows them in place. Negative lookups are cached
+/// as well, which keeps legacy/padded synthetic classes off the registry lock.
+///
+/// Unlike [`with_class_layout`], this deliberately does not address historical
+/// `(class_id, field_count)` versions: allocation must use only the current
+/// class recipe. A stale field-count request therefore continues to fall back
+/// to a legacy self-describing object rather than minting a compact object from
+/// an obsolete layout.
+#[inline]
+pub fn with_current_class_layout<R>(
+    class_id: u32,
+    f: impl FnOnce(&CompactLayout) -> R,
+) -> Option<R> {
+    let generation = layout_generation();
+    CURRENT_LAYOUT_CACHE.with(|cell| {
+        match cell.try_borrow() {
+            Ok(cache) => {
+                if let Some(index) = cache.find(class_id, generation) {
+                    return cache.entries[index]
+                        .as_ref()
+                        .and_then(|entry| entry.2.as_deref())
+                        .map(f);
+                }
+            }
+            Err(_) => return class_layout(class_id).map(|layout| f(&layout)),
+        }
+
+        let resolved = class_layout(class_id);
+        match cell.try_borrow_mut() {
+            Ok(mut cache) => {
+                let index = cache.install(class_id, generation, resolved);
+                drop(cache);
+                match cell.try_borrow() {
+                    Ok(cache) => cache.entries[index]
+                        .as_ref()
+                        .and_then(|entry| entry.2.as_deref())
+                        .map(f),
+                    Err(_) => class_layout(class_id).map(|layout| f(&layout)),
+                }
+            }
+            Err(_) => resolved.map(|layout| f(&layout)),
+        }
+    })
 }
 
 /// Small per-thread working set for the `(class_id, field_count) -> layout`
@@ -618,43 +724,13 @@ pub fn compact_field_storage(
     class_id: u32,
     index: usize,
 ) -> Option<(usize, FieldStorageKind)> {
-    struct SlotCache {
-        entries: [Option<(u32, u64, Arc<CompactLayout>)>; 8],
-        next: usize,
-    }
-    impl SlotCache {
-        const fn new() -> Self {
-            Self {
-                entries: [None, None, None, None, None, None, None, None],
-                next: 0,
-            }
-        }
-    }
-    thread_local! {
-        static SLOT_CACHE: std::cell::RefCell<SlotCache> =
-            const { std::cell::RefCell::new(SlotCache::new()) };
-    }
-    let generation = layout_generation();
-    SLOT_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        for entry in &cache.entries {
-            if let Some((cached_cid, cached_gen, layout)) = entry {
-                if *cached_cid == class_id && *cached_gen == generation {
-                    return Some((
-                        layout.field_offset(index)? as usize,
-                        layout.field_storage(index)?,
-                    ));
-                }
-            }
-        }
-        let layout = class_layout(class_id)?;
-        let offset = layout.field_offset(index)? as usize;
-        let storage = layout.field_storage(index)?;
-        let slot = cache.next;
-        cache.entries[slot] = Some((class_id, generation, layout));
-        cache.next = (slot + 1) % cache.entries.len();
-        Some((offset, storage))
+    with_current_class_layout(class_id, |layout| {
+        Some((
+            layout.field_offset(index)? as usize,
+            layout.field_storage(index)?,
+        ))
     })
+    .flatten()
 }
 
 /// Return the compact body size when `class_id` has a complete layout matching
@@ -666,9 +742,10 @@ pub fn compact_object_body_size(class_id: u32, field_count: usize) -> Option<usi
     if !compact_ref_fields_enabled() {
         return None;
     }
-    class_layout(class_id)
-        .filter(|layout| layout.field_count() == field_count)
-        .map(|layout| layout.body_size as usize)
+    with_current_class_layout(class_id, |layout| {
+        (layout.field_count() == field_count).then_some(layout.body_size as usize)
+    })
+    .flatten()
 }
 
 /// Resolve a field of an object that is actually marked compact.
@@ -1252,6 +1329,57 @@ mod tests {
             None,
             "borrowed entry survived unregister_class_layout"
         );
+        clear_class_layouts();
+    }
+
+    #[test]
+    fn current_layout_cache_invalidates_without_reusing_historical_recipe() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(70, one_ref_layout(8));
+        assert_eq!(compact_object_body_size(70, 1), Some(8));
+        assert_eq!(
+            with_current_class_layout(70, |layout| layout.body_size),
+            Some(8)
+        );
+
+        let grown = Arc::new(CompactLayout {
+            field_offsets: vec![0, 8],
+            is_ref: vec![true, true],
+            field_kinds: vec![
+                FieldStorageKind::Reference,
+                FieldStorageKind::Reference,
+            ],
+            ref_offsets: vec![0, 8],
+            body_size: 16,
+        });
+        register_class_layout(70, grown);
+
+        assert_eq!(
+            compact_object_body_size(70, 1),
+            None,
+            "allocation must not resurrect the historical one-field layout"
+        );
+        assert_eq!(compact_object_body_size(70, 2), Some(16));
+        assert_eq!(
+            with_current_class_layout(70, |layout| layout.body_size),
+            Some(16)
+        );
+        clear_class_layouts();
+    }
+
+    #[test]
+    fn current_layout_cache_invalidates_negative_and_unregister_entries() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        assert!(with_current_class_layout(71, |_| ()).is_none());
+        register_class_layout(71, one_ref_layout(8));
+        assert_eq!(
+            with_current_class_layout(71, |layout| layout.body_size),
+            Some(8)
+        );
+        unregister_class_layout(71);
+        assert!(with_current_class_layout(71, |_| ()).is_none());
         clear_class_layouts();
     }
 

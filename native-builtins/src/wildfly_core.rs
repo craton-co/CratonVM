@@ -1913,14 +1913,6 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Lorg/jboss/logmanager/Logger;",
         native_log_manager_get_logger,
     );
-    // Also register the `LogContext.getLogger` path — same shape.
-    r.register(
-        "org/jboss/logmanager/LogContext",
-        "getLogger",
-        "(Ljava/lang/String;)Lorg/jboss/logmanager/Logger;",
-        native_log_manager_get_logger,
-    );
-
     let logger = "org/jboss/logmanager/Logger";
     r.register(
         logger,
@@ -2142,6 +2134,8 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 

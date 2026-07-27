@@ -49,7 +49,7 @@ use crate::old_gen::OldGen;
 // instance fields are stored as 8-byte pointers per the per-class oop-map.
 use crate::gc_flags;
 use crate::satb::SatbQueue;
-use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
+use crate::{compact_ref_fields_enabled, is_compact_object, object_body_size};
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size, write_ref_slot};
 use cratonvm_types::GC_FLAG_COMPACT;
 use cratonvm_types::{ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value};
@@ -3557,6 +3557,20 @@ impl GenerationalHeap {
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
         let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
+        // Selective promotion commits young -> old relocations inside
+        // `sweep_young_non_moving`. Registered external-root providers can own
+        // the only reference to a promoted object (collection overlay backing
+        // arrays are the canonical case), and the System.gc path below may run
+        // an old-space sweep in this SAME collector call. Waiting for the VM's
+        // ordinary post-GC remap is therefore too late: the old marker would
+        // consult a provider that still points at the forwarded young source,
+        // fail to seed the promoted destination, and immediately reclaim it.
+        //
+        // Publish provider relocation at the young-phase commit boundary,
+        // before any same-cycle old marking. The VM-level remap after this
+        // function returns remains intentionally idempotent and still covers
+        // every non-provider root owner.
+        crate::external_roots::remap_external_roots(&result.0.pointer_map);
         // OOM-INVESTIGATE (dohead-oom, 2026-07-19): track young-arena usage
         // across cycles to find where reclaimed bytes stop coming back as
         // usable free space. Gated so normal runs pay nothing.
@@ -5599,7 +5613,7 @@ impl GenerationalHeap {
             // alive (instance->loader). No-op for the common
             // no-custom-loader case.
             loader_pin_on: cratonvm_types::loader_pin::loader_pinning_enabled(),
-            overlay_owners: cratonvm_native_collections::gc_overlay_owner_addrs(),
+            overlay_owners: crate::external_roots::external_owner_addrs(),
             metadata_pins: cratonvm_types::metadata_pin::snapshot(),
         };
         // mark_if_young: mark a candidate young pointer and enqueue it.
@@ -5924,7 +5938,7 @@ impl GenerationalHeap {
         // card scan does. The major marker below applies the precise
         // owner-reachable rule before it compacts old space.
         for overlay_ref in
-            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+            crate::external_roots::external_roots_for_matching_owners(&|owner_addr| {
                 old_gen.contains(owner_addr as *mut u8)
             })
         {
@@ -8086,7 +8100,7 @@ impl GenerationalHeap {
         // young from-space is conservatively retained for this major cycle,
         // matching the ordinary cross-generation seed's contract.
         for overlay_ref in
-            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+            crate::external_roots::external_roots_for_matching_owners(&|owner_addr| {
                 young_from.contains(owner_addr as *mut u8)
             })
         {
@@ -8114,7 +8128,7 @@ impl GenerationalHeap {
             // can reclaim an unreachable old collection and its side-table
             // graph together instead of treating every entry as a global root.
             for overlay_ref in
-                cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
+                crate::external_roots::external_roots_for_owner(obj_ptr as usize)
             {
                 let overlay_ptr = overlay_ref.as_ptr();
                 if old_gen.contains(overlay_ptr) {
@@ -10338,7 +10352,7 @@ fn scan_young_object(
         .as_ref()
         .is_some_and(|owners| owners.contains(&obj_addr))
     {
-        for overlay_ref in cratonvm_native_collections::gc_overlay_roots_for_collection(obj_addr) {
+        for overlay_ref in crate::external_roots::external_roots_for_owner(obj_addr) {
             mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
         }
     }
@@ -10745,22 +10759,22 @@ fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 #[inline]
 fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32, u8)> {
     if compact_ref_fields_enabled() {
-        if let Some(layout) = class_layout(class_id.as_u32()) {
-            if layout.field_count() == num_fields {
-                let total = HEADER_SIZE.checked_add(layout.body_size as usize)?;
-                return Some((total, layout.body_size, GC_FLAG_COMPACT));
-            } else if gc_flags().dbg_compact_legacy {
-                let name = crate::gc::resolve_class_info(class_id.as_u32())
-                    .map(|(n, _)| n)
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                eprintln!(
-                    "[compact-legacy] class={} id={} alloc num_fields={} != layout.field_count={} -> LEGACY object",
-                    name,
-                    class_id.as_u32(),
-                    num_fields,
-                    layout.field_count(),
-                );
-            }
+        if let Some(body_size) =
+            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields)
+        {
+            let total = HEADER_SIZE.checked_add(body_size)?;
+            let body_size = u32::try_from(body_size).ok()?;
+            return Some((total, body_size, GC_FLAG_COMPACT));
+        } else if gc_flags().dbg_compact_legacy {
+            let name = crate::gc::resolve_class_info(class_id.as_u32())
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            eprintln!(
+                "[compact-legacy] class={} id={} alloc num_fields={} has no matching current compact layout -> LEGACY object",
+                name,
+                class_id.as_u32(),
+                num_fields,
+            );
         }
     }
     let body = num_fields.checked_mul(SLOT_SIZE)?;

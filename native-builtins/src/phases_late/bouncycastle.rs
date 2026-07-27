@@ -3212,6 +3212,8 @@ pub(crate) fn register_bc_sect_point_methods(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 pub(crate) mod bc_longarray_poly_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{bc_poly_inverse, bc_poly_mul_raw, bc_poly_reduce};
 
     #[test]

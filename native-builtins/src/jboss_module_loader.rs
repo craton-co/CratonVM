@@ -205,13 +205,16 @@ fn remember_maven_repo_root(root: Option<String>) {
 ///      in the process argv.
 ///
 /// Returns `None` if neither source is present.
-fn find_mp_argument() -> Option<String> {
-    if let Ok(root) = std::env::var("CRATONVM_JBOSS_MP_ROOT") {
+fn find_mp_argument_from<I>(configured_root: Option<String>, args: I) -> Option<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    if let Some(root) = configured_root {
         if !root.is_empty() {
             return Some(root);
         }
     }
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = args.into_iter().collect();
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a == "-mp" || a == "-modulepath" || a == "--module-path" {
@@ -221,6 +224,13 @@ fn find_mp_argument() -> Option<String> {
         }
     }
     None
+}
+
+fn find_mp_argument() -> Option<String> {
+    find_mp_argument_from(
+        cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok(),
+        std::env::args(),
+    )
 }
 
 fn split_module_path_entries(raw: &str) -> Vec<String> {
@@ -299,19 +309,19 @@ fn maven_repo_candidates() -> Vec<PathBuf> {
         roots.push(cached);
     }
     for key in ["CRATONVM_MAVEN_REPO_LOCAL", "MAVEN_REPO_LOCAL", "M2_REPO"] {
-        if let Ok(raw) = std::env::var(key) {
+        if let Ok(raw) = cratonvm_types::flags::runtime_var(key) {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 roots.push(PathBuf::from(trimmed));
             }
         }
     }
-    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+    if let Ok(userprofile) = cratonvm_types::flags::runtime_var("USERPROFILE") {
         if !userprofile.trim().is_empty() {
             roots.push(PathBuf::from(userprofile).join(".m2").join("repository"));
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = cratonvm_types::flags::runtime_var("HOME") {
         if !home.trim().is_empty() {
             roots.push(PathBuf::from(home).join(".m2").join("repository"));
         }
@@ -3728,6 +3738,8 @@ fn native_loader_load_module_by_identifier(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use parking_lot::Mutex as PMutex;
@@ -3873,17 +3885,13 @@ mod tests {
     /// causes us to fall back to argv.
     #[test]
     fn wp8_10_find_mp_argument_honours_env_var() {
-        let _g = TEST_LOCK.lock();
-        // Start from a clean slate.
-        let prev = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
-        std::env::set_var("CRATONVM_JBOSS_MP_ROOT", "/tmp/wp8_10_fixture_mp");
-        let v = find_mp_argument();
+        let v = find_mp_argument_from(
+            Some("/tmp/wp8_10_fixture_mp".to_string()),
+            ["cratonvm", "-mp", "/tmp/argv_mp"]
+                .into_iter()
+                .map(str::to_string),
+        );
         assert_eq!(v.as_deref(), Some("/tmp/wp8_10_fixture_mp"));
-        // Restore prior state.
-        match prev {
-            Some(p) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", p),
-            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
-        }
     }
 
     /// Empty `CRATONVM_JBOSS_MP_ROOT` must be ignored — we should fall
@@ -3891,21 +3899,12 @@ mod tests {
     /// (and dangerous) module-path root.
     #[test]
     fn wp8_10_find_mp_argument_ignores_empty_env_var() {
-        let _g = TEST_LOCK.lock();
-        let prev = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
-        std::env::set_var("CRATONVM_JBOSS_MP_ROOT", "");
-        let v = find_mp_argument();
-        // With an empty env var and the cargo test harness's argv (which
-        // never carries `-mp`), find_mp_argument() must return None.
+        let v = find_mp_argument_from(Some(String::new()), ["cratonvm"].map(str::to_string));
         assert!(
             v.is_none(),
-            "empty env var must be treated as unset; got {:?}",
+            "empty startup flag must be treated as unset; got {:?}",
             v
         );
-        match prev {
-            Some(p) => std::env::set_var("CRATONVM_JBOSS_MP_ROOT", p),
-            None => std::env::remove_var("CRATONVM_JBOSS_MP_ROOT"),
-        }
     }
 
     /// WildFly domain launchers pass a multi-entry `-mp` where per-test
@@ -4029,13 +4028,8 @@ mod tests {
         let jar = repo.join("com/acme/tool/1.0/tool-1.0.jar");
         write(&jar, "PK");
 
-        let prev = std::env::var("CRATONVM_MAVEN_REPO_LOCAL").ok();
-        std::env::set_var("CRATONVM_MAVEN_REPO_LOCAL", &repo);
+        remember_maven_repo_root(Some(repo.to_string_lossy().into_owned()));
         let r = resolve_module(&root, "com.example.foo").unwrap();
-        match prev {
-            Some(value) => std::env::set_var("CRATONVM_MAVEN_REPO_LOCAL", value),
-            None => std::env::remove_var("CRATONVM_MAVEN_REPO_LOCAL"),
-        }
         clear_module_cache_for_test();
 
         assert_eq!(r.resource_roots.len(), 1);

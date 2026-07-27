@@ -253,7 +253,7 @@ impl GcBarrier {
             .saturating_sub(1)
             .saturating_sub(effective_blocked);
         inner.arrived = 0;
-        if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
             eprintln!(
                 "[stw-request] initiator={} alive={} blocked={} live_blocked={} effective_blocked={} expected={}",
                 initiator.0,
@@ -475,7 +475,7 @@ impl GcBarrier {
             let arrival_gen = self.gc_generation.load(Ordering::Acquire);
             if participating {
                 inner.arrived += 1;
-                if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
                     eprintln!(
                         "[stw-arrive] tid={} gen={} arrived={} expected={} (leave-blocked drain)",
                         tid.0, arrival_gen, inner.arrived, inner.expected
@@ -643,7 +643,7 @@ impl GcBarrier {
         // arrived and prematurely release `wait_for_all`.
         if participating {
             inner.arrived += 1;
-            if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
                 eprintln!(
                     "[stw-arrive] tid={} gen={} arrived={} expected={}",
                     tid.0, arrival_gen, inner.arrived, inner.expected

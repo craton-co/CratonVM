@@ -6882,6 +6882,8 @@ pub(crate) mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{p57_win_is_absolute, p57_win_parent_of};
 
     #[test]
@@ -6932,6 +6934,8 @@ pub(crate) mod p57_win_path_tests {
 pub(crate) mod p57_normalize_relativize_tests {
     //! `Path.normalize()` / `Path.relativize()` vs HotSpot (JDK 25, via the
     //! `PathDeep` repro). Helpers emit `/`-canonical internal form.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{p57_normalize_path, p57_relativize};
 
     #[test]
@@ -7968,12 +7972,14 @@ pub(crate) fn jrtfs_list_class_binary_names(
 
 #[cfg(test)]
 pub(crate) mod jrtfs_javac_listing_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::jrtfs_list_class_binary_names;
     use std::path::{Path, PathBuf};
 
     fn test_java_home() -> Option<PathBuf> {
         for key in ["CRATONVM_TEST_JDK", "CRATONVM_JAVA_HOME", "JAVA_HOME"] {
-            if let Some(home) = std::env::var_os(key).map(PathBuf::from) {
+            if let Some(home) = cratonvm_types::flags::runtime_var_os(key).map(PathBuf::from) {
                 if home.join("lib/modules").is_file() {
                     return Some(home);
                 }

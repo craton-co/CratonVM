@@ -50,7 +50,7 @@ use super::SharedVm;
 fn lenient_clinit() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_LENIENT_CLINIT") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_LENIENT_CLINIT") {
         Ok(v) => v == "1",
         Err(_) => false,
     })
@@ -1509,7 +1509,7 @@ fn initialize_class_shared(
                         // swallowed clinit in a class `Catalina` depends on
                         // leaves a static field null and surfaces later as the
                         // bare NPE that aborts `Catalina.<clinit>`.
-                        if std::env::var("CRATONVM_DBG_CATALINA").is_ok()
+                        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_CATALINA").is_ok()
                             && (class_name_for_jfr.starts_with("org/apache/catalina/")
                                 || class_name_for_jfr.starts_with("org/apache/tomcat/")
                                 || class_name_for_jfr.starts_with("org/apache/coyote/")
@@ -1610,7 +1610,8 @@ fn initialize_class_shared(
                         let exc_class_id = shared.mem.heap.class_id_of(*exc_ref);
                         let is_error = {
                             let cm = shared.classes.class_manager.read();
-                            let error_id = cm.find_class_by_name("java/lang/Error");
+                            let error_id =
+                                cm.find_bootstrap_class_by_name("java/lang/Error");
                             match error_id {
                                 Some(eid) => cm.is_subclass_of(exc_class_id, eid),
                                 None => false,
@@ -2405,7 +2406,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 .classes
                 .class_manager
                 .read()
-                .find_class_by_name("sun/misc/Unsafe$MemoryAccessOption");
+                .find_bootstrap_class_by_name("sun/misc/Unsafe$MemoryAccessOption");
             let already_initialized = unsafe_option_slot.is_some_and(|static_idx| {
                 match super::vm_object::get_static_shared(shared, class_id, static_idx) {
                     Value::Object(Some(obj)) => {
@@ -2622,8 +2623,8 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let (mode_impl_id, noop_id) = {
                 let cm = shared.classes.class_manager.read();
                 (
-                    cm.find_class_by_name(mode_impl_name),
-                    cm.find_class_by_name(noop_name),
+                    cm.find_bootstrap_class_by_name(mode_impl_name),
+                    cm.find_bootstrap_class_by_name(noop_name),
                 )
             };
             if let (Some(mid), Some(nid)) = (mode_impl_id, noop_id) {
@@ -2679,7 +2680,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let varform_name = "java/lang/invoke/VarForm";
             let varform_id = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name(varform_name)
+                cm.find_bootstrap_class_by_name(varform_name)
             };
             if let Some(vfid) = varform_id {
                 // VarForm has 4 instance fields (see javap of VarForm).
@@ -2705,7 +2706,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let handler_class_name = "io/quarkus/bootstrap/logging/QuarkusDelayedHandler";
             let handler_id = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name(handler_class_name)
+                cm.find_class_by_name_for_class(handler_class_name, class_id)
             };
             if let Some(hid) = handler_id {
                 if let Some(handler) = shared.mem.heap.try_alloc_object(hid, 4) {
@@ -2735,7 +2736,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let loader_class_name = "org/jboss/modules/LocalModuleLoader";
             let loader_id = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name(loader_class_name)
+                cm.find_class_by_name_for_class(loader_class_name, class_id)
             };
             let target_id = loader_id.unwrap_or(class_id);
             if let Some(loader_obj) = shared.mem.heap.try_alloc_object(target_id, 1) {
@@ -3312,7 +3313,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // synthetic BigDecimal constants.
             let bi_class_id = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name("java/math/BigInteger")
+                cm.find_bootstrap_class_by_name("java/math/BigInteger")
             };
             let lookup_bi_static = |name: &str| -> Option<crate::types::ObjectRef> {
                 let bi_cid = bi_class_id?;
@@ -3411,7 +3412,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let ai_name = "java/util/concurrent/atomic/AtomicInteger";
             let ai_id = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name(ai_name)
+                cm.find_bootstrap_class_by_name(ai_name)
             };
             let read_static = |field_name: &str| -> Option<Value> {
                 let cm = shared.classes.class_manager.read();
@@ -3481,7 +3482,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let impl_name = "org/wildfly/security/auth/server/_private/ElytronMessages_$logger";
             let impl_id = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name(impl_name)
+                cm.find_class_by_name_for_class(impl_name, class_id)
             };
             let target_id = impl_id.unwrap_or(class_id);
             // ElytronMessages_$logger extends DelegatingBasicLogger which has
@@ -3528,7 +3529,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
             let impl_id = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name(impl_name)
+                cm.find_class_by_name_for_class(impl_name, class_id)
             };
             // Fall back to allocating on the interface's own class_id when
             // the generated impl isn't loaded (defensive — should be rare).
@@ -4352,7 +4353,7 @@ mod tests {
     #[test]
     fn lenient_clinit_defaults_off() {
         // Guard against a polluted CI env explicitly setting the opt-in.
-        if std::env::var("CRATONVM_LENIENT_CLINIT").as_deref() == Ok("1") {
+        if cratonvm_types::flags::runtime_var("CRATONVM_LENIENT_CLINIT").as_deref() == Ok("1") {
             // Opt-in is honored — gate reads true. Nothing else to assert.
             assert!(lenient_clinit());
         } else {

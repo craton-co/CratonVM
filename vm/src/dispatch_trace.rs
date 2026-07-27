@@ -58,7 +58,7 @@ pub fn total_dispatches() -> u64 {
 }
 
 pub fn init_from_env() {
-    let on = std::env::var_os("CRATONVM_DBG_LETSGO")
+    let on = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LETSGO")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     if on {
