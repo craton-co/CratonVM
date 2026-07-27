@@ -9,7 +9,9 @@ in synthetic mode — without any JDK at all.
 
 | Crate | Covers |
 |-------|--------|
-| `cratonvm-native-builtins` | `java.lang.*`, plus security/crypto, reflection, and related. |
+| `cratonvm-native-builtins` | `java.lang.*`, registration, reflection, Java-object marshalling, and related bridges. |
+| `cratonvm-native-builtins-crypto` | Separately compiled cryptographic compatibility kernels. |
+| `cratonvm-native-builtins-security` | Separately compiled JDK security and SunEC implementation pack. |
 | `cratonvm-native-collections` | `java.util.*` collections. |
 | `cratonvm-native-io` | `java.io.*` and `java.nio.*`. |
 | `cratonvm-native-awt` | AWT/Swing/Java2D bridge natives for headless peers and in-memory rendering. |
@@ -19,10 +21,12 @@ Together they register **thousands of native methods**. See [Standard Library
 Coverage](../java-support/standard-library.md) for how to generate an exact
 catalog.
 
-## The `NativeContext` trait
+## The `NativeContext` capability facade
 
-Native methods are VM-agnostic: they receive a `NativeContext` that exposes the
-operations they need without depending on the VM's internals directly:
+Native methods are VM-agnostic: they receive a `NativeContext` composed from
+narrow capability traits rather than depending on the VM's internals directly.
+The capability families include class, invoke, heap, thread, exception, GPU,
+and system access. Common operations include:
 
 - `alloc_object(class_id)` — allocate a new object.
 - `get_field(obj, index)` / `set_field(obj, index, value)` — instance-field
@@ -33,6 +37,18 @@ operations they need without depending on the VM's internals directly:
 
 A native method has a signature of roughly `(ctx, args) -> Result<Option<Value>>`:
 `args[0]` is the receiver for instance methods, with parameters following.
+
+Loader-aware invoke operations preserve the declaring class/loader identity;
+native code must not replace them with a global lookup by binary class name.
+
+The JIT/native bridge uses an eight-slot inline scratch contract for ordinary
+x86-64 argument decoding, forwarding, and pin-index preparation. Descriptors
+larger than that use a correct heap-backed fallback; eight is a fast-path
+capacity, not an API limit.
+
+The crypto/security split is physical. Cargo compiles those kernels as
+independent crates; `cratonvm-native-builtins` retains the registry and
+Java-object conversion boundary.
 
 ## Dispatch
 
