@@ -680,25 +680,32 @@ mod tests {
         assert!(matches!(err, JvmtiError::AgentLibraryLoadFailed { .. }));
         assert!(env.agent_registry.agents().is_empty());
 
-        // Request capabilities.
+        // Request capabilities. obsaudit D14 (2026-07-26): this used to
+        // request can_generate_breakpoint_events, which JvmtiCapabilities::
+        // potential() no longer grants — breakpoint events are never fired
+        // in production (see the doc comment on potential()), so requesting
+        // that capability now correctly fails with InvalidCapability.
+        // Garbage-collection events, unlike breakpoints, are wired all the
+        // way from the interpreter/GC to a real agent (the D14 bridge), so
+        // this exercises the same local-workflow mechanics against a
+        // capability that is actually honest to request.
         let mut req = JvmtiCapabilities::default();
-        req.can_generate_breakpoint_events = true;
         req.can_generate_garbage_collection_events = true;
         env.capabilities.add_capabilities(&req).unwrap();
         assert!(env
             .capabilities
-            .has_capability("can_generate_breakpoint_events"));
+            .has_capability("can_generate_garbage_collection_events"));
 
         // Enable events and fire.
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
-        env.event_manager.callbacks.on_breakpoint = Some(Box::new(move |_| {
+        env.event_manager.callbacks.on_garbage_collection_start = Some(Box::new(move |_| {
             c.fetch_add(1, Ordering::SeqCst);
         }));
         env.event_manager
-            .set_event_notification_mode(JvmtiEvent::Breakpoint, true);
+            .set_event_notification_mode(JvmtiEvent::GarbageCollectionStart, true);
 
-        notify_breakpoint(&env, 1, 10, 3, 42);
+        notify_gc_start(&env);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 

@@ -1304,7 +1304,30 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljavax/net/SocketFactory;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
+            // FIX (springprofilearbitertests-ssf-getdefault-no-context):
+            // real `SSLSocketFactory.getDefault()` delegates to
+            // `SSLContext.getDefault().getSocketFactory()`, so the returned
+            // factory carries the default SSLContext at field 0 — exactly
+            // like `SSLContext.getSocketFactory()` above. This registration
+            // used to allocate a bare 0-field object, so any caller that
+            // later reaches the layered `createSocket(Socket,String,int,
+            // boolean)` overload (e.g. Apache HttpClient5's
+            // `SSLConnectionSocketFactory.createLayeredSocket`, which builds
+            // its default factory via this exact static call) hit that
+            // overload's `ctx.get_field(factory, 0)` on a factory with no
+            // field 0 at all, throwing `IllegalStateException("SSLSocketFactory
+            // has no owning SSLContext")` instead of connecting — a real-JDK
+            // A/B confirmed CratonVM-only failure.
+            let ssl_ctx = crate::t27_tls::get_runtime_default_ssl_context().unwrap_or_else(|| {
+                let new_ctx = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
+                let name = ctx.create_string("TLS");
+                ctx.set_field(new_ctx, 0, Value::Object(Some(name)));
+                ctx.set_field(new_ctx, 1, Value::Int(1));
+                crate::t27_tls::set_runtime_default_ssl_context(new_ctx);
+                new_ctx
+            });
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
+            ctx.set_field(obj, 0, Value::Object(Some(ssl_ctx)));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -2585,10 +2608,20 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Vec::new()
             };
             if chain.is_empty() {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "peer not authenticated (no certificate in session)".into(),
-                }
-                .into());
+                // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
+                // this threw a bare IllegalStateException, contradicting this
+                // function's own doc comment above ("Throws
+                // SSLPeerUnverifiedException") and the real SSLSession
+                // contract -- callers (e.g. Spring's DefaultSslInfo.initCertificates,
+                // Apache HttpComponents' AbstractClientTlsStrategy.verifySession)
+                // specifically catch SSLPeerUnverifiedException to mean "peer
+                // presented no certificate"; an IllegalStateException escaped
+                // past that catch instead.
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/net/ssl/SSLPeerUnverifiedException",
+                    "peer not authenticated",
+                ));
             }
             let arr = ctx.new_ref_array(ClassId::new(0), chain.len());
             for (i, der) in chain.iter().enumerate() {
@@ -2677,10 +2710,14 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Vec::new()
             };
             let Some(leaf) = chain.first() else {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "peer not authenticated (no certificate in session)".into(),
-                }
-                .into());
+                // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
+                // same wrong-exception-type bug as getPeerCertificates just
+                // above -- see that fix's comment.
+                return Err(crate::phases_early::throw_jca_exc(
+                    ctx,
+                    "javax/net/ssl/SSLPeerUnverifiedException",
+                    "peer not authenticated",
+                ));
             };
             let (subject, _issuer) = basic_der_extract_names(leaf)
                 .unwrap_or_else(|| ("CN=Unknown".into(), String::new()));

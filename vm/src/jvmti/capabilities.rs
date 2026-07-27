@@ -45,15 +45,38 @@ pub struct JvmtiCapabilities {
 }
 
 impl JvmtiCapabilities {
-    /// Returns capabilities representing what this VM implementation can potentially support.
+    /// Returns capabilities representing what this VM implementation can
+    /// potentially support for a real, `-agentpath:`-attached native agent.
     ///
-    /// All capabilities are set to `true`, indicating this VM can potentially
-    /// support the full set of JVMTI capabilities.
+    /// obsaudit D14 (2026-07-26): this used to set every field `true`,
+    /// including a dozen `can_generate_*_events` capabilities for event
+    /// kinds this env's `EventManager` would then never actually fire —
+    /// `AddCapabilities` would succeed, `SetEventNotificationMode` would
+    /// succeed, and the agent would simply never see the event, with
+    /// nothing telling it why. That is the same failure shape D2 documents
+    /// for `can_access_local_variables` on the *other* (synthetic-facing)
+    /// `JvmtiCapabilities` in `runtime/jvmti.rs`.
+    ///
+    /// `runtime::jvmti::JvmtiEventManager`'s bridge (see
+    /// `install_real_agent_env_bridge` in `runtime/jvmti.rs`) now forwards 9
+    /// event kinds to this env: VMInit, VMDeath, ThreadStart, ThreadEnd,
+    /// ClassLoad, ClassPrepare, GarbageCollectionStart/Finish, ObjectFree.
+    /// None of those correspond to a capability flag below (VM/thread/class
+    /// lifecycle and GC events are unconditionally delivered once an agent
+    /// is attached — the JVMTI spec does not gate them behind
+    /// `can_generate_*_events`). The capabilities that *are* gated behind a
+    /// `can_generate_*_events` flag — method entry/exit, single-step,
+    /// breakpoint, frame pop, field access/modification, class-file-load
+    /// hook, compiled-method-load, VM-object-alloc, and monitor events — are
+    /// per-bytecode/per-invocation or per-contended-lock hot paths the
+    /// bridge deliberately does not cover (see the bridge's own doc comment
+    /// for why), so they are `false` here: an honest "not available" is
+    /// strictly better than a silent "granted, delivers nothing".
     pub fn potential() -> Self {
         Self {
             can_tag_objects: true,
-            can_generate_field_modification_events: true,
-            can_generate_field_access_events: true,
+            can_generate_field_modification_events: false,
+            can_generate_field_access_events: false,
             can_get_bytecodes: true,
             can_get_synthetic_attribute: true,
             can_get_owned_monitor_info: true,
@@ -67,17 +90,17 @@ impl JvmtiCapabilities {
             can_get_source_debug_extension: true,
             can_access_local_variables: true,
             can_maintain_original_method_order: true,
-            can_generate_single_step_events: true,
-            can_generate_exception_events: true,
-            can_generate_frame_pop_events: true,
-            can_generate_breakpoint_events: true,
+            can_generate_single_step_events: false,
+            can_generate_exception_events: false,
+            can_generate_frame_pop_events: false,
+            can_generate_breakpoint_events: false,
             can_suspend: true,
-            can_generate_method_entry_events: true,
-            can_generate_method_exit_events: true,
-            can_generate_all_class_hook_events: true,
-            can_generate_compiled_method_load_events: true,
-            can_generate_monitor_events: true,
-            can_generate_vm_object_alloc_events: true,
+            can_generate_method_entry_events: false,
+            can_generate_method_exit_events: false,
+            can_generate_all_class_hook_events: false,
+            can_generate_compiled_method_load_events: false,
+            can_generate_monitor_events: false,
+            can_generate_vm_object_alloc_events: false,
             can_generate_garbage_collection_events: true,
             can_get_current_thread_cpu_time: true,
             can_force_early_return: true,
@@ -196,11 +219,31 @@ mod tests {
         let pot = JvmtiCapabilities::potential();
         assert!(pot.can_tag_objects);
         assert!(pot.can_get_bytecodes);
-        assert!(pot.can_generate_breakpoint_events);
         assert!(pot.can_generate_garbage_collection_events);
         assert!(pot.can_pop_frame);
         assert!(pot.can_redefine_classes);
         assert!(pot.can_force_early_return);
+    }
+
+    /// obsaudit D14: capabilities whose events the real-agent bridge does
+    /// not (and, for hot-path reasons, should not) forward must stay
+    /// unavailable, or `AddCapabilities` would grant something that then
+    /// silently never fires. See the doc comment on `potential()`.
+    #[test]
+    fn test_potential_capabilities_excludes_unbridged_events() {
+        let pot = JvmtiCapabilities::potential();
+        assert!(!pot.can_generate_method_entry_events);
+        assert!(!pot.can_generate_method_exit_events);
+        assert!(!pot.can_generate_single_step_events);
+        assert!(!pot.can_generate_breakpoint_events);
+        assert!(!pot.can_generate_frame_pop_events);
+        assert!(!pot.can_generate_field_access_events);
+        assert!(!pot.can_generate_field_modification_events);
+        assert!(!pot.can_generate_all_class_hook_events);
+        assert!(!pot.can_generate_compiled_method_load_events);
+        assert!(!pot.can_generate_vm_object_alloc_events);
+        assert!(!pot.can_generate_monitor_events);
+        assert!(!pot.can_generate_exception_events);
     }
 
     #[test]
@@ -208,12 +251,27 @@ mod tests {
         let mut caps = JvmtiCapabilities::default();
         let mut requested = JvmtiCapabilities::default();
         requested.can_tag_objects = true;
-        requested.can_generate_breakpoint_events = true;
+        requested.can_generate_garbage_collection_events = true;
 
         assert!(caps.add_capabilities(&requested).is_ok());
         assert!(caps.can_tag_objects);
-        assert!(caps.can_generate_breakpoint_events);
+        assert!(caps.can_generate_garbage_collection_events);
         assert!(!caps.can_get_bytecodes); // not requested
+    }
+
+    /// obsaudit D14: requesting a capability whose events are not bridged
+    /// to a real agent must fail, not silently succeed.
+    #[test]
+    fn test_add_capabilities_rejects_unbridged_events() {
+        let mut caps = JvmtiCapabilities::default();
+        let mut requested = JvmtiCapabilities::default();
+        requested.can_generate_breakpoint_events = true;
+
+        assert_eq!(
+            caps.add_capabilities(&requested),
+            Err(JvmtiError::InvalidCapability)
+        );
+        assert!(!caps.can_generate_breakpoint_events);
     }
 
     #[test]
