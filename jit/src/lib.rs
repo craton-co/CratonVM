@@ -7473,13 +7473,25 @@ fn try_compile_inner(
                     // publish that local through the precise exceptional-frame
                     // handoff. Compiling any broader shape would reset the
                     // handler local to null/zero on an exception.
-                    return None;
+                    //
+                    // Report the REASON on the default trace, not just under
+                    // `CRATONVM_DBG_RBC6`. Without this the outer wrapper only
+                    // prints `compile-bail ... backend_attempted=false`, which
+                    // reads like a transient resolver miss — and a permanently
+                    // interpreted hot method looks identical to one that is
+                    // simply still warming up. (Found chasing Tomcat's
+                    // `StringCache.toString`, refused for its `synchronized`
+                    // block's javac-generated monitor handler; it sits in the
+                    // middle of a 600M-call hot chain whose neighbours both
+                    // compile. See docs/internal/fixed-suite-bugs/tomcat/
+                    // 30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md.)
+                    jitc_bail!("rbc6-handler-reads-unsafe-local");
                 }
                 precise_exception_frames = true;
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                return None;
+                jitc_bail!("rbc6-handler-reads-unsafe-local-non-x64");
             }
         }
     }
