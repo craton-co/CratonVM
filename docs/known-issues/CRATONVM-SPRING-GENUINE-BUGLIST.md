@@ -156,11 +156,22 @@ belong in it — the count of 8 already includes them:
   — LOADERR after 948 s: `NoClassDefFoundError:
   org/junit/platform/commons/util/ExceptionUtils`, a core JUnit-Platform class
   that is unconditionally on the classpath. The archived history guessed
-  memory pressure; that is now unlikely — this is the third
-  "`NoClassDefFoundError` for a class that is demonstrably loaded" of the
-  session, after the two loader-ambiguity bugs fixed above, and it survives
-  those fixes. `CRATONVM_DBG_LINKAGE_BT=1` names the raise site in one run;
-  start there.
+  memory pressure; that is now ruled out. Re-run under
+  `CRATONVM_DBG_LINKAGE_BT=1` against `cratonvm-sprfinal-v16.bin` (so it
+  carries every fix above), it reproduces, and the raise site is:
+
+  ```
+  raise_no_class_def_found            runtime/exceptions.rs:1795
+  ensure_class_initialized_shared     vm/vm_util.rs:499
+  execute_invokestatic                runtime/interpreter.rs:32060
+  ```
+
+  i.e. an ordinary `invokestatic` whose target class fails to INITIALISE —
+  not to be found. So the next question is what `ensure_class_initialized`
+  is unhappy about for a class that is plainly on the classpath (a `<clinit>`
+  that threw and was swallowed into a load failure is the obvious candidate);
+  the raise fires repeatedly through the run, so a breakpoint there catches it
+  immediately.
 
 ## Reproducing
 
