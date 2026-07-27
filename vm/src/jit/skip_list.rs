@@ -518,59 +518,60 @@ fn should_skip_jit_internal(
         return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
 
-    // SPRING-CRHM.1 (2026-07-27) — REGRESSION REPAIR, not a new ban.
+    // SPRING-RT-EQUALS.1 (2026-07-27) — REGRESSION REPAIR, not a new ban.
     //
     // `654dfb918` ("retire the inert is_known_miscompile ban block") deleted
-    // ~189 (class, method) entries on the finding that the block's gate had
-    // drifted and the list was therefore inert. That held for most of it, but
-    // NOT for this family: the removed list contained
-    //   ("org/springframework/util/ConcurrentReferenceHashMap",         "get")
-    //   ("org/springframework/util/ConcurrentReferenceHashMap",         "getReference")
-    //   ("org/springframework/util/ConcurrentReferenceHashMap",         "getEntryIfAvailable")
-    //   ("org/springframework/util/ConcurrentReferenceHashMap$Segment", "getReference")
-    //   ("org/springframework/util/ConcurrentReferenceHashMap$Segment", "findInChain")
-    //   ("org/springframework/util/ConcurrentReferenceHashMap$Segment", "restructureIfNecessary")
-    // and dropping them re-enabled a live miscompile.
+    // ~189 (class, method) entries after finding the block's gate had drifted
+    // and concluding the list was inert. That held for most of it, but not
+    // here: the deleted list covered the `ConcurrentReferenceHashMap` lookup
+    // chain that reaches this method, and dropping it re-enabled a live
+    // miscompile of `ResolvableType.equals`.
     //
-    // Symptom (~75 Spring Boot classes): `ResolvableType.forType` does
-    // `cache.get(key)` on this map then `checkcast ResolvableType`
-    // (bytecode 61 -> 64). The compiled `Segment.getReference` returns an
-    // object of the wrong type, so the cast throws
+    // Symptom (~59 Spring Boot classes): `ResolvableType.forType` does
+    // `cache.get(key)` on a `ConcurrentReferenceHashMap` then
+    // `checkcast ResolvableType` (bytecode 61 -> 64). The lookup compares keys
+    // with `ResolvableType.equals`, whose compiled body confuses a
+    // `ResolvableType[]` with a `ResolvableType` element, so the map hands back
+    // the wrong object and the cast throws
     //   `ClassCastException: class org.springframework.core.ResolvableType
     //    cannot be cast to class org.springframework.core.ResolvableType`
-    // which READS like a class-identity split but is not: the receiver is a
-    // `ResolvableType[]` (`kind=Array`,
-    // `arr_desc="[Lorg/springframework/core/ResolvableType;"`, component cid
-    // == target cid), and `jit_checkcast`'s message renders an array receiver
-    // by its COMPONENT name. The typecheck refusal is correct; the value
-    // reaching it is not.
     //
-    // Isolation (all on one binary, no rebuilds):
-    //   --nojit                                                      -> 38/38 pass
-    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/core            -> pass
-    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/util            -> pass
-    //   CRATONVM_JIT_BISECT_ONLY=<core>,<util>                       -> FAIL (minimal pair)
-    //   CRATONVM_JIT_BISECT_SKIP=...$Segment.getReference, full JIT  -> 38/38 pass
-    // Not heap/GC dependent (identical at --Xmx 512m and 8g); not the
+    // That message READS like a duplicate-class / loader-identity split and is
+    // NOT one. The receiver is an ARRAY (`kind=Array`,
+    // `arr_desc="[Lorg/springframework/core/ResolvableType;"`, component cid ==
+    // target cid), and `jit_checkcast` renders an array receiver by its
+    // COMPONENT name. The typecheck refusal is correct; the value reaching it
+    // is not. `jit_typecheck_resolve`'s own comment already warned this shape
+    // "made this look like a class-identity split for far longer than it should
+    // have" — it cost two wrong diagnoses again here, so the checkcast-fail
+    // trace in `vm/src/jit/helpers.rs` now prints kind + array descriptor.
+    //
+    // Isolation (one binary, no rebuilds), witness `ConditionalOnPropertyTests`
+    // (38 tests):
+    //   --nojit                                                     -> 38/38 pass
+    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/core           -> pass
+    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/util           -> pass
+    //   CRATONVM_JIT_BISECT_ONLY=<core>,<util>                      -> FAIL (minimal pair)
+    //   CRATONVM_JIT_BISECT_SKIP=ResolvableType.equals, full JIT    -> 38/38 pass
+    // Not heap/GC dependent (identical at --Xmx 512m and 8g) and not the
     // pointer-keyed typecheck target cache (instrumented: zero stale hits).
-    // Witness: `ConditionalOnPropertyTests` (38 tests, all 38 failed).
     //
-    // The sibling entries are restored with it because they form one lookup
-    // chain (`get` -> `getReference` -> `Segment.getReference` ->
-    // `findInChain`): skipping `ConcurrentReferenceHashMap.get` or
-    // `ResolvableType.forType` alone does NOT help, because the defective body
-    // arrives by INLINING rather than by call.
-    if class_name == "org/springframework/util/ConcurrentReferenceHashMap"
-        && matches!(method_name, "get" | "getReference" | "getEntryIfAvailable")
-    {
-        return Some(SkipReason::JavaUtilCollection);
-    }
-    if class_name == "org/springframework/util/ConcurrentReferenceHashMap$Segment"
-        && matches!(
-            method_name,
-            "getReference" | "findInChain" | "restructureIfNecessary"
-        )
-    {
+    // Scope: this ban is deliberately ONE method. An earlier revision of this
+    // fix banned the whole six-entry `ConcurrentReferenceHashMap` lookup chain
+    // (`get`/`getReference`/`getEntryIfAvailable` +
+    // `$Segment.{getReference,findInChain,restructureIfNecessary}`), which also
+    // works — but only because banning `findInChain` stops `equals` being
+    // INLINED into it. `equals` is the actual defective body: skipping it alone,
+    // with no chain ban at all, passes 38/38. Independently bisected to the same
+    // method by dev's `c7c0ac86e`. Banning one leaf method instead of a hot
+    // map-lookup chain keeps `ConcurrentReferenceHashMap` JIT-eligible.
+    //
+    // Still open as a codegen defect — see
+    // docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md.
+    // Remove this ban when the array-vs-element confusion in the lowerer is
+    // fixed, not before: verified load-bearing on dev at 70f1fddfc (removing it
+    // returns the witness class to 38/38 FAIL).
+    if class_name == "org/springframework/core/ResolvableType" && method_name == "equals" {
         return Some(SkipReason::JavaUtilCollection);
     }
 
