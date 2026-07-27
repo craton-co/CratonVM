@@ -804,6 +804,30 @@ pub fn take_major_gc_request() -> bool {
     })
 }
 
+/// Will the young half of the collection this thread is about to initiate
+/// certainly take the NON-MOVING young marker?
+///
+/// The non-moving young marker (`gen_heap::mark_young_precise_object`) follows
+/// the loader-scoped side-table edges — `loader_pin`, `mirror_pin` and
+/// `metadata_pin` — as ordinary marking edges. The MOVING (Cheney) young
+/// closure does not: it seeds strictly from the direct root set. So a young
+/// object reachable ONLY through one of those side tables can safely be left
+/// out of the unconditional root set exactly when this returns true, and must
+/// be rooted directly otherwise.
+///
+/// Mirrors `GenerationalHeap::collect_garbage_inner`'s `divert_non_moving`
+/// decision, but deliberately only in its *certain* direction: every term here
+/// forces the non-moving sweep on its own, and the two switches that could
+/// still route a cycle back to the moving path (`CRATONVM_MOVING_YOUNG`,
+/// `CRATONVM_DBG_FORCE_MOVING`) veto it. A false negative merely costs one
+/// extra conservative root; a false positive would DROP a live root, so this
+/// errs strictly toward `false`.
+pub fn young_marker_follows_side_tables() -> bool {
+    !crate::gc_flags().dbg_force_moving
+        && !moving_young_enabled()
+        && (is_active() || unregistered_jit_frame_on_stack() || major_gc_requested())
+}
+
 // ---------------------------------------------------------------------------
 // Stage B (precise oop maps, B-K fix) — movable precise-JIT roots
 // ---------------------------------------------------------------------------
