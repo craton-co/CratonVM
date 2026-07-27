@@ -373,6 +373,36 @@ static-resource 404s were not a URL-decoding bug, they were the harness.**
 `core.io.support.PathMatchingResourcePatternResolverTests` improved 15/22 →
 19/22.
 
+### Regression landed by `origin/dev` between `60a710ad8` and `ffc7f90d4`
+
+`beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests`
+went **14/14 → 1/14**, and it is not from this session's work: bisected across
+this session's own binaries, `v7` (all six VM fixes, pre-merge) is 14/14 and
+`v8` (`v7` + the `origin/dev` merge, nothing else) is 1/14. Thirteen methods now
+fail `assertThat(contribution).isNotNull()` at
+`getAndApplyContribution(...):278`, i.e.
+`AutowiredAnnotationBeanPostProcessor.processAheadOfTime(registeredBean)`
+returns null — no autowired members detected. Runtime also drops from ~170s to
+~7s, so it bails early.
+
+Ruled out: reflection metadata. A probe
+(`probes/AutowiredProbe.java`) printing `isSynthetic`/`isBridge`/
+`getAnnotation(Autowired.class)` for private and package-private fields and
+methods of a nested class returns **identical, correct** answers on `v7` and
+`v11`.
+
+The 61-commit delta's most plausible suspects, by subject:
+`b3b999b78 fix(interpreter): remove package-selected dispatch` (the failing
+methods are exactly the private / package-private injection ones),
+`2e2fea0fc fix(natives): Class.isSynthetic reads the access flag`,
+`a50ce9348 fix(classloading): eliminate loader-blind VM lookups`.
+
+Repro:
+```
+apps/spring-suite-runner/one.sh \
+  org.springframework.beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests
+```
+
 ### What is left (21 classes)
 
 Verified in isolation against the merged binary unless noted. The shared host
