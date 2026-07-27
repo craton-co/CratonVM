@@ -189,7 +189,11 @@ High-value (wide blast radius or already well-isolated in comments):
   `CRATONVM_JIT_DENY` technique) on one of these before assuming the JIT
   theory is even still correct for them — it may also be stale, like
   TOMCAT-DOHEAD-JUNIT-ITERATOR.1 turned out to possibly be.
-- **ANTLR.1 / ANTLR-COLDPATH.1 / HIB-ANTLR.1** — shaded ANTLR v4 runtime,
+- **ANTLR.1 / ANTLR-COLDPATH.1 / HIB-ANTLR.1** — ANTLR.1 and HIB-ANTLR.1 are
+  CLOSED (removed 2026-07-26/27; `org/antlr/v4/runtime/` is JIT-eligible, see
+  `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`).
+  ANTLR-COLDPATH.1's 7-method guard stays, and now covers both the shaded and
+  unshaded runtimes. Original entry: shaded ANTLR v4 runtime,
   used by Groovy/Hibernate/Keycloak; comment already narrows suspicion to
   7 specific ATN config-context methods but keeps a package-level ban as
   the "surgical per-method ban of those 7 is the future minimal fix."
@@ -242,7 +246,8 @@ still real correctness bugs worth closing):
   WILDFLY-CONTROLLER-JIT.1 (`org/jboss/as/controller/`) — **already
   transitively confirmed still-needed**: it's a strict subset of the
   broader `org/jboss/as/` prefix this session already lifted for the
-  `org/jboss/as/` WildFly-boot test (`docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`)
+  `org/jboss/as/` WildFly-boot test — RESOLVED 2026-07-27, ban lifted
+  (`docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md`)
   — `package_allowed()` lifts any ban whose prefix starts with an allowed
   entry, so lifting `org/jboss/as/` also lifted `org/jboss/as/controller/`
   in that same run. The crash found (`ModelTypeValidator.validTypes` null)

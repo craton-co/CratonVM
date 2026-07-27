@@ -179,5 +179,5 @@ production diagnostic channel.
   [`gc/src/concurrent_mark.rs`](../gc/src/concurrent_mark.rs),
   [`gc/src/satb.rs`](../gc/src/satb.rs)).
 - Lock hierarchy (heap is L8): [`vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs).
-- Embedding the VM from Rust: [`docs/embedding.md`](embedding.md).
+- Embedding the VM from Rust: [`docs/EMBEDDING.md`](EMBEDDING.md).
 - Profiling: [`docs/PROFILING.md`](PROFILING.md).
