@@ -22,6 +22,30 @@ use cratonvm_vm::vm::{
 use cratonvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
+/// Claim and emit the process-wide JIT method summary once.
+///
+/// `System.exit` never unwinds Rust frames, so it calls this from the native
+/// pre-exit hook. A normal Java-main return calls it from the launcher thread.
+/// The atomic makes those paths safe to share and prevents future shutdown
+/// convergence from printing the summary twice.
+fn maybe_dump_jit_method_stats() {
+    static DUMPED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    if cratonvm_types::flags().jit.method_stats
+        && DUMPED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        cratonvm_jit::tiered::dump_method_stats_to_stderr();
+    }
+}
+
 /// CratonVM - A Java Virtual Machine implemented in Rust.
 ///
 /// Executes Java programs by loading and interpreting `.class` files.
@@ -1754,13 +1778,7 @@ fn run() -> Result<()> {
             eprintln!("=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ===");
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
         }
-        if std::env::var("CRATONVM_DBG_JIT_METHOD_STATS")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            cratonvm_jit::tiered::dump_method_stats_to_stderr();
-        }
+        maybe_dump_jit_method_stats();
     });
 
     // `java`-launcher positional semantics: insert a `--` separator right
@@ -4091,7 +4109,11 @@ fn main() {
             // (Display AND Debug) and flush stderr so a startup failure that ends the
             // process is never invisible. Additive logging only — no behaviour change.
             use std::io::Write as _;
-            match run() {
+            let result = run();
+            // A normal Java-main return never reaches the System.exit hook.
+            // Flush controlled-exit diagnostics before rendering the outcome.
+            maybe_dump_jit_method_stats();
+            match result {
                 Ok(()) => {
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();

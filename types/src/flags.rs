@@ -778,12 +778,18 @@ pub struct JitFlags {
     /// Read from `gc`, `jit` and `vm`, which is why it is in the shared config
     /// rather than a crate-private cache.
     pub shadow_stack: bool,
+    /// `CRATONVM_DBG_JIT_METHOD_STATS=1` — emit the tier/promotion summary
+    /// exactly once during controlled VM shutdown. Kept in the shared snapshot
+    /// so the supported `CRATONVM_DBG=jit-method-stats` spelling and the legacy
+    /// spelling cannot diverge at the launcher.
+    pub method_stats: bool,
 }
 
 impl JitFlags {
     fn from_source(src: &dyn FlagSource) -> Self {
         Self {
             shadow_stack: parse::present(src, "CRATONVM_SHADOW_STACK"),
+            method_stats: parse::exactly_one(src, "CRATONVM_DBG_JIT_METHOD_STATS"),
         }
     }
 }
@@ -1746,6 +1752,7 @@ mod tests {
         assert!(!f.gc.card_table_only);
         assert!(!f.gc.dbg_a2);
         assert!(!f.jit.shadow_stack);
+        assert!(!f.jit.method_stats);
         // …and every default-ON flag is on.
         assert!(f.gc.old_sweep_jit);
         // Value flags fall back.
@@ -1754,6 +1761,24 @@ mod tests {
         assert_eq!(f.gc.dbg_stale_objref_cycles, 1);
         assert_eq!(f.gc.dbg_watch_cell, 0);
         assert_eq!(f.gc.dbg_blocked_access, BlockedAccessMode::Off);
+    }
+
+    #[test]
+    fn jit_method_stats_uses_the_grouped_and_legacy_spelling_consistently() {
+        let grouped = src(&[("CRATONVM_DBG", "jit-method-stats")]);
+        let grouped = crate::flag_groups::resolve(&grouped);
+        assert!(VmFlags::from_source(&grouped).jit.method_stats);
+
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_JIT_METHOD_STATS", "1")]))
+                .jit
+                .method_stats
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_DBG_JIT_METHOD_STATS", "0")]))
+                .jit
+                .method_stats
+        );
     }
 
     #[test]

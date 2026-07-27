@@ -201,8 +201,9 @@ still fail to realize the intended compiled/PIC performance. Before tuning PIC
 assembly, record tier transitions and fallback reasons for the containing
 method; otherwise the work risks optimizing a path the workload never reaches.
 The existing method-statistics diagnostic could not provide that evidence
-because it is silent on normal VM exit; the reproducible defect is recorded in
-`docs/known-issues/jit-method-stats-normal-exit-inert-20260726.md`.
+because it was silent on normal VM exit. That diagnostic is now fixed and
+verified on both controlled shutdown paths; see
+`docs/internal/jit-method-stats-normal-exit-fixed-20260726.md`.
 
 ### P1: pack instance fields and then shrink the header
 
