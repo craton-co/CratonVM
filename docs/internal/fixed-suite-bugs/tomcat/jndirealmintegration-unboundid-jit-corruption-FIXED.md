@@ -109,16 +109,28 @@ All runs: real JDK 25, real sockets, the suite runner's own environment
 | dev `e4e4053bb` (control, 2026-07-24) | guards lifted | **4 of 5 runs FAIL** (`Tests run: 76, Failures: 2` + CCE) | 3–8 |
 | dev `95e4d9929` (pre-fix) | guards in place | 76/76 | 0 (guard hides it) |
 | dev `95e4d9929` (pre-fix) | guards lifted | 76/76 × 38 runs | **3–4 (bug live, masked by the CP-class fallback)** |
-| this branch | **guards removed**, no env overrides | 76/76 × 25 runs | **0** |
+| this branch, pre-merge | **guards removed**, no env overrides | 76/76 × 25 runs | **0** |
+| this branch, after merging dev (+159 commits) | **guards removed**, no env overrides | 76/76 × 22 runs | **0** |
 
 The control build is the important row: the documented corruption still
 reproduces on this box in this harness at the pre-fix commit, so "clean on
 current dev" is a real fix and not a platform artifact.
 
 `CRATONVM_DBG_JITC=1` confirms 562 UnboundID compile events per run with the
-guards removed — including `RDN.getNameValuePairs` (RDN.1's target) and
-`StaticUtils.toLowerCase` (the JIT.3 trigger) — so the code really is compiled,
-C1 and C2, not merely admitted.
+guards removed (566 after the dev merge) — including `RDN.getNameValuePairs`
+(RDN.1's target) and `StaticUtils.toLowerCase` (the JIT.3 trigger) — so the
+code really is compiled, C1 and C2, not merely admitted.
+
+### Regression coverage
+
+The fix only ever *adds* GC roots, but it is on a core path, so:
+
+| Suite | Result |
+| --- | --- |
+| `cargo test -p cratonvm-vm --lib skip_list` | 64 passed / 0 failed pre-merge; 68 / 0 after the dev merge |
+| Tomcat `catalina.realm.*` (11 classes) | 10 PASS + `TestJNDIRealm` FAIL — pre-existing fixture gap (no LDAP server on `127.0.0.1:12345`), identical on the pre-fix binary |
+| Tomcat 36-class deterministic slice, A/B on the same tree | **class-for-class identical** before and after: PASS=29 FAIL=2 NOSUMMARY=4 HANG=1, 0 stale events in both |
+| Spring Boot `spring-boot-micrometer-metrics` (82 classes) | 79 PASS / 3 EMPTY / 0 FAIL — the 2026-07-20 baseline for the same list was 76 PASS / 3 EMPTY / **3 FAIL**, and the same 3 EMPTY classes are base classes with no runnable tests |
 
 > **Note for future stale-receiver hunts:** the 38 pre-fix runs all *passed*
 > while emitting 3–4 stale-pointer warnings each. The interpreter's "falling
