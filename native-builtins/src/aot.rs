@@ -1520,6 +1520,8 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod aot_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 

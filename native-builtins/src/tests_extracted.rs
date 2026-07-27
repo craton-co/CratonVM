@@ -5,6 +5,8 @@
 #[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::config::VmConfig;
     use cratonvm_types::ArrayElementType;
@@ -3839,6 +3841,8 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests_s2 {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::config::VmConfig;
     use cratonvm_native_api::NativeMethodRegistry;
@@ -4224,6 +4228,8 @@ fn s3_stub_response(ctx: &mut dyn NativeContext, status: i32, msg: &str) -> Meth
 
 #[cfg(test)]
 mod tests_s3 {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::vm::{NativeContextImpl, Vm};
     use crate::config::VmConfig;
@@ -5323,6 +5329,8 @@ fn baos_dbg_enabled() -> bool {
 
 #[cfg(test)]
 mod baos_dbg_flag_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     #[test]
     fn baos_dbg_flag_is_latched_and_matches_environment() {
         // `ByteArrayOutputStream.write(int)` used to probe `env::var_os` per
@@ -5713,6 +5721,8 @@ fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests_t4_method_handle {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::vm::{NativeContextImpl, Vm};
     use crate::config::VmConfig;
@@ -5789,6 +5799,8 @@ mod tests_t4_method_handle {
 
 #[cfg(test)]
 mod tests_s4 {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::vm::{NativeContextImpl, Vm};
     use crate::config::VmConfig;

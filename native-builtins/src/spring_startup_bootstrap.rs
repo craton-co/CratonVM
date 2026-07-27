@@ -2133,6 +2133,8 @@ fn ccpp_dbg_enabled() -> bool {
 
 #[cfg(test)]
 mod ccpp_dbg_flag_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     #[test]
     fn ccpp_dbg_flag_is_latched_and_matches_environment() {
         // The `@Import` walker used to call `env::var` (which also allocates a
@@ -4714,6 +4716,8 @@ fn ccpp_process_config_bean_definitions_noop(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 

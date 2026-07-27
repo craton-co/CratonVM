@@ -610,6 +610,10 @@ impl SharedVm {
         // otherwise invisible until someone notices the VM "feels slow".
         let __boot_t0 = std::time::Instant::now();
         let mut class_manager = ClassManager::new(&boot_cp, &ext_cp, &config.classpath);
+        let native_shim_selection =
+            cratonvm_native_builtins::app_shims::ShimSelection::from_resource_probe(
+                |resource| class_manager.application_contains_resource(resource),
+            );
         let __boot_classpath_elapsed = __boot_t0.elapsed();
         tracing::info!(
             "boot phase 1/3 classpath ingestion: {:?} ({} boot entries, {} ext, {} app)",
@@ -1094,7 +1098,10 @@ impl SharedVm {
                 // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md's
                 // 2026-07-14 addendum for the WildFly-boot regression this
                 // caused and how it was found (git bisect).
-                register_essential_natives(&mut native_methods);
+                cratonvm_native_builtins::register_essential_natives_with_shims(
+                    &mut native_methods,
+                    native_shim_selection,
+                );
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
                 cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
@@ -1519,7 +1526,10 @@ impl SharedVm {
             // regression + revert, 2026-07-14): several SyntheticStub-tagged
             // register_* clusters (JMX, Function$Identity) are permanent
             // bridges needed in real mode too, not fake-JDK-only shadows.
-            register_essential_natives(&mut native_methods);
+            cratonvm_native_builtins::register_essential_natives_with_shims(
+                &mut native_methods,
+                native_shim_selection,
+            );
             // cratonvm-cli default features omit `synthetic-jdk`; the rich
             // registration block only lives under `cfg(feature = "synthetic-jdk")`
             // above. Real-JDK apps still need ReentrantLock / Condition / LBQ

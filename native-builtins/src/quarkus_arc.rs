@@ -369,9 +369,14 @@ fn reset_container_state() {
 /// Note: `cfg!(feature = "synthetic-quarkus-arc")` evaluates to `false` when
 /// the feature is not declared in `Cargo.toml`, so this stays sound whether
 /// or not the feature has been added to the manifest.
+fn synthetic_arc_opted_in_value(runtime_value: Option<&str>) -> bool {
+    cfg!(feature = "synthetic-quarkus-arc") || runtime_value == Some("1")
+}
+
 fn synthetic_arc_opted_in() -> bool {
-    cfg!(feature = "synthetic-quarkus-arc")
-        || cratonvm_types::flags::runtime_var("CRATONVM_SYNTHETIC_QUARKUS_ARC").as_deref() == Ok("1")
+    let runtime_value =
+        cratonvm_types::flags::runtime_var("CRATONVM_SYNTHETIC_QUARKUS_ARC").ok();
+    synthetic_arc_opted_in_value(runtime_value.as_deref())
 }
 
 /// Register every `io.quarkus.arc.*` native we implement. Called from
@@ -1251,6 +1256,8 @@ fn native_injectable_bean_get_bean_class(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_native_api::NativeMethodRegistry;
@@ -1320,45 +1327,26 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_shim_is_default_off_and_env_opt_in_enables_it() {
-        // Serialize on the shared guard: this test mutates a process-wide
-        // env var that other tests would otherwise observe.
-        let _g = state_guard().lock();
-        let prev = cratonvm_types::flags::runtime_var("CRATONVM_SYNTHETIC_QUARKUS_ARC").ok();
-
-        // Default (no opt-in, feature not declared): registers nothing.
-        std::env::remove_var("CRATONVM_SYNTHETIC_QUARKUS_ARC");
+    fn synthetic_shim_is_default_off_and_startup_opt_in_enables_it() {
+        // Startup configuration is immutable. Exercise the parser directly
+        // instead of mutating process state after the global snapshot latched.
         if !cfg!(feature = "synthetic-quarkus-arc") {
             assert!(
-                !synthetic_arc_opted_in(),
+                !synthetic_arc_opted_in_value(None),
                 "shim must be off by default without opt-in"
-            );
-            let mut r_off = NativeMethodRegistry::new();
-            register_quarkus_arc_natives(&mut r_off);
-            assert!(
-                r_off.find(CLS_ARC, "initialize", "()V").is_none(),
-                "default path must not register the synthetic ArC shim"
             );
         }
 
-        // Opt-in via env var: registers the full shim.
-        std::env::set_var("CRATONVM_SYNTHETIC_QUARKUS_ARC", "1");
         assert!(
-            synthetic_arc_opted_in(),
-            "env var must enable the synthetic shim"
+            synthetic_arc_opted_in_value(Some("1")),
+            "startup flag must enable the synthetic shim"
         );
         let mut r_on = NativeMethodRegistry::new();
-        register_quarkus_arc_natives(&mut r_on);
+        register_quarkus_arc_natives_unconditional(&mut r_on);
         assert!(
             r_on.find(CLS_ARC, "initialize", "()V").is_some(),
             "opt-in path must register the synthetic ArC shim"
         );
-
-        // Restore the prior env state for sibling tests.
-        match prev {
-            Some(v) => std::env::set_var("CRATONVM_SYNTHETIC_QUARKUS_ARC", v),
-            None => std::env::remove_var("CRATONVM_SYNTHETIC_QUARKUS_ARC"),
-        }
     }
 
     #[test]

@@ -2330,6 +2330,8 @@ fn h2_parser_read_dbg_enabled() -> bool {
 
 #[cfg(test)]
 mod h2_parser_read_dbg_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     #[test]
     fn h2_parser_read_dbg_flag_is_latched_and_matches_environment() {
         // The per-token parser step used to probe `env::var_os` on every call.
@@ -3030,6 +3032,8 @@ fn table_filter_prepare_on(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 

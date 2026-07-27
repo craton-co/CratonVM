@@ -2366,6 +2366,8 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 #[cfg(test)]
 mod bootstrap_property_fallback_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
@@ -4583,6 +4585,8 @@ fn native_thread_get_context_class_loader(
 
 #[cfg(test)]
 mod context_class_loader_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -6887,7 +6891,18 @@ fn populate_real_thread_holder(
     ctx.unpin_native_roots(pin_base);
 }
 
+/// Compatibility wrapper for embedders and tests that explicitly request the
+/// historical all-packs surface.
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
+    register_essential_natives_with_shims(registry, app_shims::ShimSelection::ALL);
+}
+
+/// Register core JDK natives plus the application packs selected once by the
+/// VM's indexed classpath probe.
+pub fn register_essential_natives_with_shims(
+    registry: &mut NativeMethodRegistry,
+    shim_selection: app_shims::ShimSelection,
+) {
     // ModifiedClassPathClassLoader can legitimately materialize a second
     // Spring-core namespace. Spring's package-private Adapt.isIn helper is
     // only an option-name membership test, but its bytecode uses reference
@@ -6931,6 +6946,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // to `Intrinsic` individually later.)
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+
+    // JDK-module registrations stay unconditional. They used to be mixed
+    // into the WildFly datasource/naming/security registrars, which made
+    // those application packs impossible to omit safely.
+    crate::wildfly_datasources_tx::register_jdk_datasource_natives(registry);
+    crate::wildfly_naming::register_jdk_naming_natives(registry);
+    crate::wildfly_security::register_jdk_security_natives(registry);
 
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
@@ -7040,9 +7062,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `crate::app_shims` — grouped so this family can be moved or made
     // conditional at one site. Still registered unconditionally, under the
     // same ambient `Intrinsic` category as before.
-    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
-        crate::app_shims::register_app_intrinsic_shims(registry);
-    });
+    if shim_selection.includes(crate::app_shims::ShimFamily::AppIntrinsics) {
+        registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+            crate::app_shims::register_app_intrinsic_shims(registry);
+        });
+    }
     // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // through the interpreted `java.util.regex` engine, which is 30–600× slower
@@ -7630,7 +7654,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // their per-kernel rationale moved alongside them. Order, ambient
     // category and the registered set are unchanged; the family is still
     // registered on every boot, including for programs that never load BC.
-    crate::app_shims::register_bouncycastle_shims(registry);
+    if shim_selection.includes(crate::app_shims::ShimFamily::BouncyCastle) {
+        crate::app_shims::register_bouncycastle_shims(registry);
+    }
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode
@@ -8774,7 +8800,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the registered set is unchanged. NOTE: this family also registers
     // `javax/sql/DataSource`, so it is not severable as-is — see
     // `ShimFamily::jdk_entanglements`.
-    crate::app_shims::register_datasource_pool_shims(registry);
+    if shim_selection.includes(crate::app_shims::ShimFamily::DataSourcePools) {
+        crate::app_shims::register_datasource_pool_shims(registry);
+    }
     // T19.H2: StackWalker boot-time getInstance variants + getCallerClass.
     stack_walker::register_stack_walker_boot(registry);
     // WildFly's security manager can hit StackWalker.walk(Function) before the
@@ -16909,7 +16937,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `java/security/AccessControlContext`) and JNDI
     // (`javax/naming/InitialContext`) natives that non-WildFly programs rely
     // on, so it is NOT severable as-is — see `ShimFamily::jdk_entanglements`.
-    crate::app_shims::register_jboss_wildfly_xnio_shims(registry);
+    if shim_selection.includes(crate::app_shims::ShimFamily::JBossWildFlyXnio) {
+        crate::app_shims::register_jboss_wildfly_xnio_shims(registry);
+    }
 
     // B3: ClassLoader.getResources / getSystemResources override.  The real
     // JDK implementation in JDK 25 NPEs during URLClassPath.<clinit> and the
@@ -26550,6 +26580,8 @@ fn map_java_predefined_class(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod java_predefined_class_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::compile_java_regex;
 
     fn m(pat: &str, s: &str) -> bool {
@@ -29288,6 +29320,8 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 #[cfg(test)]
 mod base64_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{b64_encode, B64_VARIANT_BASIC, B64_VARIANT_URL};
 
     #[test]
@@ -33776,6 +33810,8 @@ fn striped64_base_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize
 
 #[cfg(test)]
 mod striped64_base_slot_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::striped64_base_slot_from_layout;
 
     #[test]
@@ -37920,6 +37956,8 @@ fn pd_has_failure(ctx: &dyn NativeContext, scope: ObjectRef) -> bool {
 
 #[cfg(test)]
 mod vector_support_essential_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 
@@ -37998,6 +38036,8 @@ mod vector_support_essential_tests {
 
 #[cfg(test)]
 mod base64_encoder_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -38040,6 +38080,8 @@ mod base64_encoder_tests {
 
 #[cfg(test)]
 mod nio_heap_byte_buffer_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -38126,6 +38168,8 @@ mod nio_heap_byte_buffer_tests {
 
 #[cfg(test)]
 mod charset_alias_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 
@@ -38180,6 +38224,8 @@ mod charset_alias_tests {
 
 #[cfg(test)]
 mod reflection_field_essential_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -38218,6 +38264,8 @@ mod reflection_field_essential_tests {
 
 #[cfg(test)]
 mod panama_essential_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -38262,6 +38310,8 @@ mod panama_essential_tests {
 
 #[cfg(test)]
 mod liquibase_checksum_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -38470,6 +38520,8 @@ mod liquibase_checksum_tests {
 // ===========================================================================
 #[cfg(test)]
 mod t2_random_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -38579,6 +38631,8 @@ mod t2_random_tests {
 // ===========================================================================
 #[cfg(test)]
 mod t2_6_crypto_acceptance_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// T2.6.19 — SHA-256("hello") matches RFC 6234 test vector

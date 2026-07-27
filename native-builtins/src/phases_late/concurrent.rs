@@ -6170,6 +6170,8 @@ pub(crate) fn populate_common_factory(
 
 #[cfg(test)]
 pub(crate) mod new15_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

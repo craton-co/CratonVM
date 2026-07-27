@@ -4601,6 +4601,14 @@ impl ClassManager {
             .or_else(|| self.application.class_path().find_resource(name))
     }
 
+    /// Test only the application classpath for a resource, without reading or
+    /// inflating it. This deliberately excludes bootstrap and extension
+    /// modules so an identically named JDK resource cannot enable an
+    /// application compatibility pack.
+    pub fn application_contains_resource(&self, name: &str) -> bool {
+        self.application.class_path().contains_resource(name)
+    }
+
     /// Return a URL string for every classpath entry that contains a resource
     /// with the given name. Searches bootstrap, extension, and application
     /// classpaths in order and concatenates the results. Analog of

@@ -46,6 +46,7 @@ use cratonvm_reader::class_access_flags::MethodAccessFlags;
 use cratonvm_reader::constant_pool::ConstantPoolEntry;
 use cratonvm_reader::instruction::Instruction;
 use tracing::trace;
+use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess};
 
 use crate::classloading::resolution::{
     CachedBytecodeMethod, CachedInvokeTarget as GenericCachedInvokeTarget, MethodHandleKind,

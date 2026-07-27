@@ -2404,6 +2404,8 @@ pub(crate) fn register_xerces_xml_parser_intrinsics(registry: &mut NativeMethodR
 
 #[cfg(test)]
 mod xerces_cmstateset_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -2508,6 +2510,8 @@ mod xerces_cmstateset_tests {
 
 #[cfg(test)]
 mod xerces_xml_parser_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::FieldMetadata;

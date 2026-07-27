@@ -4972,6 +4972,8 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod serialization_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 
@@ -6815,6 +6817,8 @@ mod serialization_tests {
 
 #[cfg(test)]
 mod wp02_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::{FieldMetadata, MethodMetadata};
@@ -7185,6 +7189,8 @@ mod wp02_tests {
 
 #[cfg(test)]
 mod marshal_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::FieldMetadata;

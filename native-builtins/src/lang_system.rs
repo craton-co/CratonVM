@@ -3695,6 +3695,8 @@ pub(crate) fn native_perf_high_res_frequency(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod t2_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -3740,6 +3742,8 @@ mod t2_tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod t19_n2_thread_sleep0_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -3867,6 +3871,8 @@ mod t19_n2_thread_sleep0_tests {
 
 #[cfg(test)]
 mod t14_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -3957,6 +3963,8 @@ mod t14_tests {
 
 #[cfg(test)]
 mod t15_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -4147,6 +4155,8 @@ mod t15_tests {
 // simulate both deny (pre-arm an Err) and allow (default).
 #[cfg(test)]
 mod checkexec_security_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::security_manager::set_security_manager_for_test;
     use crate::test_utils::mock_ctx;

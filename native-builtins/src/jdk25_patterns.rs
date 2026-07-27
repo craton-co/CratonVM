@@ -615,6 +615,8 @@ pub(crate) fn register_jdk25_patterns_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod jdk25_patterns_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 

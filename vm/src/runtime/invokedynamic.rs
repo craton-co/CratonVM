@@ -18,7 +18,7 @@ use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
 // `NativeContext` trait brought into scope for `ctx.get_class_mirror(...)` on
 // `NativeContextImpl` in the generic-invokedynamic bootstrap path.
-use cratonvm_native_api::NativeContext;
+use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess, NativeInvokeAccess};
 
 use crate::classloading::resolution::{
     LambdaCallSite, MethodHandle, MethodHandleKind, RecordMethodKind, ResolvedCallSite, SwitchLabel,

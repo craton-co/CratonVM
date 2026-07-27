@@ -9,7 +9,9 @@
 use std::cell::Cell;
 
 use cratonvm_jit::{DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitPICSlot, JitRuntimeHelpers};
-use cratonvm_native_api::NativeContext;
+use cratonvm_native_api::{
+    NativeClassAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess,
+};
 use cratonvm_types::{
     ArrayElementType, ClassId, ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,

@@ -714,6 +714,8 @@ pub fn standard_offset_seconds_at_instant(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     fn test_catalog() -> Arc<TzdbCatalog> {
