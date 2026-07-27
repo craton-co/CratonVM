@@ -5239,7 +5239,100 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // Phase 34: ReadWriteLock, Atomic extras, LongAdder
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Real AQS long state
+// ---------------------------------------------------------------------------
+//
+// JDK 25's ReentrantReadWriteLock uses AbstractQueuedLongSynchronizer.  Its
+// state word is only ever reached through these final protected methods by the
+// real lock implementation, but the generic Unsafe CAS path stores a 64-bit
+// value in CratonVM's 16-byte Value slot.  Keep the JDK queue and lock
+// algorithm intact while placing that one scalar state word in an AtomicI64.
+// The side table is keyed with the same moving-GC-stable identity protocol as
+// the other native lock state tables.
+fn aqls_state_table(
+) -> &'static parking_lot::Mutex<
+    std::collections::HashMap<usize, std::sync::Arc<std::sync::atomic::AtomicI64>>,
+> {
+    static TABLE: std::sync::OnceLock<
+        parking_lot::Mutex<
+            std::collections::HashMap<usize, std::sync::Arc<std::sync::atomic::AtomicI64>>,
+        >,
+    > = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn aqls_state_slot(
+    ctx: &mut dyn NativeContext,
+    synchronizer: ObjectRef,
+) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+    let key = gc_stable_lock_key(ctx, synchronizer);
+    let mut table = aqls_state_table().lock();
+    table
+        .entry(key)
+        // AbstractQueuedLongSynchronizer initializes `state` to zero. Every
+        // later Java-side transition goes through the three forced natives
+        // registered below, including deserialization's `setState` path.
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)))
+        .clone()
+}
+
+fn native_aqls_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(synchronizer))) = args.first() else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let state = aqls_state_slot(ctx, *synchronizer)
+        .load(std::sync::atomic::Ordering::SeqCst);
+    Ok(Some(Value::Long(state)))
+}
+
+fn native_aqls_set_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (Some(Value::Object(Some(synchronizer))), Some(Value::Long(state))) =
+        (args.first(), args.get(1))
+    else {
+        return Ok(None);
+    };
+    aqls_state_slot(ctx, *synchronizer).store(*state, std::sync::atomic::Ordering::SeqCst);
+    Ok(None)
+}
+
+fn native_aqls_compare_and_set_state(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let (
+        Some(Value::Object(Some(synchronizer))),
+        Some(Value::Long(expected)),
+        Some(Value::Long(new_state)),
+    ) = (args.first(), args.get(1), args.get(2))
+    else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let swapped = aqls_state_slot(ctx, *synchronizer)
+        .compare_exchange(
+            *expected,
+            *new_state,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok();
+    Ok(Some(Value::Int(i32::from(swapped))))
+}
+
+fn register_aqls_state_natives(registry: &mut NativeMethodRegistry) {
+    let aqls = "java/util/concurrent/locks/AbstractQueuedLongSynchronizer";
+    registry.register(aqls, "getState", "()J", native_aqls_get_state);
+    registry.register(aqls, "setState", "(J)V", native_aqls_set_state);
+    registry.register(
+        aqls,
+        "compareAndSetState",
+        "(JJ)Z",
+        native_aqls_compare_and_set_state,
+    );
+}
+
 pub(crate) fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
+    register_aqls_state_natives(registry);
     // Real AQS is the default (and is explicitly enabled by the Spring Boot
     // runner).  Its `ReentrantReadWriteLock` constructor creates real
     // ReadLock/WriteLock views whose `sync` field points at the real nested
@@ -8984,5 +9077,55 @@ mod concurrency_tests {
             &[Value::Object(Some(t)), Value::Long(0), Value::Int(1)],
         );
         assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn aqls_state_natives_preserve_atomic_long_transitions() {
+        let mut ctx = make_ctx();
+        let synchronizer = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+
+        assert_eq!(
+            native_aqls_get_state(&mut ctx, &[Value::Object(Some(synchronizer))])
+                .unwrap()
+                .unwrap(),
+            Value::Long(0)
+        );
+        native_aqls_set_state(
+            &mut ctx,
+            &[Value::Object(Some(synchronizer)), Value::Long(4)],
+        )
+        .unwrap();
+        assert_eq!(
+            native_aqls_compare_and_set_state(
+                &mut ctx,
+                &[
+                    Value::Object(Some(synchronizer)),
+                    Value::Long(4),
+                    Value::Long(8),
+                ],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            native_aqls_compare_and_set_state(
+                &mut ctx,
+                &[
+                    Value::Object(Some(synchronizer)),
+                    Value::Long(4),
+                    Value::Long(12),
+                ],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            native_aqls_get_state(&mut ctx, &[Value::Object(Some(synchronizer))])
+                .unwrap()
+                .unwrap(),
+            Value::Long(8)
+        );
     }
 }
