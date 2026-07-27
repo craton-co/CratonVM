@@ -103,11 +103,9 @@ samples — and enforces:
    regression and fails the gate outright.
 2. **No phase median may exceed its baseline by more than 5%**
    (`perf/cratonbench-baseline-azure-epyc.tsv`). `anchored` baselines carry a
-   linked evidence doc (e.g.
-   `docs/internal/performance/binarytrees-half-gap-20260718.md` for
-   bintrees = 1,468 ms) and may only be re-anchored by a new evidence doc;
-   `provisional` baselines may be re-anchored with a normal PR justification
-   (use `--calibrate` on a quiet host).
+   linked evidence doc (e.g. bintrees = 1,468 ms) and may only be re-anchored
+   by a new evidence doc; `provisional` baselines may be re-anchored with a
+   normal PR justification (use `--calibrate` on a quiet host).
 3. **Never measure under load.** The script refuses (exit 3) when the 1-min
    load average exceeds `--max-load` (default 2.0). A refused run is not a
    pass — rerun on a quiet host.

@@ -118,3 +118,21 @@ in the same family of gaps as `preload_isolated_loader_supertypes`/
 `resolve_class_loader_aware` (see the now-fixed parent doc and the
 `OnBeanCondition` residual doc above) but not yet narrowed to a specific
 call site.
+
+## Regression note — confirmed still failing 2026-07-23 (craton-rerun-20260723), but with a NEW, different symptom
+
+3 of this doc's 4 classes (`SecurityFilterAutoConfigurationEarlyInitializationTests`,
+`ManagementWebSecurityAutoConfigurationTests`,
+`ReactiveManagementWebSecurityAutoConfigurationTests`) are FAILing again as
+of the 2026-07-23 rerun, but **not** with this doc's `NoSuchBeanDefinitionException`/
+`ObjectProvider<X>` symptom — the new failure is a JUnit Platform
+`DiscoveryIssueException` ("`UniqueIdSelector [...] could not be resolved`")
+during test *discovery*, before the test body (and therefore this doc's
+`ObjectProvider` injection point) ever runs. Root-caused as a new doc:
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md).
+This doc's own root-cause hypothesis (`ObjectProvider<X>` generic-identity
+mismatch under an isolated loader) is not confirmed or refuted by this —
+it simply never gets a chance to reproduce anymore, since the new failure
+happens earlier in the pipeline. `JerseyChildManagementContextConfigurationTests`
+(this doc's 4th class) was not part of this session's assigned batch and
+was not re-checked.

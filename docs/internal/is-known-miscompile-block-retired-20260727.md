@@ -137,15 +137,31 @@ with no unwinding catch, so a method body that outgrew its estimated buffer
 took the whole process down. (`offset == len` in the panic: the branch's own
 `rel32` placeholder had already been dropped by the sticky-overflow `emit`.)
 
-Fixed in `jit/src/ir_lower.rs` by routing both stub patch loops through a new
+Fixed in `jit/src/ir_lower.rs` by routing the patch through a new
 `patch_or_bail` helper that honours the documented contract — the same
-convention `patch_rel32_to_here` already followed. A `debug_assert!` keeps the
+convention `patch_rel32_to_here` already followed, and which the file's
+`try_patch_byte` sites already used via `.ok()`. A `debug_assert!` keeps the
 invariant loud in debug builds: a patch failure must have marked the buffer
 overflowed, which is exactly what makes the compile discardable.
 
+**It was a family of 13, not one.** Fixing only the two stub emitters was not
+enough: the very next real-fixture run, Tomcat's
+`org.apache.jasper.compiler.TestGenerator`, aborted at a *third* site —
+
+```
+thread 'http-nio-127.0.0.1-auto-8-exec-3' panicked at jit/src/ir_lower.rs:638:14:
+IR safepoint poll patch in-bounds: PatchFailed { kind: "i32", offset: 4864 }
+```
+
+— so every remaining `try_patch_i32(..).expect(..)` in the lowerer was
+converted too: the safepoint poll, the self-call stack-sample / sentinel-keep /
+rel32 patches, the call-sentinel keep, the guard JNZ, both generic
+`patch_branches` sites, both div-overflow patches, and the deopt-unless Jcc.
+Thirteen sites in total, all of them reachable the same way.
+
 This defect is **not** specific to Groovy — any method whose lowered body
 exceeds `nodes*32 + calls*448 + 1024` bytes reaches it. Groovy's AST/parser
-code is simply the shape that got there first in a probe.
+code and Tomcat's JSP compiler are simply the shapes that got there first.
 
 ### (b) `dev` did not compile
 
@@ -161,21 +177,32 @@ immediately.
 Same runner (`apps/tomcat-suite-runner/run-tomcat-suite.sh craton`), same
 fixture, one frozen binary each:
 
-| Class | baseline `cratonvm-jbi-base-20260727` | with both fixes |
-|---|---|---|
-| `org.apache.jasper.compiler.TestCompiler` | rc=124 **HANG** at the 301s cap, log ending in a flood of `try_patch_i32: offset out of bounds` warnings | **completes**: `Tests run: 12, Failures: 1` in 897s |
-| `org.apache.tomcat.util.buf.TestByteChunk` | PASS | PASS |
-| `org.apache.tomcat.util.buf.TestMessageBytes` | PASS | PASS |
-| `org.apache.tomcat.util.buf.TestMessageBytesConversion` | PASS | PASS |
-| `org.apache.tomcat.util.collections.TestSynchronizedStack` | PASS | PASS |
-| `org.apache.tomcat.util.http.TestCookieProcessorGeneration` | PASS | PASS |
+| Class | baseline `…-base-…` | 2 sites fixed | all 13 sites fixed |
+|---|---|---|---|
+| `org.apache.jasper.compiler.TestCompiler` | rc=124 HANG at the 301s cap, log ending in a flood of `try_patch_i32: offset out of bounds` warnings | `Tests run: 12, Failures: 1` at 897s | rc=124 HANG at the 900s cap |
+| `org.apache.jasper.compiler.TestGenerator` | not run | **rc=134 ABORT at 129s** (`IR safepoint poll patch in-bounds`) | runs the full 900s, **0 panics**, HANG at the cap |
+| `org.apache.tomcat.util.buf.TestByteChunk` | PASS | PASS | — |
+| `org.apache.tomcat.util.buf.TestMessageBytes` | PASS | PASS | — |
+| `org.apache.tomcat.util.buf.TestMessageBytesConversion` | PASS | PASS | — |
+| `org.apache.tomcat.util.collections.TestSynchronizedStack` | PASS | PASS | — |
+| `org.apache.tomcat.util.http.TestCookieProcessorGeneration` | PASS | PASS | — |
 
-`TestCompiler` is jasper → Eclipse-JDT, i.e. exactly the ecj family this
-change lifts, and it reaches the same `ExecutableBuffer` overflow path the
-Groovy probe did. Its one remaining failure is a separate, pre-existing issue,
-and the host was heavily loaded by other sessions throughout (load average
-30-85 on 16 cores), so the wall times are not comparable across runs — the
-transition from "never finishes" to "runs all 12 tests" is the signal.
+Read that carefully, because only part of it is a clean result. **What is
+established:** the VM no longer aborts — `TestGenerator` went from a
+process-killing panic at 129s to running the whole 900s window with zero
+panics, and `TomcatGroovyProbe` (the controlled repro, below) is clean in all
+three JIT configurations where it previously aborted. **What is NOT
+established:** a pass/fail improvement on the two jasper classes. Both are
+timeout-bound at whatever cap they are given on this host — `TestCompiler`
+landed at 897s of a 900s budget in one run and at the cap in the next — and the
+box was shared with other sessions at load average 30-85 on 16 cores
+throughout, so those wall times are not comparable to each other. The five
+`tomcat-util` classes are the stable part of the regression check: identical
+PASS on both binaries.
+
+`TestCompiler`/`TestGenerator` are jasper → Eclipse-JDT, i.e. exactly the ecj
+family this change lifts, and both reach the same `ExecutableBuffer` overflow
+path the Groovy probe did.
 
 Unit tests on the final tree: `cargo test --release -p cratonvm-vm skip_list`
 68 passed / 0 failed; `cargo test --release -p cratonvm-jit ir_lower` 31 passed
