@@ -217,6 +217,15 @@ Full log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260717/sh
 this session (fixed in a local worktree, not yet re-run through the full
 suite harness).
 
+**Confirmed still failing 2026-07-23** (`RunName=craton-rerun-20260723`):
+both `getResourceFindsResourceFromParentClassLoader` and
+`getResourcesOnlyFindsResourcesFromParentClassLoader` fail with exactly this
+URL-formatting mismatch (backslash-laden opaque path vs. CratonVM's
+normalized forward-slash/single-leading-slash form), matching this doc's
+root cause precisely — not a new regression, this residual was explicitly
+never fixed (see "not attempted this session" above). Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard5/logs/module_spring-boot-tomcat.org.springframework.boot.tomcat.TomcatEmbeddedWebappClassLoaderTests.out.log`.
+
 ## 3. `TomcatMetricsAutoConfigurationTests` — FIXED (independently, by concurrent `dev` work)
 
 **Status: FIXED.** Re-run 2026-07-19: **5/5 tests pass**, including the 2 that

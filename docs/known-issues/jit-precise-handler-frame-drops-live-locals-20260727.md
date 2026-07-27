@@ -76,6 +76,22 @@ from the parser's handler-bearing methods. Denying just that method's
 compilation is also clean (3/3 runs), which is what first pointed at frame
 reconstruction rather than at the parser.
 
+## Why it needed a moving young generation
+
+A concurrent session measured the same corruption from the GC side
+(`docs/known-issues/jit-virtual-direct-entry-json-corruption-20260727.md`):
+1,500,000 ops are clean with `CRATONVM_MOVING_YOUNG=0` at an unchanged heap,
+and clean at `-Xmx8g`, while `-Xmx1g` fails 1-3 times. They also refuted, with
+`CRATONVM_JIT_POISON_FREE=1`, that this is a call into retired or recycled JIT
+code.
+
+That fits this root cause exactly. A reference dropped from a reconstructed
+frame is a root the collector cannot see: with a non-moving young generation
+the object usually survives anyway (nothing relocates, and the conservative
+scan can still find it), but as soon as the young generation evacuates, the
+object is moved or reclaimed and whatever still points at its old address now
+addresses a different live object — "a re-parse returned one of the keys".
+
 ## Two defects, one fixed properly and one gated
 
 **1. The liveness behind the snapshot had no exception edges — FIXED.**

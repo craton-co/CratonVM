@@ -1,8 +1,8 @@
 # Garbage Collection in CratonVM — architecture and current state
 
-*Last updated 2026-07-11, after the four-wave G1/ZGC correctness audit
-(see [known-issues/gc-audit-2026-07-10-open-findings.md](internal/gc-audit-2026-07-10-open-findings.md)
-for the finding-by-finding record).*
+*Last updated 2026-07-27. The historical four-wave G1/ZGC correctness
+audit is retained in
+[the internal fixed-issue archive](internal/fixed-suite-bugs/gc-audit-2026-07-10-open-findings.md).*
 
 CratonVM ships three garbage-collector backends behind one dispatcher
 (`gc/src/vm_heap.rs::VmHeap`). All are stop-the-world at the collection
@@ -94,26 +94,21 @@ RefCheckOld / SpinPoll / SpinPollMark produce HotSpot-identical output on
 Generational, G1 and ZGC at `-Xmx256m`; the gc crate's unit+integration
 suites are green.
 
-**Known open issues** (details, evidence and reproducers in
-[known-issues/gc-audit-2026-07-10-open-findings.md](internal/gc-audit-2026-07-10-open-findings.md)):
+**Current limitations:**
 
-1. **STW barrier quota race (finding 1)** — the barrier can count an
-   excluded (blocked) thread's arrival toward its quota and release the
-   initiator while a counted mutator still runs. Intermittent lost
-   `synchronized` updates / wrong results / rare GC-time SIGSEGV under
-   multi-threaded JIT churn on moving collectors (≈1-in-5 on the MTChurn
-   probe), plus a *single-threaded* deep-recursion component
-   (BinaryTrees under G1+JIT). A fix attempt is parked on
-   `wip/gc-stw-quota-race-20260710` — its accounting is sound but a
-   residual race survives it; do not merge as-is.
-2. **Class unloading** (`gc/src/class_unloading.rs`) has no driver:
-   classes, mirrors and statics are immortal roots (footprint, not
-   correctness).
-3. **String deduplication** is plumbed (`-XX:+UseStringDeduplication`)
-   but intentionally inert: the dedup table is not remapped across
-   collections and the API carries a do-not-wire-up warning.
-4. **G1 parallel young evacuator** (`CRATONVM_G1_PARALLEL_EVAC`) has a
-   documented residual race — keep it off (default).
+1. `-XX:+UseZGC` selects the compatibility implementation described
+   above, not HotSpot's concurrent colored-pointer ZGC.
+2. `-XX:+UseStringDeduplication` is parsed but intentionally inert. The
+   raw-address deduplication table must participate in every collector's
+   remap and purge protocol before production callers can use it.
+3. `CRATONVM_G1_PARALLEL_EVAC=1` is an experimental opt-in. Mixed
+   collections stay on the serial evacuator, and the serial path remains
+   the supported default.
+
+The STW barrier race and missing class-unloading driver described by
+earlier versions of this page are fixed. For the current class-loader
+liveness and reclamation contract, see
+[Class-loader unloading and bounded metadata](architecture/class-loader-unloading.md).
 
 ## Verifying and debugging
 
@@ -194,7 +189,7 @@ next one, and the parallel walker writes nothing — on any grid anomaly
 it is abandoned wholesale and the untouched sequential walk (which owns
 every diagnostic and the unwind/re-anchor recovery) runs from scratch.
 Parallel EVACUATION does not exist here. The moving young gen's
-JIT-held-oop corruption is fixed (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+JIT-held-oop corruption is fixed,
 but it remains opt-in behind `CRATONVM_MOVING_YOUNG` on throughput grounds.
 Old gen is a free-list
 allocator collected by a VM-driven concurrent cycle (initial mark STW →

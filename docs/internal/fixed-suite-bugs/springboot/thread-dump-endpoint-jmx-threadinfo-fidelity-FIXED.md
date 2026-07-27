@@ -2,6 +2,23 @@
 
 **Status: FIXED - 2026-07-18**
 
+> **Confirmed still failing 2026-07-23** — `ThreadDumpEndpointTests.dumpThreadsAsText`
+> fails again in the `craton-rerun-20260723` results, and this worktree's HEAD
+> (`a3d75f295`, a 2026-07-23 merge of `origin/dev`) already contains this fix
+> as an ancestor commit — so this is not a stale-binary artifact, it's a
+> genuine regression on top of the fix. The actual dump text is missing
+> exactly the piece this doc's "Resolution" claims is covered: no
+> `"\t- parking to wait for <addr> (a java.util.concurrent.CountDownLatch$Sync)"`
+> line appears anywhere for the `"Awaiting CountDownLatch"` thread (it shows
+> `WAITING` state and a frame, but the parking-blocker/lock annotation the
+> assertion regexes for is simply absent from that thread's block):
+> `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard7/logs/module_spring-boot-actuator.org.springframework.boot.actuate.management.ThreadDumpEndpointTests.out.log`.
+> Not re-investigated this session (out of scope — this doc's fix predates
+> the rerun and the discrepancy needs a fresh trace of the JMX
+> snapshot/parking-blocker code this doc describes, not a re-derivation from
+> the original symptom). Flagging as a confirmed root-cause/status
+> discrepancy rather than re-filing a duplicate doc.
+
 ## Boundary
 
 This was independent of the prior JUnit 5 invocation-liveness repair. Its acceptance class reached the endpoint only after `Thread.getState()` accurately reported `WAITING` and `BLOCKED`.

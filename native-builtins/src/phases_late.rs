@@ -2516,7 +2516,21 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         },
     );
     let phi = "java/lang/ProcessHandle$Info";
-    r.register(phi, "command", "()Ljava/util/Optional;", p60_empty_optional);
+    // `ProcessHandle.current().info().command()` is the standard way to find the
+    // running JVM's executable in order to spawn a child JVM -- Spring's
+    // `PathMatchingResourcePatternResolverTests$ClassPathManifestEntries` does
+    // exactly that, and an empty Optional there is an immediate
+    // `NoSuchElementException: No value present`. Report this VM's own
+    // executable, the way the real `ProcessHandleImpl.Info` does.
+    r.register(phi, "command", "()Ljava/util/Optional;", |ctx, args| {
+        let Ok(exe) = std::env::current_exe() else {
+            return p60_empty_optional(ctx, args);
+        };
+        let text = ctx.create_string(&exe.to_string_lossy());
+        let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        ctx.set_field(optional, 0, Value::Object(Some(text)));
+        Ok(Some(Value::Object(Some(optional))))
+    });
     r.register(
         phi,
         "arguments",

@@ -123,11 +123,11 @@ offload after a call site's first invocation, and the kernel's bounds-failure
 flag was read before outputs were written back, which could miss a late
 failure. Both are fixed in current `dev`.
 
-Remaining follow-ups — reduction kernels (non-`void` return) not yet wired
-into the dispatch path, JIT-compiled callers bypassing the offload hook,
-broader opcode coverage in the lowering stage, and a few smaller items — are
-tracked in
-[`docs/internal/gpu-offload-followups-20260711.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/internal/gpu-offload-followups-20260711.md).
+The follow-ups from that validation pass — wiring reduction kernels
+(non-`void` return) into the dispatch path, closing the JIT-caller bypass of
+the offload hook, and broadening opcode coverage in the lowering stage — are
+now closed; see [`docs/gpu/README.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/gpu/README.md)
+for the current feature-doc index.
 
 ## FAQ
 

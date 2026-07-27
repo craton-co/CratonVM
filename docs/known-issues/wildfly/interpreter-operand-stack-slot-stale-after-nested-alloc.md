@@ -19,8 +19,7 @@ interpreter frame walk. A full forensic campaign (worktree
 that: frames are scanned and remapped correctly in every captured event. The family's true members:
 
 1. **Producer #11 — `Properties.load` re-entrant natives (FIXED, commit `8e1162cfa`).** The fatal
-   `MechanismDatabase.<init>` Reader NSME — see
-   `docs/internal/fixed-suite-bugs/wildfly-boot-stale-reader-nsme-mechanismdatabase-FIXED.md`.
+   `MechanismDatabase.<init>` Reader NSME, since fixed and archived.
    0/320 boots post-fix (was the only fatal member).
 2. **Frozen-in-JIT peer interpreter-frame coverage (HARDENED, commit `ec883f519`).** A peer frozen
    mid-JIT by the cross-thread STW takeover was covered only by its last root-snapshot deposit +
@@ -191,8 +190,8 @@ A fresh 320-boot campaign (`out/results.tsv`, waves 1-80) came back with 3 `STAL
   `WFLYCTL0043: An attribute named 'hornetq-store-enable-async-io' is already registered at
   location '/subsystem=transactions'` — a genuine DUPLICATE attribute registration, i.e. some
   extension-initialization code path ran twice. This smells like a class/loader-identity duplication
-  bug (the same family as `docs/internal/aot-beanoverride-double-context-refresh-rootcaused-*`'s
-  fork-loader ClassId instability) rather than a stale-pointer read. **Not yet root-caused; not
+  bug (the same family as the AOT bean-override double-context-refresh fork-loader ClassId
+  instability) rather than a stale-pointer read. **Not yet root-caused; not
   confirmed related to this doc's family** — flagged here only because it was in the same
   1.2%-tail sample as the other three.
 
@@ -462,3 +461,70 @@ stale — the frame's stack slot missed the moving-GC root scan/remap" — was W
 never missed by the remap; the stale value re-entered via Rust-side invoke plumbing after the
 remap. The suggested pickup (audit the frame stack scanner's slot classification) was carried out
 during this investigation and found sound.
+
+## 2026-07-27: a FATAL member with a precise, repeatable site — `NoSuchMethodError: java/lang/Object.hasNext()Z`
+
+Found while closing
+the retired `modeltypevalidator-validtypes-npe` write-up
+(the `org/jboss/as/` JIT-ban lift; archived with docs/internal). Once that doc's two root causes were fixed,
+WildFly 32.0.1.Final boots to `WFLYSRV0026` — but only in roughly 4 out of every
+6 attempts. **Every** failing boot in a 6+6 interleaved A/B (ban in place vs ban
+lifted, JIT on, identical harness) died on this, and nothing else:
+
+```
+WARN cratonvm_vm::vm::vm_exec: NoSuchMethodError
+  method="java/lang/Object.hasNext()Z"
+  caller="org/jboss/as/controller/registry/BasicResource.writeModel(Lorg/jboss/dmr/ModelNode;)V @pc=8"
+→ WFLYCTL0013 Operation ("add") failed
+→ WFLYCTL0193: Failed executing subsystem infinispan boot operations
+→ WFLYSRV0056
+```
+
+and, on other runs, the same error at a different site:
+
+```
+  method="java/lang/Object.hasNext()Z"   (also seen as "java/lang/Object.next()Ljava/lang/Object;")
+  caller="org/jboss/as/controller/xml/VersionedNamespace.createURN(
+            Ljava/util/List;Lorg/jboss/as/version/Stability;Ljava/lang/Comparable;
+            Ljava/util/function/Function;)Lorg/jboss/as/controller/xml/VersionedNamespace; @pc=78"
+→ ServiceConfigurationError: Provider org.wildfly.extension.<x>.<X>Extension could not be instantiated
+→ WFLYCTL0083: Failed to load module org.wildfly.extension.<x>
+→ WFLYCTL0085 / WFLYSRV0056
+```
+
+`createURN @pc=78` is `String.join(":", new CompositeIterable(...))` — reached
+concurrently, once per extension, from `DeferredExtensionContext`'s boot
+executor. `BasicResource.writeModel @pc=8` is the return point of
+`ModelNode.set(ModelNode)` (its `copy()` iterates a map), so the reported caller
+is an inlined-callee attribution, not the `hasNext()` call site.
+
+### Why this belongs to this family
+
+`java/lang/Object.hasNext()` is not a method that exists. The name comes from
+`virtual_dispatch_target_for_receiver` (`vm/src/jit/helpers.rs`), which forces
+the dispatch class to `java/lang/Object` when the receiver's
+`heap.kind_of(...)` reports `Array` (and falls back for `ClassId(0)`). An
+iterator receiver that reads back as an array / all-zero header is exactly the
+stale-or-zeroed-receiver signature this doc tracks: the NSME is the *fatal* face
+of the same thing whose non-fatal face is the all-zero-header CP fallback
+described above.
+
+### What makes it a good next handle
+
+- **Ban- and JIT-independent.** Reproduces with `org/jboss/as/` banned and
+  lifted, and with `--nojit` (a `--nojit` boot hit the `createURN` face on the
+  `org.wildfly.extension.discovery` extension). So it needs no JIT
+  configuration to chase.
+- **Two named, stable sites** rather than an address-matching hunt, both on
+  short methods.
+- **~1-in-3 per boot** on the Azure host with the TRACE `logging.properties`
+  currently in the dist — a ~4 minute reproduction loop, far cheaper than the
+  Arquillian harness.
+- The existing `[BADRECV-Z]` / `[BADRECV]` guards in the interpreter's
+  `Getfield` handler already print a zeroed/non-heap receiver with 24 Java
+  frames; the equivalent print does not exist on the *invoke* path, which is
+  where this one surfaces. Adding it there is the obvious first step.
+
+Harness: fake-JDK-home `bin/java` + `CRATONVM_JAVA_HOME=/home/victor/jdk25`,
+`bash standalone.sh -Djboss.server.base.dir=<copy of standalone/configuration
+plus an empty deployments/>`, 900 s timeout.

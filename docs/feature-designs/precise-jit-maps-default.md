@@ -32,13 +32,8 @@ requires.
 > incrementing) but **non-fatal** (covered by the peer's last-published
 > `root_snapshot`); the benign real-FJP `cas_long FAIL` retry noise still fires.
 
-> Note on sources: the orchestration brief referenced
-> `docs/internal/reviews/full-review-2026-06-20.md`. That file does **not** exist
-> in this tree; the authoritative grounding for this topic is in the
-> known-issues family docs and the JIT/GC source, cited inline below. The
-> general crate reviews `docs/internal/reviews/jit-review.md` and
-> `docs/internal/reviews/gc-review.md` are the closest standing reviews and are
-> referenced where relevant.
+> Note on sources: the authoritative grounding for this topic is the JIT/GC
+> source itself, cited inline below.
 
 ## Problem & motivation
 

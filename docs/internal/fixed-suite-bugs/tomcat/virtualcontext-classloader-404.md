@@ -349,7 +349,7 @@ symlink-resolution fix from the same session —
 whole class) is NOT a new/distinct bug either — it's the same cross-suite,
 already-tracked, deliberately-deferred interpreter/dispatch throughput
 ceiling documented in
-[`04-embedded-server-throughput-wall-OPEN.md`](04-embedded-server-throughput-wall-OPEN.md)
+[`../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md`](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md)
 (annotation/BCEL constant-pool scanning of the container classpath's large
 jars, e.g. `bouncycastle-provider` at 6112 classes, `bnd` at 5919) — confirmed
 by a live trace showing the interpreter genuinely and repeatedly executing
