@@ -4730,6 +4730,15 @@ pub unsafe extern "C" fn jit_checkcast(
         obj_ref.as_ptr() as i64
     } else {
         if cv_trace_enabled() {
+            // The receiver's OBJECT KIND disambiguates this failure: for a
+            // reference array the header stores the *component* class id, and
+            // the message below renders it by the component name — so a
+            // genuine `T[]` → `T` refusal prints as "X cannot be cast to X"
+            // and reads like a class-identity split. Print kind + array
+            // descriptor so the two are separable (see SPRING-CRHM.1 in
+            // `vm/src/jit/skip_list.rs`, where exactly that cost hours).
+            let kind = vm.mem.heap.kind_of(obj_ref);
+            let arr_desc = crate::runtime::interpreter::array_descriptor_of(vm, obj_ref);
             let cm = vm.classes.class_manager.read();
             let obj_cls_name = cm
                 .get_class(obj_class_id)
@@ -4737,8 +4746,10 @@ pub unsafe extern "C" fn jit_checkcast(
                 .unwrap_or_else(|| "<none>".into());
             let target_cid = cm.find_unique_class_by_name(class_name);
             eprintln!(
-                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
+                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} kind={:?} arr_desc={:?} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
                 obj_ptr,
+                kind,
+                arr_desc,
                 obj_class_id.as_u32(),
                 obj_cls_name,
                 class_name,
