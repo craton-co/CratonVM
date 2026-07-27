@@ -1211,16 +1211,28 @@ fn should_skip_jit_internal(
             }
         }
 
-        // Hibernate mapping metadata initializes JAXB's QName-heavy runtime
-        // graph.  JITting org.glassfish.jaxb currently corrupts that graph and
-        // produces a self-cast `QName cannot be cast to QName`; interpreting
-        // the package reproduces the no-JIT result.  Keep this scoped guard
-        // liftable for bisection.
-        if let Some(prefix) = jaxb_mapping_residual_skip_prefix(class_name) {
-            if !package_allowed(prefix, allow_packages) {
-                return Some(SkipReason::RustJvmTestFixture);
-            }
-        }
+        // JAXB (`org/glassfish/jaxb/`) -- REMOVED 2026-07-27. The ban existed
+        // for a self-cast `QName cannot be cast to QName` seen while
+        // Hibernate mapping metadata built JAXB's QName-heavy runtime graph,
+        // and was re-confirmed on 2026-07-26 as an `UnmarshalException:
+        // unexpected element (uri:"", local:"widget")` at iteration 81 of
+        // `JaxbQNameProbe`. Re-verified 2026-07-27 against that same probe
+        // (real jakarta.xml.bind / org.glassfish.jaxb 4.0.7, fresh
+        // Marshaller + StringWriter + Unmarshaller per iteration, 4000
+        // iterations x 6 runs, ban removed from this file entirely): 0
+        // failures. The 2026-07-26 run of the same config on the *previous*
+        // dev binary is also clean, so the QName corruption was closed by
+        // general JIT work between those two dates, not by this session's
+        // change. What this session DID fix is the separate general defect
+        // the same probe kept tripping over first -- the LICM/speculative
+        // pre-header bypass (`find_bypassable_loop_headers` in
+        // `jit/src/x64.rs`), whose `AttributesImpl.ensureCapacity` face made
+        // the 4000-iteration probe die with
+        // `OutOfMemoryError ... anewarray ... length 1677721600` roughly one
+        // run in three. See
+        // `docs/internal/jit-licm-preheader-bypass-20260727.md`.
+        // `docs/known-issues/repros/jitban-remaining-20260726/JaxbQNameProbe.java`
+        // is the regression witness.
 
         // SPRING-HAZELCAST-XERCES-JIT.1 -- REMOVED 2026-07-26. Historically,
         // Hazelcast's schema validation passed the complete server suite
@@ -2227,16 +2239,6 @@ fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static 
     }
 }
 
-fn jaxb_mapping_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
-    const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
-    const DOT_PREFIX: &str = "org.glassfish.jaxb.";
-    if class_name.starts_with(SLASH_PREFIX) {
-        Some(SLASH_PREFIX)
-    } else {
-        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
-    }
-}
-
 fn is_snakeyaml_emitter_emit_jit_corruption(class_name: &str, method_name: &str) -> bool {
     class_name == "org/yaml/snakeyaml/emitter/Emitter" && method_name == "emit"
 }
@@ -2860,28 +2862,20 @@ mod tests {
     }
 
     #[test]
-    fn jaxb_mapping_package_skipped_conservatively_and_lifts_for_bisection() {
+    fn jaxb_mapping_package_is_jit_eligible_after_removal() {
+        // The `org/glassfish/jaxb/` ban was removed 2026-07-27 -- see the
+        // removal comment in `should_skip_jit_internal` for the
+        // re-verification evidence.
         for cls in [
             "org/glassfish/jaxb/runtime/v2/runtime/reflect/Accessor",
             "org.glassfish.jaxb.runtime.v2.runtime.reflect.Accessor",
         ] {
             assert_eq!(
                 check(cls, "get", false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{cls} should stay interpreted under the JAXB mapping guard"
+                None,
+                "{cls} must be JIT-eligible now that the JAXB ban is gone"
             );
         }
-        assert_eq!(
-            check_with(
-                "org/glassfish/jaxb/runtime/v2/runtime/reflect/Accessor",
-                "get",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["org/glassfish/jaxb/"],
-            ),
-            None
-        );
     }
 
     #[test]
