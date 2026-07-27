@@ -108,6 +108,35 @@ Expect 2-3 failures per run today, 0 with
 1,500,000 operations per configuration: at ~1 error per 500,000 ops, a
 300,000-op run proves nothing.
 
+## Almost certainly the same bug as the NodeConnections SIGSEGV
+
+`docs/known-issues/jit-segv/nodeconnections-retired-jit-code-jump-20260727.md`
+(branch `fix/nodeconnections-segv-20260727`, OPEN, another session — neither
+that doc nor its `CRATONVM_JIT_POISON_FREE` diagnostics are on dev yet) has an
+ElasticSearch test SIGSEGV-ing ~10% of runs on an **indirect call through r11
+into a RETIRED JIT code buffer** — proven retired by an A/B under
+`CRATONVM_JIT_POISON_FREE=1` (the faulting page reappears as `---p`). Its own
+"remaining raw-entry holders to check" list starts with *generated-code inline
+caches (`cached_entry_ptr`)* — which is exactly the pointer this doc's kill
+switch turns off.
+
+Same mechanism, two symptoms, and they agree on the parts each has tested:
+
+| | NodeConnections SIGSEGV | this (json-smart) |
+|---|---|---|
+| symptom | jump into an UNMAPPED retired buffer -> SIGSEGV | call into a buffer that got REUSED -> another method's result |
+| `--nojit` | 0/20 | 0 errors in 1.5M ops with the parser package banned |
+| unowned raw entry in a dispatch cache | refuted (`pin_jit_entry` never missed, 0/16) | refuted (every unowned install had `entry=0x0`) |
+| suspected owner | last `Arc` in a superseded `JitCache` shard snapshot, freed without reaching `defer_jit_owner` | supersession that replaces a cache entry without the slot-clearing walk |
+
+Whoever picks this up should treat them as one investigation: this probe is the
+cheaper repro to iterate on (no ES fixture, deterministic-ish rate, and a
+one-variable A/B), while that branch has the memory-level proof and the
+`CRATONVM_JIT_POISON_FREE` / `CRATONVM_JIT_LEAK_CODE` /
+`CRATONVM_JIT_STRICT_CALLEE_ROOTS` diagnostics already built. Running this probe
+under `CRATONVM_JIT_POISON_FREE=1` should convert the silent wrong answer into a
+crash at the moment of the stale call — that is the next experiment.
+
 ## Next steps
 
 1. Audit every `cached_entry_ptr` / PIC `mega_entry_ptrs` install and lookup
