@@ -141,7 +141,7 @@ cd apps/h2database-suite-runner
 ONLY='TestStreamStore|TestFreeSpace|TestNestedJoins'
 # lifted arm — add CRATONVM_JIT_ALLOW_PACKAGES; omit it for the control arm
 TMPDIR=/data/tmp H2_ROOT=/data/data/h2database/h2 CRATONVM_BIN=<binary> \
-  CRATONVM_JIT_ALLOW_PACKAGES='org/h2/,org/antlr/v4/runtime/' \
+  CRATONVM_JIT_ALLOW_PACKAGES='org/h2/' \
   OUTROOT=<out> ./run-h2-suite.sh run --category all --only "$ONLY" --tag lifted
 ```
 
@@ -158,7 +158,8 @@ device" writing to `/tmp` — so build with `TMPDIR=/data/tmp/build`.
 - `docs/known-issues/jit-ban/jit-ban-sweep-20260725.md` — the sweep this came out of.
 - `docs/known-issues/full-ban-inventory-status-20260726.md` — the cross-session
   ban tracker.
-- `docs/known-issues/hib-antlr-1-removed-shadowed-20260726.md` — a concurrent
-  session's isolation test of the `org/antlr/v4/runtime/` half of this same
-  ban, which came back clean; the H2 suite never exercises ANTLR, so that half
-  is now the better-evidenced candidate for narrowing.
+- `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` — the
+  `org/antlr/v4/runtime/` half of this same ban. **Removed 2026-07-27**: the
+  H2 suite never exercises ANTLR, and a 57-class Hibernate HQL A/B came back
+  identical. HIB-LONGTAIL.1 is `org/h2/`-only now, so the three residuals
+  below are all that is left of it.

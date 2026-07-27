@@ -21,7 +21,7 @@ retain full evidence/repro details; this file is the summary.
 | SUNEC-INTPOLY | `sun/security/util/math/intpoly/` | real EC keygen/sign/verify |
 | ANTLR.1 | `groovyjarjarantlr4/` | real groovy-3.0.21.jar |
 | HIB-LONGTAIL.3 | `GenerationTargetToScript.<init>` | shadowing analysis |
-| HIB-ANTLR.1 | `org/antlr/v4/runtime/` | shadowed no-op (see below) |
+| HIB-ANTLR.1 | `org/antlr/v4/runtime/` | real Hibernate ORM 8.0 HQL suite; shadowed no-op when removed, but the shadow (HIB-LONGTAIL.1's second prefix) was itself dropped 2026-07-27 on a 57-class A/B — `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` |
 | TOMCAT-DOHEAD-JUNIT-ITERATOR.1 | `TestClass.collectAnnotatedMethodValues` | real junit-4.13.2, blanket-ban-lifted-too |
 | JSONSMART-PARSER.1 | `net/minidev/json/parser/` | real json-smart-2.3.jar |
 | SPB.9 | `org/slf4j/`,`ch/qos/logback/`,`org/apache/commons/logging/` | real jcl-over-slf4j+logback |
