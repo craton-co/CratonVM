@@ -187,3 +187,33 @@ CRATONVM_DBG_JITC=1 CRATONVM_DBG_RBC6=1 <cratonvm.exe> -Xmx2g -cp "$CP" \
 
 Both diagnostic lines appear within the first ~30 s, long before the class
 would finish.
+
+## Update 2026-07-27 — ban 2 (RBC.6) is lifted; ban 1 (RBC.7) remains
+
+`precise_exception_frame_sites_supported` now admits `invokevirtual` /
+`invokespecial` / `invokeinterface` alongside `invokestatic` and the monitor
+ops, so the RBC.6 refusal of `StringCache.toString` is gone. The widening was
+gated on auditing every lowering the `0xb6 | 0xb7 | 0xb9` codegen arm can
+select — two of its four exits emit no call at all, the inline path is already
+unreachable under `precise_exception_frames` (`inline_sites.clear()`), and the
+remaining two both end in `emit_post_invoke_exception_check`. The sibling
+tail-call, which tears the frame down before the callee runs and so escapes the
+handler, is now suppressed inside protected ranges
+(`x64::Compiler::pc_is_protected`); that was a pre-existing hole for
+`invokestatic`, which this whitelist always admitted.
+
+This addresses direction 3 of "What a fix would involve" above — though by
+proving the *lowerings* safe rather than by pattern-matching the javac
+`synchronized` shape, which is strictly more general.
+
+**This does not on its own close this document.** Ban 1 (RBC.7 — a method
+containing `invokedynamic` is permanently OSR-denied) is untouched, and
+`testGetMethodPerformance` is a once-invoked harness method whose hot loop is
+inline, so OSR remains the only way it can run compiled. Expect the
+compiled→interpreted→compiled transition through `StringCache.toString` to be
+gone and the per-iteration cost to drop, but the loop control itself still
+interprets until RBC.7's premise is removed (direction 2: link
+`invokedynamic` in compiled code instead of lowering it to a trap).
+
+Sibling doc `23-charsetcache-pathological-slowdown.md` shares this gate and was
+half-closed by the same change (its `timeFull < timeNone` assertion now passes).

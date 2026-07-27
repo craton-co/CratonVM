@@ -7399,16 +7399,79 @@ fn local_handler_reads_unsafe_local(
     false
 }
 
+/// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
+///
+/// **Default OFF (2026-07-27).** The relaxation (added by `83e078aa5`) compiles
+/// methods whose exception handler reads a local beyond the incoming
+/// parameters, on the promise that every throwing site in the protected range
+/// publishes a precise exceptional frame. Measured against that promise, the
+/// handoff still loses live values:
+///
+/// | build (json-smart round-trip probe, `-Xmx64m`, 200k ops/run) | first error |
+/// |---|---|
+/// | dev before `83e078aa5` | none |
+/// | dev at/after `83e078aa5` | iteration 400-5,000 |
+/// | same, with this gate closed | none |
+///
+/// The failures are lost-object failures, not exception-handling failures: a
+/// re-parse returns one of the document's own keys, or a
+/// `ClassCastException: java.lang.Object cannot be cast to JSONArray` — an
+/// unrelated object standing where a live one used to be, i.e. a value dropped
+/// from a reconstructed frame (and with it, from the GC's view of that frame).
+/// One input to that has been fixed separately (the liveness scan behind the
+/// snapshot had no exception edges — see
+/// `regalloc::live_locals_per_pc_with_handlers`), but the shape survives it, so
+/// the admission stays closed until the handoff itself is proven.
+///
+/// Set `CRATONVM_JIT_PRECISE_HANDLER_FRAMES=1` to re-open it while working on
+/// it. Repro: `docs/known-issues/repros/jsonsmart/JsonSmartProbeWarmed.java`
+/// under `-Xmx64m`; writeup:
+/// `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+fn precise_handler_frames_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_PRECISE_HANDLER_FRAMES").is_some()
+    })
+}
+
 /// Whether every potentially throwing bytecode covered by this method's
 /// exception table already exits through an x64 runtime call site that can
 /// publish a precise reason-9 exceptional frame.
 ///
-/// This deliberately recognises only `invokestatic` and monitor operations.
-/// It is enough for javac's ordinary synchronized-loop shape (the synthetic
-/// catch-all protects arithmetic/control-flow plus `monitorexit`) while
-/// keeping array, field, allocation, cast, divide, `athrow`, and ldc failure
-/// paths behind the existing params-only safety gate until each of those
-/// lowerings publishes the same snapshot.
+/// This recognises the four invoke opcodes plus the monitor operations, and
+/// keeps array, field, allocation, cast, divide, `athrow` and ldc failure paths
+/// behind the existing params-only safety gate until each of those lowerings
+/// publishes the same snapshot.
+///
+/// The three non-static invokes (`invokevirtual` / `invokespecial` /
+/// `invokeinterface`, 0xb6/0xb7/0xb9) were added 2026-07-27 after auditing
+/// every lowering their codegen arm can select. Refusing them left ordinary
+/// `try`/`catch` methods permanently interpreted:
+/// `org.apache.tomcat.util.buf.CharsetCache.getCharset` (tomcat doc 23) and
+/// `org.apache.tomcat.util.buf.StringCache.toString` (tomcat doc 30) each die
+/// on a single `invokevirtual` inside their protected range, and an
+/// interpreted `getCharset` costs ~15us per call against ~2us compiled.
+///
+/// The `0xb6 | 0xb7 | 0xb9` arm of `x64::compile` has exactly four exits, and
+/// all four are safe:
+///
+/// * the scalar-replacement `<init>` skip and the `java/lang/Object.<init>()V`
+///   elision emit no call at all, so they cannot throw;
+/// * the inline path is unreachable here — `try_compile_inner` already runs
+///   `inline_sites.clear()` whenever `precise_exception_frames` is set, for
+///   exactly this reason (an inlined callee's throwing operations would land in
+///   this body without independently snapshotting each one); and
+/// * the direct-call path and the MIC / `jit_invoke_dispatch` path both end in
+///   `emit_post_invoke_exception_check`, which is what builds and records the
+///   reason-9 deopt point.
+///
+/// The one lowering that could not honour this is the sibling tail-call, which
+/// tears the frame down before the callee runs, so a throw escapes past the
+/// handler covering that pc. It is now suppressed inside protected ranges
+/// outright (`x64::Compiler::pc_is_protected`) — that was a latent hole for
+/// `invokestatic`, which this list has always admitted, not something the
+/// opcodes added here introduced.
 #[cfg(target_arch = "x86_64")]
 fn precise_exception_frame_sites_supported(
     code: &[u8],
@@ -7436,9 +7499,13 @@ fn precise_exception_frame_sites_supported(
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
+        // 0xb6 invokevirtual, 0xb7 invokespecial, 0xb8 invokestatic,
+        // 0xb9 invokeinterface, 0xc2/0xc3 monitorenter/monitorexit.
+        // 0xba (invokedynamic) is deliberately NOT here: it lowers to an
+        // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb8 | 0xc2 | 0xc3)
+            && !matches!(op, 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
         {
             return false;
         }
@@ -7736,11 +7803,13 @@ fn try_compile_inner(
         if unsafe_local {
             #[cfg(target_arch = "x86_64")]
             {
-                if !precise_exception_frame_sites_supported(
-                    code,
-                    code_len,
-                    &cached.exception_table,
-                ) {
+                if !precise_handler_frames_enabled()
+                    || !precise_exception_frame_sites_supported(
+                        code,
+                        code_len,
+                        &cached.exception_table,
+                    )
+                {
                     // A handler that reads a later local remains interpreted
                     // unless every throwing site in its protected ranges can
                     // publish that local through the precise exceptional-frame
@@ -9498,6 +9567,17 @@ fn try_compile_inner(
     // attempt cannot leak the request into the next method compiled on this
     // thread.
     x64::set_precise_exception_frame_request(precise_exception_frames);
+    // Same one-shot contract, set at the same point and for the same reason.
+    // Unlike the flag above this is published for EVERY method with handlers,
+    // not just the precise-frame ones: the sibling tail-call it suppresses
+    // escapes a handler regardless of how that handler reconstructs its locals.
+    x64::set_protected_ranges_request(
+        cached
+            .exception_table
+            .iter()
+            .map(|entry| (entry.start_pc as u32, entry.end_pc as u32))
+            .collect(),
+    );
     // Pure-kernel GPR local homes: this is the METHOD-ENTRY compile path
     // (OSR artifacts go through the interpreter's `compile_osr_artifact`,
     // which never sets this), so request the kernel register homes. The

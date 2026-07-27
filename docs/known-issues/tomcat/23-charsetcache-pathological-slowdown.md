@@ -1,7 +1,13 @@
 # `TestCharsetCachePerformance` — the cached paths lose to the uncached one
 
-**Status:** OPEN. Root-caused (2026-07-27) and partially fixed; the headline
-defect is understood but its fix is a JIT project, not a charset one.
+**Status:** OPEN, **half fixed** (2026-07-27). The `timeFull < timeNone`
+assertion now PASSES; `timeLazy < timeNone` still fails.
+
+The RBC.6 admission gate described below as "why this was not fixed here" WAS
+subsequently fixed — see *Update* at the end — which is what flipped the first
+assertion. `CharsetCache.getCharset` now compiles, yet the `LazyCsCache` arm is
+still ~835s, so compilation admission was necessary but not sufficient and
+something further remains in that arm.
 
 Confirmed CratonVM-only — passes on HotSpot in the same fixture.
 
@@ -157,3 +163,111 @@ Distinct from the general interpreter/JIT throughput ceiling in
 `04-embedded-server-throughput-wall-OPEN.md`.
 Those are roughly-uniform overhead versus HotSpot. This is a specific method
 being refused compilation outright, plus a set of now-fixed hot-path defects.
+
+## Update 2026-07-27 — RBC.6 gate removed; first assertion now passes
+
+The "why this was not fixed here" reservation above has been resolved. The
+`0xb6 | 0xb7 | 0xb9` codegen arm was audited: all four of its exits are safe
+(two emit no call at all; the inline path is already unreachable because
+`try_compile_inner` clears `inline_sites` under `precise_exception_frames`; and
+the direct-call and MIC/`jit_invoke_dispatch` paths both end in
+`emit_post_invoke_exception_check`). The only lowering that could not honour
+the contract was the **sibling tail-call**, which tears the frame down before
+the callee runs — a latent hole for `invokestatic`, which the whitelist had
+always admitted, not something the new opcodes introduced. It is now suppressed
+inside protected ranges (`x64::Compiler::pc_is_protected`, fed by a one-shot
+thread-local carrying the exception table's `[start_pc, end_pc)` ranges).
+
+`precise_exception_frame_sites_supported` now admits 0xb6/0xb7/0xb8/0xb9 plus
+the monitor ops. `invokedynamic` (0xba) is still excluded — it lowers to an
+unconditional deopt trap, not a frame-publishing call site.
+
+Result on the real class:
+
+| arm | before | after |
+|---|---|---|
+| `NoCsCache` (control) | 60.5s | 60.8s |
+| `FullCsCache` | 89.9s | **36.7s** |
+| `LazyCsCache` | 909s | 835s |
+
+`assertTrue(timeFull < timeNone)` — **PASSES** (full/none 1.49 → 0.60).
+`assertTrue(timeLazy < timeNone)` — still fails (13.7).
+
+`CharsetCache.getCharset` is confirmed compiled now
+(`hot_but_stuck_in_interpreter` 1 → 0, `c1=1`).
+
+### The remaining `LazyCsCache` gap is NOT admission
+
+With `getCharset` compiled, the same binary gives wildly different per-op costs
+depending only on the *driver* shape:
+
+* `LazyDiag` (single thread, direct `CharsetCache` local, loop in `main`):
+  **1961 ns/op**
+* `WarmCmp` (single thread, call through a one-method interface):
+  **12152 ns/op**
+
+Both compile `getCharset`. Call-site polymorphism was ruled out — running the
+lazy probe *first*, while its call site is still monomorphic, measures the same
+~12000 ns/op. So the residual is a third factor, not yet identified, and it is
+what the surviving assertion is measuring. That is the next thing to chase for
+this doc; the admission gate is no longer in the way.
+
+Validation for the gate change: `jit_local_exception_handler_tests` 8/8 (the
+suite guarding this exact property, including the
+`AthrowCountBisect.twoThrowsSequential` silent-wrong-checksum regression the
+params-only rule was added for), plus a `HandlerLocals` conformance probe
+(handler reads a local assigned before the try / inside the try / across
+sequential and nested try blocks / behind a `synchronized` block / reassigned
+after the call, with the throwing call reached through each invoke opcode
+including one in tail position) — byte-identical on CratonVM and HotSpot.
+
+## Update 2026-07-27 (2) — the third factor: try/catch excludes a method from C2
+
+The residual flagged above ("NOT admission … a third factor, not yet
+identified") is now identified: **a method with an exception table never enters
+the optimizing IR pipeline at all**, so it is permanently limited to
+single-pass-backend code quality — worth ~7x here.
+
+`jit/src/lib.rs:7831` gates the whole IR/C2 path on
+`cached.exception_table.is_empty()`. The rationale is in the STUB-S8 comment
+directly above it: the IR builder has no exception-table-aware codegen — a
+handler entry is not a registered merge target, so the builder would walk
+handler bytecode with stale `ctrl`/`locals`/`stack` from wherever the linear PC
+walk last was, producing orphaned nodes referencing `NO_NODE` that the
+scheduler/lowerer still visit (panicking in `ir_lower::slot_of` on a `u32::MAX`
+index).
+
+Measured with `LazyIsolate`, which changes exactly one thing per variant —
+300k iterations, single thread, same binary, same run:
+
+| variant | CratonVM | HotSpot |
+|---|---|---|
+| d4 clone of `getCharset`, handler reads a non-param local, `try` | 8252 ns/op | 74 |
+| d5 **identical, `try`/`catch` removed** | **1094 ns/op** | 85 |
+| d8 same but handler reads ONLY parameters, `try` | 7091 ns/op | 17 |
+| d9 **identical, `try`/`catch` removed** | **1149 ns/op** | 61 |
+| d7 plain `ConcurrentHashMap` control | 1339 ns/op | 72 |
+
+d8/d9 are the important pair: that handler reads only parameters, so
+`local_handler_reads_unsafe_local` is false and `precise_exception_frames` is
+never engaged — and it is still ~6x slower than its no-`try` twin. So this is
+**not** the RBC.6 escape hatch being expensive; it is the flat
+`exception_table.is_empty()` requirement on C2. The catch block is never
+entered in any variant; the cost is entirely static.
+
+That closes out the "why is `LazyCsCache` still slow" question for this doc:
+`CharsetCache.getCharset` has a `try`/`catch (UnsupportedCharsetException)`,
+so even now that it compiles it can only ever be C1-quality.
+
+### What a fix requires
+
+Exception-table support in the IR builder: register each handler entry as a
+merge target with a correctly-typed `ctrl`/`locals`/`stack` state, so the
+handler's bytecode is built as a real CFG block rather than walked over. That
+is a self-contained but non-trivial IR project, and it would lift a ceiling
+that applies to **every** `try`/`catch` method in every workload — not just
+this test. It is almost certainly worth more than anything else named in this
+document.
+
+Reproduce the measurement with the `LazyIsolate` probe shape above; the d5/d9
+"delete the try/catch, change nothing else" control is what makes it airtight.
