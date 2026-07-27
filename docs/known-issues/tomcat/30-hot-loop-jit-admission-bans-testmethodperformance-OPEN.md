@@ -1,10 +1,10 @@
 # Two conservative JIT-admission bans leave `TestMethodPerformance`'s whole hot path interpreted
 
 **Status:** 🔴 **OPEN.** Residual of
-[24](24-stringcache-oom-under-load.md) (whose `OutOfMemoryError` is FIXED).
+[24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) (whose `OutOfMemoryError` is FIXED).
 This is a *throughput* residual, in the family of
 [04](04-embedded-server-throughput-wall-OPEN.md) and
-[29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) — but unlike those it
+[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) — but unlike those it
 is root-caused here to two **specific, named** admission gates, both of which
 were added deliberately to close real silent-corruption bugs.
 
@@ -13,10 +13,23 @@ were added deliberately to close real silent-corruption bugs.
 `org.apache.tomcat.util.http.TestMethodPerformance` runs 6 × 100 000 000
 iterations of `mb.setBytes(...); mb.toStringType();` and then 6 × 100 000 000
 of `Method.bytesToString(...)`. HotSpot finishes the class in **41.2 s**.
-CratonVM sustains ≈ **33 000 iterations/s** on the first loop against
-HotSpot's ≈ 15 000 000/s, i.e. the class needs on the order of **hours**, not
-seconds. Before the [24](24-stringcache-oom-under-load.md) fix this was masked:
-the run died with a spurious OOM at ~150-600 s and never reached a timeout.
+
+Measured end-to-end on the post-[24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) binary,
+from the class's own printout:
+
+```
+.MessageBytes conversion took :3820342393100ns      (CratonVM, one 100M loop)
+MessageBytes conversion took :6573830400ns          (HotSpot, same loop)
+```
+
+**3820 s vs 6.6 s for the same 100M iterations — ~580x.** Six such loops put
+phase 1 alone at ~6.4 hours, so the class cannot finish inside any suite
+timeout. Before the bug-24 fix this was masked: the run died with a spurious
+OOM at ~150-600 s and never reached a timeout.
+
+That same run is also the end-to-end confirmation for bug 24 — it cleared
+200 000 000+ iterations with no `OutOfMemoryError`, against a pre-fix baseline
+that died before 10 000 000.
 
 ## Root cause — two independent admission bans on the same hot path
 
@@ -64,6 +77,16 @@ method whose exception handler reads a local it has not itself written. The
 javac-generated monitor handler that does exactly that (it reloads the monitor
 local to `monitorexit` it), so the method is refused.
 
+> **This gate is analysed canonically in
+> [23](23-charsetcache-pathological-slowdown.md)**,
+> which reached it independently the same day via
+> `CharsetCache.getCharset` and went further: RBC.6 fires on *ordinary*
+> try/catch too, because only **parameter** slots count as reconstructible, and
+> the `precise_exception_frames` escape hatch whitelists only
+> `invokestatic`/`monitorenter`/`monitorexit` — so one `invokevirtual` inside
+> the try region is enough. Read 23 before touching this gate; the two docs
+> describe one bug with two victims.
+
 This one sits in the *middle* of the per-iteration call chain — `toStringType`
 → `ByteChunk.toString` → **`StringCache.toString`** → `ByteChunk.toStringInternal`
 — and both of its neighbours DO compile, so every iteration pays a
@@ -72,11 +95,13 @@ the synchronized block: `tomcat.util.buf.StringCache.byte.enabled` is false by
 default, so `bcCache` is null and the method falls straight through to
 `toStringInternal`. The ban is purely static.
 
-The bail is also **silent** by default: it reports only
-`backend_attempted=false` under `CRATONVM_DBG_JITC`, which reads like a
-transient resolver miss. Naming the gate requires the separate
-`CRATONVM_DBG_RBC6=1`. A "hot method never compiles, no diagnostic says why"
-shape is worth making self-reporting.
+The bail used to be **silent**: it reported only `backend_attempted=false`
+under `CRATONVM_DBG_JITC`, which reads like a transient resolver miss. Fixed
+here — the refusal now names itself on the default trace as
+`resolver-bail site=rbc6-handler-reads-unsafe-local`. The fastest first check
+for this whole shape is `CRATONVM_DBG_JIT_METHOD_STATS=1`, which prints
+`hot_but_stuck_in_interpreter=N` with the offending method and its
+`tier_fail_count`.
 
 ## Supporting measurements (isolated probes, this host, JDK 25 HotSpot control)
 
@@ -132,12 +157,16 @@ value/risk:
    fixing it does not require relaxing any safety property.
 2. **Link `invokedynamic` in compiled code** instead of lowering it to an
    unconditional trap. That removes RBC.7's premise rather than its check.
-3. **Narrow RBC.6** to the handlers it actually needs: a javac-generated
-   `synchronized`-block monitor handler is a recognisable shape whose "unsafe"
-   local read is provably the monitor slot the `monitorenter` wrote.
-4. **Make the silent bails self-reporting** — fold the `rbc6-dbg` reason into
-   the default `compile-bail` line so "hot method never compiles" is one run,
-   not three.
+3. **Narrow RBC.6** — but see
+   [23](23-charsetcache-pathological-slowdown.md)
+   first, which spells out why the obvious narrowing (widening
+   `precise_exception_frame_sites_supported` to `invokevirtual`) is *unsafe*:
+   several invoke lowerings in `jit/src/x64.rs` deliberately bypass
+   `emit_post_invoke_exception_check`, and inlined callees never reach the
+   caller's check, so widening reintroduces silent-wrong-locals. Doing it right
+   means auditing every invoke lowering to publish the reason-9 frame first.
+4. ~~Make the silent bails self-reporting~~ — **done**, see the trace line
+   above.
 
 ## Reproduction
 
