@@ -130,7 +130,14 @@ baseline (`apps/tomcat/.suite/clsrun/{h2tls-craton-fix,h2tls-hotspot}`):
 * **HTTP/2 group: 42/44 PASS.** The two exceptions are not this bug:
   * `TestHttp2Limits` — HANG at the 300s suite timeout under 3-way parallel
     load; **PASSes in 393s when run serially**. Throughput wall (group 04).
-  * `TestHttp2Section_8_2` — HANGs on HotSpot too (doc 29).
+  * `TestHttp2Section_8_2` — never completes on **any** VM: HANG at 600s on
+    HotSpot, on CratonVM with this fix (470 tests in), and on a CratonVM
+    control binary **without** it (486 tests in). One run of ~700 did die at
+    343s with a SIGSEGV in the JULI `AsyncFileHandlerWriter` thread executing a
+    stale JIT code address (`rip=0x1C46C9D0000`, "faulting access: execute",
+    cache generation 3447) — a nondeterministic JIT code-cache fault that did
+    NOT reproduce on re-run past the same point, and unrelated to TLS. Tracked
+    under doc 29, not here.
 * No regressions. Every remaining CratonVM-only non-PASS in the sweep belongs to
   an already-open doc or is a fixture gap:
   * `TestSsl`, `TestClientCert`, `TestCustomSslTrustManager`,
