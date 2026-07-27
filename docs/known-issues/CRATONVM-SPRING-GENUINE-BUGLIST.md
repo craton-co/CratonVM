@@ -1,4 +1,399 @@
-# CratonVM Spring suite — genuine bug list (dev `8719dca85`)
+# CratonVM Spring suite — genuine bug list (dev `57c89f2de`)
+
+| | |
+|---|---|
+| **Status** | OPEN — **21 residual classes**, down from the 57 captured on 2026-07-27 (see the "second session" entry below for the six VM fixes and two harness fixes that closed the other 36, and for the per-class state of what is left). The older "127 non-passed of 2925" figure is superseded: 73 of those 74 `EMPTY` classes were `Abstract*Tests`/annotation-interface entries the runner should never have indexed, and the runner no longer does. |
+| **Captured** | 2026-07-27 (second session), branch `fix/spring-buglist-close-20260727` merged forward to `origin/dev` `ffc7f90d4`, Azure host `20.83.144.174`, real JDK 25. The baseline it improves on is the 2026-07-27 full 8-shard run recorded immediately below. **The shared host ran at load 70–100 throughout, so batch runs emit spurious FAIL/TIMEOUT rows — re-check any residual in isolation before believing it.** |
+
+## 2026-07-27 suite-wide reconfirmation: current numbers, named remaining clusters
+
+Full-suite run (all 2925 classes, `--category all`, 8-way sharded, jit-real,
+real JDK 25), immediately followed by re-running just the non-passed set
+after merging `origin/dev` forward from `346c74b71` to `57c89f2de`
+(hundreds of intervening commits from concurrent sessions). Numbers below
+are **after** the merge.
+
+### Top-line
+
+| status | classes |
+|---|--:|
+| OK | 2798 |
+| FAIL | 47 |
+| EMPTY | 74 (**70 are `Abstract*Tests` harness false-positives — see below**) |
+| LOADERR | 3 |
+| TIMEOUT | 3 |
+| **Total** | 2925 |
+
+### `EMPTY` cluster (74) — mostly not a bug, a harness discovery gap
+
+**70 of the 74** `EMPTY` classes are literally named `Abstract*Tests`
+(e.g. `aop.framework.AbstractAopProxyTests`, `oxm.AbstractMarshallerTests`,
+`test.context.transaction.AbstractTransactionalSpringTests`) — real Java
+`abstract` classes meant only to be extended by concrete subclasses, with
+zero `@Test` methods of their own. **0 tests found is the objectively
+correct result** for these under any JVM; this is `run-suite.sh discover`'s
+own `find ... -name '*Tests.class'` filename heuristic picking up abstract
+classes it shouldn't index as runnable standalone classes (it doesn't
+check the `ACC_ABSTRACT` flag). Not a CratonVM bug. **Fix**: teach
+`discover()` to skip abstract classes (check the class file's access flags,
+or simpler: `javap`/reflection-check each candidate before indexing) so
+these stop inflating the "non-passed" count in every future run.
+
+The remaining **4** are genuinely worth a look — not obviously abstract,
+possibly a JUnit5-feature discovery gap (interface default test methods /
+generic type-parameterized test classes) rather than a VM bug, but not
+confirmed either way this session:
+```
+test.context.async.AsyncMethodsSpringTestContextIntegrationTests
+test.context.junit.jupiter.defaultmethods.GenericComicCharactersInterfaceDefaultMethodsTests
+test.context.junit.jupiter.generics.GenericComicCharactersTests
+web.servlet.handler.PathPatternsParameterizedTest
+```
+
+### `TIMEOUT` cluster (3) — all already tracked, no new investigation needed
+
+```
+context.aot.ApplicationContextAotGeneratorTests
+core.io.buffer.DataBufferTests
+test.context.aot.AotIntegrationTests
+```
+All three are pre-existing, extensively characterized hangs — see the AOT
+bean-registration TIMEOUT cluster and Blocker 1/2 sections elsewhere in
+this doc, and
+[`../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`](../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md).
+Also independently reconfirmed genuine (not slow-but-finite) at a 1500s
+ceiling on 2026-07-26.
+
+### `LOADERR` cluster (3) — likely host-contention artifacts, needs an isolated rerun to confirm
+
+```
+LOADERR beans.PropertyDescriptorUtilsPropertyResolutionTests :: java.lang.OutOfMemoryError: Java heap space (anewarray component 0 length 0)
+LOADERR beans.factory.aot.BeanRegistrationsAotContributionTests :: java.lang.OutOfMemoryError: Java heap space (anewarray component 0 length 0)
+LOADERR web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests :: java.lang.NoClassDefFoundError: org/junit/platform/commons/util/ExceptionUtils
+```
+Two `OutOfMemoryError`s and a `NoClassDefFoundError` on a core
+JUnit-Platform class that is trivially always on the classpath — the
+latter in particular looks like memory/resource pressure corrupting
+classloading rather than a real missing dependency. This run used
+`CRATONVM_DEFAULT_HEAP_MAX_MB=2048` with 8 shards running concurrently on
+a host that had 30+ other sessions' builds/tests running at the same
+time (see other memory notes on this host's contention). Not re-verified
+in isolation this session — do that before treating these as VM bugs.
+(`BeanRegistrationsAotContributionTests` is also independently known-slow/
+perf-bound per the TIMEOUT cluster doc — plausible this is that same
+class simply going OOM instead of hanging, depending on host load that
+run.)
+
+### `FAIL` cluster breakdown (47) — named by common signature
+
+**A. Suite-runner CWD/resource-path artifacts (3) — NOT CratonVM bugs.**
+All fail trying to resolve a resource relative to the process's working
+directory, which is `apps/spring-suite-runner/`, not the owning module's
+test-resources root:
+```
+oxm.jaxb.Jaxb2UnmarshallerTests :: Resource does not exist: file [.../spring-suite-runner/src/test/schema/flight.xsd]
+test.context.groovy.AbsolutePathGroovySpringContextTests :: Failed to load ApplicationContext (classpath:/.../context.groovy)
+test.context.env.ExplicitPropertiesFileTestPropertySourceTests :: Failed to load ApplicationContext (file:src/test/resources/.../explicit.properties)
+```
+Harness gap (working-directory-relative resource resolution), not a VM
+defect — needs the suite runner to `cd` into each module before invoking
+`KRun`, or resolve resources against the module root instead of the
+runner's own CWD.
+
+**B. `synchronized` block NPE — "Cannot enter synchronized block because
+`this.lock` is null" (3) — recurrence of a previously-fixed bug family.**
+```
+scripting.bsh.BshScriptFactoryTests
+scripting.config.ScriptingDefaultsTests
+scripting.groovy.GroovyScriptFactoryTests
+```
+Identical message across all three. This is the same symptom shape as the
+`CopyOnWriteArrayList` "this.lock is null" bug fixed `68c44f62`
+(`register_properties_sidetable` whole-function category-tagging gap,
+documented in
+[`../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md`](../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-TIMEOUT-CLUSTER-1500S-RERUN.md))
+-- but for a *different* class this time (scripting-related, not
+`java.util.concurrent`). Worth checking whether it's the same native
+category-tagging gap hitting a new class, or a new instance of the same
+bug shape. Not re-investigated this session.
+
+**C. In-memory `TestCompiler`/AOT-javac `CompilationException` (5) —
+already-tracked AOT/javac cluster, still open.**
+```
+beans.factory.aot.BeanDefinitionPropertyValueCodeGeneratorDelegatesTests
+beans.factory.aot.CodeWarningsTests
+context.index.processor.CandidateComponentsIndexerTests (IllegalStateException: Compilation failed -- same family)
+core.test.tools.TestCompilerTests
+test.context.aot.TestContextAotGeneratorIntegrationTests
+```
+See the existing AOT bean-registration / in-memory-javac sections
+elsewhere in this doc and in the TIMEOUT-cluster doc; no new
+characterization needed.
+
+**D. AOT bean-registration codegen `AssertionError` (4) — already-tracked
+AOT cluster, still open.**
+```
+aot.nativex.FileNativeConfigurationWriterTests
+beans.factory.annotation.AutowiredAnnotationBeanRegistrationAotContributionTests
+beans.factory.aot.BeanDefinitionMethodGeneratorTests
+beans.factory.aot.InstanceSupplierCodeGeneratorTests
+```
+
+**E. CGLIB enhancer synthetic `$$beanFactory` field access inside
+`BeanCreationException` (2) — possibly related to "Blocker 2" elsewhere in
+this doc, not confirmed.**
+```
+context.annotation.BeanMethodPolymorphismTests :: .../BeanMethodPolymorphismTests$Config$$SpringCGLIB$$0.$$beanFactory
+context.annotation.NestedConfigurationClassTests :: .../S1ConfigWithProxy$$SpringCGLIB$$0.$$beanFactory
+```
+Both fail accessing a CGLIB-synthesized `$$beanFactory` field on a
+`$$SpringCGLIB$$0` enhanced class. Worth cross-checking against Blocker
+2's `Class.getDeclaredMethods()`/dynamically-defined-class investigation
+elsewhere in this doc before assuming it's a third, unrelated CGLIB
+defect.
+
+**F. Static-resource-serving 404s (3) — needs environmental-vs-bug
+triage.**
+```
+test.web.servlet.samples.client.context.WebAppResourceTests :: Status expected:<200 OK> but was:<404 NOT_FOUND>
+test.web.servlet.samples.context.WebAppResourceTests :: Status expected:<200> but was:<404>
+web.reactive.resource.ResourceWebHandlerTests :: 404 for test/foo%20with%20spaces.css
+```
+Could be a missing test-resource file on this classpath (environmental)
+or a genuine URL-decoding/static-resource-lookup bug (the
+space-in-filename case is suspicious) — not distinguished this session.
+
+**G. JMX MBean registration residuals (2) — recheck against the
+previously-CLOSED JMX cluster.**
+```
+jmx.export.MBeanExporterTests :: [Must have unregistered all previously registered MBeans due to RuntimeException]
+transaction.annotation.AnnotationTransactionNamespaceHandlerTests :: UnableToRegisterMBeanException ... key 'testBean'
+```
+Memory of this project's JMX work says that cluster was closed 26/26 —
+this may be a regression, or a batch-ordering artifact (a prior class in
+the same 8-per-batch run leaking an MBean registration into the next
+class), not necessarily a fresh bug. Rerun `--batch 1` on both before
+concluding either way.
+
+**H. Long-tail singleton residuals (~20) — not clustered, one-off
+`AssertionError`/`NullPointerException`/misc failures each** across
+`core.annotation.MergedAnnotationsTests`, `core.io.PathResourceTests`,
+`core.io.ModuleResourceTests`, `core.io.support.*`,
+`format.datetime.DateFormattingTests`,
+`messaging.simp.config.MessageBrokerConfigurationTests`,
+`orm.jpa.support.PersistenceInjectionTests`,
+`resilience.ConcurrencyLimitTests`,
+`test.context.junit.jupiter.{event,parallel}.*` (2, parallel-execution
+flakiness — possibly host-load timing, not investigated),
+`test.web.servlet.assertj.MockMvcTesterIntegrationTests`,
+`util.SerializationUtilsTests`,
+`web.context.support.StandardServletEnvironmentTests`,
+`web.method.annotation.RequestHeaderMethodArgumentResolverTests` (+
+its reactive twin), `web.reactive.function.client.{DefaultWebClientTests,WebClientIntegrationTests}`,
+`web.servlet.config.annotation.WebMvcConfigurationSupportTests`,
+`web.reactive.result.view.FragmentViewResolutionResultHandlerTests`
+(NPE inside AssertJ's own `Objects.assertEqual` — likely the same
+AssertJ-native-shim-null-field family as the now-fixed
+`spring-kotlin-reflect-illegalstateexception-root-FIXED.md`'s second bug —
+worth a quick cross-check),
+`test.context.bean.override.mockito.MockitoBeanByTypeLookupForConstructorParametersIntegrationKotlinTests`
+(`[is a Mockito mock]` — unrelated to the now-fixed Kotlin-reflect
+cluster, confirmed by cross-check when that doc was closed).
+
+None of H were individually root-caused this session — grouped here so
+the next person doesn't have to re-run the full suite just to get this
+list again.
+
+
+## 2026-07-27 (second session) — six VM bugs + two harness gaps; 57 residual classes → 21
+
+Worktree `/data/data/wt-sprbuglist-20260727` (branch
+`fix/spring-buglist-close-20260727`, from `origin/dev` `60a710ad8`, merged
+forward to `ffc7f90d4`), Azure host `20.83.144.174`, real JDK 25, binaries
+`localbin/cratonvm-sprbuglist-v*.bin`. No subagents, per this task's standing
+instruction.
+
+Method: re-ran the exact 57 "meaningful residual" classes the section below
+names, fixed what the failures actually pointed at, re-ran. Every fix has a
+standalone HotSpot-vs-CratonVM probe under
+`/data/data/wt-sprbuglist-20260727/probes/`.
+
+**Two things to know before reading the older sections below**: the
+`EMPTY` cluster and the "static-resource 404" cluster were harness artifacts,
+not VM bugs, and the whole `CompilationException` cluster was one collection
+bug. Those sections are kept for history but their conclusions are superseded.
+
+### Fix 1 — `LinkedHashSet.remove(Object)` returned `false` while removing
+
+`native_linkedhashset_remove` (`native-builtins/src/properties_sidetable.rs`),
+an override that only wants `Properties.keySet()` snapshots, sent every
+*ordinary* `LinkedHashSet` to real bytecode via
+`invoke_virtual_bytecode_only`. Real `HashSet.remove` is
+`return map.remove(o) == PRESENT;`, and this VM's synthetic backing map stores
+an `Int(1)` sentinel rather than JDK `HashSet.PRESENT` — so the identity
+comparison was always false. `HashSet` itself was fine; only `LinkedHashSet`
+carried that extra override.
+
+**This produced the entire section-C `CompilationException: Unable to compile
+source` cluster.** javac's
+`com.sun.tools.javac.comp.Annotate.attributeAnnotation` collects an annotation
+type's elements into a `LinkedHashSet` and logs
+`duplicate element 'value' in annotation @X` when `members.remove(method)`
+returns false — so the **in-process** compiler
+(`ToolProvider.getSystemJavaCompiler()`, which Spring's AOT `TestCompiler`
+uses) rejected *every* source containing an annotation with a `value` element:
+`@SuppressWarnings("...")`, `@Retention`, any custom `@interface`.
+`probes/JavacProbe.java` reproduces it in ~10s and now matches HotSpot on all
+six cases.
+
+Fixed by `try_native_hashset_remove` (new `pub fn` in `native-collections`),
+called from all three bytecode-only fallbacks.
+
+### Fix 2 — real-JDK `ReferenceQueue.lock` was null
+
+`NullPointerException: Cannot enter synchronized block because "this.lock" is
+null` out of `java.lang.ref.ReferenceQueue.enqueue`. The synthetic
+`ReferenceQueue.<init>()V` native writes only the two-slot (head, size) shape;
+a real JDK 25 `ReferenceQueue` also declares `private final Lock lock` that its
+own `enqueue`/`poll`/`remove` bytecode synchronizes on. Fixed by dropping
+**only the constructor** under `drop_real_layout_synthetic` so the real one
+runs. `poll`/`remove` deliberately stay native: the GC reference processor
+enqueues by writing the head slot directly and never notifies that lock, so
+real blocking `remove()` bytecode would wait forever. Slot 1 is `size` (int)
+synthetically but `queueLength` (long) on the real class, so all three writers
+now preserve the stored value's width.
+
+Reached via `Reference.enqueue()` → `ConcurrentReferenceHashMap` purge →
+`AbstractApplicationContext.resetCommonCaches()`, so it broke every *cancelled*
+context refresh — section B's `scripting.{bsh,config,groovy}.*` cluster.
+
+### Fix 3 — `equals(null)` was short-circuited instead of dispatched
+
+Two natives implemented "one side is null ⇒ not equal", but the contracts they
+emulate both end in a virtual `equals(null)`:
+
+- `java.util.Objects.equals(a, b)` is `(a == b) || (a != null && a.equals(b))`.
+- AssertJ's `StandardComparisonStrategy.areEqual` (natively shimmed in
+  `native-builtins/src/test_frameworks.rs`) only short-circuits on a null
+  *actual*; every array branch is guarded by `other != null` and the method
+  ends in `return actual.equals(other)`.
+
+Spring's `NullBean` — the placeholder a `@Bean` method that returned null is
+registered as — is defined as `equals(obj) { return (this == obj || obj ==
+null); }` precisely so `assertThat(getBean(name)).isEqualTo(null)` passes.
+Under the old shims that assertion failed with the self-contradictory message
+`expected: null but was: null`, the signature seen in three unrelated classes.
+
+### Fix 4 — the native config enhancer and real CGLIB minted the same class name
+
+`cce_enhance` generates `<Config>$$SpringCGLIB$$0` itself, bypassing CGLIB.
+Real CGLIB guarantees uniqueness through
+`AbstractClassGenerator$ClassLoaderData.reservedClassNames`; a natively
+generated class is invisible to that set, so the next real-CGLIB generation for
+the same prefix in the same loader picked `$$0` as well. `CglibAopProxy` is
+exactly that case — `ClassUtils.getUserClass` strips the `$$SpringCGLIB$$`
+suffix, so AOP-proxying an enhanced `@Configuration` bean uses the RAW config
+class as its prefix. The second definition took over the name, and every
+symbolic field/method ref naming that class then resolved to the AOP proxy:
+`NoSuchFieldError: ...$Config$$SpringCGLIB$$0.$$beanFactory`.
+
+Both victims passed in isolation and failed 100% deterministically once a test
+that AOP-proxies a `@Configuration` bean ran first. Fixed by wrapping
+`SpringNamingPolicy.getClassName`: delegate to the real bytecode for the
+candidate, then advance the trailing counter past any name already defined in
+this VM.
+
+**This is the same bug shape as the long-running "CGLIB cross-test residual"
+family in the sections below** (`processAheadOfTimeUsesCglibClassForFactoryMethod`
+/ `...WhenHasCglibProxyUseProxy`: pass in isolation, fail deterministically in
+the full class run) — those were closed by an earlier session from the
+`config_enhancer_class_cache` side; this closes the naming side.
+
+### Fix 5 — `java.util.Date(String)` threw `UnsupportedOperationException`
+
+Real JDK defines it as `this(parse(s))`, and `Date.parse(String)` has no native
+override here — it already runs as real bytecode and returns the right value.
+Spring reaches this constructor through `ObjectToObjectConverter`, so
+`@RequestHeader java.util.Date` could not bind an ordinary RFC-1123 header.
+
+### Fix 6 — `InitialContext.getEnvironment()` ignored an installed factory builder
+
+Real JDK: `getDefaultInitCtx().getEnvironment()`. The native went straight to
+the `java.naming.factory.initial` system property and threw
+`NoInitialContextException` when unset — the same omission the
+lookup/bind/rebind/unbind natives were already fixed for. Spring probes JNDI
+availability with exactly `new InitialContext().getEnvironment()` in a
+try/catch, so `StandardServletEnvironment` silently omitted its
+`jndiProperties` source.
+
+### Harness gap 1 — `discover()` indexed classes that cannot be run
+
+`run-suite.sh discover` finds candidates by *filename* (`*Tests.class`), which
+also matches `Abstract*Tests` base classes and JUnit meta-annotation interfaces
+such as `@PathPatternsParameterizedTest`. Zero tests is the correct result for
+those on any JVM. **That accounted for 73 of the 74 `EMPTY` classes**, so the
+"EMPTY cluster" section below is closed. `apps/spring-suite-runner/
+is_concrete.py` now checks `ACC_ABSTRACT`/`ACC_INTERFACE` in the class file and
+drops them: 2925 → 2852 indexed. Only
+`test.context.async.AsyncMethodsSpringTestContextIntegrationTests` is a
+genuinely concrete class that still reports 0 tests (it uses
+`@RepeatedTest(200)`) — a real discovery gap, still open.
+
+### Harness gap 2 — the runner ran every class from its own directory
+
+Section A's three "CWD/resource-path artifacts" were the tip of it. Running
+each class from its owning module's directory (what Gradle does) closed six
+classes outright: `oxm.jaxb.Jaxb2UnmarshallerTests` (0/12 → 12/12),
+`core.io.PathResourceTests` (27/38 → 38/38),
+`test.context.env.ExplicitPropertiesFileTestPropertySourceTests` (6/13 →
+13/13), `test.context.groovy.AbsolutePathGroovySpringContextTests`, and both
+`test.web.servlet.samples.*.WebAppResourceTests` — **so section F's
+static-resource 404s were not a URL-decoding bug, they were the harness.**
+`core.io.support.PathMatchingResourcePatternResolverTests` improved 15/22 →
+19/22.
+
+### What is left (21 classes)
+
+Verified in isolation against the merged binary unless noted. The shared host
+ran at load 70–100 for much of this session, so batch runs produce spurious
+FAIL/TIMEOUT rows — **always re-check a residual in isolation before believing
+it**.
+
+| class | state | note |
+|---|---|---|
+| `beans.PropertyDescriptorUtilsPropertyResolutionTests` | LOADERR | `OutOfMemoryError` during discovery of a JUnit `@ParameterizedClass` + `@FieldSource` class; reproduces in isolation at 2GB **and** 8GB heap, so it is a real allocation blow-up, not host contention |
+| `aot.nativex.FileNativeConfigurationWriterTests` | 2/7 | JSONAssert `Unexpected: comment` — the writer emits a `comment` key the expected JSON does not have |
+| `context.annotation.ConfigurationClassEnhancerTests` | 3/5 | `cce_enhance` ignores the `classLoader` argument and defines into the config class's own loader. Real Spring/CGLIB picks the defining loader per `ReflectUtils.defineClass`'s contextClass/SmartClassLoader rules, which the two failing methods assert case by case |
+| `core.annotation.MergedAnnotationsTests` | 177/178 | `equalsForSynthesizedAnnotations` — a synthesized annotation and a real one are not `equals()`; their `toString()`s show one is a real JDK annotation proxy and the other CratonVM's synthetic |
+| `core.io.ModuleResourceTests` | 2/3 | `ModuleResource(Introspector.class.getModule(), "java/beans/Introspector.class").exists()` is false |
+| `core.io.support.PathMatchingResourcePatternResolverTests` | 19/22 | `encodedHashtagInPath`, plus two `javaDashJarFinds*ClassPathManifestEntries` (`NoSuchElementException: No value present`) |
+| `orm.jpa.support.PersistenceInjectionTests` | 26/27 | unchanged from the older section below |
+| `scripting.groovy.GroovyScriptFactoryTests` | 27/38 | `NoClassDefFoundError` for classes GroovyClassLoader compiles from `.groovy` sources (`GroovyCalculator`, `TestFactoryBean`, `GroovyMessenger2`, `TestCustomizer`) |
+| `test.context.async.AsyncMethodsSpringTestContextIntegrationTests` | EMPTY | `@RepeatedTest(200)` discovery gap |
+| `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | 0/2 | JUnit parallel execution × `ApplicationEvents` |
+| `test.web.servlet.assertj.MockMvcTesterIntegrationTests` | 72/74 | `MockMvcTester.debug()` output-stream capture |
+| `util.SerializationUtilsTests` | 8/9 | `ObjectInputStream.readObject` on a stream naming an undefined class throws `InvalidClassException` where the JDK throws `ClassNotFoundException`; `Class.forName` itself is correct, so the swallow is inside the deserializer |
+| `web.reactive.function.client.DefaultWebClientTests` | 24/25 | |
+| `web.reactive.function.client.WebClientIntegrationTests` | 168/170 | |
+| `web.reactive.result.view.FragmentViewResolutionResultHandlerTests` | 5/6 | reactor `Timeout on blocking read` in the SSE path |
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | the separately tracked ~227×-vs-HotSpot interpreter throughput defect |
+| `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | needs re-measuring on a quiet host — it was 40/40 as of follow-up 10 |
+| `core.io.buffer.DataBufferTests` | TIMEOUT | |
+| `test.context.aot.AotIntegrationTests` | TIMEOUT | |
+| `test.context.aot.TestContextAotGeneratorIntegrationTests` | TIMEOUT | follow-up 9c's `Spliterators.spliterator` hang |
+| `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests` | TIMEOUT | |
+| `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | TIMEOUT | |
+
+Also closed on the way, without a dedicated fix (they were downstream of the
+six above): the whole section-D AOT bean-registration `AssertionError` cluster,
+section G's two JMX residuals, `jndi.JndiObjectFactoryBeanTests` (24/25 → 25/25,
+including the `lookupWithExposeAccessContext` extra-`close()` the section below
+left open), `core.io.ResourceTests`, `format.datetime.DateFormattingTests`,
+`resilience.ConcurrencyLimitTests`, `core.io.support.SpringFactoriesLoaderTests`,
+`core.test.tools.{SourceFileTests,TestCompilerTests}`,
+`context.index.processor.CandidateComponentsIndexerTests`,
+`test.context.web.WebAppConfigurationBootstrapWithTests`, and
+`web.reactive.resource.ResourceWebHandlerTests`.
 
 ## 2026-07-21 late session — non-AOT residual sweep
 
