@@ -62,8 +62,7 @@ started.
   `skip_list.rs`, the package JIT-compiles, and 3,000,000 round-trip parse
   operations produce 0 errors. The one real defect found on re-test was a
   VM-wide JIT bug (a native-shadowed `HashMap.<init>()V` being elided by the
-  trivial-constructor optimisation), now fixed. See
-  `docs/internal/jsonsmart-parser-jit-retired-20260727.md`.
+  trivial-constructor optimisation), now fixed.
 
 ## CONFIRMED still needed, KEPT, each with a dedicated writeup
 
@@ -73,8 +72,19 @@ started.
 - ES fragile cluster (`org/elasticsearch/`) — no fixture, `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`
 - SPB.1 (`org/springframework/util/`) — inconclusive real-app-less repro, `docs/known-issues/spb1-springframework-util-investigation.md`
 - TOMCAT-JNDIREALM-RDN.1 / JIT.2 (`com/unboundid/`) — real Tomcat suite, SIGSEGV confirmed, see `docs/known-issues/jit-skip-list-open-bans-20260725.md`
-- `org/jboss/as/` (WildFly boot, part of the SPB.8b/8c family) — real WildFly boot, `ModelTypeValidator.validTypes` NPE, `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`; WILDFLY-CONTROLLER-JIT.1 transitively confirmed via the same finding
-- `org/h2/` + `org/antlr/v4/runtime/` (HIB-LONGTAIL.1) — real 218-class H2 suite, `Schema not found` reconnect bug, `docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`
+- `org/jboss/as/` (WildFly boot, part of the SPB.8b/8c family) — **BAN LIFTED
+  2026-07-27**. The `ModelTypeValidator.validTypes` NPE that re-confirmed it was
+  not a JIT miscompile: `Runtime.addShutdownHook` was a no-op stub, so MSC's
+  leak-detector `Cleaner` tore the boot down mid-flight once `Main.main`
+  returned. Root-caused and fixed (retired write-up archived under
+  docs/internal); the surviving residual is the flaky
+  `NoSuchMethodError: java/lang/Object.hasNext()Z` in
+  `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`,
+  which reproduces with the ban in place and under `--nojit`.
+  WILDFLY-CONTROLLER-JIT.1 was only *transitively* implicated by that same
+  finding and is therefore no longer backed by it either — it is kept in place
+  pending its own re-test.
+- `org/h2/` (HIB-LONGTAIL.1) — real 218-class H2 suite, `Schema not found` reconnect bug (root-caused and fixed). **The `org/antlr/v4/runtime/` half was removed 2026-07-27** — the H2 evidence never covered it (H2 loads no ANTLR class at all) and a 57-class Hibernate HQL A/B came back equivalent; see `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`
 - HIB-BIGINTEGER-AIOOBE.1/.2 (`java/math/{BigInteger,MutableBigInteger}`) — deterministic repro, no escape hatch by design; now cross-referenced with SUNEC-INTPOLY above
 - TYPES-ERASURE.1 (`com/sun/tools/javac/code/Types.erasure`) — 40/40 repro; consolidation-with-the-other-6-javac-bans hypothesis explicitly REFUTED (see `docs/known-issues/jit-skip-list-open-bans-20260725.md`), so it stays as its own entry alongside SPRING-TESTCOMPILER.1-4/HIB-STOREDPROC-JIT.1 below
 
@@ -96,8 +106,7 @@ the SPB.1/2/8 *individual-method* entries
 today and correct (`--nojit` vs. JIT vs. `CRATONVM_JIT_THRESHOLD=1`, with
 `CRATONVM_DBG_JITC` proving compilation); the rest cannot be compiled at all
 (Rust natives win over their bytecode), are `<init>`s the constructor gate
-already blocks, or are shadowed by other still-active bans. Full writeup:
-`docs/internal/is-known-miscompile-block-retired-20260727.md`.
+already blocks, or are shadowed by other still-active bans.
 
 ## NOT YET RE-INVESTIGATED this session — real, open work, blocked or unclaimed
 
@@ -124,9 +133,11 @@ checkouts onto the host or finding an equivalent real app.
   3.0.21/3.0.8/4.0.22 directly). ANTLR-COLDPATH.1's narrower correctness
   guard inside this package is independently confirmed and stays
   regardless (kept by design, not blocked).
-- **HIB-ANTLR.1** (ordinary, non-shaded ANTLR4 runtime used directly by
-  Hibernate) — not yet investigated this multi-session effort.
-- **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`.
+- ~~**HIB-ANTLR.1**~~ (ordinary, non-shaded ANTLR4 runtime used directly by
+  Hibernate) — DONE. Its own check went 2026-07-26, and the HIB-LONGTAIL.1
+  prefix that was still shadowing it went 2026-07-27; `org/antlr/v4/runtime/`
+  is now genuinely JIT-eligible. See `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`.
+- **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`).
 - **KC26-PIC.1, KC26-RX.1** (Keycloak/picocli/RxJava3) — needs a real
   Keycloac 26.2.4 checkout; not present on this host.
 - **HIB-TEMPORAL.1** (`org/hibernate/`, temporal/DDL type descriptor
@@ -193,8 +204,9 @@ they were built for rather than the technology itself, so the earlier
   `org/hibernate/`) — found a full real Hibernate ORM 8.0 test harness at
   `apps/hibernate-orm-harness/` (compiled `hibernate-core` test classes +
   full runtime classpath + a JUnit5 Platform Launcher driver). HIB-ANTLR.1
-  **REMOVED** (own claim doesn't reproduce, though shadowed by
-  HIB-LONGTAIL.1 regardless). HIB-TEMPORAL.1 **CONFIRMED STILL NEEDED** —
+  **REMOVED** (own claim doesn't reproduce; it was shadowed by
+  HIB-LONGTAIL.1 at the time, and that shadow was itself removed
+  2026-07-27 — the package is JIT-eligible now). HIB-TEMPORAL.1 **CONFIRMED STILL NEEDED** —
   and MORE severe than documented: lifting it causes a full
   `StrategySelectionException` Hibernate bootstrap failure, not just a
   narrow DDL-descriptor NPE.
@@ -206,7 +218,7 @@ they were built for rather than the technology itself, so the earlier
   real regression (`FloatFieldBlockLoaderTests`: 38→41 failures under
   JIT); the true failure surface across the full suite is likely larger,
   not yet fully characterized.
-- **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`.
+- **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`).
 - **KC26-PIC.1 / KC26-RX.1** (Keycloak) — found a full real Keycloak
   26.6.1 Maven repo + bootable quarkus-dist server at
   `/home/victor/.m2/repository/org/keycloak/`. Still blocked, but for a
@@ -243,8 +255,8 @@ literal substring "sportme"; re-ran each name as its own separate `find`
 invocation to avoid this). Zero real matches for `SportMe-master`,
 `ms-course-youtube`, `insurance-backend`, `eureka-server` anywhere under
 `/data` or `/home`. This independently confirms the same conclusion the
-concurrent `fix/jit-ban-sweep-20260725` session already reached (see
-`docs/internal/jit-ban-sweep-20260725.md`'s own SPB.1 section) — this gap
+concurrent `fix/jit-ban-sweep-20260725` session already reached (per that
+session's own SPB.1 findings) — this gap
 is real, not a search-methodology failure like the earlier Groovy/
 Hibernate/ES/Keycloak false negatives were.
 
@@ -281,8 +293,7 @@ Hibernate/ES/Keycloak false negatives were.
    class, `org/junit/internal/MethodSorter`. That fix also cleared 7
    pre-existing SIGABRTs from the default-settings Elasticsearch baseline.
    `JUNIT.1`'s shadowed-no-op claim was re-tested properly with the shadow
-   lifted and now holds. Retired writeup:
-   `docs/internal/blanket-org-junit-ban-undocumented-shadow-20260726.md`.
+   lifted and now holds.
 
 4. **TYPES-ERASURE.1 consolidation hypothesis tested and REFUTED**: the
    open question of whether banning `Types.erasure` alone subsumes the

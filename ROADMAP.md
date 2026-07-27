@@ -1,8 +1,8 @@
 # CratonVM Roadmap
 
 CratonVM is an experimental Java Virtual Machine in Rust. This roadmap lists
-the next milestones in rough priority order. Granular work items live in
-`docs/internal/` and are subject to change.
+the next milestones in rough priority order. Granular, session-level work
+items are tracked internally and are subject to change.
 
 ## Status
 

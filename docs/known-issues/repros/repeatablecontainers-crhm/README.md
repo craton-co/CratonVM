@@ -4,8 +4,7 @@ Standalone probe mirroring `RepeatableContainers$StandardRepeatableContainers`'s
 `Map<Class<?>, Object>` cache pattern (real Spring `ConcurrentReferenceHashMap`,
 `computeIfAbsent` caching either a real object or a `NONE` sentinel, with an
 explicit cast + `!=` sentinel check on read — the exact shape that threw
-`ClassCastException` in
-`docs/internal/springboot/repeatablecontainers-method-cache-classcastexception-FIXED.md`).
+`ClassCastException` in the (since-fixed) `RepeatableContainers` method-cache bug).
 
 Needs only `spring-core-7.0.7.jar` on the classpath (no Spring Boot checkout,
 no Gradle build).
@@ -22,8 +21,7 @@ Exits 1 if any mismatch or `ClassCastException` was observed.
 
 Note: the key-generation loop (many distinct dynamically-defined `Class`
 objects) was previously ALSO subject to an unrelated JIT/OSR loop-duplication
-bug — see `docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`
-and its repro under `../../../internal/fixed-suite-bugs/repros/jit-osr-loop-duplicate-execution/`.
+bug (silent corruption from duplicate loop execution under OSR).
 That bug is now FIXED on `dev`; `keys.size()` should equal `numKeys` again
 regardless of JIT/OSR state. If it does not on the tree you're using, you are
 likely on a pre-fix checkout.
