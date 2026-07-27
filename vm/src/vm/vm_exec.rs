@@ -9053,8 +9053,43 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // enclosing class was defined by a child / bytecode-enhancing loader
             // on that loader's copy of the impl class, not the global one (see
             // `lambda_impl_dispatch_override`).
-            let impl_override =
-                crate::runtime::interpreter::lambda_impl_dispatch_override(self.shared, &lcs);
+            //
+            // Uses the DRIVEN variant, not the passive `lambda_impl_dispatch_override`.
+            // This `NativeContextImpl::invoke_virtual` path is the lambda dispatcher
+            // used when a *native* helper calls back into a lambda — most notably
+            // `native-collections`' Stream pipeline (`stream_process_chain` ->
+            // `invoke_deferred_stream_lambda`). A method reference evaluated only
+            // from inside such a native callback (e.g. `.map(Foo::new)` reached via
+            // `Stream.toList()`) can be the VERY FIRST reference to `Foo` from an
+            // isolated loader's namespace, so the passive cache-only lookup misses
+            // and the `NewInvokeSpecial`/`Invoke*` arms below fall back to the
+            // loader-BLIND `class_manager.load_class(name)` / `invoke_or_native(name)`,
+            // minting an Application-loader copy of a class the isolated loader owns.
+            //
+            // Concrete failure (docs/known-issues/springboot/
+            // micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md):
+            // Spring Boot's `OpenTelemetryEventPublisherBeansApplicationListener`
+            // builds its wrappers with
+            // `getBeansOfType(EventPublisher.class).values().stream()
+            //     .map(EventPublishingContextWrapper::new).toList()`. Under
+            // `@ForkedClassPath`'s `ModifiedClassPathClassLoader` the listener is
+            // child-loader-defined, but the constructor reference resolved
+            // `EventPublishingContextWrapper` (and hence its anonymous
+            // `ContextStorage` subclass `EventPublishingContextWrapper$1`) under the
+            // Application loader. That subclass then inherited the APPLICATION copy
+            // of `io.opentelemetry.context.ContextStorage`, whose default `root()`
+            // returns the Application `ArrayBasedContext.ROOT` — so `Context.current()`
+            // handed back a foreign-loader `Context`, `makeCurrent()` attached to the
+            // Application `ContextStorage` (which has no event-publishing wrapper),
+            // and no `EventPublisher` events were ever published: MDC `traceId`
+            // stayed null and `OtelEventListener.events` stayed empty.
+            // Mirrors the same fix already applied to the sibling `interpreter.rs`
+            // lambda dispatcher (`try_lambda_dispatch`).
+            let impl_override = crate::runtime::interpreter::lambda_impl_dispatch_override_driven(
+                self.shared,
+                self.thread,
+                &lcs,
+            );
             // Dispatch by method handle kind.
             let raw_result = match lcs.impl_handle.kind {
                 MethodHandleKind::InvokeStatic => {
