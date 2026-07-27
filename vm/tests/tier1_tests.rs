@@ -134,8 +134,12 @@ fn t1_hprof_dump_writes_a_real_file() {
 
     // Build a real Vm so self_arc is set, then call dump_heap directly.
     let vm = cratonvm_vm::vm::Vm::new(cfg);
-    let bytes = cratonvm_vm::runtime::hprof::dump_heap(&vm.shared, path.to_str().unwrap())
-        .expect("HPROF dump must succeed on a fresh VM");
+    let bytes = cratonvm_vm::runtime::hprof::dump_heap(
+        &vm.shared,
+        path.to_str().unwrap(),
+        ThreadId(0), // main thread, registered by Vm::new
+    )
+    .expect("HPROF dump must succeed on a fresh VM");
     assert!(bytes > 0, "dump_heap should write a non-zero file");
 
     let raw = std::fs::read(&path).unwrap();
@@ -164,6 +168,105 @@ fn t1_oom_dump_flag_can_be_set_via_config() {
 fn t1_oom_dump_written_flag_starts_unset() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     assert!(!shared.debug.oom_dump_written.load(Ordering::SeqCst));
+}
+
+// ===========================================================================
+// obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording` actually starts a
+// recording at boot, instead of being permanently unreachable.
+// ===========================================================================
+
+#[test]
+fn d12_start_flight_recording_config_defaults_off() {
+    let cfg = VmConfig::default();
+    assert!(cfg.jfr_start_recording.is_none());
+}
+
+#[test]
+fn d12_start_flight_recording_starts_a_running_recording_at_boot() {
+    let mut cfg = VmConfig::default();
+    cfg.jfr_start_recording = Some(cratonvm_vm::config::JfrStartRecordingConfig {
+        filename: None,
+        duration: None,
+        max_age: None,
+        max_events: Some(10_000),
+        dump_on_exit: true,
+    });
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+
+    // The recording this boot path created must exist and be Running — not
+    // just "some global flag somewhere is true", which could race against
+    // another JFR-using test in the same binary (JFR_ENABLED is one
+    // process-wide flag). `jfr_dump_on_exit` names the exact recording id
+    // this VM's own boot path started, so asserting on that recording's own
+    // state is race-free regardless of what else is running concurrently.
+    let target = vm
+        .shared
+        .debug
+        .jfr_dump_on_exit
+        .lock()
+        .clone()
+        .expect("dump_on_exit=true must populate jfr_dump_on_exit");
+    let (recording_id, _filename) = target;
+
+    let fr = vm.shared.debug.flight_recorder.lock();
+    let rec = fr
+        .get_recording(recording_id)
+        .expect("the recording this VM started must still be registered");
+    assert_eq!(rec.state, cratonvm_jfr::RecordingState::Running);
+}
+
+#[test]
+fn d12_start_flight_recording_dump_on_exit_false_leaves_no_exit_target() {
+    let mut cfg = VmConfig::default();
+    cfg.jfr_start_recording = Some(cratonvm_vm::config::JfrStartRecordingConfig {
+        filename: None,
+        duration: None,
+        max_age: None,
+        max_events: None,
+        dump_on_exit: false,
+    });
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+    assert!(vm.shared.debug.jfr_dump_on_exit.lock().is_none());
+}
+
+#[test]
+fn d12_dump_recording_via_the_stashed_exit_target_produces_a_real_jfr_file() {
+    let mut cfg = VmConfig::default();
+    let path = std::env::temp_dir().join("cratonvm-d12-jfr-e2e.jfr");
+    let _ = std::fs::remove_file(&path);
+    cfg.jfr_start_recording = Some(cratonvm_vm::config::JfrStartRecordingConfig {
+        filename: Some(path.to_str().unwrap().to_string()),
+        duration: None,
+        max_age: None,
+        max_events: None,
+        dump_on_exit: true,
+    });
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+
+    let (recording_id, filename) = vm
+        .shared
+        .debug
+        .jfr_dump_on_exit
+        .lock()
+        .clone()
+        .expect("dump_on_exit=true must populate jfr_dump_on_exit");
+    assert_eq!(filename, path.to_str().unwrap());
+
+    // Exercises exactly what the pre-exit hook does at real process exit,
+    // without needing to actually exit the test process.
+    let bytes = vm
+        .shared
+        .debug
+        .flight_recorder
+        .lock()
+        .dump_recording(recording_id, &path)
+        .expect("dump_recording must succeed for a Running recording");
+    assert!(bytes > 0, "JFR dump should write a non-zero file");
+
+    let raw = std::fs::read(&path).unwrap();
+    // JFR v2.0 binary format magic: "FLR\0".
+    assert!(raw.starts_with(b"FLR\0"), "file must start with the JFR magic");
+    let _ = std::fs::remove_file(&path);
 }
 
 // ===========================================================================
@@ -1470,4 +1573,110 @@ fn t1_gc_pause_budget_100k_objects_under_200ms() {
         elapsed < Duration::from_millis(200),
         "100k-object allocation took {elapsed:?} — must be < 200ms"
     );
+}
+
+
+// ===========================================================================
+// obsaudit D15 (2026-07-26) — the attach socket speaks the real HotSpot
+// Attach API wire protocol, not a bespoke one.
+// ===========================================================================
+
+/// Connects to a live `Vm`'s real attach socket and speaks the exact wire
+/// protocol a real `jcmd`/`jstack`/`jmap` uses (see the `AttachListener`
+/// doc comment in `runtime/serviceability.rs` for how this was verified
+/// against a real OpenJDK 21 client) — end to end, no `jcmd` binary
+/// required, so this runs in any CI environment.
+///
+/// This test's first version (before the framing fix landed) would have
+/// hung forever: the handler used to read until EOF, but a real client
+/// never closes its write side before reading the response, so server and
+/// client both block waiting on each other. The read timeout below turns
+/// that failure mode into a fast, clear test failure instead of a wedged
+/// test run.
+#[cfg(unix)]
+#[test]
+fn d15_attach_socket_speaks_the_real_wire_protocol() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let cfg = VmConfig::default();
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+    let socket_path = format!("/tmp/.java_pid{}", std::process::id());
+
+    // The listener thread starts asynchronously in `Vm::new` — briefly
+    // retry the connect rather than assume it has bound by the time this
+    // line runs.
+    let mut stream = None;
+    for _ in 0..50 {
+        match UnixStream::connect(&socket_path) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let mut stream = stream.expect("attach socket must be connectable shortly after Vm::new");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    // The real wire format: <version>\0<operation>\0<arg1>\0<arg2>\0<arg3>\0.
+    stream.write_all(b"1\0jcmd\0VM.version\0\0\0").unwrap();
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("must receive a response within the read timeout, not hang");
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("0\n"),
+        "first line must be the decimal result code 0 (success): {response:?}"
+    );
+    assert!(
+        response.contains("CratonVM"),
+        "response body must be VM.version's real output: {response:?}"
+    );
+
+    let _ = &vm;
+}
+
+/// Same protocol, but the `threaddump` operation (what `jstack` sends) —
+/// covers the operation-name translation table, not just the generic
+/// `jcmd` passthrough.
+#[cfg(unix)]
+#[test]
+fn d15_attach_socket_threaddump_operation() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let cfg = VmConfig::default();
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+    let socket_path = format!("/tmp/.java_pid{}", std::process::id());
+
+    let mut stream = None;
+    for _ in 0..50 {
+        match UnixStream::connect(&socket_path) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let mut stream = stream.expect("attach socket must be connectable shortly after Vm::new");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    stream.write_all(b"1\0threaddump\0\0\0\0").unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("must not hang");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("0\n"));
+    assert!(response.contains("Full thread dump"));
+    assert!(response.contains("\"main\""));
+
+    let _ = &vm;
 }

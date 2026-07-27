@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 #[inline]
 pub fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("CRATONVM_DBG_ECWATCH").is_some())
+    *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ECWATCH").is_some())
 }
 
 /// Secondary gate for the EXPENSIVE per-native detect (re-reads the whole list
@@ -45,7 +45,7 @@ pub fn enabled() -> bool {
 #[inline]
 pub fn native_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("CRATONVM_DBG_ECWATCH_NATIVE").is_some())
+    *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ECWATCH_NATIVE").is_some())
 }
 
 /// table of `(holder, field_idx, expected_pointer, holder_class_id)`. The

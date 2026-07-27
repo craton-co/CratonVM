@@ -166,10 +166,10 @@ fn native_platform_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     if let Ok(dir) = std::env::current_dir() {
         set(USER_DIR_NDX, &dir.to_string_lossy());
     }
-    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+    if let Ok(home) = cratonvm_types::flags::runtime_var("USERPROFILE").or_else(|_| cratonvm_types::flags::runtime_var("HOME")) {
         set(USER_HOME_NDX, &home);
     }
-    if let Ok(user) = std::env::var("USERNAME").or_else(|_| std::env::var("USER")) {
+    if let Ok(user) = cratonvm_types::flags::runtime_var("USERNAME").or_else(|_| cratonvm_types::flags::runtime_var("USER")) {
         set(USER_NAME_NDX, &user);
     }
 
@@ -191,7 +191,7 @@ fn native_vm_properties(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     // java.home — required by StaticProperty, ClassLoader, etc.
     if let Some(java_home) = ctx.get_system_property("java.home") {
         props.push(("java.home", java_home));
-    } else if let Ok(jh) = std::env::var("JAVA_HOME") {
+    } else if let Ok(jh) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
         props.push(("java.home", jh));
     }
 
@@ -409,6 +409,8 @@ pub fn register_t14_system_bootstrap(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 

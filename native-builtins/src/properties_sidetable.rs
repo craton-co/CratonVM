@@ -2327,17 +2327,6 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     ctx.invoke_virtual_bytecode_only(this, "remove", "(Ljava/lang/Object;)Z", &args[1..])
 }
 
-/// Build a real `ArrayList<String>` populated with the side-table values for
-/// the given Properties object.  ArrayList is a `Collection` — sufficient for
-/// `Properties.values()`'s declared return type.
-fn build_value_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
-    let vals: Vec<String> = snapshot_kv(ctx, this)
-        .into_iter()
-        .map(|(_k, v)| v)
-        .collect();
-    build_string_collection(ctx, "java/util/ArrayList", vals)
-}
-
 /// Build a real `java.util.Enumeration` over `items` by populating a real
 /// `java/util/Vector` (via its public `add`) and returning its `elements()`.
 /// Used by `keys()` / `elements()`.  The previous implementation returned an
@@ -2468,8 +2457,26 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(set))))
 }
 
-/// Native `Properties.values()Ljava/util/Collection;` — returns a
-/// synthetic ArrayList populated from the side-table.
+/// Native `Properties.values()Ljava/util/Collection;` — returns a **live**
+/// view of the side-table backed by this Properties object, mirroring
+/// `entrySet()`/the `LinkedHashSet`-scoped `keySet()` fix above: the previous
+/// implementation built a plain, disconnected `ArrayList` snapshot, so
+/// `values().remove(v)` / `.iterator().remove()` / `.clear()` silently never
+/// touched the source `Properties` (the same "same applies to entrySet()/
+/// values()" gap this doc originally called out for keySet()). The returned
+/// list is tagged with the source Properties object in its trailing capacity
+/// slot via `make_live_values_list`, reusing the ALREADY-hardened generic
+/// `values_view_source`/`propagate_list_removal` machinery that
+/// `native_map_values` (regular `HashMap`/`Hashtable`) relies on for the same
+/// purpose — no new override on `java/util/ArrayList` itself, so this carries
+/// none of the "global HashSet override" blast-radius risk the keySet retry
+/// above had to work around.
+///
+/// Note: `retainAll` on a values()-view list does NOT currently propagate to
+/// the source map — that is a pre-existing, Properties-independent gap in the
+/// shared `native_al_retain_all` (it never consults `values_view_source` for
+/// ANY `Map.values()`, not just Properties'), out of scope for this
+/// Properties-specific doc.
 fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -2481,14 +2488,45 @@ fn native_properties_values(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Object(Some(list))));
         }
     };
-    let list = build_value_list(ctx, this);
+    let snapshot = snapshot_kv(ctx, this);
+    // cceres5-style GC safety (mirrors `native_properties_entry_set`): every
+    // `create_string` below can trigger a moving GC that relocates `this` and
+    // strings already accumulated in `vals`. Pin everything and refresh
+    // through the pins immediately before building the live list.
+    let this_pin = ctx.pin_native_root(this);
+    let mut vals: Vec<Value> = Vec::with_capacity(snapshot.len());
+    let mut val_pins: Vec<usize> = Vec::with_capacity(snapshot.len());
+    for (_k, v) in &snapshot {
+        let vs = ctx.create_string(v);
+        let vs_pin = ctx.pin_native_root(vs);
+        vals.push(Value::Object(Some(vs)));
+        val_pins.push(vs_pin);
+    }
     // Append CHM-exclusive (non-String) values so the value view matches the
     // real map. Skip-set is the side-table keys, so mirrored String values are
     // not duplicated.
     let side = side_key_set(ctx, this);
-    for (_key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
-        let _ = ctx.invoke_virtual(list, "add", "(Ljava/lang/Object;)Z", &[value]);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    for (_key_obj, value, _kstr) in chm_extra_entries(ctx, this_cur, &side) {
+        let v_pin = match value {
+            Value::Object(Some(o)) => ctx.pin_native_root(o),
+            _ => usize::MAX,
+        };
+        vals.push(value);
+        val_pins.push(v_pin);
     }
+    // Refresh every accumulated value to its current address.
+    for (i, pin) in val_pins.iter().enumerate() {
+        vals[i] = match vals[i] {
+            Value::Object(Some(o)) if *pin != usize::MAX => {
+                Value::Object(Some(ctx.read_native_pin(*pin, o)))
+            }
+            other => other,
+        };
+    }
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let list = cratonvm_native_collections::make_live_values_list(ctx, this_cur, &vals);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -3713,6 +3751,8 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

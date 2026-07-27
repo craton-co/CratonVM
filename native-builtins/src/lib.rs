@@ -63,12 +63,12 @@ fn jboss_home_from_class_path(class_path: &str) -> Option<String> {
 }
 
 fn jboss_home_dir_fallback() -> Option<String> {
-    if let Ok(home) = std::env::var("JBOSS_HOME") {
+    if let Ok(home) = cratonvm_types::flags::runtime_var("JBOSS_HOME") {
         if !home.is_empty() {
             return Some(home);
         }
     }
-    std::env::var("CRATONVM_JBOSS_MP_ROOT")
+    cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT")
         .ok()
         .and_then(|mp_root| jboss_home_from_modules_dir(std::path::Path::new(&mp_root)))
         .or_else(|| {
@@ -2366,6 +2366,8 @@ fn native_output_stream_write_all(ctx: &mut dyn NativeContext, args: &[Value]) -
 
 #[cfg(test)]
 mod bootstrap_property_fallback_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::sync::{Mutex, OnceLock};
 
@@ -2377,8 +2379,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_jboss_home_env() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::set_var("JBOSS_HOME", "/opt/wildfly");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
 
@@ -2400,8 +2402,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_module_path_property() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::remove_var("JBOSS_HOME");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
 
@@ -2425,8 +2427,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_java_class_path_property() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::remove_var("JBOSS_HOME");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
 
@@ -2450,8 +2452,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_wildfly_current_dir() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         let old_cwd = std::env::current_dir().unwrap();
         std::env::remove_var("JBOSS_HOME");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
@@ -4048,10 +4050,7 @@ pub mod lang_string;
 // helpers, Executable.getParameters, Method.getDefaultValue, etc.).
 pub mod lang_reflect;
 // WP4.7: Real StampedLock + ReentrantReadWriteLock backends.
-pub(crate) mod bc_aes;
-pub(crate) mod bc_chacha;
-pub(crate) mod bc_newhope;
-pub(crate) mod bc_newhope_tables;
+pub(crate) use cratonvm_native_builtins_crypto::{bc_aes, bc_chacha, bc_newhope};
 pub mod lang_invoke;
 pub mod lang_math;
 pub mod lang_misc;
@@ -4379,10 +4378,10 @@ pub mod atomic_updater;
 pub mod biginteger_intrinsics;
 // Byte-identical native intrinsic for the SunEC P-256 Montgomery field
 // multiply/square (dominant cost of EC keygen/sign/verify).
-pub mod sunec_intpoly;
+pub use cratonvm_native_builtins_security::sunec_intpoly;
 // Gated (default-off) coarse native EC scalar-multiply via the p256 crate,
 // bypassing the one-time generator-table precompute.
-pub mod sunec_point;
+pub use cratonvm_native_builtins_security::sunec_point;
 
 // WP1.4 — `jdk.internal.access.SharedSecrets` bridge: 15 *Access
 // interface singletons + every per-interface method.  Unblocks
@@ -4583,6 +4582,8 @@ fn native_thread_get_context_class_loader(
 
 #[cfg(test)]
 mod context_class_loader_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -6887,7 +6888,18 @@ fn populate_real_thread_holder(
     ctx.unpin_native_roots(pin_base);
 }
 
+/// Compatibility wrapper for embedders and tests that explicitly request the
+/// historical all-packs surface.
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
+    register_essential_natives_with_shims(registry, app_shims::ShimSelection::ALL);
+}
+
+/// Register core JDK natives plus the application packs selected once by the
+/// VM's indexed classpath probe.
+pub fn register_essential_natives_with_shims(
+    registry: &mut NativeMethodRegistry,
+    shim_selection: app_shims::ShimSelection,
+) {
     // ModifiedClassPathClassLoader can legitimately materialize a second
     // Spring-core namespace. Spring's package-private Adapt.isIn helper is
     // only an option-name membership test, but its bytecode uses reference
@@ -6931,6 +6943,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // to `Intrinsic` individually later.)
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+
+    // JDK-module registrations stay unconditional. They used to be mixed
+    // into the WildFly datasource/naming/security registrars, which made
+    // those application packs impossible to omit safely.
+    crate::wildfly_datasources_tx::register_jdk_datasource_natives(registry);
+    crate::wildfly_naming::register_jdk_naming_natives(registry);
+    crate::wildfly_security::register_jdk_security_natives(registry);
 
     // Integration-test harness support. These classes are not part of the JDK,
     // but test VMs use real-JDK mode and still need the print capture natives.
@@ -7040,9 +7059,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `crate::app_shims` — grouped so this family can be moved or made
     // conditional at one site. Still registered unconditionally, under the
     // same ambient `Intrinsic` category as before.
-    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
-        crate::app_shims::register_app_intrinsic_shims(registry);
-    });
+    if shim_selection.includes(crate::app_shims::ShimFamily::AppIntrinsics) {
+        registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+            crate::app_shims::register_app_intrinsic_shims(registry);
+        });
+    }
     // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
     // through the interpreted `java.util.regex` engine, which is 30–600× slower
@@ -7630,7 +7651,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // their per-kernel rationale moved alongside them. Order, ambient
     // category and the registered set are unchanged; the family is still
     // registered on every boot, including for programs that never load BC.
-    crate::app_shims::register_bouncycastle_shims(registry);
+    if shim_selection.includes(crate::app_shims::ShimFamily::BouncyCastle) {
+        crate::app_shims::register_bouncycastle_shims(registry);
+    }
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode
@@ -8774,7 +8797,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the registered set is unchanged. NOTE: this family also registers
     // `javax/sql/DataSource`, so it is not severable as-is — see
     // `ShimFamily::jdk_entanglements`.
-    crate::app_shims::register_datasource_pool_shims(registry);
+    if shim_selection.includes(crate::app_shims::ShimFamily::DataSourcePools) {
+        crate::app_shims::register_datasource_pool_shims(registry);
+    }
     // T19.H2: StackWalker boot-time getInstance variants + getCallerClass.
     stack_walker::register_stack_walker_boot(registry);
     // WildFly's security manager can hit StackWalker.walk(Function) before the
@@ -10573,7 +10598,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // System.getenv — needed in both synthetic and real-JDK modes because
     // the real JDK bytecode for getenv() calls ProcessEnvironment which
     // requires native interop we don't support. Our native override
-    // delegates directly to std::env::var.
+    // delegates directly to cratonvm_types::flags::runtime_var.
     registry.register(
         "java/lang/System",
         "getenv",
@@ -16909,7 +16934,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `java/security/AccessControlContext`) and JNDI
     // (`javax/naming/InitialContext`) natives that non-WildFly programs rely
     // on, so it is NOT severable as-is — see `ShimFamily::jdk_entanglements`.
-    crate::app_shims::register_jboss_wildfly_xnio_shims(registry);
+    if shim_selection.includes(crate::app_shims::ShimFamily::JBossWildFlyXnio) {
+        crate::app_shims::register_jboss_wildfly_xnio_shims(registry);
+    }
 
     // B3: ClassLoader.getResources / getSystemResources override.  The real
     // JDK implementation in JDK 25 NPEs during URLClassPath.<clinit> and the
@@ -22940,7 +22967,7 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// Cached `CRATONVM_DBG_VDISP` check for `native_object_hash_code` --
 /// `Object.hashCode()`'s native is one of the hottest paths in the entire
 /// VM (every `HashMap`/`HashSet` operation on a default-hashCode key calls
-/// it), so a raw `std::env::var_os(...)` here -- a global-lock-guarded
+/// it), so a raw `cratonvm_types::flags::runtime_var_os(...)` here -- a global-lock-guarded
 /// syscall -- on every single call is a severe, silently-pervasive
 /// performance bug: any hashCode()-heavy workload (Hibernate Validator's
 /// reflective constraint-metadata caching was the one that surfaced it,
@@ -26550,6 +26577,8 @@ fn map_java_predefined_class(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod java_predefined_class_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::compile_java_regex;
 
     fn m(pat: &str, s: &str) -> bool {
@@ -29288,6 +29317,8 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 #[cfg(test)]
 mod base64_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{b64_encode, B64_VARIANT_BASIC, B64_VARIANT_URL};
 
     #[test]
@@ -31574,13 +31605,13 @@ pub(crate) fn resolve_real_hostname() -> String {
 /// The uncached probe behind [`resolve_real_hostname`]. Split out so the
 /// resolution order stays directly testable without the `OnceLock` latch.
 pub(crate) fn resolve_real_hostname_uncached() -> String {
-    if let Ok(name) = std::env::var("HOSTNAME") {
+    if let Ok(name) = cratonvm_types::flags::runtime_var("HOSTNAME") {
         let trimmed = name.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
     }
-    if let Ok(name) = std::env::var("COMPUTERNAME") {
+    if let Ok(name) = cratonvm_types::flags::runtime_var("COMPUTERNAME") {
         let trimmed = name.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -33776,6 +33807,8 @@ fn striped64_base_slot(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize
 
 #[cfg(test)]
 mod striped64_base_slot_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::striped64_base_slot_from_layout;
 
     #[test]
@@ -36527,10 +36560,22 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "isEnum", "()Z", native_class_is_enum);
     registry.register(c, "isRecord", "()Z", native_class_is_record);
     registry.register(c, "isSealed", "()Z", native_class_is_sealed);
-    registry.register(c, "isSynthetic", "()Z", native_return_false);
-    registry.register(c, "isAnonymousClass", "()Z", native_return_false);
-    registry.register(c, "isLocalClass", "()Z", native_return_false);
-    registry.register(c, "isMemberClass", "()Z", native_return_false);
+    registry.register(c, "isSynthetic", "()Z", native_class_is_synthetic);
+    // The nesting predicates are derived from the class's own `InnerClasses`
+    // entry (see `lang_class::class_nesting_kind`). They were `native_return_false`,
+    // so under `synthetic-jdk` every nested class reported itself top-level —
+    // `isMemberClass()` in particular is false for NO nested class on HotSpot.
+    // Real-JDK mode never reaches here: it runs `java.lang.Class`'s own
+    // bytecode, which was already correct on all 19 shapes of the
+    // nesting/enclosing differential probe.
+    registry.register(
+        c,
+        "isAnonymousClass",
+        "()Z",
+        native_class_is_anonymous_class,
+    );
+    registry.register(c, "isLocalClass", "()Z", native_class_is_local_class);
+    registry.register(c, "isMemberClass", "()Z", native_class_is_member_class);
     // NEW-8: Class.isHidden real impl — was native_return_false which
     // shadowed the registration at lib.rs:~325. Both now consult the
     // class's hidden flag through NativeContext::is_class_hidden.
@@ -37920,6 +37965,8 @@ fn pd_has_failure(ctx: &dyn NativeContext, scope: ObjectRef) -> bool {
 
 #[cfg(test)]
 mod vector_support_essential_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 
@@ -37998,6 +38045,8 @@ mod vector_support_essential_tests {
 
 #[cfg(test)]
 mod base64_encoder_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -38040,6 +38089,8 @@ mod base64_encoder_tests {
 
 #[cfg(test)]
 mod nio_heap_byte_buffer_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -38126,6 +38177,8 @@ mod nio_heap_byte_buffer_tests {
 
 #[cfg(test)]
 mod charset_alias_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 
@@ -38180,6 +38233,8 @@ mod charset_alias_tests {
 
 #[cfg(test)]
 mod reflection_field_essential_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -38218,6 +38273,8 @@ mod reflection_field_essential_tests {
 
 #[cfg(test)]
 mod panama_essential_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -38262,6 +38319,8 @@ mod panama_essential_tests {
 
 #[cfg(test)]
 mod liquibase_checksum_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -38470,6 +38529,8 @@ mod liquibase_checksum_tests {
 // ===========================================================================
 #[cfg(test)]
 mod t2_random_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -38579,6 +38640,8 @@ mod t2_random_tests {
 // ===========================================================================
 #[cfg(test)]
 mod t2_6_crypto_acceptance_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// T2.6.19 — SHA-256("hello") matches RFC 6234 test vector
@@ -38776,7 +38839,7 @@ pub(crate) fn vmflags() -> &'static cratonvm_types::flags::VmFlags {
 
 /// The `native-builtins`-only slice of the typed configuration.
 ///
-/// Replaces ~360 direct `std::env::var`/`var_os` probes. A field read here is
+/// Replaces ~360 direct `cratonvm_types::flags::runtime_var`/`var_os` probes. A field read here is
 /// one relaxed-acquire load of an already-initialised `OnceLock` plus a load
 /// from a static — cheaper than the per-flag `OnceLock<bool>` helpers it
 /// subsumes, and *far* cheaper than `getenv`, which takes the process environ

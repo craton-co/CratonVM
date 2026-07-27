@@ -98,6 +98,8 @@ thread_local! {
 
 #[cfg(test)]
 mod test_fixtures {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     pub(crate) const CA_CRT_PEM: &str = include_str!("t27_certs/ca.crt");
     pub(crate) const SERVER_CRT_PEM: &str = include_str!("t27_certs/server.crt");
     pub(crate) const SERVER_KEY_PEM: &str = include_str!("t27_certs/server.key");
@@ -1304,7 +1306,10 @@ pub(crate) struct ServerRegistry {
 }
 
 pub(crate) struct TlsClientStreamEntry {
-    pub(crate) stream: StreamOwned<ClientConnection, TcpStream>,
+    /// Per-stream mutex, NOT guarded by `sreg()`. Blocking socket I/O on one
+    /// TLS connection must never hold the process-wide registry lock — see
+    /// `rustls_stream_read`'s doc comment.
+    pub(crate) stream: Arc<Mutex<StreamOwned<ClientConnection, TcpStream>>>,
     pub(crate) peer_host: String,
     pub(crate) peer_port: u16,
     pub(crate) negotiated_protocol: String,
@@ -1313,7 +1318,8 @@ pub(crate) struct TlsClientStreamEntry {
 }
 
 pub(crate) struct TlsServerStreamEntry {
-    pub(crate) stream: TlsServerStream,
+    /// Per-stream mutex — see `TlsClientStreamEntry::stream`.
+    pub(crate) stream: Arc<Mutex<TlsServerStream>>,
     pub(crate) sni_hostname: Option<String>,
     pub(crate) negotiated_protocol: String,
     pub(crate) negotiated_cipher: String,
@@ -2400,24 +2406,42 @@ pub(crate) fn any_cipher_mappable(ciphers: &[String]) -> bool {
 
 /// A `ClientCertVerifier` that accepts any structurally-valid, correctly
 /// SIGNED client certificate WITHOUT validating its chain against a trust
-/// anchor. Used exclusively when Tomcat's `trustManagerClassName` mechanism
-/// is configured: that feature's whole point is to delegate the trust
-/// decision to a Java `TrustManager` class INSTEAD OF a keystore-backed
-/// truststore, so there is no CA data here for `WebPkiClientVerifier` to
-/// build a `RootCertStore` from.
+/// anchor.
 ///
-/// Accepting a certificate here does NOT mean the connection is ultimately
-/// trusted — it only means the client proved possession of the leaf
-/// certificate's private key (`verify_tls12/13_signature` still do real
-/// cryptographic signature verification via the same webpki primitives
-/// `WebPkiClientVerifier` uses). The actual trust decision is made
-/// afterwards, synchronously, by `engine_run_trust_check` calling the real
-/// Java `TrustManager.checkClientTrusted` once the handshake completes —
-/// which aborts the connection (`SSLHandshakeException`) on rejection. This
-/// verifier must therefore ONLY be selected when a Java `TrustManager` is
-/// actually registered for the owning engine (see `engine_begin`'s
-/// `use_passthrough_client_verifier` check) — never as a general fallback for
-/// "no truststore configured", which would be a fail-open regression.
+/// Two callers select this:
+///
+/// 1. Tomcat's `trustManagerClassName` mechanism: that feature's whole point
+///    is to delegate the trust decision to a Java `TrustManager` class
+///    INSTEAD OF a keystore-backed truststore, so there is no CA data here
+///    for `WebPkiClientVerifier` to build a `RootCertStore` from. Trust is
+///    enforced afterwards, synchronously, by `engine_run_trust_check` calling
+///    the real Java `TrustManager.checkClientTrusted` once the handshake
+///    completes — which aborts the connection (`SSLHandshakeException`) on
+///    rejection.
+/// 2. Optional (`ClientAuth.WANT`/`setWantClientAuth(true)`) client auth with
+///    no trust source configured at all (no truststore, no custom
+///    `TrustManager`). Real JSSE does NOT fail the handshake here even when
+///    the presented certificate fails trust verification against its default
+///    (system cacerts) trust manager — confirmed empirically against a real
+///    JDK: the handshake completes, only the SERVER's own
+///    `getPeerPrincipal()`/`getPeerCertificates()` throw
+///    `SSLPeerUnverifiedException` afterward. rustls's `WebPkiClientVerifier`
+///    has no such soft-fail path (verification failure is always a fatal
+///    alert), so this verifier is the closest achievable approximation:
+///    accept the cert structurally (proves key possession via
+///    `verify_tls12/13_signature`, same webpki primitives
+///    `WebPkiClientVerifier` uses) without asserting CA trust. No Java
+///    `TrustManager` runs afterward in this case (none is registered), so
+///    unlike case 1 there is no later enforcement step — this only matters
+///    for callers that read `SSLSession.getPeerCertificates()` expecting an
+///    authoritative trust decision, which real JSSE would also leave
+///    unresolved here (it simply drops the unverified identity instead of
+///    exposing it, a difference this approximation does not fully capture).
+///
+/// Mandatory (`ClientAuth.NEED`/`setNeedClientAuth(true)`) client auth is
+/// UNCHANGED by case 2 above and still requires a real trust source — see
+/// `default_engine_server_config`'s own
+/// "setNeedClientAuth(true) requires javax.net.ssl.trustStore" error.
 #[derive(Debug)]
 struct PassthroughClientCertVerifier {
     mandatory: bool,
@@ -2613,7 +2637,7 @@ pub(crate) fn rustls_client_connect(
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
 
     let entry = TlsClientStreamEntry {
-        stream,
+        stream: Arc::new(Mutex::new(stream)),
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol,
@@ -2777,7 +2801,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
         };
 
     let entry = TlsServerStreamEntry {
-        stream,
+        stream: Arc::new(Mutex::new(stream)),
         sni_hostname,
         negotiated_protocol,
         negotiated_cipher,
@@ -2932,7 +2956,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     reg.server_streams.insert(
         id,
         TlsServerStreamEntry {
-            stream: TlsServerStream::Rustls(stream),
+            stream: Arc::new(Mutex::new(TlsServerStream::Rustls(stream))),
             sni_hostname,
             negotiated_protocol,
             negotiated_cipher,
@@ -3000,7 +3024,7 @@ pub(crate) fn rustls_client_handshake_over_stream(
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
     let entry = TlsClientStreamEntry {
-        stream,
+        stream: Arc::new(Mutex::new(stream)),
         peer_host: host.to_string(),
         peer_port: 0,
         negotiated_protocol,
@@ -3272,8 +3296,23 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
 
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     let debug_srv = crate::nbflags().dbg_tls_srv;
-    let mut reg = sreg().lock();
-    if let Some(e) = reg.client_streams.get_mut(&id) {
+    // LOCK DISCIPLINE (stw-takeover / accept-close-deadlock family): resolve
+    // the id and clone the per-stream handle under `sreg()`, then RELEASE
+    // `sreg()` before blocking. Holding the process-wide registry mutex
+    // across a read that waits for a peer parks every other TLS operation in
+    // the process behind it — including the peer's own write — and a thread
+    // parked on a plain mutex inside a native call never reaches a safepoint,
+    // so a concurrent STW waits for it forever. Identical reasoning to
+    // `rustls_server_accept`'s fix; these sibling functions were missed then.
+    let (client, server) = {
+        let reg = sreg().lock();
+        (
+            reg.client_streams.get(&id).map(|e| e.stream.clone()),
+            reg.server_streams.get(&id).map(|e| e.stream.clone()),
+        )
+    };
+    if let Some(stream) = client {
+        let mut e = stream.lock();
         // FIX (TestSsl.testSni[JSSE]): a plain `SSLSocket.getInputStream()
         // .read()` on the client side used to propagate rustls's raw
         // `UnexpectedEof` ("peer closed connection without sending TLS
@@ -3285,9 +3324,10 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
         // Reuse the same EOF-tolerant read already established for the
         // native HTTP client bridge (`http_url_connection::
         // read_eof_tolerant`) instead of duplicating the tolerance logic.
-        return crate::http_url_connection::read_eof_tolerant(&mut e.stream, buf);
+        return crate::http_url_connection::read_eof_tolerant(&mut *e, buf);
     }
-    if let Some(e) = reg.server_streams.get_mut(&id) {
+    if let Some(stream) = server {
+        let mut e = stream.lock();
         if debug_srv {
             eprintln!(
                 "[dbg-tls-srv] stream_read ENTER id={} requested_len={}",
@@ -3295,7 +3335,7 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
                 buf.len()
             );
         }
-        let result = match &mut e.stream {
+        let result = match &mut *e {
             TlsServerStream::Rustls(s) => s.read(buf),
             TlsServerStream::Native(s) => s.read(buf),
             #[cfg(unix)]
@@ -3318,11 +3358,20 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
 /// Write to either a client- or server-side rustls stream.
 pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
     let debug_srv = crate::nbflags().dbg_tls_srv;
-    let mut reg = sreg().lock();
-    if let Some(e) = reg.client_streams.get_mut(&id) {
-        return e.stream.write(data);
+    // Same lock discipline as `rustls_stream_read` — see its doc comment.
+    let (client, server) = {
+        let reg = sreg().lock();
+        (
+            reg.client_streams.get(&id).map(|e| e.stream.clone()),
+            reg.server_streams.get(&id).map(|e| e.stream.clone()),
+        )
+    };
+    if let Some(stream) = client {
+        let mut e = stream.lock();
+        return e.write(data);
     }
-    if let Some(e) = reg.server_streams.get_mut(&id) {
+    if let Some(stream) = server {
+        let mut e = stream.lock();
         if debug_srv {
             eprintln!(
                 "[dbg-tls-srv] stream_write ENTER id={} len={}",
@@ -3330,7 +3379,7 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
                 data.len()
             );
         }
-        let result = match &mut e.stream {
+        let result = match &mut *e {
             TlsServerStream::Rustls(s) => s.write(data),
             TlsServerStream::Native(s) => s.write(data),
             #[cfg(unix)]
@@ -3352,23 +3401,38 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
 
 /// Close either a client- or server-side rustls stream (idempotent).
 pub(crate) fn rustls_stream_close(id: i32) {
-    let mut reg = sreg().lock();
-    if let Some(mut e) = reg.client_streams.remove(&id) {
-        e.stream.conn.send_close_notify();
-        let _ = e.stream.flush();
+    // Unregister under `sreg()`, then do the graceful shutdown outside it.
+    let (client, server) = {
+        let mut reg = sreg().lock();
+        (
+            reg.client_streams.remove(&id),
+            reg.server_streams.remove(&id),
+        )
+    };
+    // `try_lock`: a peer parked in a blocking read on this SAME stream holds
+    // the per-stream mutex, and waiting for it here would just relocate the
+    // old global-lock stall. The entry is already unregistered, so dropping
+    // our handle is sufficient — the socket closes when the last `Arc` goes.
+    if let Some(e) = client {
+        if let Some(mut s) = e.stream.try_lock() {
+            s.conn.send_close_notify();
+            let _ = s.flush();
+        }
     }
-    if let Some(mut e) = reg.server_streams.remove(&id) {
-        match &mut e.stream {
-            TlsServerStream::Rustls(s) => {
-                s.conn.send_close_notify();
-                let _ = s.flush();
-            }
-            TlsServerStream::Native(s) => {
-                let _ = s.shutdown();
-            }
-            #[cfg(unix)]
-            TlsServerStream::LegacyDsa(s) => {
-                let _ = s.shutdown();
+    if let Some(e) = server {
+        if let Some(mut guard) = e.stream.try_lock() {
+            match &mut *guard {
+                TlsServerStream::Rustls(s) => {
+                    s.conn.send_close_notify();
+                    let _ = s.flush();
+                }
+                TlsServerStream::Native(s) => {
+                    let _ = s.shutdown();
+                }
+                #[cfg(unix)]
+                TlsServerStream::LegacyDsa(s) => {
+                    let _ = s.shutdown();
+                }
             }
         }
     }
@@ -3422,9 +3486,14 @@ pub(crate) fn rustls_session_info(
 /// here despite being queried after the handshake loop that produced it has
 /// already returned.
 pub(crate) fn rustls_client_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
-    let reg = sreg().lock();
-    let entry = reg.client_streams.get(&id)?;
-    let certs = entry.stream.conn.peer_certificates()?;
+    // Clone the per-stream handle under `sreg()` and release it before
+    // touching the stream — see `rustls_stream_read`'s lock-discipline note.
+    let stream = {
+        let reg = sreg().lock();
+        reg.client_streams.get(&id)?.stream.clone()
+    };
+    let entry = stream.lock();
+    let certs = entry.conn.peer_certificates()?;
     if certs.is_empty() {
         return None;
     }
@@ -4528,6 +4597,8 @@ fn obj_arg(args: &[Value], idx: usize) -> Result<ObjectRef, RuntimeError> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::test_fixtures::*;
     use super::*;
     use cratonvm_native_api::NativeContext;
@@ -6706,13 +6777,30 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                                     .unwrap_or(false)
                             })
                             .unwrap_or(false);
+                    let optional_client_cert = (state.want_client_auth || speculative_optional_auth)
+                        && !state.need_client_auth;
+                    // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
+                    // optional client auth (WANT) with no trust source at all
+                    // (no truststore, no custom TrustManager) used to fall
+                    // into the `else` branch below with `client_ca=None`,
+                    // where `build_server_config_single_cert_ex_ciphers`
+                    // treats a missing CA as a hard config-build error even
+                    // for the optional case -- real JSSE does not fail the
+                    // handshake in this scenario (see the doc comment on
+                    // `PassthroughClientCertVerifier`, case 2), so use the
+                    // same passthrough verifier already used for the
+                    // custom-trust-manager case. NEED (mandatory) mode is
+                    // untouched: `optional_client_cert` is false whenever
+                    // `state.need_client_auth` is true.
+                    let use_passthrough_verifier =
+                        has_custom_trust_managers || (client_ca.is_none() && optional_client_cert);
                     if crate::nbflags().dbg_tls_auth_ok {
                         eprintln!(
-                            "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={}",
-                            request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers
+                            "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={} use_passthrough_verifier={}",
+                            request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers, use_passthrough_verifier
                         );
                     }
-                    let built = if has_custom_trust_managers {
+                    let built = if use_passthrough_verifier {
                         build_server_config_single_cert_passthrough_client_auth(
                             cert,
                             key,
@@ -6726,8 +6814,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             key,
                             &alpn_strs,
                             state.need_client_auth,
-                            (state.want_client_auth || speculative_optional_auth)
-                                && !state.need_client_auth,
+                            optional_client_cert,
                             client_ca.as_deref(),
                             &state.enabled_ciphers,
                         )

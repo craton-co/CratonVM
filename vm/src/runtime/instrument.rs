@@ -479,7 +479,7 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let n = ctx.array_length(arr);
-    if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
         eprintln!("[RETRANSFORM] retransformClasses0 called with {n} classes");
     }
     for i in 0..n {
@@ -491,7 +491,7 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             Some(cid) => cid,
             None => continue,
         };
-        if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
             let nm = ctx.class_name_of_id(class_id).unwrap_or_default();
             let ob = original_class_bytes(ctx, class_id);
             eprintln!("[RETRANSFORM]   [{i}] {nm} original_bytes={}", ob.len());
@@ -873,7 +873,7 @@ fn run_transformer_chain(
     inst_receiver: Option<ObjectRef>,
 ) -> Vec<u8> {
     let rust_chain = snapshot_transformer_chain();
-    if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
         eprintln!(
             "[RETRANSFORM]   run_transformer_chain: rust_chain={} entries, initial_bytes={}, retransform_only={retransform_only}",
             rust_chain.len(),
@@ -938,7 +938,7 @@ fn run_transformer_chain(
         let descriptor = "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;\
                           Ljava/security/ProtectionDomain;[B)[B";
         let result = ctx.invoke_virtual(entry.transformer_ref, "transform", descriptor, &args);
-        let dbg = std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok();
+        let dbg = cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok();
         match result {
             Ok(Some(Value::Object(Some(out_obj)))) => {
                 let out_bytes = read_byte_array(ctx, out_obj);

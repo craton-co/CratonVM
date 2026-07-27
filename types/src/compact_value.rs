@@ -512,7 +512,7 @@ impl CompactValue {
     #[cold]
     #[inline(never)]
     fn object_out_of_range(ptr: u64) -> ! {
-        if std::env::var_os("CRATONVM_DBG_COMPACTVALUE").is_some() {
+        if crate::flags::runtime_var_os("CRATONVM_DBG_COMPACTVALUE").is_some() {
             eprintln!(
                 "[CRATONVM_DBG_COMPACTVALUE] CompactValue::object out-of-range ptr={ptr:#x}\n{}",
                 std::backtrace::Backtrace::force_capture()

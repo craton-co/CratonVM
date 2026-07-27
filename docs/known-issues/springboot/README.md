@@ -45,7 +45,7 @@ smaller/individual differences not yet clustered.
 > `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`,
 > `DataRedisHealthContributorAutoConfigurationTests` — see
 > `RESULTS-20260723.md`'s residual table) is fixed — see
-> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
+> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](../../internal/fixed-suite-bugs/springboot/data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
 > Root cause: `URLClassLoader.findClass`/`findResource` rebuilt the whole
 > classpath scan from scratch on every call (no caching), and `JarFile`
 > entry lookups eagerly decompressed every entry in a jar just to answer an
@@ -60,6 +60,23 @@ smaller/individual differences not yet clustered.
 > `ClassNotFoundException` and fell through to CratonVM's loader-blind flat
 > global class store, un-doing `ModifiedClassPathClassLoader`'s
 > `@ClassPathExclusions` filtering.
+
+> Closure update (2026-07-27): `mockito-silently-selects-fallback-location-and-memberaccessor.md`
+> is fixed — moved to
+> [`../../internal/fixed-suite-bugs/springboot/mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md`](../../internal/fixed-suite-bugs/springboot/mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md).
+> Root cause was **not** the branch/dispatch defect that doc hypothesised, and
+> not classloader-related at all (it reproduces with no fork loader at all):
+> CratonVM shipped two deliberate native overrides that replaced Mockito's
+> selector methods wholesale — `LocationFactory.create` returned a
+> `Java8LocationImpl` carrying the hardcoded string `"-> at <<unknown line>>"`
+> instead of walking the stack, and `ModuleMemberAccessor.delegate` always
+> returned `ReflectionMemberAccessor`. Both are now off by default (behind
+> `CRATONVM_MOCKITO_LEGACY_SELECTORS`), so every Mockito failure message names
+> its real call site again. Removing the first override unmasked a second,
+> wider bug also fixed here: CratonVM's synthetic `StackWalker$StackFrame`
+> carrier never registered `toString()`, so it printed
+> `java.lang.StackWalker$StackFrame@a166` instead of `Cls.method(File:line)`
+> for **any** consumer, not just Mockito.
 
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
@@ -112,9 +129,22 @@ rather than assuming closed or re-investigating from scratch.
 > an effectively empty classpath, since `ClassPath::new` never expanded a
 > plain jar's own manifest `Class-Path:` attribute. **FIXED** — see
 > [`../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md).
-> `PathRequestTests` now passes outright; the other 3 narrow to two distinct,
-> newly-exposed residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
-> and [`securityfilterautoconfig-capturedoutput-password-not-observed.md`](securityfilterautoconfig-capturedoutput-password-not-observed.md).
+> `PathRequestTests` now passes outright; the other 3 narrowed to two distinct
+> residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
+> (still OPEN) and `securityfilterautoconfig-capturedoutput-password-not-observed.md`
+> (was here, now **FIXED** — see below).
+
+> Closure update (2026-07-26): `SecurityFilterAutoConfigurationEarlyInitializationTests`
+> (the `securityfilterautoconfig-capturedoutput-password-not-observed.md` residual
+> above) is fixed — verified 5/5 PASS against current `dev`, resolved as a side
+> effect of unrelated classloader/reflection drift between 2026-07-23 and
+> 2026-07-26, not independently root-caused. Moved to
+> [`../../internal/fixed-suite-bugs/springboot/securityfilterautoconfig-capturedoutput-password-not-observed-FIXED.md`](../../internal/fixed-suite-bugs/springboot/securityfilterautoconfig-capturedoutput-password-not-observed-FIXED.md).
+> The sibling `onbeancondition-mergedannotations-intermittent-identity-mismatch.md`
+> residual remains OPEN (independently spot-checked the same session:
+> `ManagementWebSecurityAutoConfigurationTests` 3/3 clean; the reactive variant
+> shows a separate, likely-unrelated intermittent timeout — see the FIXED doc
+> above for details).
 
 > Investigation (2026-07-24): `module/spring-boot-micrometer-tracing-opentelemetry`'s
 > 2-class residual from this rerun (`OpenTelemetryBaggagePropagationIntegrationTests`,
@@ -125,8 +155,14 @@ rather than assuming closed or re-investigating from scratch.
 > constructed via `Assertions.assertThat(String)`, not via direct
 > construction — reduced to a 100% reproducing ~15-line standalone repro, not
 > yet root-caused to file:line, likely masking real failure messages broadly
-> across the suite since `assertThat(someString)` is ubiquitous). OPEN — see
-> [`micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md`](micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md).
+> across the suite since `assertThat(someString)` is ubiquitous). **CLOSED
+> 2026-07-26** — moved to
+> [`../../internal/fixed-suite-bugs/springboot/micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals-FIXED.md`](../../internal/fixed-suite-bugs/springboot/micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals-FIXED.md).
+> The NPE was CratonVM's own `native_assertj_lightweight_comparable_assert`
+> shim building `AbstractAssert` without running its constructor (fixed by
+> `fdc852f558`, bisect-confirmed); the two real failures it had been masking
+> were a single loader-blind lambda-impl resolution in the native-callback
+> dispatcher (`vm/src/vm/vm_exec.rs`). The module is now 9/9 classes PASS.
 
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 

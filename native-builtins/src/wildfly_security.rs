@@ -1665,7 +1665,12 @@ fn native_access_control_context_init(
 // Registration.
 // ===========================================================================
 
-pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
+/// Register the JAAS and access-control bridges that belong to JDK modules.
+///
+/// These are deliberately independent of the WildFly security compatibility
+/// pack: ordinary applications use `Subject` and `LoginContext` too, so their
+/// availability must not depend on a WildFly classpath witness.
+pub fn register_jdk_security_natives(r: &mut NativeMethodRegistry) {
     let subject = "javax/security/auth/Subject";
     r.register(subject, "<init>", "()V", native_subject_init);
     r.register(
@@ -1743,6 +1748,22 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
         native_login_context_get_subject,
     );
 
+    // Register only the <init>(ProtectionDomain[]) — the
+    // checkPermission(Permission) native is already owned by
+    // `security_manager.rs` (Session 86/87) and we share the same
+    // underlying `policy_allows` check path via
+    // [`access_control_context_check_permission`].
+    let acc = "java/security/AccessControlContext";
+    r.register(
+        acc,
+        "<init>",
+        "([Ljava/security/ProtectionDomain;)V",
+        native_access_control_context_init,
+    );
+}
+
+/// Register only the WildFly-owned security compatibility pack.
+pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
     let sds = "org/jboss/as/security/SecurityDomainService";
     r.register(
         sds,
@@ -1764,19 +1785,6 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/lang/Object;",
         native_security_identity_run_as,
     );
-
-    // Register only the <init>(ProtectionDomain[]) — the
-    // checkPermission(Permission) native is already owned by
-    // `security_manager.rs` (Session 86/87) and we share the same
-    // underlying `policy_allows` check path via
-    // [`access_control_context_check_permission`].
-    let acc = "java/security/AccessControlContext";
-    r.register(
-        acc,
-        "<init>",
-        "([Ljava/security/ProtectionDomain;)V",
-        native_access_control_context_init,
-    );
 }
 
 // ===========================================================================
@@ -1785,6 +1793,8 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -2373,6 +2383,7 @@ mod tests {
     #[test]
     fn t19_2_c_register_wildfly_security_natives_installs_each_method() {
         let mut r = NativeMethodRegistry::new();
+        register_jdk_security_natives(&mut r);
         register_wildfly_security_natives(&mut r);
         assert!(r
             .find(

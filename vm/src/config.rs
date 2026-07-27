@@ -225,6 +225,37 @@ pub const EMBEDDED_DEFAULT_JDK_MODE: JdkMode = JdkMode::Synthetic;
 /// call [`require_synthetic_jdk`]) before honouring a synthetic request.
 pub const SYNTHETIC_JDK_COMPILED_IN: bool = cfg!(feature = "synthetic-jdk");
 
+/// obsaudit D12 (2026-07-26) — settings for `-XX:StartFlightRecording`.
+/// Parsed by `vm-cli/src/main.rs`, consumed by `Vm::new`
+/// (`vm/src/vm/vm_init.rs`) to start a real JFR recording at boot.
+///
+/// Deliberately narrower than HotSpot's `StartFlightRecording:` option set:
+/// no `disk=` (recordings stay memory-only — see the `RecordingSettings`
+/// doc comment in `jfr/src/recording.rs` for why), and `maxevents` names
+/// what `jfr::RecordingSettings::max_size` actually bounds (an event
+/// count) rather than reusing HotSpot's `maxsize` name, which means bytes
+/// in real JFR — a CratonVM `maxsize=` would silently mean something
+/// different from HotSpot's, which is worse than not offering the name.
+#[derive(Debug, Clone, Default)]
+pub struct JfrStartRecordingConfig {
+    /// `filename=<path>`. `None` defaults to `./cratonvm-recording-<pid>.jfr`
+    /// (chosen at dump time, once the pid is known).
+    pub filename: Option<String>,
+    /// `duration=<secs>`. `None` means the recording runs until the VM
+    /// exits (or is stopped by some future explicit control surface).
+    pub duration: Option<std::time::Duration>,
+    /// `maxage=<secs>`. `None` means no age-based eviction — see
+    /// `jfr::repository::EventRepository::with_max_age`.
+    pub max_age: Option<std::time::Duration>,
+    /// `maxevents=<n>`. `None` keeps the default 100_000-event ring.
+    pub max_events: Option<usize>,
+    /// `dumponexit=true|false`, default `true` (matches HotSpot's default
+    /// for `-XX:StartFlightRecording`). When true, the VM dumps this
+    /// recording to `filename` from the pre-exit hook — see
+    /// `vm-cli/src/main.rs`'s `set_pre_exit_hook` installer.
+    pub dump_on_exit: bool,
+}
+
 /// Configuration for the JVM instance.
 ///
 /// Mirrors common JVM `-X` flags and provides defaults suitable for development.
@@ -438,6 +469,13 @@ pub struct VmConfig {
     /// `./java_pid<pid>.hprof` in the current working directory.
     pub heap_dump_path: Option<String>,
 
+    /// obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording[:opts]`.
+    /// `Some` means the VM starts a JFR recording during boot with these
+    /// settings; `None` (the default) means JFR stays off, exactly as
+    /// before this flag existed. See `JfrStartRecordingConfig` and
+    /// `vm-cli/src/main.rs`'s parser for the accepted `opts`.
+    pub jfr_start_recording: Option<JfrStartRecordingConfig>,
+
     /// Enable container/cgroup support (`-XX:+UseContainerSupport`).
     /// When `true` (default), the JVM reads cgroup v1/v2 limits to
     /// auto-size heap and thread pools inside Docker/Kubernetes.
@@ -604,7 +642,7 @@ impl Default for VmConfig {
             // carrier) — those ceilings remain the actual backstop on smaller
             // stacks and will trip first there, so raising this default adds
             // no new crash risk.
-            max_stack_depth: std::env::var("RJ_MAX_STACK_DEPTH")
+            max_stack_depth: cratonvm_types::flags::runtime_var("RJ_MAX_STACK_DEPTH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|n| *n >= 64 && *n <= 65536)
@@ -648,6 +686,7 @@ impl Default for VmConfig {
             jit_aggressive_compilation: false,
             heap_dump_on_oom: false,
             heap_dump_path: None,
+            jfr_start_recording: None,
             use_container_support: true,
             container_effective_processors: None,
             // JEP 358: default ON to match HotSpot (messages verified
@@ -1149,7 +1188,7 @@ pub fn detect_real_jdk_from(explicit: Option<&str>) -> Option<PathBuf> {
 /// so the operator can see *why* the probe failed rather than guessing.
 pub fn describe_jdk_search(explicit: Option<&str>) -> String {
     fn env_line(key: &str) -> String {
-        match std::env::var(key) {
+        match cratonvm_types::flags::runtime_var(key) {
             Ok(v) if !v.trim().is_empty() => {
                 let p = Path::new(v.trim());
                 if p.is_dir() {
@@ -1286,7 +1325,7 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
 
     // 2. CRATONVM_JAVA_HOME — used when JAVA_HOME points at a cratonvm shim
     // tree (Maven, Gradle) but boot modules must come from a real JDK.
-    if let Ok(val) = std::env::var("CRATONVM_JAVA_HOME") {
+    if let Ok(val) = cratonvm_types::flags::runtime_var("CRATONVM_JAVA_HOME") {
         let p = PathBuf::from(val.trim());
         if p.is_dir() {
             return Some(p);
@@ -1294,7 +1333,7 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
     }
 
     // 3. JAVA_HOME env var
-    if let Ok(val) = std::env::var("JAVA_HOME") {
+    if let Ok(val) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
         let p = PathBuf::from(&val);
         if p.is_dir() {
             return Some(p);
@@ -1316,7 +1355,7 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
 ///   - JDK 25+: `-XshowSettings:properties` (plural)
 ///   - Fallback: `-XshowSettings:all`
 fn first_java_executable_on_path() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
+    let path_var = cratonvm_types::flags::runtime_var_os("PATH")?;
     let exe = if cfg!(windows) { "java.exe" } else { "java" };
     for dir in std::env::split_paths(&path_var) {
         let candidate = Path::new(&dir).join(exe);
@@ -1866,7 +1905,7 @@ mod tests {
     /// Helper: find a real JDK installation on this machine, or return None.
     fn find_local_jdk() -> Option<PathBuf> {
         // Check JAVA_HOME first
-        if let Ok(val) = std::env::var("JAVA_HOME") {
+        if let Ok(val) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
             let p = PathBuf::from(&val);
             if p.join("jmods").is_dir() {
                 return Some(p);
@@ -2025,7 +2064,7 @@ mod tests {
     /// them. We isolate by stashing/restoring and serialising via a
     /// static mutex below.
     fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
-        let prev = std::env::var_os(key);
+        let prev = cratonvm_types::flags::runtime_var_os(key);
         match value {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
@@ -2046,43 +2085,25 @@ mod tests {
 
     #[test]
     fn detect_real_jdk_returns_some_when_java_base_jmod_present() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_jmod(tmp.path());
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let detected = detect_real_jdk();
-                    assert!(
-                        detected.is_some(),
-                        "detect_real_jdk should find synthetic JDK at {}",
-                        tmp.path().display()
-                    );
-                    assert_eq!(detected.unwrap(), tmp.path());
-                });
-            },
+        let detected = detect_real_jdk_from(tmp.path().to_str());
+        assert!(
+            detected.is_some(),
+            "detect_real_jdk should find synthetic JDK at {}",
+            tmp.path().display()
         );
+        assert_eq!(detected.unwrap(), tmp.path());
     }
 
     #[test]
     fn detect_real_jdk_returns_some_for_lib_modules_image() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_lib_modules(tmp.path());
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let detected = detect_real_jdk();
-                    assert!(
-                        detected.is_some(),
-                        "detect_real_jdk should accept jlink-image layout"
-                    );
-                });
-            },
+        let detected = detect_real_jdk_from(tmp.path().to_str());
+        assert!(
+            detected.is_some(),
+            "detect_real_jdk should accept jlink-image layout"
         );
     }
 
@@ -2093,20 +2114,13 @@ mod tests {
         // `CRATONVM_JAVA_HOME` is the highest-priority probe in
         // `resolve_java_home`, so we don't need to scrub `JAVA_HOME` or
         // `PATH` — the synthesised directory wins.
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("rt.jar"), b"PK\x03\x04").unwrap();
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                assert!(
-                    detect_real_jdk().is_none(),
-                    "rt.jar-only install must not satisfy detect_real_jdk"
-                );
-            },
+        assert!(
+            detect_real_jdk_from(tmp.path().to_str()).is_none(),
+            "rt.jar-only install must not satisfy detect_real_jdk"
         );
     }
 
@@ -2145,29 +2159,19 @@ mod tests {
     /// empty `PATH`.
     #[test]
     fn launcher_default_never_falls_back_to_synthetic_when_no_jdk() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         // Bare directory: no `jmods/`, no `lib/modules`. `resolve_java_home`
         // will accept it (it's a real directory) but `detect_real_jdk`
         // must reject it because neither boot blob is present.
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let cfg = VmConfig::for_launcher();
-                    assert_eq!(
-                        cfg.jdk_mode(),
-                        JdkMode::Real,
-                        "the launcher default must not depend on whether a JDK exists"
-                    );
-                    // ...and the unavailability must surface as a hard error.
-                    let err = require_real_jdk(None)
-                        .expect_err("require_real_jdk must fail when no boot modules exist");
-                    assert!(err.contains("no usable JDK was found"), "{err}");
-                });
-            },
+        let cfg = VmConfig::for_launcher();
+        assert_eq!(
+            cfg.jdk_mode(),
+            JdkMode::Real,
+            "the launcher default must not depend on whether a JDK exists"
         );
+        let err = require_real_jdk(tmp.path().to_str())
+            .expect_err("require_real_jdk must fail when no boot modules exist");
+        assert!(err.contains("no usable JDK was found"), "{err}");
     }
 
     /// `with_host_jdk_default` is retained only as a compatibility alias
@@ -2249,32 +2253,20 @@ mod tests {
     /// the machine without a round trip.
     #[test]
     fn require_real_jdk_error_names_search_path_and_layouts() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let err = require_real_jdk(None).expect_err("bare dir is not a JDK");
-                    for needle in [
-                        "CRATONVM_JAVA_HOME",
-                        "JAVA_HOME",
-                        "java on PATH",
-                        "jmods/java.base.jmod",
-                        "lib/modules",
-                        "lib/rt.jar",
-                        "--java-home",
-                        "--synthetic-jdk",
-                    ] {
-                        assert!(
-                            err.contains(needle),
-                            "error message must mention {needle:?}; got:\n{err}"
-                        );
-                    }
-                });
-            },
-        );
+        let err = require_real_jdk(tmp.path().to_str()).expect_err("bare dir is not a JDK");
+        for needle in [
+            "jmods/java.base.jmod",
+            "lib/modules",
+            "lib/rt.jar",
+            "--java-home",
+            "--synthetic-jdk",
+        ] {
+            assert!(
+                err.contains(needle),
+                "error message must mention {needle:?}; got:\n{err}"
+            );
+        }
     }
 
     /// An `rt.jar`-only (JDK 8) install is rejected by the *validation*
@@ -2283,18 +2275,11 @@ mod tests {
     /// `detect_real_jdk_returns_none_when_only_rtjar_present`.
     #[test]
     fn require_real_jdk_rejects_rtjar_only_install() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("rt.jar"), b"PK\x03\x04").unwrap();
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                assert!(require_real_jdk(None).is_err());
-            },
-        );
+        assert!(require_real_jdk(tmp.path().to_str()).is_err());
     }
 
     /// A valid JDK makes validation succeed and hand back the resolved

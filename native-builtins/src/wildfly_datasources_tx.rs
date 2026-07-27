@@ -837,6 +837,37 @@ fn native_xa_rollback(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 
 /// Register every Datasources-subsystem + JTA native. Called from
 /// `register_essential_natives` in `lib.rs`.
+pub fn register_jdk_datasource_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+    registry.register(
+        CLS_DS,
+        "getConnection",
+        "()Ljava/sql/Connection;",
+        native_ds_get_connection,
+    );
+    registry.register(
+        CLS_DS,
+        "getConnection",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/sql/Connection;",
+        native_ds_get_connection_auth,
+    );
+    registry.register(
+        CLS_DS,
+        "getLoginTimeout",
+        "()I",
+        native_ds_get_login_timeout,
+    );
+    registry.register(
+        CLS_DS,
+        "setLoginTimeout",
+        "(I)V",
+        native_ds_set_login_timeout,
+    );
+    registry.set_category(__prev_cat);
+}
+
+/// Register every application-owned Datasources-subsystem + JTA native.
 pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -866,31 +897,6 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
         native_ds_service_get_value,
     );
 
-    // javax.sql.DataSource — delegate through the service's pool handle.
-    registry.register(
-        CLS_DS,
-        "getConnection",
-        "()Ljava/sql/Connection;",
-        native_ds_get_connection,
-    );
-    registry.register(
-        CLS_DS,
-        "getConnection",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljava/sql/Connection;",
-        native_ds_get_connection_auth,
-    );
-    registry.register(
-        CLS_DS,
-        "getLoginTimeout",
-        "()I",
-        native_ds_get_login_timeout,
-    );
-    registry.register(
-        CLS_DS,
-        "setLoginTimeout",
-        "(I)V",
-        native_ds_set_login_timeout,
-    );
     // Also register on the service so the synthetic-type lookup hits it
     // when Java code does a direct `getConnection()` on the service ref.
     registry.register(
@@ -1001,6 +1007,8 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::agroal_pool::{create_pool, pool_stats, test_lock, PoolConfig};
     use crate::ironjacamar_pool::bind_pool;
@@ -1346,6 +1354,7 @@ mod tests {
     #[test]
     fn t19_2_e_registration_smoke() {
         let mut r = NativeMethodRegistry::new();
+        register_jdk_datasource_natives(&mut r);
         register_wildfly_datasources_tx_natives(&mut r);
         assert!(r.find(CLS_TM, "begin", "()V").is_some());
         assert!(r.find(CLS_TM, "commit", "()V").is_some());

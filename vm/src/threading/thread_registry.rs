@@ -38,7 +38,7 @@ mod threadreg_perf {
     fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
-            std::env::var("CRATONVM_DBG_THREADREG_PERF")
+            cratonvm_types::flags::runtime_var("CRATONVM_DBG_THREADREG_PERF")
                 .map(|v| {
                     let t = v.trim();
                     !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
@@ -1449,7 +1449,7 @@ impl ThreadRegistry {
         if let Some(entry) = threads.get(&thread_id) {
             {
                 let mut f = entry.gc_block_state.fixup.lock();
-                if !f.is_empty() && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                if !f.is_empty() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
                     eprintln!(
                         "[blockgc] native-unblock DISCARDS {} fixups tid={}",
                         f.len(),
@@ -1731,7 +1731,7 @@ impl ThreadRegistry {
         if pointer_map.is_empty() {
             return;
         }
-        let dbg = std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some();
+        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some();
         let threads = self.threads.read();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {

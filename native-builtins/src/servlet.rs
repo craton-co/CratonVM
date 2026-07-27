@@ -1962,7 +1962,16 @@ pub(crate) struct SocketRegistry {
 /// chain is stored as DER bytes so it can be handed out repeatedly through
 /// `SSLSession.getPeerCertificates()` without touching the live TLS stream.
 pub(crate) struct TlsEntry {
-    pub(crate) stream: TlsClientStream,
+    /// Per-stream mutex, deliberately NOT guarded by `s2_registry()`: a
+    /// blocking TLS read/write must not hold the process-wide socket
+    /// registry lock (see `s2_tls_read`'s doc comment).
+    pub(crate) stream: Arc<parking_lot::Mutex<TlsClientStream>>,
+    /// A `try_clone`d handle on the same underlying socket, for fd-level
+    /// operations (`shutdownInput/Output`, `set/getSoTimeout`) that must NOT
+    /// wait on `stream`'s mutex — `shutdownInput` is exactly how a caller
+    /// unblocks a peer parked in a blocking TLS read, so taking that mutex
+    /// here would deadlock. `None` only if `try_clone` failed.
+    pub(crate) raw: Option<TcpStream>,
     pub(crate) peer_host: String,
     pub(crate) peer_port: u16,
     /// T2.7.11: owned so real negotiated handshake values can live here
@@ -2134,8 +2143,10 @@ pub(crate) fn s2_tls_connect(
         }
     }
 
+    let raw = tls_stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: TlsClientStream::Native(tls_stream),
+        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::Native(tls_stream))),
+        raw,
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol,
@@ -2209,8 +2220,10 @@ pub(crate) fn s2_legacy_dsa_tls_connect(
                 .map_err(|e| std::io::Error::other(e.to_string()))?,
         );
     }
+    let raw = stream.get_ref().try_clone().ok();
     let entry = TlsEntry {
-        stream: TlsClientStream::LegacyDsa(stream),
+        stream: Arc::new(parking_lot::Mutex::new(TlsClientStream::LegacyDsa(stream))),
+        raw,
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol: "TLSv1.2".to_string(),
@@ -2246,17 +2259,31 @@ pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     if id >= RUSTLS_SOCK_ID_BASE {
         return crate::t27_tls::rustls_stream_read(id - RUSTLS_SOCK_ID_BASE, buf);
     }
-    let mut reg = s2_registry().lock();
-    match reg.tls_streams.get_mut(&id) {
-        Some(entry) => match &mut entry.stream {
-            TlsClientStream::Native(stream) => stream.read(buf),
-            #[cfg(unix)]
-            TlsClientStream::LegacyDsa(stream) => stream.read(buf),
-        },
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no such TLS stream id",
-        )),
+    // LOCK DISCIPLINE: resolve the id and clone the per-stream handle under
+    // `s2_registry()`, then RELEASE it before blocking. This mutex guards
+    // every synthetic socket/listener/datagram in the process; holding it for
+    // the duration of a read that waits on a peer stalls all of them — and a
+    // thread parked on a plain mutex inside a native call never reaches a
+    // safepoint, so a concurrent STW then waits for it forever. Same
+    // reasoning as `s2_blocking_accept`'s existing "clone the handle out
+    // under a SHORT lock" comment.
+    let stream = {
+        let reg = s2_registry().lock();
+        match reg.tls_streams.get(&id) {
+            Some(entry) => entry.stream.clone(),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such TLS stream id",
+                ));
+            }
+        }
+    };
+    let mut stream = stream.lock();
+    match &mut *stream {
+        TlsClientStream::Native(stream) => stream.read(buf),
+        #[cfg(unix)]
+        TlsClientStream::LegacyDsa(stream) => stream.read(buf),
     }
 }
 
@@ -2266,17 +2293,24 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
     if id >= RUSTLS_SOCK_ID_BASE {
         return crate::t27_tls::rustls_stream_write(id - RUSTLS_SOCK_ID_BASE, data);
     }
-    let mut reg = s2_registry().lock();
-    match reg.tls_streams.get_mut(&id) {
-        Some(entry) => match &mut entry.stream {
-            TlsClientStream::Native(stream) => stream.write(data),
-            #[cfg(unix)]
-            TlsClientStream::LegacyDsa(stream) => stream.write(data),
-        },
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no such TLS stream id",
-        )),
+    // Same lock discipline as `s2_tls_read` — see its doc comment.
+    let stream = {
+        let reg = s2_registry().lock();
+        match reg.tls_streams.get(&id) {
+            Some(entry) => entry.stream.clone(),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such TLS stream id",
+                ));
+            }
+        }
+    };
+    let mut stream = stream.lock();
+    match &mut *stream {
+        TlsClientStream::Native(stream) => stream.write(data),
+        #[cfg(unix)]
+        TlsClientStream::LegacyDsa(stream) => stream.write(data),
     }
 }
 
@@ -2287,18 +2321,24 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
         crate::t27_tls::rustls_stream_close(id - RUSTLS_SOCK_ID_BASE);
         return Ok(());
     }
-    let mut reg = s2_registry().lock();
-    if let Some(mut entry) = reg.tls_streams.remove(&id) {
+    // Unregister under the registry lock, shut down outside it.
+    let entry = s2_registry().lock().tls_streams.remove(&id);
+    if let Some(entry) = entry {
         // Best-effort: if the peer already closed the connection, shutdown
         // can legitimately return an error that should not surface as an
-        // exception to Java-side callers.
-        match &mut entry.stream {
-            TlsClientStream::Native(stream) => {
-                let _ = stream.shutdown();
-            }
-            #[cfg(unix)]
-            TlsClientStream::LegacyDsa(stream) => {
-                let _ = stream.shutdown();
+        // exception to Java-side callers. `try_lock` because a peer parked in
+        // a blocking read on this same stream holds the per-stream mutex —
+        // waiting for it here would just relocate the stall we removed. The
+        // entry is already unregistered, so dropping the handle suffices.
+        if let Some(mut stream) = entry.stream.try_lock() {
+            match &mut *stream {
+                TlsClientStream::Native(stream) => {
+                    let _ = stream.shutdown();
+                }
+                #[cfg(unix)]
+                TlsClientStream::LegacyDsa(stream) => {
+                    let _ = stream.shutdown();
+                }
             }
         }
     }
@@ -2306,8 +2346,25 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
 }
 
 /// NEW-13: snapshot the captured peer certificate chain (DER bytes) for a
-/// given TLS stream id. Returns an empty Vec if no cert was presented.
+/// given TLS stream id, or -- for ids >= `RUSTLS_SOCK_ID_BASE` -- the rustls
+/// client stream table. Returns an empty Vec if no cert was presented.
+///
+/// FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
+/// this was missing the same `RUSTLS_SOCK_ID_BASE` redirect `s2_tls_read`/
+/// `s2_tls_write`/`s2_tls_close` (just above) already have. A client TLS
+/// socket backed by the rustls path (`t27_tls`, e.g. one that went through
+/// the deferred `SSLSocketFactory.createSocket(Socket,...)` handshake) stores
+/// its stream id offset by `RUSTLS_SOCK_ID_BASE` -- looking that id up in
+/// `s2_registry()` (the native-tls-only table) always misses, so
+/// `SSLSession.getPeerCertificates()`/`getPeerPrincipal()` (both call this)
+/// silently saw an empty chain and reported a "peer not authenticated" error
+/// even though rustls had genuinely captured the peer certificate, and
+/// `t27_tls::rustls_client_peer_cert_chain_der` already exposed it correctly
+/// for a different call site (`record_client_peer_chain`'s caller).
 pub(crate) fn s2_tls_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
+    if id >= RUSTLS_SOCK_ID_BASE {
+        return crate::t27_tls::rustls_client_peer_cert_chain_der(id - RUSTLS_SOCK_ID_BASE);
+    }
     let reg = s2_registry().lock();
     reg.tls_streams
         .get(&id)
@@ -6033,7 +6090,15 @@ fn register_s2_server_socket_channel(r: &mut NativeMethodRegistry) {
                 ctx.set_field(this, S2SSC_PENDING, Value::Int(-1));
                 pending
             } else {
+                // STW-COOPERATION: an idle acceptor parks here indefinitely.
+                // Without the blocked-region bracket it is still counted as a
+                // cooperative mutator that can never reach a safepoint, so a
+                // concurrent STW waits on it forever — the same
+                // `rounds=64 pending=1 taken=0` stall root-caused for
+                // `SSLSocketInputStream.read`.
+                ctx.begin_blocking_region();
                 let result = s2_blocking_accept(lid);
+                ctx.end_blocking_region();
                 match result {
                     Some(id) => id,
                     None => return Ok(Some(Value::Object(None))),
@@ -6658,6 +6723,8 @@ fn s3_stub_response(ctx: &mut dyn NativeContext, status: i32, msg: &str) -> Meth
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeContext as _;
     use cratonvm_types::ClassId;

@@ -153,7 +153,7 @@ enum AppConfigField {
 fn datasource_env_lookup(field: DatasourceField) -> Option<String> {
     for (env_name, kind) in DATASOURCE_ENV_ALLOWLIST {
         if *kind == field {
-            if let Ok(v) = std::env::var(env_name) {
+            if let Ok(v) = cratonvm_types::flags::runtime_var(env_name) {
                 if !v.is_empty() {
                     return Some(v);
                 }
@@ -166,7 +166,7 @@ fn datasource_env_lookup(field: DatasourceField) -> Option<String> {
 fn application_config_env_lookup(field: AppConfigField) -> Option<String> {
     for (env_name, kind) in APPLICATION_CONFIG_ENV_ALLOWLIST {
         if *kind == field {
-            if let Ok(v) = std::env::var(env_name) {
+            if let Ok(v) = cratonvm_types::flags::runtime_var(env_name) {
                 if !v.is_empty() {
                     return Some(v);
                 }
@@ -416,7 +416,7 @@ fn sanitize_main_class_candidate(s: &str) -> Option<String> {
 /// provides an override (sanitized); otherwise falls back to the
 /// Keycloak 26 default.
 fn resolve_main_class() -> String {
-    let from_env = std::env::var("QUARKUS_MAIN_CLASS")
+    let from_env = cratonvm_types::flags::runtime_var("QUARKUS_MAIN_CLASS")
         .ok()
         .and_then(|v| sanitize_main_class_candidate(&v));
     if let Some(name) = from_env {
@@ -1177,6 +1177,8 @@ fn reset_supplier_state() {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeMethodRegistry;

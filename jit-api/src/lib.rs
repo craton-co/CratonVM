@@ -29,6 +29,72 @@ use std::sync::Arc;
 use cratonvm_reader::attribute::ExceptionTableEntry;
 use cratonvm_types::ClassId;
 
+/// Count Java parameters using CratonVM's compact one-slot-per-value calling
+/// convention. `long` and `double` each occupy one compact argument slot.
+///
+/// This descriptor contract belongs in the backend-neutral JIT API because
+/// class loading needs it while constructing cached call metadata. Keeping it
+/// in the concrete compiler crate inverted the intended
+/// `classloading -> jit-api <- jit` dependency direction.
+pub fn count_param_slots(descriptor: &str) -> usize {
+    let bytes = descriptor.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return 0;
+    }
+    let mut i = 1;
+    let mut slots = 0;
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'I' | b'F' | b'B' | b'C' | b'S' | b'Z' | b'J' | b'D' => {
+                slots += 1;
+                i += 1;
+            }
+            b'L' => {
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += usize::from(i < bytes.len());
+                slots += 1;
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    if bytes[i] == b'L' {
+                        while i < bytes.len() && bytes[i] != b';' {
+                            i += 1;
+                        }
+                        i += usize::from(i < bytes.len());
+                    } else {
+                        i += 1;
+                    }
+                }
+                slots += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    slots
+}
+
+#[cfg(test)]
+mod descriptor_contract_tests {
+    use super::count_param_slots;
+
+    #[test]
+    fn compact_parameter_count_is_backend_neutral() {
+        assert_eq!(count_param_slots("()V"), 0);
+        assert_eq!(count_param_slots("(IJDF)V"), 4);
+        assert_eq!(
+            count_param_slots("([[I[Ljava/lang/Object;Ljava/lang/String;)V"),
+            3
+        );
+        assert_eq!(count_param_slots("not-a-method-descriptor"), 0);
+    }
+}
+
 /// Cached bytecode method info — everything needed to create a Frame without
 /// any lock acquisitions or string allocations.
 ///

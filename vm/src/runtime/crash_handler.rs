@@ -1384,7 +1384,7 @@ mod windows_fault {
     pub fn symbolize_rvas(rvas: &[usize]) -> Vec<(usize, Option<String>)> {
         let module_base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
         let process = unsafe { GetCurrentProcess() };
-        let verbose = std::env::var("CRATONVM_SYMBOLIZE_DBG").as_deref() == Ok("1");
+        let verbose = cratonvm_types::flags::runtime_var("CRATONVM_SYMBOLIZE_DBG").as_deref() == Ok("1");
         // Build a search path = the exe's own directory, so dbghelp finds the
         // co-located cratonvm.pdb regardless of cwd / _NT_SYMBOL_PATH.
         let mut exe_path = [0u16; 1024];
@@ -2161,7 +2161,7 @@ fn get_cpu_info_macos() -> String {
 fn get_cpu_info_windows() -> String {
     // Read the CPU name from the PROCESSOR_IDENTIFIER environment variable
     // or fall back to a wmic query.
-    let model = std::env::var("PROCESSOR_IDENTIFIER")
+    let model = cratonvm_types::flags::runtime_var("PROCESSOR_IDENTIFIER")
         .ok()
         .or_else(|| {
             std::process::Command::new("wmic")

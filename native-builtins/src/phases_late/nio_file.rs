@@ -4478,6 +4478,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         };
         let temp_dir = jdk_temp_dir(ctx.get_system_property("java.io.tmpdir"));
         let path_str = jdk_create_temp_file(&temp_dir, &prefix, &suffix)?;
+        // Real JDK: `TempFileHelper.create` creates temp FILES 0600 by
+        // default, and honors an explicit `FileAttribute` above that. (The
+        // `java.io.File.createTempFile` natives keep the umask default —
+        // that API has no such contract.)
+        apply_unix_mode(
+            &path_str,
+            posix_mode_from_file_attributes(ctx, args.get(2)).or(Some(0o600)),
+        );
         let result = p57_alloc_path(ctx, &path_str);
         Ok(Some(Value::Object(Some(result))))
     });
@@ -4501,6 +4509,12 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let full_path = temp_dir.join(name);
             std::fs::create_dir_all(&full_path).map_err(|e| p57_io_error(&e))?;
             let path_str = full_path.to_string_lossy().to_string();
+            // Real JDK: `TempFileHelper.create` creates temp directories 0700
+            // by default, and honors an explicit `FileAttribute` above that.
+            apply_unix_mode(
+                &path_str,
+                posix_mode_from_file_attributes(ctx, args.get(1)).or(Some(0o700)),
+            );
             let result = p57_alloc_path(ctx, &path_str);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -4693,8 +4707,16 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) => Err(p57_io_error(&e)),
                 };
             }
+            // Same `FileAttribute` contract as `createDirectory`. The real
+            // JDK applies the mode to each directory it creates; applying it
+            // to the leaf covers every caller we have (the parents are
+            // usually pre-existing).
+            let mode = posix_mode_from_file_attributes(ctx, args.get(1));
             match std::fs::create_dir_all(&p) {
-                Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
+                Ok(()) => {
+                    apply_unix_mode(&p, mode);
+                    Ok(Some(Value::Object(Some(path_obj))))
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     Err(p57_no_such_file(ctx, &p))
                 }
@@ -4735,7 +4757,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     Err(e) => Err(p57_io_error(&e)),
                 };
             }
-            match std::fs::create_dir(&p) {
+            // Honor `PosixFilePermissions.asFileAttribute(...)` (arg 1): the
+            // real JDK passes it straight to `mkdir(2)`. Ignoring it left
+            // every such directory at the process umask.
+            let mode = posix_mode_from_file_attributes(ctx, args.get(1));
+            match create_dir_with_mode(&p, mode) {
                 Ok(()) => Ok(Some(Value::Object(Some(path_obj)))),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     Err(p57_no_such_file(ctx, &p))
@@ -6882,6 +6908,8 @@ pub(crate) mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{p57_win_is_absolute, p57_win_parent_of};
 
     #[test]
@@ -6932,6 +6960,8 @@ pub(crate) mod p57_win_path_tests {
 pub(crate) mod p57_normalize_relativize_tests {
     //! `Path.normalize()` / `Path.relativize()` vs HotSpot (JDK 25, via the
     //! `PathDeep` repro). Helpers emit `/`-canonical internal form.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{p57_normalize_path, p57_relativize};
 
     #[test]
@@ -7968,12 +7998,14 @@ pub(crate) fn jrtfs_list_class_binary_names(
 
 #[cfg(test)]
 pub(crate) mod jrtfs_javac_listing_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::jrtfs_list_class_binary_names;
     use std::path::{Path, PathBuf};
 
     fn test_java_home() -> Option<PathBuf> {
         for key in ["CRATONVM_TEST_JDK", "CRATONVM_JAVA_HOME", "JAVA_HOME"] {
-            if let Some(home) = std::env::var_os(key).map(PathBuf::from) {
+            if let Some(home) = cratonvm_types::flags::runtime_var_os(key).map(PathBuf::from) {
                 if home.join("lib/modules").is_file() {
                     return Some(home);
                 }
@@ -12095,6 +12127,20 @@ pub(crate) fn p59_files_read_attributes(
                 mod_millis,
                 perm_bits,
             );
+            // `UnixFileAttributes.owner()`/`group()` (real JDK bytecode) read
+            // these two fields and hand them to `UnixUserPrincipals.fromUid/
+            // fromGid`. They were never populated, so every file reported
+            // uid/gid 0 ("root") — wrong for any ownership check, and the
+            // reason Spring Boot's `ApplicationTemp` ownership assertion had
+            // nothing sensible to compare against. Only meaningful on Unix;
+            // the Windows attribute object has no such fields (the setters
+            // are by-name and are silently dropped when absent).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                ctx.set_field_by_name(bfa, "st_uid", Value::Int(meta.uid() as i32));
+                ctx.set_field_by_name(bfa, "st_gid", Value::Int(meta.gid() as i32));
+            }
         }
         // NIO contract: `Files.readAttributes` must raise `IOException`
         // (`NoSuchFileException` when the path is missing) — silently
@@ -13407,6 +13453,107 @@ pub(crate) fn watch_service_poll(
 // java.nio.file.attribute extensions — PosixFilePermission, FileTime, UserPrincipal
 // =============================================================================
 
+/// Synthetic class backing `PosixFilePermissions.asFileAttribute`'s result.
+/// Field 0 = the attribute name (`"posix:permissions"`), field 1 = the
+/// `Set<PosixFilePermission>` value — the same two things the interface's
+/// `name()`/`value()` return.
+pub(crate) const FILE_ATTRIBUTE_CLASS: &str = "java/nio/file/attribute/FileAttribute";
+
+/// Unix mode requested by a `[Ljava/nio/file/attribute/FileAttribute;` varargs
+/// argument, i.e. by `PosixFilePermissions.asFileAttribute(...)`.
+///
+/// The real JDK applies this at creation time (the `mkdir(2)`/`open(2)` mode
+/// argument); every `Files.create*` native here used to ignore the array
+/// outright, so the created file/directory got the process umask instead of
+/// the caller's requested mode. Returns `None` when the array is absent,
+/// empty, or carries no `posix:permissions` attribute — callers then keep
+/// their previous default behaviour.
+pub(crate) fn posix_mode_from_file_attributes(
+    ctx: &mut dyn NativeContext,
+    arg: Option<&Value>,
+) -> Option<u32> {
+    let arr = match arg {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return None,
+    };
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        let elem = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(e)) => e,
+            _ => continue,
+        };
+        // Synthetic `asFileAttribute` result: read the two fields directly.
+        // A real JDK `PosixFilePermissions$1` has no such layout, so fall
+        // back to the interface methods for it — and check the object's width
+        // first, since probing slots it does not have is an out-of-bounds read
+        // the heap guard reports.
+        let two_field_carrier = ctx.object_num_fields(elem) > 1;
+        let mut name = match two_field_carrier.then(|| ctx.get_field(elem, 0)) {
+            Some(Value::Object(Some(s))) => ctx.read_string(s),
+            _ => None,
+        };
+        let mut value = if two_field_carrier {
+            ctx.get_field(elem, 1)
+        } else {
+            Value::Object(None)
+        };
+        if name.as_deref() != Some("posix:permissions") {
+            name = match ctx.invoke_virtual(elem, "name", "()Ljava/lang/String;", &[]) {
+                Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+                _ => None,
+            };
+            if name.as_deref() != Some("posix:permissions") {
+                continue;
+            }
+            value = match ctx.invoke_virtual(elem, "value", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(v)) => v,
+                _ => continue,
+            };
+        }
+        if let Value::Object(Some(set)) = value {
+            return Some(posix_permission_bits_from_set(ctx, set));
+        }
+    }
+    None
+}
+
+/// `std::fs::create_dir` with an explicit Unix mode when the caller asked for
+/// one (atomic — the mode is passed to `mkdir(2)`, so the directory is never
+/// briefly visible with wider permissions).
+pub(crate) fn create_dir_with_mode(p: &str, mode: Option<u32>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
+        if let Some(m) = mode {
+            b.mode(m);
+        }
+        return b.create(p);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::fs::create_dir(p)
+    }
+}
+
+/// Best-effort `chmod` for paths that were already created (the recursive
+/// `create_dir_all` and temp-file paths). No-op off Unix and when no mode was
+/// requested.
+pub(crate) fn apply_unix_mode(p: &str, mode: Option<u32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(m) = mode {
+            let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (p, mode);
+    }
+}
+
 /// Convert a `Set<PosixFilePermission>` (the 9 canonical singleton constants
 /// from `posix_file_permission_stub_clinit`/the real enum) into a Unix
 /// permission-bits mode (e.g. for `std::fs::Permissions::from_mode`). Walks
@@ -13864,17 +14011,60 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(set))))
         },
     );
-    // Spring Boot 3 `JarFileArchive.<clinit>` uses this in a `FileAttribute[]`;
-    // null is valid. Bridges NSM when the method is missing from the resolved
-    // class table, without inventing a synthetic `java/**` FileAttribute type.
+    // Bridges NSM when the method is missing from the resolved class table.
+    // This native SHADOWS the real JDK's anonymous-class implementation even
+    // in real-JDK mode, so returning `null` here (the previous behaviour) was
+    // not a harmless fallback: it silently erased the requested mode from
+    // every `Files.createDirectory(dir, PosixFilePermissions
+    // .asFileAttribute(<700>))` call, which then created the directory with
+    // the process umask (0755). Spring Boot's `ApplicationTemp` rejected its
+    // OWN temp directory on the next call ("Existing directory ... does not
+    // have the permissions [OWNER_READ, OWNER_WRITE, OWNER_EXECUTE]") —
+    // `AbstractServletWebServerFactoryTests#persistSession` /
+    // `#getValidSessionStoreWhenSessionStoreNotSet`. Hand back a two-field
+    // synthetic carrier instead; `posix_mode_from_file_attributes` reads it,
+    // and `name()`/`value()` below cover anyone who calls the interface.
     r.register(
         pfps,
         "asFileAttribute",
         "(Ljava/util/Set;)Ljava/nio/file/attribute/FileAttribute;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let set = match args.first() {
+                Some(Value::Object(Some(s))) => *s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Pin across the alloc/create_string below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let set_pin = ctx.pin_native_root(set);
+            let fa = alloc_concurrent_synthetic(ctx, FILE_ATTRIBUTE_CLASS, 2);
+            let fa_pin = ctx.pin_native_root(fa);
+            let name = ctx.create_string("posix:permissions");
+            let fa = ctx.read_native_pin(fa_pin, fa);
+            let set = ctx.read_native_pin(set_pin, set);
+            ctx.unpin_native_roots(set_pin);
+            ctx.set_field(fa, 0, Value::Object(Some(name)));
+            ctx.set_field(fa, 1, Value::Object(Some(set)));
+            Ok(Some(Value::Object(Some(fa))))
+        },
     );
-    // `asFileAttribute` — when real JDK bytecode is present, it builds an
-    // anonymous `FileAttribute`; the native above is a fallback only.
+    r.register(
+        FILE_ATTRIBUTE_CLASS,
+        "name",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
+        },
+    );
+    r.register(
+        FILE_ATTRIBUTE_CLASS,
+        "value",
+        "()Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 1)))
+        },
+    );
     register_posix_file_permission_stub_clinit(r);
     r.set_category(__prev_cat);
 }

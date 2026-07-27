@@ -3818,6 +3818,8 @@ pub fn register_nio_selector(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
