@@ -868,6 +868,8 @@ impl DenseIntEntries {
 
 #[cfg(test)]
 mod dense_int_entries_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     fn object(address: usize) -> ObjectRef {
@@ -1231,7 +1233,7 @@ pub fn jit_overlay_hashmap_put(
 // Cached debug-flag probes.
 //
 // These flags are read from the OS environment on every native call in the
-// original code (`std::env::var`/`var_os`), which is a syscall-backed lookup
+// original code (`cratonvm_types::flags::runtime_var`/`var_os`), which is a syscall-backed lookup
 // on the hot path. The values never change for the lifetime of the process,
 // so we resolve each exactly once into a `OnceLock<bool>` and reference the
 // cached boolean thereafter. Behaviour is identical — the flag is still
@@ -1241,19 +1243,19 @@ pub fn jit_overlay_hashmap_put(
 /// `true` iff `CRATONVM_HM_TRACE` is set (HashMap equals/contract tracing).
 fn dbg_hm_trace() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HM_TRACE").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_HM_TRACE").is_some())
 }
 
 /// `true` iff `CRATONVM_HS_ITR_DBG` is set (HashSet iterator tracing).
 fn dbg_hs_itr() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HS_ITR_DBG").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_HS_ITR_DBG").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_SBLOAD` is set (synthetic-build-load tracing).
 fn dbg_sbload() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_SBLOAD").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SBLOAD").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_KCBOOL` is set — traces enum-keyed map lookups,
@@ -1265,14 +1267,14 @@ fn dbg_sbload() -> bool {
 /// constant object exists (same `(class_id, ordinal)`, different pointer).
 fn dbg_kcbool() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_KCBOOL").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_KCBOOL").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_HMPUT` is set (HashMap put node-walk tracing).
 /// Cached to avoid a syscall-backed env probe per node on the hot put path.
 fn dbg_hmput() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_HMPUT").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HMPUT").is_some())
 }
 
 /// Diagnostic: on an enum-keyed `Map.get` miss, dump the lookup key's enum
@@ -1331,6 +1333,7 @@ fn native_unsorted_set_comparator(
 
 /// Register all collection native methods.
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
+    register_gc_root_provider();
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_arraylist_natives(registry);
@@ -2907,7 +2910,7 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn altrace_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some())
 }
 
 // ALTRACE helper: resolve a Value to "ptr cls=... [str=...]" so a trace line
@@ -3281,7 +3284,7 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs={}",
             args.len()
@@ -3381,7 +3384,7 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let elems = al_or_collection_elements(ctx, this);
     let size = elems.len();
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array_typed HIT nargs={} size={} template_some={}",
             args.len(),
@@ -9289,6 +9292,22 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// LETSGO_S1: HashSet.hashCode — sum of `hashCode()` over elements
 /// (matches `AbstractSet.hashCode` semantics).
+///
+/// This native is registered on `java/util/AbstractSet` (where HashSet's
+/// inherited `hashCode()` resolves), so it intercepts *every* `AbstractSet`
+/// subclass — including user/library sets whose elements do not live in a
+/// HashSet-shaped backing map, e.g. Weld's `ImmutableTinySet$Doubleton`
+/// (members held in named `element1`/`element2` fields). For those
+/// `hs_backing_map` is `None`, and the bare `collect_collection_elements`
+/// extractor — which only knows fixed collection layouts — returned an empty
+/// Vec, so `hashCode()` was silently 0 instead of the `AbstractSet` contract's
+/// element-hash sum. A 0 hash still compares `equals` correctly but lands in
+/// the wrong HashMap bucket, so a `Map<Set<..>, ..>` keyed by such a set is
+/// unfindable with an equal `HashSet` probe (the `getSharedSet` shape from
+/// HIB-CV-25; caught by regression-suite `RCollections` "set-key true hit").
+/// Use the `_or_real` variant — the same fix already applied to
+/// `containsAll`/`retainAll`/`removeAll` — which falls back to the
+/// collection's real `toArray()`.
 fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -9296,7 +9315,7 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let keys = match hs_backing_map(ctx, this) {
         Some(m) => map_collect_keys(ctx, m),
-        None => collect_collection_elements(ctx, this),
+        None => collect_collection_elements_or_real(ctx, this),
     };
     let mut h: i32 = 0;
     for k in &keys {
@@ -9527,6 +9546,28 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let old = native_map_put(ctx, &put_args)?;
     let was_new = matches!(old, Some(Value::Object(None)));
     Ok(Some(Value::Int(if was_new { 1 } else { 0 })))
+}
+
+/// `HashSet.remove(Object)` against this VM's native backing map, for callers
+/// that registered their own override on a `HashSet` subclass and need the
+/// ordinary behaviour as a fallback.
+///
+/// Returns `None` when `this` has no native backing map, so the caller can
+/// still fall through to real bytecode. Falling through UNCONDITIONALLY is not
+/// safe: real `HashSet.remove` is `return map.remove(o) == PRESENT;`, and the
+/// synthetic backing map stores an `Int(1)` sentinel rather than JDK
+/// `HashSet.PRESENT` — so that identity comparison is always false and
+/// `remove()` deletes the element while reporting `false`.
+pub fn try_native_hashset_remove(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    hs_backing_map(ctx, this)?;
+    Some(native_hs_remove(ctx, args))
 }
 
 fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11109,7 +11150,7 @@ fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// branch when unset.
 fn dbg_cce_backtrace(site: &str, ctx: &dyn NativeContext, ao: ObjectRef, bo: Option<ObjectRef>) {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*E.get_or_init(|| std::env::var_os("CRATONVM_DBG_CCE_BT").is_some()) {
+    if !*E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CCE_BT").is_some()) {
         return;
     }
     let a_name = object_class_name(ctx, ao);
@@ -13765,10 +13806,10 @@ const LAZY_OP_FLAT_MAP: i32 = 5;
 fn lazy_streams_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        if std::env::var_os("CRATONVM_LAZY_STREAMS").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_LAZY_STREAMS").is_some() {
             return true; // explicit force-on wins
         }
-        std::env::var_os("CRATONVM_EAGER_STREAMS").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_EAGER_STREAMS").is_none()
     })
 }
 
@@ -24407,7 +24448,7 @@ fn native_random_next_int_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // CRATONVM_DBG_NEXTINT=1 — dump the Java caller chain. See the twin
         // diagnostic in native-builtins securerandom.rs for rationale (locating
         // the empty-collection divergence in ES/Lucene test-framework setup).
-        if std::env::var("CRATONVM_DBG_NEXTINT").is_ok() {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_NEXTINT").is_ok() {
             eprintln!("NEXTINT-BAD(coll) bound={bound} caller-chain (inner→outer):");
             let frames = ctx.capture_stack_trace(0);
             for f in frames.iter().rev().take(20) {
@@ -27204,7 +27245,7 @@ fn native_lhm_put_evict(
     // `ExplicitQueryStatsMaxSizeTest` (query-plan stats trimmed at 100 entries).
     let (this_cid, this_class_name, is_plain_lhm, invoke_remove_eldest) =
         lhm_remove_eldest_hook_decision(ctx, this);
-    if std::env::var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
         eprintln!(
             "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={} invoke_remove_eldest={} evict={}",
             this_cid,
@@ -31468,6 +31509,26 @@ pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
     for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
+/// Publish the collection-overlay root contract to the collector abstraction.
+///
+/// Registration is deliberately performed from native initialization rather
+/// than from the GC crate: this keeps the collector independent of collection
+/// implementations and guarantees the provider exists before an overlay can be
+/// created through a registered native.
+fn register_gc_root_provider() {
+    cratonvm_gc::external_roots::register_external_root_provider(
+        cratonvm_gc::external_roots::ExternalRootProvider {
+            name: "native-collection-overlays",
+            scan: gc_scan_collection_overlay_roots,
+            owner_addrs: gc_overlay_owner_addrs,
+            roots_for_owner: gc_overlay_roots_for_collection,
+            roots_for_matching_owners: gc_overlay_roots_for_matching_owners,
+            remap: gc_update_collection_overlay_refs,
+            prune: gc_prune_dead_collection_overlays,
+        },
+    );
+}
+
 /// Owner addresses that have at least one overlay key registered.
 ///
 /// `gc_overlay_roots_for_collection` locks the owner index on every call and
@@ -31596,7 +31657,7 @@ pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
 /// retain them for the minor collection, then let the major marker apply the
 /// precise per-owner rule before old-space compaction.
 pub fn gc_overlay_roots_for_matching_owners(
-    owner_matches: impl Fn(usize) -> bool,
+    owner_matches: &dyn Fn(usize) -> bool,
 ) -> Vec<ObjectRef> {
     let owners: Vec<usize> = {
         let index = overlay_owner_keys()
@@ -31698,7 +31759,7 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
 /// this crate's scope and is flagged in the change report rather than edited
 /// here.
 pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
-    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
     if dbg {
         let total_slots: usize = obj_key_shards()
             .iter()
@@ -46082,7 +46143,7 @@ fn native_tp_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// native-builtins helper of the same shape (kept separate to avoid a crate
 /// dependency cycle).
 fn interrupt_tpe_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
-    let dbg = std::env::var_os("CRATONVM_DBG_EXEC").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXEC").is_some();
     let tpe = match ctx.get_field_by_name(exec, "e") {
         Value::Object(Some(inner)) => inner,
         _ => exec,
@@ -46323,6 +46384,8 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     // Unit tests for helper functions only.
@@ -46333,7 +46396,7 @@ mod tests {
         // The cached helper must report exactly "env var is set" — identical
         // truthiness to the original `env::var(...).is_ok()` check.
         use super::dbg_hmput;
-        let expected = std::env::var_os("CRATONVM_DBG_HMPUT").is_some();
+        let expected = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HMPUT").is_some();
         assert_eq!(dbg_hmput(), expected);
         // Cached: second call returns the same value.
         assert_eq!(dbg_hmput(), expected);
@@ -47822,6 +47885,8 @@ mod tests {
     // ===================================================================
 
     mod lbq_blocking_tests {
+        #[allow(unused_imports)]
+        use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
         use super::super::*;
         use cratonvm_native_api::{
             AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, StackTraceEntry,
@@ -48035,7 +48100,181 @@ mod tests {
             }
         }
 
-        impl NativeContext for MockCtx {
+        impl cratonvm_native_api::NativeClassAccess for MockCtx {
+
+
+            // --- default stubs for everything else ---------------------
+            fn load_class(&mut self, _n: &str) -> MethodCallResult {
+                Ok(None)
+            }
+            fn class_name_of_id(&self, c: ClassId) -> Option<String> {
+                self.shared.lock().unwrap().class_names.get(&c).cloned()
+            }
+            fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .object_classes
+                    .get(&(o.as_ptr() as usize))
+                    .copied()
+                    .unwrap_or_else(|| ClassId::new(0))
+            }
+            fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
+                false
+            }
+            fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
+                Ok(ClassId::new(0))
+            }
+            fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool {
+                false
+            }
+            fn superclass_of(&self, c: ClassId) -> Option<ClassId> {
+                if let Some(parent) = self.shared.lock().unwrap().superclasses.get(&c) {
+                    return Some(*parent);
+                }
+                // No modelled edge: same as the previous always-`None` stub.
+                None
+            }
+            /// Reverse of `class_name_of_id` over the classes this mock has
+            /// actually been told about. Previously an unconditional `None`,
+            /// which made `ClassDiscriminator` unable to resolve anything and
+            /// so untestable here. A name that was never `define_class`d — or
+            /// that has been `unload_class`d — still answers `None`, so no
+            /// existing test's expectations move.
+            fn class_id_by_name(&self, n: &str) -> Option<ClassId> {
+                let s = self.shared.lock().unwrap();
+                s.class_names
+                    .iter()
+                    .find(|(_, name)| name.as_str() == n)
+                    .map(|(id, _)| *id)
+            }
+            fn loader_id_of_class(&self, _c: ClassId) -> i32 {
+                2
+            }
+            fn is_record_class(&self, _c: ClassId) -> bool {
+                false
+            }
+            fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
+                Vec::new()
+            }
+            fn is_sealed_class(&self, _c: ClassId) -> bool {
+                false
+            }
+            fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
+                Vec::new()
+            }
+            fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
+                Vec::new()
+            }
+            fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
+                Vec::new()
+            }
+            fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
+                Vec::new()
+            }
+            fn class_access_flags(&self, _c: ClassId) -> u16 {
+                0
+            }
+            fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
+                Vec::new()
+            }
+            fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
+                Vec::new()
+            }
+            fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
+                Vec::new()
+            }
+            fn method_parameter_annotations(
+                &self,
+                _c: ClassId,
+                _m: &str,
+                _d: &str,
+            ) -> Vec<Vec<AnnotationData>> {
+                Vec::new()
+            }
+            fn class_signature(&self, _c: ClassId) -> Option<String> {
+                None
+            }
+            fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
+                None
+            }
+            fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
+                None
+            }
+            fn method_annotation_default(
+                &self,
+                _c: ClassId,
+                _m: &str,
+                _d: &str,
+            ) -> Option<AnnotationElementValue> {
+                None
+            }
+            fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
+                None
+            }
+            fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
+                None
+            }
+            fn list_application_class_names(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn register_dynamic_classpath(&mut self, _p: &[String]) {}
+            fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
+                None
+            }
+            fn define_class_with_loader(
+                &mut self,
+                _n: &str,
+                _b: &[u8],
+                _l: u32,
+            ) -> Option<ClassId> {
+                None
+            }
+            fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
+                None
+            }
+            fn allocate_loader_id(&mut self) -> u32 {
+                0
+            }
+            fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
+                true
+            }
+            fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+                true
+            }
+            fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
+                true
+            }
+            fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+                true
+            }
+            fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
+
+            fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
+                Ok(None)
+            }
+            fn invoke_virtual(
+                &mut self,
+                _r: ObjectRef,
+                _m: &str,
+                _d: &str,
+                _a: &[Value],
+            ) -> MethodCallResult {
+                Ok(None)
+            }
+        }
+
+        impl cratonvm_native_api::NativeHeapAccess for MockCtx {
+
             // Pre-existing test-fixture gap (unrelated to this session's fix):
             // `c812b622` added this trait method with no default impl but
             // never updated this inline mock, breaking `cargo test -p
@@ -48135,6 +48374,63 @@ mod tests {
             fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
                 ArrayElementType::Reference
             }
+            fn new_object(&mut self, _c: &str) -> MethodCallResult {
+                Ok(None)
+            }
+            fn identity_hash_code(&self, o: ObjectRef) -> i32 {
+                o.as_ptr() as i32
+            }
+            fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {
+                Value::Object(None)
+            }
+            fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
+            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
+                None
+            }
+            fn create_string(&mut self, _t: &str) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn read_string(&self, _o: ObjectRef) -> Option<String> {
+                None
+            }
+            fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn heap_allocated_bytes(&self) -> usize {
+                0
+            }
+            fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value {
+                self.get_field(o, i)
+            }
+            fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) {
+                self.set_field(o, i, v)
+            }
+            fn compare_and_swap_field(
+                &mut self,
+                _o: ObjectRef,
+                _i: usize,
+                _e: Value,
+                _n: Value,
+            ) -> bool {
+                false
+            }
+            fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {
+                None
+            }
+            fn discover_reference(
+                &mut self,
+                _t: u8,
+                _r: ObjectRef,
+                _f: ObjectRef,
+                _q: Option<ObjectRef>,
+            ) {
+            }
+        }
+
+        impl cratonvm_native_api::NativeThreadAccess for MockCtx {
+
 
             // --- monitor primitives (the load-bearing bit) -------------
             fn thread_id(&self) -> u64 {
@@ -48182,126 +48478,6 @@ mod tests {
                 m.notify_all();
                 Ok(None)
             }
-
-            // --- default stubs for everything else ---------------------
-            fn load_class(&mut self, _n: &str) -> MethodCallResult {
-                Ok(None)
-            }
-            fn new_object(&mut self, _c: &str) -> MethodCallResult {
-                Ok(None)
-            }
-            fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
-                Ok(None)
-            }
-            fn invoke_virtual(
-                &mut self,
-                _r: ObjectRef,
-                _m: &str,
-                _d: &str,
-                _a: &[Value],
-            ) -> MethodCallResult {
-                Ok(None)
-            }
-            fn identity_hash_code(&self, o: ObjectRef) -> i32 {
-                o.as_ptr() as i32
-            }
-            fn record_printed_value(&mut self, _v: Value) {}
-            fn class_name_of_id(&self, c: ClassId) -> Option<String> {
-                self.shared.lock().unwrap().class_names.get(&c).cloned()
-            }
-            fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
-                self.shared
-                    .lock()
-                    .unwrap()
-                    .object_classes
-                    .get(&(o.as_ptr() as usize))
-                    .copied()
-                    .unwrap_or_else(|| ClassId::new(0))
-            }
-            fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
-                Vec::new()
-            }
-            fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
-                None
-            }
-            fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {
-                Value::Object(None)
-            }
-            fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
-            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-                None
-            }
-            fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
-                false
-            }
-            fn create_string(&mut self, _t: &str) -> ObjectRef {
-                let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
-            }
-            fn read_string(&self, _o: ObjectRef) -> Option<String> {
-                None
-            }
-            fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
-                let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
-            }
-            fn record_printed_line(&mut self, _t: String) {}
-            fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
-                None
-            }
-            fn get_system_property(&self, _k: &str) -> Option<String> {
-                None
-            }
-            fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
-                None
-            }
-            fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
-                Ok(ClassId::new(0))
-            }
-            fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool {
-                false
-            }
-            fn vm_identity(&self) -> usize {
-                self.shared.lock().unwrap().vm_id
-            }
-            fn superclass_of(&self, c: ClassId) -> Option<ClassId> {
-                if let Some(parent) = self.shared.lock().unwrap().superclasses.get(&c) {
-                    return Some(*parent);
-                }
-                // No modelled edge: same as the previous always-`None` stub.
-                None
-            }
-            fn is_interface_class(&self, _c: ClassId) -> bool {
-                false
-            }
-            /// Reverse of `class_name_of_id` over the classes this mock has
-            /// actually been told about. Previously an unconditional `None`,
-            /// which made `ClassDiscriminator` unable to resolve anything and
-            /// so untestable here. A name that was never `define_class`d — or
-            /// that has been `unload_class`d — still answers `None`, so no
-            /// existing test's expectations move.
-            fn class_id_by_name(&self, n: &str) -> Option<ClassId> {
-                let s = self.shared.lock().unwrap();
-                s.class_names
-                    .iter()
-                    .find(|(_, name)| name.as_str() == n)
-                    .map(|(id, _)| *id)
-            }
-            fn loader_id_of_class(&self, _c: ClassId) -> i32 {
-                2
-            }
-            fn is_record_class(&self, _c: ClassId) -> bool {
-                false
-            }
-            fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
-                Vec::new()
-            }
-            fn is_sealed_class(&self, _c: ClassId) -> bool {
-                false
-            }
-            fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
-                Vec::new()
-            }
             fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult {
                 Ok(None)
             }
@@ -48325,8 +48501,50 @@ mod tests {
             fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> {
                 Vec::new()
             }
-            fn heap_allocated_bytes(&self) -> usize {
+            fn park(&mut self, _t: Option<std::time::Duration>) {}
+            fn unpark(&self, _o: ObjectRef) {}
+            fn get_scoped_value(&self, _k: u64) -> Option<Value> {
+                None
+            }
+            fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
+            fn pop_scoped_value(&mut self) {}
+            fn scoped_value_depth(&self) -> usize {
                 0
+            }
+        }
+
+        impl cratonvm_native_api::NativeExceptionAccess for MockCtx {
+
+            fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
+                Vec::new()
+            }
+            fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
+                None
+            }
+        }
+
+        impl cratonvm_native_api::NativeGpuAccess for MockCtx {
+
+        }
+
+        impl cratonvm_native_api::NativeSystemAccess for MockCtx {
+
+            fn record_printed_value(&mut self, _v: Value) {}
+            fn record_printed_line(&mut self, _t: String) {}
+            fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
+                None
+            }
+            fn get_system_property(&self, _k: &str) -> Option<String> {
+                None
+            }
+            fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
+                None
+            }
+            fn vm_identity(&self) -> usize {
+                self.shared.lock().unwrap().vm_id
+            }
+            fn is_interface_class(&self, _c: ClassId) -> bool {
+                false
             }
             fn loaded_class_count(&self) -> usize {
                 0
@@ -48335,93 +48553,15 @@ mod tests {
                 0
             }
             fn force_gc(&mut self) {}
-            fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
-                Vec::new()
-            }
-            fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
-                Vec::new()
-            }
-            fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
-                Vec::new()
-            }
-            fn class_access_flags(&self, _c: ClassId) -> u16 {
-                0
-            }
             fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
                 Value::Int(0)
             }
             fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
-            fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
-                let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
-            }
             fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
                 use std::sync::OnceLock;
                 static FD: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> =
                     OnceLock::new();
                 FD.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
-            }
-            fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value {
-                self.get_field(o, i)
-            }
-            fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) {
-                self.set_field(o, i, v)
-            }
-            fn compare_and_swap_field(
-                &mut self,
-                _o: ObjectRef,
-                _i: usize,
-                _e: Value,
-                _n: Value,
-            ) -> bool {
-                false
-            }
-            fn park(&mut self, _t: Option<std::time::Duration>) {}
-            fn unpark(&self, _o: ObjectRef) {}
-            fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {
-                None
-            }
-            fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
-                Vec::new()
-            }
-            fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
-                Vec::new()
-            }
-            fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
-                Vec::new()
-            }
-            fn method_parameter_annotations(
-                &self,
-                _c: ClassId,
-                _m: &str,
-                _d: &str,
-            ) -> Vec<Vec<AnnotationData>> {
-                Vec::new()
-            }
-            fn class_signature(&self, _c: ClassId) -> Option<String> {
-                None
-            }
-            fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
-                None
-            }
-            fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
-                None
-            }
-            fn method_annotation_default(
-                &self,
-                _c: ClassId,
-                _m: &str,
-                _d: &str,
-            ) -> Option<AnnotationElementValue> {
-                None
-            }
-            fn get_scoped_value(&self, _k: u64) -> Option<Value> {
-                None
-            }
-            fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
-            fn pop_scoped_value(&mut self) {}
-            fn scoped_value_depth(&self) -> usize {
-                0
             }
             fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> {
                 None
@@ -48439,57 +48579,10 @@ mod tests {
             fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
                 None
             }
-            fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
-                None
-            }
-            fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
-                None
-            }
-            fn list_application_class_names(&self) -> Vec<String> {
-                Vec::new()
-            }
-            fn register_dynamic_classpath(&mut self, _p: &[String]) {}
-            fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
-                None
-            }
-            fn define_class_with_loader(
-                &mut self,
-                _n: &str,
-                _b: &[u8],
-                _l: u32,
-            ) -> Option<ClassId> {
-                None
-            }
-            fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
-                None
-            }
-            fn allocate_loader_id(&mut self) -> u32 {
-                0
-            }
-            fn discover_reference(
-                &mut self,
-                _t: u8,
-                _r: ObjectRef,
-                _f: ObjectRef,
-                _q: Option<ObjectRef>,
-            ) {
-            }
-            fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
-                true
-            }
-            fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-                true
-            }
-            fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
-                true
-            }
-            fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-                true
-            }
-            fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
-                Ok(())
-            }
         }
+
+
+
 
         #[test]
         fn unbox_wrapper_requires_jdk_wrapper_class() {

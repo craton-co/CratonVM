@@ -794,6 +794,20 @@ fn native_initial_context_get_environment(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real JDK: `getEnvironment()` is `getDefaultInitCtx().getEnvironment()`,
+    // so an installed `InitialContextFactoryBuilder` answers it. Same omission
+    // the lookup/bind/rebind/unbind natives already fixed — see
+    // `builder_initial_context`. Spring's
+    // `JndiLocatorDelegate.isDefaultJndiEnvironmentAvailable()` is exactly
+    // `new InitialContext().getEnvironment()` inside a try/catch, so throwing
+    // here told Spring that JNDI is unavailable even right after
+    // `SimpleNamingContextBuilder.emptyActivatedContextBuilder()` — and
+    // `StandardServletEnvironment` then skipped its `jndiProperties` source
+    // entirely (`web.context.support.StandardServletEnvironmentTests
+    // .propertySourceOrder`).
+    if let Some(delegate) = builder_initial_context(ctx, this)? {
+        return ctx.invoke_virtual(delegate, "getEnvironment", "()Ljava/util/Hashtable;", &[]);
+    }
     let incoming = initial_context_env(ctx, this);
     if matches!(incoming, Value::Object(Some(_))) {
         return Ok(Some(incoming));
@@ -1601,7 +1615,8 @@ fn native_service_based_naming_store_init(
 // Registration
 // ===========================================================================
 
-pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
+/// Register the `java.naming` bridge independently of the WildFly pack.
+pub fn register_jdk_naming_natives(r: &mut NativeMethodRegistry) {
     // --- javax.naming.InitialContext ---
     let ic = "javax/naming/InitialContext";
     r.register(ic, "<init>", "()V", native_initial_context_init);
@@ -1655,7 +1670,10 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/naming/NamingEnumeration;",
         native_context_list_bindings,
     );
+}
 
+/// Register only WildFly-owned naming compatibility classes.
+pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
     // --- org.jboss.as.naming.ServiceBasedNamingStore ---
     let sbns = "org/jboss/as/naming/ServiceBasedNamingStore";
     r.register(
@@ -1693,6 +1711,8 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex, MutexGuard};

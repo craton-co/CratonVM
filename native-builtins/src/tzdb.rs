@@ -714,10 +714,12 @@ pub fn standard_offset_seconds_at_instant(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     fn test_catalog() -> Arc<TzdbCatalog> {
-        let java_home = std::env::var("JAVA_HOME_FOR_TZDB_TEST")
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME_FOR_TZDB_TEST")
             .unwrap_or_else(|_| "/home/victor/jdk25".to_string());
         let path = std::path::Path::new(&java_home).join("lib").join("tzdb.dat");
         let data = std::fs::read(path).expect("tzdb.dat not found for test");

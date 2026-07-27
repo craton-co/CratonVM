@@ -742,6 +742,8 @@ pub(crate) fn guarded_send_callback_for_test() -> cratonvm_native_api::NativeCal
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::net::Ipv4Addr;
     use std::time::Duration;

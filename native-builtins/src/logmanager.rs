@@ -4649,6 +4649,8 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeMethodRegistry;
@@ -5179,13 +5181,21 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(
-            logger_registry()
+        // `get_or_create_logger` materialises a real Logger for every
+        // dotted-name ancestor up to the root so `getEffectiveLevel()`-style
+        // walks and JUL's parent-handler propagation terminate correctly
+        // (5bfc73479). Registering "a.b.c" and "d.e.f" therefore also creates
+        // "a", "a.b", "d", "d.e" and the shared root "" — 7 entries, not 2.
+        // What matters here is that both requested loggers are present and
+        // that every entry is an ancestor of one of them.
+        {
+            let reg = logger_registry()
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
-            2
-        );
+                .unwrap_or_else(|e| e.into_inner());
+            let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["", "a", "a.b", "a.b.c", "d", "d.e", "d.e.f"]);
+        }
         native_reset(&mut ctx, &[Value::Object(Some(mgr))]).unwrap();
         assert!(
             logger_registry()
@@ -5245,7 +5255,17 @@ mod tests {
             }
         }
         observed.sort();
-        let mut expected = vec!["bar".to_string(), "baz".to_string(), "foo".to_string()];
+        // The root logger "" is always present: `get_or_create_logger` links
+        // every logger to a real parent chain terminating at it (5bfc73479),
+        // and real `LogManager.getLoggerNames()` likewise always enumerates
+        // the root. These three names have no dots, so "" is the only
+        // ancestor added.
+        let mut expected = vec![
+            String::new(),
+            "bar".to_string(),
+            "baz".to_string(),
+            "foo".to_string(),
+        ];
         expected.sort();
         assert_eq!(observed, expected);
     }

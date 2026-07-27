@@ -18,8 +18,12 @@
  * `Object`: once compiled it classified a `String[]` as TYPE_STRING, and the
  * generic bridge's `checkcast java/lang/String` then blew up with
  * `ClassCastException: java.lang.String cannot be cast to java.lang.String`
- * (an array receiver is rendered by its component name — a cosmetic defect
- * that is NOT fixed here and made this look like a class-identity split).
+ * — an array receiver rendered by its COMPONENT name, which made a plain
+ * type error look like a class-identity split and cost a session of
+ * misdiagnosis. That second defect is fixed too (2026-07-26) and is asserted
+ * below on both the interpreted and the compiled `checkcast` path: the
+ * receiver must render as its own descriptor, `[Ljava.lang.String;`, exactly
+ * as HotSpot does.
  */
 public class RJitArrayTypecheck {
     static int checks = 0;
@@ -37,6 +41,31 @@ public class RJitArrayTypecheck {
     static boolean isSerializable(Object o){ return o instanceof java.io.Serializable; }
     static int     castToStringLen(Object o) { return ((String) o).length(); }
 
+    /**
+     * The ClassCastException message a `(String) o` cast produces, or "" if
+     * the cast succeeded. A null message is reported as `<fastthrow>`: once
+     * HotSpot's C2 has seen enough of these it throws a preallocated,
+     * message-less, stack-trace-less exception (`OmitStackTraceInFastThrow`),
+     * so any assertion on a message from an already-hot site has to tolerate
+     * that. The strict assertions below therefore run against COLD sites.
+     */
+    static String cceText(Object o) {
+        try {
+            castToStringLen(o);
+            return "";
+        } catch (ClassCastException e) {
+            String m = e.getMessage();
+            return m == null ? "<fastthrow>" : m;
+        }
+    }
+
+    /** Strict on a real message; tolerant of HotSpot's fast-throw elision. */
+    static void checkCceNames(String msg, String expected, String what) {
+        check(!msg.isEmpty(), what + ": cast must throw ClassCastException");
+        check(msg.equals("<fastthrow>") || msg.contains(expected),
+                what + ": receiver must render as " + expected + ", got: " + msg);
+    }
+
     public static void main(String[] args) {
         Object strArr = new String[] { "x", "y" };
         Object intArr = new Integer[] { 1, 2 };
@@ -44,6 +73,13 @@ public class RJitArrayTypecheck {
         Object nestedArr = new String[][] { { "a" } };
         Object str = "plain";
         Object boxed = Integer.valueOf(7);
+
+        // Captured BEFORE the warm-up loop: these checkcasts run interpreted
+        // (cold) on both VMs, so the messages are real on both.
+        String coldStrArr = cceText(strArr);
+        String coldNested = cceText(nestedArr);
+        String coldPrim = cceText(intPrimArr);
+        String coldBoxed = cceText(boxed);
 
         int bad = 0;
         long sink = 0;
@@ -75,14 +111,19 @@ public class RJitArrayTypecheck {
         check(bad == 0, "JIT array-typecheck mismatches: " + bad);
         check(sink == 400_000L * 5, "sink " + sink);
 
-        // checkcast on an array receiver must throw, not silently succeed.
-        boolean threw = false;
-        try {
-            castToStringLen(strArr);
-        } catch (ClassCastException expected) {
-            threw = true;
-        }
-        check(threw, "(String) new String[]{...} must throw ClassCastException");
+        // checkcast on an array receiver must throw, not silently succeed —
+        // and must name the receiver by ITS OWN type, not its component's.
+        // Interpreted (cold) sites first: strict on both VMs.
+        checkCceNames(coldStrArr, "[Ljava.lang.String;", "interpreted String[]");
+        checkCceNames(coldNested, "[[Ljava.lang.String;", "interpreted String[][]");
+        checkCceNames(coldPrim, "[I", "interpreted int[]");
+        checkCceNames(coldBoxed, "java.lang.Integer", "interpreted Integer");
+        // Then the same four through the now-hot (compiled on CratonVM)
+        // `castToStringLen`.
+        checkCceNames(cceText(strArr), "[Ljava.lang.String;", "compiled String[]");
+        checkCceNames(cceText(nestedArr), "[[Ljava.lang.String;", "compiled String[][]");
+        checkCceNames(cceText(intPrimArr), "[I", "compiled int[]");
+        checkCceNames(cceText(boxed), "java.lang.Integer", "compiled Integer");
 
         System.out.println("CK RJitArrayTypecheck sink=" + sink);
         System.out.println("PASS RJitArrayTypecheck (" + checks + " checks)");

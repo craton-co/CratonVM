@@ -2470,6 +2470,8 @@ fn native_require(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

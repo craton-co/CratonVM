@@ -2574,6 +2574,8 @@ pub(crate) fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
 
 #[cfg(test)]
 pub(crate) mod break_iterator_line_boundary_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     const HELP_TEXT: &str =
@@ -2634,6 +2636,8 @@ pub(crate) mod break_iterator_line_boundary_tests {
 
 #[cfg(test)]
 pub(crate) mod break_iterator_sentence_boundary_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

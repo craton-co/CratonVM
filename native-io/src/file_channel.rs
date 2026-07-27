@@ -445,7 +445,39 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
     ctx.set_field_by_name(channel, "closeLock", Value::Object(Some(close_lock)));
     ctx.set_field_by_name(channel, "closed", Value::Int(0));
-    ctx.set_field_by_name(channel, "interruptor", Value::Object(None));
+    // `interruptor` is a FINAL field that the real
+    // `AbstractInterruptibleChannel()` constructor always assigns -- it is never
+    // null on a live channel. This bridge builds the channel without running
+    // that constructor and used to leave the slot null, which made
+    // `AbstractInterruptibleChannel.begin()` throw
+    // `NullPointerException: Cannot invoke "sun.nio.ch.Interruptible.interrupt(
+    // java.lang.Thread)" because "this.interruptor" is null` on any channel
+    // operation performed by a thread whose interrupt flag happens to be set --
+    // so an interrupt during file I/O crashed instead of performing the
+    // specified asynchronous close (H2 `TestStreamStore`, 2026-07-26).
+    //
+    // Build the real anonymous implementation
+    // (`AbstractInterruptibleChannel$1`, whose only state is `this$0`) so
+    // `interrupt(Thread)` runs the JDK bytecode -- `this$0.trySetTarget(target)`
+    // -- and `postInterrupt()` closes the channel. Falls back to null if the
+    // class is unavailable, which is exactly the previous behaviour.
+    //
+    // GC: `new_object_initialized` allocates and runs bytecode, either of which
+    // can relocate `channel`; pin it across the call and read the live address
+    // back (native stale-local family).
+    let channel_ipin = ctx.pin_native_root(channel);
+    let interruptor = ctx
+        .new_object_initialized(
+            "java/nio/channels/spi/AbstractInterruptibleChannel$1",
+            "(Ljava/nio/channels/spi/AbstractInterruptibleChannel;)V",
+            &[Value::Object(Some(channel))],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Object(None));
+    let channel = ctx.read_native_pin(channel_ipin, channel);
+    ctx.unpin_native_roots(channel_ipin);
+    ctx.set_field_by_name(channel, "interruptor", interruptor);
     ctx.set_field_by_name(channel, "interrupted", Value::Object(None));
 
     ctx.set_field_by_name(channel, "threads", Value::Object(Some(threads)));
@@ -1276,6 +1308,8 @@ fn native_fc_map0_legacy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::fd_table::FileDescriptorTable;
     use std::io::Write;

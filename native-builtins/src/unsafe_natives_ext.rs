@@ -4573,6 +4573,8 @@ pub(crate) fn native_unsafe_compare_and_exchange_reference(
 
 #[cfg(test)]
 mod unsafe_static_field_offset_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::FieldMetadata;

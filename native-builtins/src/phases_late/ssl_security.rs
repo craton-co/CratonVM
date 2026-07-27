@@ -1615,9 +1615,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // Pure native socket I/O below (the actual TLS handshake). Mark this
         // thread blocked so a concurrent VM safepoint doesn't wait for it
         // while the peer's event loop waits for this handshake's reply.
+        // Pin `socket` across the park: the handshake is long, a moving young
+        // collection during it relocates the object, and EVERY write below
+        // (`sock_set_for_create`, `NEW13_SOCK_TLSID`, the `SSLSession`) would
+        // then land on a stale reference. The socket keeps its PENDING tls id,
+        // so the next resolution drives the handshake again and finds the
+        // pending entry already consumed — `SSLHandshakeException: layered
+        // socket handshake state missing`, seen intermittently in
+        // `shouldUpdateSslWhenReloadingSslBundles`. Same hazard
+        // `new13_do_create_socket`'s blocking-region comment describes.
+        let socket_pin = ctx.pin_native_root(socket);
         ctx.begin_blocking_region();
         let stream_result = crate::t27_tls::drive_pending_layered_handshake(pending_id);
         ctx.end_blocking_region();
+        let socket = ctx.read_native_pin(socket_pin, socket);
+        ctx.unpin_native_roots(socket_pin);
         // Match `new13_do_create_socket`'s existing contract: a rustls
         // handshake failure (rejected/mismatched certificate, no common
         // cipher suite, etc.) must surface as `SSLHandshakeException`, not a
@@ -2333,7 +2345,22 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(-1)));
         }
         let mut buf = [0u8; 1];
-        match crate::servlet::s2_tls_read(tls_id, &mut buf) {
+        // STW-COOPERATION (tomcatservletwebserverfactorytests-stw-takeover-hang):
+        // `s2_tls_read`/`s2_tls_write` do a genuine OS-level blocking socket
+        // operation. Without the blocked-region bracket this thread stays
+        // counted as a cooperative mutator that can never reach a safepoint
+        // poll, so a concurrent STW (GC / cross-thread JIT takeover) waits on
+        // it forever — and the bytes it waits for are produced by a peer
+        // thread in this same process (Tomcat's NioEndpoint SocketProcessor)
+        // which DOES stop at the barrier: a mutual deadlock, observed as
+        // `rounds=64 pending=1 taken=0` repeating with no further progress.
+        // Same bug shape as the `net_phase_e` HttpClient and S2 selector
+        // fixes; see `docs/internal/fixed-suite-bugs/keycloak/
+        // keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`.
+        ctx.begin_blocking_region();
+        let read_result = crate::servlet::s2_tls_read(tls_id, &mut buf);
+        ctx.end_blocking_region();
+        match read_result {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
             Err(e) => Err(RuntimeError::IOException {
@@ -2376,7 +2403,17 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Int(0)));
         }
         let mut buf = vec![0u8; len];
-        match crate::servlet::s2_tls_read(tls_id, &mut buf) {
+        // STW-COOPERATION: blocking socket I/O — see the full rationale on
+        // `SSLSocketInputStream.read()I` above.
+        // `arr` is written AFTER the block, so it must survive a moving
+        // collection that runs while this thread is parked — pin it.
+        let arr_pin = ctx.pin_native_root(arr);
+        ctx.begin_blocking_region();
+        let read_result = crate::servlet::s2_tls_read(tls_id, &mut buf);
+        ctx.end_blocking_region();
+        let arr = ctx.read_native_pin(arr_pin, arr);
+        ctx.unpin_native_roots(arr_pin);
+        match read_result {
             Ok(0) => Ok(Some(Value::Int(-1))),
             Ok(n) => {
                 for i in 0..n {
@@ -2421,7 +2458,12 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             .into());
         }
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-        crate::servlet::s2_tls_write(tls_id, &[b]).map_err(|e| RuntimeError::IOException {
+        // STW-COOPERATION: blocking socket I/O — see the full rationale on
+        // `SSLSocketInputStream.read()I` above.
+        ctx.begin_blocking_region();
+        let write_result = crate::servlet::s2_tls_write(tls_id, &[b]);
+        ctx.end_blocking_region();
+        write_result.map_err(|e| RuntimeError::IOException {
             message: e.to_string(),
         })?;
         Ok(None)
@@ -2479,22 +2521,31 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // pressure, which callers would otherwise interpret as silent data
         // loss. Loop until the whole buffer has been accepted.
         let mut written = 0usize;
+        // STW-COOPERATION: blocking socket I/O — see the full rationale on
+        // `SSLSocketInputStream.read()I` above.
+        // The whole drain loop goes in ONE blocked region, and the error
+        // is carried out instead of returned from inside it — an early
+        // `return` between begin/end would leave this thread permanently
+        // marked blocked (the mirror-image failure: a live mutator the
+        // barrier stops waiting for).
+        ctx.begin_blocking_region();
+        let mut write_err: Option<String> = None;
         while written < buf.len() {
             match crate::servlet::s2_tls_write(tls_id, &buf[written..]) {
                 Ok(0) => {
-                    return Err(RuntimeError::IOException {
-                        message: "SSLSocketOutputStream.write: peer closed".into(),
-                    }
-                    .into());
+                    write_err = Some("SSLSocketOutputStream.write: peer closed".into());
+                    break;
                 }
                 Ok(n) => written += n,
                 Err(e) => {
-                    return Err(RuntimeError::IOException {
-                        message: e.to_string(),
-                    }
-                    .into());
+                    write_err = Some(e.to_string());
+                    break;
                 }
             }
+        }
+        ctx.end_blocking_region();
+        if let Some(message) = write_err {
+            return Err(RuntimeError::IOException { message }.into());
         }
         Ok(None)
     });
@@ -4626,6 +4677,8 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 pub(crate) mod new13_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 

@@ -215,7 +215,7 @@ impl Drop for JitAllocClassCache {
 #[inline]
 pub fn alloc_class_cache_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE").is_none())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE").is_none())
 }
 
 #[cfg(test)]

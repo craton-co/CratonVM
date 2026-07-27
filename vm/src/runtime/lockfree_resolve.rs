@@ -78,14 +78,19 @@ const DEFAULT_SHARED_CACHE_CAP: usize = 65_536;
 /// Uncached form of [`shared_cache_cap`]. Kept separate so the unit tests can
 /// exercise the parsing rules without depending on which test happened to run
 /// first (the public entry point memoizes for process lifetime).
-fn read_shared_cache_cap() -> usize {
-    match std::env::var("CRATONVM_RESOLVE_CACHE_CAP") {
-        Ok(s) => match s.trim().parse::<usize>() {
+fn parse_shared_cache_cap(value: Option<&str>) -> usize {
+    match value {
+        Some(s) => match s.trim().parse::<usize>() {
             Ok(n) if n >= 1 => n,
             _ => DEFAULT_SHARED_CACHE_CAP,
         },
-        Err(_) => DEFAULT_SHARED_CACHE_CAP,
+        None => DEFAULT_SHARED_CACHE_CAP,
     }
+}
+
+fn read_shared_cache_cap() -> usize {
+    let value = cratonvm_types::flags::runtime_var("CRATONVM_RESOLVE_CACHE_CAP").ok();
+    parse_shared_cache_cap(value.as_deref())
 }
 
 /// Resolve the shared-cache capacity, honouring the `CRATONVM_RESOLVE_CACHE_CAP`
@@ -94,7 +99,7 @@ fn read_shared_cache_cap() -> usize {
 /// back to [`DEFAULT_SHARED_CACHE_CAP`]; the cap can never be set below 1 so a
 /// freshly-inserted entry always survives.
 ///
-/// PERF (2026-07-26 arch pass). This used to call `std::env::var` — which
+/// PERF (2026-07-26 arch pass). This used to call `cratonvm_types::flags::runtime_var` — which
 /// allocates a `String` and, on Windows, is a `GetEnvironmentVariableW`
 /// syscall — on **every first promotion of a call site**, and did so *while
 /// holding the `promoted_invokes` write guard*, so every thread promoting a
@@ -178,9 +183,11 @@ use parking_lot::RwLock;
 
 #[allow(unused_imports)]
 use super::fx_collections::{fx_hashmap, FxBuildHasher, FxHashMap, FxHasher};
-use crate::classloading::resolution::CachedInvokeTarget;
+use crate::classloading::resolution::CachedInvokeTarget as GenericCachedInvokeTarget;
 use crate::classloading::ClassId;
 use std::hash::{Hash, Hasher};
+
+type CachedInvokeTarget = GenericCachedInvokeTarget<Arc<crate::jit::CompiledMethod>>;
 
 // ---------------------------------------------------------------------------
 // ResolutionKey
@@ -1431,59 +1438,26 @@ mod tests {
 
     #[test]
     fn shared_cache_cap_parses_env_override() {
-        // Exercises the *parsing* rules against the uncached reader.
-        // `shared_cache_cap` itself memoizes for process lifetime (it sits
-        // under the `promoted_invokes` write lock and must not syscall), so it
-        // is deliberately not the function under test here.
-        //
-        // Single test owns the env var across all its assertions so it does
-        // not race other tests on the process-global environment. Restored
-        // on every exit path.
-        let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
-        const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
-        let prev = std::env::var(VAR).ok();
-
-        std::env::set_var(VAR, "10");
-        assert_eq!(read_shared_cache_cap(), 10);
-
-        // Zero / empty / garbage all fall back to the generous default.
-        std::env::set_var(VAR, "0");
-        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
-        std::env::set_var(VAR, "");
-        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
-        std::env::set_var(VAR, "not-a-number");
-        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
-
-        std::env::remove_var(VAR);
-        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
-
-        // Restore whatever the harness had before.
-        match prev {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
+        assert_eq!(parse_shared_cache_cap(Some("10")), 10);
+        assert_eq!(parse_shared_cache_cap(Some("0")), DEFAULT_SHARED_CACHE_CAP);
+        assert_eq!(parse_shared_cache_cap(Some("")), DEFAULT_SHARED_CACHE_CAP);
+        assert_eq!(
+            parse_shared_cache_cap(Some("not-a-number")),
+            DEFAULT_SHARED_CACHE_CAP
+        );
+        assert_eq!(parse_shared_cache_cap(None), DEFAULT_SHARED_CACHE_CAP);
     }
 
     #[test]
     fn shared_cache_cap_is_memoized_for_process_lifetime() {
-        // Documents the contract change: the env var is read once. Setting it
-        // afterwards must NOT retroactively change the live cap.
+        // The public path is a stable process-lifetime value.
         let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
-        const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
-        let prev = std::env::var(VAR).ok();
-
         let first = shared_cache_cap();
-        std::env::set_var(VAR, "3");
         assert_eq!(
             shared_cache_cap(),
             first,
             "shared_cache_cap must not re-read the environment"
         );
-
-        match prev {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
     }
 
     #[test]

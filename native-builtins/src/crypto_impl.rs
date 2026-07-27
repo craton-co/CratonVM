@@ -4910,6 +4910,8 @@ fn extract_certs_from_der(data: &[u8], entries: &mut HashMap<String, KeyStoreEnt
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     fn hex(bytes: &[u8]) -> String {

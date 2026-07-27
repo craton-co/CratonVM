@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 /// this file.
 ///
 /// Why this matters: every one of these was previously an **uncached**
-/// `std::env::var_os` on the `throw_runtime_error` / `convert_class_not_found`
+/// `cratonvm_types::flags::runtime_var_os` on the `throw_runtime_error` / `convert_class_not_found`
 /// / `throw_linkage_error` entry paths. `throw_runtime_error` alone paid three
 /// of them on *every* VM-raised throw (NPE, CCE, AIOOBE, ISE, IOException, …)
 /// — i.e. ~1.5 µs of pure syscall on Windows before a single useful
@@ -38,7 +38,7 @@ macro_rules! cached_env_flag {
         #[inline]
         fn $name() -> bool {
             static CACHE: OnceLock<bool> = OnceLock::new();
-            *CACHE.get_or_init(|| std::env::var_os($env).is_some())
+            *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os($env).is_some())
         }
     };
 }
@@ -49,7 +49,7 @@ macro_rules! cached_env_flag {
 #[inline]
 fn iae_trace_enabled() -> bool {
     static IAE_TRACE: OnceLock<bool> = OnceLock::new();
-    *IAE_TRACE.get_or_init(|| std::env::var("CRATONVM_IAE_TRACE").is_ok())
+    *IAE_TRACE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_IAE_TRACE").is_ok())
 }
 
 cached_env_flag!(dbg_npe_none, "CRATONVM_DBG_NPE_NONE");
@@ -1304,6 +1304,26 @@ pub fn throw_runtime_error(
     thread: &mut JvmThread,
     error: RuntimeError,
 ) -> MethodCallFailed {
+    // `CRATONVM_DBG_RTERR=<substring>` -- dump every VM-raised runtime error
+    // whose `Debug` form contains `<substring>` (empty matches all), with the
+    // Java stack at the raise point. The VM-side raise path never goes through
+    // `athrow`, so `CRATONVM_DBG_ATHROW` cannot see these; this is the
+    // companion for exceptions manufactured in Rust (a `ClassNotFoundException`
+    // out of a classloading native being the case it was written for).
+    if let Some(want) = dbg_rterr_filter() {
+        let text = format!("{error:?}");
+        if want.is_empty() || text.contains(want) {
+            eprintln!("[DBG_RTERR] {text}");
+            let cm = shared.classes.class_manager.read();
+            for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
+                let cn = cm
+                    .get_class(f.class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                eprintln!("[DBG_RTERR-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+            }
+        }
+    }
     // charset-NPE diagnostic (2026-05-21) — gated by `CRATONVM_DBG_CHARSET=1`.
     // Defensive companion to the `Athrow`-opcode dump in `interpreter.rs`:
     // catches the case where a `NullPointerException` with message exactly
@@ -1827,7 +1847,31 @@ pub fn raise_no_class_def_found_with_cause(
     MethodCallFailed::ExceptionThrown(ncdfe)
 }
 
+/// Cached `CRATONVM_DBG_RTERR` filter (see `throw_runtime_error`). Read once:
+/// `throw_runtime_error` is on the hot path of every VM-raised NPE / CCE /
+/// AIOOBE, so a per-call `env::var` allocation is not acceptable here.
+fn dbg_rterr_filter() -> Option<&'static str> {
+    static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FILTER
+        .get_or_init(|| std::env::var("CRATONVM_DBG_RTERR").ok())
+        .as_deref()
+}
+
+/// Cached `CRATONVM_DBG_LINKAGE_BT` flag (see `linkage_throwable`).
+fn dbg_linkage_bt() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_LINKAGE_BT").is_some())
+}
+
 fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
+    // `CRATONVM_DBG_LINKAGE_BT=1` -- Rust backtrace at every linkage-error
+    // raise. A `VerifyError`/`NoSuchMethodError` reaching Java carries only
+    // the class+method; the *VM* call path that produced it (which resolver,
+    // which native) is what actually identifies the defect.
+    if dbg_linkage_bt() {
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[DBG_LINKAGE_BT] {error:?}\n{bt}");
+    }
     match error {
         LinkageError::NoClassDefFoundError { class_name } => {
             ("java/lang/NoClassDefFoundError", class_name.clone())
@@ -2013,7 +2057,7 @@ mod tests {
     // Cached debug-flag helpers (throw hot path)
     // -----------------------------------------------------------------------
 
-    /// `throw_runtime_error` used to pay three uncached `std::env::var_os`
+    /// `throw_runtime_error` used to pay three uncached `cratonvm_types::flags::runtime_var_os`
     /// lookups on *every* VM-raised throw, plus one each in
     /// `convert_class_not_found` and `throw_linkage_error`. They are now
     /// process-lifetime memoized. The failure mode a memo introduces is a typo'd
@@ -2032,7 +2076,7 @@ mod tests {
             (dbg_verify_error, "CRATONVM_DBG_VERIFY_ERROR"),
         ];
         for (flag, name) in pairs {
-            let expected = std::env::var_os(name).is_some();
+            let expected = cratonvm_types::flags::runtime_var_os(name).is_some();
             assert_eq!(
                 flag(),
                 expected,
@@ -2042,7 +2086,7 @@ mod tests {
         }
         assert_eq!(
             iae_trace_enabled(),
-            std::env::var("CRATONVM_IAE_TRACE").is_ok()
+            cratonvm_types::flags::runtime_var("CRATONVM_IAE_TRACE").is_ok()
         );
     }
 

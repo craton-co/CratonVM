@@ -2661,6 +2661,8 @@ mod tests {
     //! Hermetic tests with inlined fixture bytes. The fixtures are tiny
     //! synthetic keystores produced specifically for this test (a single
     //! self-signed leaf + one trusted-cert entry, both ≤ 4 KiB).
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
 
     use super::*;
 

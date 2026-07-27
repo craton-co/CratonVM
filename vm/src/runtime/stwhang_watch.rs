@@ -18,7 +18,7 @@
 
 #[cfg(windows)]
 pub fn arm_from_env() {
-    let Ok(v) = std::env::var("CRATONVM_DBG_HANGWALK") else {
+    let Ok(v) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_HANGWALK") else {
         return;
     };
     let secs = v.trim().parse::<u64>().ok().filter(|s| *s > 0).unwrap_or(7);

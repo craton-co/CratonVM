@@ -22,6 +22,30 @@ use cratonvm_vm::vm::{
 use cratonvm_vm::{ClassPath, VmConfig};
 use tracing::info;
 
+/// Claim and emit the process-wide JIT method summary once.
+///
+/// `System.exit` never unwinds Rust frames, so it calls this from the native
+/// pre-exit hook. A normal Java-main return calls it from the launcher thread.
+/// The atomic makes those paths safe to share and prevents future shutdown
+/// convergence from printing the summary twice.
+fn maybe_dump_jit_method_stats() {
+    static DUMPED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    if cratonvm_types::flags().jit.method_stats
+        && DUMPED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        cratonvm_jit::tiered::dump_method_stats_to_stderr();
+    }
+}
+
 /// CratonVM - A Java Virtual Machine implemented in Rust.
 ///
 /// Executes Java programs by loading and interpreting `.class` files.
@@ -1421,6 +1445,11 @@ struct HotspotFlags {
     heap_dump_on_oom: Option<bool>,
     /// `-XX:HeapDumpPath=<path>` companion.
     heap_dump_path: Option<String>,
+    /// obsaudit D12 — `-XX:StartFlightRecording` (bare, `Some("")`) or
+    /// `-XX:StartFlightRecording:opt=val,opt=val` (`Some("opt=val,...")`).
+    /// Parsed into a `JfrStartRecordingConfig` by
+    /// `parse_jfr_start_recording_opts` after clap returns.
+    jfr_start_recording: Option<String>,
     /// `-agentlib:<spec>`, `-agentpath:<spec>`, `-javaagent:<spec>` — the
     /// entire token (including prefix) is preserved so the existing
     /// `AgentRegistry::parse_agent_option` can consume it verbatim.
@@ -1452,9 +1481,14 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
             // Boolean toggles: -XX:+Foo / -XX:-Foo
             "-XX:+HeapDumpOnOutOfMemoryError" => out.heap_dump_on_oom = Some(true),
             "-XX:-HeapDumpOnOutOfMemoryError" => out.heap_dump_on_oom = Some(false),
+            // obsaudit D12 — bare form, no options.
+            "-XX:StartFlightRecording" => out.jfr_start_recording = Some(String::new()),
             _ => {
                 if let Some(rest) = arg.strip_prefix("-XX:HeapDumpPath=") {
                     out.heap_dump_path = Some(rest.to_string());
+                } else if let Some(rest) = arg.strip_prefix("-XX:StartFlightRecording:") {
+                    // obsaudit D12 — options form.
+                    out.jfr_start_recording = Some(rest.to_string());
                 } else if arg.starts_with("-agentlib:")
                     || arg.starts_with("-agentpath:")
                     || arg.starts_with("-javaagent:")
@@ -1467,6 +1501,81 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
         }
     }
     (filtered, out)
+}
+
+/// obsaudit D12 (2026-07-26) — parse `-XX:StartFlightRecording[:opts]`'s
+/// comma-separated `key=value` options into a `JfrStartRecordingConfig`.
+/// `raw` is `""` for the bare flag (all defaults).
+///
+/// Recognized keys: `filename`, `duration`, `maxage`, `maxevents`,
+/// `dumponexit`. Unlike most of the rest of this parser (which silently
+/// drops flags it doesn't specifically recognize so clap can report unknown
+/// long options), an unrecognized key *inside* `StartFlightRecording:` is a
+/// hard error — a typo'd sub-option here has no other layer that will ever
+/// catch it, and JFR's whole failure mode in this audit is options that
+/// silently do nothing.
+fn parse_jfr_start_recording_opts(
+    raw: &str,
+) -> Result<cratonvm_vm::config::JfrStartRecordingConfig, String> {
+    let mut cfg = cratonvm_vm::config::JfrStartRecordingConfig {
+        dump_on_exit: true, // HotSpot's default for -XX:StartFlightRecording
+        ..Default::default()
+    };
+    if raw.is_empty() {
+        return Ok(cfg);
+    }
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            format!("-XX:StartFlightRecording: option `{pair}` is missing `=value`")
+        })?;
+        match key {
+            "filename" => cfg.filename = Some(value.to_string()),
+            "duration" => cfg.duration = Some(parse_jfr_duration(value)?),
+            "maxage" => cfg.max_age = Some(parse_jfr_duration(value)?),
+            "maxevents" => {
+                cfg.max_events = Some(value.parse::<usize>().map_err(|_| {
+                    format!("-XX:StartFlightRecording: maxevents=`{value}` is not a number")
+                })?);
+            }
+            "dumponexit" => {
+                cfg.dump_on_exit = match value {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(format!(
+                            "-XX:StartFlightRecording: dumponexit=`{value}` must be true or false"
+                        ))
+                    }
+                };
+            }
+            other => {
+                return Err(format!(
+                    "-XX:StartFlightRecording: unrecognized option `{other}`                      (supported: filename, duration, maxage, maxevents, dumponexit)"
+                ))
+            }
+        }
+    }
+    Ok(cfg)
+}
+
+/// Parse a HotSpot-style duration: plain digits (seconds) or digits with a
+/// trailing `s`/`m`/`h`/`d` unit suffix (seconds/minutes/hours/days).
+fn parse_jfr_duration(value: &str) -> Result<std::time::Duration, String> {
+    let (digits, mult) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1u64),
+        Some('m') => (&value[..value.len() - 1], 60),
+        Some('h') => (&value[..value.len() - 1], 3600),
+        Some('d') => (&value[..value.len() - 1], 86400),
+        _ => (value, 1),
+    };
+    let secs: u64 = digits
+        .parse()
+        .map_err(|_| format!("`{value}` is not a valid duration (e.g. 30s, 5m, 1h)"))?;
+    Ok(std::time::Duration::from_secs(secs.saturating_mul(mult)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,6 +1845,12 @@ fn resolve_watchdog_timeout(
     }
 }
 
+fn launcher_nojit_requested(argv: &[String]) -> bool {
+    argv.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--nojit")
+}
+
 fn run() -> Result<()> {
     // Install the pre-`std::process::exit` hook on `native_system_exit` /
     // `native_runtime_exit`. A silent `System.exit(N)` during real app boot
@@ -1750,17 +1865,31 @@ fn run() -> Result<()> {
     // init below.)
     cratonvm_native_builtins::lang_system::set_pre_exit_hook(|code| {
         cleanup_staged_archive_copies();
+        // obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording`'s
+        // `dumponexit` (default true). This is the same pre-exit hook
+        // `cleanup_staged_archive_copies` already relies on for "run before
+        // the process actually exits" — it covers Java-initiated exit
+        // (`System.exit`/`Runtime.exit`/`Runtime.halt`, the common case for
+        // a real application shutting down cleanly) via `native_system_exit`/
+        // `native_runtime_exit`. `process_vm()` resolves the live VM this
+        // late without threading it through the hook's own signature.
+        if let Some(shared) = cratonvm_vm::native::jni::process_vm() {
+            let target = shared.debug.jfr_dump_on_exit.lock().clone();
+            if let Some((recording_id, filename)) = target {
+                let mut fr = shared.debug.flight_recorder.lock();
+                match fr.dump_recording(recording_id, std::path::Path::new(&filename)) {
+                    Ok(bytes) => {
+                        tracing::info!("wrote {bytes} byte JFR recording to {filename}")
+                    }
+                    Err(e) => tracing::error!("failed to dump JFR recording on exit: {e}"),
+                }
+            }
+        }
         if std::env::var("CRATONVM_DBG_EXIT").ok().as_deref() == Some("1") {
             eprintln!("=== CRATONVM_DBG_EXIT: System.exit({code}) — dispatch trace ===");
             cratonvm_vm::dispatch_trace::dump_to_stderr_unconditional("pre-system-exit");
         }
-        if std::env::var("CRATONVM_DBG_JIT_METHOD_STATS")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            cratonvm_jit::tiered::dump_method_stats_to_stderr();
-        }
+        maybe_dump_jit_method_stats();
     });
 
     // `java`-launcher positional semantics: insert a `--` separator right
@@ -1872,21 +2001,6 @@ fn run() -> Result<()> {
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
         .init();
-
-    // --nojit: surface as the CRATONVM_DISABLE_JIT env var so the
-    // already-existing kill-switch in `vm/src/runtime/env_cache.rs`
-    // observes it on first read. Must happen *before* any code path
-    // that calls `env_cache::disable_jit()` (interpreter / JIT
-    // dispatcher) — the cache uses `OnceLock`, so a late `set_var`
-    // would be ignored. Setting it here, immediately after clap
-    // parsing, is well before `Vm::new(config)` runs any bytecode.
-    //
-    // We're still on the main thread with no cratonvm-spawned threads
-    // yet, so the documented `set_var` race against concurrent readers
-    // (which is why it became unsafe in edition 2024) cannot fire here.
-    if args.nojit {
-        std::env::set_var("CRATONVM_DISABLE_JIT", "1");
-    }
 
     // --enable-native-access: open the process-wide Panama FFI gate
     // (`native-builtins/src/panama.rs::NATIVE_ACCESS_ENABLED`), which is
@@ -2464,6 +2578,16 @@ fn run() -> Result<()> {
     }
     if let Some(path) = hotspot_flags.heap_dump_path.clone() {
         config.heap_dump_path = Some(path);
+    }
+
+    // obsaudit D12 — `-XX:StartFlightRecording[:opts]`. Parsed here (not in
+    // extract_hotspot_flags) so a bad sub-option produces a proper `Err`
+    // this function can propagate, instead of a raw panic/exit from deep
+    // inside argv scanning.
+    if let Some(raw) = &hotspot_flags.jfr_start_recording {
+        config.jfr_start_recording = Some(
+            parse_jfr_start_recording_opts(raw).map_err(|e| anyhow::anyhow!("{e}"))?,
+        );
     }
 
     // T6.3.3 — `-agentlib:`, `-agentpath:`, `-javaagent:`. The options
@@ -3845,6 +3969,24 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // Install the immutable runtime configuration before crash handlers or
+    // any other subsystem can read a CratonVM flag. `--nojit` is detected
+    // from the launcher portion of the expanded argv (never from Java program
+    // arguments) and applied as a typed overlay. `run()` performs the full
+    // parse again; this early pass exists solely to close the configuration
+    // ordering boundary.
+    let early_argv =
+        insert_program_args_separator(expand_argfiles(std::env::args().collect::<Vec<_>>()));
+    let mut flag_overrides = cratonvm_types::MapSource::empty();
+    if launcher_nojit_requested(&early_argv) {
+        flag_overrides = flag_overrides.with("CRATONVM_DISABLE_JIT", "1");
+    }
+    let runtime_flags = cratonvm_types::VmFlags::from_env_with_overrides(flag_overrides);
+    if cratonvm_types::install_flags(runtime_flags).is_err() {
+        eprintln!("[cratonvm] runtime flags were read before launcher configuration");
+        std::process::exit(1);
+    }
+
     // Expand the ten grouped configuration variables (`CRATONVM_JIT=-bce,unroll`
     // and friends) into the per-knob keys the rest of the VM reads.
     //
@@ -4091,7 +4233,11 @@ fn main() {
             // (Display AND Debug) and flush stderr so a startup failure that ends the
             // process is never invisible. Additive logging only — no behaviour change.
             use std::io::Write as _;
-            match run() {
+            let result = run();
+            // A normal Java-main return never reaches the System.exit hook.
+            // Flush controlled-exit diagnostics before rendering the outcome.
+            maybe_dump_jit_method_stats();
+            match result {
                 Ok(()) => {
                     eprintln!("[cratonvm] main-vm run() returned Ok — VM main exiting normally");
                     let _ = std::io::stderr().flush();
@@ -4382,6 +4528,22 @@ mod tests {
         // After the program selector these are program args.
         assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--", "-version"])).is_none());
         assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--"])).is_none());
+    }
+
+    #[test]
+    fn early_nojit_scan_ignores_java_program_arguments() {
+        assert!(launcher_nojit_requested(&tokens(&[
+            "cratonvm",
+            "--nojit",
+            "Main",
+            "--"
+        ])));
+        assert!(!launcher_nojit_requested(&tokens(&[
+            "cratonvm",
+            "Main",
+            "--",
+            "--nojit"
+        ])));
     }
 
     /// The whole point of routing version output through our own banner:
@@ -4861,6 +5023,94 @@ mod tests {
         let (filtered, flags) = extract_hotspot_flags(raw);
         assert_eq!(filtered, vec!["cratonvm", "Main"]);
         assert_eq!(flags.heap_dump_path.as_deref(), Some("/tmp/heap.hprof"));
+    }
+
+    // obsaudit D12 — -XX:StartFlightRecording extraction + option parsing.
+
+    #[test]
+    fn hotspot_flag_extracts_bare_start_flight_recording() {
+        let raw = vec![
+            "cratonvm".to_string(),
+            "-XX:StartFlightRecording".to_string(),
+            "Main".to_string(),
+        ];
+        let (filtered, flags) = extract_hotspot_flags(raw);
+        assert_eq!(filtered, vec!["cratonvm", "Main"]);
+        assert_eq!(flags.jfr_start_recording.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn hotspot_flag_extracts_start_flight_recording_with_opts() {
+        let raw = vec![
+            "cratonvm".to_string(),
+            "-XX:StartFlightRecording:filename=rec.jfr,duration=30s".to_string(),
+            "Main".to_string(),
+        ];
+        let (filtered, flags) = extract_hotspot_flags(raw);
+        assert_eq!(filtered, vec!["cratonvm", "Main"]);
+        assert_eq!(
+            flags.jfr_start_recording.as_deref(),
+            Some("filename=rec.jfr,duration=30s")
+        );
+    }
+
+    #[test]
+    fn jfr_opts_bare_flag_uses_defaults() {
+        let cfg = parse_jfr_start_recording_opts("").unwrap();
+        assert_eq!(cfg.filename, None);
+        assert_eq!(cfg.duration, None);
+        assert_eq!(cfg.max_age, None);
+        assert_eq!(cfg.max_events, None);
+        assert!(cfg.dump_on_exit, "HotSpot defaults dumponexit to true");
+    }
+
+    #[test]
+    fn jfr_opts_parses_all_recognized_keys() {
+        let cfg = parse_jfr_start_recording_opts(
+            "filename=out.jfr,duration=30s,maxage=5m,maxevents=500,dumponexit=false",
+        )
+        .unwrap();
+        assert_eq!(cfg.filename.as_deref(), Some("out.jfr"));
+        assert_eq!(cfg.duration, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(cfg.max_age, Some(std::time::Duration::from_secs(5 * 60)));
+        assert_eq!(cfg.max_events, Some(500));
+        assert!(!cfg.dump_on_exit);
+    }
+
+    #[test]
+    fn jfr_opts_bare_duration_digits_mean_seconds() {
+        let cfg = parse_jfr_start_recording_opts("duration=45").unwrap();
+        assert_eq!(cfg.duration, Some(std::time::Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn jfr_opts_hour_and_day_suffixes() {
+        let cfg = parse_jfr_start_recording_opts("maxage=2h").unwrap();
+        assert_eq!(cfg.max_age, Some(std::time::Duration::from_secs(2 * 3600)));
+        let cfg = parse_jfr_start_recording_opts("maxage=1d").unwrap();
+        assert_eq!(cfg.max_age, Some(std::time::Duration::from_secs(86400)));
+    }
+
+    #[test]
+    fn jfr_opts_rejects_unrecognized_key() {
+        let err = parse_jfr_start_recording_opts("disk=true").unwrap_err();
+        assert!(err.contains("disk"), "error should name the bad key: {err}");
+    }
+
+    #[test]
+    fn jfr_opts_rejects_missing_equals() {
+        let err = parse_jfr_start_recording_opts("filename").unwrap_err();
+        assert!(err.contains("filename"));
+    }
+
+    #[test]
+    fn jfr_opts_rejects_bad_duration() {
+        assert!(parse_jfr_start_recording_opts("duration=notanumber").is_err());
+    }
+
+    #[test]
+    fn jfr_opts_rejects_bad_dumponexit_value() {
+        assert!(parse_jfr_start_recording_opts("dumponexit=maybe").is_err());
     }
 
     #[test]

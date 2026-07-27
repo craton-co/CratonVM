@@ -24,7 +24,7 @@ use crate::native_id::{NativeMethodId, NativeMethodKey};
 fn real_net_sockets_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
 }
 
 /// REAL-FORKJOINPOOL (opt-in `CRATONVM_REAL_FORKJOINPOOL`): when set, the
@@ -53,7 +53,7 @@ fn real_net_sockets_enabled() -> bool {
 fn real_forkjoinpool_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
 }
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -446,291 +446,1273 @@ impl Drop for NativeHandleScope<'_> {
 ///
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
 /// module dependencies between `native` and `vm`.
-pub trait NativeContext {
-    /// Whether this context can construct and dispatch real generated proxy
-    /// classes. Lightweight unit-test contexts intentionally return `false`:
-    /// they model native object state but do not own a VM-wide class-loader and
-    /// proxy-class namespace.
-    fn supports_real_proxy_generation(&self) -> bool {
-        true
-    }
+pub trait NativeClassAccess {
+    /// Capability boundary: Class identity, metadata, loading, resources, and modules.
 
-    /// Force-refresh this thread's deposited GC root snapshot (the same
-    /// mechanism `NativeContextImpl::deposit_root_snapshot` uses before a
-    /// blocking call) without actually blocking.
-    ///
-    /// Background: a peer-initiated stop-the-world collection has two ways
-    /// to see a thread's roots — (1) a live conservative register/stack scan
-    /// if that thread is forcibly frozen while executing JIT-compiled code
-    /// (`jit::xt_root_scan`), which does NOT know about `native_pin_roots`
-    /// (a native-side `Vec` living on the Rust heap, not the JIT frame), or
-    /// (2) this thread's last-deposited snapshot
-    /// (`collect_all_root_snapshots`/`root_snapshots_for_os_tids`), which
-    /// DOES include `native_pin_roots` but is only refreshed at specific
-    /// checkpoints: a cooperative interpreter safepoint arrival, entry into
-    /// a blocking native region, or this thread itself initiating a GC.
-    /// JIT-compiled code has no periodic cooperative safepoint poll at all
-    /// (see the comment on `jit::helpers::jit_safepoint_flush_satb`) — it
-    /// only touches those checkpoints via specific GC-triggering runtime
-    /// helpers, which a hot loop making only fast-path allocations may never
-    /// call.
-    ///
-    /// A native method that pins a long-lived batch of objects (e.g. a
-    /// materialized `Stream` of elements, each pinned once up front) and then
-    /// drives per-element re-entrant Java execution that can run for a long
-    /// time and/or tier up into JIT — without itself ever blocking or
-    /// initiating GC — leaves a window where neither mechanism above sees
-    /// those pins: not (1), because `native_pin_roots` isn't scanned that
-    /// way, and not (2), because nothing has refreshed the deposit since
-    /// before the pins were pushed. A peer thread's GC during that window
-    /// can reclaim a still-pinned object; the next read through the pin
-    /// (correctly re-validated, `via_pin=true`) observes a stale/reused
-    /// address. Confirmed live for JUnit 5's `TestTemplateExecutor`/
-    /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
-    /// java.lang.Object cannot be cast to
-    /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
-    /// `obj_cid=0` — see `docs/known-issues/
-    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`,
-    /// which documents the same family from WildFly's `parallel-extension-add`
-    /// boot step) — one more independent occurrence of that already-tracked
-    /// "register-invisible root" / cross-thread GC-root-visibility family,
-    /// now with this specific closeable checkpoint gap identified.
-    ///
-    /// Calling this right after establishing such a batch of pins (and
-    /// optionally again periodically across a long per-element loop) closes
-    /// that window by (re-)publishing a fresh deposit — the exact same
-    /// mechanism already relied on for peers parked in a blocking region —
-    /// without requiring this thread to actually block. Default impl is a
-    /// no-op: test/mock contexts have no cross-thread GC to defend against.
-    fn refresh_root_snapshot(&mut self) {}
 
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
 
-    /// Phase 5 escape hatch for GPU offload — dispatch the named method
-    /// asynchronously on the GPU and return the submission handle. The
-    /// default impl returns `None` (no GPU offload). The VM's
-    /// `NativeContextImpl` overrides under `#[cfg(feature = "gpu-offload")]`
-    /// to resolve `class_name`/`method_name`/`descriptor` against the
-    /// class manager, marshal `java_args` into `KernelArgs`, and call
-    /// `OffloadCache::dispatch_async`. The returned handle is what the
-    /// Java `GpuFutureImpl` wraps; pass it back to
-    /// `Native.futureSynchronize` / `Native.futureGetResult` to drive
-    /// the future.
+    /// Get the class name for a ClassId.
+    fn class_name_of_id(&self, class_id: ClassId) -> Option<String>;
+
+    /// Get the class id of a heap object.
+    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId;
+
+    /// True when the named class is loaded as a synthetic stub (no real
+    /// `.class` bytes). Used to branch native helpers that must mirror JDK
+    /// behaviour without registering natives that would override real JDK
+    /// bytecode once the stub upgrades.
+    /// Would a name-based load of `name` be answered with a *fabricated
+    /// synthetic stub* (a class with no `Code` on any method, minted only so
+    /// enterprise bytecode can link) rather than a real class?
     ///
-    /// `java_args` follows the same convention as the JVM stack: each
-    /// `Value::Object(Some(...))` is a Java array reference, each
-    /// `Value::Int/Long/Float/Double` is a primitive scalar.
-    fn gpu_dispatch_method(
+    /// Non-destructive: unlike [`Self::is_class_synthetic_stub`] it does not
+    /// load anything, so it can be used to decide whether to consult a real
+    /// `ClassLoader` *before* the stub is minted and registered globally.
+    /// Default `false` for contexts with no class manager.
+    fn would_fabricate_synthetic_stub(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
+    fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
+        false
+    }
+
+    /// Check if a method exists in a class (searches the class hierarchy).
+    /// Returns `true` if the method is found.
+    fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool;
+
+    /// True iff `class_id` ITSELF declares (not merely inherits) a method with
+    /// the given name+descriptor. Unlike [`method_exists`], this does NOT walk
+    /// superclasses — it answers "does this exact class override the method?".
+    /// Used by the `ClassLoader.getResources` native to distinguish a custom
+    /// loader that overrides `findResources` (delegate to it) from one that
+    /// merely inherits the default (fall back to parent-delegated scan).
+    /// Default returns `false` so mock/test contexts compile unchanged.
+    fn class_declares_method(&self, _class_id: ClassId, _name: &str, _descriptor: &str) -> bool {
+        false
+    }
+
+    /// Ensure a class is loaded and initialized. Returns the ClassId.
+    fn ensure_class_initialized(
         &mut self,
-        _class_name: &str,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
+
+    /// Ensure the exact already-resolved class id is initialized without
+    /// re-resolving its binary name through the global loader map.
+    fn ensure_class_initialized_with_class_id(
+        &mut self,
+        class_id: ClassId,
+    ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+        if let Some(name) = self.class_name_of_id(class_id) {
+            self.ensure_class_initialized(&name)?;
+        }
+        Ok(())
+    }
+
+    /// Register a lambda proxy synthesized from a *reflective*
+    /// `LambdaMetafactory.metafactory` / `altMetafactory` call (as opposed to
+    /// the `invokedynamic` opcode, which is handled inline in the interpreter).
+    ///
+    /// Returns the raw `u32` of a freshly-allocated synthetic proxy `ClassId`
+    /// whose lambda call-site metadata is registered in the VM's
+    /// `lambda_proxies` table — identical in shape to the metadata produced by
+    /// the `invokedynamic` lambda bootstrap, so the interpreter's SAM-dispatch
+    /// path (`try_lambda_dispatch`) handles instances of it without any further
+    /// special-casing. A factory `MethodHandle` (kind `MH_KIND_LAMBDA_FACTORY`)
+    /// later allocates proxy instances of this class once the captured values
+    /// are known.
+    ///
+    /// `impl_ref_kind` is the JVMS `reference_kind` byte (1..=9) of the
+    /// implementation method handle. `capture_types` is one type char per
+    /// captured value (`'L'`, `'I'`, `'J'`, ...), in factory-argument order.
+    ///
+    /// Returns `0` when the host cannot register a proxy (e.g. test mocks, or
+    /// the proxy table is full); callers treat `0` as "unsupported" and fall
+    /// back to a non-null no-op `CallSite`.
+    #[allow(clippy::too_many_arguments)]
+    fn register_lambda_proxy(
+        &mut self,
+        functional_interface: &str,
+        sam_method_name: &str,
+        sam_descriptor: &str,
+        impl_class: &str,
+        impl_member: &str,
+        impl_descriptor: &str,
+        impl_ref_kind: u8,
+        instantiated_descriptor: &str,
+        capture_types: &str,
+    ) -> u32 {
+        let _ = (
+            functional_interface,
+            sam_method_name,
+            sam_descriptor,
+            impl_class,
+            impl_member,
+            impl_descriptor,
+            impl_ref_kind,
+            instantiated_descriptor,
+            capture_types,
+        );
+        0
+    }
+
+    /// Check if child_class is a subclass of parent_class.
+    fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
+
+    /// Get the superclass ClassId. Returns None for java/lang/Object.
+    fn superclass_of(&self, class_id: ClassId) -> Option<ClassId>;
+
+    /// Get the ClassId for a loaded class by name. Returns None if not loaded.
+    fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
+
+    /// Resolve `name` to a `ClassId`, preferring whichever loaded class is
+    /// registered under the SAME classloader as `near`'s own declaring
+    /// context, falling back to the normal global (bootstrap-first) search
+    /// used by [`Self::class_id_by_name`].
+    ///
+    /// A plain by-name lookup can silently resolve to an unrelated
+    /// same-named class loaded under a DIFFERENT classloader when the JVM
+    /// spec's (loader, name) identity legitimately produces two distinct
+    /// classes with the same name -- e.g. Hibernate ORM's bytecode
+    /// enhancement reloads an `@EmbeddedId` class under its own private
+    /// ByteBuddy classloader. Resolving a field/parameter's declared type
+    /// via plain name search can then find the FIRST-loaded (often stale)
+    /// variant instead of the one the caller's own class actually sees,
+    /// causing a real, correctly-typed value to be rejected as an
+    /// assignability mismatch. Use this instead of `class_id_by_name`
+    /// whenever `name` is a symbolic reference that must match the specific
+    /// class variant visible to a known class (`near`) -- e.g. a
+    /// `Field`/`Method`/`Constructor`'s own declaring class.
+    fn class_id_by_name_near(&self, name: &str, _near: ClassId) -> Option<ClassId> {
+        self.class_id_by_name(name)
+    }
+
+    /// Resolve `name` the way a requester-less parent-delegation loader
+    /// would: bootstrap, then extension, then application. Do not collapse
+    /// onto an unrelated user-defined loader's private same-named class unless
+    /// it is the only possible answer.
+    ///
+    /// Use this for lookups performed on behalf of ordinary application code
+    /// when no precise requesting class is available. Prefer
+    /// [`Self::class_id_by_name_near`] whenever a requester is known.
+    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
+        self.class_id_by_name(name)
+    }
+
+    /// Resolve `name` to a `ClassId`, LOADING it through
+    /// `referencing_class_id`'s own defining classloader if it isn't loaded
+    /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/
+    /// `invokestatic`/...) referencing `name` FROM `referencing_class_id`
+    /// would (JVMS SS5.4.3 initiating-loader semantics).
+    ///
+    /// Unlike [`Self::class_id_by_name_near`]/[`Self::class_id_by_name`] --
+    /// pure lookups that only succeed once `name` has already been
+    /// resolved/indexed under that loader -- this drives the loader's own
+    /// `loadClass`/`defineClass` on a miss, so it also answers correctly the
+    /// very first time a class is needed under a given loader (the gap that
+    /// made two prior lookup-based fix attempts for the H2 `Parser`
+    /// loader-collapse bug regress on a fresh session -- see
+    /// docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md's
+    /// eighth-pass section).
+    ///
+    /// Native overrides that construct or invoke-special a DIFFERENT class
+    /// than their own receiver's declaring class (an app/H2 native bridging
+    /// into the receiver's own package -- e.g. `SessionLocal.prepareLocal`'s
+    /// `new Parser(this)`) MUST use this instead of
+    /// `new_object_initialized`/`invoke_special` with a bare name: those
+    /// collapse to whichever loader defined `name` FIRST process-wide,
+    /// silently constructing/invoking the WRONG loader's copy of the class
+    /// whenever the receiver's own defining loader is a user-defined one
+    /// distinct from the first-loaded (usually Application) copy.
+    ///
+    /// The default implementation ignores `referencing_class_id` and falls
+    /// back to the name-only [`Self::ensure_class_initialized`] -- sufficient
+    /// for test mocks and any context with a single (global) loader
+    /// namespace; the real VM implementation honours per-loader identity.
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        _referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        self.ensure_class_initialized(name)
+    }
+
+    /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
+    /// class id `>= 0x8000_0000`, not in the class store), return the internal
+    /// name of its functional (SAM) interface. Returns `None` for any non-lambda
+    /// class. Used by reflection natives so a lambda's mirror reports a sane
+    /// hierarchy (`getSuperclass()` = Object, `getInterfaces()` = [SAM]) instead
+    /// of null/empty — Gradle's listener type-walk calls
+    /// `concreteClass.getSuperclass().isInterface()` and a null superclass NPEs.
+    fn lambda_functional_interface(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
+    /// For a synthetic lambda-proxy `ClassId`, return the internal name of the
+    /// lambda's *defining* class (the class that owns the implementation method,
+    /// e.g. `Refl6` for a `() -> {}` whose body compiles to `Refl6.lambda$..`).
+    /// Returns `None` for any non-lambda class. Used by the reflection name
+    /// natives (`getName`/`getSimpleName`/`getNestHost`) to synthesize the
+    /// HotSpot-style `<host>$$Lambda/0x<id>` name instead of `unknown_<id>`.
+    fn lambda_proxy_host(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
+    /// For a synthetic lambda-proxy `ClassId`, return `(sam_method_name,
+    /// sam_erased_descriptor, instantiated_descriptor)` from the
+    /// `LambdaMetafactory` bootstrap that created it. `sam_erased_descriptor`
+    /// is the functional interface's own (type-erased) SAM descriptor — the
+    /// key needed to look up that method's generic `Signature` attribute via
+    /// `method_signature`. `instantiated_descriptor` is the call-site-specific,
+    /// concrete-typed descriptor (e.g. `(Lcom/foo/Bar;)V` for a
+    /// `Consumer<Bar>` lambda) — the source of truth for substituting the
+    /// functional interface's type variable(s) with concrete types. Returns
+    /// `None` for any non-lambda class. Used to synthesize a real
+    /// `ParameterizedType` for `Class.getGenericInterfaces()` on a lambda
+    /// proxy instead of falling back to the raw (non-generic) interface
+    /// `Class` — Spring's `GenericTypeResolver` (and similar reflection-based
+    /// generic-argument resolvers) require an actual `ParameterizedType` and
+    /// throw when only a raw `Class` is available.
+    fn lambda_call_site_descriptors(&self, _class_id: ClassId) -> Option<(String, String, String)> {
+        None
+    }
+
+    /// For a synthetic lambda-proxy `ClassId`, return the full lambda
+    /// call-site metadata required to serialize and later reconstruct the
+    /// lambda (see [`LambdaSerialMetadata`]). Returns `None` for any
+    /// non-lambda class. Used by the object-serialization natives to emit a
+    /// `SerializedLambda`-equivalent record instead of attempting to serialize
+    /// the (un-loadable) synthetic `$$Lambda` proxy class by name.
+    fn lambda_proxy_serial_metadata(&self, _class_id: ClassId) -> Option<LambdaSerialMetadata> {
+        None
+    }
+
+    /// Get the ClassLoaderId for a loaded class.
+    /// Returns 0 = Bootstrap, 1 = Extension, 2 = Application, 3+ = UserDefined(id).
+    fn loader_id_of_class(&self, class_id: ClassId) -> i32;
+
+    /// Check if a class is a record (has Record attribute, JEP 395).
+    fn is_record_class(&self, class_id: ClassId) -> bool;
+
+    /// Get the record components (name, descriptor) for a record class.
+    fn record_components(&self, class_id: ClassId) -> Vec<(String, String)>;
+
+    /// Check if a class is sealed (has PermittedSubclasses attribute, JEP 409).
+    fn is_sealed_class(&self, class_id: ClassId) -> bool;
+
+    /// Get the permitted subclass names for a sealed class.
+    fn permitted_subclasses(&self, class_id: ClassId) -> Vec<String>;
+
+    /// Get the total number of instance fields (including inherited) for a
+    /// loaded class.  Returns 0 if the class isn't loaded.  Used by native
+    /// allocators that otherwise hard-code a synthetic field count — in
+    /// real-JDK mode the hard-coded count often underestimates the real
+    /// layout, and allocating with too few slots causes out-of-bounds
+    /// `get_field` / `set_field` later when bytecode accesses an inherited
+    /// field at `first_field_index + local_offset`.
+    fn class_num_total_fields(&self, class_id: ClassId) -> usize {
+        let _ = class_id;
+        0
+    }
+
+    // -- Reflection metadata methods --
+
+    /// Get metadata for all fields declared in this class (not inherited).
+    fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata>;
+
+    /// Get metadata for all methods declared in this class (not inherited).
+    fn declared_methods(&self, class_id: ClassId) -> Vec<MethodMetadata>;
+
+    /// Get the ClassIds of directly implemented/extended interfaces.
+    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId>;
+
+    /// Get the raw access_flags bits for a class.
+    fn class_access_flags(&self, class_id: ClassId) -> u16;
+
+    /// Get or create a Class mirror for a primitive type (e.g. "int", "boolean").
+    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef;
+
+    // -- Annotation support --
+
+    /// Get runtime-visible annotation type descriptors for a class.
+    /// Returns a list of (type_descriptor, element_value_pairs) tuples.
+    fn class_annotations(&self, class_id: ClassId) -> Vec<AnnotationData>;
+
+    /// Get runtime-visible annotation type descriptors for a method.
+    /// `method_name` and `method_desc` identify the method within the class.
+    fn method_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<AnnotationData>;
+
+    /// Get runtime-visible annotation type descriptors for a field.
+    /// `field_name` identifies the field within the class.
+    fn field_annotations(&self, class_id: ClassId, field_name: &str) -> Vec<AnnotationData>;
+
+    /// Get parameter annotations for a method.
+    /// Returns a Vec of Vec<AnnotationData>, one per parameter.
+    fn method_parameter_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<AnnotationData>>;
+
+    /// Get the runtime-visible TYPE_USE annotations that target a method's
+    /// return type (JVMS 4.7.20 `target_type` 0x14, METHOD_RETURN) with an
+    /// empty `type_path` (i.e. annotations placed directly on the top-level
+    /// return type rather than a nested array/type-argument component).
+    ///
+    /// Backs `Method.getAnnotatedReturnType().getDeclaredAnnotations()` so
+    /// JSpecify-style `@Nullable`/`@NonNull` (which are TYPE_USE-only and thus
+    /// live in `RuntimeVisibleTypeAnnotations`, not `RuntimeVisibleAnnotations`)
+    /// are surfaced to reflection. Default impl returns an empty `Vec` so mock
+    /// `NativeContext` implementations don't need to plumb the attribute store.
+    fn method_return_type_annotations(
+        &self,
+        _class_id: ClassId,
         _method_name: &str,
-        _descriptor: &str,
-        _java_args: &[Value],
-    ) -> Option<u64> {
+        _method_desc: &str,
+    ) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a method return
+    /// type's TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type`
+    /// 0x14, METHOD_RETURN, with a `type_path` made entirely of TYPE_ARGUMENT
+    /// entries) -- e.g. `List<@NotBlank String> getNames()`, or nested generics
+    /// like `ValueExtractor<Wrapper<@Foo ?>>`.
+    ///
+    /// The outer `Vec` is indexed by the top-level `type_argument_index`
+    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
+    /// next nesting level. Default impl returns an empty `Vec`.
+    fn method_return_type_argument_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<TypeArgAnnotations> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a method's
+    /// formal parameters (JVMS 4.7.20 `target_type` 0x16,
+    /// METHOD_FORMAL_PARAMETER) with an empty `type_path`. The outer `Vec` is
+    /// indexed by `formal_parameter_index`; entries with no annotations are
+    /// empty inner `Vec`s.
+    ///
+    /// Backs `Parameter.getAnnotatedType().getDeclaredAnnotations()`. Default
+    /// impl returns an empty `Vec`.
+    fn method_parameter_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a field's type
+    /// (JVMS 4.7.20 `target_type` 0x13, FIELD) with an empty `type_path`.
+    /// Backs `Field.getAnnotatedType().getDeclaredAnnotations()`. Default impl
+    /// returns an empty `Vec`.
+    fn field_type_annotations(&self, _class_id: ClassId, _field_name: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a field type's
+    /// TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type` 0x13,
+    /// FIELD, with a `type_path` made entirely of TYPE_ARGUMENT entries) --
+    /// e.g. `List<@NotBlank String> names`.
+    ///
+    /// The outer `Vec` is indexed by the top-level `type_argument_index`
+    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
+    /// next nesting level. Default impl returns an empty `Vec`.
+    fn field_type_argument_annotations(
+        &self,
+        _class_id: ClassId,
+        _field_name: &str,
+    ) -> Vec<TypeArgAnnotations> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations that target a method
+    /// formal parameter's type ARGUMENTS, at any nesting depth (JVMS 4.7.20
+    /// `target_type` 0x16, METHOD_FORMAL_PARAMETER, with a `type_path` made
+    /// entirely of TYPE_ARGUMENT entries) -- e.g. the `@Valid` in
+    /// `List<@Valid Person> persons`, which annotates the type argument
+    /// `Person`, not the top-level `List` parameter type.
+    ///
+    /// The outer `Vec` is indexed by `formal_parameter_index`; the inner
+    /// `Vec` is indexed by the top-level `type_argument_index` (0-based, per
+    /// JVMS 4.7.20.2), and each entry's own `children` carries the next
+    /// nesting level. Backs
+    /// `((AnnotatedParameterizedType) method.getAnnotatedParameterTypes()[i])
+    /// .getAnnotatedActualTypeArguments()[j].getDeclaredAnnotations()`, which
+    /// Spring's `HandlerMethod.MethodValidationInitializer
+    /// .getContainerElementAnnotations` walks to decide whether e.g.
+    /// `addPeople(List<@Valid Person> persons)` needs method validation.
+    /// Default impl returns an empty `Vec`.
+    fn method_parameter_type_argument_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<Vec<TypeArgAnnotations>> {
+        Vec::new()
+    }
+
+    /// Get the generic Signature attribute for a class (if present).
+    fn class_signature(&self, class_id: ClassId) -> Option<String>;
+
+    /// Get the generic Signature attribute for a method (if present).
+    fn method_signature(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Option<String>;
+
+    /// Get the generic Signature attribute for a field (if present).
+    fn field_signature(&self, class_id: ClassId, field_name: &str) -> Option<String>;
+
+    /// WP2.1 — Get the parsed `MethodParameters` attribute (JVMS 4.7.24)
+    /// for a method. Each entry is `(name, access_flags)`. The name is the
+    /// resolved Utf8 from the constant pool, or empty string if
+    /// `name_index == 0` (synthetic / unnamed parameter).
+    ///
+    /// Returns an empty `Vec` if the method has no `MethodParameters`
+    /// attribute (the common case for code not compiled with `-parameters`),
+    /// or if the class / method cannot be located. Callers should fall
+    /// back to synthesizing `arg0`, `arg1`, … names in that case.
+    ///
+    /// Default implementation returns an empty `Vec` so that mock
+    /// `NativeContext` implementations don't need to plumb through
+    /// the class-file attribute store.
+    fn method_parameters(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<(String, u16)> {
+        Vec::new()
+    }
+
+    /// Get annotation default values for annotation type methods.
+    /// Returns the default ElementValue for the given method, if any.
+    fn method_annotation_default(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Option<AnnotationElementValue>;
+
+    /// WP2.1 — Get the list of checked-exception class internal names from
+    /// a method's `Exceptions` attribute (JVMS 4.7.5).
+    ///
+    /// Returns an empty `Vec` if the method has no `Exceptions` attribute
+    /// (no `throws` clause), or if the class / method cannot be located.
+    /// Each entry is a binary internal class name like
+    /// `"java/io/IOException"`.
+    ///
+    /// Default implementation returns an empty `Vec` so that mock
+    /// `NativeContext` implementations don't need to plumb through the
+    /// class-file attribute store.
+    fn method_exceptions(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
+    // -- JPMS Module support (N3) --
+
+    /// Return the module name (JPMS) of the class with the given ClassId.
+    ///
+    /// Returns `None` for classes in the unnamed module.
+    fn module_name_of_class(&self, class_id: ClassId) -> Option<String>;
+
+    /// Find a classpath resource by name. Returns raw bytes or None if not found.
+    ///
+    /// Searches bootstrap → extension → application classpaths.
+    /// The name should be a forward-slash-separated path (leading `/` is stripped).
+    fn find_resource(&self, name: &str) -> Option<Vec<u8>>;
+
+    /// Return the raw bytes of the class file from which `class_id` was
+    /// loaded (or last redefined). Reads from `ClassManager::class_bytes_cache`,
+    /// which is populated by every `define_class_with_options` call.
+    /// Used by `Instrumentation.retransformClasses` to seed the transformer
+    /// chain with the true source bytes — `find_resource` would only find
+    /// classpath-resident classes, missing dynamically-defined and hidden
+    /// classes. Default impl returns `None` so test mocks compile.
+    fn class_bytes(&self, _class_id: ClassId) -> Option<Vec<u8>> {
         None
     }
 
-    /// GpuStream affinity — mint a new Java-visible CUDA stream on the
-    /// per-VM default-ordinal `OffloadCache`.
-    ///
-    /// Called by `Native.newStream` (wraps the returned handle in a
-    /// `GpuStreamImpl`) and, lazily, by every `submit`/`launch`/
-    /// `submitMethod`/`submitWithArg(s)` handler the first time a given
-    /// `GpuExecutor` handle is used — see
-    /// `native-builtins/src/craton_gpu.rs::resolve_or_create_default_stream`.
-    /// That laziness is what gives an executor a real *default* stream:
-    /// every dispatch through the same executor handle reuses the one
-    /// stream minted on its first submit, instead of each call getting
-    /// its own private one-shot stream (the gap
-    /// `docs/gpu/async-api.md` describes under "GpuStream affinity is
-    /// not wired up").
-    ///
-    /// Returns `None` when there is no device (no driver / `--gpu` off
-    /// / `gpu-offload` compiled off on the VM side) — the default impl
-    /// here, matching every other no-driver fallback in this trait.
-    /// The VM's `NativeContextImpl` overrides under
-    /// `#[cfg(feature = "gpu-offload")]` to call
-    /// `runtime::offload::OffloadCache::stream_create`.
-    fn gpu_stream_create(&mut self) -> Option<u64> {
+    /// Return a URL string (e.g. `file:/...` or `jar:file:/...!/...`) for
+    /// every classpath entry that contains a resource with the given name.
+    /// Used by `ClassLoader.getResources` / `getSystemResources`.
+    /// Default implementation returns an empty vector so test mocks compile.
+    fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
+        let _ = name;
+        Vec::new()
+    }
+
+    /// Return the raw bytes of every classpath entry that contains a
+    /// resource with the given name. Parallel to [`find_all_resource_urls`]
+    /// but returns content rather than URLs — used by Rust-native resource
+    /// enumeration paths (e.g. `ServiceLoader` provider discovery in
+    /// `native-builtins/src/service_loader.rs`) that bypass the JDK's
+    /// `URL.openStream` / `BufferedReader` chain.
+    /// Default implementation returns an empty vector so test mocks compile.
+    fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
+        let _ = name;
+        Vec::new()
+    }
+
+    /// Find the filesystem path of the classpath entry that holds a given
+    /// class (for `Class.getProtectionDomain().getCodeSource().getLocation()`).
+    /// Returns a `file:`-scheme-ready absolute path (directory has trailing
+    /// slash, JAR is a plain path).  Returns `None` for classes loaded from
+    /// jimage (bootstrap JDK) or if the class cannot be found on any path.
+    fn find_class_source_path(&self, class_name: &str) -> Option<String> {
+        let _ = class_name;
         None
     }
 
-    /// Release a stream minted by [`gpu_stream_create`](Self::gpu_stream_create).
-    /// Safe to call on an unknown or already-released `handle`
-    /// (no-op) — same idempotent-release convention as
-    /// [`gpu_release_array_cache`](Self::gpu_release_array_cache).
-    ///
-    /// Default impl is a no-op (no GPU offload). The VM override calls
-    /// `runtime::offload::OffloadCache::stream_release`.
-    fn gpu_stream_release(&mut self, _handle: u64) {}
+    /// Return the CodeSource URL attached to a loaded class — what
+    /// `Class.getProtectionDomain().getCodeSource().getLocation()` returns.
+    /// This is populated at class-load time from the classpath entry that
+    /// produced the class, and surfaces real JAR/dir URLs (e.g.
+    /// `file:/opt/app.jar`) rather than the synthetic `class:` placeholder.
+    /// Returns `None` for synthetic stubs and JDK internals.
+    fn class_code_base(&self, class_id: ClassId) -> Option<String> {
+        let _ = class_id;
+        None
+    }
 
-    /// Stream-affine sibling of [`gpu_dispatch_method`](Self::gpu_dispatch_method):
-    /// identical contract, plus `stream_handle`.
+    /// Return the SHA-256 hex digests of every signer certificate block on
+    /// the class's CodeSource (one per JAR-signer). Empty vector means an
+    /// unsigned source; used by `security_manager` policy enforcement to
+    /// match `grant signedBy "..."` entries.
+    fn class_code_source_cert_digests(&self, class_id: ClassId) -> Vec<String> {
+        let _ = class_id;
+        Vec::new()
+    }
+
+    /// Return the raw DER-encoded signer certificate blocks (PKCS#7 / CMS
+    /// SignedData) attached to the class's CodeSource.  Parallel to
+    /// `class_code_source_cert_digests` — one block per JAR-signer — but
+    /// exposes the original bytes so the policy engine can parse each
+    /// signer's X.509 subject DN for `grant signedBy "CN=..."` matching.
+    /// Empty vector means an unsigned source.
+    fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
+        let _ = class_id;
+        Vec::new()
+    }
+
+    /// Reverse-lookup: given a `java.lang.Class` mirror object, return the
+    /// backing `ClassId` (the class the mirror reflects).  Returns `None`
+    /// for primitive-type mirrors and for non-mirror objects.
     ///
-    /// * `Some(h)` — pin this dispatch onto the CUDA stream previously
-    ///   minted by [`gpu_stream_create`](Self::gpu_stream_create) under
-    ///   handle `h`. Two dispatches pinned to the SAME `h` serialize in
-    ///   submission order (the ordering guarantee a CUDA stream gives
-    ///   for free). An `h` that was never minted, or was already
-    ///   released via [`gpu_stream_release`](Self::gpu_stream_release),
-    ///   is a hard failure (a `Failed` submission), not a silent
-    ///   fresh-stream fallback.
-    /// * `None` — identical to calling
-    ///   [`gpu_dispatch_method`](Self::gpu_dispatch_method) directly: a
-    ///   fresh, private, one-shot stream for this dispatch alone.
+    /// Implemented by consulting the VM's `class_mirrors_reverse` map;
+    /// avoids encoding the class_id in the mirror's Java-visible fields,
+    /// which would clash with real-JDK `java/lang/Class` layout.
+    fn class_id_from_mirror(&self, mirror: ObjectRef) -> Option<ClassId> {
+        let _ = mirror;
+        None
+    }
+
+    /// List all class names on the application classpath.
     ///
-    /// Default impl delegates to `gpu_dispatch_method` and ignores
-    /// `stream_handle` — correct for every mock/test context (no GPU
-    /// offload at all) and for a VM build with `gpu-offload` off. The
-    /// VM's `NativeContextImpl` overrides under
-    /// `#[cfg(feature = "gpu-offload")]` to call
-    /// `runtime::offload::dispatch_method_from_native_on_stream`.
-    fn gpu_dispatch_method_on_stream(
+    /// Returns binary class names (e.g. `com/example/MyClass`).
+    fn list_application_class_names(&self) -> Vec<String>;
+
+    /// Dynamically extend the application classpath (for URLClassLoader).
+    ///
+    /// Each string in `paths` is a filesystem path to either a directory or a
+    /// JAR/ZIP file. Paths are appended to the application class finder so that
+    /// subsequent `ensure_class_initialized` and `find_resource` calls search them.
+    fn register_dynamic_classpath(&mut self, paths: &[String]);
+
+    /// Append paths to the BOOTSTRAP class search path so their classes load
+    /// with the bootstrap loader (null `Class.getClassLoader()`). Drives
+    /// `Instrumentation.appendToBootstrapClassLoaderSearch`. The default
+    /// implementation falls back to the application classpath; the VM's
+    /// `NativeContext` overrides it to target the bootstrap loader.
+    fn register_bootstrap_classpath(&mut self, paths: &[String]) {
+        self.register_dynamic_classpath(paths);
+    }
+
+    /// Define a new class from raw bytecode (Phase 23.2).
+    ///
+    /// Parses the class bytes, registers the class with the ClassManager under
+    /// the application loader, and returns the ClassId of the newly defined class.
+    /// Returns `None` if parsing fails.
+    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId>;
+
+    /// NEW-8: Define a hidden class (JEP 371 / JEP 429) from raw bytecode.
+    ///
+    /// `stored_name` is the mangled name under which the class is
+    /// registered in the class store — typically
+    /// `"<original>/0x<counter>"` so multiple hidden classes derived
+    /// from the same template get distinct names. The class's
+    /// `hidden` flag is set atomically with registration so the class
+    /// is never visible to `find_class_by_name` / `Class.forName`.
+    ///
+    /// Returns a typed error string on parse / link failure so the
+    /// caller can surface a proper `ClassFormatError` or
+    /// `LinkageError` to Java code. The default implementation
+    /// delegates to [`define_class_from_bytes`] for backward
+    /// compatibility — implementations that want real JEP 371
+    /// semantics should override this.
+    fn define_hidden_class_from_bytes(
+        &mut self,
+        stored_name: &str,
+        bytes: &[u8],
+    ) -> Result<ClassId, String> {
+        match self.define_class_from_bytes(stored_name, bytes) {
+            Some(cid) => {
+                self.set_class_hidden(cid);
+                Ok(cid)
+            }
+            None => Err(format!("failed to define hidden class {stored_name}")),
+        }
+    }
+
+    /// Define a new class under a specific user-defined classloader namespace.
+    ///
+    /// `loader_id` is the unique integer ID of the user-defined classloader.
+    /// Classes defined with different loader IDs are isolated (same class name
+    /// can exist in multiple loader namespaces per JVM spec §5.3).
+    fn define_class_with_loader(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        loader_id: u32,
+    ) -> Option<ClassId>;
+
+    /// WP2.3 — full-options defineClass. Returns
+    /// `Ok(class_id)` on success or `Err(error_message)` describing
+    /// the LinkageError / ClassFormatError. Used by all four entry
+    /// points (Unsafe.defineClass, jdk.internal.misc.Unsafe.defineClass,
+    /// MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2)
+    /// so they all dispatch to the same backend.
+    ///
+    /// `loader_id == 0` means use the application loader; non-zero
+    /// values are user-defined loader namespaces.
+    fn define_class_full(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        loader_id: u32,
+        opts: DefineClassFull,
+    ) -> Result<ClassId, String> {
+        // Default: degrade to define_class_with_loader / define_class_from_bytes.
+        let result = if loader_id > 0 {
+            self.define_class_with_loader(name, bytes, loader_id)
+        } else {
+            self.define_class_from_bytes(name, bytes)
+        };
+        match result {
+            Some(cid) => {
+                if opts.hidden {
+                    self.set_class_hidden(cid);
+                }
+                Ok(cid)
+            }
+            None => Err(format!("define_class_full failed for {name}")),
+        }
+    }
+
+    /// WP2.4 — redefine the bytecode of an already-loaded class.
+    ///
+    /// Used by `Instrumentation.redefineClasses` /
+    /// `retransformClasses`. The class must already exist; otherwise
+    /// returns `Err("class not loaded")`. On success, the JIT cache
+    /// for the old class is invalidated and any new method lookups
+    /// resolve through the new bytecode.
+    fn redefine_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
+        let _ = (class_id, new_bytes);
+        Err("redefine_class not implemented".to_string())
+    }
+
+    /// Like [`Self::redefine_class`] but for
+    /// `Instrumentation.retransformClasses`: preserves the class's original
+    /// cached bytes so each retransformation re-runs the transformer chain
+    /// from the ORIGINAL bytes (not the previously-woven ones). Without this,
+    /// a second retransform of the same class — e.g. `mockStatic(X)` then
+    /// `mock(X)` — double-instruments it. The default delegates to
+    /// `redefine_class` (correct for impls that don't cache original bytes).
+    fn retransform_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
+        self.redefine_class(class_id, new_bytes)
+    }
+
+    /// WP2.4 — list all loaded classes.
+    fn list_loaded_class_ids(&self) -> Vec<ClassId> {
+        Vec::new()
+    }
+
+    /// WP2.4 — list all classes whose initiating loader was the
+    /// application loader (or, if `loader_id != 0`, the user-defined
+    /// loader with that id).
+    fn list_initiated_class_ids(&self, _loader_id: u32) -> Vec<ClassId> {
+        Vec::new()
+    }
+
+    /// Look up a class by name within a specific user-defined loader's namespace.
+    /// Falls back to the standard delegation chain if not found.
+    fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId>;
+
+    /// Exact `(loader, name)` lookup with **no** delegation/global fallback —
+    /// only a class the loader with `loader_id` has itself defined. Used by
+    /// loader-faithful `findLoadedClass` so it never returns another loader's
+    /// class. Default impl falls back to the (fallback-prone)
+    /// [`Self::class_id_by_name_and_loader`] for contexts that do not override
+    /// it (e.g. test mocks).
+    fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
+        self.class_id_by_name_and_loader(name, loader_id)
+    }
+
+    /// Allocate a unique classloader ID for a new user-defined classloader instance.
+    fn allocate_loader_id(&mut self) -> u32;
+
+    // -- JPMS module queries (Phase B) --
+
+    /// Check if module `reader` reads module `provider`.
+    fn reads_module(&self, reader: &str, provider: &str) -> bool {
+        // Default: all modules can read each other (classpath-only mode).
+        let _ = (reader, provider);
+        true
+    }
+
+    /// Check if `module_name` exports `pkg` unconditionally (to all modules).
+    ///
+    /// AUDIT 2026-05-19: this method has **no default** and is REQUIRED. A
+    /// fail-open default (`true`) silently grants arbitrary cross-module
+    /// access for any implementor that forgets to override it. Forcing every
+    /// `NativeContext` impl to provide a body makes the security decision
+    /// explicit. Classpath-only / mock contexts should return `true`
+    /// deliberately; a JPMS-enabled VM must perform a real readability check.
+    fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool;
+
+    /// Check if `module_name` exports `pkg` to `to_module`.
+    ///
+    /// AUDIT 2026-05-19: REQUIRED, no default — see
+    /// `is_package_exported_unqualified` for the fail-open rationale.
+    fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool;
+
+    /// Check if `module_name` opens `pkg` unconditionally.
+    ///
+    /// AUDIT 2026-05-19: REQUIRED, no default — see
+    /// `is_package_exported_unqualified` for the fail-open rationale.
+    fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool;
+
+    /// Check if `module_name` opens `pkg` to `to_module`.
+    ///
+    /// AUDIT 2026-05-19: REQUIRED, no default — see
+    /// `is_package_exported_unqualified` for the fail-open rationale.
+    fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool;
+
+    /// Add a dynamic read edge: `reader` reads `provider`.
+    fn module_add_reads(&mut self, reader: &str, provider: &str) {
+        let _ = (reader, provider);
+    }
+
+    /// Add a dynamic export: `module_name` exports `pkg` to `target`.
+    fn module_add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
+        let _ = (module_name, pkg, target);
+    }
+
+    /// Add a dynamic open: `module_name` opens `pkg` to `target`.
+    fn module_add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
+        let _ = (module_name, pkg, target);
+    }
+
+    /// Return all packages owned by `module_name`.
+    fn module_packages(&self, module_name: &str) -> Vec<String> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// Return the `uses` service-type binary names (slash format) declared by
+    /// `module_name`'s `module-info.class` `uses` directives. Empty for the
+    /// unnamed module, an unregistered module, or a module whose descriptor
+    /// declares no `uses`.
+    fn module_uses(&self, module_name: &str) -> Vec<String> {
+        let _ = module_name;
+        vec![]
+    }
+
+    /// True if `module_name`'s `module-info.class` declared `open module ...`
+    /// (the real `ACC_MODULE_OPEN` flag). `false` for the unnamed module, an
+    /// unregistered module, or a module that isn't open.
+    fn module_is_open(&self, module_name: &str) -> bool {
+        let _ = module_name;
+        false
+    }
+
+    /// Return all registered module names.
+    fn all_module_names(&self) -> Vec<String> {
+        vec![]
+    }
+
+    /// Find which module owns a given package (slash format).
+    fn module_for_package(&self, pkg: &str) -> Option<String> {
+        let _ = pkg;
+        None
+    }
+
+    /// Mark a class as hidden (JEP 371). Hidden classes are not discoverable via
+    /// `Class.forName` or `ClassLoader.findLoadedClass`.
+    fn set_class_hidden(&mut self, class_id: ClassId) {
+        let _ = class_id;
+    }
+
+    /// Query whether a class is hidden (JEP 371). Used by the
+    /// `Class.isHidden()` native. The default returns `false` for every
+    /// class so implementations that do not support hidden classes
+    /// continue to work.
+    fn is_class_hidden(&self, class_id: ClassId) -> bool {
+        let _ = class_id;
+        false
+    }
+
+    /// Copy nest-host and nest-members information from `source_class` to
+    /// `target_class`. Used by `defineHiddenClass` when the `NESTMATE`
+    /// class option is specified: the hidden class joins the lookup
+    /// class's nest rather than being a standalone nest of its own.
+    /// The default is a no-op for implementations that do not track
+    /// nest membership.
+    fn copy_nest_info(&mut self, source_class: ClassId, target_class: ClassId) {
+        let _ = (source_class, target_class);
+    }
+
+    /// Force a class to complete its `<clinit>` immediately. Used by
+    /// `defineHiddenClass` when the `initialize` flag is `true`, and by
+    /// `Class.forName`/`Constructor.newInstance`/`Lookup.ensureInitialized`.
+    /// The default is a no-op — callers that care about deterministic init
+    /// must override this in their NativeContext impl.
+    ///
+    /// HIB-CV-26 fix (2026-07-16): the error type is `MethodCallFailed`
+    /// (not a flattened `String`) so a `<clinit>` failure keeps its
+    /// two-layer identity all the way to the caller: a genuine Java
+    /// exception from a static initializer comes back as
+    /// `MethodCallFailed::ExceptionThrown` (already correctly wrapped as a
+    /// catchable `ExceptionInInitializerError`/`NoClassDefFoundError` by
+    /// `ensure_class_initialized_shared` per JVMS §5.5) and only a true
+    /// VM-level bug comes back as `MethodCallFailed::InternalError`.
+    /// Collapsing both into a `String` here previously forced every call
+    /// site to treat ordinary `<clinit>` exceptions as unrecoverable
+    /// internal errors, aborting the VM instead of letting Java code catch
+    /// them.
+    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
+        let _ = class_id;
+        Ok(())
+    }
+
+    /// Return all JPMS `provides` implementation class names for a given service
+    /// interface (binary class name, e.g. `"com/example/MyService"`).
+    /// Walks all registered module descriptors' `provides` entries.
+    fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
+        let _ = service_class;
+        vec![]
+    }
+
+    // -- JPMS deep reflection access (Phase B) --
+
+    /// Check whether `accessor_class_id` has deep (reflective) access to
+    /// `target_class_id` via JPMS `opens` directives.
+    ///
+    /// Returns `Ok(())` if allowed (same module, unnamed module, target module
+    /// opens the package, or a dynamic `addOpens` edge exists).
+    /// Returns `Err(message)` if the access is denied.
+    ///
+    /// Called by reflection natives (`Method.invoke`, `Field.get/set`,
+    /// `Constructor.newInstance`) when `setAccessible(true)` is used on a
+    /// member in a different module.
+    ///
+    /// AUDIT 2026-05-19: this method has **no default** and is REQUIRED. The
+    /// previous `Ok(())` default silently allowed arbitrary cross-module
+    /// `setAccessible` for any implementor that forgot to override it.
+    /// Forcing every `NativeContext` impl to provide a body makes the
+    /// security decision explicit — classpath-only / mock contexts may
+    /// return `Ok(())` deliberately; a JPMS-enabled VM must perform a real
+    /// module-readability + opens check.
+    fn check_deep_reflection_access(
+        &self,
+        accessor_class_id: ClassId,
+        target_class_id: ClassId,
+    ) -> Result<(), String>;
+
+    // -- T13 java/lang/Class reflection metadata --
+
+    /// Get the class file version (major number) for a class.
+    fn class_file_version(&self, _class_id: ClassId) -> u16 {
+        65 // Default: Java 21
+    }
+
+    /// Get the inner classes of a class.
+    /// Returns vec of (inner_class_name, outer_class_name, inner_name, access_flags).
+    fn inner_classes(&self, _class_id: ClassId) -> Vec<(String, String, String, u16)> {
+        Vec::new()
+    }
+
+    /// Get the enclosing method info for a class.
+    /// Returns (enclosing_class, method_name, method_descriptor) or None.
+    fn enclosing_method(&self, _class_id: ClassId) -> Option<(String, String, String)> {
+        None
+    }
+
+    /// Get the declaring class of this class (from InnerClasses attribute).
+    /// Returns the class ID of the outer class, or None if not an inner class.
+    fn declaring_class(&self, _class_id: ClassId) -> Option<ClassId> {
+        None
+    }
+
+    /// Get the raw annotation bytes for a class.
+    /// Returns the bytes of the RuntimeVisibleAnnotations attribute, or empty.
+    fn raw_annotations(&self, _class_id: ClassId) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Get the raw type annotation bytes for a class.
+    fn raw_type_annotations(&self, _class_id: ClassId) -> Vec<u8> {
+        Vec::new()
+    }
+
+    /// Get the runtime-visible TYPE_USE annotations targeting one of this
+    /// class's declared supertypes (JVMS 4.7.20 `target_type` 0x10,
+    /// CLASS_EXTENDS). `supertype_index` is the JVMS-defined index: `0xFFFF`
+    /// (65535) selects the superclass, `0..n` selects the n-th entry of
+    /// `getInterfaces()`.
+    ///
+    /// Returns a [`TypeArgAnnotations`] tree: `.anns` holds annotations with
+    /// an empty `type_path` (directly on the supertype itself, e.g.
+    /// `implements @Foo Bar`); `.children[i]` holds the subtree for the
+    /// supertype's i-th type argument (recursively, for arbitrarily nested
+    /// generics, e.g. `implements ValueExtractor<ArgumentValue<@ExtractedValue
+    /// ?>>`). Backs `Class.getAnnotatedSuperclass()` /
+    /// `Class.getAnnotatedInterfaces()` and their
+    /// `getAnnotatedActualTypeArguments()` chains. Default impl returns an
+    /// empty tree so mock `NativeContext` implementations don't need to plumb
+    /// the attribute store.
+    fn class_extends_type_annotations(
+        &self,
+        _class_id: ClassId,
+        _supertype_index: u16,
+    ) -> TypeArgAnnotations {
+        TypeArgAnnotations::default()
+    }
+
+    /// Get the nest host class name for a class.
+    /// Returns None if the class is its own nest host.
+    fn nest_host_name(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
+    /// Get the nest member class names for a class.
+    fn nest_member_names(&self, _class_id: ClassId) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+pub trait NativeInvokeAccess: NativeClassAccess {
+    /// Capability boundary: Java method invocation and linkage.
+
+
+    /// Invoke a method by class name, method name, descriptor, and arguments.
+    fn invoke(
         &mut self,
         class_name: &str,
         method_name: &str,
         descriptor: &str,
-        java_args: &[Value],
-        _stream_handle: Option<u64>,
-    ) -> Option<u64> {
-        self.gpu_dispatch_method(class_name, method_name, descriptor, java_args)
+        args: &[Value],
+    ) -> MethodCallResult;
+
+    /// Invoke a method on an ALREADY-RESOLVED declaring class, bypassing
+    /// name-based class resolution entirely.
+    ///
+    /// `Method.invoke()` (reflection) on a static method already has an
+    /// unambiguous declaring `ClassId` in hand (from the `Method` object's
+    /// own `clazz` mirror) — it must not re-resolve the class by NAME, which
+    /// goes through the loader-blind global lookup (`load_class`/
+    /// `get_loaded_class_id`). That lookup deliberately returns "not found"
+    /// (not a guess) whenever 2+ *different* user-defined loaders each
+    /// register their own distinct class under the identical simple name —
+    /// an intentional, documented anti-ambiguity guard (see
+    /// `ClassManager::get_loaded_class_id`), but it means ANY name-based
+    /// re-resolution after the fact is unsound the moment a second same-named
+    /// class from a different loader exists anywhere in the process — a
+    /// completely ordinary pattern for repeatedly-invoked test/codegen
+    /// harnesses that mint a fresh ClassLoader + identically-named generated
+    /// class each time (e.g. Spring's `TestCompiler`/
+    /// `@CompileWithForkedClassLoader`, which produced the exact
+    /// `GroupsMetadataValueDelegateTests` "class file error: class not
+    /// found" VM abort this fixes). Default implementation falls back to the
+    /// name-based [`Self::invoke`] for callers/mocks that have no ClassId
+    /// fast path; the real VM overrides this to skip re-resolution.
+    fn invoke_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let _ = class_id;
+        self.invoke(class_name, method_name, descriptor, args)
     }
 
-    /// Phase 6 #4 — query the real GPU submission registry for the
-    /// future at `handle`. Returns:
-    ///   * `Some(0)` — Running
-    ///   * `Some(1)` — Completed
-    ///   * `Some(2)` — Failed
-    ///   * `None`    — the handle is not in the real registry
-    ///                 (caller should fall back to the synthetic
-    ///                 future state in native-builtins).
-    /// Default impl returns None (no GPU offload).
-    fn gpu_future_status(&self, _handle: u64) -> Option<i32> {
-        None
-    }
 
-    /// 2026-07-11 — take the real GPU submission's completed result for
-    /// `handle`, without blocking. This is the read half `gpu_future_status`
-    /// was missing: `gpu_future_status` (now backed by
-    /// `runtime::offload::poll_submission_status`) tells a caller *that*
-    /// a submission finished; this method hands back *what it produced*.
-    ///
-    /// Returns:
-    ///   * `Some(GpuFutureResult::Scalar*)` — the submission is complete
-    ///     and its kernel returned a scalar (`)I`/`)J`/`)F`/`)D`).
-    ///   * `Some(GpuFutureResult::Void)` — the submission is complete and
-    ///     either the kernel had a void return, or it wrote its result
-    ///     into a caller-owned primitive array rather than the future's
-    ///     result slot (array results are delivered via writeback into
-    ///     the caller's own arrays, not through the future — see
-    ///     [`GpuFutureResult`]'s doc comment).
-    ///   * `None` — the handle is not in the real registry, the
-    ///     submission is still `Running`, or it failed. This method
-    ///     never blocks and never finalizes-and-waits on the caller's
-    ///     behalf beyond what an already-observed completion allows: a
-    ///     caller that hasn't first seen `gpu_future_status`/
-    ///     `futureIsDone` report completion should treat `None` here as
-    ///     "not ready yet" and fall back to the blocking
-    ///     `gpu_future_synchronize` path, not as a permanent failure.
-    ///
-    /// Default impl returns `None` (no GPU offload).
-    fn gpu_future_take_result(&self, _handle: u64) -> Option<GpuFutureResult> {
-        None
-    }
+    // -- LinkResolver wiring for Java-side reflection natives -----------
+    //
+    // Round 9 audit fix (HIGH #7): Java-side reflection
+    // (`Class.getDeclaredMethod`, `Class.getMethod`,
+    // `Class.getDeclaredField`, `Class.getField`) re-walks the entire
+    // metadata + hierarchy on every probe. Spring / Hibernate /
+    // ByteBuddy run thousands of identical `(class_id, name, desc)`
+    // probes during cold start. Round-8 wired JNI's `GetMethodID` /
+    // `GetFieldID` into the per-VM `LinkResolver`; these helpers
+    // extend the same cache to the Java-side natives.
+    //
+    // The trait methods are intentionally narrow: probe + insert.
+    // The native code keeps owning the actual hierarchy walk (it has
+    // synthetic-method awareness, ByteBuddy reentrancy guards, and
+    // shim short-circuits that the LinkResolver layer doesn't model).
+    // The default implementations are no-ops so the existing
+    // `MockNativeContext` and other test contexts compile unchanged
+    // and behave as if the cache is permanently empty (correct but
+    // slow — no caching).
+    //
+    // The `index_or_slot` payload is overloaded:
+    //   * for **method** lookups it is the position within the
+    //     declaring class's `methods` vec (matches the JNI shape);
+    //   * for **field** lookups it is the absolute heap slot index
+    //     (matches `LinkResolver`'s `absolute_index`).
+    // The boolean is `is_static` (only meaningful for fields; ignored
+    // for methods).
 
-    /// Phase 6 #4 — block until the real GPU submission at `handle`
-    /// completes (via its recorded event). Returns:
-    ///   * `Some(Ok(()))`    — completed
-    ///   * `Some(Err(msg))`  — submission failed; `msg` carries the reason
-    ///   * `None`            — handle not in the real registry
-    /// Default impl returns None.
-    fn gpu_future_synchronize(&self, _handle: u64) -> Option<Result<(), String>> {
-        None
-    }
-
-    /// Phase 8 #1 — evict the device-side buffer cache entry for
-    /// the given `GpuArray` handle. Called by
-    /// `Native.releaseArray` so a long-running Java program that
-    /// churns through GpuArrays doesn't accumulate device memory.
-    ///
-    /// Default impl is a no-op (no GPU offload). The VM override
-    /// calls `runtime::offload::device_cache::release(handle)`.
-    fn gpu_release_array_cache(&mut self, _handle: u64) {}
-
-    /// Phase 10 #1 — wipe the explicit-submit input-residency cache.
-    /// Called by `Native.releaseExecutor` so the device buffers
-    /// cached by plain `int[]` / `long[]` / `float[]` / `double[]`
-    /// args to `submitMethod` are freed when the Java
-    /// `GpuExecutor` is closed.
-    ///
-    /// Default impl is a no-op (no GPU offload). The VM override
-    /// calls `runtime::offload::input_cache::clear_all()`.
-    fn gpu_clear_input_cache(&mut self) {}
-
-    /// Phase 9 #1 — materialise the device-side buffer's contents
-    /// into host bytes if (and only if) the cache entry is dirty
-    /// from a prior kernel's writes. Returns
-    /// `Some(little-endian-bytes)` when a download happened (and
-    /// the caller should write them into the resident store
-    /// before reading the Java array), or `None` when the entry
-    /// is unknown or clean (host bytes are already current).
-    ///
-    /// Default impl returns None (no GPU offload). The VM
-    /// override calls
-    /// `runtime::offload::device_cache::download_into_bytes_if_dirty(handle)`.
-    fn gpu_array_download_if_dirty(&self, _handle: u64) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// GPU device enumeration escape hatch.
-    ///
-    /// Returns one entry per attached CUDA device, in ordinal order:
-    /// `(name, compute_major, compute_minor, total_global_mem_bytes)`.
-    ///
-    /// The default impl returns an empty `Vec` — the truthful answer on
-    /// a build without the `gpu-offload` feature, or on a host with no
-    /// CUDA driver. The VM's `NativeContextImpl` overrides this under
-    /// `#[cfg(feature = "gpu-offload")]` to call [`cuda_bridge::probe`].
-    /// Because `probe()` itself returns `Err(NoDriver)` on a driverless
-    /// host (or when `cuda-bridge` was built in stub mode), the override
-    /// likewise yields an empty `Vec` there — `deviceCount()` honestly
-    /// reports `0` rather than pretending a device exists.
-    ///
-    /// `cuda_bridge::probe` currently reports only the primary device
-    /// (ordinal 0); the contract here is general (a `Vec`) so a future
-    /// multi-device probe needs no signature change.
-    fn gpu_device_info(&self) -> Vec<(String, u32, u32, u64)> {
-        Vec::new()
-    }
-
-    /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
-    /// `GpuFunction` lambda's target method.
-    ///
-    /// When the user writes
-    ///
-    /// ```ignore
-    /// executor.submit(() -> Pipeline.vectorAdd(a, b, out));
-    /// ```
-    ///
-    /// the lambda is materialised as a proxy object whose class is
-    /// recorded in `shared.classes.lambda_proxies`. This method looks the
-    /// proxy up and returns
-    /// `Some((target_class, target_method, target_descriptor,
-    ///        captured_values))` so the dispatcher can route through
-    /// `gpu_dispatch_method`.
-    ///
-    /// Returns `None` for any of:
-    ///   * `callable` is not a lambda proxy
-    ///   * the impl method handle is not InvokeStatic (instance
-    ///     methods cannot run on the GPU)
-    ///   * gpu-offload feature is off (default impl)
-    fn gpu_resolve_lambda_target(
+    /// Probe the per-VM `LinkResolver` for a previously-resolved
+    /// reflective method `(class_id, name, descriptor)` triple. Returns
+    /// `Some((declaring_class_id, method_index))` on cache hit,
+    /// `None` on cold miss (caller should walk the hierarchy and call
+    /// [`Self::link_resolver_insert_method`] with the result).
+    fn link_resolver_get_method(
         &self,
-        _callable: ObjectRef,
-    ) -> Option<(String, String, String, Vec<Value>)> {
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+    ) -> Option<(ClassId, u32)> {
         None
     }
+
+    /// Populate the LinkResolver method cache. `index` is the position
+    /// of the resolved method inside `declaring`'s `methods` vec.
+    fn link_resolver_insert_method(
+        &self,
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+        _declaring: ClassId,
+        _index: u32,
+    ) {
+    }
+
+    /// Probe the LinkResolver field cache. Returns
+    /// `Some((declaring_class_id, absolute_index, is_static))` on hit.
+    fn link_resolver_get_field(
+        &self,
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+    ) -> Option<(ClassId, u32, bool)> {
+        None
+    }
+
+    /// Populate the LinkResolver field cache.
+    fn link_resolver_insert_field(
+        &self,
+        _class_id: ClassId,
+        _name: &str,
+        _descriptor: &str,
+        _declaring: ClassId,
+        _absolute_index: u32,
+        _is_static: bool,
+    ) {
+    }
+
+    /// Invoke a virtual method on a receiver, with lambda-proxy awareness.
+    ///
+    /// If the receiver's ClassId is registered as a lambda proxy, this performs
+    /// lambda dispatch (reading captures, dispatching by MethodHandle kind).
+    /// Otherwise, it resolves the receiver's class name and performs normal
+    /// method invocation.
+    ///
+    /// `args` does NOT include the receiver — the implementation prepends it.
+    fn invoke_virtual(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult;
+
+    /// Invoke a virtual method whose declaring class is known by the caller.
+    ///
+    /// Most callers should use [`Self::invoke_virtual`]. Method-handle dispatch
+    /// has one extra piece of information, though: the owner class stored in the
+    /// handle. VM contexts can use that as a recovery target when receiver-based
+    /// dispatch collapses to bare `java/lang/Object` for a non-Object member.
+    /// Mock/test contexts keep the simple virtual behavior by default.
+    fn invoke_virtual_declared(
+        &mut self,
+        _declared_class: &str,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_virtual(receiver, method_name, descriptor, args)
+    }
+
+    /// Invoke a virtual method on `receiver`, skipping the native-override
+    /// check entirely so a registered Rust native for this exact
+    /// (class, method, descriptor) triple is NOT re-entered — dispatch goes
+    /// straight to the receiver's real JDK bytecode.
+    ///
+    /// This exists for natives that must distinguish a genuinely-real object
+    /// from a same-named synthetic one by *instance* state rather than by
+    /// class name (registration is static/global and can't make that call).
+    /// The canonical example is `ThreadPoolExecutor.execute`/`submit`/
+    /// `shutdown`: CratonVM's synthetic `Executors.newSingleThreadExecutor()`
+    /// et al. stamp their 2-field placeholder with the REAL `ThreadPoolExecutor`
+    /// class name, so a real executor (e.g. the internal async worker pool in
+    /// `native-builtins`) and a synthetic one are indistinguishable by class
+    /// name alone. The native override checks `executor_has_real_workers`
+    /// per-instance and calls this method for a real receiver instead of
+    /// recursing back into itself via [`Self::invoke_virtual`] (which would
+    /// hit the same native registration again and loop forever).
+    ///
+    /// Default implementation falls back to [`Self::invoke_virtual`] — safe
+    /// for any context that has no such real/synthetic ambiguity to resolve
+    /// (mocks, tests, other native contexts).
+    fn invoke_virtual_bytecode_only(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_virtual(receiver, method_name, descriptor, args)
+    }
+
+    /// Invoke a method with invokespecial semantics — *exactly* the resolved
+    /// method on `class_name`, with no virtual dispatch and no interface
+    /// retarget to the receiver's concrete class.
+    ///
+    /// This is the dispatch contract behind `MethodHandles.Lookup.findSpecial`
+    /// and the JLS `super.m()` call sequence. Use cases:
+    ///
+    /// - private-to-private calls within the same class
+    /// - default-method super calls: `Lookup.findSpecial(I.class, "m", mt, C.class)`
+    ///   on an `I.super.m()` pattern must invoke `I.m()`, NOT C's overriding
+    ///   `m()` — even though the receiver is a concrete `C`.
+    ///
+    /// `args[0]` MUST be the receiver. Parameters follow.
+    ///
+    /// The default implementation falls back to [`Self::invoke`] for
+    /// implementations that do not need super-call semantics. The `Vm`
+    /// override bypasses the iface/abstract retarget that `invoke_on_class_shared`
+    /// applies, so it is correct for super-call invocation.
+    fn invoke_special(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke(class_name, method_name, descriptor, args)
+    }
+
+    /// [`Self::invoke_special`] for a caller that ALREADY holds the declaring
+    /// class's resolved `ClassId`.
+    ///
+    /// Same rationale as [`Self::invoke_by_class_id`] (see its doc comment for
+    /// the full argument), applied to the invokespecial dispatch contract.
+    /// `invoke_special` resolves `class_name` through the loader-blind global
+    /// lookup, which collapses to ONE copy per binary name - so a caller that
+    /// knows the exact declaring class must not throw that identity away.
+    ///
+    /// The concrete bug this exists for: `Method.invoke` routes a *private* or
+    /// *cross-package package-private* instance method through
+    /// `invoke_special` (both must bypass virtual dispatch - JLS 8.4.8.1).
+    /// The `Method` mirror's own `clazz` slot already names the exact declaring
+    /// class, but the name-based re-resolution picked the APPLICATION-loader
+    /// copy whenever an isolating loader (Spring Boot's
+    /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
+    /// own copy of that class. See docs/internal/fixed-suite-bugs/springboot/
+    /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
+    ///
+    /// Default implementation falls back to the name-based
+    /// [`Self::invoke_special`] for contexts with no ClassId fast path.
+    fn invoke_special_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let _ = class_id;
+        self.invoke_special(class_name, method_name, descriptor, args)
+    }
+
+    /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
+    /// native registered for `(class_name, method_name, descriptor)` and
+    /// must run that class's own real bytecode body directly.
+    ///
+    /// [`Self::invoke_special`] re-finds ANY registered native FIRST (see its
+    /// own contract) -- calling it from inside that same native re-enters it
+    /// (unbounded Rust-stack recursion). This variant skips that check
+    /// entirely and resolves straight to `class_name`'s own bytecode, still
+    /// with true invokespecial semantics: static binding on `class_name`'s
+    /// hierarchy, never virtual dispatch to a receiver's overriding
+    /// subclass. That distinction is the whole point -- the bug this exists
+    /// to fix was a native registered on `ThreadPoolExecutor.shutdown()`,
+    /// reached via `ScheduledThreadPoolExecutor.shutdown()`'s
+    /// `super.shutdown()`, which used `invoke_virtual_bytecode_only` (dynamic
+    /// receiver class) and so re-dispatched straight back into the STPE
+    /// override that called it -- `StackOverflowError` from infinite
+    /// self-recursion.
+    ///
+    /// `args[0]` MUST be the receiver, same contract as [`Self::invoke_special`].
+    ///
+    /// Default implementation falls back to [`Self::invoke_special`] -- safe
+    /// for any context with no such native-reentrancy hazard (mocks, tests).
+
+    fn invoke_special_bytecode_only(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        self.invoke_special(class_name, method_name, descriptor, args)
+    }
+}
+
+pub trait NativeHeapAccess: NativeInvokeAccess {
+    /// Capability boundary: Allocation, roots, object fields, arrays, and strings.
+
 
     /// Create a new object of the given class.
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
@@ -953,70 +1935,8 @@ pub trait NativeContext {
     /// Implementations must preserve normal map mutation semantics.
     fn hashmap_string_node_cache_put(&mut self, _map: ObjectRef, _key: &str, _node: ObjectRef) {}
 
-    /// Invoke a method by class name, method name, descriptor, and arguments.
-    fn invoke(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult;
-
-    /// Invoke a method on an ALREADY-RESOLVED declaring class, bypassing
-    /// name-based class resolution entirely.
-    ///
-    /// `Method.invoke()` (reflection) on a static method already has an
-    /// unambiguous declaring `ClassId` in hand (from the `Method` object's
-    /// own `clazz` mirror) — it must not re-resolve the class by NAME, which
-    /// goes through the loader-blind global lookup (`load_class`/
-    /// `get_loaded_class_id`). That lookup deliberately returns "not found"
-    /// (not a guess) whenever 2+ *different* user-defined loaders each
-    /// register their own distinct class under the identical simple name —
-    /// an intentional, documented anti-ambiguity guard (see
-    /// `ClassManager::get_loaded_class_id`), but it means ANY name-based
-    /// re-resolution after the fact is unsound the moment a second same-named
-    /// class from a different loader exists anywhere in the process — a
-    /// completely ordinary pattern for repeatedly-invoked test/codegen
-    /// harnesses that mint a fresh ClassLoader + identically-named generated
-    /// class each time (e.g. Spring's `TestCompiler`/
-    /// `@CompileWithForkedClassLoader`, which produced the exact
-    /// `GroupsMetadataValueDelegateTests` "class file error: class not
-    /// found" VM abort this fixes). Default implementation falls back to the
-    /// name-based [`Self::invoke`] for callers/mocks that have no ClassId
-    /// fast path; the real VM overrides this to skip re-resolution.
-    fn invoke_by_class_id(
-        &mut self,
-        class_id: ClassId,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        let _ = class_id;
-        self.invoke(class_name, method_name, descriptor, args)
-    }
-
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
-
-    /// ES-FAIL-FAMILY-20260710 hunt: arm the GC's dynamic software
-    /// write-watchpoint (see `cratonvm_gc::heap::set_dynamic_watch`) at a
-    /// raw heap address, so any subsequent write through an instrumented
-    /// heap write primitive that covers this address prints its call site.
-    /// `addr = 0` disarms. Default no-op so mock/test `NativeContext` impls
-    /// don't need to implement it; only the real VM's impl (which has a
-    /// live heap to watch) overrides it.
-    fn dbg_set_watch_cell(&mut self, _addr: usize) {}
-
-    /// Stable identity for the owning VM/heap.
-    ///
-    /// Native side caches that store heap `ObjectRef`s must scope entries to
-    /// this value; Rust tests can create multiple independent `Vm` instances in
-    /// one process, so process-global object caches are otherwise stale across
-    /// VM lifetimes. Mock contexts default to a single synthetic scope.
-    fn vm_identity(&self) -> usize {
-        0
-    }
 
     /// B-J: register a `java.lang.invoke.VarHandle` as a permanent GC root.
     /// VarHandles live in `static final` fields and are used for lock-free CAS;
@@ -1041,85 +1961,6 @@ pub trait NativeContext {
     /// cached ref, matching the mock heaps that never move objects).
     fn read_var_handle_root(&self, _identity_key: i32) -> Option<ObjectRef> {
         None
-    }
-
-    /// Store a value into the test output buffer (for `tempPrint`).
-    fn record_printed_value(&mut self, value: Value);
-
-    /// Get the class name for a ClassId.
-    fn class_name_of_id(&self, class_id: ClassId) -> Option<String>;
-
-    /// Get the class id of a heap object.
-    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId;
-
-    /// VM-accelerated primitive-wrapper recognition. `None` means this context
-    /// does not implement the fast path; `Some(None)` means the object is not a
-    /// wrapper; `Some(Some(value))` is the unboxed primitive.
-    fn fast_unbox_primitive_wrapper(&self, _obj: ObjectRef) -> Option<Option<Value>> {
-        None
-    }
-
-    /// True when the named class is loaded as a synthetic stub (no real
-    /// `.class` bytes). Used to branch native helpers that must mirror JDK
-    /// behaviour without registering natives that would override real JDK
-    /// bytecode once the stub upgrades.
-    fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
-        false
-    }
-
-    /// Whether the current Java execution stack already contains the exact
-    /// instance method on `receiver`.
-    ///
-    /// Native shadows occasionally need to distinguish a native-first virtual
-    /// entry from an `invokespecial` delegation made by real bytecode already
-    /// executing in an override. The default is deliberately conservative for
-    /// lightweight test contexts, which do not own a live Java frame stack.
-    fn is_executing_instance_method(
-        &self,
-        _receiver: ObjectRef,
-        _method_name: &str,
-        _descriptor: &str,
-    ) -> bool {
-        false
-    }
-
-    /// Capture the current Java call stack without retaining it. Used by
-    /// StackWalker and caller-sensitive helpers.
-    fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;
-
-    /// Capture and retain a stack trace for `Throwable.fillInStackTrace`.
-    ///
-    /// The default keeps lightweight/mock contexts source-compatible. The VM
-    /// implementation overrides it so retained frames are owned by the VM,
-    /// rather than by the Java thread that happened to construct the throwable.
-    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
-        self.capture_stack_trace(self.identity_hash_code(throwable))
-    }
-
-    /// Retrieve a previously captured stack trace as an owned snapshot.
-    ///
-    /// An owned value deliberately avoids lending a reference through a
-    /// VM-shared lock while another Java thread may replace or discard a trace.
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>>;
-
-    /// The exact `ClassId` each live frame is currently executing in,
-    /// innermost (most recent call) first.
-    ///
-    /// Unlike `capture_stack_trace`'s `StackTraceEntry`s (which carry only a
-    /// display `class_name: Arc<str>`, for `Throwable`/`StackWalker` output),
-    /// this exposes each frame's precise, already-resolved `ClassId` — no
-    /// re-resolution by name needed. That distinction matters whenever two
-    /// *different* classes share one name (a common shape for custom
-    /// classloaders, e.g. Hibernate bytecode-enhancement's per-test-class
-    /// `EnhancingClassLoader`, or a class reloaded under a fresh loader
-    /// between JUnit tests sharing one process): re-resolving a frame's name
-    /// via `class_id_by_name` collapses to whichever definition the global
-    /// class table associates with that name (typically the first one ever
-    /// registered), which is not necessarily the one actually executing on
-    /// that frame. Used by `latest_user_defined_loader_class` to correctly
-    /// mirror `jdk.internal.misc.VM.latestUserDefinedLoader()`.
-    fn frame_class_ids(&self) -> Vec<ClassId> {
-        Vec::new()
     }
 
     // -- Heap access methods (for native method implementations) --
@@ -1191,44 +2032,6 @@ pub trait NativeContext {
     /// `@CompileWithForkedClassLoader`).
     fn resolve_field_index_by_class_id(&self, class_id: ClassId, field_name: &str)
         -> Option<usize>;
-
-    /// Read `out.len()` bytes of native memory at `addr` into `out`.
-    ///
-    /// `addr` may be either a real OS pointer (e.g. a mapped buffer) OR one of
-    /// the VM's `Unsafe.allocateMemory` arena handles (a synthetic high
-    /// address, base `0x10_0000_0000`, NOT a dereferenceable pointer). NIO
-    /// native dispatchers (`sun/nio/ch/Net.read0`, `SocketDispatcher` …) that
-    /// receive a `DirectByteBuffer.address()` MUST go through this instead of a
-    /// raw `copy_nonoverlapping`, because `Util.getTemporaryDirectBuffer` backs
-    /// its temp buffers with arena handles — dereferencing one raw SIGSEGVs.
-    ///
-    /// The default implementation fails closed. Implementations that can prove
-    /// the address range is valid must override this and perform their own
-    /// pointer/arena validation before copying.
-    fn copy_from_native_memory(&self, _addr: i64, _out: &mut [u8]) -> bool {
-        false
-    }
-
-    /// Write `data` to native memory at `addr`. See [`Self::copy_from_native_memory`]
-    /// for the arena-handle vs raw-pointer distinction.
-    fn copy_to_native_memory(&mut self, _addr: i64, _data: &[u8]) -> bool {
-        false
-    }
-
-    /// Check if a method exists in a class (searches the class hierarchy).
-    /// Returns `true` if the method is found.
-    fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool;
-
-    /// True iff `class_id` ITSELF declares (not merely inherits) a method with
-    /// the given name+descriptor. Unlike [`method_exists`], this does NOT walk
-    /// superclasses — it answers "does this exact class override the method?".
-    /// Used by the `ClassLoader.getResources` native to distinguish a custom
-    /// loader that overrides `findResources` (delegate to it) from one that
-    /// merely inherits the default (fall back to parent-delegated scan).
-    /// Default returns `false` so mock/test contexts compile unchanged.
-    fn class_declares_method(&self, _class_id: ClassId, _name: &str, _descriptor: &str) -> bool {
-        false
-    }
 
     /// Allocate a primitive array (element_type: Boolean=4..Long=11).
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef;
@@ -1585,49 +2388,6 @@ pub trait NativeContext {
     /// Get or create the java.lang.Class mirror for the given ClassId.
     fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef;
 
-    /// Record a printed line (for System.out.println capture in tests).
-    fn record_printed_line(&mut self, text: String);
-
-    /// Get a system stream object (stdout or stderr).
-    fn get_system_stream(&self, name: &str) -> Option<ObjectRef>;
-
-    /// Pin the canonical `System.in` object on the VM so natives and `GETSTATIC`
-    /// agree after `initPhase1` allocates it. Default: no-op.
-    fn cache_system_stdin(&mut self, _stream: ObjectRef) {}
-
-    /// Look up the canonical `java.lang.Module` mirror for a module name
-    /// (`None`/`Some("")` ⇒ the unnamed module). `Class.getModule()` MUST return
-    /// the SAME instance for every class in a module — the JDK compares modules
-    /// by identity (see `Throwable.validateSuppressedExceptionsList`, HIB-CV-29).
-    /// Default: `None` (mock contexts have no persistent store).
-    fn get_cached_module_mirror(&self, _module_name: Option<&str>) -> Option<ObjectRef> {
-        None
-    }
-
-    /// Store the canonical `java.lang.Module` mirror for a module name so that
-    /// subsequent `Class.getModule()` calls return the identical instance.
-    /// The mirror is registered as a permanent GC root. Default: no-op.
-    fn cache_module_mirror(&mut self, _module_name: Option<&str>, _module: ObjectRef) {}
-
-    /// Get a system property by key.
-    fn get_system_property(&self, key: &str) -> Option<String>;
-
-    /// Snapshot every system property as a `(key, value)` list.  Used by
-    /// `System.getProperties()` to materialise a populated Properties
-    /// object when real-JDK's `System.props` static field is null.
-    fn list_system_properties(&self) -> Vec<(String, String)> {
-        Vec::new()
-    }
-
-    /// Set a system property. Returns the old value if any.
-    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String>;
-
-    /// Remove a system property from the global store. Returns the old value if
-    /// any. Default no-op (mock contexts have no live store); the VM overrides it.
-    fn remove_system_property(&mut self, _key: &str) -> Option<String> {
-        None
-    }
-
     /// Allocate an object with the given class_id and number of fields,
     /// without loading a class (for synthetic objects).
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef;
@@ -1648,825 +2408,11 @@ pub trait NativeContext {
         Some(self.alloc_object(class_id, num_fields))
     }
 
-    /// Ensure a class is loaded and initialized. Returns the ClassId.
-    fn ensure_class_initialized(
-        &mut self,
-        name: &str,
-    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed>;
-
-    /// Ensure the exact already-resolved class id is initialized without
-    /// re-resolving its binary name through the global loader map.
-    fn ensure_class_initialized_with_class_id(
-        &mut self,
-        class_id: ClassId,
-    ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-        if let Some(name) = self.class_name_of_id(class_id) {
-            self.ensure_class_initialized(&name)?;
-        }
-        Ok(())
-    }
-
-    /// Register (or look up) a minimal synthetic class with the given name
-    /// and instance-field count, returning its `ClassId`.
-    ///
-    /// Unlike [`ensure_class_initialized`], this never fails: when the real
-    /// `.class` file cannot be loaded it still produces a usable `ClassId`
-    /// whose class declares `num_fields` instance fields. Native allocators
-    /// MUST use this (rather than `ClassId::new(0)`) as the fallback class
-    /// when allocating an object with a non-zero field count — allocating
-    /// with `ClassId::new(0)` (`java/lang/Object`, which declares zero
-    /// fields) produces an "undersized object layout" object that the GC's
-    /// `get_field` bounds guard rejects on every field access.
-    ///
-    /// The default implementation falls back to `ClassId::new(0)` so mocks
-    /// and non-VM contexts still compile; real VM contexts override it.
-    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        let _ = (name, num_fields);
-        ClassId::new(0)
-    }
-
-    /// Register a lambda proxy synthesized from a *reflective*
-    /// `LambdaMetafactory.metafactory` / `altMetafactory` call (as opposed to
-    /// the `invokedynamic` opcode, which is handled inline in the interpreter).
-    ///
-    /// Returns the raw `u32` of a freshly-allocated synthetic proxy `ClassId`
-    /// whose lambda call-site metadata is registered in the VM's
-    /// `lambda_proxies` table — identical in shape to the metadata produced by
-    /// the `invokedynamic` lambda bootstrap, so the interpreter's SAM-dispatch
-    /// path (`try_lambda_dispatch`) handles instances of it without any further
-    /// special-casing. A factory `MethodHandle` (kind `MH_KIND_LAMBDA_FACTORY`)
-    /// later allocates proxy instances of this class once the captured values
-    /// are known.
-    ///
-    /// `impl_ref_kind` is the JVMS `reference_kind` byte (1..=9) of the
-    /// implementation method handle. `capture_types` is one type char per
-    /// captured value (`'L'`, `'I'`, `'J'`, ...), in factory-argument order.
-    ///
-    /// Returns `0` when the host cannot register a proxy (e.g. test mocks, or
-    /// the proxy table is full); callers treat `0` as "unsupported" and fall
-    /// back to a non-null no-op `CallSite`.
-    #[allow(clippy::too_many_arguments)]
-    fn register_lambda_proxy(
-        &mut self,
-        functional_interface: &str,
-        sam_method_name: &str,
-        sam_descriptor: &str,
-        impl_class: &str,
-        impl_member: &str,
-        impl_descriptor: &str,
-        impl_ref_kind: u8,
-        instantiated_descriptor: &str,
-        capture_types: &str,
-    ) -> u32 {
-        let _ = (
-            functional_interface,
-            sam_method_name,
-            sam_descriptor,
-            impl_class,
-            impl_member,
-            impl_descriptor,
-            impl_ref_kind,
-            instantiated_descriptor,
-            capture_types,
-        );
-        0
-    }
-
-    /// Check if child_class is a subclass of parent_class.
-    fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
-
-    /// Get the superclass ClassId. Returns None for java/lang/Object.
-    fn superclass_of(&self, class_id: ClassId) -> Option<ClassId>;
-
-    /// Check if a ClassId represents an interface.
-    fn is_interface_class(&self, class_id: ClassId) -> bool;
-
-    /// Get the ClassId for a loaded class by name. Returns None if not loaded.
-    fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
-
-    /// Resolve `name` to a `ClassId`, preferring whichever loaded class is
-    /// registered under the SAME classloader as `near`'s own declaring
-    /// context, falling back to the normal global (bootstrap-first) search
-    /// used by [`Self::class_id_by_name`].
-    ///
-    /// A plain by-name lookup can silently resolve to an unrelated
-    /// same-named class loaded under a DIFFERENT classloader when the JVM
-    /// spec's (loader, name) identity legitimately produces two distinct
-    /// classes with the same name -- e.g. Hibernate ORM's bytecode
-    /// enhancement reloads an `@EmbeddedId` class under its own private
-    /// ByteBuddy classloader. Resolving a field/parameter's declared type
-    /// via plain name search can then find the FIRST-loaded (often stale)
-    /// variant instead of the one the caller's own class actually sees,
-    /// causing a real, correctly-typed value to be rejected as an
-    /// assignability mismatch. Use this instead of `class_id_by_name`
-    /// whenever `name` is a symbolic reference that must match the specific
-    /// class variant visible to a known class (`near`) -- e.g. a
-    /// `Field`/`Method`/`Constructor`'s own declaring class.
-    fn class_id_by_name_near(&self, name: &str, _near: ClassId) -> Option<ClassId> {
-        self.class_id_by_name(name)
-    }
-
-    /// Resolve `name` to a `ClassId`, LOADING it through
-    /// `referencing_class_id`'s own defining classloader if it isn't loaded
-    /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/
-    /// `invokestatic`/...) referencing `name` FROM `referencing_class_id`
-    /// would (JVMS SS5.4.3 initiating-loader semantics).
-    ///
-    /// Unlike [`Self::class_id_by_name_near`]/[`Self::class_id_by_name`] --
-    /// pure lookups that only succeed once `name` has already been
-    /// resolved/indexed under that loader -- this drives the loader's own
-    /// `loadClass`/`defineClass` on a miss, so it also answers correctly the
-    /// very first time a class is needed under a given loader (the gap that
-    /// made two prior lookup-based fix attempts for the H2 `Parser`
-    /// loader-collapse bug regress on a fresh session -- see
-    /// docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md's
-    /// eighth-pass section).
-    ///
-    /// Native overrides that construct or invoke-special a DIFFERENT class
-    /// than their own receiver's declaring class (an app/H2 native bridging
-    /// into the receiver's own package -- e.g. `SessionLocal.prepareLocal`'s
-    /// `new Parser(this)`) MUST use this instead of
-    /// `new_object_initialized`/`invoke_special` with a bare name: those
-    /// collapse to whichever loader defined `name` FIRST process-wide,
-    /// silently constructing/invoking the WRONG loader's copy of the class
-    /// whenever the receiver's own defining loader is a user-defined one
-    /// distinct from the first-loaded (usually Application) copy.
-    ///
-    /// The default implementation ignores `referencing_class_id` and falls
-    /// back to the name-only [`Self::ensure_class_initialized`] -- sufficient
-    /// for test mocks and any context with a single (global) loader
-    /// namespace; the real VM implementation honours per-loader identity.
-    fn class_id_by_name_via_referencing_class(
-        &mut self,
-        _referencing_class_id: ClassId,
-        name: &str,
-    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
-        self.ensure_class_initialized(name)
-    }
-
-    /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
-    /// class id `>= 0x8000_0000`, not in the class store), return the internal
-    /// name of its functional (SAM) interface. Returns `None` for any non-lambda
-    /// class. Used by reflection natives so a lambda's mirror reports a sane
-    /// hierarchy (`getSuperclass()` = Object, `getInterfaces()` = [SAM]) instead
-    /// of null/empty — Gradle's listener type-walk calls
-    /// `concreteClass.getSuperclass().isInterface()` and a null superclass NPEs.
-    fn lambda_functional_interface(&self, _class_id: ClassId) -> Option<String> {
-        None
-    }
-
-    /// For a synthetic lambda-proxy `ClassId`, return the internal name of the
-    /// lambda's *defining* class (the class that owns the implementation method,
-    /// e.g. `Refl6` for a `() -> {}` whose body compiles to `Refl6.lambda$..`).
-    /// Returns `None` for any non-lambda class. Used by the reflection name
-    /// natives (`getName`/`getSimpleName`/`getNestHost`) to synthesize the
-    /// HotSpot-style `<host>$$Lambda/0x<id>` name instead of `unknown_<id>`.
-    fn lambda_proxy_host(&self, _class_id: ClassId) -> Option<String> {
-        None
-    }
-
-    /// For a synthetic lambda-proxy `ClassId`, return `(sam_method_name,
-    /// sam_erased_descriptor, instantiated_descriptor)` from the
-    /// `LambdaMetafactory` bootstrap that created it. `sam_erased_descriptor`
-    /// is the functional interface's own (type-erased) SAM descriptor — the
-    /// key needed to look up that method's generic `Signature` attribute via
-    /// `method_signature`. `instantiated_descriptor` is the call-site-specific,
-    /// concrete-typed descriptor (e.g. `(Lcom/foo/Bar;)V` for a
-    /// `Consumer<Bar>` lambda) — the source of truth for substituting the
-    /// functional interface's type variable(s) with concrete types. Returns
-    /// `None` for any non-lambda class. Used to synthesize a real
-    /// `ParameterizedType` for `Class.getGenericInterfaces()` on a lambda
-    /// proxy instead of falling back to the raw (non-generic) interface
-    /// `Class` — Spring's `GenericTypeResolver` (and similar reflection-based
-    /// generic-argument resolvers) require an actual `ParameterizedType` and
-    /// throw when only a raw `Class` is available.
-    fn lambda_call_site_descriptors(&self, _class_id: ClassId) -> Option<(String, String, String)> {
-        None
-    }
-
-    /// For a synthetic lambda-proxy `ClassId`, return the full lambda
-    /// call-site metadata required to serialize and later reconstruct the
-    /// lambda (see [`LambdaSerialMetadata`]). Returns `None` for any
-    /// non-lambda class. Used by the object-serialization natives to emit a
-    /// `SerializedLambda`-equivalent record instead of attempting to serialize
-    /// the (un-loadable) synthetic `$$Lambda` proxy class by name.
-    fn lambda_proxy_serial_metadata(&self, _class_id: ClassId) -> Option<LambdaSerialMetadata> {
-        None
-    }
-
-    /// Get the ClassLoaderId for a loaded class.
-    /// Returns 0 = Bootstrap, 1 = Extension, 2 = Application, 3+ = UserDefined(id).
-    fn loader_id_of_class(&self, class_id: ClassId) -> i32;
-
-    /// Check if a class is a record (has Record attribute, JEP 395).
-    fn is_record_class(&self, class_id: ClassId) -> bool;
-
-    /// Get the record components (name, descriptor) for a record class.
-    fn record_components(&self, class_id: ClassId) -> Vec<(String, String)>;
-
-    /// Check if a class is sealed (has PermittedSubclasses attribute, JEP 409).
-    fn is_sealed_class(&self, class_id: ClassId) -> bool;
-
-    /// Get the permitted subclass names for a sealed class.
-    fn permitted_subclasses(&self, class_id: ClassId) -> Vec<String>;
-
     /// Get the number of fields (slots) of a heap object.
     fn object_num_fields(&self, obj: ObjectRef) -> usize;
 
-    /// Get the total number of instance fields (including inherited) for a
-    /// loaded class.  Returns 0 if the class isn't loaded.  Used by native
-    /// allocators that otherwise hard-code a synthetic field count — in
-    /// real-JDK mode the hard-coded count often underestimates the real
-    /// layout, and allocating with too few slots causes out-of-bounds
-    /// `get_field` / `set_field` later when bytecode accesses an inherited
-    /// field at `first_field_index + local_offset`.
-    fn class_num_total_fields(&self, class_id: ClassId) -> usize {
-        let _ = class_id;
-        0
-    }
-
-    // -- Threading methods --
-
-    /// Get the current thread's ThreadId (as a u64).
-    fn thread_id(&self) -> u64;
-
-    /// Acquire the monitor (synchronized) on the given object.
-    fn monitor_enter(&mut self, obj: ObjectRef);
-
-    /// GC-safe variant of [`monitor_enter`], for the rare native whose
-    /// contended wait needs to be excused from an in-flight STW barrier
-    /// pause instead of leaving the calling thread counted in its `expected`
-    /// set for the whole wait (see
-    /// `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`).
-    ///
-    /// Deliberately NARROW: `monitor_enter` itself stays on its original,
-    /// non-GC-blocked path for the other ~80 native call sites that use
-    /// it (Semaphore/Phaser/Exchanger/blocking-queue/ConcurrentHashMap/
-    /// ReentrantLock/Condition/etc.) — a from-scratch audit of every one of
-    /// those (2026-07-13) found the overwhelming majority keep reading
-    /// fields off the SAME `obj`/`this` after the call without any
-    /// pin-and-refresh, so blanket-switching `monitor_enter`'s contended
-    /// path to span a completing (possibly moving) GC pause would expose
-    /// all of them to the stale-`ObjectRef`-across-GC bug class this
-    /// codebase has repeatedly hit (see
-    /// `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`)
-    /// — an unaudited-at-scale regression risk far worse than the original
-    /// hang. This method exists so the ONE call site with live-gdb-confirmed
-    /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
-    /// `native_cdl_await_timeout` / `native_cdl_count_down` polling loop,
-    /// contending a shared handshake latch under WildFly's
-    /// `parallel-extension-add`) can opt in individually, and MUST use the
-    /// returned reference for anything after the call — the object may have
-    /// moved if the wait spanned a GC. Default implementation is a no-op
-    /// pass-through to `monitor_enter` (correct for every mock/test context
-    /// in this workspace, none of which move objects mid-wait).
-    fn monitor_enter_gc_safe(&mut self, obj: ObjectRef) -> ObjectRef {
-        self.monitor_enter(obj);
-        obj
-    }
-
-    /// Release the monitor (synchronized) on the given object.
-    fn monitor_exit(&mut self, obj: ObjectRef);
-
-    /// T1.6.7 — `Thread.holdsLock(Object)`. Returns `true` iff the
-    /// current thread currently holds the monitor for `obj`. Default
-    /// implementation returns `false` so non-monitor-aware contexts
-    /// (mocks, stubs) fall back to the spec-permitted "no" answer.
-    fn current_thread_holds_lock(&self, _obj: ObjectRef) -> bool {
-        false
-    }
-
-    /// Perform Object.wait() on the given object's monitor.
-    fn monitor_wait(
-        &mut self,
-        obj: ObjectRef,
-        timeout_ms: Option<u64>,
-    ) -> cratonvm_types::error::MethodCallResult;
-
-    /// Perform Object.notify() on the given object's monitor.
-    fn monitor_notify(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
-
-    /// Perform Object.notifyAll() on the given object's monitor.
-    fn monitor_notify_all(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
-
-    /// Spawn a new OS thread to run Thread.run() on the given Java Thread object.
-    fn thread_start(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
-
-    /// T19_K2 — Register a native-spawned OS thread with the VM's
-    /// `ThreadRegistry`.
-    ///
-    /// Used by event-loop schedulers (Vert.x / Netty / XNIO) that spawn
-    /// their own carrier OS threads via `std::thread::spawn` rather than
-    /// going through `Thread.start0`. Returning the thread ids these
-    /// schedulers create through this entry point ensures:
-    ///
-    /// * the CLI's `wait_for_non_daemon_threads()` waits for them when
-    ///   `daemon == false` (otherwise the VM exits as soon as `main()`
-    ///   returns even though Quarkus / Keycloak's HTTP listeners are
-    ///   still alive),
-    /// * GC root scanning sees their stacks (T1.5.1 path),
-    /// * JVMTI thread-list APIs see them.
-    ///
-    /// Parameters:
-    /// * `name`     — thread label (shown in `ThreadInfo`, panic logs)
-    /// * `daemon`   — `false` for Vert.x / Netty event loops, `true` for
-    ///                truly background schedulers (XNIO IO threads, GC
-    ///                workers)
-    /// * `join_handle_ptr` — opaque `Box<JoinHandle<()>>` raw pointer.
-    ///                The VM takes ownership and arranges for it to be
-    ///                joined when `wait_for_non_daemon_threads()` runs.
-    ///                Pass `0` to register without a join handle (the
-    ///                caller is responsible for ensuring the thread
-    ///                eventually terminates on its own).
-    ///
-    /// Returns the registered `ThreadId.0` (a u64) on success. A value
-    /// of `0` indicates the call was a no-op (mock context or registry
-    /// not available); callers should treat this as "thread spawned but
-    /// not VM-tracked" — the OS thread still runs, it just won't keep
-    /// the process alive.
-    ///
-    /// The default implementation is a no-op so mock contexts and
-    /// any future trait consumers don't need to implement registry
-    /// plumbing. The VM override (`vm/src/vm/vm_exec.rs`) wires it
-    /// into `ThreadRegistry::register_with_daemon` + `set_join_handle`.
-    fn register_native_thread(
-        &mut self,
-        _name: &str,
-        _daemon: bool,
-        _join_handle_ptr: usize,
-    ) -> u64 {
-        0
-    }
-
-    /// Return GC/STW hooks for a thread registered via
-    /// [`Self::register_native_thread`].
-    ///
-    /// The returned object is intentionally independent of `&mut self` so a
-    /// spawned host thread can carry it into its event loop and bracket native
-    /// waits without a full `NativeContext`.
-    fn native_thread_blocker(&self, _thread_id: u64) -> Option<Arc<dyn NativeThreadBlocker>> {
-        None
-    }
-
-    /// T19_K2 — Mark a previously-registered native thread dead.
-    ///
-    /// Called from a native-spawned OS thread's exit path right before
-    /// the OS thread's `JoinHandle` returns. Flips the registry's
-    /// `alive` flag for the given id so `is_alive()` returns false and
-    /// `alive_non_daemon_thread_ids()` no longer reports it. The
-    /// `JoinHandle` is still kept by the registry — `join()` will
-    /// observe the dead flag and return immediately.
-    ///
-    /// Default impl is a no-op.
-    fn unregister_native_thread(&mut self, _thread_id: u64) {}
-
-    /// T19_K2 — Attach a `Box<JoinHandle<()>>` raw pointer to an
-    /// already-registered native thread.
-    ///
-    /// Used by event-loop schedulers that need to know the assigned
-    /// `ThreadId` BEFORE spawning the OS thread (so the spawned closure
-    /// can capture it and use it on exit). The two-phase API is:
-    ///
-    ///   1. Call `register_native_thread(name, daemon, 0)` to get the
-    ///      `ThreadId.0` without an attached handle.
-    ///   2. Spawn the OS thread; capture the id in its closure.
-    ///   3. Call `attach_join_handle_to_native_thread(id, raw_ptr)` to
-    ///      hand the `JoinHandle<()>` over to the registry.
-    ///
-    /// `join_handle_ptr` follows the same ownership protocol as
-    /// `register_native_thread`: a raw `Box<JoinHandle<()>>` pointer
-    /// the VM takes back as `Box::from_raw`.
-    ///
-    /// Returns `true` if the attach succeeded, `false` if `thread_id`
-    /// was unknown (in which case the caller MUST reclaim the
-    /// `Box<JoinHandle<()>>` via `Box::from_raw` or it leaks the OS
-    /// thread).
-    fn attach_join_handle_to_native_thread(
-        &mut self,
-        _thread_id: u64,
-        _join_handle_ptr: usize,
-    ) -> bool {
-        false
-    }
-
-    /// T19_K4 — Attach a `java.lang.Thread` mirror to an
-    /// already-registered native thread.
-    ///
-    /// Used by event-loop schedulers (Vert.x / Netty / XNIO) that
-    /// register their carrier OS thread via
-    /// [`Self::register_native_thread`] but also need a real
-    /// `java.lang.Thread` mirror so:
-    ///
-    ///  * `Thread.currentThread()` resolves to the right object when
-    ///    Java-side code runs on the event-loop carrier (e.g. a
-    ///    Runnable that consults the thread name),
-    ///  * `ThreadRegistry::find_thread_id_by_thread_obj` works
-    ///    cross-thread (so other code that has the mirror handle can
-    ///    locate the `ThreadId`),
-    ///  * the carrier thread shows up in
-    ///    `ThreadRegistry::alive_thread_objects()` (and therefore in
-    ///    `Thread.enumerate()` / JVMTI thread-list listings).
-    ///
-    /// `thread_id` must be a value previously returned by
-    /// [`Self::register_native_thread`] / the two-phase
-    /// [`Self::attach_join_handle_to_native_thread`] flow. The
-    /// `java_thread_obj` should be a freshly-allocated synthetic
-    /// `java.lang.Thread` mirror with `name` set on slot 0 and
-    /// (optionally) `tid` on slot 2 — `register_native_thread`
-    /// already stamped the registry entry, this call just attaches
-    /// the mirror so look-ups by `ObjectRef` succeed.
-    ///
-    /// Returns `true` if the thread id was found and the mirror was
-    /// stored, `false` if the id was unknown. Default impl is a
-    /// no-op so mock contexts don't need to model a heap.
-    fn set_native_thread_java_obj(&mut self, _thread_id: u64, _java_thread_obj: ObjectRef) -> bool {
-        false
-    }
-
-    /// Block until the target thread (identified by Java Thread object) finishes.
-    fn thread_join(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
-
-    /// Check if the target thread (identified by Java Thread object) is alive.
-    fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool;
-
-    /// Coarse run-state of the target thread, derived from the VM thread
-    /// registry (the authoritative liveness source). Returns:
-    ///   * `0` — NEW: the thread was never started (no registry entry).
-    ///   * `1` — RUNNABLE: started and still alive.
-    ///   * `2` — TERMINATED: started and has since finished.
-    ///
-    /// Value `3` represents an alive thread parked in a blocking region
-    /// (`WAITING`) and value `4` an alive thread acquiring a contended
-    /// monitor (`BLOCKED`); the default returns `0`.
-    ///
-    /// Used to back `Thread.getState()` in real-JDK mode, where the JDK
-    /// bytecode reads `holder.threadStatus` — a field the VM does not keep
-    /// updated, so `getState()` would otherwise always report `NEW` (even for
-    /// finished threads), tripping strict thread-leak detectors. The default
-    /// returns `0`.
-    fn thread_run_state(&self, _thread_obj: ObjectRef) -> u8 {
-        0
-    }
-
-    /// The Java call stack of the target thread (identified by its Thread
-    /// object), innermost frame first. For the *current* thread this is the live
-    /// stack; for another thread it is the snapshot published at its last
-    /// blocking deposit point (so for a parked thread it shows where it is
-    /// stuck). Empty if unavailable. Backs cross-thread `Thread.getStackTrace()`
-    /// / `Thread.dumpThreads()`. The default returns empty.
-    fn thread_stack_trace(&self, _thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
-        Vec::new()
-    }
-
-    /// Atomically snapshot the thread state and lock relationships needed by
-    /// `ThreadMXBean`. The default leaves lightweight/mock contexts source
-    /// compatible; production VMs must return GC-safe registry-backed refs.
-    fn thread_jmx_snapshot(&self, _thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
-        None
-    }
-
-    /// Record the current ownership of an `AbstractOwnableSynchronizer`.
-    /// Implementations retain/remap the synchronizer while it is owned so a
-    /// later JMX dump can report `lockedSynchronizers` without heap walking.
-    fn record_jmx_owned_synchronizer(
-        &mut self,
-        _synchronizer: ObjectRef,
-        _owner: Option<ObjectRef>,
-    ) {
-    }
-
-    /// Get the Java Thread object for the current thread.
-    fn current_thread_object(&mut self) -> ObjectRef;
-
-    /// Interrupt the target thread (identified by Java Thread object).
-    fn thread_interrupt(&mut self, thread_obj: ObjectRef);
-
-    /// T1.5.1 — post an asynchronous `Throwable` to the target
-    /// thread (identified by its Java `Thread` object). The target
-    /// will raise the exception at its next safepoint.
-    ///
-    /// Returns `true` if the post succeeded (target found, slot
-    /// written), `false` if the target is not alive or not
-    /// registered. Default impl is a no-op for mock contexts.
-    fn thread_post_async_exception(
-        &mut self,
-        _thread_obj: ObjectRef,
-        _throwable: ObjectRef,
-    ) -> bool {
-        false
-    }
-
-    /// Check and optionally clear the current thread's interrupted status.
-    fn is_interrupted(&self, clear: bool) -> bool;
-
-    /// Check the interrupted status of the thread identified by `thread_obj`
-    /// — which may be a thread *other* than the current one (e.g.
-    /// `ThreadPoolExecutor.interruptIdleWorkers` calls `worker.isInterrupted()`
-    /// from the pool-management thread). Never clears the flag. The default
-    /// impl falls back to the current thread's status for mock contexts that
-    /// don't track per-thread state.
-    fn thread_is_interrupted(&self, _thread_obj: ObjectRef) -> bool {
-        self.is_interrupted(false)
-    }
-
-    // -- Virtual-thread / Loom (JEP 444/491) --
-    //
-    // Default implementations make these no-ops so platform native code (and
-    // test mocks) don't need to implement them. The VM overrides them in
-    // `vm_exec.rs` to drive the carrier-thread semaphore and pin tracking.
-
-    /// Returns `true` if the current thread is a virtual thread.
-    fn is_current_virtual(&self) -> bool {
-        false
-    }
-
-    /// Return the current thread's pin depth (0 = not pinned).
-    fn vt_pin_count(&self) -> u32 {
-        0
-    }
-
-    /// Increment the current thread's pin count with the given reason.
-    /// Called from `monitor_enter` / JNI entry. No-op for platform threads.
-    fn vt_pin(&mut self, _reason: &'static str) {}
-
-    /// Decrement the current thread's pin count.
-    /// No-op for platform threads or when pin_count is already zero.
-    fn vt_unpin(&mut self) {}
-
-    /// Release the carrier-thread permit so another virtual thread can run.
-    /// Called before a blocking syscall (sleep, park, NIO wait) in a VT.
-    /// No-op for platform threads.
-    fn vt_release_carrier(&mut self) {}
-
-    /// Reacquire a carrier-thread permit after a blocking operation completes.
-    /// Must be paired with `vt_release_carrier`. No-op for platform threads.
-    fn vt_acquire_carrier(&mut self) {}
-
-    /// Request a continuation-backed timed park. Returns `true` only for an
-    /// unpinned virtual thread whose interpreter frames can be frozen by the
-    /// VM. The native must then return `ContinuationYield` without blocking.
-    fn vt_park_for(&mut self, _duration: std::time::Duration) -> bool {
-        false
-    }
-
-    /// Register the current unpinned virtual thread as an asynchronous waiter
-    /// on a VM-local stable key. The native must recheck its condition after
-    /// registration and return `ContinuationYield` only while it remains false.
-    fn vt_wait_on_key(&mut self, _key: u64) -> bool {
-        false
-    }
-
-    /// Cancel a waiter registration made by [`Self::vt_wait_on_key`].
-    fn vt_cancel_wait_on_key(&mut self, _key: u64) {}
-
-    /// Wake and resubmit all virtual threads waiting on a stable key.
-    fn vt_wake_waiters(&mut self, _key: u64) {}
-
-    /// Emit a `jdk.VirtualThreadPinned` JFR event for the current thread.
-    /// Called when a pinned virtual thread is about to block its carrier.
-    ///
-    /// Round-4: `reason` is `&'static str` (JEP 491 pin-reason taxonomy:
-    /// "Synchronized", "Native", "Thread.sleep while pinned", ...).
-    fn emit_virtual_thread_pinned_jfr(&mut self, _reason: &'static str) {}
-
-    /// Get the number of alive threads in the VM.
-    fn active_thread_count(&self) -> i32;
-
-    /// Get the Java Thread objects for all alive threads (up to `max` entries).
-    /// Returns the number of thread objects written.
-    fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef>;
-
-    // -- VM stats methods (for JMX) --
-
-    /// Effective available-processor count, honoring container/cgroup CPU
-    /// limits when `-XX:+UseContainerSupport` is active. This backs
-    /// `Runtime.availableProcessors()` and the JMX `OperatingSystemMXBean`.
-    ///
-    /// The default (used by mock/test contexts) returns the host hardware
-    /// thread count; the VM overrides it to prefer the cgroup-derived count
-    /// from `VmConfig::container_effective_processors` when present.
-    fn available_processor_count(&self) -> i32 {
-        std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(1)
-    }
-
-    /// Maximum heap size in bytes, as reported by `Runtime.maxMemory()` and the
-    /// JMX `MemoryMXBean`. The default (mock/test contexts) is the historical
-    /// 256 MiB placeholder; the VM overrides it to return the configured
-    /// `-Xmx` (which is itself container-aware once sized from a cgroup limit).
-    fn max_heap_bytes(&self) -> i64 {
-        256 * 1024 * 1024
-    }
-
-    /// Initial heap size in bytes, as reported by the JMX `MemoryMXBean`'s
-    /// heap `MemoryUsage.getInit()`. The default (mock/test contexts) mirrors
-    /// `max_heap_bytes`'s historical placeholder; the VM overrides it to
-    /// return the configured `-Xms` (`VmConfig::initial_heap_size`).
-    fn initial_heap_bytes(&self) -> i64 {
-        16 * 1024 * 1024
-    }
-
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
-
-    /// Returns the number of classes currently loaded in the VM.
-    fn loaded_class_count(&self) -> usize;
-
-    /// Cumulative classes reclaimed by class-loader unloading.
-    fn unloaded_class_count(&self) -> u64 {
-        0
-    }
-
-    /// Returns the cumulative number of GC collections that have occurred.
-    fn gc_collection_count(&self) -> u64;
-
-    /// Force a garbage collection cycle and run pending finalizers.
-    /// Used by `System.gc()` / `Runtime.gc()`.
-    fn force_gc(&mut self);
-
-    /// T19.H1 — mark the start of a *blocking region* inside a native
-    /// method (a spin/poll loop or an OS wait that may run for a long
-    /// time, e.g. `ReferenceQueue.remove`, a selector `select`, a socket
-    /// `accept`).
-    ///
-    /// While inside a blocking region the calling thread is treated as
-    /// GC-safe: its frame roots are published to the registry snapshot
-    /// and a concurrent stop-the-world collector will NOT wait for it to
-    /// reach an interpreter safepoint. Every `begin_blocking_region` MUST
-    /// be paired with exactly one `end_blocking_region`.
-    ///
-    /// The default impl is a no-op so out-of-tree `NativeContext`
-    /// implementors (tests) need not change.
-    fn begin_blocking_region(&mut self) {}
-
-    /// Same GC-safety contract as `begin_blocking_region`, for a region with
-    /// a bounded/known wait duration (`Thread.sleep`, a timed `Object.wait`,
-    /// `LockSupport.parkNanos`, …). `Thread.getState()` reports
-    /// `TIMED_WAITING` for a thread inside one of these vs. plain `WAITING`
-    /// for an unbounded `begin_blocking_region` — real JDK's
-    /// `Thread.State` makes exactly this distinction, and callers such as
-    /// Spring Boot's `SpringApplicationShutdownHookTests` assert on it via
-    /// `Awaitility.await().until(thread::getState, State.TIMED_WAITING::equals)`.
-    ///
-    /// The default impl just delegates to `begin_blocking_region` (reported
-    /// as plain `WAITING`) so out-of-tree `NativeContext` implementors need
-    /// not change; must still be paired with exactly one `end_blocking_region`.
-    fn begin_timed_blocking_region(&mut self) {
-        self.begin_blocking_region();
-    }
-
-    /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
-    /// Re-syncs the thread with any GC that ran while it was blocked.
-    fn end_blocking_region(&mut self) {}
-
-    /// End a blocking region AND re-sync caller-held raw `Value` refs.
-    ///
-    /// A native poll loop captures its arguments as raw `Value`s before
-    /// entering the region; a moving GC that completes while the thread is
-    /// blocked relocates the referenced objects, and the thread-side
-    /// re-sync (`end_blocking_region`) only repairs the *frames* — the
-    /// native-local copies would keep their stale pre-GC addresses (the
-    /// `ReferenceQueue.remove` stale-receiver writer). Pass those locals
-    /// here so they are rewritten through the same accumulated GC fixup.
-    ///
-    /// The default impl ends the region without touching `refs` (matches
-    /// VMs/tests whose collector never moves objects under natives).
-    fn end_blocking_region_refs(&mut self, refs: &mut [Value]) {
-        let _ = &refs;
-        self.end_blocking_region();
-    }
-
-    // -- Reflection metadata methods --
-
-    /// Get metadata for all fields declared in this class (not inherited).
-    fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata>;
-
-    /// Get metadata for all methods declared in this class (not inherited).
-    fn declared_methods(&self, class_id: ClassId) -> Vec<MethodMetadata>;
-
-    /// Get the ClassIds of directly implemented/extended interfaces.
-    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId>;
-
-    // -- LinkResolver wiring for Java-side reflection natives -----------
-    //
-    // Round 9 audit fix (HIGH #7): Java-side reflection
-    // (`Class.getDeclaredMethod`, `Class.getMethod`,
-    // `Class.getDeclaredField`, `Class.getField`) re-walks the entire
-    // metadata + hierarchy on every probe. Spring / Hibernate /
-    // ByteBuddy run thousands of identical `(class_id, name, desc)`
-    // probes during cold start. Round-8 wired JNI's `GetMethodID` /
-    // `GetFieldID` into the per-VM `LinkResolver`; these helpers
-    // extend the same cache to the Java-side natives.
-    //
-    // The trait methods are intentionally narrow: probe + insert.
-    // The native code keeps owning the actual hierarchy walk (it has
-    // synthetic-method awareness, ByteBuddy reentrancy guards, and
-    // shim short-circuits that the LinkResolver layer doesn't model).
-    // The default implementations are no-ops so the existing
-    // `MockNativeContext` and other test contexts compile unchanged
-    // and behave as if the cache is permanently empty (correct but
-    // slow — no caching).
-    //
-    // The `index_or_slot` payload is overloaded:
-    //   * for **method** lookups it is the position within the
-    //     declaring class's `methods` vec (matches the JNI shape);
-    //   * for **field** lookups it is the absolute heap slot index
-    //     (matches `LinkResolver`'s `absolute_index`).
-    // The boolean is `is_static` (only meaningful for fields; ignored
-    // for methods).
-
-    /// Probe the per-VM `LinkResolver` for a previously-resolved
-    /// reflective method `(class_id, name, descriptor)` triple. Returns
-    /// `Some((declaring_class_id, method_index))` on cache hit,
-    /// `None` on cold miss (caller should walk the hierarchy and call
-    /// [`Self::link_resolver_insert_method`] with the result).
-    fn link_resolver_get_method(
-        &self,
-        _class_id: ClassId,
-        _name: &str,
-        _descriptor: &str,
-    ) -> Option<(ClassId, u32)> {
-        None
-    }
-
-    /// Populate the LinkResolver method cache. `index` is the position
-    /// of the resolved method inside `declaring`'s `methods` vec.
-    fn link_resolver_insert_method(
-        &self,
-        _class_id: ClassId,
-        _name: &str,
-        _descriptor: &str,
-        _declaring: ClassId,
-        _index: u32,
-    ) {
-    }
-
-    /// Probe the LinkResolver field cache. Returns
-    /// `Some((declaring_class_id, absolute_index, is_static))` on hit.
-    fn link_resolver_get_field(
-        &self,
-        _class_id: ClassId,
-        _name: &str,
-        _descriptor: &str,
-    ) -> Option<(ClassId, u32, bool)> {
-        None
-    }
-
-    /// Populate the LinkResolver field cache.
-    fn link_resolver_insert_field(
-        &self,
-        _class_id: ClassId,
-        _name: &str,
-        _descriptor: &str,
-        _declaring: ClassId,
-        _absolute_index: u32,
-        _is_static: bool,
-    ) {
-    }
-
-    /// Get the raw access_flags bits for a class.
-    fn class_access_flags(&self, class_id: ClassId) -> u16;
-
-    /// Read a static field value by class and field index.
-    ///
-    /// `field_index` must be in range for `class_id`'s static field block
-    /// (typically resolved via [`static_field_index_by_name`](Self::static_field_index_by_name)).
-    /// The trait does NOT validate it (M4a): the implementation MUST
-    /// bounds-check and MUST NOT read out of range — fail safe on a bad index.
-    fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value;
-
-    /// Write a static field value by class and field index.
-    ///
-    /// `field_index` must be in range for `class_id`'s static field block
-    /// (typically resolved via [`static_field_index_by_name`](Self::static_field_index_by_name)).
-    /// The trait does NOT validate it (M4a): the implementation MUST
-    /// bounds-check and MUST NOT write out of range — fail safe on a bad index.
-    fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value);
-
-    /// Write a static field by class name and field name.
-    /// Resolves the class and finds the static field index by name.
-    /// No-op if the class or field cannot be found.
-    fn set_static_field_by_name(&mut self, class_name: &str, field_name: &str, value: Value) {
-        if let Some(class_id) = self.class_id_by_name(class_name) {
-            if let Some(idx) = self.static_field_index_by_name(class_id, field_name) {
-                self.set_static_field(class_id, idx, value);
-            }
-        }
-    }
-
-    /// Find the static field index for a field by name.  Returns `None` if the
-    /// class doesn't have a static field with that name.
-    fn static_field_index_by_name(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
-        let _ = (class_id, field_name);
-        None
-    }
-
-    /// Get or create a Class mirror for a primitive type (e.g. "int", "boolean").
-    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef;
-
-    /// Get the file descriptor table for I/O operations.
-    fn fd_table(&self) -> &crate::fd_table::FileDescriptorTable;
 
     // -- ObjectStreamClass descriptor cache (WP0.2) --
     //
@@ -2634,6 +2580,315 @@ pub trait NativeContext {
         }
     }
 
+    // -- Object allocation without constructor --
+
+    /// Allocate an uninitialized object instance (for Unsafe.allocateInstance).
+    /// Returns None if the class cannot be loaded.
+    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef>;
+
+    /// Register a discovered weak/soft/phantom reference with the GC's ReferenceProcessor.
+    /// `ref_type`: 0=Weak, 1=Soft, 2=Phantom
+    /// `reference_obj`: the Reference object itself
+    /// `referent`: the referred-to object
+    /// `queue`: optional ReferenceQueue object
+    fn discover_reference(
+        &mut self,
+        ref_type: u8,
+        reference_obj: ObjectRef,
+        referent: ObjectRef,
+        queue: Option<ObjectRef>,
+    );
+
+    /// Notify the GC's reference processor that a `SoftReference.get()` just
+    /// observed its referent, refreshing the LRU timestamp used by
+    /// soft-reference clearing heuristics on the next major GC.
+    ///
+    /// Round-5 fix (HIGH): without this hook, the LRU index sees
+    /// `last_access_time_ms == 0` forever and every SoftReference looks
+    /// infinitely stale — clearing on the first low-memory cycle and
+    /// defeating soft-ref-backed caches. The VM overrides this with a
+    /// call into `ReferenceProcessor::touch_soft_reference`. The default
+    /// no-op keeps mock/test contexts compiling.
+    fn touch_soft_reference(&mut self, _reference_obj: ObjectRef) {}
+
+    /// INT-8: GC keep-alive for a referent a `Reference.get()` just handed to
+    /// the mutator — the HotSpot `G1ReferenceGet` intrinsic barrier
+    /// equivalent. While a G1 concurrent mark cycle is active, the marker
+    /// deliberately does NOT trace through referent slots (referent-slot
+    /// hiding); a mutator that reads a referent and stores it into an
+    /// already-scanned (black) object would create the only strong path via
+    /// an edge the snapshot cannot see, and the remark-time reference
+    /// processor could then clear the weak ref and free the referent while
+    /// strongly reachable (use-after-free). The VM overrides this with the
+    /// heap's SATB pre-barrier (`VmHeap::write_barrier_pre`), which logs the
+    /// value as a mark root when marking is active and is a no-op otherwise.
+    /// `refersTo` intentionally does NOT call this — its JDK contract is to
+    /// test the referent WITHOUT keeping it alive. The default no-op keeps
+    /// mock/test contexts compiling.
+    fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
+}
+
+pub trait NativeThreadAccess: NativeHeapAccess {
+    /// Capability boundary: Threads, monitors, parking, blocking, and scoped values.
+
+
+    // -- Threading methods --
+
+    /// Get the current thread's ThreadId (as a u64).
+    fn thread_id(&self) -> u64;
+
+    /// Acquire the monitor (synchronized) on the given object.
+    fn monitor_enter(&mut self, obj: ObjectRef);
+
+    /// GC-safe variant of [`monitor_enter`], for the rare native whose
+    /// contended wait needs to be excused from an in-flight STW barrier
+    /// pause instead of leaving the calling thread counted in its `expected`
+    /// set for the whole wait (see
+    /// `docs/internal/fixed-suite-bugs/wildfly-standalone-boot-stw-jit-takeover-hang.md`).
+    ///
+    /// Deliberately NARROW: `monitor_enter` itself stays on its original,
+    /// non-GC-blocked path for the other ~80 native call sites that use
+    /// it (Semaphore/Phaser/Exchanger/blocking-queue/ConcurrentHashMap/
+    /// ReentrantLock/Condition/etc.) — a from-scratch audit of every one of
+    /// those (2026-07-13) found the overwhelming majority keep reading
+    /// fields off the SAME `obj`/`this` after the call without any
+    /// pin-and-refresh, so blanket-switching `monitor_enter`'s contended
+    /// path to span a completing (possibly moving) GC pause would expose
+    /// all of them to the stale-`ObjectRef`-across-GC bug class this
+    /// codebase has repeatedly hit (see
+    /// `docs/internal/wildfly-parallel-boot-stale-objectref-residual.md`)
+    /// — an unaudited-at-scale regression risk far worse than the original
+    /// hang. This method exists so the ONE call site with live-gdb-confirmed
+    /// evidence of the deadlock (`CountDownLatch`'s `native_cdl_await` /
+    /// `native_cdl_await_timeout` / `native_cdl_count_down` polling loop,
+    /// contending a shared handshake latch under WildFly's
+    /// `parallel-extension-add`) can opt in individually, and MUST use the
+    /// returned reference for anything after the call — the object may have
+    /// moved if the wait spanned a GC. Default implementation is a no-op
+    /// pass-through to `monitor_enter` (correct for every mock/test context
+    /// in this workspace, none of which move objects mid-wait).
+    fn monitor_enter_gc_safe(&mut self, obj: ObjectRef) -> ObjectRef {
+        self.monitor_enter(obj);
+        obj
+    }
+
+    /// Release the monitor (synchronized) on the given object.
+    fn monitor_exit(&mut self, obj: ObjectRef);
+
+    /// Perform Object.wait() on the given object's monitor.
+    fn monitor_wait(
+        &mut self,
+        obj: ObjectRef,
+        timeout_ms: Option<u64>,
+    ) -> cratonvm_types::error::MethodCallResult;
+
+    /// Perform Object.notify() on the given object's monitor.
+    fn monitor_notify(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
+
+    /// Perform Object.notifyAll() on the given object's monitor.
+    fn monitor_notify_all(&mut self, obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
+
+    /// Spawn a new OS thread to run Thread.run() on the given Java Thread object.
+    fn thread_start(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
+
+    /// Block until the target thread (identified by Java Thread object) finishes.
+    fn thread_join(&mut self, thread_obj: ObjectRef) -> cratonvm_types::error::MethodCallResult;
+
+    /// Check if the target thread (identified by Java Thread object) is alive.
+    fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool;
+
+    /// Coarse run-state of the target thread, derived from the VM thread
+    /// registry (the authoritative liveness source). Returns:
+    ///   * `0` — NEW: the thread was never started (no registry entry).
+    ///   * `1` — RUNNABLE: started and still alive.
+    ///   * `2` — TERMINATED: started and has since finished.
+    ///
+    /// Value `3` represents an alive thread parked in a blocking region
+    /// (`WAITING`) and value `4` an alive thread acquiring a contended
+    /// monitor (`BLOCKED`); the default returns `0`.
+    ///
+    /// Used to back `Thread.getState()` in real-JDK mode, where the JDK
+    /// bytecode reads `holder.threadStatus` — a field the VM does not keep
+    /// updated, so `getState()` would otherwise always report `NEW` (even for
+    /// finished threads), tripping strict thread-leak detectors. The default
+    /// returns `0`.
+    fn thread_run_state(&self, _thread_obj: ObjectRef) -> u8 {
+        0
+    }
+
+    /// The Java call stack of the target thread (identified by its Thread
+    /// object), innermost frame first. For the *current* thread this is the live
+    /// stack; for another thread it is the snapshot published at its last
+    /// blocking deposit point (so for a parked thread it shows where it is
+    /// stuck). Empty if unavailable. Backs cross-thread `Thread.getStackTrace()`
+    /// / `Thread.dumpThreads()`. The default returns empty.
+    fn thread_stack_trace(&self, _thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+
+    /// Atomically snapshot the thread state and lock relationships needed by
+    /// `ThreadMXBean`. The default leaves lightweight/mock contexts source
+    /// compatible; production VMs must return GC-safe registry-backed refs.
+    fn thread_jmx_snapshot(&self, _thread_obj: ObjectRef) -> Option<ThreadJmxSnapshot> {
+        None
+    }
+
+    /// Record the current ownership of an `AbstractOwnableSynchronizer`.
+    /// Implementations retain/remap the synchronizer while it is owned so a
+    /// later JMX dump can report `lockedSynchronizers` without heap walking.
+    fn record_jmx_owned_synchronizer(
+        &mut self,
+        _synchronizer: ObjectRef,
+        _owner: Option<ObjectRef>,
+    ) {
+    }
+
+    /// Get the Java Thread object for the current thread.
+    fn current_thread_object(&mut self) -> ObjectRef;
+
+    /// Interrupt the target thread (identified by Java Thread object).
+    fn thread_interrupt(&mut self, thread_obj: ObjectRef);
+
+    /// T1.5.1 — post an asynchronous `Throwable` to the target
+    /// thread (identified by its Java `Thread` object). The target
+    /// will raise the exception at its next safepoint.
+    ///
+    /// Returns `true` if the post succeeded (target found, slot
+    /// written), `false` if the target is not alive or not
+    /// registered. Default impl is a no-op for mock contexts.
+    fn thread_post_async_exception(
+        &mut self,
+        _thread_obj: ObjectRef,
+        _throwable: ObjectRef,
+    ) -> bool {
+        false
+    }
+
+    /// Check and optionally clear the current thread's interrupted status.
+    fn is_interrupted(&self, clear: bool) -> bool;
+
+    /// Check the interrupted status of the thread identified by `thread_obj`
+    /// — which may be a thread *other* than the current one (e.g.
+    /// `ThreadPoolExecutor.interruptIdleWorkers` calls `worker.isInterrupted()`
+    /// from the pool-management thread). Never clears the flag. The default
+    /// impl falls back to the current thread's status for mock contexts that
+    /// don't track per-thread state.
+    fn thread_is_interrupted(&self, _thread_obj: ObjectRef) -> bool {
+        self.is_interrupted(false)
+    }
+
+    // -- Virtual-thread / Loom (JEP 444/491) --
+    //
+    // Default implementations make these no-ops so platform native code (and
+    // test mocks) don't need to implement them. The VM overrides them in
+    // `vm_exec.rs` to drive the carrier-thread semaphore and pin tracking.
+
+    /// Returns `true` if the current thread is a virtual thread.
+    fn is_current_virtual(&self) -> bool {
+        false
+    }
+
+    /// Return the current thread's pin depth (0 = not pinned).
+    fn vt_pin_count(&self) -> u32 {
+        0
+    }
+
+    /// Increment the current thread's pin count with the given reason.
+    /// Called from `monitor_enter` / JNI entry. No-op for platform threads.
+    fn vt_pin(&mut self, _reason: &'static str) {}
+
+    /// Decrement the current thread's pin count.
+    /// No-op for platform threads or when pin_count is already zero.
+    fn vt_unpin(&mut self) {}
+
+    /// Release the carrier-thread permit so another virtual thread can run.
+    /// Called before a blocking syscall (sleep, park, NIO wait) in a VT.
+    /// No-op for platform threads.
+    fn vt_release_carrier(&mut self) {}
+
+    /// Reacquire a carrier-thread permit after a blocking operation completes.
+    /// Must be paired with `vt_release_carrier`. No-op for platform threads.
+    fn vt_acquire_carrier(&mut self) {}
+
+    /// Request a continuation-backed timed park. Returns `true` only for an
+    /// unpinned virtual thread whose interpreter frames can be frozen by the
+    /// VM. The native must then return `ContinuationYield` without blocking.
+    fn vt_park_for(&mut self, _duration: std::time::Duration) -> bool {
+        false
+    }
+
+    /// Register the current unpinned virtual thread as an asynchronous waiter
+    /// on a VM-local stable key. The native must recheck its condition after
+    /// registration and return `ContinuationYield` only while it remains false.
+    fn vt_wait_on_key(&mut self, _key: u64) -> bool {
+        false
+    }
+
+    /// Cancel a waiter registration made by [`Self::vt_wait_on_key`].
+    fn vt_cancel_wait_on_key(&mut self, _key: u64) {}
+
+    /// Wake and resubmit all virtual threads waiting on a stable key.
+    fn vt_wake_waiters(&mut self, _key: u64) {}
+
+    /// Get the number of alive threads in the VM.
+    fn active_thread_count(&self) -> i32;
+
+    /// Get the Java Thread objects for all alive threads (up to `max` entries).
+    /// Returns the number of thread objects written.
+    fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef>;
+
+    /// T19.H1 — mark the start of a *blocking region* inside a native
+    /// method (a spin/poll loop or an OS wait that may run for a long
+    /// time, e.g. `ReferenceQueue.remove`, a selector `select`, a socket
+    /// `accept`).
+    ///
+    /// While inside a blocking region the calling thread is treated as
+    /// GC-safe: its frame roots are published to the registry snapshot
+    /// and a concurrent stop-the-world collector will NOT wait for it to
+    /// reach an interpreter safepoint. Every `begin_blocking_region` MUST
+    /// be paired with exactly one `end_blocking_region`.
+    ///
+    /// The default impl is a no-op so out-of-tree `NativeContext`
+    /// implementors (tests) need not change.
+    fn begin_blocking_region(&mut self) {}
+
+    /// Same GC-safety contract as `begin_blocking_region`, for a region with
+    /// a bounded/known wait duration (`Thread.sleep`, a timed `Object.wait`,
+    /// `LockSupport.parkNanos`, …). `Thread.getState()` reports
+    /// `TIMED_WAITING` for a thread inside one of these vs. plain `WAITING`
+    /// for an unbounded `begin_blocking_region` — real JDK's
+    /// `Thread.State` makes exactly this distinction, and callers such as
+    /// Spring Boot's `SpringApplicationShutdownHookTests` assert on it via
+    /// `Awaitility.await().until(thread::getState, State.TIMED_WAITING::equals)`.
+    ///
+    /// The default impl just delegates to `begin_blocking_region` (reported
+    /// as plain `WAITING`) so out-of-tree `NativeContext` implementors need
+    /// not change; must still be paired with exactly one `end_blocking_region`.
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region();
+    }
+
+    /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
+    /// Re-syncs the thread with any GC that ran while it was blocked.
+    fn end_blocking_region(&mut self) {}
+
+    /// End a blocking region AND re-sync caller-held raw `Value` refs.
+    ///
+    /// A native poll loop captures its arguments as raw `Value`s before
+    /// entering the region; a moving GC that completes while the thread is
+    /// blocked relocates the referenced objects, and the thread-side
+    /// re-sync (`end_blocking_region`) only repairs the *frames* — the
+    /// native-local copies would keep their stale pre-GC addresses (the
+    /// `ReferenceQueue.remove` stale-receiver writer). Pass those locals
+    /// here so they are rewritten through the same accumulated GC fixup.
+    ///
+    /// The default impl ends the region without touching `refs` (matches
+    /// VMs/tests whose collector never moves objects under natives).
+    fn end_blocking_region_refs(&mut self, refs: &mut [Value]) {
+        let _ = &refs;
+        self.end_blocking_region();
+    }
+
     // -- Park/Unpark (LockSupport) --
 
     /// Park the current thread (block until unparked or timeout).
@@ -2641,334 +2896,6 @@ pub trait NativeContext {
 
     /// Unpark a thread identified by its Java Thread object.
     fn unpark(&self, thread_obj: ObjectRef);
-
-    // -- Object allocation without constructor --
-
-    /// Allocate an uninitialized object instance (for Unsafe.allocateInstance).
-    /// Returns None if the class cannot be loaded.
-    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef>;
-
-    // -- Annotation support --
-
-    /// Get runtime-visible annotation type descriptors for a class.
-    /// Returns a list of (type_descriptor, element_value_pairs) tuples.
-    fn class_annotations(&self, class_id: ClassId) -> Vec<AnnotationData>;
-
-    /// Get runtime-visible annotation type descriptors for a method.
-    /// `method_name` and `method_desc` identify the method within the class.
-    fn method_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<AnnotationData>;
-
-    /// Get runtime-visible annotation type descriptors for a field.
-    /// `field_name` identifies the field within the class.
-    fn field_annotations(&self, class_id: ClassId, field_name: &str) -> Vec<AnnotationData>;
-
-    /// Get parameter annotations for a method.
-    /// Returns a Vec of Vec<AnnotationData>, one per parameter.
-    fn method_parameter_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<Vec<AnnotationData>>;
-
-    /// Get the runtime-visible TYPE_USE annotations that target a method's
-    /// return type (JVMS 4.7.20 `target_type` 0x14, METHOD_RETURN) with an
-    /// empty `type_path` (i.e. annotations placed directly on the top-level
-    /// return type rather than a nested array/type-argument component).
-    ///
-    /// Backs `Method.getAnnotatedReturnType().getDeclaredAnnotations()` so
-    /// JSpecify-style `@Nullable`/`@NonNull` (which are TYPE_USE-only and thus
-    /// live in `RuntimeVisibleTypeAnnotations`, not `RuntimeVisibleAnnotations`)
-    /// are surfaced to reflection. Default impl returns an empty `Vec` so mock
-    /// `NativeContext` implementations don't need to plumb the attribute store.
-    fn method_return_type_annotations(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-
-    /// Get the runtime-visible TYPE_USE annotations that target a method return
-    /// type's TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type`
-    /// 0x14, METHOD_RETURN, with a `type_path` made entirely of TYPE_ARGUMENT
-    /// entries) -- e.g. `List<@NotBlank String> getNames()`, or nested generics
-    /// like `ValueExtractor<Wrapper<@Foo ?>>`.
-    ///
-    /// The outer `Vec` is indexed by the top-level `type_argument_index`
-    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
-    /// next nesting level. Default impl returns an empty `Vec`.
-    fn method_return_type_argument_annotations(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Vec<TypeArgAnnotations> {
-        Vec::new()
-    }
-
-    /// Get the runtime-visible TYPE_USE annotations that target a method's
-    /// formal parameters (JVMS 4.7.20 `target_type` 0x16,
-    /// METHOD_FORMAL_PARAMETER) with an empty `type_path`. The outer `Vec` is
-    /// indexed by `formal_parameter_index`; entries with no annotations are
-    /// empty inner `Vec`s.
-    ///
-    /// Backs `Parameter.getAnnotatedType().getDeclaredAnnotations()`. Default
-    /// impl returns an empty `Vec`.
-    fn method_parameter_type_annotations(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Vec<Vec<AnnotationData>> {
-        Vec::new()
-    }
-
-    /// Get the runtime-visible TYPE_USE annotations that target a field's type
-    /// (JVMS 4.7.20 `target_type` 0x13, FIELD) with an empty `type_path`.
-    /// Backs `Field.getAnnotatedType().getDeclaredAnnotations()`. Default impl
-    /// returns an empty `Vec`.
-    fn field_type_annotations(&self, _class_id: ClassId, _field_name: &str) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-
-    /// Get the runtime-visible TYPE_USE annotations that target a field type's
-    /// TYPE ARGUMENTS, at any nesting depth (JVMS 4.7.20 `target_type` 0x13,
-    /// FIELD, with a `type_path` made entirely of TYPE_ARGUMENT entries) --
-    /// e.g. `List<@NotBlank String> names`.
-    ///
-    /// The outer `Vec` is indexed by the top-level `type_argument_index`
-    /// (0-based, per JVMS 4.7.20.2); each entry's own `children` carries the
-    /// next nesting level. Default impl returns an empty `Vec`.
-    fn field_type_argument_annotations(
-        &self,
-        _class_id: ClassId,
-        _field_name: &str,
-    ) -> Vec<TypeArgAnnotations> {
-        Vec::new()
-    }
-
-    /// Get the runtime-visible TYPE_USE annotations that target a method
-    /// formal parameter's type ARGUMENTS, at any nesting depth (JVMS 4.7.20
-    /// `target_type` 0x16, METHOD_FORMAL_PARAMETER, with a `type_path` made
-    /// entirely of TYPE_ARGUMENT entries) -- e.g. the `@Valid` in
-    /// `List<@Valid Person> persons`, which annotates the type argument
-    /// `Person`, not the top-level `List` parameter type.
-    ///
-    /// The outer `Vec` is indexed by `formal_parameter_index`; the inner
-    /// `Vec` is indexed by the top-level `type_argument_index` (0-based, per
-    /// JVMS 4.7.20.2), and each entry's own `children` carries the next
-    /// nesting level. Backs
-    /// `((AnnotatedParameterizedType) method.getAnnotatedParameterTypes()[i])
-    /// .getAnnotatedActualTypeArguments()[j].getDeclaredAnnotations()`, which
-    /// Spring's `HandlerMethod.MethodValidationInitializer
-    /// .getContainerElementAnnotations` walks to decide whether e.g.
-    /// `addPeople(List<@Valid Person> persons)` needs method validation.
-    /// Default impl returns an empty `Vec`.
-    fn method_parameter_type_argument_annotations(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Vec<Vec<TypeArgAnnotations>> {
-        Vec::new()
-    }
-
-    /// Get the generic Signature attribute for a class (if present).
-    fn class_signature(&self, class_id: ClassId) -> Option<String>;
-
-    /// Get the generic Signature attribute for a method (if present).
-    fn method_signature(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Option<String>;
-
-    /// Get the generic Signature attribute for a field (if present).
-    fn field_signature(&self, class_id: ClassId, field_name: &str) -> Option<String>;
-
-    /// WP2.1 — Get the parsed `MethodParameters` attribute (JVMS 4.7.24)
-    /// for a method. Each entry is `(name, access_flags)`. The name is the
-    /// resolved Utf8 from the constant pool, or empty string if
-    /// `name_index == 0` (synthetic / unnamed parameter).
-    ///
-    /// Returns an empty `Vec` if the method has no `MethodParameters`
-    /// attribute (the common case for code not compiled with `-parameters`),
-    /// or if the class / method cannot be located. Callers should fall
-    /// back to synthesizing `arg0`, `arg1`, … names in that case.
-    ///
-    /// Default implementation returns an empty `Vec` so that mock
-    /// `NativeContext` implementations don't need to plumb through
-    /// the class-file attribute store.
-    fn method_parameters(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Vec<(String, u16)> {
-        Vec::new()
-    }
-
-    /// Get annotation default values for annotation type methods.
-    /// Returns the default ElementValue for the given method, if any.
-    fn method_annotation_default(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Option<AnnotationElementValue>;
-
-    /// WP2.1 — Get the list of checked-exception class internal names from
-    /// a method's `Exceptions` attribute (JVMS 4.7.5).
-    ///
-    /// Returns an empty `Vec` if the method has no `Exceptions` attribute
-    /// (no `throws` clause), or if the class / method cannot be located.
-    /// Each entry is a binary internal class name like
-    /// `"java/io/IOException"`.
-    ///
-    /// Default implementation returns an empty `Vec` so that mock
-    /// `NativeContext` implementations don't need to plumb through the
-    /// class-file attribute store.
-    fn method_exceptions(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Vec<String> {
-        Vec::new()
-    }
-
-    /// Invoke a virtual method on a receiver, with lambda-proxy awareness.
-    ///
-    /// If the receiver's ClassId is registered as a lambda proxy, this performs
-    /// lambda dispatch (reading captures, dispatching by MethodHandle kind).
-    /// Otherwise, it resolves the receiver's class name and performs normal
-    /// method invocation.
-    ///
-    /// `args` does NOT include the receiver — the implementation prepends it.
-    fn invoke_virtual(
-        &mut self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult;
-
-    /// Invoke a virtual method whose declaring class is known by the caller.
-    ///
-    /// Most callers should use [`Self::invoke_virtual`]. Method-handle dispatch
-    /// has one extra piece of information, though: the owner class stored in the
-    /// handle. VM contexts can use that as a recovery target when receiver-based
-    /// dispatch collapses to bare `java/lang/Object` for a non-Object member.
-    /// Mock/test contexts keep the simple virtual behavior by default.
-    fn invoke_virtual_declared(
-        &mut self,
-        _declared_class: &str,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        self.invoke_virtual(receiver, method_name, descriptor, args)
-    }
-
-    /// Invoke a virtual method on `receiver`, skipping the native-override
-    /// check entirely so a registered Rust native for this exact
-    /// (class, method, descriptor) triple is NOT re-entered — dispatch goes
-    /// straight to the receiver's real JDK bytecode.
-    ///
-    /// This exists for natives that must distinguish a genuinely-real object
-    /// from a same-named synthetic one by *instance* state rather than by
-    /// class name (registration is static/global and can't make that call).
-    /// The canonical example is `ThreadPoolExecutor.execute`/`submit`/
-    /// `shutdown`: CratonVM's synthetic `Executors.newSingleThreadExecutor()`
-    /// et al. stamp their 2-field placeholder with the REAL `ThreadPoolExecutor`
-    /// class name, so a real executor (e.g. the internal async worker pool in
-    /// `native-builtins`) and a synthetic one are indistinguishable by class
-    /// name alone. The native override checks `executor_has_real_workers`
-    /// per-instance and calls this method for a real receiver instead of
-    /// recursing back into itself via [`Self::invoke_virtual`] (which would
-    /// hit the same native registration again and loop forever).
-    ///
-    /// Default implementation falls back to [`Self::invoke_virtual`] — safe
-    /// for any context that has no such real/synthetic ambiguity to resolve
-    /// (mocks, tests, other native contexts).
-    fn invoke_virtual_bytecode_only(
-        &mut self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        self.invoke_virtual(receiver, method_name, descriptor, args)
-    }
-
-    /// Invoke a method with invokespecial semantics — *exactly* the resolved
-    /// method on `class_name`, with no virtual dispatch and no interface
-    /// retarget to the receiver's concrete class.
-    ///
-    /// This is the dispatch contract behind `MethodHandles.Lookup.findSpecial`
-    /// and the JLS `super.m()` call sequence. Use cases:
-    ///
-    /// - private-to-private calls within the same class
-    /// - default-method super calls: `Lookup.findSpecial(I.class, "m", mt, C.class)`
-    ///   on an `I.super.m()` pattern must invoke `I.m()`, NOT C's overriding
-    ///   `m()` — even though the receiver is a concrete `C`.
-    ///
-    /// `args[0]` MUST be the receiver. Parameters follow.
-    ///
-    /// The default implementation falls back to [`Self::invoke`] for
-    /// implementations that do not need super-call semantics. The `Vm`
-    /// override bypasses the iface/abstract retarget that `invoke_on_class_shared`
-    /// applies, so it is correct for super-call invocation.
-    fn invoke_special(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        self.invoke(class_name, method_name, descriptor, args)
-    }
-
-    /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
-    /// native registered for `(class_name, method_name, descriptor)` and
-    /// must run that class's own real bytecode body directly.
-    ///
-    /// [`Self::invoke_special`] re-finds ANY registered native FIRST (see its
-    /// own contract) -- calling it from inside that same native re-enters it
-    /// (unbounded Rust-stack recursion). This variant skips that check
-    /// entirely and resolves straight to `class_name`'s own bytecode, still
-    /// with true invokespecial semantics: static binding on `class_name`'s
-    /// hierarchy, never virtual dispatch to a receiver's overriding
-    /// subclass. That distinction is the whole point -- the bug this exists
-    /// to fix was a native registered on `ThreadPoolExecutor.shutdown()`,
-    /// reached via `ScheduledThreadPoolExecutor.shutdown()`'s
-    /// `super.shutdown()`, which used `invoke_virtual_bytecode_only` (dynamic
-    /// receiver class) and so re-dispatched straight back into the STPE
-    /// override that called it -- `StackOverflowError` from infinite
-    /// self-recursion.
-    ///
-    /// `args[0]` MUST be the receiver, same contract as [`Self::invoke_special`].
-    ///
-    /// Default implementation falls back to [`Self::invoke_special`] -- safe
-    /// for any context with no such native-reentrancy hazard (mocks, tests).
-    fn invoke_special_bytecode_only(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        self.invoke_special(class_name, method_name, descriptor, args)
-    }
 
     // -- Scoped Values (JEP 446, Java 25) --
 
@@ -2998,6 +2925,703 @@ pub trait NativeContext {
 
     /// Return the current depth (number of entries) of the scoped value binding stack.
     fn scoped_value_depth(&self) -> usize;
+}
+
+pub trait NativeExceptionAccess: NativeHeapAccess {
+    /// Capability boundary: Throwable and stack-trace capture.
+
+
+    /// Capture the current Java call stack without retaining it. Used by
+    /// StackWalker and caller-sensitive helpers.
+    fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;
+
+    /// Capture and retain a stack trace for `Throwable.fillInStackTrace`.
+    ///
+    /// The default keeps lightweight/mock contexts source-compatible. The VM
+    /// implementation overrides it so retained frames are owned by the VM,
+    /// rather than by the Java thread that happened to construct the throwable.
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        self.capture_stack_trace(self.identity_hash_code(throwable))
+    }
+
+    /// Retrieve a previously captured stack trace as an owned snapshot.
+    ///
+    /// An owned value deliberately avoids lending a reference through a
+    /// VM-shared lock while another Java thread may replace or discard a trace.
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>>;
+
+    /// The exact `ClassId` each live frame is currently executing in,
+    /// innermost (most recent call) first.
+    ///
+    /// Unlike `capture_stack_trace`'s `StackTraceEntry`s (which carry only a
+    /// display `class_name: Arc<str>`, for `Throwable`/`StackWalker` output),
+    /// this exposes each frame's precise, already-resolved `ClassId` — no
+    /// re-resolution by name needed. That distinction matters whenever two
+    /// *different* classes share one name (a common shape for custom
+    /// classloaders, e.g. Hibernate bytecode-enhancement's per-test-class
+    /// `EnhancingClassLoader`, or a class reloaded under a fresh loader
+    /// between JUnit tests sharing one process): re-resolving a frame's name
+    /// via `class_id_by_name` collapses to whichever definition the global
+    /// class table associates with that name (typically the first one ever
+    /// registered), which is not necessarily the one actually executing on
+    /// that frame. Used by `latest_user_defined_loader_class` to correctly
+    /// mirror `jdk.internal.misc.VM.latestUserDefinedLoader()`.
+    fn frame_class_ids(&self) -> Vec<ClassId> {
+        Vec::new()
+    }
+}
+
+pub trait NativeGpuAccess: NativeInvokeAccess {
+    /// Capability boundary: Optional GPU submission and result services.
+
+
+    /// Phase 5 escape hatch for GPU offload — dispatch the named method
+    /// asynchronously on the GPU and return the submission handle. The
+    /// default impl returns `None` (no GPU offload). The VM's
+    /// `NativeContextImpl` overrides under `#[cfg(feature = "gpu-offload")]`
+    /// to resolve `class_name`/`method_name`/`descriptor` against the
+    /// class manager, marshal `java_args` into `KernelArgs`, and call
+    /// `OffloadCache::dispatch_async`. The returned handle is what the
+    /// Java `GpuFutureImpl` wraps; pass it back to
+    /// `Native.futureSynchronize` / `Native.futureGetResult` to drive
+    /// the future.
+    ///
+    /// `java_args` follows the same convention as the JVM stack: each
+    /// `Value::Object(Some(...))` is a Java array reference, each
+    /// `Value::Int/Long/Float/Double` is a primitive scalar.
+    fn gpu_dispatch_method(
+        &mut self,
+        _class_name: &str,
+        _method_name: &str,
+        _descriptor: &str,
+        _java_args: &[Value],
+    ) -> Option<u64> {
+        None
+    }
+
+    /// GpuStream affinity — mint a new Java-visible CUDA stream on the
+    /// per-VM default-ordinal `OffloadCache`.
+    ///
+    /// Called by `Native.newStream` (wraps the returned handle in a
+    /// `GpuStreamImpl`) and, lazily, by every `submit`/`launch`/
+    /// `submitMethod`/`submitWithArg(s)` handler the first time a given
+    /// `GpuExecutor` handle is used — see
+    /// `native-builtins/src/craton_gpu.rs::resolve_or_create_default_stream`.
+    /// That laziness is what gives an executor a real *default* stream:
+    /// every dispatch through the same executor handle reuses the one
+    /// stream minted on its first submit, instead of each call getting
+    /// its own private one-shot stream (the gap
+    /// `docs/gpu/async-api.md` describes under "GpuStream affinity is
+    /// not wired up").
+    ///
+    /// Returns `None` when there is no device (no driver / `--gpu` off
+    /// / `gpu-offload` compiled off on the VM side) — the default impl
+    /// here, matching every other no-driver fallback in this trait.
+    /// The VM's `NativeContextImpl` overrides under
+    /// `#[cfg(feature = "gpu-offload")]` to call
+    /// `runtime::offload::OffloadCache::stream_create`.
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        None
+    }
+
+    /// Release a stream minted by [`gpu_stream_create`](Self::gpu_stream_create).
+    /// Safe to call on an unknown or already-released `handle`
+    /// (no-op) — same idempotent-release convention as
+    /// [`gpu_release_array_cache`](Self::gpu_release_array_cache).
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override calls
+    /// `runtime::offload::OffloadCache::stream_release`.
+    fn gpu_stream_release(&mut self, _handle: u64) {}
+
+    /// Stream-affine sibling of [`gpu_dispatch_method`](Self::gpu_dispatch_method):
+    /// identical contract, plus `stream_handle`.
+    ///
+    /// * `Some(h)` — pin this dispatch onto the CUDA stream previously
+    ///   minted by [`gpu_stream_create`](Self::gpu_stream_create) under
+    ///   handle `h`. Two dispatches pinned to the SAME `h` serialize in
+    ///   submission order (the ordering guarantee a CUDA stream gives
+    ///   for free). An `h` that was never minted, or was already
+    ///   released via [`gpu_stream_release`](Self::gpu_stream_release),
+    ///   is a hard failure (a `Failed` submission), not a silent
+    ///   fresh-stream fallback.
+    /// * `None` — identical to calling
+    ///   [`gpu_dispatch_method`](Self::gpu_dispatch_method) directly: a
+    ///   fresh, private, one-shot stream for this dispatch alone.
+    ///
+    /// Default impl delegates to `gpu_dispatch_method` and ignores
+    /// `stream_handle` — correct for every mock/test context (no GPU
+    /// offload at all) and for a VM build with `gpu-offload` off. The
+    /// VM's `NativeContextImpl` overrides under
+    /// `#[cfg(feature = "gpu-offload")]` to call
+    /// `runtime::offload::dispatch_method_from_native_on_stream`.
+    fn gpu_dispatch_method_on_stream(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+        _stream_handle: Option<u64>,
+    ) -> Option<u64> {
+        self.gpu_dispatch_method(class_name, method_name, descriptor, java_args)
+    }
+
+    /// Phase 6 #4 — query the real GPU submission registry for the
+    /// future at `handle`. Returns:
+    ///   * `Some(0)` — Running
+    ///   * `Some(1)` — Completed
+    ///   * `Some(2)` — Failed
+    ///   * `None`    — the handle is not in the real registry
+    ///                 (caller should fall back to the synthetic
+    ///                 future state in native-builtins).
+    /// Default impl returns None (no GPU offload).
+    fn gpu_future_status(&self, _handle: u64) -> Option<i32> {
+        None
+    }
+
+    /// 2026-07-11 — take the real GPU submission's completed result for
+    /// `handle`, without blocking. This is the read half `gpu_future_status`
+    /// was missing: `gpu_future_status` (now backed by
+    /// `runtime::offload::poll_submission_status`) tells a caller *that*
+    /// a submission finished; this method hands back *what it produced*.
+    ///
+    /// Returns:
+    ///   * `Some(GpuFutureResult::Scalar*)` — the submission is complete
+    ///     and its kernel returned a scalar (`)I`/`)J`/`)F`/`)D`).
+    ///   * `Some(GpuFutureResult::Void)` — the submission is complete and
+    ///     either the kernel had a void return, or it wrote its result
+    ///     into a caller-owned primitive array rather than the future's
+    ///     result slot (array results are delivered via writeback into
+    ///     the caller's own arrays, not through the future — see
+    ///     [`GpuFutureResult`]'s doc comment).
+    ///   * `None` — the handle is not in the real registry, the
+    ///     submission is still `Running`, or it failed. This method
+    ///     never blocks and never finalizes-and-waits on the caller's
+    ///     behalf beyond what an already-observed completion allows: a
+    ///     caller that hasn't first seen `gpu_future_status`/
+    ///     `futureIsDone` report completion should treat `None` here as
+    ///     "not ready yet" and fall back to the blocking
+    ///     `gpu_future_synchronize` path, not as a permanent failure.
+    ///
+    /// Default impl returns `None` (no GPU offload).
+    fn gpu_future_take_result(&self, _handle: u64) -> Option<GpuFutureResult> {
+        None
+    }
+
+    /// Phase 6 #4 — block until the real GPU submission at `handle`
+    /// completes (via its recorded event). Returns:
+    ///   * `Some(Ok(()))`    — completed
+    ///   * `Some(Err(msg))`  — submission failed; `msg` carries the reason
+    ///   * `None`            — handle not in the real registry
+    /// Default impl returns None.
+    fn gpu_future_synchronize(&self, _handle: u64) -> Option<Result<(), String>> {
+        None
+    }
+
+    /// Phase 8 #1 — evict the device-side buffer cache entry for
+    /// the given `GpuArray` handle. Called by
+    /// `Native.releaseArray` so a long-running Java program that
+    /// churns through GpuArrays doesn't accumulate device memory.
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override
+    /// calls `runtime::offload::device_cache::release(handle)`.
+    fn gpu_release_array_cache(&mut self, _handle: u64) {}
+
+    /// Phase 10 #1 — wipe the explicit-submit input-residency cache.
+    /// Called by `Native.releaseExecutor` so the device buffers
+    /// cached by plain `int[]` / `long[]` / `float[]` / `double[]`
+    /// args to `submitMethod` are freed when the Java
+    /// `GpuExecutor` is closed.
+    ///
+    /// Default impl is a no-op (no GPU offload). The VM override
+    /// calls `runtime::offload::input_cache::clear_all()`.
+    fn gpu_clear_input_cache(&mut self) {}
+
+    /// Phase 9 #1 — materialise the device-side buffer's contents
+    /// into host bytes if (and only if) the cache entry is dirty
+    /// from a prior kernel's writes. Returns
+    /// `Some(little-endian-bytes)` when a download happened (and
+    /// the caller should write them into the resident store
+    /// before reading the Java array), or `None` when the entry
+    /// is unknown or clean (host bytes are already current).
+    ///
+    /// Default impl returns None (no GPU offload). The VM
+    /// override calls
+    /// `runtime::offload::device_cache::download_into_bytes_if_dirty(handle)`.
+    fn gpu_array_download_if_dirty(&self, _handle: u64) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// GPU device enumeration escape hatch.
+    ///
+    /// Returns one entry per attached CUDA device, in ordinal order:
+    /// `(name, compute_major, compute_minor, total_global_mem_bytes)`.
+    ///
+    /// The default impl returns an empty `Vec` — the truthful answer on
+    /// a build without the `gpu-offload` feature, or on a host with no
+    /// CUDA driver. The VM's `NativeContextImpl` overrides this under
+    /// `#[cfg(feature = "gpu-offload")]` to call [`cuda_bridge::probe`].
+    /// Because `probe()` itself returns `Err(NoDriver)` on a driverless
+    /// host (or when `cuda-bridge` was built in stub mode), the override
+    /// likewise yields an empty `Vec` there — `deviceCount()` honestly
+    /// reports `0` rather than pretending a device exists.
+    ///
+    /// `cuda_bridge::probe` currently reports only the primary device
+    /// (ordinal 0); the contract here is general (a `Vec`) so a future
+    /// multi-device probe needs no signature change.
+    fn gpu_device_info(&self) -> Vec<(String, u32, u32, u64)> {
+        Vec::new()
+    }
+
+    /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
+    /// `GpuFunction` lambda's target method.
+    ///
+    /// When the user writes
+    ///
+    /// ```ignore
+    /// executor.submit(() -> Pipeline.vectorAdd(a, b, out));
+    /// ```
+    ///
+    /// the lambda is materialised as a proxy object whose class is
+    /// recorded in `shared.classes.lambda_proxies`. This method looks the
+    /// proxy up and returns
+    /// `Some((target_class, target_method, target_descriptor,
+    ///        captured_values))` so the dispatcher can route through
+    /// `gpu_dispatch_method`.
+    ///
+    /// Returns `None` for any of:
+    ///   * `callable` is not a lambda proxy
+    ///   * the impl method handle is not InvokeStatic (instance
+    ///     methods cannot run on the GPU)
+    ///   * gpu-offload feature is off (default impl)
+    fn gpu_resolve_lambda_target(
+        &self,
+        _callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        None
+    }
+}
+
+pub trait NativeSystemAccess: NativeThreadAccess {
+    /// Capability boundary: Process, VM, I/O, FFI, metrics, and diagnostics.
+
+    /// Whether this context can construct and dispatch real generated proxy
+    /// classes. Lightweight unit-test contexts intentionally return `false`:
+    /// they model native object state but do not own a VM-wide class-loader and
+    /// proxy-class namespace.
+    fn supports_real_proxy_generation(&self) -> bool {
+        true
+    }
+
+    /// Force-refresh this thread's deposited GC root snapshot (the same
+    /// mechanism `NativeContextImpl::deposit_root_snapshot` uses before a
+    /// blocking call) without actually blocking.
+    ///
+    /// Background: a peer-initiated stop-the-world collection has two ways
+    /// to see a thread's roots — (1) a live conservative register/stack scan
+    /// if that thread is forcibly frozen while executing JIT-compiled code
+    /// (`jit::xt_root_scan`), which does NOT know about `native_pin_roots`
+    /// (a native-side `Vec` living on the Rust heap, not the JIT frame), or
+    /// (2) this thread's last-deposited snapshot
+    /// (`collect_all_root_snapshots`/`root_snapshots_for_os_tids`), which
+    /// DOES include `native_pin_roots` but is only refreshed at specific
+    /// checkpoints: a cooperative interpreter safepoint arrival, entry into
+    /// a blocking native region, or this thread itself initiating a GC.
+    /// JIT-compiled code has no periodic cooperative safepoint poll at all
+    /// (see the comment on `jit::helpers::jit_safepoint_flush_satb`) — it
+    /// only touches those checkpoints via specific GC-triggering runtime
+    /// helpers, which a hot loop making only fast-path allocations may never
+    /// call.
+    ///
+    /// A native method that pins a long-lived batch of objects (e.g. a
+    /// materialized `Stream` of elements, each pinned once up front) and then
+    /// drives per-element re-entrant Java execution that can run for a long
+    /// time and/or tier up into JIT — without itself ever blocking or
+    /// initiating GC — leaves a window where neither mechanism above sees
+    /// those pins: not (1), because `native_pin_roots` isn't scanned that
+    /// way, and not (2), because nothing has refreshed the deposit since
+    /// before the pins were pushed. A peer thread's GC during that window
+    /// can reclaim a still-pinned object; the next read through the pin
+    /// (correctly re-validated, `via_pin=true`) observes a stale/reused
+    /// address. Confirmed live for JUnit 5's `TestTemplateExecutor`/
+    /// `ParameterizedTestExtension` dynamic-test dispatch (`ClassCastException:
+    /// java.lang.Object cannot be cast to
+    /// org.junit.jupiter.api.extension.TestTemplateInvocationContext`,
+    /// `obj_cid=0` — see `docs/known-issues/
+    /// wildfly-standalone-boot-attributeaccess-cce-register-invisible-root.md`,
+    /// which documents the same family from WildFly's `parallel-extension-add`
+    /// boot step) — one more independent occurrence of that already-tracked
+    /// "register-invisible root" / cross-thread GC-root-visibility family,
+    /// now with this specific closeable checkpoint gap identified.
+    ///
+    /// Calling this right after establishing such a batch of pins (and
+    /// optionally again periodically across a long per-element loop) closes
+    /// that window by (re-)publishing a fresh deposit — the exact same
+    /// mechanism already relied on for peers parked in a blocking region —
+    /// without requiring this thread to actually block. Default impl is a
+    /// no-op: test/mock contexts have no cross-thread GC to defend against.
+    fn refresh_root_snapshot(&mut self) {}
+
+    /// ES-FAIL-FAMILY-20260710 hunt: arm the GC's dynamic software
+    /// write-watchpoint (see `cratonvm_gc::heap::set_dynamic_watch`) at a
+    /// raw heap address, so any subsequent write through an instrumented
+    /// heap write primitive that covers this address prints its call site.
+    /// `addr = 0` disarms. Default no-op so mock/test `NativeContext` impls
+    /// don't need to implement it; only the real VM's impl (which has a
+    /// live heap to watch) overrides it.
+    fn dbg_set_watch_cell(&mut self, _addr: usize) {}
+
+    /// Stable identity for the owning VM/heap.
+    ///
+    /// Native side caches that store heap `ObjectRef`s must scope entries to
+    /// this value; Rust tests can create multiple independent `Vm` instances in
+    /// one process, so process-global object caches are otherwise stale across
+    /// VM lifetimes. Mock contexts default to a single synthetic scope.
+    fn vm_identity(&self) -> usize {
+        0
+    }
+
+    /// Store a value into the test output buffer (for `tempPrint`).
+    fn record_printed_value(&mut self, value: Value);
+
+    /// VM-accelerated primitive-wrapper recognition. `None` means this context
+    /// does not implement the fast path; `Some(None)` means the object is not a
+    /// wrapper; `Some(Some(value))` is the unboxed primitive.
+    fn fast_unbox_primitive_wrapper(&self, _obj: ObjectRef) -> Option<Option<Value>> {
+        None
+    }
+
+    /// Whether the current Java execution stack already contains the exact
+    /// instance method on `receiver`.
+    ///
+    /// Native shadows occasionally need to distinguish a native-first virtual
+    /// entry from an `invokespecial` delegation made by real bytecode already
+    /// executing in an override. The default is deliberately conservative for
+    /// lightweight test contexts, which do not own a live Java frame stack.
+    fn is_executing_instance_method(
+        &self,
+        _receiver: ObjectRef,
+        _method_name: &str,
+        _descriptor: &str,
+    ) -> bool {
+        false
+    }
+
+    /// Read `out.len()` bytes of native memory at `addr` into `out`.
+    ///
+    /// `addr` may be either a real OS pointer (e.g. a mapped buffer) OR one of
+    /// the VM's `Unsafe.allocateMemory` arena handles (a synthetic high
+    /// address, base `0x10_0000_0000`, NOT a dereferenceable pointer). NIO
+    /// native dispatchers (`sun/nio/ch/Net.read0`, `SocketDispatcher` …) that
+    /// receive a `DirectByteBuffer.address()` MUST go through this instead of a
+    /// raw `copy_nonoverlapping`, because `Util.getTemporaryDirectBuffer` backs
+    /// its temp buffers with arena handles — dereferencing one raw SIGSEGVs.
+    ///
+    /// The default implementation fails closed. Implementations that can prove
+    /// the address range is valid must override this and perform their own
+    /// pointer/arena validation before copying.
+    fn copy_from_native_memory(&self, _addr: i64, _out: &mut [u8]) -> bool {
+        false
+    }
+
+    /// Write `data` to native memory at `addr`. See [`Self::copy_from_native_memory`]
+    /// for the arena-handle vs raw-pointer distinction.
+    fn copy_to_native_memory(&mut self, _addr: i64, _data: &[u8]) -> bool {
+        false
+    }
+
+    /// Record a printed line (for System.out.println capture in tests).
+    fn record_printed_line(&mut self, text: String);
+
+    /// Get a system stream object (stdout or stderr).
+    fn get_system_stream(&self, name: &str) -> Option<ObjectRef>;
+
+    /// Pin the canonical `System.in` object on the VM so natives and `GETSTATIC`
+    /// agree after `initPhase1` allocates it. Default: no-op.
+    fn cache_system_stdin(&mut self, _stream: ObjectRef) {}
+
+    /// Look up the canonical `java.lang.Module` mirror for a module name
+    /// (`None`/`Some("")` ⇒ the unnamed module). `Class.getModule()` MUST return
+    /// the SAME instance for every class in a module — the JDK compares modules
+    /// by identity (see `Throwable.validateSuppressedExceptionsList`, HIB-CV-29).
+    /// Default: `None` (mock contexts have no persistent store).
+    fn get_cached_module_mirror(&self, _module_name: Option<&str>) -> Option<ObjectRef> {
+        None
+    }
+
+    /// Store the canonical `java.lang.Module` mirror for a module name so that
+    /// subsequent `Class.getModule()` calls return the identical instance.
+    /// The mirror is registered as a permanent GC root. Default: no-op.
+    fn cache_module_mirror(&mut self, _module_name: Option<&str>, _module: ObjectRef) {}
+
+    /// Get a system property by key.
+    fn get_system_property(&self, key: &str) -> Option<String>;
+
+    /// Snapshot every system property as a `(key, value)` list.  Used by
+    /// `System.getProperties()` to materialise a populated Properties
+    /// object when real-JDK's `System.props` static field is null.
+    fn list_system_properties(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Set a system property. Returns the old value if any.
+    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String>;
+
+    /// Remove a system property from the global store. Returns the old value if
+    /// any. Default no-op (mock contexts have no live store); the VM overrides it.
+    fn remove_system_property(&mut self, _key: &str) -> Option<String> {
+        None
+    }
+
+    /// Register (or look up) a minimal synthetic class with the given name
+    /// and instance-field count, returning its `ClassId`.
+    ///
+    /// Unlike [`ensure_class_initialized`], this never fails: when the real
+    /// `.class` file cannot be loaded it still produces a usable `ClassId`
+    /// whose class declares `num_fields` instance fields. Native allocators
+    /// MUST use this (rather than `ClassId::new(0)`) as the fallback class
+    /// when allocating an object with a non-zero field count — allocating
+    /// with `ClassId::new(0)` (`java/lang/Object`, which declares zero
+    /// fields) produces an "undersized object layout" object that the GC's
+    /// `get_field` bounds guard rejects on every field access.
+    ///
+    /// The default implementation falls back to `ClassId::new(0)` so mocks
+    /// and non-VM contexts still compile; real VM contexts override it.
+    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        let _ = (name, num_fields);
+        ClassId::new(0)
+    }
+
+    /// Check if a ClassId represents an interface.
+    fn is_interface_class(&self, class_id: ClassId) -> bool;
+
+    /// T1.6.7 — `Thread.holdsLock(Object)`. Returns `true` iff the
+    /// current thread currently holds the monitor for `obj`. Default
+    /// implementation returns `false` so non-monitor-aware contexts
+    /// (mocks, stubs) fall back to the spec-permitted "no" answer.
+    fn current_thread_holds_lock(&self, _obj: ObjectRef) -> bool {
+        false
+    }
+
+    /// T19_K2 — Register a native-spawned OS thread with the VM's
+    /// `ThreadRegistry`.
+    ///
+    /// Used by event-loop schedulers (Vert.x / Netty / XNIO) that spawn
+    /// their own carrier OS threads via `std::thread::spawn` rather than
+    /// going through `Thread.start0`. Returning the thread ids these
+    /// schedulers create through this entry point ensures:
+    ///
+    /// * the CLI's `wait_for_non_daemon_threads()` waits for them when
+    ///   `daemon == false` (otherwise the VM exits as soon as `main()`
+    ///   returns even though Quarkus / Keycloak's HTTP listeners are
+    ///   still alive),
+    /// * GC root scanning sees their stacks (T1.5.1 path),
+    /// * JVMTI thread-list APIs see them.
+    ///
+    /// Parameters:
+    /// * `name`     — thread label (shown in `ThreadInfo`, panic logs)
+    /// * `daemon`   — `false` for Vert.x / Netty event loops, `true` for
+    ///                truly background schedulers (XNIO IO threads, GC
+    ///                workers)
+    /// * `join_handle_ptr` — opaque `Box<JoinHandle<()>>` raw pointer.
+    ///                The VM takes ownership and arranges for it to be
+    ///                joined when `wait_for_non_daemon_threads()` runs.
+    ///                Pass `0` to register without a join handle (the
+    ///                caller is responsible for ensuring the thread
+    ///                eventually terminates on its own).
+    ///
+    /// Returns the registered `ThreadId.0` (a u64) on success. A value
+    /// of `0` indicates the call was a no-op (mock context or registry
+    /// not available); callers should treat this as "thread spawned but
+    /// not VM-tracked" — the OS thread still runs, it just won't keep
+    /// the process alive.
+    ///
+    /// The default implementation is a no-op so mock contexts and
+    /// any future trait consumers don't need to implement registry
+    /// plumbing. The VM override (`vm/src/vm/vm_exec.rs`) wires it
+    /// into `ThreadRegistry::register_with_daemon` + `set_join_handle`.
+    fn register_native_thread(
+        &mut self,
+        _name: &str,
+        _daemon: bool,
+        _join_handle_ptr: usize,
+    ) -> u64 {
+        0
+    }
+
+    /// Return GC/STW hooks for a thread registered via
+    /// [`Self::register_native_thread`].
+    ///
+    /// The returned object is intentionally independent of `&mut self` so a
+    /// spawned host thread can carry it into its event loop and bracket native
+    /// waits without a full `NativeContext`.
+    fn native_thread_blocker(&self, _thread_id: u64) -> Option<Arc<dyn NativeThreadBlocker>> {
+        None
+    }
+
+    /// T19_K2 — Mark a previously-registered native thread dead.
+    ///
+    /// Called from a native-spawned OS thread's exit path right before
+    /// the OS thread's `JoinHandle` returns. Flips the registry's
+    /// `alive` flag for the given id so `is_alive()` returns false and
+    /// `alive_non_daemon_thread_ids()` no longer reports it. The
+    /// `JoinHandle` is still kept by the registry — `join()` will
+    /// observe the dead flag and return immediately.
+    ///
+    /// Default impl is a no-op.
+    fn unregister_native_thread(&mut self, _thread_id: u64) {}
+
+    /// T19_K2 — Attach a `Box<JoinHandle<()>>` raw pointer to an
+    /// already-registered native thread.
+    ///
+    /// Used by event-loop schedulers that need to know the assigned
+    /// `ThreadId` BEFORE spawning the OS thread (so the spawned closure
+    /// can capture it and use it on exit). The two-phase API is:
+    ///
+    ///   1. Call `register_native_thread(name, daemon, 0)` to get the
+    ///      `ThreadId.0` without an attached handle.
+    ///   2. Spawn the OS thread; capture the id in its closure.
+    ///   3. Call `attach_join_handle_to_native_thread(id, raw_ptr)` to
+    ///      hand the `JoinHandle<()>` over to the registry.
+    ///
+    /// `join_handle_ptr` follows the same ownership protocol as
+    /// `register_native_thread`: a raw `Box<JoinHandle<()>>` pointer
+    /// the VM takes back as `Box::from_raw`.
+    ///
+    /// Returns `true` if the attach succeeded, `false` if `thread_id`
+    /// was unknown (in which case the caller MUST reclaim the
+    /// `Box<JoinHandle<()>>` via `Box::from_raw` or it leaks the OS
+    /// thread).
+    fn attach_join_handle_to_native_thread(
+        &mut self,
+        _thread_id: u64,
+        _join_handle_ptr: usize,
+    ) -> bool {
+        false
+    }
+
+    /// T19_K4 — Attach a `java.lang.Thread` mirror to an
+    /// already-registered native thread.
+    ///
+    /// Used by event-loop schedulers (Vert.x / Netty / XNIO) that
+    /// register their carrier OS thread via
+    /// [`Self::register_native_thread`] but also need a real
+    /// `java.lang.Thread` mirror so:
+    ///
+    ///  * `Thread.currentThread()` resolves to the right object when
+    ///    Java-side code runs on the event-loop carrier (e.g. a
+    ///    Runnable that consults the thread name),
+    ///  * `ThreadRegistry::find_thread_id_by_thread_obj` works
+    ///    cross-thread (so other code that has the mirror handle can
+    ///    locate the `ThreadId`),
+    ///  * the carrier thread shows up in
+    ///    `ThreadRegistry::alive_thread_objects()` (and therefore in
+    ///    `Thread.enumerate()` / JVMTI thread-list listings).
+    ///
+    /// `thread_id` must be a value previously returned by
+    /// [`Self::register_native_thread`] / the two-phase
+    /// [`Self::attach_join_handle_to_native_thread`] flow. The
+    /// `java_thread_obj` should be a freshly-allocated synthetic
+    /// `java.lang.Thread` mirror with `name` set on slot 0 and
+    /// (optionally) `tid` on slot 2 — `register_native_thread`
+    /// already stamped the registry entry, this call just attaches
+    /// the mirror so look-ups by `ObjectRef` succeed.
+    ///
+    /// Returns `true` if the thread id was found and the mirror was
+    /// stored, `false` if the id was unknown. Default impl is a
+    /// no-op so mock contexts don't need to model a heap.
+    fn set_native_thread_java_obj(&mut self, _thread_id: u64, _java_thread_obj: ObjectRef) -> bool {
+        false
+    }
+
+    /// Emit a `jdk.VirtualThreadPinned` JFR event for the current thread.
+    /// Called when a pinned virtual thread is about to block its carrier.
+    ///
+    /// Round-4: `reason` is `&'static str` (JEP 491 pin-reason taxonomy:
+    /// "Synchronized", "Native", "Thread.sleep while pinned", ...).
+    fn emit_virtual_thread_pinned_jfr(&mut self, _reason: &'static str) {}
+
+    // -- VM stats methods (for JMX) --
+
+    /// Effective available-processor count, honoring container/cgroup CPU
+    /// limits when `-XX:+UseContainerSupport` is active. This backs
+    /// `Runtime.availableProcessors()` and the JMX `OperatingSystemMXBean`.
+    ///
+    /// The default (used by mock/test contexts) returns the host hardware
+    /// thread count; the VM overrides it to prefer the cgroup-derived count
+    /// from `VmConfig::container_effective_processors` when present.
+    fn available_processor_count(&self) -> i32 {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(1)
+    }
+
+    /// Maximum heap size in bytes, as reported by `Runtime.maxMemory()` and the
+    /// JMX `MemoryMXBean`. The default (mock/test contexts) is the historical
+    /// 256 MiB placeholder; the VM overrides it to return the configured
+    /// `-Xmx` (which is itself container-aware once sized from a cgroup limit).
+    fn max_heap_bytes(&self) -> i64 {
+        256 * 1024 * 1024
+    }
+
+    /// Initial heap size in bytes, as reported by the JMX `MemoryMXBean`'s
+    /// heap `MemoryUsage.getInit()`. The default (mock/test contexts) mirrors
+    /// `max_heap_bytes`'s historical placeholder; the VM overrides it to
+    /// return the configured `-Xms` (`VmConfig::initial_heap_size`).
+    fn initial_heap_bytes(&self) -> i64 {
+        16 * 1024 * 1024
+    }
+
+    /// Returns the number of classes currently loaded in the VM.
+    fn loaded_class_count(&self) -> usize;
+
+    /// Cumulative classes reclaimed by class-loader unloading.
+    fn unloaded_class_count(&self) -> u64 {
+        0
+    }
+
+    /// Returns the cumulative number of GC collections that have occurred.
+    fn gc_collection_count(&self) -> u64;
+
+    /// Force a garbage collection cycle and run pending finalizers.
+    /// Used by `System.gc()` / `Runtime.gc()`.
+    fn force_gc(&mut self);
+
+    /// Read a static field value by class and field index.
+    ///
+    /// `field_index` must be in range for `class_id`'s static field block
+    /// (typically resolved via [`static_field_index_by_name`](Self::static_field_index_by_name)).
+    /// The trait does NOT validate it (M4a): the implementation MUST
+    /// bounds-check and MUST NOT read out of range — fail safe on a bad index.
+    fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value;
+
+    /// Write a static field value by class and field index.
+    ///
+    /// `field_index` must be in range for `class_id`'s static field block
+    /// (typically resolved via [`static_field_index_by_name`](Self::static_field_index_by_name)).
+    /// The trait does NOT validate it (M4a): the implementation MUST
+    /// bounds-check and MUST NOT write out of range — fail safe on a bad index.
+    fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value);
+
+    /// Write a static field by class name and field name.
+    /// Resolves the class and finds the static field index by name.
+    /// No-op if the class or field cannot be found.
+    fn set_static_field_by_name(&mut self, class_name: &str, field_name: &str, value: Value) {
+        if let Some(class_id) = self.class_id_by_name(class_name) {
+            if let Some(idx) = self.static_field_index_by_name(class_id, field_name) {
+                self.set_static_field(class_id, idx, value);
+            }
+        }
+    }
+
+    /// Find the static field index for a field by name.  Returns `None` if the
+    /// class doesn't have a static field with that name.
+    fn static_field_index_by_name(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
+        let _ = (class_id, field_name);
+        None
+    }
+
+    /// Get the file descriptor table for I/O operations.
+    fn fd_table(&self) -> &crate::fd_table::FileDescriptorTable;
 
     // -- Panama FFI (JEP 454, Java 25) --
 
@@ -3066,299 +3690,6 @@ pub trait NativeContext {
     /// so a stale handle fails closed.
     fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)>;
 
-    // -- JPMS Module support (N3) --
-
-    /// Return the module name (JPMS) of the class with the given ClassId.
-    ///
-    /// Returns `None` for classes in the unnamed module.
-    fn module_name_of_class(&self, class_id: ClassId) -> Option<String>;
-
-    /// Find a classpath resource by name. Returns raw bytes or None if not found.
-    ///
-    /// Searches bootstrap → extension → application classpaths.
-    /// The name should be a forward-slash-separated path (leading `/` is stripped).
-    fn find_resource(&self, name: &str) -> Option<Vec<u8>>;
-
-    /// Return the raw bytes of the class file from which `class_id` was
-    /// loaded (or last redefined). Reads from `ClassManager::class_bytes_cache`,
-    /// which is populated by every `define_class_with_options` call.
-    /// Used by `Instrumentation.retransformClasses` to seed the transformer
-    /// chain with the true source bytes — `find_resource` would only find
-    /// classpath-resident classes, missing dynamically-defined and hidden
-    /// classes. Default impl returns `None` so test mocks compile.
-    fn class_bytes(&self, _class_id: ClassId) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// Return a URL string (e.g. `file:/...` or `jar:file:/...!/...`) for
-    /// every classpath entry that contains a resource with the given name.
-    /// Used by `ClassLoader.getResources` / `getSystemResources`.
-    /// Default implementation returns an empty vector so test mocks compile.
-    fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
-        let _ = name;
-        Vec::new()
-    }
-
-    /// Return the raw bytes of every classpath entry that contains a
-    /// resource with the given name. Parallel to [`find_all_resource_urls`]
-    /// but returns content rather than URLs — used by Rust-native resource
-    /// enumeration paths (e.g. `ServiceLoader` provider discovery in
-    /// `native-builtins/src/service_loader.rs`) that bypass the JDK's
-    /// `URL.openStream` / `BufferedReader` chain.
-    /// Default implementation returns an empty vector so test mocks compile.
-    fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
-        let _ = name;
-        Vec::new()
-    }
-
-    /// Find the filesystem path of the classpath entry that holds a given
-    /// class (for `Class.getProtectionDomain().getCodeSource().getLocation()`).
-    /// Returns a `file:`-scheme-ready absolute path (directory has trailing
-    /// slash, JAR is a plain path).  Returns `None` for classes loaded from
-    /// jimage (bootstrap JDK) or if the class cannot be found on any path.
-    fn find_class_source_path(&self, class_name: &str) -> Option<String> {
-        let _ = class_name;
-        None
-    }
-
-    /// Return the CodeSource URL attached to a loaded class — what
-    /// `Class.getProtectionDomain().getCodeSource().getLocation()` returns.
-    /// This is populated at class-load time from the classpath entry that
-    /// produced the class, and surfaces real JAR/dir URLs (e.g.
-    /// `file:/opt/app.jar`) rather than the synthetic `class:` placeholder.
-    /// Returns `None` for synthetic stubs and JDK internals.
-    fn class_code_base(&self, class_id: ClassId) -> Option<String> {
-        let _ = class_id;
-        None
-    }
-
-    /// Return the SHA-256 hex digests of every signer certificate block on
-    /// the class's CodeSource (one per JAR-signer). Empty vector means an
-    /// unsigned source; used by `security_manager` policy enforcement to
-    /// match `grant signedBy "..."` entries.
-    fn class_code_source_cert_digests(&self, class_id: ClassId) -> Vec<String> {
-        let _ = class_id;
-        Vec::new()
-    }
-
-    /// Return the raw DER-encoded signer certificate blocks (PKCS#7 / CMS
-    /// SignedData) attached to the class's CodeSource.  Parallel to
-    /// `class_code_source_cert_digests` — one block per JAR-signer — but
-    /// exposes the original bytes so the policy engine can parse each
-    /// signer's X.509 subject DN for `grant signedBy "CN=..."` matching.
-    /// Empty vector means an unsigned source.
-    fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
-        let _ = class_id;
-        Vec::new()
-    }
-
-    /// Reverse-lookup: given a `java.lang.Class` mirror object, return the
-    /// backing `ClassId` (the class the mirror reflects).  Returns `None`
-    /// for primitive-type mirrors and for non-mirror objects.
-    ///
-    /// Implemented by consulting the VM's `class_mirrors_reverse` map;
-    /// avoids encoding the class_id in the mirror's Java-visible fields,
-    /// which would clash with real-JDK `java/lang/Class` layout.
-    fn class_id_from_mirror(&self, mirror: ObjectRef) -> Option<ClassId> {
-        let _ = mirror;
-        None
-    }
-
-    /// List all class names on the application classpath.
-    ///
-    /// Returns binary class names (e.g. `com/example/MyClass`).
-    fn list_application_class_names(&self) -> Vec<String>;
-
-    /// Dynamically extend the application classpath (for URLClassLoader).
-    ///
-    /// Each string in `paths` is a filesystem path to either a directory or a
-    /// JAR/ZIP file. Paths are appended to the application class finder so that
-    /// subsequent `ensure_class_initialized` and `find_resource` calls search them.
-    fn register_dynamic_classpath(&mut self, paths: &[String]);
-
-    /// Append paths to the BOOTSTRAP class search path so their classes load
-    /// with the bootstrap loader (null `Class.getClassLoader()`). Drives
-    /// `Instrumentation.appendToBootstrapClassLoaderSearch`. The default
-    /// implementation falls back to the application classpath; the VM's
-    /// `NativeContext` overrides it to target the bootstrap loader.
-    fn register_bootstrap_classpath(&mut self, paths: &[String]) {
-        self.register_dynamic_classpath(paths);
-    }
-
-    /// Define a new class from raw bytecode (Phase 23.2).
-    ///
-    /// Parses the class bytes, registers the class with the ClassManager under
-    /// the application loader, and returns the ClassId of the newly defined class.
-    /// Returns `None` if parsing fails.
-    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId>;
-
-    /// NEW-8: Define a hidden class (JEP 371 / JEP 429) from raw bytecode.
-    ///
-    /// `stored_name` is the mangled name under which the class is
-    /// registered in the class store — typically
-    /// `"<original>/0x<counter>"` so multiple hidden classes derived
-    /// from the same template get distinct names. The class's
-    /// `hidden` flag is set atomically with registration so the class
-    /// is never visible to `find_class_by_name` / `Class.forName`.
-    ///
-    /// Returns a typed error string on parse / link failure so the
-    /// caller can surface a proper `ClassFormatError` or
-    /// `LinkageError` to Java code. The default implementation
-    /// delegates to [`define_class_from_bytes`] for backward
-    /// compatibility — implementations that want real JEP 371
-    /// semantics should override this.
-    fn define_hidden_class_from_bytes(
-        &mut self,
-        stored_name: &str,
-        bytes: &[u8],
-    ) -> Result<ClassId, String> {
-        match self.define_class_from_bytes(stored_name, bytes) {
-            Some(cid) => {
-                self.set_class_hidden(cid);
-                Ok(cid)
-            }
-            None => Err(format!("failed to define hidden class {stored_name}")),
-        }
-    }
-
-    /// Define a new class under a specific user-defined classloader namespace.
-    ///
-    /// `loader_id` is the unique integer ID of the user-defined classloader.
-    /// Classes defined with different loader IDs are isolated (same class name
-    /// can exist in multiple loader namespaces per JVM spec §5.3).
-    fn define_class_with_loader(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-        loader_id: u32,
-    ) -> Option<ClassId>;
-
-    /// WP2.3 — full-options defineClass. Returns
-    /// `Ok(class_id)` on success or `Err(error_message)` describing
-    /// the LinkageError / ClassFormatError. Used by all four entry
-    /// points (Unsafe.defineClass, jdk.internal.misc.Unsafe.defineClass,
-    /// MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2)
-    /// so they all dispatch to the same backend.
-    ///
-    /// `loader_id == 0` means use the application loader; non-zero
-    /// values are user-defined loader namespaces.
-    fn define_class_full(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-        loader_id: u32,
-        opts: DefineClassFull,
-    ) -> Result<ClassId, String> {
-        // Default: degrade to define_class_with_loader / define_class_from_bytes.
-        let result = if loader_id > 0 {
-            self.define_class_with_loader(name, bytes, loader_id)
-        } else {
-            self.define_class_from_bytes(name, bytes)
-        };
-        match result {
-            Some(cid) => {
-                if opts.hidden {
-                    self.set_class_hidden(cid);
-                }
-                Ok(cid)
-            }
-            None => Err(format!("define_class_full failed for {name}")),
-        }
-    }
-
-    /// WP2.4 — redefine the bytecode of an already-loaded class.
-    ///
-    /// Used by `Instrumentation.redefineClasses` /
-    /// `retransformClasses`. The class must already exist; otherwise
-    /// returns `Err("class not loaded")`. On success, the JIT cache
-    /// for the old class is invalidated and any new method lookups
-    /// resolve through the new bytecode.
-    fn redefine_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
-        let _ = (class_id, new_bytes);
-        Err("redefine_class not implemented".to_string())
-    }
-
-    /// Like [`Self::redefine_class`] but for
-    /// `Instrumentation.retransformClasses`: preserves the class's original
-    /// cached bytes so each retransformation re-runs the transformer chain
-    /// from the ORIGINAL bytes (not the previously-woven ones). Without this,
-    /// a second retransform of the same class — e.g. `mockStatic(X)` then
-    /// `mock(X)` — double-instruments it. The default delegates to
-    /// `redefine_class` (correct for impls that don't cache original bytes).
-    fn retransform_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
-        self.redefine_class(class_id, new_bytes)
-    }
-
-    /// WP2.4 — list all loaded classes.
-    fn list_loaded_class_ids(&self) -> Vec<ClassId> {
-        Vec::new()
-    }
-
-    /// WP2.4 — list all classes whose initiating loader was the
-    /// application loader (or, if `loader_id != 0`, the user-defined
-    /// loader with that id).
-    fn list_initiated_class_ids(&self, _loader_id: u32) -> Vec<ClassId> {
-        Vec::new()
-    }
-
-    /// Look up a class by name within a specific user-defined loader's namespace.
-    /// Falls back to the standard delegation chain if not found.
-    fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId>;
-
-    /// Exact `(loader, name)` lookup with **no** delegation/global fallback —
-    /// only a class the loader with `loader_id` has itself defined. Used by
-    /// loader-faithful `findLoadedClass` so it never returns another loader's
-    /// class. Default impl falls back to the (fallback-prone)
-    /// [`Self::class_id_by_name_and_loader`] for contexts that do not override
-    /// it (e.g. test mocks).
-    fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
-        self.class_id_by_name_and_loader(name, loader_id)
-    }
-
-    /// Allocate a unique classloader ID for a new user-defined classloader instance.
-    fn allocate_loader_id(&mut self) -> u32;
-
-    /// Register a discovered weak/soft/phantom reference with the GC's ReferenceProcessor.
-    /// `ref_type`: 0=Weak, 1=Soft, 2=Phantom
-    /// `reference_obj`: the Reference object itself
-    /// `referent`: the referred-to object
-    /// `queue`: optional ReferenceQueue object
-    fn discover_reference(
-        &mut self,
-        ref_type: u8,
-        reference_obj: ObjectRef,
-        referent: ObjectRef,
-        queue: Option<ObjectRef>,
-    );
-
-    /// Notify the GC's reference processor that a `SoftReference.get()` just
-    /// observed its referent, refreshing the LRU timestamp used by
-    /// soft-reference clearing heuristics on the next major GC.
-    ///
-    /// Round-5 fix (HIGH): without this hook, the LRU index sees
-    /// `last_access_time_ms == 0` forever and every SoftReference looks
-    /// infinitely stale — clearing on the first low-memory cycle and
-    /// defeating soft-ref-backed caches. The VM overrides this with a
-    /// call into `ReferenceProcessor::touch_soft_reference`. The default
-    /// no-op keeps mock/test contexts compiling.
-    fn touch_soft_reference(&mut self, _reference_obj: ObjectRef) {}
-
-    /// INT-8: GC keep-alive for a referent a `Reference.get()` just handed to
-    /// the mutator — the HotSpot `G1ReferenceGet` intrinsic barrier
-    /// equivalent. While a G1 concurrent mark cycle is active, the marker
-    /// deliberately does NOT trace through referent slots (referent-slot
-    /// hiding); a mutator that reads a referent and stores it into an
-    /// already-scanned (black) object would create the only strong path via
-    /// an edge the snapshot cannot see, and the remark-time reference
-    /// processor could then clear the weak ref and free the referent while
-    /// strongly reachable (use-after-free). The VM overrides this with the
-    /// heap's SATB pre-barrier (`VmHeap::write_barrier_pre`), which logs the
-    /// value as a mark root when marking is active and is a no-op otherwise.
-    /// `refersTo` intentionally does NOT call this — its JDK contract is to
-    /// test the referent WITHOUT keeping it alive. The default no-op keeps
-    /// mock/test contexts compiling.
-    fn gc_reference_keep_alive(&mut self, _referent: ObjectRef) {}
-
     /// Record a JFR thread sleep event. Called by Thread.sleep implementations.
     /// Default is no-op; the VM overrides this with the real JFR recorder.
     fn record_thread_sleep(&mut self, _sleep_nanos: i64, _actual_duration_nanos: u64) {}
@@ -3368,246 +3699,22 @@ pub trait NativeContext {
 
     /// Record a JFR file write event.
     fn record_file_write(&mut self, _fd: i32, _bytes_written: i64, _duration_nanos: u64) {}
-
-    // -- JPMS module queries (Phase B) --
-
-    /// Check if module `reader` reads module `provider`.
-    fn reads_module(&self, reader: &str, provider: &str) -> bool {
-        // Default: all modules can read each other (classpath-only mode).
-        let _ = (reader, provider);
-        true
-    }
-
-    /// Check if `module_name` exports `pkg` unconditionally (to all modules).
-    ///
-    /// AUDIT 2026-05-19: this method has **no default** and is REQUIRED. A
-    /// fail-open default (`true`) silently grants arbitrary cross-module
-    /// access for any implementor that forgets to override it. Forcing every
-    /// `NativeContext` impl to provide a body makes the security decision
-    /// explicit. Classpath-only / mock contexts should return `true`
-    /// deliberately; a JPMS-enabled VM must perform a real readability check.
-    fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool;
-
-    /// Check if `module_name` exports `pkg` to `to_module`.
-    ///
-    /// AUDIT 2026-05-19: REQUIRED, no default — see
-    /// `is_package_exported_unqualified` for the fail-open rationale.
-    fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool;
-
-    /// Check if `module_name` opens `pkg` unconditionally.
-    ///
-    /// AUDIT 2026-05-19: REQUIRED, no default — see
-    /// `is_package_exported_unqualified` for the fail-open rationale.
-    fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool;
-
-    /// Check if `module_name` opens `pkg` to `to_module`.
-    ///
-    /// AUDIT 2026-05-19: REQUIRED, no default — see
-    /// `is_package_exported_unqualified` for the fail-open rationale.
-    fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool;
-
-    /// Add a dynamic read edge: `reader` reads `provider`.
-    fn module_add_reads(&mut self, reader: &str, provider: &str) {
-        let _ = (reader, provider);
-    }
-
-    /// Add a dynamic export: `module_name` exports `pkg` to `target`.
-    fn module_add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
-        let _ = (module_name, pkg, target);
-    }
-
-    /// Add a dynamic open: `module_name` opens `pkg` to `target`.
-    fn module_add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
-        let _ = (module_name, pkg, target);
-    }
-
-    /// Return all packages owned by `module_name`.
-    fn module_packages(&self, module_name: &str) -> Vec<String> {
-        let _ = module_name;
-        vec![]
-    }
-
-    /// Return the `uses` service-type binary names (slash format) declared by
-    /// `module_name`'s `module-info.class` `uses` directives. Empty for the
-    /// unnamed module, an unregistered module, or a module whose descriptor
-    /// declares no `uses`.
-    fn module_uses(&self, module_name: &str) -> Vec<String> {
-        let _ = module_name;
-        vec![]
-    }
-
-    /// True if `module_name`'s `module-info.class` declared `open module ...`
-    /// (the real `ACC_MODULE_OPEN` flag). `false` for the unnamed module, an
-    /// unregistered module, or a module that isn't open.
-    fn module_is_open(&self, module_name: &str) -> bool {
-        let _ = module_name;
-        false
-    }
-
-    /// Return all registered module names.
-    fn all_module_names(&self) -> Vec<String> {
-        vec![]
-    }
-
-    /// Find which module owns a given package (slash format).
-    fn module_for_package(&self, pkg: &str) -> Option<String> {
-        let _ = pkg;
-        None
-    }
-
-    /// Mark a class as hidden (JEP 371). Hidden classes are not discoverable via
-    /// `Class.forName` or `ClassLoader.findLoadedClass`.
-    fn set_class_hidden(&mut self, class_id: ClassId) {
-        let _ = class_id;
-    }
-
-    /// Query whether a class is hidden (JEP 371). Used by the
-    /// `Class.isHidden()` native. The default returns `false` for every
-    /// class so implementations that do not support hidden classes
-    /// continue to work.
-    fn is_class_hidden(&self, class_id: ClassId) -> bool {
-        let _ = class_id;
-        false
-    }
-
-    /// Copy nest-host and nest-members information from `source_class` to
-    /// `target_class`. Used by `defineHiddenClass` when the `NESTMATE`
-    /// class option is specified: the hidden class joins the lookup
-    /// class's nest rather than being a standalone nest of its own.
-    /// The default is a no-op for implementations that do not track
-    /// nest membership.
-    fn copy_nest_info(&mut self, source_class: ClassId, target_class: ClassId) {
-        let _ = (source_class, target_class);
-    }
-
-    /// Force a class to complete its `<clinit>` immediately. Used by
-    /// `defineHiddenClass` when the `initialize` flag is `true`, and by
-    /// `Class.forName`/`Constructor.newInstance`/`Lookup.ensureInitialized`.
-    /// The default is a no-op — callers that care about deterministic init
-    /// must override this in their NativeContext impl.
-    ///
-    /// HIB-CV-26 fix (2026-07-16): the error type is `MethodCallFailed`
-    /// (not a flattened `String`) so a `<clinit>` failure keeps its
-    /// two-layer identity all the way to the caller: a genuine Java
-    /// exception from a static initializer comes back as
-    /// `MethodCallFailed::ExceptionThrown` (already correctly wrapped as a
-    /// catchable `ExceptionInInitializerError`/`NoClassDefFoundError` by
-    /// `ensure_class_initialized_shared` per JVMS §5.5) and only a true
-    /// VM-level bug comes back as `MethodCallFailed::InternalError`.
-    /// Collapsing both into a `String` here previously forced every call
-    /// site to treat ordinary `<clinit>` exceptions as unrecoverable
-    /// internal errors, aborting the VM instead of letting Java code catch
-    /// them.
-    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
-        let _ = class_id;
-        Ok(())
-    }
-
-    /// Return all JPMS `provides` implementation class names for a given service
-    /// interface (binary class name, e.g. `"com/example/MyService"`).
-    /// Walks all registered module descriptors' `provides` entries.
-    fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
-        let _ = service_class;
-        vec![]
-    }
-
-    // -- JPMS deep reflection access (Phase B) --
-
-    /// Check whether `accessor_class_id` has deep (reflective) access to
-    /// `target_class_id` via JPMS `opens` directives.
-    ///
-    /// Returns `Ok(())` if allowed (same module, unnamed module, target module
-    /// opens the package, or a dynamic `addOpens` edge exists).
-    /// Returns `Err(message)` if the access is denied.
-    ///
-    /// Called by reflection natives (`Method.invoke`, `Field.get/set`,
-    /// `Constructor.newInstance`) when `setAccessible(true)` is used on a
-    /// member in a different module.
-    ///
-    /// AUDIT 2026-05-19: this method has **no default** and is REQUIRED. The
-    /// previous `Ok(())` default silently allowed arbitrary cross-module
-    /// `setAccessible` for any implementor that forgot to override it.
-    /// Forcing every `NativeContext` impl to provide a body makes the
-    /// security decision explicit — classpath-only / mock contexts may
-    /// return `Ok(())` deliberately; a JPMS-enabled VM must perform a real
-    /// module-readability + opens check.
-    fn check_deep_reflection_access(
-        &self,
-        accessor_class_id: ClassId,
-        target_class_id: ClassId,
-    ) -> Result<(), String>;
-
-    // -- T13 java/lang/Class reflection metadata --
-
-    /// Get the class file version (major number) for a class.
-    fn class_file_version(&self, _class_id: ClassId) -> u16 {
-        65 // Default: Java 21
-    }
-
-    /// Get the inner classes of a class.
-    /// Returns vec of (inner_class_name, outer_class_name, inner_name, access_flags).
-    fn inner_classes(&self, _class_id: ClassId) -> Vec<(String, String, String, u16)> {
-        Vec::new()
-    }
-
-    /// Get the enclosing method info for a class.
-    /// Returns (enclosing_class, method_name, method_descriptor) or None.
-    fn enclosing_method(&self, _class_id: ClassId) -> Option<(String, String, String)> {
-        None
-    }
-
-    /// Get the declaring class of this class (from InnerClasses attribute).
-    /// Returns the class ID of the outer class, or None if not an inner class.
-    fn declaring_class(&self, _class_id: ClassId) -> Option<ClassId> {
-        None
-    }
-
-    /// Get the raw annotation bytes for a class.
-    /// Returns the bytes of the RuntimeVisibleAnnotations attribute, or empty.
-    fn raw_annotations(&self, _class_id: ClassId) -> Vec<u8> {
-        Vec::new()
-    }
-
-    /// Get the raw type annotation bytes for a class.
-    fn raw_type_annotations(&self, _class_id: ClassId) -> Vec<u8> {
-        Vec::new()
-    }
-
-    /// Get the runtime-visible TYPE_USE annotations targeting one of this
-    /// class's declared supertypes (JVMS 4.7.20 `target_type` 0x10,
-    /// CLASS_EXTENDS). `supertype_index` is the JVMS-defined index: `0xFFFF`
-    /// (65535) selects the superclass, `0..n` selects the n-th entry of
-    /// `getInterfaces()`.
-    ///
-    /// Returns a [`TypeArgAnnotations`] tree: `.anns` holds annotations with
-    /// an empty `type_path` (directly on the supertype itself, e.g.
-    /// `implements @Foo Bar`); `.children[i]` holds the subtree for the
-    /// supertype's i-th type argument (recursively, for arbitrarily nested
-    /// generics, e.g. `implements ValueExtractor<ArgumentValue<@ExtractedValue
-    /// ?>>`). Backs `Class.getAnnotatedSuperclass()` /
-    /// `Class.getAnnotatedInterfaces()` and their
-    /// `getAnnotatedActualTypeArguments()` chains. Default impl returns an
-    /// empty tree so mock `NativeContext` implementations don't need to plumb
-    /// the attribute store.
-    fn class_extends_type_annotations(
-        &self,
-        _class_id: ClassId,
-        _supertype_index: u16,
-    ) -> TypeArgAnnotations {
-        TypeArgAnnotations::default()
-    }
-
-    /// Get the nest host class name for a class.
-    /// Returns None if the class is its own nest host.
-    fn nest_host_name(&self, _class_id: ClassId) -> Option<String> {
-        None
-    }
-
-    /// Get the nest member class names for a class.
-    fn nest_member_names(&self, _class_id: ClassId) -> Vec<String> {
-        Vec::new()
-    }
 }
+
+/// Complete native-call capability set. Native implementations are split
+/// into the narrow supertraits above; this marker exists only at the
+/// legacy callback ABI boundary.
+pub trait NativeContext:
+    NativeSystemAccess + NativeExceptionAccess + NativeGpuAccess
+{
+}
+
+impl<T> NativeContext for T where
+    T: NativeSystemAccess + NativeExceptionAccess + NativeGpuAccess + ?Sized
+{
+}
+
+
 
 /// Annotation data extracted from class file attributes.
 #[derive(Debug, Clone)]
@@ -4024,7 +4131,7 @@ impl NativeMethodRegistry {
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
             // dropped so calls hit real bytecode or a clear error.
-            drop_synthetic_stubs: std::env::var_os("CRATONVM_NO_STUBS")
+            drop_synthetic_stubs: cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STUBS")
                 .is_some_and(|v| !v.is_empty()),
             drop_real_layout_synthetic: false,
             // PERF: deferred native-ring name index. Sized like the other boot
@@ -4126,7 +4233,7 @@ impl NativeMethodRegistry {
             // category at one of its call sites — this made the drop visible
             // in seconds instead of a multi-round bisection. Cheap/no-op when
             // unset; kept as a permanent diagnostic for the next occurrence.
-            if std::env::var_os("CRATONVM_DBG_DROPPED_STUBS").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DROPPED_STUBS").is_some() {
                 eprintln!("[DROPPED-STUB] {class_name}.{method_name}{descriptor}");
             }
             return;
@@ -4520,6 +4627,31 @@ impl NativeMethodRegistry {
                 class_name,
                 "java/lang/ref/Cleaner" | "java/lang/ref/Cleaner$Cleanable"
             )
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `java/lang/ref/ReferenceQueue`
+        // CONSTRUCTOR so the real one runs. The synthetic ctor only writes the
+        // two-slot (head, size) shape this file's natives use; a real JDK 25
+        // `ReferenceQueue` additionally declares `private final Lock lock`,
+        // which the real `enqueue`/`poll`/`remove` bytecode synchronizes on.
+        // Leaving it null made every real `ReferenceQueue.enqueue()` throw
+        // `NullPointerException: Cannot enter synchronized block because
+        // "this.lock" is null` — reached from `Reference.enqueue()`, whose
+        // native already (correctly) delegates to the real `enqueue` bytecode
+        // for a real-layout Reference. Symptom: Spring's
+        // `ConcurrentReferenceHashMap` failing to purge stale entries, which
+        // aborts `AbstractApplicationContext.resetCommonCaches()` and hence
+        // any context refresh that has to be cancelled
+        // (`scripting.{bsh,config,groovy}.*` in the Spring suite).
+        //
+        // Only the constructor is dropped. `poll`/`remove` stay native: the
+        // GC's reference processor enqueues by writing the queue's head slot
+        // directly (`vm/src/runtime/interpreter.rs`) and never notifies the
+        // real `lock`, so real blocking `remove()` bytecode would wait forever.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/lang/ref/ReferenceQueue"
+            && method_name == "<init>"
         {
             return;
         }

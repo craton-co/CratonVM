@@ -47,6 +47,24 @@ pub struct DebugRealm {
     /// Java Flight Recorder — records VM events (GC, thread, class loading, compilation).
     pub flight_recorder: parking_lot::Mutex<cratonvm_jfr::FlightRecorder>,
 
+    /// obsaudit D12 (2026-07-26) — `(recording_id, filename)` for the
+    /// `-XX:StartFlightRecording` recording that should be dumped when the
+    /// VM exits, if `dumponexit` was not explicitly set to `false`. `None`
+    /// when no such recording exists (the flag was never passed) or when
+    /// `dumponexit=false` was requested. Read by the pre-exit hook installed
+    /// in `vm-cli/src/main.rs`'s `run()`.
+    pub jfr_dump_on_exit: parking_lot::Mutex<Option<(u64, String)>>,
+
+    /// obsaudit D15 (2026-07-26) — the real attach-API jcmd processor,
+    /// constructed in `Vm::new` (not here — it needs an `Arc<SharedVm>` for
+    /// `VmDiagnosticState`, which does not exist yet during `SharedVm::new`)
+    /// via `JcmdProcessor::new_with_vm_state`. Must be kept alive for the
+    /// VM's lifetime: dropping it would not by itself close the listener's
+    /// background thread or unlink the socket, but there is no reason to
+    /// drop it early, and holding it here ties its lifetime to the most
+    /// natural owner. `None` until `Vm::new` fills it in.
+    pub jcmd_processor: parking_lot::Mutex<Option<crate::runtime::serviceability::JcmdProcessor>>,
+
     /// JVMTI debug state — breakpoints, step requests, and event callbacks.
     #[cfg(feature = "experimental-debug")]
     pub debug_state: parking_lot::Mutex<crate::debug::DebugState>,

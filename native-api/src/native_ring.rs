@@ -280,7 +280,7 @@ pub fn record_exit(token: usize) {
 
 fn track_enabled() -> bool {
     static T: OnceLock<bool> = OnceLock::new();
-    *T.get_or_init(|| std::env::var_os("CRATONVM_TRACK_NATIVE").is_some())
+    *T.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_TRACK_NATIVE").is_some())
 }
 
 thread_local! {

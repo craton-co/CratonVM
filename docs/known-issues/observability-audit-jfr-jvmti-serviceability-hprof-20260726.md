@@ -13,17 +13,39 @@ established first, per subsystem, before any code change.**
 
 ---
 
+## Closure status (2026-07-26, follow-up pass)
+
+**13 of 15 defects are FIXED. The remaining two (D2, D14) are PARTIALLY
+FIXED** — in both cases the specific failure mode this audit exists to catch
+("a subsystem silently reports fake, incomplete, or unreachable data while
+*advertising* that it works") is closed, but a larger, separately-scoped
+feature described in the defect's own text (a verifier slot-kind extension
+for D2, full JVMTI-implementation unification for D14) remains open and is
+not attempted here — see each defect's own updated section for exactly what
+was and wasn't done and why.
+
+This doc stays in `docs/known-issues/` rather than moving to
+`docs/internal/` per the repo's convention (a doc moves out only when it has
+*no* remaining open sub-part) — D2 and D14 each still name one. Everything
+else — every subsystem that was silently lying, unreachable, or leaking —
+is closed: JVMTI event delivery (D1, D14 bridge), JFR (D12), HPROF (D6-D11),
+`java.lang.instrument` (D5), jcmd/attach (D3, D4, D15), and the two
+misleading/dead surfaces (D13 removed, D2's capability negotiation made
+honest).
+
+---
+
 ## 1. Liveness table
 
 | Subsystem | Reachable on a default build? | Produces real data? | Data trustworthy? |
 |---|---|---|---|
-| **JFR emit surface** (`jfr/src/builtin.rs`, ~30 VM call sites) | Compiled in and called — but every `emit_*` returns early on `is_enabled()`, which is **permanently false** | **No** | n/a |
-| **JFR recording lifecycle** (`new_recording` / `start_recording`) | **No** — zero callers outside `#[cfg(test)]`; no `-XX:StartFlightRecording`; no working jcmd verb | No | n/a |
+| **JFR emit surface** (`jfr/src/builtin.rs`, ~30 VM call sites) | Compiled in and called; `is_enabled()` is real once `-XX:StartFlightRecording` starts a recording (D12) | **Yes, when a recording is active** | Yes for the fields these sites populate |
+| **JFR recording lifecycle** (`new_recording` / `start_recording`) | **Yes (D12)** — `-XX:StartFlightRecording` calls both from `Vm::new`; jcmd verbs still the D3 stubs (bundled with D15) | Yes | Yes — `max_age`/`max_size` are now enforced, not just stored |
 | **JFR file writer** (`dump_to_file`) | **No** — no caller outside the `jfr` crate | n/a | Format is a documented **bespoke** encoding, not stock JFR: not loadable by JMC / `jfr print` |
 | **JVMTI event delivery** (`runtime/jvmti.rs`) | Yes — global manager installed from `SharedVm::new`; `fire_*` driven by interpreter / classloading / GC hooks | Fires; in-tree/test listeners always worked, and a real native agent now receives 9 of ~26 event kinds via the D14 bridge | Yes — see D1, D2, D14 |
 | **JVMTI native agents** (`-agentpath:`) | Yes, via `vm/src/jvmti/agent.rs` (real `dlopen` + `Agent_OnLoad`), feature `experimental-debug` (default-on) | Yes | Agents reach a **different** `EventManager`, now bridged (D14) for VMInit/VMDeath/ThreadStart/ThreadEnd/ClassLoad/ClassPrepare/GC-start-finish/ObjectFree; `JvmtiCapabilities::potential()` was corrected to advertise `false` for the event kinds that remain unbridged, so `AddCapabilities` no longer over-promises |
 | **JVMTI `GetLocalVariable*`** | Yes (capability advertised) | **No** — reads an agent-written side table, never real frames | n/a — see D2 |
-| **jcmd / attach surface** (`runtime/serviceability.rs`) | **No** — `AttachListener` opens no socket; `JcmdProcessor` constructed only in tests | No | Several handlers returned **fabricated** data — see D3, D4 |
+| **jcmd / attach surface** (`runtime/serviceability.rs`) | **Yes (D15)** — real Unix domain socket at `/tmp/.java_pid<pid>`, `JcmdProcessor::new_with_vm_state` constructed from `Vm::new` | Yes | Yes — the *live* command set (`register_live_commands`) is real; the fabricated-data set (D3, D4) is never reached from production |
 | **`java.lang.instrument`** (`runtime/instrument.rs`) | **Yes** — natives registered in both the synthetic and real-JDK paths; self-attach (`ByteBuddyAgent.install()`) supported | Yes | Yes, after D5 |
 | **HPROF heap dump** (`runtime/hprof.rs`) | **Yes**, one trigger: `-XX:+HeapDumpOnOutOfMemoryError`, once per VM lifetime | Yes | **No** before this audit — see D6, D7, D8 |
 
@@ -38,8 +60,18 @@ established first, per subsystem, before any code change.**
   a real native agent (`vm/src/jvmti/`) now receives 9 of ~26 event kinds via
   a bridge (D14) with an honest, correspondingly-narrowed capability set —
   full unification of the two implementations remains open.
-* JFR captures nothing (D12, open); jcmd/attach is unreachable from another
-  process (D15, open).
+* **JFR** — captures real events once `-XX:StartFlightRecording` starts a
+  recording (D12 fixed). jcmd's attach surface itself is now reachable from
+  another process (D15 fixed) — real `jcmd`/`jstack`/`jmap` verified — but
+  the *live* jcmd command set does not register `JFR.*` yet, so `jcmd <pid>
+  JFR.start` currently gets "unknown command" rather than either a real
+  start or D3's honest-error text; wiring that is the natural next step
+  (see D15's section) and was left for whoever picks it up next.
+* **jcmd/attach** — reachable from another process (D15 fixed), serving
+  `Thread.print`, `GC.heap_dump`, `GC.run`, `GC.heap_info`,
+  `GC.class_histogram`, `VM.version`, `VM.flags`, `VM.system_properties`,
+  `VM.uptime`, `VM.command_line` — all backed by real VM state, none
+  fabricated.
 
 ---
 
@@ -278,29 +310,72 @@ in `runtime/interpreter.rs` now thread the calling thread through. Related,
 still open: object IDs are raw heap addresses, so under a relocating
 collector two dumps disagree and a recycled address can alias.
 
-### D12 — JFR is unreachable; `RecordingSettings` has five inert fields — **DOCUMENTED**
+### D12 — JFR is unreachable; `RecordingSettings` has five inert fields — **FIXED**
 
-`vm-cli` never calls `start_recording` (the code's own comment in
-`vm_init.rs:5041` says so), there is no `-XX:StartFlightRecording`, and the
-jcmd verbs were the stubs of D3. `is_enabled()` is permanently false, so the
-~30 wired `emit_*` call sites are one relaxed atomic load each and capture
-nothing.
+`vm-cli` never called `start_recording`, there was no
+`-XX:StartFlightRecording`, and the jcmd verbs were the stubs of D3.
+`is_enabled()` was permanently false, so the ~30 wired `emit_*` call sites
+were one relaxed atomic load each and captured nothing.
 
 Separately, `RecordingSettings::{max_age, max_size, disk, dump_on_exit,
-duration}` are **read by no code**. `max_size` and `max_age` in particular are
-honest-looking retention knobs that do nothing: a recording's only bound is
-`EventRepository::default()`'s fixed 100 000-event ring. These must not be
-surfaced as a CLI option, jcmd argument, or `jdk.jfr` API until enforced.
-Contract pinned by `obsaudit_max_size_and_max_age_are_not_enforced`.
+duration}` were **read by no code**. `max_size` and `max_age` in particular
+were honest-looking retention knobs that did nothing: a recording's only
+bound was `EventRepository::default()`'s fixed 100 000-event ring.
 
-**Memory is bounded** (the audit's specific question): per-thread ring 1024
-entries fixed, per-recording repository 100 000 events with eviction. One
-latent hazard: `ThreadRingRegistry` reclaims retired+empty shards only from
-inside `drain_all`, which runs at dump time — so reclamation never runs today.
-Harmless only because the disabled gate keeps ordinary threads from registering
-a shard at all; it becomes a real per-thread leak the moment a long-lived
-recording starts on a thread-churning workload. Fix reclamation as part of
-wiring the trigger, not after.
+**Fixed (2026-07-26):**
+
+* **The trigger.** `-XX:StartFlightRecording[:filename=...,duration=...,
+  maxage=...,maxevents=...,dumponexit=...]` (`vm-cli/src/main.rs`) starts a
+  real recording from `Vm::new` (`vm/src/vm/vm_init.rs`). Bare
+  `-XX:StartFlightRecording` works with HotSpot's defaults (`dumponexit=true`,
+  no other limits). Deliberately **not** offered: `disk=` (recordings stay
+  memory-only — see below) and HotSpot's `maxsize=` name, reused here as
+  `maxevents=` instead, because `jfr::RecordingSettings::max_size` bounds an
+  *event count*, not bytes — keeping HotSpot's byte-denominated name would
+  have meant something silently different in CratonVM, which is worse than
+  not offering it. jcmd `JFR.start`/`JFR.stop`/`JFR.dump` are unchanged (still
+  D3's honest-error stubs) — wiring them to the now-real `start_recording`/
+  `dump_recording` calls is bundled with D15 (the jcmd dispatch surface),
+  not here.
+* **`max_age` / `max_size`.** `jfr::repository::EventRepository` gained
+  `with_max_age(max_events, max_age_nanos)`; `Recording::new` uses it instead
+  of `EventRepository::default()`, so both are real, continuously-enforced
+  retention bounds now — not a CLI-only illusion. Age is compared against
+  each pushed event's own `start_time` (no wall-clock dependency inside the
+  library). The original contract pin
+  (`obsaudit_max_size_and_max_age_are_not_enforced`) is renamed
+  `obsaudit_max_size_and_max_age_are_enforced` and now asserts the opposite —
+  see the doc comment for how the test still forces a deterministic result.
+* **`dump_on_exit`.** The VM's existing pre-`std::process::exit` hook
+  (`vm-cli/src/main.rs`, the same one `cleanup_staged_archive_copies` already
+  used) now also dumps the flagged recording via `process_vm()` +
+  `FlightRecorder::dump_recording`. Covers Java-initiated exit
+  (`System.exit`/`Runtime.exit`/`Runtime.halt`) — the common real-application
+  shutdown path; a hard native crash or an unrelated direct
+  `std::process::exit` call elsewhere in the Rust CLI would still miss it, an
+  honestly-documented residual rather than a claimed 100%-coverage guarantee.
+* **`duration`.** A background "JFR-Periodic-Drain" thread (spawned only
+  when `-XX:StartFlightRecording` is used) stops the recording once the
+  configured duration elapses.
+* **`disk`.** Still **inert** — there is no disk-backed repository;
+  recordings remain memory-only until an explicit dump. Not exposed by the
+  new CLI flag for this reason; still left in place as "the right shape for
+  the eventual implementation" per `RecordingSettings`'s own doc comment.
+
+**The reclamation leak — fixed as part of the trigger, per this doc's own
+instruction.** `ThreadRingRegistry` reclaimed retired+empty shards only from
+inside `drain_all`, which used to run only at dump time. The same
+periodic-drain thread that enforces `duration` also calls
+`FlightRecorder::drain_per_thread_into_repository()` once a second for the
+lifetime of the recording, so `reclaim_retired_shards` now actually runs
+continuously while a recording is active — a long-lived recording on a
+thread-churning workload no longer accumulates retired shards for its whole
+lifetime.
+
+**Memory is bounded** (the audit's original question, still true and now
+backed by real enforcement rather than accident): per-thread ring 1024
+entries fixed, per-recording repository bounded by `max_size` (default
+100 000) with real age-eviction on top when `max_age` is set.
 
 ### D13 — `runtime::jvmti::AgentRegistry::load_agents` loads nothing — **FIXED (removed)**
 
@@ -357,14 +432,88 @@ capability structs remain separate types. **Full unification (shared event
 enum, shared capability set, one `JvmtiEnv`) remains open, as originally
 scoped**; see the cross-owner request below, updated to reflect the bridge.
 
-### D15 — the attach surface opens no socket — **DOCUMENTED**
+### D15 — the attach surface opens no socket — **FIXED**
 
-`AttachListener::start_listening` only flips a `bool`; no socket, named pipe,
-or `.attach_pid<N>` file is created, and `JcmdProcessor` is constructed only in
-tests. `jcmd`/`jstack`/`jmap` from another process cannot connect to a
-CratonVM at all. Pinned by `obsaudit_attach_listener_creates_no_socket`, with a
-warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
-`register_default_commands` would then start reporting invented data.
+`AttachListener::start_listening` only flipped a `bool`; no socket, named
+pipe, or `.attach_pid<N>` file was created, and `JcmdProcessor` was
+constructed only in tests (`JcmdProcessor::new_with_vm_state`, the variant
+backed by real VM state via the already-implemented `VmDiagnosticState for
+SharedVm`, existed and was even integration-tested — just never called from
+`Vm::new`). `jcmd`/`jstack`/`jmap` from another process could not connect to
+a CratonVM at all.
+
+**Fixed (2026-07-26):** `AttachListener::start_listening` now binds a real
+Unix domain socket at `/tmp/.java_pid<pid>` — the exact path real HotSpot
+tooling probes for on Linux — and serves the HotSpot Attach API wire
+protocol in a background thread. `Vm::new` constructs
+`JcmdProcessor::new_with_vm_state(shared.clone())` (never the argument-less
+`::new()`, which still reports fabricated data via
+`register_standard_commands` — that variant is now a test-only affordance
+with a per-call unique socket path so its ~15 test call sites don't collide
+under `cargo test`'s default parallelism).
+
+The wire protocol was **not** reverse-engineered from memory or
+documentation: it was determined empirically by standing up a bare Python
+socket listener at `/tmp/.java_pid<pid>` for a live dummy process and
+logging the raw bytes a real OpenJDK 21 `jcmd`/`jstack`/`jmap` sent, on the
+audit host. Findings, all now implemented in `handle_attach_connection`:
+
+* Every attach opens the socket twice: a zero-byte "is a listener already
+  up?" readiness probe, then the real request. Both must be handled — the
+  first is a no-op, not an error.
+* The real request is five NUL-terminated fields:
+  `<protocol-version>\0<operation>\0<arg1>\0<arg2>\0<arg3>\0`. `jcmd`
+  sends operation `jcmd` with the entire diagnostic command line as `arg1`;
+  `jstack` sends `threaddump`; `jmap -histo` sends `inspectheap`; `jmap
+  -dump:file=X` sends `dumpheap` with `X` as `arg1`.
+* The response is a decimal result code, a newline, then the raw command
+  output; connection close signals EOF. No length prefix.
+
+**A real, load-bearing bug was caught by testing against the real tools, not
+just unit tests of the framing code in isolation:** the first implementation
+read each connection until EOF before responding. A real client does not
+close its write side before reading the response — it writes the request,
+then immediately starts reading — so read-until-EOF deadlocks: the server
+blocks waiting for a close the client will only do after seeing a response,
+and the client blocks waiting for a response the server never sends because
+it's still waiting to read. Confirmed end-to-end: `jcmd <pid> VM.version`
+reported `Premature EOF` (its own timeout gave up first), and every
+subsequent attach attempt then reported `Connection refused`. Fixed by
+reading until the five NUL-terminated fields are complete rather than until
+EOF, with a 5-second read timeout as a backstop against a malformed peer.
+Verified against real `jcmd VM.version`/`VM.uptime`/`Thread.print`, real
+`jstack`, and real `jmap -histo` after the fix — all succeeded with correct,
+live output (e.g. a real, advancing `VM uptime`, a real thread dump naming
+the `main` thread). Two permanent regression tests
+(`d15_attach_socket_speaks_the_real_wire_protocol`,
+`d15_attach_socket_threaddump_operation`, in `vm/tests/tier1_tests.rs`)
+speak the protocol directly over a `UnixStream` with a read timeout, so a
+regression back to read-until-EOF fails fast instead of hanging CI.
+
+The original contract pin (`obsaudit_attach_listener_creates_no_socket`) is
+renamed `obsaudit_attach_listener_creates_a_real_socket` and now asserts a
+real socket file exists (and that `stop_listening` removes it) instead of
+asserting the opposite.
+
+**Deliberately out of scope for this pass, left honestly documented rather
+than silently absent:**
+
+* **Windows.** The implementation is `std::os::unix::net`-based, matching
+  HotSpot's own per-OS split (Unix domain socket on Linux/macOS, a named
+  pipe on Windows). `start_listening` still just flips the flag on a
+  non-Unix target.
+* **`load` (dynamic agent attach) and `datadump`.** Only `jcmd`,
+  `threaddump`, `inspectheap`, `dumpheap`, and `properties` are translated;
+  an unrecognized operation gets an honest "unrecognized" error rather than
+  silently doing nothing.
+* **Wiring `register_live_commands` to JFR.** Now that D12 makes
+  `start_recording`/`dump_recording` genuinely work, `JFR.start`/`JFR.stop`/
+  `JFR.dump` could be added to the live command set for real (today they
+  simply aren't registered there at all — a real client gets "unknown
+  command", not the D3 stubs' honest-error text, since the live set never
+  included them). Natural next step for whoever picks this up; not
+  attempted here to keep this change scoped to "the socket exists and
+  speaks the real protocol."
 
 ---
 
@@ -373,7 +522,7 @@ warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
 | File | Change |
 |---|---|
 | `vm/src/runtime/hprof.rs` | D6, D7, D8, D9, D10, D11 fixed; module LIVENESS block; 4 tests (original pass) |
-| `vm/src/runtime/serviceability.rs` | D3, D4 fixed; D15 + module LIVENESS block; 3 tests (replacing 4 that asserted the fabricated output) |
+| `vm/src/runtime/serviceability.rs` | D3, D4 fixed (original pass); D15 fixed: `AttachListener` opens a real Unix socket and serves the real Attach API wire protocol, `commands` is now `Arc<RwLock<Vec<_>>>` (`find_command` replaced by `dispatch_command`), unique per-instance test socket paths; contract pin renamed `obsaudit_attach_listener_creates_a_real_socket`; 2 new permanent end-to-end protocol tests in `vm/tests/tier1_tests.rs` |
 | `vm/src/runtime/instrument.rs` | D5 fixed (`class_file_this_class` validator); 4 tests |
 | `vm/src/runtime/jvmti.rs` | D1 fixed (deferred hook firing + real thread id); D2 partially fixed (honest capability negotiation; frame access itself still open); D13 fixed (dead `AgentRegistry` removed, -8 tests); D14 bridged (`install_real_agent_env_bridge`, 9 event kinds); LIVENESS block updated throughout |
 | `classloading/src/class_manager.rs` | D1: deferred-queue hook firing, `set_current_thread_id`/`current_thread_id`, `drain_pending_class_hooks`; 2 new tests |
@@ -382,15 +531,26 @@ warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
 | `vm/src/jvmti/capabilities.rs` | D14: `potential()` no longer advertises capabilities for unbridged event kinds; 2 new tests |
 | `vm/src/jvmti/mod.rs` | D14: `test_full_workflow` updated (no longer requests a now-`false` capability) |
 | `jfr/src/lib.rs` | D12 LIVENESS + memory-bounds block |
-| `jfr/src/recording.rs` | D12 inert-field docs; 2 tests |
+| `jfr/src/recording.rs` | D12 fixed: `Recording::new` enforces `max_size`/`max_age` via `EventRepository::with_max_age`; `RecordingSettings` doc comment updated; contract pin renamed to `obsaudit_max_size_and_max_age_are_enforced` (now asserts enforcement); 1 new test |
+| `jfr/src/repository.rs` | D12 fixed: `EventRepository::with_max_age` + `evict_front` helper (shared by size-cap and age-cap eviction) |
+| `vm/src/config.rs` | D12: `JfrStartRecordingConfig` + `VmConfig::jfr_start_recording` |
+| `vm/src/vm/realms/debug_realm.rs` | D12: `jfr_dump_on_exit` field (recording id + filename for the pre-exit dump). D15: `jcmd_processor` field keeps the real `JcmdProcessor` (and its socket) alive for the VM's lifetime |
+| `vm/src/vm/vm_init.rs` | D12: `Vm::new` starts the recording, spawns the periodic drain/duration-watcher thread (also fixes the `ThreadRingRegistry` reclamation leak). D15: `Vm::new` constructs `JcmdProcessor::new_with_vm_state` |
+| `vm-cli/src/main.rs` | D12: `-XX:StartFlightRecording[:opts]` parsing (`parse_jfr_start_recording_opts`, `parse_jfr_duration`); pre-exit hook dumps the recording via `process_vm()`; 10 new tests |
 
-D1, D13, D14 rows above: built and tested on the Azure host
-(`fix/observability-audit-20260726`) — `cratonvm-classloading` full suite,
-`cratonvm-vm` `jvmti` test subset (117 passed after D13's removal), and
-`vm/tests/lock_order_smoke` / `vm/tests/new19_module_access` all green. The
-original D3–D12 rows above were not built or tested (concurrent builds OOM'd
-the audit host at the time) — still true for that original work; not
-re-verified in this pass.
+D1, D2, D11–D15 rows above: built and tested on the Azure host
+(`fix/observability-audit-20260726`, later merged to `dev`) —
+`cratonvm-classloading` and `cratonvm-jfr` full suites, `cratonvm-cli` full
+suite (119+10 tests), `cratonvm-vm` `jvmti`/`hprof`/`serviceability` test
+subsets, `vm/tests/tier1_tests` full suite (incl. 6 new end-to-end tests
+that boot a real `Vm` and exercise JFR/HPROF/attach against it), and
+`vm/tests/lock_order_smoke` / `vm/tests/new19_module_access` all green. D15
+in particular was verified against **real, unmodified OpenJDK 21
+`jcmd`/`jstack`/`jmap`** on the audit host, not just this repo's own tests —
+see D15's section for the wire-protocol deadlock that real-tool testing
+caught and unit tests alone would have missed. The original D3–D10 rows
+(from the first pass on this doc) were not re-verified in this follow-up
+pass; nothing in this pass touched their code.
 
 ---
 

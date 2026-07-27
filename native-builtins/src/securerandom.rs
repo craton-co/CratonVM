@@ -1011,6 +1011,8 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// JDK reference values for `new Random(42).nextLong()` followed by
