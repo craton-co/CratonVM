@@ -80,6 +80,14 @@ shape is worth making self-reporting.
 
 ## Supporting measurements (isolated probes, this host, JDK 25 HotSpot control)
 
+> **Caveat on absolute rates.** This Windows box was multitenant throughout
+> (17 concurrent `cratonvm` processes from other sessions at one point), so
+> treat every absolute figure below as a *lower bound* — see
+> `feedback_shared_host_multitenant_confound`. The HotSpot control ran under
+> the same conditions, and the two structural findings above (OSR-denied,
+> RBC.6-refused) are compile-time facts read out of a trace, not timings, so
+> neither depends on host load.
+
 Per-operation cost in a JIT-compiled loop, nanoseconds. HotSpot's figures are
 escape-analysed for the allocating rows, so treat those as a floor rather than
 a like-for-like ratio; the CratonVM *column* is the interesting part.
