@@ -1,7 +1,7 @@
 # Semantic Differential Fuzzer vs HotSpot
 
 > Industrialize the manual "run it on HotSpot and eyeball the diff" loop that
-> has produced nearly every bug in `docs/internal/*` and `MEMORY.md`. Generate
+> has produced nearly every bug logged in `MEMORY.md`. Generate
 > and mutate Java programs (and bytecode), run them on **both** CratonVM and a
 > real JDK, and **diff observable behavior** — stdout/stderr, thrown exception
 > type+message, return value, and process exit code — automatically, with
@@ -46,11 +46,11 @@ and without a human:
 
 These are **semantic** divergences: the program parses and runs, but produces a
 different *observable result*. They are exactly what the existing fuzz crate
-does **not** test. `docs/internal/reviews/fuzz-review.md` is explicit: the
-`fuzz/` targets are **panic-only parser fuzzers** ("arbitrary input may produce
-`Err(_)`, but must never panic") over untrusted *byte* surfaces (class file,
-jimage, ASN.1, keystore, TLS record). Useful for memory safety; blind to "the
-VM ran the program and got `43` where HotSpot got `42`."
+does **not** test: the `fuzz/` targets are **panic-only parser fuzzers**
+("arbitrary input may produce `Err(_)`, but must never panic") over untrusted
+*byte* surfaces (class file, jimage, ASN.1, keystore, TLS record). Useful for
+memory safety; blind to "the VM ran the program and got `43` where HotSpot got
+`42`."
 
 The thesis of this doc: the manual loop is already a differential oracle. We
 have a working — but tiny and hand-curated — in-repo harness
@@ -433,7 +433,7 @@ the `fuzz/` OSS-Fuzz `build.sh` sketch already in `fuzz/README.md`.
 
 ### First targets (the corners that dominate the bug history)
 
-Ordered by historical bug density in `MEMORY.md` / `docs/internal/`:
+Ordered by historical bug density in `MEMORY.md`:
 
 1. **`invokedynamic` family** — lambdas, `String` concat indy, record
    `toString`/components, switch patterns, `MethodHandle` invoke/adapt

@@ -112,12 +112,9 @@ Row notes:
   compiles to a guarded direct call, and the remaining gap is register
   allocation and recursion inlining, which the current backends do not do.
 - **Binary Trees** was measured at `-Xmx8g` as seven alternating
-  fresh-process pairs; all fourteen checksums were `68332206`. The full
-  optimization story is
-  [docs/internal/performance/binarytrees-half-gap-20260718.md](docs/internal/performance/binarytrees-half-gap-20260718.md).
+  fresh-process pairs; all fourteen checksums were `68332206`.
   A July 2026 dev regression that temporarily quadrupled this row was
-  root-caused (two independent causes) and fixed — see
-  [docs/internal/performance/bt18-inline-tlab-regression-20260724.md](docs/internal/performance/bt18-inline-tlab-regression-20260724.md).
+  root-caused (two independent causes) and fixed.
   The perf gate's anchored baseline is 1,550 ms, reflecting a deliberate
   ~2% correctness hardening (explicit header initialization in the inline
   allocator) accepted after that fix.
@@ -159,11 +156,6 @@ The journey from the earliest 20–100x gaps to the current table is
 documented round by round:
 
 - [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) — the full 26-round JIT journey
-- [docs/internal/performance/halfgap-residuals-20260718.md](docs/internal/performance/halfgap-residuals-20260718.md)
-- [docs/internal/performance/halfgap-20260717.md](docs/internal/performance/halfgap-20260717.md)
-- [docs/internal/performance/hashmap-sieve-half-gap-20260714.md](docs/internal/performance/hashmap-sieve-half-gap-20260714.md)
-- [docs/internal/performance/quickbench-half-gap-3rows-20260713.md](docs/internal/performance/quickbench-half-gap-3rows-20260713.md)
-- [docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md](docs/internal/performance/string-regex-overallocated-groups-fastpath-20260714.md)
 
 ## GPU benchmarks
 

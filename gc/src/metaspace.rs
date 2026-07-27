@@ -719,7 +719,7 @@ impl MetaspaceRegistry {
     /// `register_loader` is the only other writer, `loaders` was append-only:
     /// every loader ever created kept a `ClassLoaderMetaspace` row (with an
     /// owned `loader_name: String`) for the process lifetime. That is the exact
-    /// shape of leak `docs/internal/class-loader-unloading-and-bounded-metadata.md`
+    /// shape of leak `docs/architecture/class-loader-unloading.md`
     /// forbids ("either unload invalidation or hard bounds"), and it is invisible
     /// — the row is small, so it fails only after hours under a proxy-generating
     /// workload.

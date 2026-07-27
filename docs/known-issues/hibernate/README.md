@@ -11,8 +11,7 @@ single digits) cleared after merging `origin/dev` commit `13055f75c` ("fix(jit):
 compact-layout field offsets and the branch-join reload mirror") and rebuilding:
 
 - `MappingXsdSupport.<clinit>` `StringIndexOutOfBoundsException` cluster (113 classes) — root-caused
-  and FIXED, see
-  [docs/internal/fixed-suite-bugs/hibernate/mappingxsdsupport-clinit-siobe-compact-ref-fields-jit-regression-FIXED.md](../../internal/fixed-suite-bugs/hibernate/mappingxsdsupport-clinit-siobe-compact-ref-fields-jit-regression-FIXED.md).
+  and FIXED (compact-ref-fields JIT regression in the class-init path).
   112/113 confirmed passing after the fix; the 1 straggler (`ScannerTest`) now fails on an
   unrelated pre-existing timeout, not this bug.
 - `TableGroupJoinProducer.createTableGroupJoin` `NullPointerException` cluster (20 classes) — never

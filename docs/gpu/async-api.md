@@ -416,9 +416,8 @@ from the by-design [Limitations](#limitations) below.
   completion reaper thread (`ensure_completion_reaper_started` in
   `vm/src/runtime/offload.rs`) that finalizes the submission itself, off
   the mutator, while application code is doing something else entirely.
-  This was formerly the last item in
-  `docs/internal/gpu-offload-followups-20260711.md`; that file's item
-  3 is now closed.
+  See [`async-completion-reaper.md`](async-completion-reaper.md) for the
+  reaper's design.
 - **Only `Void` results were surfaced until 2026-07-11 evening; scalar
   reduction results now reach Java too.** `SerializedResult`'s
   `ScalarI32/I64/F32/F64` variants (integer/long reduction kernels, `)I`/`)J`
@@ -454,8 +453,7 @@ from the by-design [Limitations](#limitations) below.
   of a hot loop), dispatch moves into JIT-emitted code and the hook is
   never consulted again — offload silently stops, structurally, even
   though the 2026-07-11 fix keeps eligible interpreted call sites
-  re-entering the hook correctly. See
-  `docs/internal/gpu-offload-followups-20260711.md` item 2.
+  re-entering the hook correctly. See [`jit-caller-gate.md`](jit-caller-gate.md).
 
 ## Limitations
 
@@ -509,7 +507,6 @@ from the by-design [Limitations](#limitations) below.
   to methods bearing this annotation.
 - [`README.md`](README.md) — top-level reference: build matrix
   (`gpu` vs `gpu-driver`), CLI surface, file index.
-- [`docs/internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md)
-  — completed follow-ups from the first real-hardware validation pass,
-  including the reduction void-return gate and the JIT-caller bypass
-  referenced in [Current limitations](#current-limitations).
+- [`reductions.md`](reductions.md) and [`jit-caller-gate.md`](jit-caller-gate.md)
+  — the reduction void-return gate and the JIT-caller bypass referenced in
+  [Current limitations](#current-limitations).

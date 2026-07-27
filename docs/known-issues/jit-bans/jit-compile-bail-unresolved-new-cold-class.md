@@ -2,8 +2,7 @@
 
 **Status:** OPEN (diagnosed, not fixed). Not a correctness bug — affected
 methods stay interpreted, which is safe but can be very slow. Found on
-2026-07-27 while re-testing the json-smart JIT ban
-(`docs/internal/jsonsmart-parser-jit-retired-20260727.md`).
+2026-07-27 while re-testing the json-smart JIT ban (since retired).
 
 ## Symptom
 
