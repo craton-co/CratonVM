@@ -1816,84 +1816,43 @@ fn should_skip_jit_internal(
         // longer reproduces on current dev.
         // `SerializableTypeWrapperProbe.java` is the regression witness.
 
-        // SPB.4 (Session 113 r1) — provisional blanket ban for the Spring
-        // Boot configuration-property binder package. ms-course-youtube
-        // `admin-service` SIGSEGVs (rc=139) deep inside the property bind
-        // path: `JavaBeanBinder$Bean.<init>` -> `BeanProperties.<init>`
-        // -> `BeanProperties.addProperties` -> `getSorted`. The
-        // `CRATONVM_FRAME_TRACE=1` capture shows the very last frames
-        // before the crash are `Banner$Mode.<clinit>` returning into
-        // `Class$ReflectionData.<init>` then `Reflection.filter` —
-        // i.e. the JavaBeanBinder is reflectively scanning a class for
-        // bindable properties via `Class.getDeclaredMethods()` /
-        // `Class.getDeclaredFields()`, sorting the filtered Member array,
-        // and storing each into a `LinkedHashMap` keyed by property name.
+        // SPB.4 / SPB.4b / SPB.4c -- REMOVED 2026-07-27. All three were
+        // provisional blanket bans (Session 113 r1) for
+        // org/springframework/boot/context/properties/bind/,
+        // org/springframework/boot/context/, and the org/springframework/boot/
+        // umbrella (excl. boot/loader/, which SPB.9b covers separately and is
+        // untouched by this removal), originally added against a SIGSEGV seen
+        // in the ms-course-youtube admin-service frame trace -- a fixture app
+        // never present on this host and never independently reproduced here.
         //
-        // The signature matches W2-CHM / RBC.1 / SPB.1 / SPB.2 / SPB.3:
-        // every method on this hot path is allocate-then-putfield-heavy.
-        // `BeanProperties.addProperties` calls `addMethod`/`addField`
-        // which allocate a fresh `BeanProperty` and immediately store
-        // `name`/`type`/`getter`/`setter`/`field` slots; `Bean.<init>`
-        // builds a `Bindable.BindMethod` enum and a `Constructor`
-        // reference; the SAM `BiPredicate.lambda$or$0` captured by the
-        // tight `ConfigurationPropertyName.isAncestorOf` loop allocates
-        // a fresh `lambda$or$0` capture object on each invocation. With
-        // `CRATONVM_DISABLE_JIT=1` the SIGSEGV is replaced by a clean
-        // `NullPointerException` in `PathMatchingResourcePatternResolver.
-        // <clinit>` (a different downstream gap, not a JIT issue).
+        // Re-verified against a real, previously-established fixture:
+        // `/data/data/spring-boot-tomcat-crossmodule-20260717/cratonvm-suite`,
+        // a 10-scenario Spring Boot functional battery (real
+        // spring-boot-4.0.6.jar + spring-context/beans/core/aop/expression-
+        // 7.0.7.jar) that exercises SpringApplication boot, property binding,
+        // environment/profile resolution, conditionals, events, AOP, and
+        // resource loading -- i.e. the exact org/springframework/boot/* boot
+        // path these bans target. Ran baseline (bans active) and with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/` (a superset
+        // that also lifts the narrower SPB.4/.4b prefixes): both configs
+        // produced byte-identical per-scenario pass/fail counts across all 10
+        // scenarios (S01-S10), no new crash, no new hang, no SIGSEGV. (One
+        // pre-existing scenario, S03_ConfigProxy, fails identically 4/8 in
+        // both configs -- a real CGLIB @Configuration proxy singleton-identity
+        // regression, unrelated to these bans and tracked separately, see
+        // docs/known-issues/springboot/configproxy-cglib-singleton-regression-20260727.md.)
+        // A further `CRATONVM_JIT_THRESHOLD=1` aggressive pass with the ban
+        // lifted surfaced a real `ClassCastException` in
+        // `org/springframework/boot/context/config/Profiles.<clinit>`
+        // (array-vs-element-type confusion reading a `ResolvableType[]`) --
+        // but this reproduces IDENTICALLY with the ban still active (not
+        // gated by it at all; the affected class calls into
+        // org/springframework/core/ResolvableType, already unbanned since
+        // SPB.2's own removal), so it is not evidence for keeping SPB.4/.4b/.4c
+        // and is tracked as its own new finding:
+        // docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md.
         //
-        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/
-        // context/properties/bind/`. The narrow per-method entries
-        // (SPB.3) for `SpringIterableConfigurationPropertySource` cover
-        // the upstream cache-key build path; this blanket ban covers the
-        // downstream binder dispatch.
-        if class_name.starts_with("org/springframework/boot/context/properties/bind/")
-            && !package_allowed(
-                "org/springframework/boot/context/properties/bind/",
-                allow_packages,
-            )
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-
-        // SPB.4b (Session 113 r1) — broaden the SPB.4 ban to cover the
-        // surrounding Spring Boot context-property plumbing. After SPB.4
-        // pins the binder dispatch, the very next consumer is
-        // `org/springframework/boot/context/properties/source/
-        // SystemEnvironmentPropertyMapper.processElementValue`, which
-        // calls `String.toLowerCase` (already covered) but also
-        // allocates fresh `CharSequence` views via `String.subSequence`
-        // on every property name. The companion package
-        // `org/springframework/boot/context/properties/source/` (where
-        // SPB.3 has narrow per-method pins) plus the umbrella
-        // `org/springframework/boot/context/` are blanket-banned here so
-        // the JIT cannot promote any method on the bind path. The
-        // SportMe agent's SPB.3 narrow pins remain in effect; this
-        // broader ban is additive, not replacing those entries. Lifted
-        // by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/context/`.
-        if class_name.starts_with("org/springframework/boot/context/")
-            && !package_allowed("org/springframework/boot/context/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-
-        // SPB.4c (Session 113 r1) — Spring Boot's top-level
-        // `SpringApplication`, `Banner$Mode`, `ApplicationEnvironment`,
-        // `DefaultApplicationContextFactory`, `ApplicationInfoPropertySource`,
-        // and friends are also on the boot critical path observed in the
-        // ms-course-youtube admin-service frame trace. Those classes
-        // execute exactly once at boot but do thousand+ allocations
-        // each, putting them above the JIT thresholds. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/`. (This
-        // is the umbrella ban; subpackages like `boot/loader/` are
-        // already past their ctor by the time the binder runs, so the
-        // throughput loss is bounded to startup.)
-        if class_name.starts_with("org/springframework/boot/")
-            && !class_name.starts_with("org/springframework/boot/loader/")
-            && !package_allowed("org/springframework/boot/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // No longer reproduces on current dev at real-world JIT thresholds.
 
         // SPB.5 (Session 113 r1) — provisional blanket ban for Spring
         // Cloud. ms-course-youtube `admin-service` is a Spring Cloud
@@ -2769,26 +2728,22 @@ mod tests {
         // SPRINGBOOT-WITHOUT-JACKSON.2 (a narrow, method-specific,
         // both-policies guard) was removed 2026-07-26 -- see the removal
         // comment above should_skip_jit_internal for the re-verification
-        // evidence. Its removal is only independently observable under
-        // Aggressive: under Conservative (the default, and the only policy
-        // reachable from the CLI -- jit_aggressive_compilation has no
-        // CLI/env wiring), this exact class is ALSO caught by the much
-        // broader, unrelated, still-active "org/springframework/boot/"
-        // blanket ban a few hundred lines below (excluding the loader
-        // subpackage), which is out of scope for this removal and
-        // was not re-tested this session.
+        // evidence. At the time, this class was ALSO caught under
+        // Conservative by the separate, broader "org/springframework/boot/"
+        // blanket ban (SPB.4c), so the removal was only independently
+        // observable under Aggressive. SPB.4/.4b/.4c were themselves removed
+        // 2026-07-27 (see that removal comment, real spring-boot-4.0.6.jar
+        // suite evidence) with no shadow remaining, so this class is now
+        // unconditionally JIT-eligible under both policies.
         let class_name =
             "org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader";
-        assert_eq!(
-            check(class_name, "loadClass", false, true, SkipPolicy::Aggressive),
-            None,
-            "{class_name}.loadClass must be JIT-eligible under Aggressive now that SPRINGBOOT-WITHOUT-JACKSON.2 is removed"
-        );
-        assert_eq!(
-            check(class_name, "loadClass", false, true, SkipPolicy::Conservative),
-            Some(SkipReason::RustJvmTestFixture),
-            "still caught by the separate org/springframework/boot/ blanket ban under Conservative"
-        );
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(class_name, "loadClass", false, true, policy),
+                None,
+                "{class_name}.loadClass must be JIT-eligible under {policy:?} now that both SPRINGBOOT-WITHOUT-JACKSON.2 and its former SPB.4c shadow are removed"
+            );
+        }
     }
 
     #[test]
@@ -3567,6 +3522,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn springboot_boot_packages_are_jit_eligible_after_spb4_4b_4c_removal() {
+        // SPB.4/.4b/.4c (org/springframework/boot/context/properties/bind/,
+        // org/springframework/boot/context/, and the org/springframework/boot/
+        // umbrella excl. boot/loader/) were removed 2026-07-27 -- see the
+        // removal comment above should_skip_jit_internal for the
+        // re-verification evidence (the real spring-boot-tomcat-crossmodule
+        // 10-scenario suite, real spring-boot-4.0.6.jar, baseline vs.
+        // CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/ byte-identical
+        // across all 10 scenarios).
+        for (class_name, method) in [
+            (
+                "org/springframework/boot/context/properties/bind/JavaBeanBinder",
+                "bind",
+            ),
+            (
+                "org/springframework/boot/context/properties/source/SystemEnvironmentPropertyMapper",
+                "processElementValue",
+            ),
+            ("org/springframework/boot/SpringApplication", "run"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that SPB.4/.4b/.4c are removed"
+                );
+            }
+        }
+        // org/springframework/boot/loader/ is untouched by this removal --
+        // SPB.9b's own, separate ban on it stays active regardless.
+        assert_eq!(
+            check(
+                "org/springframework/boot/loader/JarLauncher",
+                "launch",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "org/springframework/boot/loader/ must stay skipped under Conservative -- SPB.9b, not SPB.4c, covers it"
+        );
     }
 
     #[test]
