@@ -314,11 +314,42 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
 fn platform_free(ptr: *mut u8, size: usize) {
     extern "C" {
         fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
     }
     unsafe {
+        if jit_poison_free_enabled() {
+            // DIAG: keep the mapping, make it permanently inaccessible, never
+            // recycle the address. A later jump into this retired body still
+            // faults at the same moment it would have, but the region is still
+            // in /proc/self/maps (as `---p`), which positively identifies the
+            // fault as "jumped into retired JIT code" instead of leaving an
+            // unmapped address with no provenance.
+            const PROT_NONE: i32 = 0;
+            mprotect(ptr, size, PROT_NONE);
+            POISONED_JIT_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         munmap(ptr, size);
     }
 }
+
+/// DIAG (2026-07-27): `CRATONVM_JIT_POISON_FREE=1` retires executable buffers
+/// with `mprotect(PROT_NONE)` instead of `munmap`, so a use-after-free jump into
+/// retired JIT code is directly observable (the range stays mapped and the
+/// address is never reused). Leaks address space by construction.
+pub fn jit_poison_free_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_POISON_FREE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Total bytes retired via the poison path.
+pub static POISONED_JIT_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(all(
     not(target_os = "windows"),

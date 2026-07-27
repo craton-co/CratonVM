@@ -376,6 +376,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // multiple sources and strip any `file:` scheme prefix before
             // handing the result to `p57_to_os_path`.
             let mut candidates: Vec<String> = Vec::new();
+            // 0. `URI.getPath()` -- the DECODED path component, which is what
+            //    the real `Path.of(URI)` ends up with. Every field probe below
+            //    reads a RAW (still percent-encoded) component, so a directory
+            //    genuinely named `custom#root` came back as `custom%23root`
+            //    and `Files.exists`/`Files.walk` saw nothing
+            //    (`core.io.support.PathMatchingResourcePatternResolverTests
+            //    .encodedHashtagInPath`). Same shape as the `new File(URI)`
+            //    raw-path fix.
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[])
+            {
+                if let Some(decoded) = ctx.read_string(s) {
+                    candidates.push(decoded);
+                }
+            }
             // 1. URI.path by name (real-JDK URIs constructed via real-JDK
             //    URI bytecode populate this; ours don't but cheap to try).
             if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "path") {
@@ -1723,6 +1738,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
                 ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
                 return Ok(Some(Value::Object(Some(result))));
+            }
+            // `URI.getPath()` first -- the DECODED path component (see the
+            // matching note in the `Path.of(URI)` native above); the field
+            // probes below all yield the RAW, still percent-encoded form.
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[])
+            {
+                if let Some(decoded) = ctx.read_string(s) {
+                    if !decoded.is_empty() {
+                        let os_path = p57_to_os_path(&decoded);
+                        let result = p57_alloc_path(ctx, &os_path);
+                        return Ok(Some(Value::Object(Some(result))));
+                    }
+                }
             }
             // URI field 4 is the path component (from our toUri registration)
             let path_str = match ctx.get_field(uri, 4) {
@@ -9512,7 +9541,49 @@ pub(crate) fn file_normalise_path(path: &str) -> String {
 
 #[cfg(not(windows))]
 pub(crate) fn file_normalise_path(path: &str) -> String {
-    path.to_string()
+    // `UnixFileSystem.normalize`: collapse runs of `/` and drop a single
+    // trailing `/` (but keep the root `/` itself). `File.<init>` stores the
+    // NORMALIZED string, so `getPath()`/`getAbsolutePath()` observe it.
+    //
+    // Leaving it un-normalized let a trailing separator survive into
+    // `getAbsolutePath()`, and Spring's
+    // `PathMatchingResourcePatternResolver.retrieveMatchingFiles` builds its
+    // glob as `rootDir.getAbsolutePath() + "/" + subPattern` — a root
+    // directory that already ended in `/` produced `.../scanned//*.txt`, which
+    // matches nothing (`core.io.support.PathMatchingResourcePatternResolverTests
+    // .encodedHashtagInPath` found zero files). The root came straight from
+    // `new File(uri.getSchemeSpecificPart())`, whose value legitimately ends
+    // in `/` for a directory URL.
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        let is_slash = ch == '/';
+        if !(is_slash && prev_slash) {
+            out.push(ch);
+        }
+        prev_slash = is_slash;
+    }
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+#[cfg(test)]
+mod file_normalise_tests {
+    use super::file_normalise_path;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_normalise_matches_unixfilesystem() {
+        assert_eq!(file_normalise_path("/tmp/x/scanned/"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/tmp/x//scanned"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/tmp/x///scanned//"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/"), "/");
+        assert_eq!(file_normalise_path("//"), "/");
+        assert_eq!(file_normalise_path("relative/dir/"), "relative/dir");
+        assert_eq!(file_normalise_path(""), "");
+    }
 }
 
 /// Resolve `new File(parent, child)` the way the JDK's
