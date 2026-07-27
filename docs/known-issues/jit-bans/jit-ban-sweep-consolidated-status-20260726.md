@@ -66,7 +66,7 @@ retain full evidence/repro details; this file is the summary.
 
 ## Flagged, not yet investigated (real, high-value, explicitly recommended for a future session)
 
-- **Undocumented blanket `org/junit/` + 3 siblings** (`junit/`, `org/apache/logging/log4j/`, `com/carrotsearch/randomizedtesting/`) — all from one incidental commit, no rationale. 80-class Hibernate sample clean with all 4 lifted; an ES-specific test (their likely true origin) was inconclusive due to host contention, not a regression. `docs/known-issues/blanket-org-junit-ban-undocumented-shadow-20260726.md`. **NOT removed** — positive partial evidence only.
+- ~~**Undocumented blanket `org/junit/` + 3 siblings**~~ — **CLOSED 2026-07-27, all four REMOVED.** The ES-specific leg this entry called for was completed and initially aborted 58/60 classes — but the cause was not a miscompile these bans guarded against. It was `jit/src/ir_lower.rs` panicking (`expect`) on an overflowed code buffer instead of taking `lower_inner`'s existing `buf.overflowed()` bail to the single-pass backend, triggered by exactly one class, `org/junit/internal/MethodSorter`. Fixing that (13 patch sites now `.ok()`, matching `x64.rs`) ALSO removed 7 pre-existing SIGABRTs from the default-settings ES baseline. With the fix in, baseline-vs-lifted is byte-for-byte identical across ES 60/60, Hibernate 160/160 and Spring Boot 40/40. Retired to `docs/internal/blanket-org-junit-ban-undocumented-shadow-20260726.md`.
 
 ## What genuinely remains unaddressed by this session
 

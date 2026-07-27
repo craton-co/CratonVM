@@ -635,7 +635,7 @@ impl<'a> Lowerer<'a> {
         let rel = self.buf.pos() as i32 - (clear_patch as i32 + 4);
         self.buf
             .try_patch_i32(clear_patch, rel)
-            .expect("IR safepoint poll patch in-bounds");
+            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
     }
 
     /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
@@ -1011,7 +1011,7 @@ impl<'a> Lowerer<'a> {
         let rel = self.buf.pos() as i32 - (fast_skip_patch as i32 + 4);
         self.buf
             .try_patch_i32(fast_skip_patch, rel)
-            .expect("ir_lower self-call stack-sample patch in-bounds");
+            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
 
         // Marshal args into this method's OWN entry ABI — IDENTICAL to the
         // register list `emit_prologue` reads incoming args from: abi[0] = the
@@ -1056,7 +1056,7 @@ impl<'a> Lowerer<'a> {
         let rel = keep_off as i32 - (keep_patch as i32 + 4);
         self.buf
             .try_patch_i32(keep_patch, rel)
-            .expect("ir_lower self-call sentinel keep patch in-bounds");
+            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
         // Spill the return value.
         self.store_rax(slot);
     }
@@ -1476,7 +1476,7 @@ impl<'a> Lowerer<'a> {
             let rel = keep_off as i32 - (keep_patch as i32 + 4);
             self.buf
                 .try_patch_i32(keep_patch, rel)
-                .expect("ir_lower call-sentinel keep patch in-bounds");
+                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
         } else {
             self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
             let patch = self.buf.pos();
@@ -1495,7 +1495,7 @@ impl<'a> Lowerer<'a> {
             let rel = 0i32 - (p as i32 + 4);
             self.buf
                 .try_patch_i32(p, rel)
-                .expect("ir_lower self-call rel32 patch in-bounds");
+                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
         }
     }
 
@@ -1923,7 +1923,7 @@ impl<'a> Lowerer<'a> {
                 let rel = cont as i32 - (jnz_patch as i32 + 4);
                 self.buf
                     .try_patch_i32(jnz_patch, rel)
-                    .expect("guard JNZ patch in-bounds");
+                    .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
             }
             // getfield read — `Op::Load`. The IR builder emits only
             // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
@@ -2368,7 +2368,7 @@ impl<'a> Lowerer<'a> {
                         let rel = around_first as i32 - (jcc_patch as i32 + 4);
                         self.buf
                             .try_patch_i32(jcc_patch, rel)
-                            .expect("codegen patch in-bounds");
+                            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
                         self.emit_phi_copies(block_idx, second_block);
                         self.buf.emit_byte(0xE9); // JMP second_block
                         let jmp_second = self.buf.pos();
@@ -2398,7 +2398,7 @@ impl<'a> Lowerer<'a> {
             let rel32 = target_offset as i32 - (patch_pos as i32 + 4);
             self.buf
                 .try_patch_i32(patch_pos, rel32)
-                .expect("codegen patch in-bounds");
+                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
         }
     }
 
@@ -2594,7 +2594,7 @@ impl<'a> Lowerer<'a> {
             let rel = do_div as i32 - (p as i32 + 4);
             self.buf
                 .try_patch_i32(p, rel)
-                .expect("div-overflow JNE patch in-bounds");
+                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
         }
         after_patch
     }
@@ -2607,7 +2607,7 @@ impl<'a> Lowerer<'a> {
         let rel = cont as i32 - (after_patch as i32 + 4);
         self.buf
             .try_patch_i32(after_patch, rel)
-            .expect("div-overflow JMP patch in-bounds");
+            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
     }
 
     /// Emit a deopt-on-zero branch, given the caller has already emitted a
@@ -2659,7 +2659,7 @@ impl<'a> Lowerer<'a> {
         let rel = cont as i32 - (jcc_patch as i32 + 4);
         self.buf
             .try_patch_i32(jcc_patch, rel)
-            .expect("deopt-unless Jcc patch in-bounds");
+            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
     }
 
     /// IR FP tier (Slice B) — emit the JVMS null + bounds deopt guards for an
@@ -2713,7 +2713,7 @@ impl<'a> Lowerer<'a> {
             let rel = stub_off as i32 - (p as i32 + 4);
             self.buf
                 .try_patch_i32(p, rel)
-                .expect("deopt JMP patch in-bounds");
+                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
         }
     }
 
@@ -2737,7 +2737,7 @@ impl<'a> Lowerer<'a> {
             let rel = stub_off as i32 - (p as i32 + 4);
             self.buf
                 .try_patch_i32(p, rel)
-                .expect("call-exc JE patch in-bounds");
+                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
         }
     }
 
@@ -3255,6 +3255,50 @@ mod tests {
     /// all-integer (usize) fields, so an all-zero bit pattern is a valid value.
     fn no_helpers() -> JitRuntimeHelpers {
         unsafe { std::mem::zeroed() }
+    }
+
+    /// Regression witness (2026-07-27): NO rel32 patch site in this file may
+    /// `expect`/`unwrap` its `try_patch_*` result.
+    ///
+    /// `ExecutableBuffer::emit` is non-panicking — on capacity exhaustion it
+    /// sets a sticky `overflowed` flag and DROPS the write, so recorded patch
+    /// offsets stop addressing their placeholder bytes and `try_patch_i32`
+    /// legitimately fails (setting the flag itself). `lower_inner` is built for
+    /// exactly that: its `if buf.overflowed() { return None }` bail discards the
+    /// artifact and the caller falls back to the single-pass backend. An
+    /// `expect` at a patch site turns that recoverable fallback into a
+    /// compile-thread panic, which in a release VM is
+    /// `fatal runtime error: failed to initiate panic` → SIGABRT of the whole
+    /// process. See `patch_rel32_to_here`'s doc comment for the same argument.
+    ///
+    /// How this was found: lifting the blanket `org/junit/` JIT ban aborted
+    /// 58 of 60 real Elasticsearch test classes, every one at
+    /// `emit_call_exc_stub`'s `expect("call-exc JE patch in-bounds")`. Thirteen
+    /// sites in this file still had that shape; they now use `.ok()`, matching
+    /// what `jit/src/x64.rs` has always done. Asserting on the source keeps a
+    /// future site from silently reintroducing the abort — a behavioural test
+    /// cannot reach these emitters without a graph large enough to overflow
+    /// `lower_inner`'s own buffer estimate, which is exactly the condition the
+    /// estimate exists to prevent.
+    #[test]
+    fn no_patch_site_panics_on_an_overflowed_buffer() {
+        let src = include_str!("ir_lower.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                (t.starts_with(".expect(") || t.starts_with(".unwrap("))
+                    && l.contains("patch")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "patch sites must swallow the error and let `lower_inner`'s \
+             `buf.overflowed()` bail fall back to single-pass, not panic \
+             (use `.ok()`); offenders: {offenders:?}",
+        );
     }
 
     #[test]

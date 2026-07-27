@@ -218,10 +218,17 @@ Hibernate/ES/Keycloak false negatives were.
    silently shadowed the first pass of TOMCAT-DOHEAD-JUNIT-ITERATOR.1's
    re-test AND retroactively invalidates part of this session's earlier
    `JUNIT.1` removal claim ("JIT-eligible unconditionally now" — corrected
-   to accurately describe a safe-but-shadowed no-op). Full writeup:
-   `docs/known-issues/blanket-org-junit-ban-undocumented-shadow-20260726.md`
-   — flagged as a high-value target for a future session (if liftable,
-   restores JIT eligibility to the entire JUnit test-running harness).
+   to accurately describe a safe-but-shadowed no-op).
+
+   **UPDATE 2026-07-27: CLOSED.** This ban and its three siblings were all
+   removed. Root cause of what they were hiding: not a miscompile, but
+   `jit/src/ir_lower.rs` panicking on an overflowed code buffer rather than
+   taking its own `buf.overflowed()` bail to single-pass — reached via one
+   class, `org/junit/internal/MethodSorter`. That fix also cleared 7
+   pre-existing SIGABRTs from the default-settings Elasticsearch baseline.
+   `JUNIT.1`'s shadowed-no-op claim was re-tested properly with the shadow
+   lifted and now holds. Retired writeup:
+   `docs/internal/blanket-org-junit-ban-undocumented-shadow-20260726.md`.
 
 4. **TYPES-ERASURE.1 consolidation hypothesis tested and REFUTED**: the
    open question of whether banning `Types.erasure` alone subsumes the

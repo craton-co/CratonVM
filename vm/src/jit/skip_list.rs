@@ -873,17 +873,17 @@ fn should_skip_jit_internal(
     // longer reproduces on current dev. `TomcatDoheadJunitIteratorProbe.java`
     // is the regression witness.
     //
-    // IMPORTANT: this class stays interpreted by DEFAULT regardless of this
-    // removal -- the separate, still-active blanket "org/junit/" ban a few
-    // hundred lines below (`class_name.starts_with("org/junit/") &&
-    // !package_allowed(...)`) also matches
-    // org/junit/runners/model/TestClass and catches it first. Unlike most
-    // shadowed removals this session, this one WAS independently
-    // re-verified against the real, unshadowed condition: every probe run
-    // above also used `CRATONVM_JIT_ALLOW_PACKAGES=org/junit/` (lifting the
-    // blanket ban too) to confirm collectAnnotatedMethodValues itself is
-    // genuinely safe once actually JIT-compiled, not merely a safe no-op
-    // removal riding on the blanket ban's continued coverage.
+    // HISTORY: when this was removed on 2026-07-26 the class still stayed
+    // interpreted by default, because the separate blanket "org/junit/" ban
+    // further down also matched org/junit/runners/model/TestClass and caught
+    // it first. That removal was nonetheless sound: unlike the other shadowed
+    // removals in that sweep, every probe run above ALSO set
+    // `CRATONVM_JIT_ALLOW_PACKAGES=org/junit/`, confirming
+    // collectAnnotatedMethodValues is safe when genuinely JIT-compiled rather
+    // than merely riding on the blanket ban. The blanket ban was itself
+    // removed 2026-07-27 (see the TEST-HARNESS BLANKET BANS comment below), so
+    // this class is now JIT-eligible by default and this removal is finally
+    // observable in a plain run.
 
     // REACTOR-ADDCAP.1 / REACTOR-FLUXCREATE.1 -- REMOVED 2026-07-26.
     // Re-verified with a standalone probe (`ReactorAddCapProbe.java`, real
@@ -1025,17 +1025,26 @@ fn should_skip_jit_internal(
     // near the old is_known_miscompile entry, for the re-verification
     // evidence). The CRATONVM_JIT_UNBAN_JUNITCORE DBG bypass that used to
     // live here is no longer needed for JUNIT.1's OWN narrow check.
-    // CORRECTION (2026-07-26, same day): this removal is a shadowed no-op,
-    // like SPRINGBOOT-WITHOUT-JACKSON.2 and HIB-ANTLR.1 -- JUnitCore.main
-    // is NOT actually JIT-eligible by default, because the separate,
-    // still-active blanket "org/junit/" ban below also matches
+    // CORRECTION (2026-07-26, same day): as landed, this removal was a
+    // shadowed no-op, like SPRINGBOOT-WITHOUT-JACKSON.2 and HIB-ANTLR.1 --
+    // JUnitCore.main was NOT actually JIT-eligible by default, because the
+    // separate blanket "org/junit/" ban below also matched
     // org/junit/runner/JUnitCore and was never lifted during JUNIT.1's own
     // retest (JUnitCoreMainProbe.java's 110 runs used only
     // CRATONVM_JIT_THRESHOLD=1, not CRATONVM_JIT_ALLOW_PACKAGES=org/junit/).
-    // The original claim below ("no longer reproduces on current dev") is
-    // still accurate for JUNIT.1's own specific miscompile, but "JIT-eligible
-    // unconditionally now" was an overclaim -- it is only JIT-eligible when
-    // the blanket ban is ALSO explicitly lifted, which was not tested.
+    // "JIT-eligible unconditionally now" was therefore an overclaim at the
+    // time.
+    //
+    // RESOLVED 2026-07-27: re-run properly with the shadow lifted before
+    // removing the blanket ban -- `JUnitCoreMainProbe` driven one call per
+    // process with `CRATONVM_JIT_THRESHOLD=1` (so `main`, which runs once per
+    // process and exits, is compiled on that single invocation) AND
+    // `CRATONVM_JIT_ALLOW_PACKAGES` covering org/junit/. Three test shapes
+    // (trivial pass, heavy-allocation pass, intentional fail) x 40 runs x
+    // baseline/lifted = 240 runs, 0 wrong exit codes, 0 crashes -- including
+    // the failing shape correctly still exiting 1. JUnitCore.main is now
+    // genuinely JIT-eligible by default and genuinely verified, not a
+    // shadowed no-op.
 
     // SPB.9-COMMONS-LOGGING (2026-07-26, same day as the SPB.9 blanket
     // slf4j/logback/commons-logging removal above): re-banned
@@ -1560,25 +1569,76 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
-        if class_name.starts_with("com/carrotsearch/randomizedtesting/")
-            && !package_allowed("com/carrotsearch/randomizedtesting/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-
-        if class_name.starts_with("org/apache/logging/log4j/")
-            && !package_allowed("org/apache/logging/log4j/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-
-        if class_name.starts_with("org/junit/") && !package_allowed("org/junit/", allow_packages) {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-
-        if class_name.starts_with("junit/") && !package_allowed("junit/", allow_packages) {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // TEST-HARNESS BLANKET BANS -- REMOVED 2026-07-27. Four blanket
+        // package bans lived here together:
+        //
+        //     com/carrotsearch/randomizedtesting/
+        //     org/apache/logging/log4j/
+        //     org/junit/
+        //     junit/
+        //
+        // Unlike every documented ban around them, none carried a rationale
+        // comment. `git log -S` on each of the four literals returns the SAME
+        // single commit, `60ef90d4b` (2026-07-05, "Fix Elasticsearch postings
+        // FFM checksum bridges") -- a large, generically-named squash touching
+        // 14 files. randomizedtesting/log4j/junit are all central to
+        // Elasticsearch's own test framework, so this was one incidental
+        // defensive group added to keep ES's harness fully interpreted during
+        // that historical investigation, never individually justified.
+        //
+        // Consequence while they lived here: they silently SHADOWED every
+        // narrower ban on a class under those packages, so re-testing such a
+        // ban without also setting `CRATONVM_JIT_ALLOW_PACKAGES` produced a
+        // false-clean result -- the probe ran, reported success, and the target
+        // method was never JIT-compiled at all. That trap caught two removals
+        // in the 2026-07-26 sweep (TOMCAT-DOHEAD-JUNIT-ITERATOR.1, JUNIT.1).
+        //
+        // Evidence for the removal (full writeup, including the exact seeded
+        // class lists and how to regenerate them:
+        // `docs/internal/blanket-org-junit-ban-undocumented-shadow-20260726.md`).
+        // Every comparison below is baseline-vs-lifted on ONE binary, same
+        // seeded class list, results normalised to drop timings:
+        //
+        //   - Elasticsearch (the group's own likely origin, and the leg the
+        //     2026-07-26 session could not complete): 60-class seeded sample from the real
+        //     `es-fixture-ivfknn-slicesdense-closure-20260717` corpus (2571
+        //     compiled test classes) -- baseline vs lifted BYTE-FOR-BYTE
+        //     IDENTICAL, 60/60, including every pre-existing failure.
+        //   - Hibernate ORM 8.0: 160-class seeded sample (2x the 2026-07-26
+        //     sample) through hib-suite-runner's JUnit5 Platform Launcher --
+        //     baseline vs lifted BYTE-FOR-BYTE IDENTICAL.
+        //   - Spring Boot core: 40-class seeded sample of `core/spring-boot` --
+        //     baseline vs lifted BYTE-FOR-BYTE IDENTICAL, 40/40.
+        //
+        // The ES and Spring Boot runs each included a second, decisive pair:
+        // `CRATONVM_JIT_BISECT_ONLY=<these four packages>` + `THRESHOLD=1`,
+        // once WITHOUT and once WITH the packages allowed. The control
+        // JIT-compiles literally nothing (the four packages are the only
+        // JIT-eligible ones and they were still banned); the test compiles
+        // ONLY these four packages, on the first invocation of every method.
+        // Any difference between that pair is attributable to JIT-compiling
+        // exactly the code these bans covered -- so this is not another
+        // shadowed no-op. Spring Boot: 40/40 identical. ES: 30/30 identical
+        // but for `NodeConnectionsServiceTests`' failure COUNT (2 vs 1), which
+        // 8 repeat runs in the CONTROL config alone showed to be flaky in
+        // itself (2,2,2,2,1,2,1,1 with the config held constant).
+        //
+        // Two narrower bans under these prefixes were themselves shadowed and
+        // are now the live gates; both keep their own documented evidence and
+        // are deliberately NOT removed here:
+        //   - PIC.1, `org/junit/platform/console/shadow/picocli/` (further
+        //     down in this same Conservative block).
+        //   - `("junit/textui/TestRunner", "main")` in `is_known_miscompile`.
+        //     That list is gated behind `callee_saved_gpr_local_homes_enabled()`
+        //     (default-OFF), so `TestRunner.main` becomes JIT-eligible by
+        //     default for the first time with this removal. Probed directly --
+        //     see `JUnit3TextUiRunnerProbe.java`.
+        //
+        // Note that `CRATONVM_JIT_ALLOW_PACKAGES=org/junit/` ALSO lifts PIC.1
+        // (`package_allowed` prefix-matches), so the lifted legs above were a
+        // strict superset of this removal: the shipping default still has
+        // PIC.1 active and is therefore no less conservative than what was
+        // measured.
 
         // SPB.1 (Session 112) — REMOVED 2026-07-26. This was a provisional
         // blanket ban for `org/springframework/util/`, on the theory that
@@ -5103,51 +5163,55 @@ mod tests {
     #[test]
     fn tomcat_dohead_junit_iterator_is_jit_eligible_after_removal() {
         // TOMCAT-DOHEAD-JUNIT-ITERATOR.1's own specific check was removed
-        // 2026-07-26 (see the removal comment above should_skip_jit_internal),
-        // but org/junit/ classes stay interpreted under Conservative by
-        // default regardless -- the separate, still-active, unrelated
-        // blanket "org/junit/" ban a few hundred lines below (itself gated
-        // inside `if policy == SkipPolicy::Conservative`, like all its
-        // neighboring blanket bans -- Aggressive bypasses this whole
-        // section unconditionally, same shape as the existing
-        // spring_boot_modified_classpath_loader_is_jit_eligible_after_removal
-        // test just above) also matches org/junit/runners/model/TestClass.
-        // Unlike most shadowed removals this session, this one WAS
-        // independently re-verified against the real, unshadowed condition
-        // (see check_with below, and the removal comment for the probe
-        // evidence gathered with the blanket ban explicitly lifted too).
+        // 2026-07-26. Until 2026-07-27 the class nonetheless stayed
+        // interpreted under Conservative, because the separate, unrelated
+        // blanket "org/junit/" ban caught it first; that ban has since been
+        // removed too (see the TEST-HARNESS BLANKET BANS comment in
+        // should_skip_jit_internal), so the removal is now observable under
+        // BOTH policies with no allow-list needed.
         let class_name = "org/junit/runners/model/TestClass";
         let method_name = "collectAnnotatedMethodValues";
 
-        // Aggressive: the whole Conservative-only blanket-ban section is
-        // skipped, so DoHead's removal is directly observable with no
-        // allow-list needed.
-        assert_eq!(
-            check(class_name, method_name, false, true, SkipPolicy::Aggressive),
-            None,
-            "TOMCAT-DOHEAD-JUNIT-ITERATOR.1 was removed 2026-07-26 -- must be JIT-eligible under Aggressive (no blanket org/junit/ ban applies there)",
-        );
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(class_name, method_name, false, true, policy),
+                None,
+                "TOMCAT-DOHEAD-JUNIT-ITERATOR.1 (removed 2026-07-26) and the blanket org/junit/ ban (removed 2026-07-27) must both be gone under {policy:?}",
+            );
+        }
+    }
 
-        // Conservative: the blanket org/junit/ ban still applies by default...
+    #[test]
+    fn blanket_test_harness_package_bans_are_removed() {
+        // The four undocumented blanket bans removed 2026-07-27. They were
+        // Conservative-only, so Conservative is the policy that actually
+        // proves they are gone.
+        for class_name in [
+            "org/junit/runner/JUnitCore",
+            "org/junit/runners/ParentRunner",
+            "junit/textui/ResultPrinter",
+            "org/apache/logging/log4j/core/Logger",
+            "com/carrotsearch/randomizedtesting/RandomizedRunner",
+        ] {
+            assert_eq!(
+                check(class_name, "run", false, true, SkipPolicy::Conservative),
+                None,
+                "{class_name} must be JIT-eligible: the blanket test-harness package bans were removed 2026-07-27",
+            );
+        }
+
+        // ...but the two narrower bans these used to shadow are deliberately
+        // still in force. PIC.1 keeps its own documented SEGV evidence.
         assert_eq!(
-            check(class_name, method_name, false, true, SkipPolicy::Conservative),
-            Some(SkipReason::RustJvmTestFixture),
-            "org/junit/ stays interpreted under Conservative by default via the separate blanket org/junit/ ban, independent of TOMCAT-DOHEAD-JUNIT-ITERATOR.1's own removal",
-        );
-        // ...but with that blanket ban explicitly lifted, DoHead's own
-        // specific check must be gone -- this is the real test of its
-        // removal under Conservative.
-        assert_eq!(
-            check_with(
-                class_name,
-                method_name,
+            check(
+                "org/junit/platform/console/shadow/picocli/CommandLine$Model$OptionSpec",
+                "equals",
                 false,
                 true,
                 SkipPolicy::Conservative,
-                &["org/junit/"],
             ),
-            None,
-            "TOMCAT-DOHEAD-JUNIT-ITERATOR.1 was removed 2026-07-26 -- re-verified clean with the blanket org/junit/ ban lifted too, must no longer be independently skipped",
+            Some(SkipReason::RustJvmTestFixture),
+            "PIC.1 is now the live gate for the shadowed picocli copy and must survive the blanket-ban removal",
         );
     }
 
