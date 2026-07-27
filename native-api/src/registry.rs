@@ -1629,6 +1629,23 @@ pub trait NativeInvokeAccess: NativeClassAccess {
         self.invoke(class_name, method_name, descriptor, args)
     }
 
+    /// Loader-aware form of [`Self::invoke_special`].
+    ///
+    /// Reflective invocation already resolved the declaring class to
+    /// `class_id`; preserving that identity avoids accidentally selecting a
+    /// same-named class from another loader namespace. Mocks may ignore the id.
+    fn invoke_special_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let _ = class_id;
+        self.invoke_special(class_name, method_name, descriptor, args)
+    }
+
     /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
     /// native registered for `(class_name, method_name, descriptor)` and
     /// must run that class's own real bytecode body directly.

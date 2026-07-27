@@ -121,6 +121,45 @@ fn emit_post_call_frame_republish(buf: &mut ExecutableBuffer, frame_record: usiz
     buf.emit_byte(0x58); // POP RAX
 }
 
+/// Emit the canonical object-allocation runtime stub used by both JIT tiers.
+///
+/// The runtime helper owns class initialization, compact-layout sizing, the
+/// per-thread TLAB fast path, GC retry, and the zero-on-failure convention.
+/// Keeping this ABI sequence here prevents the baseline and optimizing
+/// backends from drifting on argument order or post-call frame publication.
+pub(crate) fn emit_new_object_stub(
+    buf: &mut ExecutableBuffer,
+    context_offset: i32,
+    target: usize,
+    class_id: u32,
+    num_fields: usize,
+    frame_record: usize,
+) {
+    emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
+    emit_mov_imm64(buf, ENTRY_ABI_REGS[1], u64::from(class_id));
+    emit_mov_imm64(buf, ENTRY_ABI_REGS[2], num_fields as u64);
+    emit_call_absolute(buf, target);
+    emit_post_call_frame_republish(buf, frame_record);
+}
+
+/// Emit a VM/object runtime call used for monitor enter/exit.
+///
+/// Both operands are canonical frame slots, so the call remains valid after
+/// register allocation and at GC safepoints. The helper returns a non-sentinel
+/// value on success and `i64::MIN` after publishing a pending Java exception.
+pub(crate) fn emit_monitor_stub(
+    buf: &mut ExecutableBuffer,
+    context_offset: i32,
+    object_offset: i32,
+    target: usize,
+    frame_record: usize,
+) {
+    emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
+    emit_load_frame(buf, ENTRY_ABI_REGS[1], object_offset);
+    emit_call_absolute(buf, target);
+    emit_post_call_frame_republish(buf, frame_record);
+}
+
 /// Emit the compact two-way hashed/vtable dispatch stub shared by both tiers.
 ///
 /// `arg_offsets[0]` is the receiver.  The generated code hashes its class id
@@ -218,5 +257,36 @@ mod tests {
             assert_eq!(base & 1, 0);
             assert!(base + 1 < crate::JIT_MEGA_ENTRIES);
         }
+    }
+
+    #[test]
+    fn object_allocation_stub_embeds_runtime_target_and_immediates() {
+        let target = 0x1122_3344_5566_7788usize;
+        let mut buf = ExecutableBuffer::new(256).expect("buffer");
+        emit_new_object_stub(&mut buf, 24, target, 0xAABB_CCDD, 17, 0);
+        let bytes = buf.as_slice();
+        assert!(bytes
+            .windows(8)
+            .any(|window| window == target.to_le_bytes()));
+        assert!(bytes
+            .windows(8)
+            .any(|window| window == u64::from(0xAABB_CCDDu32).to_le_bytes()));
+        assert!(bytes
+            .windows(8)
+            .any(|window| window == 17u64.to_le_bytes()));
+        assert!(bytes.ends_with(&[0xFF, 0xD0]));
+    }
+
+    #[test]
+    fn monitor_stub_embeds_target_and_loads_both_frame_operands() {
+        let target = 0x8877_6655_4433_2211usize;
+        let mut buf = ExecutableBuffer::new(192).expect("buffer");
+        emit_monitor_stub(&mut buf, 24, 40, target, 0);
+        let bytes = buf.as_slice();
+        assert!(bytes
+            .windows(8)
+            .any(|window| window == target.to_le_bytes()));
+        assert_eq!(bytes.iter().filter(|&&byte| byte == 0x8B).count(), 2);
+        assert!(bytes.ends_with(&[0xFF, 0xD0]));
     }
 }
