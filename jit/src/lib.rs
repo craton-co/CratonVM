@@ -44,9 +44,16 @@
 //!
 //! ## SAFETY INVARIANT: GC must conservatively re-sweep every JIT frame
 //!
-//! The JIT register allocator's callee-saved GPR local homes are default-off
-//! (`CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` opts back into the legacy
-//! path for diagnostics). When that legacy path is enabled, a Java local
+//! The JIT register allocator's callee-saved GPR local homes are default-**ON**
+//! whenever precise JIT maps (or moving-young) are active, which is the default
+//! — see `x64::callee_saved_gpr_local_homes_enabled`, whose env override
+//! `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=0` is now the *opt-out*. (This
+//! paragraph said "default-off" until 2026-07-27; the default flipped back with
+//! `precise_jit_maps_enabled` on 2026-07-07 and the prose was not updated.
+//! `skip_list.rs` carried a second, private copy of this switch that kept its
+//! own default of `false`, which is how a ~950-line ban list ended up inert for
+//! weeks — see docs/internal/is-known-miscompile-block-retired-20260727.md.)
+//! With that allocator active, a Java local
 //! (including an object reference) may live **exclusively in a callee-saved GPR**
 //! between bytecode aload/astore opcodes — the value need not be present in the
 //! frame's local slot at any given native PC. The precise oop map (`OopMapEntry`)

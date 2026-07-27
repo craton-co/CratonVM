@@ -2711,10 +2711,42 @@ impl<'a> Lowerer<'a> {
         let patches = std::mem::take(&mut self.deopt_stub_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("deopt JMP patch in-bounds");
+            if !Self::patch_or_bail(&mut self.buf, p, rel) {
+                break;
+            }
         }
+    }
+
+    /// Patch one stub-relative `rel32`, tolerating an overflowed buffer.
+    ///
+    /// Returns `false` once the patch could not be applied.
+    /// [`ExecutableBuffer::try_patch_i32`] reports that ONLY by marking the
+    /// buffer overflowed, and an overflowed buffer makes `lower_inner`
+    /// discard the whole `CompiledMethod` and fall back to the single-pass
+    /// backend -- so the error is genuinely ignorable here, exactly as
+    /// `try_patch_i32`'s own contract says ("the caller may ignore the `Err`
+    /// and rely on that bail") and as `patch_rel32_to_here` already does.
+    ///
+    /// It must NOT be an `expect`. `emit_deopt_stub` / `emit_call_exc_stub`
+    /// run BEFORE that bail-out, on a VM thread with no unwinding catch, so a
+    /// body that outgrew its estimated buffer aborted the whole process
+    /// instead of falling back. Real repro (2026-07-27): parsing Groovy
+    /// source through `GroovyClassLoader.parseClass` panicked with
+    /// `call-exc JE patch in-bounds: PatchFailed { kind: "i32", offset: 4125 }`
+    /// -- offset == the emitted length, i.e. the branch's own rel32
+    /// placeholder had already been dropped by the sticky-overflow `emit` --
+    /// and took the VM down with `fatal runtime error: failed to initiate
+    /// panic`. The identical run under `--nojit` is clean.
+    fn patch_or_bail(buf: &mut ExecutableBuffer, offset: usize, rel: i32) -> bool {
+        if buf.try_patch_i32(offset, rel).is_err() {
+            debug_assert!(
+                buf.overflowed(),
+                "try_patch_i32 must mark the buffer overflowed when it fails, \
+                 so that lower_inner discards this compile"
+            );
+            return false;
+        }
+        true
     }
 
     /// Gap B: emit the single shared call-exception bail stub (if any `Op::Call`
@@ -2735,9 +2767,9 @@ impl<'a> Lowerer<'a> {
         let patches = std::mem::take(&mut self.call_exc_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("call-exc JE patch in-bounds");
+            if !Self::patch_or_bail(&mut self.buf, p, rel) {
+                break;
+            }
         }
     }
 
