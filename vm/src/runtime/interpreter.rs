@@ -2285,12 +2285,15 @@ fn process_references_after_gc(
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
         let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.mem.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
-        let size = match shared.mem.heap.get_field(q_obj, 1) {
-            // RQ_FIELD_SIZE
-            Value::Int(v) => v,
-            _ => 0,
+        // RQ_FIELD_SIZE. Slot 1 is `size` in the synthetic two-slot shape but
+        // `queueLength` — a `long` — on a real JDK ReferenceQueue, whose own
+        // `enqueue0`/`poll0` bytecode reads it back. Preserve the stored width.
+        let new_size = match shared.mem.heap.get_field(q_obj, 1) {
+            Value::Long(v) => Value::Long(v + 1),
+            Value::Int(v) => Value::Int(v + 1),
+            _ => Value::Int(1),
         };
-        shared.mem.heap.set_field(q_obj, 1, Value::Int(size + 1));
+        shared.mem.heap.set_field(q_obj, 1, new_size);
         // Mark as enqueued — sentinel Int(1) distinguishes from "never had queue"
         shared.mem.heap.set_field(ref_obj, 1, Value::Int(1)); // REF_FIELD_QUEUE = enqueued sentinel
     }

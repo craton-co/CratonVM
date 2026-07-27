@@ -4587,6 +4587,31 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // Real-JDK mode: drop the synthetic `java/lang/ref/ReferenceQueue`
+        // CONSTRUCTOR so the real one runs. The synthetic ctor only writes the
+        // two-slot (head, size) shape this file's natives use; a real JDK 25
+        // `ReferenceQueue` additionally declares `private final Lock lock`,
+        // which the real `enqueue`/`poll`/`remove` bytecode synchronizes on.
+        // Leaving it null made every real `ReferenceQueue.enqueue()` throw
+        // `NullPointerException: Cannot enter synchronized block because
+        // "this.lock" is null` — reached from `Reference.enqueue()`, whose
+        // native already (correctly) delegates to the real `enqueue` bytecode
+        // for a real-layout Reference. Symptom: Spring's
+        // `ConcurrentReferenceHashMap` failing to purge stale entries, which
+        // aborts `AbstractApplicationContext.resetCommonCaches()` and hence
+        // any context refresh that has to be cancelled
+        // (`scripting.{bsh,config,groovy}.*` in the Spring suite).
+        //
+        // Only the constructor is dropped. `poll`/`remove` stay native: the
+        // GC's reference processor enqueues by writing the queue's head slot
+        // directly (`vm/src/runtime/interpreter.rs`) and never notifies the
+        // real `lock`, so real blocking `remove()` bytecode would wait forever.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/lang/ref/ReferenceQueue"
+            && method_name == "<init>"
+        {
+            return;
+        }
         // NOTE: real-JDK mode used to drop EVERY native registered directly on
         // `java/util/concurrent/ThreadPoolExecutor` here (submit/execute/
         // shutdown included), on the theory that only genuinely-real
