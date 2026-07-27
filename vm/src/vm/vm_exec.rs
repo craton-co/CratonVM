@@ -800,7 +800,10 @@ fn safe_native_call_impl(
     // (millions of calls). Keep both scratch buffers inline for the small-
     // arity case; longer slices (e.g. Set.of during Surefire bootstrap)
     // fall back to the original heap buffers with identical behavior.
-    const INLINE_NATIVE_ARGS: usize = 4;
+    // Eight covers receiver + the full register-argument envelope of both
+    // supported x64 ABIs and avoids heap scratch for common constructor and
+    // reflection bridges with 5-7 Java arguments.
+    const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
     let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
@@ -5346,7 +5349,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         args: &[Value],
     ) -> MethodCallResult {
         // Same primitive the JIT's invokespecial resolution uses
-        // (`invoke_special_shared_on_class`) — reused here for reflective
+        // (`invoke_special_shared_on_class`) - reused here for reflective
         // `Method.invoke` dispatch of private / cross-package package-private
         // instance methods, which has the identical loader-identity
         // requirement. See the trait method's doc comment.

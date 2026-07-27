@@ -430,6 +430,147 @@ pub struct SharedVm {
     pub init_level_waiters: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
+// ---------------------------------------------------------------------------
+// Typed bootstrap state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct Allocated;
+#[derive(Debug)]
+struct ClassesReady;
+#[derive(Debug)]
+struct NativesReady;
+#[derive(Debug)]
+struct RuntimeReady;
+
+/// Compile-time ordering plus testable runtime invariants for VM startup.
+///
+/// The payload is intentionally small: the large subsystem values remain local
+/// to `SharedVm::new`, while this token is the only value allowed to cross each
+/// phase boundary. A new initialization step therefore cannot be reordered
+/// past classes/native/runtime readiness without changing the token type.
+#[must_use = "a bootstrap phase must be advanced or explicitly finished"]
+struct BootstrapPhase<State> {
+    started: std::time::Instant,
+    _state: std::marker::PhantomData<State>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BootstrapInvariantError {
+    NoClasses,
+    CoreObjectMissing,
+    NoNatives,
+    RuntimeNotWired,
+}
+
+impl BootstrapPhase<Allocated> {
+    fn begin() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    fn classes_ready(
+        self,
+        loaded_classes: usize,
+        core_object_present: bool,
+    ) -> Result<BootstrapPhase<ClassesReady>, BootstrapInvariantError> {
+        if loaded_classes == 0 {
+            return Err(BootstrapInvariantError::NoClasses);
+        }
+        if !core_object_present {
+            return Err(BootstrapInvariantError::CoreObjectMissing);
+        }
+        Ok(BootstrapPhase {
+            started: self.started,
+            _state: std::marker::PhantomData,
+        })
+    }
+}
+
+impl BootstrapPhase<ClassesReady> {
+    fn natives_ready(
+        self,
+        registered_natives: usize,
+    ) -> Result<BootstrapPhase<NativesReady>, BootstrapInvariantError> {
+        if registered_natives == 0 {
+            return Err(BootstrapInvariantError::NoNatives);
+        }
+        Ok(BootstrapPhase {
+            started: self.started,
+            _state: std::marker::PhantomData,
+        })
+    }
+}
+
+impl BootstrapPhase<NativesReady> {
+    fn runtime_ready(
+        self,
+        runtime_wired: bool,
+    ) -> Result<BootstrapPhase<RuntimeReady>, BootstrapInvariantError> {
+        if !runtime_wired {
+            return Err(BootstrapInvariantError::RuntimeNotWired);
+        }
+        Ok(BootstrapPhase {
+            started: self.started,
+            _state: std::marker::PhantomData,
+        })
+    }
+}
+
+impl BootstrapPhase<RuntimeReady> {
+    fn finish(self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+}
+
+#[cfg(test)]
+mod typed_bootstrap_phase_tests {
+    use super::{BootstrapInvariantError, BootstrapPhase};
+
+    #[test]
+    fn phase_invariants_fail_at_the_boundary_that_owns_them() {
+        assert_eq!(
+            BootstrapPhase::begin().classes_ready(0, true).err(),
+            Some(BootstrapInvariantError::NoClasses)
+        );
+        assert_eq!(
+            BootstrapPhase::begin().classes_ready(1, false).err(),
+            Some(BootstrapInvariantError::CoreObjectMissing)
+        );
+        let classes = BootstrapPhase::begin()
+            .classes_ready(1, true)
+            .expect("classes");
+        assert_eq!(
+            classes.natives_ready(0).err(),
+            Some(BootstrapInvariantError::NoNatives)
+        );
+        let natives = BootstrapPhase::begin()
+            .classes_ready(1, true)
+            .expect("classes")
+            .natives_ready(1)
+            .expect("natives");
+        assert_eq!(
+            natives.runtime_ready(false).err(),
+            Some(BootstrapInvariantError::RuntimeNotWired)
+        );
+    }
+
+    #[test]
+    fn valid_bootstrap_can_only_finish_after_all_typed_transitions() {
+        let elapsed = BootstrapPhase::begin()
+            .classes_ready(1, true)
+            .expect("classes")
+            .natives_ready(1)
+            .expect("natives")
+            .runtime_ready(true)
+            .expect("runtime")
+            .finish();
+        assert!(elapsed <= std::time::Duration::from_secs(1));
+    }
+}
+
 impl SharedVm {
     /// Retain a captured Throwable trace independently of the producing Java
     /// thread. The entry is non-owning and is swept by the GC remap hook.
@@ -914,6 +1055,7 @@ impl SharedVm {
             string_dedup: config.g1_string_dedup,
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
+        let bootstrap_phase = BootstrapPhase::<Allocated>::begin();
 
         // --- Compressed oops -------------------------------------------------
         //
@@ -1007,6 +1149,15 @@ impl SharedVm {
         cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
         let __boot_t2 = std::time::Instant::now();
+        let bootstrap_phase = bootstrap_phase
+            .classes_ready(
+                class_manager.loaded_count(),
+                class_manager
+                    .get_loaded_class_id("java/lang/Object")
+                    .is_some(),
+            )
+            .expect("bootstrap ClassesReady invariants");
+
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
         {
@@ -2510,6 +2661,9 @@ impl SharedVm {
             __boot_t2.elapsed(),
             native_methods.len(),
         );
+        let bootstrap_phase = bootstrap_phase
+            .natives_ready(native_methods.len())
+            .expect("bootstrap NativesReady invariants");
 
         let vm = Self {
             vm_identity: NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed),
@@ -2815,9 +2969,16 @@ impl SharedVm {
         // regression for every workload. The three phase lines above break the
         // total down; this line is what a `RUST_LOG=info` run can be grepped
         // for to compare two builds.
+        let typed_boot_elapsed = bootstrap_phase
+            .runtime_ready(
+                vm.classes.class_manager.read().loaded_count() > 0
+                    && vm.natives.native_methods.len() > 0,
+            )
+            .expect("bootstrap RuntimeReady invariants")
+            .finish();
         tracing::info!(
             "boot: SharedVm::new total {:?} (phase 1 classpath {:?}, phase 2 core classes {:?})",
-            __boot_t0.elapsed(),
+            typed_boot_elapsed,
             __boot_classpath_elapsed,
             __boot_core_classes_elapsed,
         );

@@ -1696,14 +1696,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 needs_heap = true;
                 pc += 3;
             }
-            // T5.2.8 — monitorenter / monitorexit. Accepted by the
-            // scanner so methods with `synchronized` blocks are
-            // JIT-eligible. Lock elision in the compiler path skips
-            // the actual monitor operation when escape analysis
-            // proves the receiver is thread-local; otherwise the
-            // compiler bails to the interpreter (see the 0xC2/0xC3
-            // handler in `compile_bytecode`).
+            // monitorenter / monitorexit. Non-escaping locks are elided;
+            // live locks call the VM's direct mark-word helper, which needs
+            // the hidden VM context just like allocation/field helpers.
             0xC2 | 0xC3 => {
+                needs_heap = true;
                 pc += 1;
             }
             // RBC.6 — athrow. Accepted; `has_athrow` is recorded so callers
@@ -27797,10 +27794,14 @@ impl Compiler {
                             //     HotSpot also bails on these),
                             //   - or the method's prologue did not stash
                             //     `vm_ptr` in a frame slot.
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
-                            self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding
-                            self.emit_call_absolute(self.helpers.new_object);
+                            crate::runtime_lowering::emit_new_object_stub(
+                                &mut self.buf,
+                                self.heap_local_offset,
+                                self.helpers.new_object,
+                                class_id_raw,
+                                num_fields,
+                                self.helpers.frame_record,
+                            );
                         }
                         // T1.1.a — `new` is a GC-triggering safepoint.
                         // Emit an oop map for the slots that were live
@@ -28187,42 +28188,56 @@ impl Compiler {
                     }
                 }
 
-                // T5.2.8 — monitorenter / monitorexit: lock elision.
-                //
-                // If the receiver was scalar-replaced by escape analysis
-                // (i.e. the object is thread-local and never escapes),
-                // the lock is trivially non-contended and can be elided.
-                // We pop the receiver slot and emit nothing.
-                //
-                // If the receiver is NOT scalar-replaced, we bail to
-                // the interpreter (no JIT monitor helper exists yet).
+                // monitorenter / monitorexit: exact lock elision followed by
+                // the direct thin-lock runtime stub for every live receiver.
                 0xC2 | 0xC3 => {
-                    let recv_slot = self.pop_stack();
-                    // Check: is the receiver a scalar-replaced object?
-                    // Scalar-replaced objects have a zero "pointer" on the
-                    // stack (a placeholder that's never dereferenced).
-                    // We recognize them by checking if the load is from
-                    // a scalar-replaced frame slot.
-                    //
-                    // For now, simply elide if ANY scalar replacement is
-                    // active in this method (conservative but correct:
-                    // if there's no SR, the method doesn't have monitors
-                    // on non-escaping objects, so the bail is safe).
-                    if self.scalar_replaced.is_empty() {
-                        // No escape analysis active → can't elide → bail.
+                    if self.sr_monitor_scalar_ops.contains(&pc) {
+                        // Proven scalar receiver: lock cannot be observed or
+                        // contended. Phase C records its depth for deopt relock.
+                        let _ = self.pop_stack();
+                        pc += 1;
+                        continue;
+                    }
+
+                    // The old "any scalar replacement in this method" test
+                    // could elide a lock on an unrelated escaping receiver.
+                    // Only the exact per-PC proof above may remove the lock.
+                    let helper = if op == 0xC2 {
+                        crate::MONITOR_ENTER_DIRECT_FN
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    } else {
+                        crate::MONITOR_EXIT_DIRECT_FN
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    };
+                    if helper == 0 || !self.needs_heap {
                         return false;
                     }
-                    // Lock elided — emit nothing. The object is thread-
-                    // local so the monitor is never contended.
-                    // Phase C: an elision over a SCALAR object is recorded in
-                    // `sr_monitor_at` and relocked on resume, so it does NOT block
-                    // deopt. Only an elision over a NON-scalar object (not in
-                    // `sr_monitor_scalar_ops`) leaves no recordable trace and keeps
-                    // the method off the resume path.
-                    if !self.sr_monitor_scalar_ops.contains(&pc) {
-                        self.has_elided_monitor = true;
-                    }
-                    let _ = recv_slot;
+                    // Keep the receiver on the abstract stack while publishing
+                    // safepoint roots; moving GC can then rewrite its shadow
+                    // home during a contended enter. Pop only after the push.
+                    self.flush_scratch_registers();
+                    self.emit_pre_safepoint_spill();
+                    let recv_slot = self.pop_stack();
+                    let recv_offset = match recv_slot {
+                        StackSlot::Frame(offset) => offset,
+                        StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                            let Some(offset) = self.reserve_spill_slots(1) else {
+                                return false;
+                            };
+                            self.emit_store_local(offset, reg);
+                            offset
+                        }
+                        StackSlot::Xmm(_) => return false,
+                    };
+                    crate::runtime_lowering::emit_monitor_stub(
+                        &mut self.buf,
+                        self.heap_local_offset,
+                        recv_offset,
+                        helper,
+                        self.helpers.frame_record,
+                    );
+                    self.emit_oop_map_for_safepoint();
+                    self.emit_post_invoke_exception_check(b'V');
                     pc += 1;
                 }
 
