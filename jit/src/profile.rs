@@ -13,7 +13,7 @@
 /// - Receiver type counts pre-populate Monomorphic Inline Cache (MIC) slots so the
 ///   common-case virtual dispatch is a direct call from the very first JIT execution.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -196,6 +196,26 @@ impl LoopTripProfile {
 
 /// Collected profile data for a single method.
 /// T10.9.B: FxHashMap — bytecode-PC keys, hot path per-branch during warmup.
+///
+/// ## Coverage — read this before basing an inlining decision on it
+///
+/// The four maps below are populated by *different* interpreter hooks with
+/// *different* coverage, and only while [`is_profiling_enabled`] is true (the
+/// process default is **false**; the tiered manager flips it on).
+///
+/// | Map | Recorded at | Covers |
+/// |---|---|---|
+/// | `branches` | every conditional-branch opcode | all branches |
+/// | `loops` | every back-edge | all loops |
+/// | `receivers` | the receiver-resolution path of `invokevirtual`/`invokeinterface` | **virtual + interface call sites only** |
+/// | `call_sites` | [`Self::record_call_site`] | whatever the interpreter calls it from |
+///
+/// In particular there is no per-call-site counter for `invokestatic` /
+/// `invokespecial` unless `call_sites` is fed: `receivers` is the only
+/// per-bci execution evidence the store has historically carried, and a
+/// monomorphic static call has no receiver to record. Use
+/// [`Self::call_site_count`], which unifies the two sources and states which
+/// one answered.
 #[derive(Default)]
 pub struct MethodProfile {
     /// Branch counts keyed by bytecode PC.
@@ -204,6 +224,14 @@ pub struct MethodProfile {
     pub receivers: FxHashMap<usize, ReceiverCounts>,
     /// Loop trip profiles keyed by back-edge bytecode PC.
     pub loops: FxHashMap<usize, LoopTripProfile>,
+    /// Execution count of the invoke instruction at each bytecode PC.
+    ///
+    /// Kind-agnostic: unlike [`Self::receivers`] this counts `invokestatic`
+    /// and `invokespecial` too, which is what an inliner needs to tell a hot
+    /// call site from a cold one inside the *same* method (per-method
+    /// invocation counts cannot — a call in a rarely-taken branch of a hot
+    /// method looks identical to one on the hot path).
+    pub call_sites: FxHashMap<usize, u32>,
 }
 
 impl MethodProfile {
@@ -241,6 +269,99 @@ impl MethodProfile {
             .or_default()
             .record_trip_complete(trip);
     }
+
+    /// Record one execution of the invoke instruction at `pc`.
+    ///
+    /// Kind-agnostic — call it for `invokestatic`/`invokespecial`/`invokevirtual`/
+    /// `invokeinterface`/`invokedynamic` alike. Saturating, like every other
+    /// counter here.
+    #[inline]
+    pub fn record_call_site(&mut self, pc: usize) {
+        let e = self.call_sites.entry(pc).or_insert(0);
+        *e = e.saturating_add(1);
+    }
+}
+
+/// Where a [`MethodProfile::call_site_count`] answer came from. An inliner
+/// that treats "no evidence" as "cold" would refuse to inline every static
+/// call in the VM, so the absence of data is reported distinctly from a
+/// genuine zero.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallSiteEvidence {
+    /// A direct per-call-site execution counter ([`MethodProfile::call_sites`]).
+    Direct(u32),
+    /// Derived by summing the receiver-type observations at this bci. Exact
+    /// for `invokevirtual`/`invokeinterface`, unavailable for every other
+    /// invoke kind.
+    Receivers(u32),
+    /// Nothing was recorded at this bci — either the site is genuinely never
+    /// executed, or profiling was off, or no hook covers its invoke kind.
+    /// **Not** the same as a count of zero.
+    None,
+}
+
+impl CallSiteEvidence {
+    /// The observed count, or `0` when there is no evidence. Only use this
+    /// where "unknown" and "cold" are genuinely interchangeable.
+    pub fn count_or_zero(self) -> u32 {
+        match self {
+            CallSiteEvidence::Direct(n) | CallSiteEvidence::Receivers(n) => n,
+            CallSiteEvidence::None => 0,
+        }
+    }
+
+    /// Whether any hook actually observed this call site.
+    pub fn is_observed(self) -> bool {
+        !matches!(self, CallSiteEvidence::None)
+    }
+}
+
+impl MethodProfile {
+    /// Execution evidence for the invoke instruction at `pc`.
+    ///
+    /// Prefers the direct counter and falls back to summing the receiver
+    /// observations, which are already recorded today for virtual/interface
+    /// sites. See [`CallSiteEvidence`] for why "no data" is distinguished from
+    /// "zero".
+    pub fn call_site_count(&self, pc: usize) -> CallSiteEvidence {
+        if let Some(&n) = self.call_sites.get(&pc) {
+            return CallSiteEvidence::Direct(n);
+        }
+        match self.receivers.get(&pc) {
+            Some(counts) => CallSiteEvidence::Receivers(
+                counts.values().copied().fold(0u32, u32::saturating_add),
+            ),
+            None => CallSiteEvidence::None,
+        }
+    }
+
+    /// Every call site with observed evidence of at least `min_count`
+    /// executions, hottest first (ties broken by ascending bci so the order is
+    /// deterministic across runs — an inliner that ranks candidates must not
+    /// produce a different artifact from the same profile).
+    pub fn hot_call_sites(&self, min_count: u32) -> Vec<(usize, u32)> {
+        let mut pcs: Vec<usize> = self
+            .call_sites
+            .keys()
+            .copied()
+            .chain(self.receivers.keys().copied())
+            .collect();
+        pcs.sort_unstable();
+        pcs.dedup();
+        let mut out: Vec<(usize, u32)> = pcs
+            .into_iter()
+            .filter_map(|pc| {
+                let n = self.call_site_count(pc).count_or_zero();
+                if n >= min_count {
+                    Some((pc, n))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +385,70 @@ impl MethodProfile {
 /// pattern (for `snapshot_all` / `get_profile`) still applies — it now
 /// runs per-shard.
 const PROFILE_SHARDS: usize = 16;
+
+/// Number of shards for the per-method invocation-counter map. Power of two so
+/// the shard mapping is a single mask.
+///
+/// Fanned out wider than [`PROFILE_SHARDS`] because this map is hotter by
+/// construction: [`ProfileStore::increment_invocation`] runs on **every**
+/// interpreted invocation of a not-yet-compiled method (the cached-invoke
+/// `Bytecode` arm in `vm/src/runtime/interpreter.rs` calls it before the
+/// warmup-threshold test), whereas the profile shards are only touched when
+/// `PROFILING_ENABLED`. The steady-state path is a shared read-lock plus one
+/// relaxed `fetch_add`; the only exclusive acquisition left is the first
+/// invocation of a given method, and a wide fan-out keeps that from
+/// serialising unrelated methods.
+const INVOCATION_SHARDS: usize = 64;
+
+/// One shard of the invocation-counter map.
+///
+/// The counter cell is an [`AtomicU32`] rather than a plain `u32` so the
+/// common "counter already exists" path needs only a *shared* read-lock: the
+/// increment itself is an atomic RMW on the cell, not a mutation of the map.
+/// Before this split the whole map sat behind one process-global
+/// `parking_lot::Mutex`, so every Java method call in the VM serialised on a
+/// single lock (plus a hash probe) purely to bump a counter.
+struct InvocationShard {
+    counts: parking_lot::RwLock<FxHashMap<u64, AtomicU32>>,
+}
+
+impl InvocationShard {
+    fn new() -> Self {
+        Self {
+            counts: parking_lot::RwLock::new(FxHashMap::default()),
+        }
+    }
+}
+
+/// Shard index for a packed invocation key.
+///
+/// The packed key is `(class_id << 32) | method_name_descriptor_hash`, so the
+/// low 32 bits are the well-distributed part; the high bits would cluster
+/// every method of one class into one shard.
+#[inline]
+fn invocation_shard_for(packed_key: u64) -> usize {
+    (packed_key as u32 as usize) & (INVOCATION_SHARDS - 1)
+}
+
+/// Increment an invocation counter cell, preserving the exact
+/// `u32::saturating_add(1)` semantics of the pre-sharding implementation.
+///
+/// The common case is a single relaxed `fetch_add`. `fetch_add` wraps rather
+/// than saturates, so the (astronomically rare — 2^32 invocations of a method
+/// whose compilation never succeeded) overflow case restores the saturated
+/// value. Concurrent incrementers all converge, because every one of them that
+/// observes the overflow stores `u32::MAX`.
+#[inline]
+fn saturating_inc(cell: &AtomicU32) -> u32 {
+    let prev = cell.fetch_add(1, Ordering::Relaxed);
+    match prev.checked_add(1) {
+        Some(next) => next,
+        None => {
+            cell.store(u32::MAX, Ordering::Relaxed);
+            u32::MAX
+        }
+    }
+}
 
 /// One shard of the per-method profile store. Each shard owns its own
 /// `methods` rwlock + `name_index` rwlock, identical in structure to
@@ -346,7 +531,16 @@ pub struct ProfileStore {
     shards: [ProfileShard; PROFILE_SHARDS],
     /// Per-method invocation counters for JIT warmup gating.
     /// Keyed by `(class_id << 32 | method_hash)` packed into a `u64` for fast lookup.
-    invocation_counts: parking_lot::Mutex<FxHashMap<u64, u32>>,
+    ///
+    /// Sharded across [`INVOCATION_SHARDS`] independent rwlocks with
+    /// [`AtomicU32`] cells. This was a single process-global
+    /// `parking_lot::Mutex<FxHashMap<u64, u32>>`, which every Java method call
+    /// in the VM had to acquire exclusively just to bump a counter — a hard
+    /// scalability ceiling on multi-threaded throughput and a measurable
+    /// single-thread cost. The steady-state path is now a shared read-lock and
+    /// one relaxed `fetch_add`; only a method's *first* invocation takes a
+    /// write-lock, and then only on its own shard.
+    invocation_counts: [InvocationShard; INVOCATION_SHARDS],
     /// PERF (round-5 vm #7): auxiliary index keyed by a 64-bit fingerprint
     /// of `(class_id, method_name, descriptor)`. See `ProfileShard::name_index`
     /// for the per-shard storage — this struct field is intentionally absent
@@ -383,9 +577,28 @@ impl ProfileStore {
     pub fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| ProfileShard::new()),
-            invocation_counts: parking_lot::Mutex::new(FxHashMap::default()),
+            invocation_counts: std::array::from_fn(|_| InvocationShard::new()),
             name_index_collisions: std::sync::atomic::AtomicU64::new(0),
             name_index_benign_races: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Reclaim every profile and warmup counter owned by an unloaded class.
+    pub fn invalidate_class(&self, class_id: u32) {
+        // Sharded by the *low* 32 bits (see `invocation_shard_for`), so a
+        // class's methods are spread across every shard — all of them must be
+        // swept. Cold path (class unloading), so the full walk is fine.
+        for shard in &self.invocation_counts {
+            shard
+                .counts
+                .write()
+                .retain(|packed, _| (*packed >> 32) as u32 != class_id);
+        }
+        for shard in &self.shards {
+            let mut methods = shard.methods.write();
+            methods.retain(|key, _| key.class_id != class_id);
+            let mut index = shard.name_index.write();
+            index.retain(|_, (key, _)| key.class_id != class_id);
         }
     }
 
@@ -416,10 +629,27 @@ impl ProfileStore {
     /// behind a warmup threshold instead of compiling on the second invocation.
     #[inline]
     pub fn increment_invocation(&self, packed_key: u64) -> u32 {
-        let mut counts = self.invocation_counts.lock();
-        let entry = counts.entry(packed_key).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
+        let shard = &self.invocation_counts[invocation_shard_for(packed_key)];
+        // Fast path (every call after a method's first): shared read-lock, one
+        // relaxed atomic RMW on the cell. Unrelated threads and unrelated
+        // methods never block each other here.
+        {
+            let read = shard.counts.read();
+            if let Some(cell) = read.get(&packed_key) {
+                return saturating_inc(cell);
+            }
+        }
+        // Slow path: this method's first invocation. Escalate to a write-lock
+        // and double-check — another thread may have inserted between our
+        // dropping the read-lock and acquiring the write-lock.
+        let mut write = shard.counts.write();
+        match write.get(&packed_key) {
+            Some(cell) => saturating_inc(cell),
+            None => {
+                write.insert(packed_key, AtomicU32::new(1));
+                1
+            }
+        }
     }
 
     /// Fetch (or insert) the per-method profile slot.  Returns a cheap `Arc`
@@ -675,6 +905,36 @@ impl ProfileStore {
         slot.lock().record_receiver(pc, receiver_class_id);
     }
 
+    /// Borrowed-key counterpart of [`record_call_site`](Self::record_call_site).
+    ///
+    /// Intended to be called from the interpreter's invoke dispatch for EVERY
+    /// invoke kind — see [`MethodProfile::call_sites`] for why per-method
+    /// invocation counts cannot substitute.
+    #[inline]
+    pub fn record_call_site_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &Arc<str>,
+        descriptor: &Arc<str>,
+        pc: usize,
+    ) {
+        if !is_profiling_enabled() {
+            return;
+        }
+        let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);
+        slot.lock().record_call_site(pc);
+    }
+
+    /// Record one execution of the invoke instruction at `pc`.
+    #[inline]
+    pub fn record_call_site(&self, key: &MethodKey, pc: usize) {
+        if !is_profiling_enabled() {
+            return;
+        }
+        let slot = self.get_or_insert(key);
+        slot.lock().record_call_site(pc);
+    }
+
     /// Record a branch observation.  Called from the interpreter hot-loop.
     ///
     /// Returns immediately when profiling is disabled (the global default),
@@ -738,6 +998,7 @@ impl ProfileStore {
             branches: p.branches.clone(),
             receivers: p.receivers.clone(),
             loops: p.loops.clone(),
+            call_sites: p.call_sites.clone(),
         })
     }
 
@@ -775,6 +1036,7 @@ impl ProfileStore {
                         branches: p.branches.clone(),
                         receivers: p.receivers.clone(),
                         loops: p.loops.clone(),
+                        call_sites: p.call_sites.clone(),
                     },
                 )
             })
@@ -783,8 +1045,20 @@ impl ProfileStore {
 
     /// Snapshot all invocation counts: returns (packed_key, count) pairs.
     pub fn snapshot_invocation_counts(&self) -> Vec<(u64, u32)> {
-        let counts = self.invocation_counts.lock();
-        counts.iter().map(|(&k, &v)| (k, v)).collect()
+        // Not a single atomic snapshot across shards — it never was: the
+        // pre-sharding version held one lock, but callers (diagnostics /
+        // tiered-manager reporting) already tolerated counters advancing
+        // concurrently. Per-shard consistency is preserved.
+        let mut out = Vec::new();
+        for shard in &self.invocation_counts {
+            let counts = shard.counts.read();
+            out.extend(
+                counts
+                    .iter()
+                    .map(|(&k, cell)| (k, cell.load(Ordering::Relaxed))),
+            );
+        }
+        out
     }
 }
 
@@ -804,10 +1078,26 @@ mod tests {
     /// parallel test that depends on the disabled-default doesn't observe
     /// `true` mid-run.
     fn with_profiling_enabled<R>(f: impl FnOnce() -> R) -> R {
-        static GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _g = GATE.lock();
         let prev = is_profiling_enabled();
         enable_profiling(true);
+        let r = f();
+        enable_profiling(prev);
+        r
+    }
+
+    /// Serialises every gate transition in this module. Hoisted out of
+    /// `with_profiling_enabled` so the disabled-side helper below shares it —
+    /// two helpers with private statics would not exclude each other, and a
+    /// parallel test would then observe the wrong gate state.
+    static GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Inverse of [`with_profiling_enabled`], for tests that assert a recorder
+    /// is a no-op while the global gate is off (its process default).
+    fn with_profiling_disabled<R>(f: impl FnOnce() -> R) -> R {
+        let _g = GATE.lock();
+        let prev = is_profiling_enabled();
+        enable_profiling(false);
         let r = f();
         enable_profiling(prev);
         r
@@ -984,6 +1274,117 @@ mod tests {
         assert_eq!(abcd.unwrap().1, 2);
     }
 
+    // --- Sharded invocation counters (global-Mutex removal) ----------------
+
+    /// Every increment must be observed exactly once under concurrency. The
+    /// old implementation held one process-global `Mutex` for this; the
+    /// sharded version relies on a per-shard read-lock plus an atomic RMW, so
+    /// a lost update here would mean methods warm up slower than their real
+    /// call count (or never reach the JIT threshold).
+    #[test]
+    fn invocation_counter_concurrent_increments_are_exact() {
+        const THREADS: usize = 8;
+        const PER_THREAD: u32 = 2_000;
+        let store = Arc::new(ProfileStore::new());
+        // Two keys that differ ONLY in the high (class_id) half: they must
+        // share a shard, since `invocation_shard_for` masks the low 32 bits.
+        // This is the case most likely to expose a lost update.
+        let key_a = 0x0000_0001_DEAD_BEEFu64;
+        let key_b = 0x0000_0002_DEAD_BEEFu64;
+        assert_eq!(
+            invocation_shard_for(key_a),
+            invocation_shard_for(key_b),
+            "keys differing only in the class_id half must collide on one shard"
+        );
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let store = Arc::clone(&store);
+            let key = if t % 2 == 0 { key_a } else { key_b };
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..PER_THREAD {
+                    store.increment_invocation(key);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("increment worker should not panic");
+        }
+
+        let counts = store.snapshot_invocation_counts();
+        let expected = PER_THREAD * (THREADS as u32 / 2);
+        for key in [key_a, key_b] {
+            let got = counts
+                .iter()
+                .find(|(k, _)| *k == key)
+                .expect("key should be present")
+                .1;
+            assert_eq!(got, expected, "lost update on key {key:#x}");
+        }
+    }
+
+    /// The counter returned by `increment_invocation` is what the interpreter
+    /// compares against the warmup threshold, so it must be the *new* value
+    /// and must advance by exactly one per call.
+    #[test]
+    fn invocation_counter_returns_monotonic_new_value() {
+        let store = ProfileStore::new();
+        for expected in 1..=64u32 {
+            assert_eq!(store.increment_invocation(0xFEED_FACE), expected);
+        }
+    }
+
+    /// Saturating semantics are preserved from the pre-sharding
+    /// `u32::saturating_add(1)` implementation: the counter pins at `u32::MAX`
+    /// instead of wrapping to 0 (which would restart JIT warmup).
+    #[test]
+    fn invocation_counter_saturates_instead_of_wrapping() {
+        let store = ProfileStore::new();
+        let key = 0x0BAD_C0DEu64;
+        // Seed the cell directly at MAX-1 rather than calling increment 4
+        // billion times.
+        {
+            let shard = &store.invocation_counts[invocation_shard_for(key)];
+            shard
+                .counts
+                .write()
+                .insert(key, AtomicU32::new(u32::MAX - 1));
+        }
+        assert_eq!(store.increment_invocation(key), u32::MAX);
+        // Further increments stay pinned, and never wrap through 0.
+        for _ in 0..4 {
+            assert_eq!(store.increment_invocation(key), u32::MAX);
+        }
+    }
+
+    /// `invalidate_class` must sweep *every* shard: because the shard index
+    /// comes from the low 32 bits, one class's methods are spread across all
+    /// of them. A single-shard sweep would leak counters for an unloaded
+    /// class and let a recycled `class_id` inherit stale warmup state.
+    #[test]
+    fn invalidate_class_sweeps_all_shards() {
+        let store = ProfileStore::new();
+        // 256 methods of class 7 — with 64 shards this reliably populates
+        // many distinct shards.
+        for m in 0..256u64 {
+            store.increment_invocation((7u64 << 32) | m);
+        }
+        // A second class that must survive the sweep.
+        for m in 0..256u64 {
+            store.increment_invocation((9u64 << 32) | m);
+        }
+        assert_eq!(store.snapshot_invocation_counts().len(), 512);
+
+        store.invalidate_class(7);
+
+        let remaining = store.snapshot_invocation_counts();
+        assert_eq!(remaining.len(), 256, "class 7 counters should all be gone");
+        assert!(
+            remaining.iter().all(|(k, _)| (*k >> 32) as u32 == 9),
+            "only class 9 counters should remain"
+        );
+    }
+
     #[test]
     fn m29_snapshot_all_preserves_branch_data() {
         with_profiling_enabled(|| {
@@ -1144,6 +1545,110 @@ mod tests {
             assert!(
                 profile.branches.contains_key(&(42usize * 4)),
                 "FxHashMap lookup should find the inserted PC"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-call-site evidence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn call_site_evidence_distinguishes_absent_from_zero() {
+        let p = MethodProfile::default();
+        assert_eq!(p.call_site_count(7), CallSiteEvidence::None);
+        assert!(!p.call_site_count(7).is_observed());
+        assert_eq!(p.call_site_count(7).count_or_zero(), 0);
+    }
+
+    #[test]
+    fn call_site_evidence_prefers_the_direct_counter() {
+        let mut p = MethodProfile::default();
+        // A virtual site with receiver observations only.
+        p.record_receiver(4, 100);
+        p.record_receiver(4, 100);
+        p.record_receiver(4, 200);
+        assert_eq!(p.call_site_count(4), CallSiteEvidence::Receivers(3));
+        // Once the direct counter exists it wins (it is kind-agnostic and
+        // counts executions the receiver hook may not see).
+        p.record_call_site(4);
+        assert_eq!(p.call_site_count(4), CallSiteEvidence::Direct(1));
+    }
+
+    #[test]
+    fn call_site_counter_covers_static_calls_receivers_cannot() {
+        let mut p = MethodProfile::default();
+        for _ in 0..5 {
+            p.record_call_site(12); // an invokestatic — no receiver to record
+        }
+        assert_eq!(p.call_site_count(12), CallSiteEvidence::Direct(5));
+        assert!(
+            p.receivers.is_empty(),
+            "a static call site contributes no receiver evidence"
+        );
+    }
+
+    #[test]
+    fn hot_call_sites_is_ordered_and_deterministic() {
+        let mut p = MethodProfile::default();
+        for _ in 0..10 {
+            p.record_call_site(30);
+        }
+        for _ in 0..10 {
+            p.record_call_site(8); // ties with pc 30 — lower bci must win
+        }
+        for _ in 0..50 {
+            p.record_call_site(20);
+        }
+        p.record_call_site(99); // below the threshold
+        p.record_receiver(40, 7); // receiver-derived, also below threshold
+        assert_eq!(p.hot_call_sites(10), vec![(20, 50), (8, 10), (30, 10)]);
+        assert_eq!(p.hot_call_sites(1).len(), 5);
+        // Same profile, same order — an inliner ranking candidates must not
+        // produce a different artifact from run to run.
+        assert_eq!(p.hot_call_sites(10), p.hot_call_sites(10));
+    }
+
+    #[test]
+    fn call_site_counts_saturate_rather_than_wrap() {
+        let mut p = MethodProfile::default();
+        p.call_sites.insert(3, u32::MAX);
+        p.record_call_site(3);
+        assert_eq!(p.call_site_count(3), CallSiteEvidence::Direct(u32::MAX));
+    }
+
+    #[test]
+    fn store_records_and_snapshots_call_sites() {
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(11);
+            store.record_call_site(&key, 16);
+            store.record_call_site(&key, 16);
+            store.record_call_site(&key, 24);
+            let p = store.get_profile(&key).expect("profile recorded");
+            assert_eq!(p.call_site_count(16), CallSiteEvidence::Direct(2));
+            assert_eq!(p.call_site_count(24), CallSiteEvidence::Direct(1));
+            // The bulk snapshot must carry the new map too — AOT training and
+            // the tiered manager both read it that way.
+            let snap = store.snapshot_all();
+            let (_, sp) = snap
+                .into_iter()
+                .find(|(k, _)| k.class_id == key.class_id)
+                .expect("method present in snapshot_all");
+            assert_eq!(sp.call_site_count(16), CallSiteEvidence::Direct(2));
+        });
+    }
+
+    #[test]
+    fn call_site_recording_respects_the_global_profiling_gate() {
+        // Profiling defaults to OFF; the recorder must be a single atomic load.
+        with_profiling_disabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(77);
+            store.record_call_site(&key, 4);
+            assert!(
+                store.get_profile(&key).is_none(),
+                "nothing may be recorded while profiling is disabled"
             );
         });
     }

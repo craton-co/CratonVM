@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! Class loading, linking, resolution and per-class caches. Owns the L10 lock.
+//!
+//! Extracted verbatim from the former monolithic `SharedVm` struct.
+//! Field types, lock types and lock levels are unchanged; only the
+//! owning struct differs. Access paths are `shared.classes.<field>`.
+
+use crate::classloading::resolution::{LambdaCallSite, LinkResolver, ResolutionCache};
+use crate::classloading::{ClassId, ClassManager};
+use crate::runtime::lock_order::{
+    LockLevel, OrderedPlMutex, OrderedPlRwLock, OrderedPlRwLockWriteGuard,
+};
+use crate::types::{ObjectRef, Value};
+use crate::vm::vm_init::ANON_CLASS_CACHE_LEN;
+use parking_lot::RwLock;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
+/// Class loading, linking, resolution and per-class caches. Owns the L10 lock.
+pub struct ClassRealm {
+    /// Class loader and cache, protected by an RwLock.
+    ///
+    /// L10 in the global lock hierarchy — the coarsest lock, acquired first.
+    /// See [`crate::runtime::lock_order`]. [`OrderedPlRwLock`] is a drop-in for
+    /// `parking_lot::RwLock` that asserts the descending acquisition order on
+    /// every `.read()` / `.write()` / `.read_recursive()`, so holding any
+    /// lower-level lock (a monitor, `ref_processor`, …) across a class-manager
+    /// acquisition is caught instead of deadlocking.
+    pub class_manager: OrderedPlRwLock<ClassManager>,
+
+    /// Lock-free cache of the shared `cratonvm/synthetic/AnonymousObject$N`
+    /// ClassId, indexed by field count `N` (slot 0 is unused — `num_fields > 0`
+    /// always on this path). `0` means "not yet resolved" — a valid sentinel
+    /// because these synthetic classes are minted with non-zero ClassIds
+    /// (`ClassId(0)` is `java/lang/Object`).
+    ///
+    /// `vm_exec::alloc_object` rewrites every `ClassId(0)`-with-fields
+    /// allocation (e.g. a `HashMap` node) to one of these synthetic classes.
+    /// The first allocation for a given `N` resolves it through
+    /// `ClassManager::ensure_synthetic_class` (a write-lock + name `format!` +
+    /// hash probe) and stores the id here; every later allocation reads the id
+    /// with a single relaxed atomic load and skips the class-manager locks
+    /// entirely. The synthetic stub declares exactly `N` fields, so the
+    /// field-count clamp is a provable no-op and is skipped on the fast path.
+    pub anon_class_cache: [std::sync::atomic::AtomicU32; ANON_CLASS_CACHE_LEN],
+
+    /// Static fields: class_id -> field_index -> Value.
+    /// T10.9.B: FxHashMap — keys are internal ClassId, hot path accessed
+    /// on every getstatic/putstatic bytecode.
+    pub statics: RwLock<FxHashMap<ClassId, Vec<Value>>>,
+
+    /// Cache of resolved symbolic references (fields and methods).
+    pub resolution_cache: RwLock<ResolutionCache>,
+
+    /// Round 8 audit fix (CRIT #2): the reflective `(class, name,
+    /// descriptor)` cache. Previously built (`LinkResolver::new()`) but
+    /// never wired into any caller, so the entire dedupe win was dead
+    /// code. Now reachable from native reflective callers
+    /// (`Class.getDeclaredMethod`, `Class.getMethod`, JNI
+    /// `GetMethodID`/`GetFieldID`) via `vm.link_resolver()`. The
+    /// cache is invalidated on `redefine_class` through the same
+    /// hook that drops `ResolutionCache` entries (see
+    /// `link_resolver_invalidate_adapter`).
+    pub link_resolver: LinkResolver,
+
+    /// T10 — vtable manager for virtual/interface dispatch.
+    ///
+    /// Shared as an `Arc` so the class-loader install hook (a plain
+    /// `fn` pointer with no captured state) can reach the same manager
+    /// via the `crate::runtime::vtable::global_vtable_manager()` cell.
+    pub vtable_manager: std::sync::Arc<parking_lot::RwLock<crate::runtime::vtable::VtableManager>>,
+
+    /// T10 — read-optimized shared resolution cache (uses RwLock internally).
+    pub shared_resolution: crate::runtime::lockfree_resolve::SharedResolutionState,
+
+    /// Per-class synthetic lock objects for static synchronized methods.
+    /// When a static synchronized method is called, we need an object to use
+    /// as the monitor (since there's no `this`). We allocate a dummy object
+    /// per class and store it here.
+    /// T10.9.B: FxHashMap — ClassId-keyed internal cache.
+    pub class_locks: RwLock<FxHashMap<ClassId, ObjectRef>>,
+
+    /// Class mirror cache: maps ClassId to java/lang/Class ObjectRef.
+    /// Used by `Object.getClass()`.
+    /// T10.9.B: FxHashMap — ClassId-keyed.
+    pub class_mirrors: RwLock<FxHashMap<ClassId, ObjectRef>>,
+
+    /// Reverse of `class_mirrors`: maps a Class mirror back to its ClassId.
+    /// Populated whenever `get_or_create_class_mirror` allocates a new mirror.
+    /// This lets `mirror_class_id` recover the ClassId without storing it in
+    /// the mirror's Java-visible fields (which would clash with the real-JDK
+    /// `java/lang/Class` layout).
+    /// T10.9.B: FxHashMap — ObjectRef pointer keys.
+    pub class_mirrors_reverse: RwLock<FxHashMap<ObjectRef, ClassId>>,
+
+    /// Loader-faithful resolution cache (gated by
+    /// `CRATONVM_LOADER_AWARE_RESOLUTION`). Maps an *initiating* loader and an
+    /// internal class name to the `ClassId` that loader resolves it to —
+    /// CratonVM's analogue of the JVMS §5.4.3 *initiating loader* table. Only
+    /// populated for references reached from bytecode defined by a user-defined
+    /// loader: once `resolve_class_loader_aware` has driven that loader's
+    /// `loadClass` (or proved the name is bootstrap/global) for a given name,
+    /// the answer is memoised here so subsequent references skip the re-entrant
+    /// `loadClass` invocation. Grow-only — CratonVM does not unload classes, and
+    /// in-place `redefine_class` keeps the `ClassId` stable. Empty (and never
+    /// read) when the gate is off.
+    ///
+    /// Nested `loader -> (name -> id)` so a hot-path read can probe by borrowed
+    /// `&str` (`Arc<str>: Borrow<str>`) without allocating an `Arc` per lookup.
+    pub initiating_resolution_cache:
+        RwLock<FxHashMap<cratonvm_types::ClassLoaderId, FxHashMap<Arc<str>, ClassId>>>,
+
+    /// Lambda proxy registry: maps synthetic proxy ClassId → LambdaCallSite metadata.
+    /// Used by the interpreter to dispatch method calls on lambda proxy objects.
+    /// T10.9.B: FxHashMap — ClassId-keyed.
+    pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
+
+    /// Defining class (the class whose `invokedynamic` created this lambda /
+    /// method-ref) for each lambda proxy id — what HotSpot names the proxy after
+    /// and reports as its nest host. Kept as a side table so the reflection name
+    /// natives report `<host>$$Lambda/0x<id>` and a correct `getNestHost()` even
+    /// for a cross-class method reference, whose implementation method lives in a
+    /// different class than the one that defines the reference. bug-06 fam5 #1.
+    pub lambda_proxy_hosts: RwLock<FxHashMap<ClassId, ClassId>>,
+
+    /// Counter for generating unique synthetic lambda proxy ClassIds.
+    /// Starts at 0x8000_0000 to avoid collisions with real ClassIds from the ClassStore.
+    pub next_lambda_id: AtomicU32,
+
+    /// Primitive type Class mirrors: "int" → ObjectRef, "boolean" → ObjectRef, etc.
+    /// T10.9.B: FxHashMap — keys are fixed primitive type names, not user input.
+    pub primitive_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
+
+    /// Canonical `java.lang.Module` mirrors keyed by module name (e.g.
+    /// "java.base"), with `""` reserved for the unnamed module. `Class.getModule()`
+    /// MUST hand back the SAME `Module` instance for every class in a module,
+    /// because the JDK compares modules by identity (`Module` does not override
+    /// `equals`). Real bytecode relies on this — e.g.
+    /// `Throwable.validateSuppressedExceptionsList` deserializes a Throwable's
+    /// suppressed-exceptions list and throws `StreamCorruptedException("List
+    /// implementation not in base module.")` unless
+    /// `Object.class.getModule() == deserializedList.getClass().getModule()`.
+    /// Allocating a fresh Module per `getModule()` call (the old behaviour) made
+    /// that comparison always false and broke ObjectInputStream round-trips of any
+    /// object holding a `java.util` List (HIB-CV-29).
+    pub module_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
+
+    /// Cached field count for java/lang/String (0 = not yet resolved).
+    /// Once resolved, this is the actual `num_total_fields` from the loaded
+    /// String class, avoiding lock contention in `create_java_string()`.
+    pub cached_string_num_fields: AtomicUsize,
+
+    /// True when the loaded java/lang/String uses JDK 9+ compact strings
+    /// (byte[] value + byte coder) instead of pre-JDK-9 char[] layout.
+    /// Set once during bootstrap; read by create_java_string / read_java_string.
+    pub compact_strings: std::sync::atomic::AtomicBool,
+
+    /// Cached field count for java/lang/Class mirror objects (0 = not yet resolved).
+    pub cached_class_mirror_num_fields: AtomicUsize,
+
+    /// Per-class initialization condition variables (JVM spec §5.5).
+    ///
+    /// When a thread starts initializing a class, it inserts an entry here.
+    /// Other threads that try to initialize the same class will wait on the
+    /// condvar until the initializing thread completes (success or error).
+    /// Entries are removed once initialization finishes.
+    /// T10.9.B: FxHashMap — ClassId-keyed.
+    /// Round-9 HIGH-4: inner `std::sync::Mutex<bool>` + `std::sync::Condvar`
+    /// migrated to `parking_lot` equivalents — removes poison handling and
+    /// yields a smaller, faster condvar with the same wait/notify API.
+    pub class_init_waiters: parking_lot::Mutex<
+        FxHashMap<ClassId, Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>>,
+    >,
+
+    /// Per-class-name loading locks (Session 30: Thread-Safe Class Loading).
+    ///
+    /// When a thread starts loading a class, it acquires the per-name lock.
+    /// Other threads that try to load the *same* class will block on this lock
+    /// instead of blocking the global ClassManager write lock, which allows
+    /// concurrent loading of *different* classes to proceed without contention.
+    /// The bool inside the Mutex indicates whether loading is in-progress.
+    /// T10.9.B: FxHashMap — keys are internal class names.
+    pub class_loading_locks:
+        parking_lot::Mutex<FxHashMap<String, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>>,
+
+    /// T10.9.E — Per-(class, slot-index) cache of the field's declared
+    /// descriptor byte (the first byte of the JVM type descriptor:
+    /// `b'J'` for `long`, `b'D'` for `double`, `b'L'` or `b'['` for
+    /// reference types, etc.).
+    ///
+    /// Populated lazily on the first native-side field access that
+    /// resolves the descriptor via the class manager, then consulted by
+    /// `NativeContextImpl::get_field`/`set_field` on every subsequent
+    /// access to the same slot so the hot path stays O(1) after the
+    /// first resolution. Missing entries (never-seen class or index)
+    /// fall back to the legacy descriptor-unaware `get_field`/`set_field`
+    /// paths so the cache is strictly a correctness normalizer +
+    /// performance acceleration, never a correctness hazard.
+    ///
+    /// Sizing: unbounded by design — total entries are bounded by
+    /// `(loaded_classes * avg_fields)`, typically ~O(10k) for large
+    /// applications like WildFly/Keycloak. The hottest access pattern
+    /// (Unsafe-style concurrent data structures re-reading a handful
+    /// of offsets) produces at most a few dozen entries per class.
+    /// No eviction: entries are stable for the lifetime of the VM
+    /// because class bytecode is immutable after loading.
+    pub field_descriptor_cache:
+        parking_lot::RwLock<crate::runtime::fx_collections::FxHashMap<(ClassId, usize), u8>>,
+
+    /// WP0.2 — per-class cache of `ObjectStreamClass` descriptor
+    /// mirrors. Populated by the first call to
+    /// `ObjectStreamClass.lookup(cls)` for any given class; every
+    /// subsequent lookup returns the same `ObjectRef`, matching the
+    /// real-JDK singleton-per-class semantics (`ObjectStreamClass.
+    /// Caches.localDescs`).
+    ///
+    /// See `crate::runtime::serialization::oscache` for the cache
+    /// implementation and rationale.
+    pub osc_cache: crate::runtime::serialization::OscCache,
+}
+
+impl ClassRealm {
+    /// Acquire the L10 `class_manager` write lock through a guard that
+    /// drains any JVMTI ClassLoad/ClassPrepare events queued during the
+    /// critical section once the underlying lock is released.
+    ///
+    /// obsaudit D1 (2026-07-26): this is now the *only* sanctioned way to
+    /// take this write lock — `cratonvm_classloading::fire_class_load_hook`/
+    /// `fire_class_prepare_hook` no longer invoke an installed JVMTI hook
+    /// synchronously; they queue the event on a thread-local and rely on
+    /// this guard's `Drop` to fire it after the lock is gone. Acquiring the
+    /// write lock any other way (e.g. reaching into `.class_manager_write()`
+    /// directly) would silently strand queued events until the next time
+    /// this method happens to run on the same OS thread — every former
+    /// direct-`.write()` call site in the workspace was mechanically
+    /// switched to this method for exactly that reason. See the DEFERRED
+    /// FIRING notes in `classloading/src/class_manager.rs` near
+    /// `install_class_load_hook`.
+    pub fn class_manager_write(&self) -> ClassManagerWriteGuard<'_> {
+        ClassManagerWriteGuard {
+            guard: Some(self.class_manager.write()),
+        }
+    }
+}
+
+/// RAII write guard for [`ClassRealm::class_manager`] that fires queued
+/// JVMTI class-lifecycle events after releasing the lock. See
+/// [`ClassRealm::class_manager_write`].
+pub struct ClassManagerWriteGuard<'a> {
+    // `Option` so `Drop` can explicitly drop the inner guard (releasing the
+    // lock) before draining hooks, rather than relying on field-drop order
+    // (which Rust does guarantee top-to-bottom for a single-field struct,
+    // but the `Option` makes the ordering an explicit, checkable step
+    // instead of an implicit language rule future edits could disturb).
+    guard: Option<OrderedPlRwLockWriteGuard<'a, ClassManager>>,
+}
+
+impl std::ops::Deref for ClassManagerWriteGuard<'_> {
+    type Target = ClassManager;
+    fn deref(&self) -> &ClassManager {
+        self.guard.as_ref().expect("guard taken before drop")
+    }
+}
+
+impl std::ops::DerefMut for ClassManagerWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ClassManager {
+        self.guard.as_mut().expect("guard taken before drop")
+    }
+}
+
+impl Drop for ClassManagerWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Release the class-manager write lock first...
+        self.guard = None;
+        // ...then fire whatever ClassLoad/ClassPrepare events this critical
+        // section queued. A hook invoked from here may freely take a fresh
+        // `class_manager_write()`/`.read()` itself: the lock this guard held
+        // is already gone by this point.
+        cratonvm_classloading::drain_pending_class_hooks();
+    }
+}

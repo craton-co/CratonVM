@@ -97,8 +97,10 @@ fn boot_log_file() -> &'static Mutex<Option<std::fs::File>> {
 /// is unset, empty, or the open syscall failed — callers fall back to
 /// stderr-only.
 fn open_boot_log_path() -> Option<std::fs::File> {
-    let path = std::env::var("CRATONVM_JBOSS_BOOT_LOG_FILE").ok()
-        .or_else(|| std::env::var("org.jboss.boot.log.file").ok());
+    let path = crate::nbflags()
+        .jboss_boot_log_file
+        .clone()
+        .or_else(|| cratonvm_types::flags::runtime_var("org.jboss.boot.log.file").ok());
     let path = match path {
         Some(p) if !p.is_empty() => p,
         _ => return None,
@@ -120,7 +122,7 @@ fn boot_log_path_from_ctx(ctx: &dyn NativeContext) -> Option<String> {
             return Some(p);
         }
     }
-    if let Ok(p) = std::env::var("org.jboss.boot.log.file") {
+    if let Ok(p) = cratonvm_types::flags::runtime_var("org.jboss.boot.log.file") {
         if !p.is_empty() {
             return Some(p);
         }
@@ -193,7 +195,7 @@ fn logger_name(ctx: &mut dyn NativeContext, this: Option<cratonvm_types::ObjectR
 /// so `info`/`warning`/`severe`/`log(Level,String)` all produce a
 /// consistent shape.
 fn log_one(ctx: &mut dyn NativeContext, level: &str, logger: &str, message: &str) {
-    if std::env::var("CRATONVM_DBG_JLM").is_ok() {
+    if crate::nbflags().dbg_jlm {
         tracing::debug!(level, logger, message, "synthetic JBoss LM: log line");
     }
     emit_log_line(ctx, &format!("{level} [{logger}] {message}\n"));
@@ -303,7 +305,7 @@ fn native_jboss_logger_log_unchecked(ctx: &mut dyn NativeContext, args: &[Value]
     // they all reduce to "format an entry then emit". Emit a single
     // best-effort line so a `tracing::warn!`-style stub indicator is
     // still preferable to a silent NoSuchMethodError.
-    if std::env::var("CRATONVM_DBG_JLM").is_ok() {
+    if crate::nbflags().dbg_jlm {
         tracing::debug!(arg_count = args.len(), "synthetic JBoss LM: stub method logRaw called");
     }
     let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
@@ -392,6 +394,8 @@ pub(crate) fn reset_for_tests() {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeMethodRegistry;

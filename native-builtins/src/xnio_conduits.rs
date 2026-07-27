@@ -156,7 +156,7 @@ const CHANNEL_LISTENER_HANDLE_EVENT_DESC: &str = "(Ljava/nio/channels/Channel;)V
 const READ_NOTIFY_RETRY_DELAYS_MS: [u64; 1] = [0];
 const READ_NOTIFY_POST_LISTENER_RETRY_DELAYS_MS: [u64; 1] = [0];
 fn xnio_tcp_dbg_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some()
+    crate::nbflags().dbg_xnio_tcp
 }
 
 macro_rules! xnio_tcp_dbg {
@@ -2466,6 +2466,8 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_types::ArrayElementType;

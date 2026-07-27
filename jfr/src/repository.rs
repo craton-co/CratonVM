@@ -45,6 +45,11 @@ use crate::event::{EventInstance, EventTypeId};
 pub struct EventRepository {
     events: VecDeque<EventInstance>,
     max_events: usize,
+    /// obsaudit D12 (2026-07-26): retention age in nanoseconds, from
+    /// `RecordingSettings::max_age`. `None` (the default, via [`Self::new`])
+    /// means no age-based eviction — only `max_events` bounds the ring, same
+    /// as before this field existed. Set via [`Self::with_max_age`].
+    max_age_nanos: Option<u64>,
     total_recorded: u64,
     /// Index from event type_id to the set of logical indices (offset from
     /// `total_recorded - events.len()`). Maintained on push/evict/clear.
@@ -63,42 +68,74 @@ impl EventRepository {
         Self {
             events: VecDeque::new(),
             max_events,
+            max_age_nanos: None,
             total_recorded: 0,
             type_index: FxHashMap::default(),
             base_index: 0,
         }
     }
 
-    /// Push an event, evicting the oldest if over the limit. O(1) amortized.
+    /// Like [`Self::new`], but also enforces a retention age (obsaudit D12).
+    /// `max_age_nanos` is compared against each pushed event's own
+    /// `start_time` as the reference "now" — the repository has no wall
+    /// clock of its own, and using the just-pushed event's timestamp keeps
+    /// eviction driven purely by the event stream's own ordering, with no
+    /// dependency on system time inside this library.
+    pub fn with_max_age(max_events: usize, max_age_nanos: Option<u64>) -> Self {
+        Self {
+            max_age_nanos,
+            ..Self::new(max_events)
+        }
+    }
+
+    /// Evict the single oldest (front) event, fixing up `type_index` and
+    /// `base_index` to match. No-op if the repository is empty. Shared by
+    /// the size-cap and age-cap eviction passes in [`Self::push`].
+    fn evict_front(&mut self) {
+        if let Some(evicted) = self.events.pop_front() {
+            // Remove evicted event from type index. Round-4 fix:
+            // because events are pushed in monotonic abs-index order,
+            // the front of the per-type deque is always the evicted
+            // event's index — no search needed. O(1) instead of the
+            // prior O(N_type) `position()` linear scan.
+            let drop_type = if let Some(indices) = self.type_index.get_mut(&evicted.type_id) {
+                // Defensive: the front *should* equal base_index, but if
+                // a future caller mutates state out of order we still
+                // produce a correct (if slower) answer by scanning.
+                let target = self.base_index as usize;
+                if indices.front().copied() == Some(target) {
+                    indices.pop_front();
+                } else if let Some(pos) = indices.iter().position(|&i| i == target) {
+                    // Fallback path — preserves correctness if the
+                    // monotonic invariant is ever broken.
+                    indices.remove(pos);
+                }
+                indices.is_empty()
+            } else {
+                false
+            };
+            if drop_type {
+                self.type_index.remove(&evicted.type_id);
+            }
+            self.base_index += 1;
+        }
+    }
+
+    /// Push an event, evicting the oldest if over the size limit and/or (if
+    /// `max_age_nanos` is set — obsaudit D12) older than the retention
+    /// window. Both eviction passes are O(1) amortized per evicted event.
     pub fn push(&mut self, event: EventInstance) {
         if self.events.len() >= self.max_events {
             // Evict oldest (front) — O(1) with VecDeque
-            if let Some(evicted) = self.events.pop_front() {
-                // Remove evicted event from type index. Round-4 fix:
-                // because events are pushed in monotonic abs-index order,
-                // the front of the per-type deque is always the evicted
-                // event's index — no search needed. O(1) instead of the
-                // prior O(N_type) `position()` linear scan.
-                let drop_type = if let Some(indices) = self.type_index.get_mut(&evicted.type_id) {
-                    // Defensive: the front *should* equal base_index, but if
-                    // a future caller mutates state out of order we still
-                    // produce a correct (if slower) answer by scanning.
-                    let target = self.base_index as usize;
-                    if indices.front().copied() == Some(target) {
-                        indices.pop_front();
-                    } else if let Some(pos) = indices.iter().position(|&i| i == target) {
-                        // Fallback path — preserves correctness if the
-                        // monotonic invariant is ever broken.
-                        indices.remove(pos);
-                    }
-                    indices.is_empty()
-                } else {
-                    false
-                };
-                if drop_type {
-                    self.type_index.remove(&evicted.type_id);
+            self.evict_front();
+        }
+        if let Some(max_age_nanos) = self.max_age_nanos {
+            let cutoff = event.start_time.saturating_sub(max_age_nanos);
+            while let Some(front) = self.events.front() {
+                if front.start_time >= cutoff {
+                    break;
                 }
-                self.base_index += 1;
+                self.evict_front();
             }
         }
         // Add to type index

@@ -110,7 +110,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
 use crate::alloc_concurrent_synthetic;
@@ -2784,7 +2784,7 @@ fn check_revocation(
             revocation,
             timeout,
         );
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] check_revocation cert_index={} outcome={:?}",
                 i, outcome
@@ -3230,7 +3230,7 @@ pub(crate) fn build_and_register_tm_state_from_mfp(
             insert_anchor(&mut state, der);
         }
         state.revocation = extract_revocation_config(ctx, mfp);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] build_and_register_tm_state_from_mfp revocation_config={:?}",
                 state.revocation
@@ -3783,18 +3783,25 @@ fn read_keystore_id(ctx: &mut dyn NativeContext, ks: ObjectRef) -> i32 {
     crate::keystore::keystore_id_from_object(ctx, ks)
 }
 
+/// FIX (TestManagerWebappSsl sslConnectorCerts, "Subject: CN=..." missing from
+/// the manager's cert-chain listing): this used to always
+/// `alloc_concurrent_synthetic` a BARE `java/security/cert/X509Certificate`
+/// (the abstract class itself, which has no `toString()` implementation of
+/// its own) and stash `alias` as both subject and issuer, unconditionally —
+/// a local, worse duplicate of `keystore::make_x509_mirror`, which this same
+/// file's own DER-extraction fallback above already documents as the
+/// "preferred path" for a REAL certificate object. Calling `.toString()` on
+/// the bare synthetic fell through to `Object.toString()`
+/// (`java.security.cert.X509Certificate@<hash>`), not a real
+/// subject/issuer/validity dump — breaking `ManagerServlet.sslConnectorCerts`
+/// (`cert.toString()`) and anything else relying on a real
+/// `X509Certificate.toString()`/`checkValidity()`/etc. Delegate to
+/// `keystore::make_x509_mirror` instead, which tries a REAL
+/// `sun.security.x509.X509CertImpl` (real bytecode, so `toString()` and
+/// friends work correctly) parsed from the DER first, only falling back to
+/// a bare synthetic mirror if that construction itself fails.
 fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> ObjectRef {
-    let cert_obj = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
-    let alias_str = ctx.create_string(alias);
-    ctx.set_field(cert_obj, 0, Value::Object(Some(alias_str)));
-    ctx.set_field(cert_obj, 1, Value::Object(Some(alias_str)));
-    ctx.set_field(cert_obj, 2, Value::Int(0));
-    let arr = ctx.new_array(ArrayElementType::Byte, der.len());
-    for (i, b) in der.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
-    }
-    ctx.set_field(cert_obj, 3, Value::Object(Some(arr)));
-    cert_obj
+    crate::keystore::make_x509_mirror(ctx, alias, der)
 }
 
 fn make_private_key_mirror(
@@ -4081,7 +4088,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             }
         }
     };
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] do_check_trusted id={} registry_hit={} anchor_ders={} anchors_groups={} chain_len={}",
             id,
@@ -4167,7 +4174,7 @@ fn kmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             .get(2)
             .map(|value| crate::keystore::read_password(ctx, value))
             .unwrap_or_default();
-        if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+        if crate::nbflags().dbg_tls_auth {
             eprintln!(
                 "[dbg-tls-auth] kmf_engine_init this_ptr={:?} ks_id={} password_len={}",
                 this.as_ptr(),
@@ -4213,7 +4220,7 @@ fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let state = build_trust_manager_state(ks_id);
     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
     let id = register_trust_manager_state(state);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_init this_ptr={:?} ks_id={} new_tm_id={}",
             this.as_ptr(),
@@ -4228,7 +4235,7 @@ fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_tm_id(ctx, this);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_get_trust_managers this_ptr={:?} read_id={}",
             this.as_ptr(),
@@ -4242,7 +4249,7 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let arr = ctx.new_ref_array(cls_id, 1);
     let tm = alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2);
     set_tm_id(ctx, tm, id);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_get_trust_managers stamped tm_ptr={:?} id={}",
             tm.as_ptr(),
@@ -4262,6 +4269,8 @@ mod tests {
     //! Hermetic tests built against a hand-rolled X.509 fixture. We never
     //! shell out to `openssl` — every cert byte here is produced by the
     //! `mk_cert` builder below so the suite passes on any host.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
 
     use super::*;
 

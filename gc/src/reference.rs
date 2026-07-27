@@ -7,15 +7,43 @@
 //! [`SoftReference`], [`WeakReference`], [`PhantomReference`], and the
 //! internal [`Cleaner`] / [`FinalReference`] types used by the JDK.
 //!
-//! Processing order matches HotSpot:
-//! 1. SoftReferences  -- cleared only under memory pressure (LRU policy)
-//! 2. WeakReferences  -- always cleared when referent is unreachable
-//! 3. FinalReferences  -- enqueued so the finalizer thread can run `finalize()`
-//! 4. PhantomReferences -- enqueued after finalisation (Java 9+: referent NOT cleared)
+//! Processing order matches HotSpot, and reachability is recomputed between
+//! phases so each level only sees objects the stronger levels have released:
+//! 1. SoftReferences  -- cleared only under memory pressure (LRU policy),
+//!    honouring the finalizer-reachable closure;
+//! 2. WeakReferences  -- cleared when the referent is unreachable, honouring
+//!    the finalizer-reachable AND soft-reachable closures;
+//! 3. FinalReferences -- enqueued so the finalizer thread can run `finalize()`,
+//!    honouring the soft-reachable closure (soft reachability blocks
+//!    finalization; finalizer reachability deliberately does not, so mutually
+//!    reachable finalizables are enqueued together);
+//! 4. PhantomReferences and `Cleaner`s -- enqueued/fired only once the referent
+//!    is neither soft- nor weak-reachable AND has already been finalized
+//!    (Java 9+: the phantom referent is NOT cleared).
+//!
+//! # Cost and locking
+//!
+//! Everything here runs inside the collector's stop-the-world pause, under the
+//! single global `ref_processor` mutex (L7 in `vm/src/runtime/lock_order.rs`).
+//! The lock therefore serialises mutator-side `discover_reference` /
+//! `touch_soft_reference` against each other, not against the GC.
+//!
+//! Per-collection cost is **O(registered references)**, not O(live references):
+//! phases 2-4 are flat scans over `weak_refs` / `cleaner_refs` /
+//! `finalizer_refs` / `phantom_refs`, and an already-cleared or already-enqueued
+//! entry is skipped but still visited. Only phase 1 is sublinear — the
+//! `soft_ref_lru_index` BTreeMap range visits just the entries idle enough to be
+//! clear candidates. The lists are bounded by `remove_collected`, which drops
+//! entries whose `Reference` OBJECT died, so the scans stay proportional to
+//! *live Reference objects* rather than to every reference ever created. A
+//! `WeakHashMap` with a million live entries still costs a million-entry scan
+//! per collection; see `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md`
+//! for the "cleared entries could be segregated into a cold list" sketch.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::gc_flags;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -212,6 +240,42 @@ pub struct ReferenceProcessor {
     /// `(timestamp, idx) -> idx` invariant the LRU-leak fix already maintains.
     soft_ref_addr_index: FxHashMap<usize, usize>,
 
+    /// Highest wall-clock millisecond value the *mutator* side has ever handed
+    /// this processor through [`Self::touch_soft_reference`].
+    ///
+    /// SOFT-POLICY FIX (2026-07-26): the soft-reference LRU compares two
+    /// numbers that came from different places, and in production they were
+    /// on different clocks, which disabled the policy outright.
+    ///
+    /// * `last_access_time_ms` on each soft entry is stamped by
+    ///   `NativeContext::touch_soft_reference` (`vm/src/vm/vm_exec.rs`), which
+    ///   uses `SystemTime::now()` — i.e. real Unix-epoch milliseconds
+    ///   (~1.7e12). It fires from `SoftReference.<init>` *and* every
+    ///   `SoftReference.get()` (`native-builtins/src/reference.rs`).
+    /// * `current_time_ms`, the argument to [`Self::process_references`], is a
+    ///   hard-coded `0` at BOTH production call sites
+    ///   (`vm/src/runtime/interpreter.rs`, the post-GC path and the G1
+    ///   final-remark path).
+    ///
+    /// With `current_time_ms == 0` the cutoff in [`Self::process_soft_refs`] is
+    /// `0.saturating_sub(threshold) == 0`, so the BTreeMap range selects only
+    /// entries still at timestamp `0`, and for those `idle_ms` is also `0` —
+    /// never greater than the threshold. Net effect: **no SoftReference could
+    /// ever be cleared on either VM path**, so soft references behaved exactly
+    /// like strong ones and `OutOfMemoryError` was reached with a heap full of
+    /// reclaimable soft-reachable objects. (Independently observed in
+    /// `docs/internal/fixed-suite-bugs/springboot/
+    /// core39-clusterD-lifecycle-ssl-validation-FIXED.md`: "`process_soft_refs`
+    /// never ran even once during the whole failing run".)
+    ///
+    /// Rather than depend on a caller-side change in a file this module does
+    /// not own, the processor now tracks the mutator clock itself and uses
+    /// `max(current_time_ms, last_observed_clock_ms)` as "now". A caller that
+    /// supplies a coherent clock (ZGC's backend, and every unit/integration
+    /// test) is unaffected, because its `current_time_ms` already dominates.
+    /// A caller that supplies `0` gets the real clock instead of a dead policy.
+    last_observed_clock_ms: u64,
+
     stats: ReferenceProcessingStats,
 }
 
@@ -232,6 +296,7 @@ impl ReferenceProcessor {
             finalization_queue: std::collections::VecDeque::new(),
             soft_ref_lru_index: BTreeMap::new(),
             soft_ref_addr_index: FxHashMap::default(),
+            last_observed_clock_ms: 0,
             stats: ReferenceProcessingStats::default(),
         }
     }
@@ -246,6 +311,27 @@ impl ReferenceProcessor {
         referent: usize,
         queue: Option<usize>,
     ) {
+        // SOFT-POLICY FIX (2026-07-26): stamp a soft entry with the processor's
+        // best knowledge of the mutator clock at *creation* time, mirroring
+        // `java.lang.ref.SoftReference`'s constructor (`this.timestamp = clock`).
+        //
+        // This matters now that [`Self::process_soft_refs`] falls back to
+        // `last_observed_clock_ms` for "now": a soft reference discovered
+        // through a path that does not also call
+        // [`Self::touch_soft_reference`] would otherwise sit at timestamp `0`
+        // and look infinitely idle against a wall-clock "now", so the very
+        // first collection after the process had been up for
+        // `SoftRefLRUPolicyMSPerMB * free_mb` would clear it even though the
+        // application had just allocated it.
+        //
+        // `last_observed_clock_ms` is `0` until the first
+        // `touch_soft_reference`, so this is a no-op for every caller that
+        // never touches (all current unit and integration tests), and equals
+        // "roughly now" for the live VM, where `SoftReference.<init>` touches.
+        let creation_stamp = match ref_type {
+            ReferenceType::Soft => self.last_observed_clock_ms,
+            _ => 0,
+        };
         let entry = ReferenceEntry {
             ref_type,
             reference_obj,
@@ -253,7 +339,7 @@ impl ReferenceProcessor {
             queue_addr: queue,
             enqueued: false,
             cleared: false,
-            last_access_time_ms: 0,
+            last_access_time_ms: creation_stamp,
             clear_emitted: false,
             action_emitted: false,
         };
@@ -293,6 +379,17 @@ impl ReferenceProcessor {
     /// BTreeMap re-key; no global lock beyond the caller's existing
     /// `Mutex<ReferenceProcessor>` is taken.
     pub fn touch_soft_reference(&mut self, reference_obj: usize, now_ms: u64) {
+        // SOFT-POLICY FIX (2026-07-26): record the mutator's clock BEFORE any
+        // early return, so the processor learns the real time base even from a
+        // touch that resolves no entry or does not advance the timestamp. This
+        // is the only clock the processor ever sees that is guaranteed to be on
+        // the same scale as `last_access_time_ms`; `process_soft_refs` falls
+        // back to it when the collector-side caller passes `0` (see the field
+        // doc on `last_observed_clock_ms`). Monotone by construction so a
+        // non-monotonic `SystemTime` (NTP step-back) cannot rewind the policy.
+        if now_ms > self.last_observed_clock_ms {
+            self.last_observed_clock_ms = now_ms;
+        }
         // PERF: O(1) address-index lookup replaces the former O(n) linear
         // scan over all soft refs. `SoftReference.get()` calls this on the
         // timer-advance path; for large cache populations the linear scan made
@@ -416,15 +513,24 @@ impl ReferenceProcessor {
             finalizer_roots.iter().copied().collect()
         };
 
-        // Augmented liveness predicate used for Phase 1 (soft) only: an object
-        // is "live" if the collector already marked it OR it is reachable from
-        // a to-be-finalized object. Phases 3-4 keep using the raw `is_marked`
-        // snapshot so finalizers/phantoms are still discovered correctly.
+        // Augmented liveness predicate used for Phase 1 (soft): an object is
+        // "live" if the collector already marked it OR it is reachable from a
+        // to-be-finalized object. Phases 2-4 build on this with the additional
+        // soft-reachable closure — see each phase's construction below.
         let soft_is_live =
             |addr: usize| -> bool { is_marked(addr) || finalizer_live.contains(&addr) };
 
+        // SOFT-POLICY FIX (2026-07-26): "now" for the LRU comparison is the
+        // later of the caller's clock and the mutator clock the processor has
+        // observed through `touch_soft_reference`. Both production call sites
+        // in `vm/src/runtime/interpreter.rs` pass a literal `0`, which made the
+        // whole soft-ref policy unreachable; a caller with a real clock (ZGC's
+        // backend, every test) already dominates and is unaffected. See the
+        // `last_observed_clock_ms` field doc for the full analysis.
+        let effective_now_ms = current_time_ms.max(self.last_observed_clock_ms);
+
         // Phase 1 (soft) honours the finalizer-reachable closure.
-        self.process_soft_refs(&soft_is_live, free_heap_mb, current_time_ms);
+        self.process_soft_refs(&soft_is_live, free_heap_mb, effective_now_ms);
 
         // SPEC FIX (JLS reachability ordering, strong > soft > weak > phantom):
         // weak references must NOT be cleared for a referent that is still
@@ -463,11 +569,50 @@ impl ReferenceProcessor {
             is_marked(addr) || finalizer_live.contains(&addr) || soft_live.contains(&addr)
         };
         self.process_weak_refs(&weak_is_live);
-        // Phase 3-4 (final, phantom) use the raw collector marking so that
-        // the about-to-be-finalized objects are still discovered/enqueued and
-        // phantom reachability is unaffected by the resurrection closure.
-        self.process_final_refs(is_marked);
-        self.process_phantom_refs(is_marked);
+
+        // SPEC FIX (JLS/`java.lang.ref` reachability ordering, phases 3-4),
+        // 2026-07-26. Phases 3 and 4 previously used the RAW `is_marked`
+        // snapshot, with a comment claiming phantom reachability should be
+        // "unaffected by the resurrection closure". That is the wrong way
+        // round: the *whole reason* phantom is processed last is that an object
+        // is phantom-reachable only once it is neither strongly, softly, nor
+        // weakly reachable AND it has already been finalized. Using raw marking
+        // meant:
+        //
+        //   * a `Cleaner`/`PhantomReference` fired for an object that Phase 1
+        //     had just decided to RETAIN through a surviving SoftReference.
+        //     For the JDK's most important cleaner — `DirectByteBuffer`'s —
+        //     that means freeing the native allocation backing a buffer the
+        //     application can still reach via `SoftReference.get()`:
+        //     use-after-free, not merely a spec nit; and
+        //   * `finalize()` was scheduled for an object that was still softly
+        //     reachable, and a phantom was enqueued for an object whose
+        //     `finalize()` had not run yet (so a resurrecting finalizer would
+        //     race an already-delivered phantom notification).
+        //
+        // Both phases now fold in the closures Phases 1-2 already computed.
+        // The split is deliberate:
+        //
+        //   * FINALIZER entries fold in `soft_live` ONLY. Soft reachability
+        //     blocks finalization, but finalizer-reachability must NOT: when
+        //     two mutually-reachable objects both override `finalize()`,
+        //     HotSpot enqueues both in the same cycle. Folding `finalizer_live`
+        //     here would make each block the other forever.
+        //   * CLEANER and PHANTOM entries fold in BOTH. `Cleaner` is a
+        //     `PhantomReference` subclass, so it takes the phantom rule, and
+        //     "has been finalized" is part of that rule.
+        //
+        // This is strictly *less* clearing/enqueueing than before, so it can
+        // only over-retain, never free early. Over-retention is bounded at one
+        // collection for the finalizer closure: once Phase 3 flags an entry
+        // `enqueued`, it stops contributing a root, and the next cycle fires
+        // the phantom.
+        let final_is_live = |addr: usize| -> bool { is_marked(addr) || soft_live.contains(&addr) };
+        let phantom_is_live = |addr: usize| -> bool {
+            is_marked(addr) || soft_live.contains(&addr) || finalizer_live.contains(&addr)
+        };
+        self.process_final_refs(&final_is_live, &phantom_is_live);
+        self.process_phantom_refs(&phantom_is_live);
 
         // Build result
         let mut to_enqueue = Vec::new();
@@ -608,7 +753,7 @@ impl ReferenceProcessor {
     // -- Phase 2: WeakReferences -------------------------------------------
 
     fn process_weak_refs(&mut self, is_marked: &dyn Fn(usize) -> bool) {
-        let dbg = std::env::var_os("CRATONVM_DBG_WATCHREF").is_some();
+        let dbg = gc_flags().dbg_watchref;
         for entry in &mut self.weak_refs {
             if entry.cleared {
                 continue;
@@ -642,13 +787,21 @@ impl ReferenceProcessor {
 
     // -- Phase 3: Cleaner / FinalReferences --------------------------------
 
-    fn process_final_refs(&mut self, is_marked: &dyn Fn(usize) -> bool) {
+    /// `finalizer_is_live` gates `finalize()` scheduling (raw marking + the
+    /// soft-reachable closure); `cleaner_is_live` gates `Cleaner` actions
+    /// (raw marking + soft-reachable + finalizer-reachable, because `Cleaner`
+    /// is a `PhantomReference`). See the call site for why the two differ.
+    fn process_final_refs(
+        &mut self,
+        finalizer_is_live: &dyn Fn(usize) -> bool,
+        cleaner_is_live: &dyn Fn(usize) -> bool,
+    ) {
         // Cleaners
         for entry in &mut self.cleaner_refs {
             if entry.cleared {
                 continue;
             }
-            if is_marked(entry.referent) {
+            if cleaner_is_live(entry.referent) {
                 continue;
             }
             entry.cleared = true;
@@ -661,7 +814,7 @@ impl ReferenceProcessor {
             if entry.enqueued || entry.cleared {
                 continue;
             }
-            if is_marked(entry.referent) {
+            if finalizer_is_live(entry.referent) {
                 continue;
             }
             entry.enqueued = true;
@@ -2045,7 +2198,7 @@ mod tests {
         proc.discover_reference(ReferenceType::Cleaner, 0x50, 0x51, None); // pending
         proc.discover_reference(ReferenceType::Cleaner, 0x60, 0x60, None); // self-referent
         proc.discover_reference(ReferenceType::Cleaner, 0x70, 0x71, None); // will fire
-        // Fire 0x70's action: its referent 0x71 is dead.
+                                                                           // Fire 0x70's action: its referent 0x71 is dead.
         let result = proc.process_references(&|addr| addr != 0x71, 64, 0);
         assert!(result.cleaner_actions.contains(&0x70));
         let addrs = proc.cleaner_pending_object_addresses();
@@ -2235,5 +2388,190 @@ mod tests {
         assert_eq!(result.stats.soft_refs_cleared, 0);
         assert_eq!(result.stats.weak_refs_cleared, 1);
         assert!(proc.weak_refs[0].cleared);
+    }
+
+    // ======================================================================
+    // SOFT-POLICY FIX (2026-07-26): the LRU must survive a caller that has no
+    // clock. Both production call sites in `vm/src/runtime/interpreter.rs`
+    // pass `current_time_ms == 0`, which used to make `process_soft_refs`
+    // structurally incapable of clearing anything. See the
+    // `last_observed_clock_ms` field doc.
+    // ======================================================================
+
+    // 66. With a `0` caller clock, the mutator clock observed through
+    //     `touch_soft_reference` is used instead, so an idle soft ref clears.
+    #[test]
+    fn soft_policy_uses_mutator_clock_when_caller_passes_zero() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, Some(0x180));
+        // `SoftReference.get()` stamps a wall-clock time on the entry.
+        proc.touch_soft_reference(0x100, 1_000_000);
+        // Time passes; another (unrelated / unknown) touch advances only the
+        // processor's clock. This also pins that the clock is recorded BEFORE
+        // the unknown-address early return.
+        proc.touch_soft_reference(0xDEAD, 1_100_000);
+
+        // Exactly what the interpreter passes today.
+        let result = proc.process_references(&always_dead, 64, 0);
+
+        // threshold = 1000 ms/MB * 64 MB = 64_000; idle = 100_000 > 64_000.
+        assert_eq!(
+            result.stats.soft_refs_cleared, 1,
+            "soft-ref LRU must run even when the collector supplies no clock"
+        );
+        assert!(proc.soft_refs[0].cleared);
+    }
+
+    // 67. A soft ref created after the clock is known carries a *creation*
+    //     timestamp (like `SoftReference`'s constructor), so it is not
+    //     instantly stale against a wall-clock "now". Non-soft types keep
+    //     stamping 0 — the field is meaningless for them.
+    #[test]
+    fn soft_policy_creation_stamp_protects_fresh_ref() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        // Establish the mutator clock first (some earlier SoftReference.get()).
+        proc.touch_soft_reference(0xDEAD, 5_000_000);
+
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, None);
+        assert_eq!(
+            proc.soft_refs[0].last_access_time_ms, 5_000_000,
+            "a freshly discovered soft ref must be stamped at creation"
+        );
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x400, None);
+        assert_eq!(
+            proc.weak_refs[0].last_access_time_ms, 0,
+            "only soft refs carry an LRU timestamp"
+        );
+
+        // Production (64, 0): idle == 0, so the fresh ref must survive.
+        let result = proc.process_references(&always_dead, 64, 0);
+        assert_eq!(result.stats.soft_refs_cleared, 0);
+        assert!(!proc.soft_refs[0].cleared);
+    }
+
+    // 68. A caller that DOES supply a coherent clock keeps full control: the
+    //     larger of the two wins, so ZGC's backend and every test behave
+    //     exactly as before the fix.
+    #[test]
+    fn soft_policy_caller_clock_dominates_observed_clock() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, None);
+        proc.touch_soft_reference(0x100, 1_000);
+
+        // threshold = 1000 * 1 = 1000; idle = 1_000_000 - 1_000 > 1000.
+        let result = proc.process_references(&always_dead, 1, 1_000_000);
+        assert_eq!(result.stats.soft_refs_cleared, 1);
+    }
+
+    // ======================================================================
+    // SPEC FIX (2026-07-26): phases 3-4 honour the soft/finalizer closures.
+    // ======================================================================
+
+    // 69. A `Cleaner` must NOT fire while its referent is still softly
+    //     reachable. The live case is `DirectByteBuffer`: firing here frees
+    //     native memory still reachable through `SoftReference.get()`.
+    #[test]
+    fn cleaner_not_fired_while_referent_softly_reachable() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        // Soft ref retains 0x200 (recently touched, ample headroom).
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, None);
+        proc.touch_soft_reference(0x100, 5_000);
+        // A Cleaner registered against that very object.
+        proc.discover_reference(ReferenceType::Cleaner, 0x300, 0x200, None);
+
+        let result = proc.process_references(&always_dead, 64, 5_000);
+
+        assert_eq!(result.stats.soft_refs_cleared, 0, "soft ref must survive");
+        assert!(
+            result.cleaner_actions.is_empty(),
+            "cleaner fired for a still-soft-reachable referent"
+        );
+        assert!(!proc.cleaner_refs[0].cleared);
+    }
+
+    // 70. `finalize()` must NOT be scheduled while the object is still softly
+    //     reachable.
+    #[test]
+    fn finalizer_not_enqueued_while_referent_softly_reachable() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, None);
+        proc.touch_soft_reference(0x100, 5_000);
+        proc.discover_reference(ReferenceType::Finalizer, 0x300, 0x200, None);
+
+        let result = proc.process_references(&always_dead, 64, 5_000);
+
+        assert_eq!(result.stats.soft_refs_cleared, 0);
+        assert_eq!(result.stats.finalizer_refs_enqueued, 0);
+        assert!(result.to_finalize.is_empty());
+    }
+
+    // 71. A phantom must wait until the referent has been finalized, then fire
+    //     on the following cycle (bounded one-cycle delay, never permanent).
+    #[test]
+    fn phantom_waits_one_cycle_for_finalization() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Finalizer, 0x100, 0x200, None);
+        proc.discover_reference(ReferenceType::Phantom, 0x300, 0x200, Some(0x400));
+
+        let r1 = proc.process_references(&always_dead, 64, 0);
+        assert_eq!(r1.stats.finalizer_refs_enqueued, 1);
+        assert_eq!(
+            r1.stats.phantom_refs_enqueued, 0,
+            "phantom must not fire before finalization"
+        );
+
+        // The finalizer entry is now flagged enqueued, so it stops rooting the
+        // object and the phantom is delivered.
+        let r2 = proc.process_references(&always_dead, 64, 0);
+        assert_eq!(r2.stats.phantom_refs_enqueued, 1);
+        assert!(r2.to_enqueue.iter().any(|&(r, q)| r == 0x300 && q == 0x400));
+    }
+
+    // 72. Mutually-reachable finalizable objects must BOTH be enqueued in the
+    //     same cycle. This pins the deliberate asymmetry: the finalizer phase
+    //     folds in the soft closure but NOT the finalizer closure, otherwise
+    //     each object would block the other forever.
+    #[test]
+    fn mutually_reachable_finalizers_both_enqueued() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Finalizer, 0x100, 0x200, None);
+        proc.discover_reference(ReferenceType::Finalizer, 0x300, 0x400, None);
+
+        // 0x200 and 0x400 reference each other.
+        let trace = |roots: &[usize]| -> Vec<usize> {
+            let mut out = roots.to_vec();
+            if roots.contains(&0x200) {
+                out.push(0x400);
+            }
+            if roots.contains(&0x400) {
+                out.push(0x200);
+            }
+            out
+        };
+
+        let result =
+            proc.process_references_with_finalizer_trace(&always_dead, Some(&trace), 64, 0);
+        assert_eq!(
+            result.stats.finalizer_refs_enqueued, 2,
+            "finalizer-reachability must not block finalization"
+        );
+    }
+
+    // 73. No over-retention: an unrelated dead cleaner/phantom referent still
+    //     fires while a soft reference survives elsewhere.
+    #[test]
+    fn unrelated_cleaner_and_phantom_still_fire_with_surviving_soft_ref() {
+        let mut proc = ReferenceProcessor::new_with_policy(1000);
+        proc.discover_reference(ReferenceType::Soft, 0x100, 0x200, None);
+        proc.touch_soft_reference(0x100, 5_000);
+        // Unrelated dead referents.
+        proc.discover_reference(ReferenceType::Cleaner, 0x300, 0x999, None);
+        proc.discover_reference(ReferenceType::Phantom, 0x500, 0x888, Some(0x600));
+
+        let result = proc.process_references(&always_dead, 64, 5_000);
+
+        assert_eq!(result.stats.soft_refs_cleared, 0);
+        assert!(result.cleaner_actions.contains(&0x300));
+        assert_eq!(result.stats.phantom_refs_enqueued, 1);
     }
 }

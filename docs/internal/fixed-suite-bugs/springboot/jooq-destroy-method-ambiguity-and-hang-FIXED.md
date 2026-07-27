@@ -52,7 +52,7 @@ Logs:
 
 ### Relationship to an existing RESOLVED doc — discrepancy
 
-[`../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md)
+[`../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md)
 covers a **generic outer** `BeanCreationException("Invalid destruction
 signature")` wrapper with **no captured inner exception**, closed RESOLVED
 2026-07-12 via a synthetic `AutoCloseable` probe. This 2026-07-17 failure has

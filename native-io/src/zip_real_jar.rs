@@ -34,6 +34,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 use zip::extra_fields::ExtraField;
 
+use crate::io_flags;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, VmError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
@@ -83,14 +84,9 @@ const MAX_COMPRESSION_RATIO: u64 = 1000;
 /// `CRATONVM_ZIP_MAX_ENTRY_BYTES` once on first call; falls back to
 /// [`DEFAULT_MAX_ENTRY_BYTES`] when unset, empty, or unparseable.
 fn max_entry_bytes() -> u64 {
-    static CAP: OnceLock<u64> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("CRATONVM_ZIP_MAX_ENTRY_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT_MAX_ENTRY_BYTES)
-    })
+    crate::io_flags()
+        .zip_max_entry_bytes
+        .unwrap_or(DEFAULT_MAX_ENTRY_BYTES)
 }
 
 /// Validate a zip entry's *declared* sizes against the decompression-bomb
@@ -383,7 +379,7 @@ fn open_and_register(
         t.insert(handle, state);
         t.len()
     };
-    if std::env::var_os("CRATONVM_DBG_JAR").is_some() {
+    if io_flags().dbg_jar {
         eprintln!("[JAR] open handle={handle} table_len={table_len} path={validated_path:?}");
     }
     set_jar_handle(ctx, this, handle);
@@ -1037,7 +1033,7 @@ fn native_jarfile_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         t.remove(&handle);
         t.len()
     };
-    if std::env::var_os("CRATONVM_DBG_JAR").is_some() {
+    if io_flags().dbg_jar {
         eprintln!("[JAR] close handle={handle} table_len={table_len}");
     }
     // Drop the identity→handle recovery entry if it still points at us.
@@ -1207,6 +1203,8 @@ pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -1235,7 +1233,9 @@ mod tests {
         // long raw `zip::ZipArchive::new` open + central-directory parse
         // takes across every real jar, to isolate whether that's the TLD-scan
         // slowdown bottleneck independent of the VM/interpreter.
-        let list_path = std::env::var("CRATONVM_DIAG_JAR_LIST")
+        let list_path = crate::io_flags()
+            .diag_jar_list
+            .clone()
             .expect("set CRATONVM_DIAG_JAR_LIST to a classpath file path");
         let contents = std::fs::read_to_string(&list_path).unwrap();
         let paths: Vec<&str> = contents

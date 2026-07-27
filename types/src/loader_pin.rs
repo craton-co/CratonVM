@@ -52,7 +52,7 @@ fn store() -> &'static RwLock<FxHashMap<u32, usize>> {
 pub fn loader_pinning_enabled() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("CRATONVM_LOADER_UNLOAD")
+        crate::flags::runtime_var("CRATONVM_LOADER_UNLOAD")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
@@ -67,6 +67,16 @@ static NON_EMPTY: AtomicBool = AtomicBool::new(false);
 pub fn set_loader_pin(class_id: u32, loader_addr: usize) {
     store().write().insert(class_id, loader_addr);
     NON_EMPTY.store(true, Ordering::Relaxed);
+}
+
+/// Remove the instance-to-loader edge for a class whose defining loader and
+/// metadata have completed unloading.
+pub fn remove_loader_pin(class_id: u32) {
+    let mut pins = store().write();
+    pins.remove(&class_id);
+    if pins.is_empty() {
+        NON_EMPTY.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The defining-loader heap address for `class_id`, if it was defined by a user

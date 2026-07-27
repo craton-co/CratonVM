@@ -1,13 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! NUMA-aware allocation (Phase 16.3) and string deduplication (Phase 16.4).
+//! NUMA topology detection (Phase 16.3) and string deduplication (Phase 16.4).
 //!
 //! Real platform NUMA detection lives in [`NumaTopology::detect`] with
 //! per-OS code paths (Linux sysfs, Windows env-based fallback, macOS proxy,
 //! generic single-node fallback). The detected topology is cached in a
 //! `OnceLock` accessible via [`global_topology`] so other crates can share
 //! the result without re-reading sysfs.
+//!
+//! # No NUMA placement happens. This module only *detects*.
+//!
+//! Audit note, 2026-07-26 (`arch-2026-07-26/refs-metaspace-unloading`). Stated
+//! plainly because the module name and the type name `NumaAllocator` both imply
+//! otherwise:
+//!
+//! **Live on the default path** — exactly three entry points, all consumed by
+//! `gc/src/gen_heap.rs` (search `crate::numa::`):
+//!
+//! * [`global_topology`] and [`NumaTopology::current_thread_node`], read once
+//!   at `GenerationalHeap` construction and again on the allocation slow path;
+//! * [`NumaTopology::node_of_cpu`], used by the above.
+//!
+//! What `gen_heap` does with the answer is store it in a `numa_node_hint`
+//! field and, on a multi-node host, emit a `tracing::trace!` when the calling
+//! thread's node differs from the heap's primary node. It calls this a "NUMA
+//! stub" in its own comments. **No allocation is ever steered to a node**: the
+//! heap has one young arena and one old generation, memory comes from the
+//! process allocator, and nothing calls `mbind`, `set_mempolicy`,
+//! `numa_alloc_onnode`, or `VirtualAllocExNuma`. On a single-node host (every
+//! current CI and dev target) even the trace is dead — it is two integer
+//! compares.
+//!
+//! **Inert** — no caller anywhere in the workspace:
+//!
+//! * [`NumaAllocator`], [`NumaArena`], [`NumaAllocation`], [`NumaStats`],
+//!   [`NumaPolicy`]. `NumaAllocator::allocate` is a *simulation*: it bumps a
+//!   `next_address` counter starting at `0x1000` and returns that integer. It
+//!   touches no memory and its "addresses" are not pointers. It also never
+//!   reports a cross-node allocation — `allocate` unconditionally increments
+//!   `local_allocations`, so `local_allocation_ratio` is `1.0` unless a caller
+//!   manually calls `record_cross_node_access`.
+//! * [`StringDeduplicator`] and its config/stats types. G1's string dedup is
+//!   not wired to this.
+//!
+//! So: any report, dashboard or doc claiming CratonVM does NUMA-aware
+//! placement is wrong. The topology probe is real and correct; the placement
+//! it would inform does not exist. See
+//! `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` for what wiring
+//! it would take.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -344,7 +385,7 @@ fn detect_windows() -> Option<NumaTopology> {
     // TODO: when the `windows` crate becomes a dependency of `gc/`, switch
     // to `GetLogicalProcessorInformationEx(RelationNumaNode, ...)` here.
     // For now: single node sized from NUMBER_OF_PROCESSORS, with all CPUs.
-    let n = std::env::var("NUMBER_OF_PROCESSORS")
+    let n = cratonvm_types::flags::runtime_var("NUMBER_OF_PROCESSORS")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or_else(available_cpu_count)

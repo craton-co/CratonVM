@@ -2895,7 +2895,7 @@ pub(crate) fn native_integer_to_hex_string(
         _ => 0,
     };
     // DEBUG-NETTYHANG: log every call
-    if std::env::var_os("CRATONVM_DBG_TOHEX").is_some() {
+    if crate::nbflags().dbg_tohex {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 600 || n % 1000 == 0 {
@@ -4573,6 +4573,8 @@ pub(crate) fn native_long_compare_to(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 

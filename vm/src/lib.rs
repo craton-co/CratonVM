@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+#![deny(deprecated)]
+
 //! CratonVM — A Java Virtual Machine implemented in Rust.
 //!
 //! This crate provides the core VM implementation including:
@@ -144,7 +146,7 @@ pub mod harness_exit_shim {
     /// Compile-time baseline for the panic-count tripwire. The
     /// regression test in `harness_exit_shim_tests` greps the
     /// source tree to assert the `#[should_panic]` attribute count
-    /// matches the 21 we expect; the other four panics observed on
+    /// matches the 28 we expect; the other four panics observed on
     /// a clean run are ambient (e.g. internal `panic!()` fired from
     /// `SharedVm::new` recovery paths that are immediately
     /// caught). The shim treats any count *greater* than this
@@ -152,10 +154,10 @@ pub mod harness_exit_shim {
     /// hook path and flags the run as failed.
     ///
     /// Currently sourced from:
-    ///   - 21 `#[should_panic]` attributes:
+    ///   - 28 `#[should_panic]` attributes:
     ///     - vm/src/runtime/frame.rs        (4)
     ///     - vm/src/runtime/gpu_marshal.rs  (1)
-    ///     - vm/src/runtime/lock_order.rs   (8)  // +2: V11 lock-order assertions
+    ///     - vm/src/runtime/lock_order.rs   (15) // +7: top-of-hierarchy wiring
     ///     - vm/src/runtime/value_stack.rs  (6)
     ///     - vm/src/vm/vm_init.rs           (2)
     ///   - 4 ambient-panic slots observed on clean Windows runs
@@ -164,13 +166,13 @@ pub mod harness_exit_shim {
     ///     panic this constant will over-count by one; the only
     ///     consequence is the tripwire becomes slightly more
     ///     generous, never less.
-    pub const EXPECTED_PANIC_COUNT: usize = 25;
+    pub const EXPECTED_PANIC_COUNT: usize = 32;
 
     /// Only the true `#[should_panic]` attributes that the
     /// source-drift regression test counts. Kept separate from
     /// [`EXPECTED_PANIC_COUNT`] so the numbers have clear
     /// provenance.
-    pub const SHOULD_PANIC_ATTR_COUNT: usize = 21;
+    pub const SHOULD_PANIC_ATTR_COUNT: usize = 28;
 
     // Windows ExitProcess(u32) — unconditional process termination.
     // Calling this bypasses any further CRT teardown that would

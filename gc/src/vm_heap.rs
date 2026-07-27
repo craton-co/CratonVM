@@ -961,35 +961,50 @@ impl VmHeap {
         }
     }
 
-    /// Native-wrapper young-exhaustion signal, consumed at the
+    /// Native-wrapper allocation-pressure signal, consumed at the
     /// `safe_native_call` boundary to run the GC the wrappers themselves
-    /// cannot (see `GenHeap::young_spill_pressure`). Collectors without the
-    /// generational young→old spill-then-abort shape report `false`.
+    /// cannot.
+    ///
+    /// Each collector latches this from the point where it notices the
+    /// mutator is outrunning it *inside* a native callback — where no
+    /// collection can be initiated, because the callback's locals are not all
+    /// rooted yet. Generational: a young→old spill
+    /// (`GenHeap::young_spill_pressure`). G1: a new Eden region claimed with
+    /// the Free pool already under the `needs_gc` threshold
+    /// (`G1Collector::native_alloc_pressure`) — without it, a workload that
+    /// allocates only from inside natives never reaches ANY safepoint and G1's
+    /// infallible allocator aborts the process on a heap full of garbage (see
+    /// `docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
     #[inline]
     pub fn young_spill_pressure(&self) -> bool {
         match self {
             VmHeap::Generational(h) => h.young_spill_pressure(),
-            VmHeap::G1(_) => false,
+            VmHeap::G1(h) => h.native_alloc_pressure(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => false,
         }
     }
 
-    /// Clear the native-wrapper young-exhaustion signal (no-op on
-    /// non-generational collectors).
+    /// Clear the native-wrapper allocation-pressure signal.
     #[inline]
     pub fn clear_young_spill_pressure(&self) {
-        if let VmHeap::Generational(h) = self {
-            h.clear_young_spill_pressure();
+        match self {
+            VmHeap::Generational(h) => h.clear_young_spill_pressure(),
+            VmHeap::G1(h) => h.clear_native_alloc_pressure(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
-    /// Record a native-wrapper young-exhaustion spill (no-op on
-    /// non-generational collectors) — see `GenHeap::note_young_spill_pressure`.
+    /// Record a native-wrapper allocation-pressure event — see
+    /// [`Self::young_spill_pressure`].
     #[inline]
     pub fn note_young_spill_pressure(&self) {
-        if let VmHeap::Generational(h) = self {
-            h.note_young_spill_pressure();
+        match self {
+            VmHeap::Generational(h) => h.note_young_spill_pressure(),
+            VmHeap::G1(h) => h.note_native_alloc_pressure(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -1150,6 +1165,19 @@ impl VmHeap {
         }
     }
 
+    /// Return stable generational card-table metadata for JIT inline barriers.
+    ///
+    /// G1 and ZGC require collector-specific remembered-set/barrier protocols,
+    /// so they return `None` and generated code retains the helper call.
+    pub fn jit_card_table_info(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            VmHeap::Generational(heap) => Some(heap.jit_card_table_info()),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
     /// Return the total number of GC collections performed so far.
     ///
     /// For the generational heap, this is the sum of minor + major cycle
@@ -1209,6 +1237,82 @@ impl VmHeap {
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(h) => (h.allocated_bytes(), h.heap_capacity()),
         }
+    }
+
+    /// Free-heap estimate in **megabytes** for the `SoftReference` LRU policy,
+    /// deliberately keyed on *allocatable* rather than merely *unused* bytes.
+    ///
+    /// HotSpot's `LRUMaxHeapPolicy` clears a soft reference when it has been
+    /// idle longer than `SoftRefLRUPolicyMSPerMB * free_heap_MB`, so this number
+    /// is the entire pressure dimension of the policy: return a large value and
+    /// nothing is ever cleared, return zero and everything is.
+    ///
+    /// **Why not simply `heap_capacity() - live_bytes_estimate()`.** The default
+    /// collector does not compact. `moving_young` defaults false, and
+    /// `gen_heap` fail-closes to a non-moving mark-sweep whenever any thread
+    /// holds a live JIT frame — the steady state at a 500-invocation JIT
+    /// threshold; compaction's correctness blocker closed 2026-07-26
+    /// (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+    /// but moving-young remains opt-in on throughput grounds. Under a
+    /// non-moving, fragmenting heap "unused bytes" and "bytes an
+    /// allocation can actually obtain" diverge without bound: a heap can be 60%
+    /// unused and still fail a modest allocation because no single free run is
+    /// large enough. A policy keyed on unused bytes then refuses to clear soft
+    /// references precisely while allocation is failing — the worst possible
+    /// time — and `OutOfMemoryError` is thrown with a heap full of reclaimable
+    /// soft-reachable objects.
+    ///
+    /// So this reports the free space of the generation that must satisfy the
+    /// next allocation (young/eden), not the whole-heap figure, and floors the
+    /// result at the old generation's headroom only insofar as young space is
+    /// backed by it. It is intentionally *pessimistic*: under-reporting free
+    /// space makes the policy clear soft references sooner, which costs cache
+    /// hit rate; over-reporting makes it clear them never, which costs the
+    /// process. Prefer the recoverable failure.
+    ///
+    /// # HANDOFF — this accessor has no caller yet (cross-owner)
+    ///
+    /// The two production reference-processing sites both pass a hardcoded
+    /// `64`, in a file this module's owner may not edit:
+    ///
+    /// * `vm/src/runtime/interpreter.rs`, in `process_references_after_gc`:
+    ///   `let result = ref_proc.process_references(&is_marked, 64, 0);`
+    /// * `vm/src/runtime/interpreter.rs`, in `g1_remark_process_references`:
+    ///   `let result = ref_proc.process_references(is_marked, 64, 0);`
+    ///
+    /// Both should become `shared.mem.heap.soft_ref_policy_free_mb()` in place
+    /// of the `64`. (The `0` third argument no longer matters: `gc::reference`
+    /// now substitutes the mutator clock it observes through
+    /// `touch_soft_reference` when the caller passes `0`. See the
+    /// `last_observed_clock_ms` field doc there.) Until that lands, the soft-ref
+    /// policy runs on a constant 64 MB of assumed headroom and therefore does
+    /// not respond to memory pressure at all. Tracked in
+    /// `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md`.
+    pub fn soft_ref_policy_free_mb(&self) -> usize {
+        const MB: usize = 1024 * 1024;
+        let (young_used, young_cap) = self.young_gen_stats();
+        let (old_used, old_cap) = self.old_gen_stats();
+
+        // Whole-heap headroom, as an upper bound.
+        let total_free = (young_cap + old_cap).saturating_sub(young_used + old_used);
+
+        // Allocation-relevant headroom. An allocation lands in young/eden; when
+        // that space is exhausted a collection runs and the survivors must fit
+        // in the old generation. Both must have room, so the binding constraint
+        // is the smaller of the two.
+        let young_free = young_cap.saturating_sub(young_used);
+        let old_free = old_cap.saturating_sub(old_used);
+        let allocatable = if young_cap == 0 {
+            // Backends that report no separate young space (ZGC's real heap
+            // reports `(0, 0)`): the old-gen pair carries the whole heap.
+            old_free
+        } else {
+            young_free.min(old_free)
+        };
+
+        // Never report more than the whole-heap headroom, and round DOWN: a
+        // sub-megabyte remainder must read as 0 MB (maximum pressure), not 1.
+        allocatable.min(total_free) / MB
     }
 
     // =====================================================================
@@ -1682,13 +1786,30 @@ impl VmHeap {
         }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
-            eprintln!("[GC] moving_young_coverage_fallbacks={fallbacks}");
+            // Both numbers, always. A correct answer while `cycles == 0` means
+            // the young generation never actually copied anything, which is the
+            // exact way the 2026-07-01 validation declared moving-young working
+            // while it was inert (see
+            // `docs/internal/arch-2026-07-26/moving-young-corruption-rootcause.md`
+            // section 6). The histogram then names what stopped it.
+            let cycles = crate::gc_quiescence::moving_young_cycle_count();
+            eprintln!("[GC] moving_young: cycles={cycles} coverage_fallbacks={fallbacks}");
+            let counts = crate::gc_quiescence::moving_young_fallback_reason_counts();
+            for (reason, n) in counts.iter().enumerate() {
+                if *n > 0 {
+                    eprintln!(
+                        "[GC] moving_young_fallback_reason: {}={}",
+                        crate::gc_quiescence::incomplete_reason::label(reason),
+                        n
+                    );
+                }
+            }
         }
     }
 
     /// Get the number of fields (slots) in an object.
     pub fn num_fields(&self, obj: ObjectRef) -> usize {
-        dispatch!(self, get_header(obj)).num_slots as usize
+        dispatch!(self, get_header(obj)).num_slots() as usize
     }
 
     /// Carve out a TLAB from the young generation (generational) or Eden region (G1).
@@ -1742,6 +1863,40 @@ impl VmHeap {
             VmHeap::G1(_) => false,
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => false,
+        }
+    }
+
+    /// True when `addr` is safe to defer to the loader-scoped
+    /// `metadata_pin` side-channel instead of pushing it as an unconditional
+    /// GC root (see `vm::memory::roots`'s static-field, class-lock and
+    /// CONSTANT_Dynamic root sections, all gated on `conditional_metadata`).
+    ///
+    /// Generational: ONLY old-gen addresses. `metadata_pin` is consulted
+    /// exclusively by `old_gen_gc`'s BFS (`gen_heap.rs`), which never scans
+    /// the young generation, and `sweep_young_non_moving` / the moving young
+    /// copy closure seed strictly from the direct root set — neither
+    /// consults `metadata_pin`. A YOUNG address deferred here has no path to
+    /// ever be marked: if it has no other reachability (the common case for
+    /// a static field's value immediately after `<clinit>` assigns it, or a
+    /// class-lock/condy object with no other reference), it is silently
+    /// reclaimed and its memory reused by the very next allocation —
+    /// producing a live object that reads back as a DIFFERENT, unrelated
+    /// type. See `docs/known-issues/spb1-springframework-util-investigation.md`'s
+    /// repro-3 follow-up for the observed corruption shape (a `ClassUtils`
+    /// static field, loaded via a user-defined `ClassLoader`, read back as
+    /// an unrelated live object from later in the same `<clinit>`).
+    ///
+    /// G1 / ZGC: always `true` — both backends' `metadata_pin` consumers
+    /// (`g1.rs`, `zgc.rs`) walk every live region uniformly during the same
+    /// full-mark pass that activates `conditional_metadata`, so deferring a
+    /// young-resident object is sound; this matches their existing,
+    /// unconditional behavior and is unchanged here.
+    pub fn metadata_pin_deferrable(&self, addr: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr),
+            VmHeap::G1(_) => true,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => true,
         }
     }
 
@@ -2213,6 +2368,64 @@ mod concurrent_mark_controller_tests {
             heap.get_array_element(large, n - 1).unwrap().as_int(),
             Some(0x1234_5678),
             "flat write to the humongous tail must round-trip",
+        );
+    }
+
+    // ======================================================================
+    // soft_ref_policy_free_mb — the pressure input to the SoftReference LRU.
+    // See the accessor's doc comment for why it is keyed on allocatable
+    // rather than merely unused bytes, and for the cross-owner handoff.
+    // ======================================================================
+
+    #[test]
+    fn soft_ref_policy_free_mb_is_bounded_by_whole_heap_headroom() {
+        let heap = VmHeap::new(GcBackend::Generational, 32 * 1024 * 1024);
+        let (young_used, young_cap) = heap.young_gen_stats();
+        let (old_used, old_cap) = heap.old_gen_stats();
+        let total_free_mb =
+            (young_cap + old_cap).saturating_sub(young_used + old_used) / (1024 * 1024);
+
+        let reported = heap.soft_ref_policy_free_mb();
+        assert!(
+            reported <= total_free_mb,
+            "reported {reported} MB exceeds whole-heap headroom {total_free_mb} MB"
+        );
+        // It must also never exceed the young generation's own headroom, which
+        // is what an allocation actually has to fit into.
+        let young_free_mb = young_cap.saturating_sub(young_used) / (1024 * 1024);
+        if young_cap != 0 {
+            assert!(
+                reported <= young_free_mb,
+                "reported {reported} MB exceeds young headroom {young_free_mb} MB"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_ref_policy_free_mb_rounds_down_to_max_pressure() {
+        // A heap far smaller than 1 MiB of usable headroom must report 0 MB
+        // (maximum pressure), never a rounded-up 1 MB that would keep the LRU
+        // threshold non-zero.
+        let heap = VmHeap::new(GcBackend::Generational, 512 * 1024);
+        assert_eq!(
+            heap.soft_ref_policy_free_mb(),
+            0,
+            "sub-megabyte headroom must read as zero free MB"
+        );
+    }
+
+    #[test]
+    fn soft_ref_policy_free_mb_shrinks_as_the_heap_fills() {
+        let heap = VmHeap::new(GcBackend::Generational, 64 * 1024 * 1024);
+        let before = heap.soft_ref_policy_free_mb();
+        // Allocate a few hundred KB of objects; the figure must not grow.
+        for _ in 0..2000 {
+            let _ = heap.try_alloc_object(cratonvm_types::ClassId::new(0), 8);
+        }
+        let after = heap.soft_ref_policy_free_mb();
+        assert!(
+            after <= before,
+            "free-MB estimate rose from {before} to {after} while allocating"
         );
     }
 }

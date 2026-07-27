@@ -207,7 +207,7 @@ pub(crate) fn native_system_arraycopy(
             }
             return Ok(None);
         }
-        if std::env::var("CRATONVM_DBG_ARRAYCOPY").as_deref() == Ok("1") {
+        if crate::nbflags().dbg_arraycopy {
             let src_cls = ctx.class_id_of_object(src);
             let dest_cls = ctx.class_id_of_object(dest);
             let src_name = ctx.class_name_of_id(src_cls).unwrap_or_default();
@@ -568,7 +568,7 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         // stuck in a Thread.sleep poll-loop; sample the Java caller chain so we
         // can identify which loop and what it polls. Sampled + capped to avoid
         // flooding; off by default (one env check per real sleep call).
-        if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+        if crate::nbflags().dbg_sleep_trace {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
             static PRINTED: AtomicUsize = AtomicUsize::new(0);
@@ -603,6 +603,15 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
             ctx.emit_virtual_thread_pinned_jfr("Thread.sleep while pinned");
         }
         let release = is_virtual && !pinned;
+        let effective_millis = crate::async_handoff_sleep_millis(millis);
+        let target = std::time::Duration::from_millis(effective_millis as u64);
+        if release && ctx.vt_park_for(target) {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::ContinuationYield {
+                    wake_after_nanos: target.as_nanos().min(u64::MAX as u128) as u64,
+                },
+            ));
+        }
         if release {
             ctx.vt_release_carrier();
         }
@@ -620,8 +629,6 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         // immediately follows async submission, give those short sleeps a small
         // scheduling floor; Thread.sleep only promises to sleep at least the
         // requested duration.
-        let effective_millis = crate::async_handoff_sleep_millis(millis);
-        let target = std::time::Duration::from_millis(effective_millis as u64);
         let deadline = sleep_start + target;
         let mut interrupted = false;
         loop {
@@ -634,7 +641,11 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
                 interrupted = true;
                 break;
             }
-            ctx.begin_blocking_region();
+            // `Thread.sleep` has a bounded duration, so `Thread.getState()`
+            // must report `TIMED_WAITING`, not plain `WAITING` (real JDK
+            // distinguishes them; `SpringApplicationShutdownHookTests`
+            // polls for exactly this state via Awaitility).
+            ctx.begin_timed_blocking_region();
             std::thread::sleep(remaining.min(pump_slice));
             ctx.end_blocking_region();
         }
@@ -679,6 +690,7 @@ pub(crate) fn native_thread_get_state(
         2 => "TERMINATED",
         3 => "WAITING",
         4 => "BLOCKED",
+        5 => "TIMED_WAITING",
         _ => "NEW",
     };
     let cid = match ctx.ensure_class_initialized("java/lang/Thread$State") {
@@ -737,10 +749,7 @@ pub(crate) fn native_thread_start0(
     // the child has no CCL of its own (preserve an explicit
     // `setContextClassLoader` issued before `start()`). Opt-out:
     // `CRATONVM_INHERIT_THREAD_CCL=0` restores the prior (no-inherit) behavior.
-    let inherit_ccl = match std::env::var("CRATONVM_INHERIT_THREAD_CCL") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    };
+    let inherit_ccl = crate::nbflags().inherit_thread_ccl;
     if inherit_ccl
         && !matches!(
             ctx.get_field_by_name(this, "contextClassLoader"),
@@ -778,10 +787,7 @@ pub(crate) fn native_thread_start0(
     // regain inheritance. That combination is rare in practice (the 5-arg
     // opt-out constructor itself is rarely used); documented pending a real
     // interpreter-level fix. Opt-out: `CRATONVM_INHERIT_TL_WORKAROUND=0`.
-    let apply_itl_workaround = match std::env::var("CRATONVM_INHERIT_TL_WORKAROUND") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    };
+    let apply_itl_workaround = crate::nbflags().inherit_tl_workaround;
     // The buggy path doesn't leave this field as `Object(None)` (the normal
     // "never written" value real bytecode `getfield` would observe) — a raw
     // native heap read here sees `Int(0)` instead, matching CratonVM's
@@ -846,7 +852,7 @@ pub(crate) fn native_thread_join_timed(
     // target thread is still alive. Poll isAlive at a small cadence so we
     // don't block beyond the deadline.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis as u64);
-    if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+    if crate::nbflags().dbg_sleep_trace {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         if N.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
@@ -1084,7 +1090,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // either soft-return or terminate. Helps identify which class/method in
     // the upstream code invoked System.exit. Env-gated so default output is
     // unchanged.
-    if std::env::var("CRATONVM_DBG_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().dbg_exit {
         let mut rendered = String::new();
         for (i, entry) in trace.iter().take(20).enumerate() {
             use std::fmt::Write as _;
@@ -1125,7 +1131,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // return so the calling Java frame keeps executing (and `main` can reach
     // further). Used to expose downstream failures hidden behind an explicit
     // upstream exit. Default behaviour (env unset) is unchanged: terminate.
-    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().soft_exit {
         tracing::warn!(
             target: "cratonvm::system_exit",
             "[cratonvm] System.exit({code}) soft-returned (CRATONVM_SOFT_EXIT=1)"
@@ -1399,7 +1405,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
 
     // Mirror native_system_exit: env-gated caller-chain dump and soft-return.
-    if std::env::var("CRATONVM_DBG_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().dbg_exit {
         let trace = ctx.capture_stack_trace(0);
         let mut rendered = String::new();
         for (i, entry) in trace.iter().take(20).enumerate() {
@@ -1418,7 +1424,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
         );
     }
 
-    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().soft_exit {
         tracing::warn!(
             target: "cratonvm::system_exit",
             "[cratonvm] Runtime.exit({code}) soft-returned (CRATONVM_SOFT_EXIT=1)"
@@ -1702,7 +1708,7 @@ pub(crate) fn native_system_getenv(
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_str = ctx.read_string(key_ref).unwrap_or_default();
-    match std::env::var(&key_str) {
+    match cratonvm_types::flags::runtime_var(&key_str) {
         Ok(val) => {
             let str_obj = ctx.create_string(&val);
             Ok(Some(Value::Object(Some(str_obj))))
@@ -2239,7 +2245,7 @@ pub(crate) fn native_thread_sleep_nanos(
         // Keycloak Gap 9 localization (CRATONVM_DBG_SLEEP_TRACE): JDK25
         // Thread.sleep(millis) routes through Thread.sleepNanos -> here, so the
         // worker's poll-loop sleeps land in THIS native (not the millis one).
-        if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+        if crate::nbflags().dbg_sleep_trace {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
             static PRINTED: AtomicUsize = AtomicUsize::new(0);
@@ -2280,6 +2286,13 @@ pub(crate) fn native_thread_sleep_nanos(
             ctx.emit_virtual_thread_pinned_jfr("Thread.sleep(nanos) while pinned");
         }
         let release = is_virtual && !pinned;
+        if release && ctx.vt_park_for(duration) {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::ContinuationYield {
+                    wake_after_nanos: duration.as_nanos().min(u64::MAX as u128) as u64,
+                },
+            ));
+        }
         if release {
             ctx.vt_release_carrier();
         }
@@ -2374,6 +2387,15 @@ pub(crate) fn native_thread_sleep0(
         ctx.emit_virtual_thread_pinned_jfr("Thread.sleep0 while pinned");
     }
     let release = is_virtual && !pinned;
+    let effective_millis = crate::async_handoff_sleep_millis(millis as i64) as u64;
+    let sleep_duration = std::time::Duration::from_millis(effective_millis);
+    if release && ctx.vt_park_for(sleep_duration) {
+        return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::ContinuationYield {
+                wake_after_nanos: sleep_duration.as_nanos().min(u64::MAX as u128) as u64,
+            },
+        ));
+    }
     if release {
         ctx.vt_release_carrier();
     }
@@ -2384,8 +2406,7 @@ pub(crate) fn native_thread_sleep0(
     // sleep window. (Pre-WP4.5 the chunk was 100ms; the smaller chunk
     // matches the resolution of `scheduleAtFixedRate`.)
     let start = std::time::Instant::now();
-    let effective_millis = crate::async_handoff_sleep_millis(millis as i64) as u64;
-    let deadline = start + std::time::Duration::from_millis(effective_millis);
+    let deadline = start + sleep_duration;
     let result = loop {
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -2705,7 +2726,7 @@ pub(crate) fn native_array_new_array(
         _ => "java/lang/Object".to_string(),
     };
 
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if crate::nbflags().dbg_toarray_ok {
         eprintln!(
             "[DBG_TOARRAY] newArray comp_name={:?} len={}",
             comp_name, length
@@ -3674,6 +3695,8 @@ pub(crate) fn native_perf_high_res_frequency(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod t2_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -3719,6 +3742,8 @@ mod t2_tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod t19_n2_thread_sleep0_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -3846,6 +3871,8 @@ mod t19_n2_thread_sleep0_tests {
 
 #[cfg(test)]
 mod t14_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -3936,6 +3963,8 @@ mod t14_tests {
 
 #[cfg(test)]
 mod t15_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 
@@ -4126,6 +4155,8 @@ mod t15_tests {
 // simulate both deny (pre-arm an Err) and allow (default).
 #[cfg(test)]
 mod checkexec_security_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::security_manager::set_security_manager_for_test;
     use crate::test_utils::mock_ctx;

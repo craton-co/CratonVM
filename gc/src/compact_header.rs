@@ -689,6 +689,62 @@ impl NarrowKlassTable {
     pub fn contains(&self, class_id: cratonvm_types::ClassId) -> bool {
         self.to_narrow.read().contains_key(&class_id.as_u32())
     }
+
+    /// Release the narrow-klass assignments of classes that have been unloaded.
+    /// Returns how many mappings were actually dropped.
+    ///
+    /// Both directions are keyed on a raw class id and, before this existed,
+    /// had **no removal path of any kind** — no `remove`, `retain`, `prune` or
+    /// `clear` anywhere in the impl. That satisfies neither arm of the
+    /// "unload invalidation or hard bound" rule in
+    /// `docs/internal/class-loader-unloading-and-bounded-metadata.md`: the two
+    /// maps grew one entry per class defined, forever, so any workload that
+    /// spins loaders (CGLIB, ByteBuddy, Groovy, repeated app redeploys) would
+    /// leak them without bound. It was latent only because
+    /// [`CompactAllocator`] has no caller outside this file — exactly the
+    /// condition under which such a table gets wired up without anyone
+    /// rechecking the invariant. See
+    /// `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` §3/§R3.
+    ///
+    /// # `next_id` is deliberately NOT rewound or recycled
+    ///
+    /// A narrow klass is embedded in the header word of every live object of
+    /// that class. Handing a retired id back out would let a header the sweeper
+    /// has not reached yet — or a stale copy captured by a concurrent
+    /// scan — [`resolve`](Self::resolve) to a *different, live* class, which is
+    /// silent heap-type confusion. Leaving `next_id` monotonic means a retired
+    /// id resolves to `None` instead, which every reader already handles
+    /// (`resolve` returns `Option`). The counter is a `u32` and only advances
+    /// on genuinely new classes, so the bound it imposes is ~4.29e9 distinct
+    /// class definitions per process — far beyond the map growth this fixes.
+    ///
+    /// # Locking
+    ///
+    /// Mirrors [`get_or_assign`](Self::get_or_assign): `to_narrow` first, then
+    /// `to_class_id`, never both held at once. A concurrent `get_or_assign` for
+    /// a class being removed therefore either completes wholly before this call
+    /// (and is then removed) or wholly after (and re-assigns a fresh id) — it
+    /// can never observe a half-removed pair in the direction it reads.
+    pub fn remove_classes(&self, class_ids: &[cratonvm_types::ClassId]) -> usize {
+        if class_ids.is_empty() {
+            return 0;
+        }
+        let retired: Vec<u32> = {
+            let mut to_narrow = self.to_narrow.write();
+            class_ids
+                .iter()
+                .filter_map(|cid| to_narrow.remove(&cid.as_u32()))
+                .collect()
+        };
+        if retired.is_empty() {
+            return 0;
+        }
+        let mut to_class_id = self.to_class_id.write();
+        for nk in &retired {
+            to_class_id.remove(nk);
+        }
+        retired.len()
+    }
 }
 
 impl Default for NarrowKlassTable {
@@ -738,8 +794,8 @@ impl HeaderView {
             class_id: h.class_id,
             is_array: h.kind == crate::heap::ObjectKind::Array,
             element_type: h.element_type as u8,
-            array_length: h.array_length,
-            num_slots: h.num_slots,
+            array_length: h.array_length(),
+            num_slots: h.num_slots(),
             identity_hash_code: h.identity_hash_code,
             gc_age: h.gc_age,
             gc_flags: h.gc_flags,
@@ -1688,6 +1744,119 @@ mod tests {
         assert_eq!(t.len(), 500);
     }
 
+    // -- NarrowKlassTable removal path (refs-metaspace-unloading.md §R3) --
+
+    #[test]
+    fn narrow_klass_table_remove_classes_drops_both_directions() {
+        let t = NarrowKlassTable::new();
+        let keep = cratonvm_types::ClassId::new(7);
+        let drop_a = cratonvm_types::ClassId::new(8);
+        let drop_b = cratonvm_types::ClassId::new(9);
+
+        let nk_keep = t.get_or_assign(keep);
+        let nk_a = t.get_or_assign(drop_a);
+        let nk_b = t.get_or_assign(drop_b);
+        assert_eq!(t.len(), 3);
+
+        assert_eq!(t.remove_classes(&[drop_a, drop_b]), 2);
+
+        // Forward direction gone...
+        assert!(!t.contains(drop_a));
+        assert!(!t.contains(drop_b));
+        // ...and the reverse direction too. A leak here is the one that
+        // matters: `to_class_id` is what keeps the raw class id reachable.
+        assert_eq!(t.resolve(nk_a), None);
+        assert_eq!(t.resolve(nk_b), None);
+
+        // The survivor is untouched in both directions.
+        assert!(t.contains(keep));
+        assert_eq!(t.resolve(nk_keep), Some(keep));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn narrow_klass_table_remove_classes_is_idempotent_and_ignores_unknowns() {
+        let t = NarrowKlassTable::new();
+        let cid = cratonvm_types::ClassId::new(3);
+        t.get_or_assign(cid);
+
+        assert_eq!(t.remove_classes(&[cid]), 1);
+        // Second removal of the same id, and of an id never assigned, are both
+        // no-ops rather than panics or phantom counts — an unloader that runs
+        // twice over the same batch must not corrupt the count it reports.
+        assert_eq!(t.remove_classes(&[cid]), 0);
+        assert_eq!(t.remove_classes(&[cratonvm_types::ClassId::new(999)]), 0);
+        assert_eq!(t.remove_classes(&[]), 0);
+        assert!(t.is_empty());
+    }
+
+    /// A retired narrow klass must NEVER be handed to a different class: a
+    /// header the sweeper has not reached yet still carries the old value, and
+    /// recycling would make it resolve to a live, wrong class. `resolve`
+    /// returning `None` is the required failure mode.
+    #[test]
+    fn narrow_klass_table_does_not_recycle_retired_ids() {
+        let t = NarrowKlassTable::new();
+        let old = cratonvm_types::ClassId::new(11);
+        let nk_old = t.get_or_assign(old);
+        assert_eq!(t.remove_classes(&[old]), 1);
+
+        let fresh = cratonvm_types::ClassId::new(12);
+        let nk_fresh = t.get_or_assign(fresh);
+        assert_ne!(
+            nk_fresh, nk_old,
+            "a retired narrow klass was reissued: a stale header for class {old:?} \
+             would now resolve to {fresh:?}"
+        );
+        assert_eq!(t.resolve(nk_old), None);
+        assert_eq!(t.resolve(nk_fresh), Some(fresh));
+    }
+
+    /// The point of the whole change: repeated define/unload cycles must reach
+    /// a steady state instead of growing one entry per cycle. This is the shape
+    /// of any CGLIB/ByteBuddy/redeploy workload.
+    #[test]
+    fn narrow_klass_table_repeated_unload_cycles_leave_no_residue() {
+        let t = NarrowKlassTable::new();
+        for cycle in 0..64u32 {
+            let batch: Vec<_> = (0..16)
+                .map(|i| cratonvm_types::ClassId::new(cycle * 16 + i))
+                .collect();
+            for cid in &batch {
+                t.get_or_assign(*cid);
+            }
+            assert_eq!(t.len(), 16);
+            assert_eq!(t.remove_classes(&batch), 16);
+            assert!(
+                t.is_empty(),
+                "residue after cycle {cycle}: {} entries",
+                t.len()
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_klass_table_remove_classes_is_thread_safe() {
+        use std::sync::Arc;
+        let t = Arc::new(NarrowKlassTable::new());
+        let all: Vec<_> = (0..500u32).map(cratonvm_types::ClassId::new).collect();
+        for cid in &all {
+            t.get_or_assign(*cid);
+        }
+        // Ten threads each retire a disjoint slice concurrently; the totals
+        // must add up to exactly one removal per class.
+        let handles: Vec<_> = (0..10usize)
+            .map(|i| {
+                let t = Arc::clone(&t);
+                let slice: Vec<_> = all[i * 50..(i + 1) * 50].to_vec();
+                std::thread::spawn(move || t.remove_classes(&slice))
+            })
+            .collect();
+        let removed: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(removed, 500);
+        assert!(t.is_empty());
+    }
+
     // -- 54.2: HeaderView --
 
     #[test]
@@ -1916,8 +2085,8 @@ mod tests {
     #[test]
     fn s54_compact_header_8_vs_legacy_32() {
         assert_eq!(CompactHeader::SIZE, 8);
-        assert_eq!(crate::heap::HEADER_SIZE, 40);
-        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 32);
+        assert_eq!(crate::heap::HEADER_SIZE, 32);
+        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 24);
     }
 
     #[test]

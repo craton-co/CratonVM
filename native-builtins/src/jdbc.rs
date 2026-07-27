@@ -67,7 +67,25 @@ pub fn register_jdbc_driver_natives(registry: &mut NativeMethodRegistry) {
     register_jdbc_driver_helpers(registry);
     register_sql_datetime_natives(registry);
     register_derby_embedded_connection_native(registry);
+    register_ucp_borrow_creation_bridge(registry);
     registry.set_category(__prev_cat);
+}
+
+/// UCP's default asynchronous growth path immediately reports an empty pool
+/// when a brand-new worker has not yet completed its first connection attempt.
+/// That scheduling race is observable under the interpreter even for a local
+/// in-memory JDBC driver: the task succeeds moments later, but the initial
+/// zero-wait borrow has already failed with UCP-29.  UCP exposes the documented
+/// `createConnectionInBorrowThread` policy specifically for this case.  Make
+/// that policy its CratonVM default while leaving an application's explicit
+/// setting authoritative.
+fn register_ucp_borrow_creation_bridge(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "oracle/ucp/util/Util",
+        "createConnectionInBorrowThread",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
 }
 
 /// Derby runs an embedded login through a temporary executor solely to enforce
@@ -529,6 +547,8 @@ fn native_find_driver_provider(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// The proper classpath-walking ServiceLoader natives are reachable

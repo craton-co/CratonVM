@@ -78,6 +78,7 @@ use std::time::{Duration, Instant};
 // a SelectionKey's GC-stable identity hash code (i32). FxHashMap matches
 // the rest of the crate's small-int side-tables and avoids SipHash on
 // the hot select() / interest-op update paths.
+use crate::io_flags;
 use rustc_hash::FxHashMap;
 
 // Gated selector tracing (CRATONVM_DBG_SELECTOR=1): logs the kernel-wait
@@ -87,15 +88,7 @@ use rustc_hash::FxHashMap;
 // parked in the kernel wait; the timeout_c value tells us whether it's an
 // infinite (-1) or timed wait, and whether a matching wakeup fired.
 fn sel_dbg_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_SELECTOR")
-            .map(|v| {
-                let t = v.trim();
-                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
-            })
-            .unwrap_or(false)
-    })
+    crate::io_flags().dbg_selector
 }
 
 /// Opt-out for the Windows selector's active connect-completion probe (Phase 1b
@@ -103,15 +96,7 @@ fn sel_dbg_enabled() -> bool {
 /// `CRATONVM_NO_SELECTOR_CONNECT_PROBE=1` to fall back to pure WSAPoll readiness
 /// for A/B debugging.
 fn connect_probe_disabled() -> bool {
-    static OFF: OnceLock<bool> = OnceLock::new();
-    *OFF.get_or_init(|| {
-        std::env::var("CRATONVM_NO_SELECTOR_CONNECT_PROBE")
-            .map(|v| {
-                let t = v.trim();
-                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
-            })
-            .unwrap_or(false)
-    })
+    crate::io_flags().no_selector_connect_probe
 }
 
 /// Coarse cap (ms) applied to an otherwise-INDEFINITE `Selector.select()` so a
@@ -120,15 +105,13 @@ fn connect_probe_disabled() -> bool {
 /// across a handful of missed wakeups, while still avoiding a tight idle spin.
 /// Overridable via CRATONVM_SELECT_MAX_BLOCK_MS.
 fn select_infinite_cap_ms() -> i32 {
-    static CAP: OnceLock<i32> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("CRATONVM_SELECT_MAX_BLOCK_MS")
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(50)
-    })
+    crate::io_flags()
+        .select_max_block_ms
+        .unwrap_or(DEFAULT_SELECT_CAP_MS)
 }
+
+/// Default cap (ms) on an otherwise-INDEFINITE `Selector.select()`.
+const DEFAULT_SELECT_CAP_MS: i32 = 50;
 
 fn sel_dbg(msg: impl AsRef<str>) {
     let tname = std::thread::current()
@@ -3835,6 +3818,8 @@ pub fn register_nio_selector(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 #[allow(non_snake_case)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};

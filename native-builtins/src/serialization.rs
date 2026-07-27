@@ -3495,7 +3495,7 @@ fn native_jdk_reflection_factory_get(
 }
 
 fn reflection_factory_debug_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some()
+    crate::nbflags().dbg_reflection_factory
 }
 
 fn reflection_factory_class_arg(
@@ -4343,9 +4343,9 @@ fn process_serial_filter() -> &'static Mutex<Option<SerialFilter>> {
         // Honour the `jdk.serialFilter` system property if present at
         // first access. The real JDK also reads `conf/security/java.security`
         // — out of scope here.
-        let default = std::env::var("jdk.serialFilter")
+        let default = cratonvm_types::flags::runtime_var("jdk.serialFilter")
             .ok()
-            .or_else(|| std::env::var("JDK_SERIAL_FILTER").ok())
+            .or_else(|| cratonvm_types::flags::runtime_var("JDK_SERIAL_FILTER").ok())
             .filter(|s| !s.is_empty())
             .map(|s| SerialFilter::parse(&s));
         Mutex::new(default)
@@ -4972,6 +4972,8 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod serialization_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 
@@ -6815,6 +6817,8 @@ mod serialization_tests {
 
 #[cfg(test)]
 mod wp02_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::{FieldMetadata, MethodMetadata};
@@ -7185,6 +7189,8 @@ mod wp02_tests {
 
 #[cfg(test)]
 mod marshal_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::FieldMetadata;

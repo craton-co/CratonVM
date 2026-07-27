@@ -9,7 +9,9 @@
 
 use cratonvm_native_api::registry::GpuFutureResult;
 use cratonvm_native_api::{
-    AnnotationData, FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry,
+    AnnotationData, FieldMetadata, MethodMetadata, NativeClassAccess, NativeContext,
+    NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess,
+    NativeSystemAccess, NativeThreadAccess, StackTraceEntry,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
@@ -557,6 +559,9 @@ pub(crate) struct MockNativeContext {
     /// Per-native-call roots for tests that simulate a moving GC during
     /// `invoke_virtual` callbacks.
     native_pin_roots: UnsafeCell<Vec<ObjectRef>>,
+    /// Open `NativeHandleScope` depths, as marks into `native_pin_roots`.
+    /// See this type's `handle_scope_push`/`handle_scope_pop`.
+    handle_scope_marks: UnsafeCell<Vec<usize>>,
     /// Process-global-style roots used by natives that need object handles
     /// across callbacks. The mock does not move objects, but implementing the
     /// API keeps tests on the same path as the real VM.
@@ -673,6 +678,12 @@ pub(crate) struct MockNativeContext {
     /// `set_nest_host_override(child_id, "OuterClass")` to simulate a
     /// lookup class that is itself a nestmate of an outer.
     pub(crate) nest_host_override: UnsafeCell<HashMap<u32, String>>,
+    /// getNestMembers0 regression: per-class `nest_members` override,
+    /// returned by the `nest_member_names` trait method. Empty by default
+    /// (no class carries a `NestMembers` attribute); tests populate this
+    /// via `set_nest_members_override(host_id, vec!["Member1", "Member2"])`
+    /// to simulate a nest host's `NestMembers` attribute contents.
+    pub(crate) nest_members_override: UnsafeCell<HashMap<u32, Vec<String>>>,
     /// WP8.11.5: snapshot of the most recent `define_class_full` call's
     /// `DefineClassFull` options. Set by the override below;
     /// `last_define_full_opts()` reads it. Used by NESTMATE-propagation
@@ -753,6 +764,7 @@ impl MockNativeContext {
             invoke_virtual_result: UnsafeCell::new(None),
             invoke_virtual_hook: UnsafeCell::new(None),
             native_pin_roots: UnsafeCell::new(Vec::new()),
+            handle_scope_marks: UnsafeCell::new(Vec::new()),
             global_roots: UnsafeCell::new(HashMap::new()),
             next_global_root: UnsafeCell::new(1),
             hidden_classes: UnsafeCell::new(std::collections::HashSet::new()),
@@ -780,6 +792,7 @@ impl MockNativeContext {
             native_thread_java_objs: UnsafeCell::new(HashMap::new()),
             registered_classpath: UnsafeCell::new(Vec::new()),
             nest_host_override: UnsafeCell::new(HashMap::new()),
+            nest_members_override: UnsafeCell::new(HashMap::new()),
             last_define_full_opts: UnsafeCell::new(None),
             last_define_full_loader: UnsafeCell::new(None),
             loader_id_override: UnsafeCell::new(HashMap::new()),
@@ -899,6 +912,17 @@ impl MockNativeContext {
         // SAFETY: single-threaded test code.
         unsafe {
             (*self.nest_host_override.get()).insert(child_id.as_u32(), host.to_string());
+        }
+    }
+
+    /// getNestMembers0 regression: declare that `host_id` has a
+    /// `NestMembers` attribute listing `members`.
+    /// Subsequent calls to `nest_member_names(host_id)` return `members`.
+    #[allow(dead_code)]
+    pub(crate) fn set_nest_members_override(&self, host_id: ClassId, members: Vec<String>) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.nest_members_override.get()).insert(host_id.as_u32(), members);
         }
     }
 
@@ -1169,48 +1193,485 @@ impl MockNativeContext {
     }
 }
 
-impl NativeContext for MockNativeContext {
-    // Mirror the production NativeContext memory bridge for REAL pointers:
-    // vm_exec falls through to a raw copy when the address is not a tagged
-    // Unsafe-arena handle. The t27_tls direct-buffer tests hand this mock
-    // genuine malloc pointers (Vec backing stores), so the arena-aware
-    // accessors (bb_get_byte & co.) must be able to reach them here too.
-    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
-        if addr <= 0 {
-            return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(addr as usize as *const u8, out.as_mut_ptr(), out.len());
-        }
-        true
-    }
+impl cratonvm_native_api::NativeClassAccess for MockNativeContext {
 
-    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
-        if addr <= 0 {
-            return false;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
-        }
-        true
-    }
-
-    fn supports_real_proxy_generation(&self) -> bool {
-        false
-    }
 
     fn load_class(&mut self, _name: &str) -> MethodCallResult {
         Ok(None)
     }
 
-    fn new_object(&mut self, class_name: &str) -> MethodCallResult {
-        let cid = self.ensure_class_initialized(class_name)?;
-        let obj = self.alloc_entry(HeapEntry::Object {
-            class_id: cid,
-            fields: vec![Value::Int(0); 4],
-        });
-        Ok(Some(Value::Object(Some(obj))))
+    fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
+        self.class_names.get(&class_id.as_u32()).cloned()
     }
+
+    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Object { class_id, .. } => *class_id,
+            HeapEntry::Array { .. } => ClassId::new(0),
+        }
+    }
+
+    fn class_id_from_mirror(&self, mirror: ObjectRef) -> Option<ClassId> {
+        match self.get_field(mirror, 0) {
+            Value::Int(raw) if raw >= 0 => Some(ClassId::new(raw as u32)),
+            _ => None,
+        }
+    }
+
+    fn method_exists(&self, _class_name: &str, _method_name: &str, _descriptor: &str) -> bool {
+        false
+    }
+
+    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
+        if let Some(&id) = self.name_to_id.get(name) {
+            return Ok(ClassId::new(id));
+        }
+        let id = self.next_class_id;
+        self.next_class_id += 1;
+        self.class_names.insert(id, name.to_string());
+        self.name_to_id.insert(name.to_string(), id);
+        Ok(ClassId::new(id))
+    }
+
+    fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
+        if child == parent {
+            return true;
+        }
+        // SAFETY: single-threaded test code.
+        let supers = unsafe { &*self.superclass_override.get() };
+        let ifaces = unsafe { &*self.interfaces_override.get() };
+        let mut cur = Some(child);
+        while let Some(cid) = cur {
+            if let Some(list) = ifaces.get(&cid.as_u32()) {
+                if list.contains(&parent) {
+                    return true;
+                }
+                // Also recurse into each interface's super-interfaces
+                // so `is_subclass(Foo, Serializable)` works even if
+                // `Foo`'s declared interface is `MyMarker extends
+                // Serializable`. Guarded against cycles via a shallow
+                // visited set — tests don't construct deep hierarchies.
+                for i in list {
+                    if self.is_subclass(*i, parent) {
+                        return true;
+                    }
+                }
+            }
+            if let Some(&sup) = supers.get(&cid.as_u32()) {
+                if sup == parent {
+                    return true;
+                }
+                cur = Some(sup);
+            } else {
+                cur = None;
+            }
+        }
+        false
+    }
+
+    fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
+        // SAFETY: single-threaded test code.
+        let supers = unsafe { &*self.superclass_override.get() };
+        supers.get(&class_id.as_u32()).copied()
+    }
+
+    fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
+        self.name_to_id.get(name).map(|&id| ClassId::new(id))
+    }
+
+    fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.loader_id_override.get())
+                .get(&class_id.as_u32())
+                .copied()
+                .unwrap_or(2) // default to app loader
+        }
+    }
+
+    fn is_record_class(&self, _class_id: ClassId) -> bool {
+        false
+    }
+
+    fn record_components(&self, _class_id: ClassId) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    fn is_sealed_class(&self, _class_id: ClassId) -> bool {
+        false
+    }
+
+    fn permitted_subclasses(&self, _class_id: ClassId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
+        // SAFETY: single-threaded test code.
+        let overrides = unsafe { &*self.inner_classes_override.get() };
+        overrides
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
+        // SAFETY: single-threaded test code.
+        let overrides = unsafe { &*self.declared_fields_override.get() };
+        overrides
+            .get(&class_id.as_u32())
+            .map(|v| {
+                v.iter()
+                    .map(|f| FieldMetadata {
+                        name: f.name.clone(),
+                        descriptor: f.descriptor.clone(),
+                        access_flags: f.access_flags,
+                        slot_index: f.slot_index,
+                        declaring_class_id: f.declaring_class_id,
+                        is_static: f.is_static,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn declared_methods(&self, class_id: ClassId) -> Vec<MethodMetadata> {
+        let overrides = unsafe { &*self.declared_methods_override.get() };
+        overrides
+            .get(&class_id.as_u32())
+            .map(|v| {
+                v.iter()
+                    .map(|m| MethodMetadata {
+                        name: m.name.clone(),
+                        descriptor: m.descriptor.clone(),
+                        access_flags: m.access_flags,
+                        declaring_class_id: m.declaring_class_id,
+                        exceptions: m.exceptions.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
+        let overrides = unsafe { &*self.interfaces_override.get() };
+        overrides
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn class_access_flags(&self, class_id: ClassId) -> u16 {
+        let overrides = unsafe { &*self.class_flags_override.get() };
+        overrides.get(&class_id.as_u32()).copied().unwrap_or(0)
+    }
+
+    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
+        // FIX(class_id-0 name shadow): give the mirror a real, distinct
+        // class id via `ensure_class_initialized` (idempotent per name)
+        // instead of the shared placeholder `0` — this mock never
+        // populates `class_names[0]`, so `mirror_class_name`'s
+        // class-id-first lookup returned None/empty for every primitive
+        // mirror, shadowing the correct name already stored in slot 1.
+        let class_id = self.ensure_class_initialized(name).unwrap().as_u32();
+        let name_obj = self.create_string(name);
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(0),
+            fields: vec![Value::Int(class_id as i32), Value::Object(Some(name_obj))],
+        })
+    }
+
+    fn class_annotations(&self, _class_id: ClassId) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    fn method_annotations(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    fn field_annotations(&self, _class_id: ClassId, _field_name: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+
+    fn method_return_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<AnnotationData> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.method_return_type_annotations_override.get())
+                .get(&(
+                    class_id.as_u32(),
+                    method_name.to_string(),
+                    method_desc.to_string(),
+                ))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn method_parameter_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.method_parameter_type_annotations_override.get())
+                .get(&(
+                    class_id.as_u32(),
+                    method_name.to_string(),
+                    method_desc.to_string(),
+                ))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn field_type_annotations(&self, class_id: ClassId, field_name: &str) -> Vec<AnnotationData> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.field_type_annotations_override.get())
+                .get(&(class_id.as_u32(), field_name.to_string()))
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn module_name_of_class(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
+    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.lambda_proxy_hosts_override.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
+    }
+
+    fn find_resource(&self, name: &str) -> Option<Vec<u8>> {
+        // T19.H10: route through the per-instance override so tests can
+        // simulate a classpath containing real resources (e.g. the
+        // `keycloak-version.properties` blob the KC26 launcher reads).
+        // Strip leading slash to match the production class-path search,
+        // which trims absolute resource names before looking them up.
+        let trimmed = name.trim_start_matches('/');
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.resources_override.get()).get(trimmed).cloned() }
+    }
+
+    fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.module_providers_override.get())
+                .get(service_class)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn list_application_class_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn register_dynamic_classpath(&mut self, paths: &[String]) {
+        // T19_H15: record paths so tests can assert the JBoss module
+        // loader registers the transitive linkage closure correctly.
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.registered_classpath.get()).extend(paths.iter().cloned());
+        }
+    }
+
+    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
+        // NEW-8 mock: remember the name so tests can inspect it, then
+        // mint a fresh ClassId. A bytes slice starting with the magic
+        // CAFEBABE is accepted; anything else returns None so error
+        // paths in the caller can be tested.
+        if bytes.len() < 4 || bytes[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+            return None;
+        }
+        unsafe {
+            *self.last_defined_class_name.get() = Some(name.to_string());
+        }
+        let id = self.next_class_id;
+        self.next_class_id += 1;
+        self.class_names.insert(id, name.to_string());
+        self.name_to_id.insert(name.to_string(), id);
+        Some(ClassId::new(id))
+    }
+
+    fn set_class_hidden(&mut self, class_id: ClassId) {
+        unsafe {
+            (*self.hidden_classes.get()).insert(class_id.as_u32());
+        }
+    }
+
+    fn is_class_hidden(&self, class_id: ClassId) -> bool {
+        unsafe { (*self.hidden_classes.get()).contains(&class_id.as_u32()) }
+    }
+
+    /// WP8.11.5: override the default `define_class_full` so the mock
+    /// captures the full `DefineClassFull` options (notably
+    /// `nest_host_class_name`). The default impl in the trait would
+    /// collapse the call to `define_class_from_bytes` and lose the
+    /// option, defeating NESTMATE-propagation tests.
+    fn define_class_full(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        loader_id: u32,
+        opts: cratonvm_native_api::DefineClassFull,
+    ) -> Result<ClassId, String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.last_define_full_opts.get() = Some(opts.clone());
+            *self.last_define_full_loader.get() = Some(loader_id);
+        }
+        // Use override_name if present (hidden-class mangled name path).
+        let stored_name = opts.override_name.as_deref().unwrap_or(name);
+        match self.define_class_from_bytes(stored_name, bytes) {
+            Some(cid) => {
+                if opts.hidden {
+                    self.set_class_hidden(cid);
+                }
+                Ok(cid)
+            }
+            None => Err(format!("define_class_full failed for {stored_name}")),
+        }
+    }
+
+    /// WP8.11.5: read the per-class nest-host override populated by
+    /// `set_nest_host_override`. `None` => the class is its own nest
+    /// host (default).
+    fn nest_host_name(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.nest_host_override.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
+    }
+
+    /// getNestMembers0 regression: read the per-class nest-members override
+    /// populated by `set_nest_members_override`. Empty by default (no
+    /// `NestMembers` attribute).
+    fn nest_member_names(&self, class_id: ClassId) -> Vec<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.nest_members_override.get())
+                .get(&class_id.as_u32())
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn define_class_with_loader(
+        &mut self,
+        _name: &str,
+        _bytes: &[u8],
+        _loader_id: u32,
+    ) -> Option<ClassId> {
+        None
+    }
+
+    fn class_id_by_name_and_loader(&self, _name: &str, _loader_id: u32) -> Option<ClassId> {
+        None
+    }
+
+    fn allocate_loader_id(&mut self) -> u32 {
+        0
+    }
+
+    fn method_parameter_annotations(
+        &self,
+        _: ClassId,
+        _: &str,
+        _: &str,
+    ) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
+        Vec::new()
+    }
+
+    fn method_annotation_default(
+        &self,
+        _: ClassId,
+        _: &str,
+        _: &str,
+    ) -> Option<cratonvm_native_api::AnnotationElementValue> {
+        None
+    }
+
+    fn class_signature(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
+    fn method_signature(
+        &self,
+        _class_id: ClassId,
+        _method_name: &str,
+        _method_desc: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    fn field_signature(&self, _class_id: ClassId, _field_name: &str) -> Option<String> {
+        None
+    }
+
+    /// T19.N1: honour any test-provided `code_base_override`; defaults to
+    /// `None` (bootstrap/synthetic class) when no override is set.
+    fn class_code_base(&self, class_id: ClassId) -> Option<String> {
+        let overrides = unsafe { &*self.code_base_override.get() };
+        overrides.get(&class_id.as_u32()).cloned()
+    }
+
+    /// T19.N1: honour any test-provided `code_source_certs_override`;
+    /// defaults to empty (unsigned class).
+    fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
+        let overrides = unsafe { &*self.code_source_certs_override.get() };
+        overrides
+            .get(&class_id.as_u32())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn is_package_exported_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
+        true
+    }
+
+    fn is_package_exported_to(&self, _module_name: &str, _pkg: &str, _to_module: &str) -> bool {
+        true
+    }
+
+    fn is_package_open_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
+        true
+    }
+
+    fn is_package_open_to(&self, _module_name: &str, _pkg: &str, _to_module: &str) -> bool {
+        true
+    }
+
+    fn check_deep_reflection_access(
+        &self,
+        _accessor_class_id: ClassId,
+        _target_class_id: ClassId,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl cratonvm_native_api::NativeInvokeAccess for MockNativeContext {
+
 
     fn invoke(
         &mut self,
@@ -1237,42 +1698,41 @@ impl NativeContext for MockNativeContext {
         Ok(None)
     }
 
+    fn invoke_virtual(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        if let Some(hook) = unsafe { *self.invoke_virtual_hook.get() } {
+            if let Some(result) = hook(self, receiver, method_name, descriptor, args) {
+                return result;
+            }
+        }
+        let result = unsafe { &mut *self.invoke_virtual_result.get() };
+        if let Some(r) = result.take() {
+            r
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
+
+
+    fn new_object(&mut self, class_name: &str) -> MethodCallResult {
+        let cid = self.ensure_class_initialized(class_name)?;
+        let obj = self.alloc_entry(HeapEntry::Object {
+            class_id: cid,
+            fields: vec![Value::Int(0); 4],
+        });
+        Ok(Some(Value::Object(Some(obj))))
+    }
+
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
         obj.as_ptr() as i32
-    }
-
-    fn record_printed_value(&mut self, _value: Value) {}
-
-    fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
-        self.class_names.get(&class_id.as_u32()).cloned()
-    }
-
-    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
-        let idx = self.entry_index(obj);
-        match &self.heap_ref()[idx] {
-            HeapEntry::Object { class_id, .. } => *class_id,
-            HeapEntry::Array { .. } => ClassId::new(0),
-        }
-    }
-
-    fn class_id_from_mirror(&self, mirror: ObjectRef) -> Option<ClassId> {
-        match self.get_field(mirror, 0) {
-            Value::Int(raw) if raw >= 0 => Some(ClassId::new(raw as u32)),
-            _ => None,
-        }
-    }
-
-    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
-        Vec::new()
-    }
-
-    fn get_stack_trace(&self, _throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
-        None
-    }
-
-    fn frame_class_ids(&self) -> Vec<ClassId> {
-        // SAFETY: single-threaded test code.
-        unsafe { (*self.frame_class_ids_override.get()).clone() }
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
@@ -1360,10 +1820,6 @@ impl NativeContext for MockNativeContext {
         field_name: &str,
     ) -> Option<usize> {
         mock_undertow_exchange_field_slot(self.class_name_of_id(class_id).as_deref(), field_name)
-    }
-
-    fn method_exists(&self, _class_name: &str, _method_name: &str, _descriptor: &str) -> bool {
-        false
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
@@ -1484,114 +1940,11 @@ impl NativeContext for MockNativeContext {
         })
     }
 
-    fn record_printed_line(&mut self, _text: String) {}
-
-    fn get_system_stream(&self, _name: &str) -> Option<ObjectRef> {
-        None
-    }
-
-    fn get_system_property(&self, key: &str) -> Option<String> {
-        self.properties.get(key).cloned()
-    }
-
-    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
-        self.properties.insert(key.to_string(), value.to_string())
-    }
-
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Object {
             class_id,
             fields: vec![Value::Int(0); num_fields],
         })
-    }
-
-    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
-        if let Some(&id) = self.name_to_id.get(name) {
-            return Ok(ClassId::new(id));
-        }
-        let id = self.next_class_id;
-        self.next_class_id += 1;
-        self.class_names.insert(id, name.to_string());
-        self.name_to_id.insert(name.to_string(), id);
-        Ok(ClassId::new(id))
-    }
-
-    fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
-        if child == parent {
-            return true;
-        }
-        // SAFETY: single-threaded test code.
-        let supers = unsafe { &*self.superclass_override.get() };
-        let ifaces = unsafe { &*self.interfaces_override.get() };
-        let mut cur = Some(child);
-        while let Some(cid) = cur {
-            if let Some(list) = ifaces.get(&cid.as_u32()) {
-                if list.contains(&parent) {
-                    return true;
-                }
-                // Also recurse into each interface's super-interfaces
-                // so `is_subclass(Foo, Serializable)` works even if
-                // `Foo`'s declared interface is `MyMarker extends
-                // Serializable`. Guarded against cycles via a shallow
-                // visited set — tests don't construct deep hierarchies.
-                for i in list {
-                    if self.is_subclass(*i, parent) {
-                        return true;
-                    }
-                }
-            }
-            if let Some(&sup) = supers.get(&cid.as_u32()) {
-                if sup == parent {
-                    return true;
-                }
-                cur = Some(sup);
-            } else {
-                cur = None;
-            }
-        }
-        false
-    }
-
-    fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
-        // SAFETY: single-threaded test code.
-        let supers = unsafe { &*self.superclass_override.get() };
-        supers.get(&class_id.as_u32()).copied()
-    }
-
-    fn is_interface_class(&self, class_id: ClassId) -> bool {
-        // SAFETY: single-threaded test code.
-        let map = unsafe { &*self.is_interface_override.get() };
-        map.get(&class_id.as_u32()).copied().unwrap_or(false)
-    }
-
-    fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
-        self.name_to_id.get(name).map(|&id| ClassId::new(id))
-    }
-
-    fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.loader_id_override.get())
-                .get(&class_id.as_u32())
-                .copied()
-                .unwrap_or(2) // default to app loader
-        }
-    }
-
-    fn is_record_class(&self, _class_id: ClassId) -> bool {
-        false
-    }
-
-    fn record_components(&self, _class_id: ClassId) -> Vec<(String, String)> {
-        Vec::new()
-    }
-
-    fn is_sealed_class(&self, _class_id: ClassId) -> bool {
-        false
-    }
-
-    fn permitted_subclasses(&self, _class_id: ClassId) -> Vec<String> {
-        Vec::new()
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
@@ -1601,6 +1954,129 @@ impl NativeContext for MockNativeContext {
             _ => 0,
         }
     }
+
+    // -- WP0.2 ObjectStreamClass cache overrides --
+
+    fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.osc_cache_map.get()).get(&class_id.as_u32()).copied() }
+    }
+
+    fn osc_cache_put(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
+        // SAFETY: single-threaded test code.
+        let map = unsafe { &mut *self.osc_cache_map.get() };
+        *map.entry(class_id.as_u32()).or_insert(desc)
+    }
+
+    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field(obj, index)
+    }
+
+    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field(obj, index, value)
+    }
+
+    fn compare_and_swap_field(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        expected: Value,
+        new_val: Value,
+    ) -> bool {
+        let current = self.get_field(obj, index);
+        if current == expected {
+            self.set_field(obj, index, new_val);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
+        let cid = self.ensure_class_initialized(class_name).ok()?;
+        Some(self.alloc_object(cid, 4))
+    }
+
+    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        let idx = roots.len();
+        roots.push(obj);
+        idx
+    }
+
+    // --- Handle scopes -----------------------------------------------------
+    //
+    // `NativeContext`'s DEFAULT `handle_root` pins (it delegates to
+    // `pin_native_root`) while the default `handle_scope_push`/`pop` are
+    // no-ops. That pairing is asymmetric: every native written against
+    // `NativeHandleScope` would appear to leak a pin per rooted object for the
+    // whole life of the mock, so a test asserting "this native releases its
+    // roots" could never pass. The VM overrides all four; the mock now does
+    // too, mapping scopes onto its existing pin stack so the balance is real.
+
+    fn handle_scope_push(&mut self) {
+        let depth = unsafe { (&*self.native_pin_roots.get()).len() };
+        unsafe { (&mut *self.handle_scope_marks.get()).push(depth) };
+    }
+
+    fn handle_scope_pop(&mut self) {
+        if let Some(base) = unsafe { (&mut *self.handle_scope_marks.get()).pop() } {
+            self.unpin_native_roots(base);
+        }
+    }
+
+    fn handle_get(&self, slot: u32) -> Option<ObjectRef> {
+        // The mock never moves objects, so the pinned reference IS the
+        // current address. `None` past the end lets `NativeHandle::get` fall
+        // back, matching the trait's contract for a popped scope.
+        unsafe { (&*self.native_pin_roots.get()).get(slot as usize).copied() }
+    }
+
+    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        unsafe { (&*self.native_pin_roots.get()).get(handle).copied() }.unwrap_or(fallback)
+    }
+
+    fn unpin_native_roots(&mut self, base: usize) {
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        if base < roots.len() {
+            roots.truncate(base);
+        }
+    }
+
+    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
+        let next = unsafe { &mut *self.next_global_root.get() };
+        let handle = *next;
+        *next = next.saturating_add(1).max(1);
+        unsafe { &mut *self.global_roots.get() }.insert(handle, obj);
+        handle
+    }
+
+    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
+        unsafe { &*self.global_roots.get() }.get(&handle).copied()
+    }
+
+    fn remove_global_root(&mut self, handle: usize) -> bool {
+        unsafe { &mut *self.global_roots.get() }
+            .remove(&handle)
+            .is_some()
+    }
+
+    fn discover_reference(
+        &mut self,
+        _ref_type: u8,
+        _reference_obj: ObjectRef,
+        _referent: ObjectRef,
+        _queue: Option<ObjectRef>,
+    ) {
+    }
+
+    fn heap_allocated_bytes(&self) -> usize {
+        0
+    }
+}
+
+impl cratonvm_native_api::NativeThreadAccess for MockNativeContext {
+
 
     fn thread_id(&self) -> u64 {
         1
@@ -1635,6 +2111,159 @@ impl NativeContext for MockNativeContext {
     }
 
     fn thread_interrupt(&mut self, _thread_obj: ObjectRef) {}
+
+    fn is_interrupted(&self, clear: bool) -> bool {
+        // SAFETY: single-threaded test code; no aliasing.
+        let slot = unsafe { &mut *self.interrupted_flag.get() };
+        let val = *slot;
+        if val && clear {
+            *slot = false;
+        }
+        val
+    }
+
+    fn park(&mut self, _timeout: Option<std::time::Duration>) {}
+
+    fn unpark(&self, _thread_obj: ObjectRef) {}
+
+    fn get_scoped_value(&self, _key_id: u64) -> Option<Value> {
+        None
+    }
+
+    fn push_scoped_value(&mut self, _key_id: u64, _value: Value) {}
+
+    fn pop_scoped_value(&mut self) {}
+
+    fn scoped_value_depth(&self) -> usize {
+        0
+    }
+
+    fn monitor_enter(&mut self, _obj: ObjectRef) {}
+    fn monitor_exit(&mut self, _obj: ObjectRef) {}
+
+    fn active_thread_count(&self) -> i32 {
+        1
+    }
+
+    fn enumerate_threads(&self, _max: usize) -> Vec<ObjectRef> {
+        Vec::new()
+    }
+
+    fn begin_blocking_region(&mut self) {
+        self.blocking_begin_count += 1;
+    }
+
+    fn end_blocking_region(&mut self) {
+        self.blocking_end_count += 1;
+    }
+}
+
+impl cratonvm_native_api::NativeExceptionAccess for MockNativeContext {
+
+
+    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+
+    fn get_stack_trace(&self, _throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
+        None
+    }
+
+    fn frame_class_ids(&self) -> Vec<ClassId> {
+        // SAFETY: single-threaded test code.
+        unsafe { (*self.frame_class_ids_override.get()).clone() }
+    }
+}
+
+impl cratonvm_native_api::NativeGpuAccess for MockNativeContext {
+
+
+    /// 2026-07-11: honour any test-provided `gpu_future_take_result_override`;
+    /// defaults to the trait's default (`None`, "no GPU offload") when no
+    /// override is set for `handle`. See `set_gpu_future_take_result`.
+    fn gpu_future_take_result(&self, handle: u64) -> Option<GpuFutureResult> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.gpu_future_take_result_override.get())
+                .get(&handle)
+                .copied()
+        }
+    }
+
+    /// GpuStream affinity: counts the call and returns whatever
+    /// `set_gpu_stream_create_result` scripted (`None` by default —
+    /// the trait's own default, "no device"). See
+    /// `gpu_stream_create_call_count`.
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            *self.gpu_stream_create_calls.get() += 1;
+            *self.gpu_stream_create_override.get()
+        }
+    }
+
+    /// GpuStream affinity: records `handle` for
+    /// `gpu_stream_release_calls()` to read back.
+    fn gpu_stream_release(&mut self, handle: u64) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.gpu_stream_release_calls.get()).push(handle);
+        }
+    }
+}
+
+impl cratonvm_native_api::NativeSystemAccess for MockNativeContext {
+
+    // Mirror the production NativeContext memory bridge for REAL pointers:
+    // vm_exec falls through to a raw copy when the address is not a tagged
+    // Unsafe-arena handle. The t27_tls direct-buffer tests hand this mock
+    // genuine malloc pointers (Vec backing stores), so the arena-aware
+    // accessors (bb_get_byte & co.) must be able to reach them here too.
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as usize as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as usize as *mut u8, data.len());
+        }
+        true
+    }
+
+    fn supports_real_proxy_generation(&self) -> bool {
+        false
+    }
+
+    fn record_printed_value(&mut self, _value: Value) {}
+
+    fn record_printed_line(&mut self, _text: String) {}
+
+    fn get_system_stream(&self, _name: &str) -> Option<ObjectRef> {
+        None
+    }
+
+    fn get_system_property(&self, key: &str) -> Option<String> {
+        self.properties.get(key).cloned()
+    }
+
+    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
+        self.properties.insert(key.to_string(), value.to_string())
+    }
+
+    fn is_interface_class(&self, class_id: ClassId) -> bool {
+        // SAFETY: single-threaded test code.
+        let map = unsafe { &*self.is_interface_override.get() };
+        map.get(&class_id.as_u32()).copied().unwrap_or(false)
+    }
 
     fn register_native_thread(&mut self, name: &str, daemon: bool, join_handle_ptr: usize) -> u64 {
         // Drop the JoinHandle if one was passed — the mock context
@@ -1721,76 +2350,6 @@ impl NativeContext for MockNativeContext {
         true
     }
 
-    fn is_interrupted(&self, clear: bool) -> bool {
-        // SAFETY: single-threaded test code; no aliasing.
-        let slot = unsafe { &mut *self.interrupted_flag.get() };
-        let val = *slot;
-        if val && clear {
-            *slot = false;
-        }
-        val
-    }
-
-    fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
-        // SAFETY: single-threaded test code.
-        let overrides = unsafe { &*self.inner_classes_override.get() };
-        overrides
-            .get(&class_id.as_u32())
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
-        // SAFETY: single-threaded test code.
-        let overrides = unsafe { &*self.declared_fields_override.get() };
-        overrides
-            .get(&class_id.as_u32())
-            .map(|v| {
-                v.iter()
-                    .map(|f| FieldMetadata {
-                        name: f.name.clone(),
-                        descriptor: f.descriptor.clone(),
-                        access_flags: f.access_flags,
-                        slot_index: f.slot_index,
-                        declaring_class_id: f.declaring_class_id,
-                        is_static: f.is_static,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn declared_methods(&self, class_id: ClassId) -> Vec<MethodMetadata> {
-        let overrides = unsafe { &*self.declared_methods_override.get() };
-        overrides
-            .get(&class_id.as_u32())
-            .map(|v| {
-                v.iter()
-                    .map(|m| MethodMetadata {
-                        name: m.name.clone(),
-                        descriptor: m.descriptor.clone(),
-                        access_flags: m.access_flags,
-                        declaring_class_id: m.declaring_class_id,
-                        exceptions: m.exceptions.clone(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
-        let overrides = unsafe { &*self.interfaces_override.get() };
-        overrides
-            .get(&class_id.as_u32())
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn class_access_flags(&self, class_id: ClassId) -> u16 {
-        let overrides = unsafe { &*self.class_flags_override.get() };
-        overrides.get(&class_id.as_u32()).copied().unwrap_or(0)
-    }
-
     fn static_field_index_by_name(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
         let fields = unsafe { &*self.declared_fields_override.get() };
         if let Some(slot) = fields.get(&class_id.as_u32()).and_then(|fields| {
@@ -1830,206 +2389,12 @@ impl NativeContext for MockNativeContext {
         statics.insert((class_id.as_u32(), field_index), value);
     }
 
-    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
-        // FIX(class_id-0 name shadow): give the mirror a real, distinct
-        // class id via `ensure_class_initialized` (idempotent per name)
-        // instead of the shared placeholder `0` — this mock never
-        // populates `class_names[0]`, so `mirror_class_name`'s
-        // class-id-first lookup returned None/empty for every primitive
-        // mirror, shadowing the correct name already stored in slot 1.
-        let class_id = self.ensure_class_initialized(name).unwrap().as_u32();
-        let name_obj = self.create_string(name);
-        self.alloc_entry(HeapEntry::Object {
-            class_id: ClassId::new(0),
-            fields: vec![Value::Int(class_id as i32), Value::Object(Some(name_obj))],
-        })
-    }
-
     fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
         // Leak a static table for testing — tests won't actually use file I/O
         use std::sync::OnceLock;
         static FD_TABLE: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> =
             OnceLock::new();
         FD_TABLE.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
-    }
-
-    // -- WP0.2 ObjectStreamClass cache overrides --
-
-    fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
-        // SAFETY: single-threaded test code.
-        unsafe { (*self.osc_cache_map.get()).get(&class_id.as_u32()).copied() }
-    }
-
-    fn osc_cache_put(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
-        // SAFETY: single-threaded test code.
-        let map = unsafe { &mut *self.osc_cache_map.get() };
-        *map.entry(class_id.as_u32()).or_insert(desc)
-    }
-
-    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
-        self.get_field(obj, index)
-    }
-
-    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
-        self.set_field(obj, index, value)
-    }
-
-    fn compare_and_swap_field(
-        &mut self,
-        obj: ObjectRef,
-        index: usize,
-        expected: Value,
-        new_val: Value,
-    ) -> bool {
-        let current = self.get_field(obj, index);
-        if current == expected {
-            self.set_field(obj, index, new_val);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn park(&mut self, _timeout: Option<std::time::Duration>) {}
-
-    fn unpark(&self, _thread_obj: ObjectRef) {}
-
-    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
-        let cid = self.ensure_class_initialized(class_name).ok()?;
-        Some(self.alloc_object(cid, 4))
-    }
-
-    fn class_annotations(&self, _class_id: ClassId) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-
-    fn method_annotations(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-
-    fn field_annotations(&self, _class_id: ClassId, _field_name: &str) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-
-    fn method_return_type_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<AnnotationData> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.method_return_type_annotations_override.get())
-                .get(&(
-                    class_id.as_u32(),
-                    method_name.to_string(),
-                    method_desc.to_string(),
-                ))
-                .cloned()
-                .unwrap_or_default()
-        }
-    }
-
-    fn method_parameter_type_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<Vec<AnnotationData>> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.method_parameter_type_annotations_override.get())
-                .get(&(
-                    class_id.as_u32(),
-                    method_name.to_string(),
-                    method_desc.to_string(),
-                ))
-                .cloned()
-                .unwrap_or_default()
-        }
-    }
-
-    fn field_type_annotations(&self, class_id: ClassId, field_name: &str) -> Vec<AnnotationData> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.field_type_annotations_override.get())
-                .get(&(class_id.as_u32(), field_name.to_string()))
-                .cloned()
-                .unwrap_or_default()
-        }
-    }
-
-    fn invoke_virtual(
-        &mut self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        if let Some(hook) = unsafe { *self.invoke_virtual_hook.get() } {
-            if let Some(result) = hook(self, receiver, method_name, descriptor, args) {
-                return result;
-            }
-        }
-        let result = unsafe { &mut *self.invoke_virtual_result.get() };
-        if let Some(r) = result.take() {
-            r
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
-        let roots = unsafe { &mut *self.native_pin_roots.get() };
-        let idx = roots.len();
-        roots.push(obj);
-        idx
-    }
-
-    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
-        unsafe { (&*self.native_pin_roots.get()).get(handle).copied() }.unwrap_or(fallback)
-    }
-
-    fn unpin_native_roots(&mut self, base: usize) {
-        let roots = unsafe { &mut *self.native_pin_roots.get() };
-        if base < roots.len() {
-            roots.truncate(base);
-        }
-    }
-
-    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
-        let next = unsafe { &mut *self.next_global_root.get() };
-        let handle = *next;
-        *next = next.saturating_add(1).max(1);
-        unsafe { &mut *self.global_roots.get() }.insert(handle, obj);
-        handle
-    }
-
-    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
-        unsafe { &*self.global_roots.get() }.get(&handle).copied()
-    }
-
-    fn remove_global_root(&mut self, handle: usize) -> bool {
-        unsafe { &mut *self.global_roots.get() }
-            .remove(&handle)
-            .is_some()
-    }
-
-    fn get_scoped_value(&self, _key_id: u64) -> Option<Value> {
-        None
-    }
-
-    fn push_scoped_value(&mut self, _key_id: u64, _value: Value) {}
-
-    fn pop_scoped_value(&mut self) {}
-
-    fn scoped_value_depth(&self) -> usize {
-        0
     }
 
     fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
@@ -2105,164 +2470,6 @@ impl NativeContext for MockNativeContext {
             .map(|e| (e.target, e.param_kinds.clone(), e.return_kind))
     }
 
-    fn module_name_of_class(&self, _class_id: ClassId) -> Option<String> {
-        None
-    }
-
-    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.lambda_proxy_hosts_override.get())
-                .get(&class_id.as_u32())
-                .cloned()
-        }
-    }
-
-    fn find_resource(&self, name: &str) -> Option<Vec<u8>> {
-        // T19.H10: route through the per-instance override so tests can
-        // simulate a classpath containing real resources (e.g. the
-        // `keycloak-version.properties` blob the KC26 launcher reads).
-        // Strip leading slash to match the production class-path search,
-        // which trims absolute resource names before looking them up.
-        let trimmed = name.trim_start_matches('/');
-        // SAFETY: single-threaded test code.
-        unsafe { (*self.resources_override.get()).get(trimmed).cloned() }
-    }
-
-    fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.module_providers_override.get())
-                .get(service_class)
-                .cloned()
-                .unwrap_or_default()
-        }
-    }
-
-    fn list_application_class_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn register_dynamic_classpath(&mut self, paths: &[String]) {
-        // T19_H15: record paths so tests can assert the JBoss module
-        // loader registers the transitive linkage closure correctly.
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.registered_classpath.get()).extend(paths.iter().cloned());
-        }
-    }
-
-    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
-        // NEW-8 mock: remember the name so tests can inspect it, then
-        // mint a fresh ClassId. A bytes slice starting with the magic
-        // CAFEBABE is accepted; anything else returns None so error
-        // paths in the caller can be tested.
-        if bytes.len() < 4 || bytes[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
-            return None;
-        }
-        unsafe {
-            *self.last_defined_class_name.get() = Some(name.to_string());
-        }
-        let id = self.next_class_id;
-        self.next_class_id += 1;
-        self.class_names.insert(id, name.to_string());
-        self.name_to_id.insert(name.to_string(), id);
-        Some(ClassId::new(id))
-    }
-
-    fn set_class_hidden(&mut self, class_id: ClassId) {
-        unsafe {
-            (*self.hidden_classes.get()).insert(class_id.as_u32());
-        }
-    }
-
-    fn is_class_hidden(&self, class_id: ClassId) -> bool {
-        unsafe { (*self.hidden_classes.get()).contains(&class_id.as_u32()) }
-    }
-
-    /// WP8.11.5: override the default `define_class_full` so the mock
-    /// captures the full `DefineClassFull` options (notably
-    /// `nest_host_class_name`). The default impl in the trait would
-    /// collapse the call to `define_class_from_bytes` and lose the
-    /// option, defeating NESTMATE-propagation tests.
-    fn define_class_full(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-        loader_id: u32,
-        opts: cratonvm_native_api::DefineClassFull,
-    ) -> Result<ClassId, String> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            *self.last_define_full_opts.get() = Some(opts.clone());
-            *self.last_define_full_loader.get() = Some(loader_id);
-        }
-        // Use override_name if present (hidden-class mangled name path).
-        let stored_name = opts.override_name.as_deref().unwrap_or(name);
-        match self.define_class_from_bytes(stored_name, bytes) {
-            Some(cid) => {
-                if opts.hidden {
-                    self.set_class_hidden(cid);
-                }
-                Ok(cid)
-            }
-            None => Err(format!("define_class_full failed for {stored_name}")),
-        }
-    }
-
-    /// WP8.11.5: read the per-class nest-host override populated by
-    /// `set_nest_host_override`. `None` => the class is its own nest
-    /// host (default).
-    fn nest_host_name(&self, class_id: ClassId) -> Option<String> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.nest_host_override.get())
-                .get(&class_id.as_u32())
-                .cloned()
-        }
-    }
-
-    fn discover_reference(
-        &mut self,
-        _ref_type: u8,
-        _reference_obj: ObjectRef,
-        _referent: ObjectRef,
-        _queue: Option<ObjectRef>,
-    ) {
-    }
-
-    fn monitor_enter(&mut self, _obj: ObjectRef) {}
-    fn monitor_exit(&mut self, _obj: ObjectRef) {}
-
-    fn define_class_with_loader(
-        &mut self,
-        _name: &str,
-        _bytes: &[u8],
-        _loader_id: u32,
-    ) -> Option<ClassId> {
-        None
-    }
-
-    fn class_id_by_name_and_loader(&self, _name: &str, _loader_id: u32) -> Option<ClassId> {
-        None
-    }
-
-    fn allocate_loader_id(&mut self) -> u32 {
-        0
-    }
-
-    fn active_thread_count(&self) -> i32 {
-        1
-    }
-
-    fn enumerate_threads(&self, _max: usize) -> Vec<ObjectRef> {
-        Vec::new()
-    }
-
-    fn heap_allocated_bytes(&self) -> usize {
-        0
-    }
-
     fn loaded_class_count(&self) -> usize {
         0
     }
@@ -2272,124 +2479,10 @@ impl NativeContext for MockNativeContext {
     }
 
     fn force_gc(&mut self) {}
-
-    fn begin_blocking_region(&mut self) {
-        self.blocking_begin_count += 1;
-    }
-
-    fn end_blocking_region(&mut self) {
-        self.blocking_end_count += 1;
-    }
-
-    fn method_parameter_annotations(
-        &self,
-        _: ClassId,
-        _: &str,
-        _: &str,
-    ) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
-        Vec::new()
-    }
-
-    fn method_annotation_default(
-        &self,
-        _: ClassId,
-        _: &str,
-        _: &str,
-    ) -> Option<cratonvm_native_api::AnnotationElementValue> {
-        None
-    }
-
-    fn class_signature(&self, _class_id: ClassId) -> Option<String> {
-        None
-    }
-
-    fn method_signature(
-        &self,
-        _class_id: ClassId,
-        _method_name: &str,
-        _method_desc: &str,
-    ) -> Option<String> {
-        None
-    }
-
-    fn field_signature(&self, _class_id: ClassId, _field_name: &str) -> Option<String> {
-        None
-    }
-
-    /// T19.N1: honour any test-provided `code_base_override`; defaults to
-    /// `None` (bootstrap/synthetic class) when no override is set.
-    fn class_code_base(&self, class_id: ClassId) -> Option<String> {
-        let overrides = unsafe { &*self.code_base_override.get() };
-        overrides.get(&class_id.as_u32()).cloned()
-    }
-
-    /// T19.N1: honour any test-provided `code_source_certs_override`;
-    /// defaults to empty (unsigned class).
-    fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
-        let overrides = unsafe { &*self.code_source_certs_override.get() };
-        overrides
-            .get(&class_id.as_u32())
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn is_package_exported_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
-        true
-    }
-
-    fn is_package_exported_to(&self, _module_name: &str, _pkg: &str, _to_module: &str) -> bool {
-        true
-    }
-
-    fn is_package_open_unqualified(&self, _module_name: &str, _pkg: &str) -> bool {
-        true
-    }
-
-    fn is_package_open_to(&self, _module_name: &str, _pkg: &str, _to_module: &str) -> bool {
-        true
-    }
-
-    fn check_deep_reflection_access(
-        &self,
-        _accessor_class_id: ClassId,
-        _target_class_id: ClassId,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// 2026-07-11: honour any test-provided `gpu_future_take_result_override`;
-    /// defaults to the trait's default (`None`, "no GPU offload") when no
-    /// override is set for `handle`. See `set_gpu_future_take_result`.
-    fn gpu_future_take_result(&self, handle: u64) -> Option<GpuFutureResult> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.gpu_future_take_result_override.get())
-                .get(&handle)
-                .copied()
-        }
-    }
-
-    /// GpuStream affinity: counts the call and returns whatever
-    /// `set_gpu_stream_create_result` scripted (`None` by default —
-    /// the trait's own default, "no device"). See
-    /// `gpu_stream_create_call_count`.
-    fn gpu_stream_create(&mut self) -> Option<u64> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            *self.gpu_stream_create_calls.get() += 1;
-            *self.gpu_stream_create_override.get()
-        }
-    }
-
-    /// GpuStream affinity: records `handle` for
-    /// `gpu_stream_release_calls()` to read back.
-    fn gpu_stream_release(&mut self, handle: u64) {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.gpu_stream_release_calls.get()).push(handle);
-        }
-    }
 }
+
+
+
 
 impl Drop for MockNativeContext {
     fn drop(&mut self) {

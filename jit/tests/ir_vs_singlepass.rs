@@ -56,7 +56,10 @@ fn dummy_helpers() -> JitRuntimeHelpers {
         0
     }
     let s = stub as *const () as usize;
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+        jit_card_table_addr: 0,
+        jit_card_old_base: 0,
+        jit_card_old_end: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,
@@ -143,6 +146,9 @@ fn cached(
         is_static: true,
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        invoc_key: std::sync::OnceLock::new(),
+        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+        quickened: std::sync::OnceLock::new(),
     }
 }
 
@@ -2111,8 +2117,19 @@ fn ir_vs_singlepass_invokevirtual_instance_call() {
         let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
         x + n
     }
+    unsafe extern "C" fn recv_mic_dispatch(
+        vm: i64,
+        info: i64,
+        args_ptr: i64,
+        num_args: i64,
+        _mic: i64,
+        _pic: i64,
+    ) -> i64 {
+        recv_dispatch(vm, info, args_ptr, num_args)
+    }
     let mut helpers = dummy_helpers();
     helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    helpers.invoke_virtual_mic = recv_mic_dispatch as *const () as usize;
     let code = vec![0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac];
     let cm = cached("f", "(Lpkg/Corpus;I)I", code, 2, 2);
     let resolver = |cp: u16| -> Option<(String, String, String)> {
@@ -2164,8 +2181,19 @@ fn ir_vs_singlepass_invokeinterface_instance_call() {
         let x = std::ptr::read_unaligned((recv as *const u8).add(off) as *const i32) as i64;
         x + n
     }
+    unsafe extern "C" fn recv_mic_dispatch(
+        vm: i64,
+        info: i64,
+        args_ptr: i64,
+        num_args: i64,
+        _mic: i64,
+        _pic: i64,
+    ) -> i64 {
+        recv_dispatch(vm, info, args_ptr, num_args)
+    }
     let mut helpers = dummy_helpers();
     helpers.invoke_dispatch = recv_dispatch as *const () as usize;
+    helpers.invoke_virtual_mic = recv_mic_dispatch as *const () as usize;
     // invokeinterface is 5 bytes: opcode, cp_hi, cp_lo, count(=2: receiver+int), 0.
     let code = vec![0x2a, 0x1b, 0xb9, 0x00, 0x02, 0x02, 0x00, 0xac];
     let cm = cached("f", "(Lpkg/Iface;I)I", code, 2, 2);
@@ -2347,7 +2375,7 @@ unsafe extern "C" fn test_drem(a: f64, b: f64) -> f64 {
 /// [`dummy_helpers`] with the two FP-remainder helpers wired to real stubs (the
 /// rest stay panic stubs — a `frem`/`drem` method calls no other helper).
 fn frem_helpers() -> JitRuntimeHelpers {
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         jit_frem: test_frem as *const () as usize,
         jit_drem: test_drem as *const () as usize,
         self_call_stack_guard: 0,
@@ -3504,4 +3532,249 @@ fn selfrec_long_direct_call_executes_correctly() {
             .unwrap_or_else(|e| panic!("call fib({n}): {e:?}"));
         assert_eq!(r, expect, "fib({n}) via IR direct self-call");
     }
+}
+
+// ---------------------------------------------------------------------------
+// IR direct-call lowering (perf(jit): direct cross-method calls in the IR)
+//
+// The IR path historically routed EVERY invoke through `jit_invoke_dispatch`,
+// which is why `ir_compatible` capped `invoke_ops` at 5: an "optimizing"
+// recompile of a call-heavy method was a net regression versus the single-pass
+// body, which has always bound a statically-resolved callee with a raw `CALL`.
+// The lowering below closes that gap for `invokestatic` / non-`<init>`
+// `invokespecial`. These tests supply a `callee_compiler` whose returned "entry"
+// is a real `extern "C"` stub, so the generated code actually calls it — proving
+// the entry ABI (vm_ptr placement, argument register order, result in RAX) and
+// the exception sentinel end to end.
+//
+// `invoke_dispatch` is deliberately wired to a DIFFERENT observable function in
+// each test: if the site fell back to helper dispatch the result would differ, so
+// each assertion is also a proof that the direct edge was taken.
+// ---------------------------------------------------------------------------
+
+/// A "compiled callee" that takes the hidden VM context pointer (needs_context
+/// == true): `(vm_ptr, a, b) -> a * 1000 + b`.
+unsafe extern "C" fn direct_callee_ctx(_vm: i64, a: i64, b: i64) -> i64 {
+    (a as i32 as i64) * 1000 + (b as i32 as i64)
+}
+
+/// A "compiled callee" that does NOT take a context pointer (needs_context ==
+/// false), so its FIRST register argument is the first Java argument:
+/// `(a, b) -> a * 1000 + b + 7`.
+unsafe extern "C" fn direct_callee_noctx(a: i64, b: i64) -> i64 {
+    (a as i32 as i64) * 1000 + (b as i32 as i64) + 7
+}
+
+/// A "compiled callee" that threw: returns the `i64::MIN` deopt sentinel.
+unsafe extern "C" fn direct_callee_throws(_vm: i64, _a: i64, _b: i64) -> i64 {
+    i64::MIN
+}
+
+/// `compile_with_dispatch` plus a `callee_compiler` — the resolver the IR
+/// eligibility loop consults to eagerly compile a statically-bound callee and
+/// obtain `(entry, needs_context)` for the direct `CALL`.
+fn compile_with_direct_callee(
+    cm: &CachedBytecodeMethod,
+    helpers: &JitRuntimeHelpers,
+    invoke_resolver: &dyn Fn(u16) -> Option<(String, String, String)>,
+    callee_compiler: &dyn Fn(&str, &str, &str) -> Option<(usize, bool)>,
+) -> Option<CompiledMethod> {
+    try_compile(
+        cm,
+        None,
+        None,
+        None,
+        Some(invoke_resolver),
+        Some(callee_compiler),
+        None,
+        None,
+        None,
+        None,
+        helpers,
+        None,
+        None,
+        None,
+        None,
+        true,  // optimize (C2 / IR pipeline)
+        true,  // ir_emit_calls
+        true,  // ir_emit_special_calls
+        true,  // ir_emit_long
+        true,  // ir_emit_virtual_calls
+        false, // ir_emit_fp
+        None,
+    )
+}
+
+#[test]
+fn ir_direct_call_static_with_context_executes_correctly() {
+    // static int f(int a, int b) { return g(a, b) * 2; }
+    //   iload_0; iload_1; invokestatic #2; iconst_2; imul; ireturn
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = positional_dispatch as *const () as usize;
+    let code = vec![0x1a, 0x1b, 0xb8, 0x00, 0x02, 0x05, 0x68, 0xac];
+    let cm = cached("f", "(II)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+        } else {
+            None
+        }
+    };
+    let entry = direct_callee_ctx as *const () as usize;
+    let callee_compiler = |c: &str, m: &str, d: &str| -> Option<(usize, bool)> {
+        if (c, m, d) == ("pkg/Helper", "g", "(II)I") {
+            Some((entry, true))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_direct_callee(&cm, &helpers, &resolver, &callee_compiler)
+        .expect("IR compile with a direct static call");
+    assert!(ir.used_ir_backend, "must stay on the IR backend");
+    assert!(
+        ir._direct_callee_entries.contains(&entry),
+        "the baked callee entry must be recorded for keep-alive + invalidation"
+    );
+    let dummy_vm = [0u8; 64];
+    for (a, b) in [(3i64, 4i64), (0, 0), (-1, 5), (12, -7)] {
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[a, b]) }
+            .unwrap_or_else(|e| panic!("call f({a},{b}): {e:?}"));
+        let expected = ((a as i32).wrapping_mul(1000).wrapping_add(b as i32)).wrapping_mul(2);
+        // Compared as `i32`, matching the `check` helper: the IR keeps an int
+        // result in its frame slot without guaranteeing upper-32 sign extension
+        // (`Op::Mul` Int is a 32-bit `IMUL EAX, ECX`), and the VM narrows an `I`
+        // return to i32. Pre-existing convention, unrelated to call lowering.
+        assert_eq!(
+            r as i32, expected,
+            "f({a},{b}) must go through the DIRECT callee (helper dispatch would              have produced the positional_dispatch value instead)"
+        );
+    }
+}
+
+#[test]
+fn ir_direct_call_static_without_context_executes_correctly() {
+    // Same shape, but the callee reports `needs_context == false`, so the first
+    // Java argument occupies abi[0] rather than abi[1]. A mis-shifted marshalling
+    // would pass the VM pointer as `a`.
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = positional_dispatch as *const () as usize;
+    let code = vec![0x1a, 0x1b, 0xb8, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(II)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+        } else {
+            None
+        }
+    };
+    let entry = direct_callee_noctx as *const () as usize;
+    let callee_compiler = |c: &str, m: &str, d: &str| -> Option<(usize, bool)> {
+        if (c, m, d) == ("pkg/Helper", "g", "(II)I") {
+            Some((entry, false))
+        } else {
+            None
+        }
+    };
+    let ir = compile_with_direct_callee(&cm, &helpers, &resolver, &callee_compiler)
+        .expect("IR compile with a context-free direct callee");
+    let dummy_vm = [0u8; 64];
+    for (a, b) in [(3i64, 4i64), (-2, 9), (100, 200)] {
+        let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[a, b]) }
+            .unwrap_or_else(|e| panic!("call f({a},{b}): {e:?}"));
+        let expected = (a as i32)
+            .wrapping_mul(1000)
+            .wrapping_add(b as i32)
+            .wrapping_add(7);
+        assert_eq!(
+            r as i32, expected,
+            "context-free direct call for f({a},{b})"
+        );
+    }
+}
+
+#[test]
+fn ir_direct_call_exception_sentinel_bails() {
+    // A directly-called callee that threw returns `i64::MIN`. The caller must
+    // detect the sentinel and bail (returning it unchanged so the VM takes the
+    // pending exception) instead of using it as the call's result — exactly the
+    // protocol the helper-dispatch path follows.
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = positional_dispatch as *const () as usize;
+    // static int f(int a, int b) { return g(a, b) * 2; } — the `* 2` would be
+    // visible in the result if the bail did not happen.
+    let code = vec![0x1a, 0x1b, 0xb8, 0x00, 0x02, 0x05, 0x68, 0xac];
+    let cm = cached("f", "(II)I", code, 2, 2);
+    let resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+        } else {
+            None
+        }
+    };
+    let entry = direct_callee_throws as *const () as usize;
+    let callee_compiler =
+        |_c: &str, _m: &str, _d: &str| -> Option<(usize, bool)> { Some((entry, true)) };
+    let ir =
+        compile_with_direct_callee(&cm, &helpers, &resolver, &callee_compiler).expect("compile");
+    let dummy_vm = [0u8; 64];
+    let r = unsafe { ir.try_call_with_context(dummy_vm.as_ptr() as i64, &[1, 2]) }.expect("call");
+    assert_eq!(
+        r,
+        i64::MIN,
+        "a throwing direct callee must bail and propagate the sentinel"
+    );
+}
+
+#[test]
+fn ir_direct_call_declines_self_recursion_and_unknown_callees() {
+    // Two negative controls for the eligibility gate:
+    //  1. A SELF-recursive static call must NOT become a cross-method direct call
+    //     (it has its own `invoke_kind == 4` path, whose stack guard is what keeps
+    //     runaway recursion a catchable StackOverflowError).
+    //  2. A callee the `callee_compiler` cannot compile must keep helper dispatch.
+    let mut helpers = dummy_helpers();
+    helpers.invoke_dispatch = positional_dispatch as *const () as usize;
+    // static int f(int a, int b) { return f(a, b); }  (self-recursive)
+    let code = vec![0x1a, 0x1b, 0xb8, 0x00, 0x02, 0xac];
+    let cm = cached("f", "(II)I", code.clone(), 2, 2);
+    let self_resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("Corpus".into(), "f".into(), "(II)I".into()))
+        } else {
+            None
+        }
+    };
+    let entry = direct_callee_ctx as *const () as usize;
+    let any_callee =
+        |_c: &str, _m: &str, _d: &str| -> Option<(usize, bool)> { Some((entry, true)) };
+    let ir = compile_with_direct_callee(&cm, &helpers, &self_resolver, &any_callee)
+        .expect("self-recursive compile");
+    assert!(
+        !ir._direct_callee_entries.contains(&entry),
+        "a self-recursive site must never be bound as a CROSS-method direct call"
+    );
+
+    // (2) unknown callee → no direct entry recorded, dispatch retained.
+    let cm2 = cached("f", "(II)I", code, 2, 2);
+    let cross_resolver = |cp: u16| -> Option<(String, String, String)> {
+        if cp == 2 {
+            Some(("pkg/Helper".into(), "g".into(), "(II)I".into()))
+        } else {
+            None
+        }
+    };
+    let no_callee = |_c: &str, _m: &str, _d: &str| -> Option<(usize, bool)> { None };
+    let ir2 = compile_with_direct_callee(&cm2, &helpers, &cross_resolver, &no_callee)
+        .expect("compile with an uncompilable callee");
+    assert!(
+        ir2._direct_callee_entries.is_empty(),
+        "no direct entry may be recorded when the callee cannot be compiled"
+    );
+    let dummy_vm = [0u8; 64];
+    let r = unsafe { ir2.try_call_with_context(dummy_vm.as_ptr() as i64, &[3, 4]) }.expect("call");
+    assert_eq!(
+        r as i32,
+        host_positional(&[3, 4]) as i32,
+        "an uncompilable callee must still reach the dispatch helper"
+    );
 }

@@ -72,7 +72,7 @@ pub fn host_view_i32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
         ArrayElementType::Int,
         "host_view_i32: not an int[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     // PERF: `int[]` elements are stored as a contiguous native-`i32`
     // little-endian region starting at `array_data_ptr`. A single
     // `copy_nonoverlapping` replaces `len` boxed `Value`-returning
@@ -125,7 +125,7 @@ pub fn host_view_i64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
         ArrayElementType::Long,
         "host_view_i64: not a long[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     // PERF: bulk copy — see `host_view_i32`. `long[]` is contiguous
     // native `i64` little-endian.
     let mut out = vec![0i64; len];
@@ -169,7 +169,7 @@ pub fn host_view_f32(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
         ArrayElementType::Float,
         "host_view_f32: not a float[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     // PERF: bulk copy — see `host_view_i32`. `float[]` is contiguous
     // native `f32` little-endian (IEEE-754 bit pattern preserved).
     let mut out = vec![0f32; len];
@@ -213,7 +213,7 @@ pub fn host_view_f64(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
         ArrayElementType::Double,
         "host_view_f64: not a double[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     // PERF: bulk copy — see `host_view_i32`. `double[]` is contiguous
     // native `f64` little-endian (IEEE-754 bit pattern preserved).
     let mut out = vec![0f64; len];
@@ -257,7 +257,7 @@ pub fn host_view_i16(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>)
         ArrayElementType::Short,
         "host_view_i16: not a short[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     // PERF: bulk copy — see `host_view_i32`. Unlike the value-based
     // `get_array_element` accessor (which boxes every element through
     // `Value::Int`, sign-extended), the *heap slot itself* is a native
@@ -312,7 +312,7 @@ pub fn host_view_i8(obj: ObjectRef, heap: &VmHeap, _token: &SafepointToken<'_>) 
         ArrayElementType::Byte,
         "host_view_i8: not a byte[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     // PERF: bulk copy — see `host_view_i32` / `host_view_i16`. `byte[]`
     // elements are stored one raw byte per slot at `base + index` (stride
     // 1, no widening — `element_byte_size(ArrayElementType::Byte) == 1`),
@@ -372,7 +372,7 @@ pub fn write_back_i32(obj: ObjectRef, heap: &VmHeap, src: &[i32], _token: &Safep
         ArrayElementType::Int,
         "write_back_i32: not an int[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     assert_eq!(
         src.len(),
         len,
@@ -419,7 +419,7 @@ pub fn write_back_i64(obj: ObjectRef, heap: &VmHeap, src: &[i64], _token: &Safep
         ArrayElementType::Long,
         "write_back_i64: not a long[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     assert_eq!(
         src.len(),
         len,
@@ -462,7 +462,7 @@ pub fn write_back_f32(obj: ObjectRef, heap: &VmHeap, src: &[f32], _token: &Safep
         ArrayElementType::Float,
         "write_back_f32: not a float[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     assert_eq!(
         src.len(),
         len,
@@ -505,7 +505,7 @@ pub fn write_back_f64(obj: ObjectRef, heap: &VmHeap, src: &[f64], _token: &Safep
         ArrayElementType::Double,
         "write_back_f64: not a double[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     assert_eq!(
         src.len(),
         len,
@@ -554,7 +554,7 @@ pub fn write_back_i16(obj: ObjectRef, heap: &VmHeap, src: &[i16], _token: &Safep
         ArrayElementType::Short,
         "write_back_i16: not a short[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     assert_eq!(
         src.len(),
         len,
@@ -610,7 +610,7 @@ pub fn write_back_i8(obj: ObjectRef, heap: &VmHeap, src: &[i8], _token: &Safepoi
         ArrayElementType::Byte,
         "write_back_i8: not a byte[]"
     );
-    let len = header.array_length as usize;
+    let len = header.array_length() as usize;
     assert_eq!(
         src.len(),
         len,
@@ -686,7 +686,7 @@ where
 fn zerocopy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
 }
 
 /// Returns `true` only when `obj`'s header describes a primitive array whose
@@ -714,7 +714,7 @@ macro_rules! direct_xfer {
             heap: &VmHeap,
             token: &SafepointToken<'_>,
         ) -> DeviceResult<DeviceBuffer<$ty>> {
-            let len = heap.get_header(obj).array_length as usize;
+            let len = heap.get_header(obj).array_length() as usize;
             // Only take the zero-copy fast path once we have proven the object
             // really is an array of the expected element type — otherwise the
             // raw `from_raw_parts` below would read past the payload (OOB).
@@ -743,7 +743,7 @@ macro_rules! direct_xfer {
             heap: &VmHeap,
             token: &SafepointToken<'_>,
         ) -> DeviceResult<()> {
-            let len = heap.get_header(obj).array_length as usize;
+            let len = heap.get_header(obj).array_length() as usize;
             // As in `$up`: validate kind + element type before reinterpreting
             // the arena as `&mut [$ty]`, or a mismatched element width would
             // write `len * size_of::<$ty>()` bytes off the end of the real

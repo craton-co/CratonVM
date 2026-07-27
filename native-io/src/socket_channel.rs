@@ -37,6 +37,7 @@
 //!
 //! All public surface is registered via `register_socket_channel_real`.
 
+use crate::io_flags;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -49,12 +50,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 fn ipc_dbg_enabled() -> bool {
-    std::env::var("CRATONVM_SUREFIRE_IPC_DBG")
-        .map(|v| {
-            let t = v.trim();
-            !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false)
+    crate::io_flags().surefire_ipc_dbg
 }
 
 fn ipc_dbg(msg: impl AsRef<str>) {
@@ -1010,7 +1006,7 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // permanent opt-in hook (zero cost when unset) for whoever
             // continues that investigation, matching CRATONVM_DBG_NET /
             // CRATONVM_DBG_STALE_RECV etc.
-            if std::env::var_os("CRATONVM_DBG_SC_CLOSE").is_some() {
+            if io_flags().dbg_sc_close {
                 let (local, peer) = match tcp_registry().read().get(&id) {
                     Some(TcpHandle::Stream(s)) => (
                         s.local_addr().map(|a| a.to_string()).unwrap_or_default(),
@@ -1295,12 +1291,12 @@ fn sc_connect_bound(
             verdict.map_err(|e| map_err(&target, e))?;
             (stream, true)
         } // NOTE: a second `DeferredFailure` arm here would be unreachable —
-        // the unconditional `DeferredFailure(_stream, error) => return
-        // Err(...)` arm above already matches every case this one used to
-        // guard on (`allow_block == true`, since the `if !allow_block` arm
-        // earlier in this match consumes the `false` case). The compiler
-        // flagged the old duplicate arm as a hard unreachable-pattern
-        // warning; removed rather than left as dead code.
+          // the unconditional `DeferredFailure(_stream, error) => return
+          // Err(...)` arm above already matches every case this one used to
+          // guard on (`allow_block == true`, since the `if !allow_block` arm
+          // earlier in this match consumes the `false` case). The compiler
+          // flagged the old duplicate arm as a hard unreachable-pattern
+          // warning; removed rather than left as dead code.
     };
     if connected && blocking {
         stream
@@ -1868,7 +1864,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // investigation at Jetty's/Tomcat's own frame-parser instead). Kept
         // as a permanent opt-in hook, zero cost when unset, matching
         // CRATONVM_DBG_SC_CLOSE's precedent in this same file.
-        if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+        if io_flags().dbg_sc_read {
             let pos_before = match ctx.get_field_by_name(bb, "position") {
                 Value::Int(v) => v,
                 _ => -1,
@@ -1948,7 +1944,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let id = read_reg_id(ctx, this).ok_or_else(|| ioex("write: channel not connected"))?;
     let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_SC_WRITE").is_some() {
+    if io_flags().dbg_sc_write {
         let position = ctx.get_field_by_name(bb, "position");
         let limit = ctx.get_field_by_name(bb, "limit");
         let address = ctx.get_field_by_name(bb, "address");
@@ -2014,7 +2010,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     if n > 0 {
         crate::net::socket_capture('w', id, &data[..n as usize]);
-        if std::env::var_os("CRATONVM_DBG_SC_WRITE").is_some() {
+        if io_flags().dbg_sc_write {
             eprintln!("[SC_WRITE] id={id:#x} wrote={n}");
         }
         let bb = ctx.read_native_pin(bb_pin, bb);
@@ -2226,29 +2222,78 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let cap = total.min(i32::MAX as i64) as usize;
     let mut buf = vec![0u8; cap];
 
-    let n_opt = {
+    // AUDIT 2026-07-26 (native-io-audit): this path used to call `try_read_nb`
+    // with NO `begin_blocking_region`/`end_blocking_region` bracket, unlike
+    // every sibling (`sc_read` 1799, `sc_write` 1967, `sc_write_gathering`
+    // 2109). A blocking-mode SocketChannel leaves its `TcpStream` in genuine
+    // OS-blocking mode, so a scattering `read(ByteBuffer[])` — the shape
+    // Jetty/Netty-style reactors use for header+body reads — parks in the
+    // kernel indefinitely. A concurrent stop-the-world pause then waits
+    // forever on a mutator that never reaches a safepoint: a whole-VM hang
+    // with no exception and no diagnostic. This is the documented
+    // "STW blocking-region missing native I/O family" issue class.
+    //
+    // The destination buffers are used after the region, so they are pinned
+    // and reloaded through `read_native_pin` (a pause inside the region may
+    // relocate them) — same protocol as `sc_write_gathering`.
+    let pins: Vec<_> = targets.iter().map(|bb| ctx.pin_native_root(*bb)).collect();
+    ctx.begin_blocking_region();
+    let read_result = {
         let map = tcp_registry().read();
         match map.get(&id) {
             Some(TcpHandle::Stream(s)) => {
-                try_read_nb(s, &mut buf).map_err(|e| map_err("read(scattering)", e))?
+                let r = try_read_nb(s, &mut buf).map_err(|e| map_err("read(scattering)", e));
+                ctx.end_blocking_region();
+                r
             }
             Some(TcpHandle::Connecting(_)) => {
+                ctx.end_blocking_region();
+                for pin in pins {
+                    ctx.unpin_native_roots(pin);
+                }
                 return Ok(Some(Value::Long(0)));
             }
             Some(TcpHandle::ConnectFailed(_, error)) => {
+                ctx.end_blocking_region();
+                for pin in pins {
+                    ctx.unpin_native_roots(pin);
+                }
                 return Err(map_err(
                     "read(scattering)",
                     std::io::Error::new(error.kind(), error.to_string()),
                 ));
             }
-            _ => return Err(ioex("read(scattering): channel not a stream")),
+            _ => {
+                ctx.end_blocking_region();
+                for pin in pins {
+                    ctx.unpin_native_roots(pin);
+                }
+                return Err(ioex("read(scattering): channel not a stream"));
+            }
+        }
+    };
+    let n_opt = match read_result {
+        Ok(v) => v,
+        Err(e) => {
+            for pin in pins {
+                ctx.unpin_native_roots(pin);
+            }
+            return Err(e);
         }
     };
     let n = match n_opt {
         Some(v) => v,
-        None => return Ok(Some(Value::Long(0))), // EAGAIN
+        None => {
+            for pin in pins {
+                ctx.unpin_native_roots(pin);
+            }
+            return Ok(Some(Value::Long(0))); // EAGAIN
+        }
     };
     if n < 0 {
+        for pin in pins {
+            ctx.unpin_native_roots(pin);
+        }
         return Ok(Some(Value::Long(-1))); // EOF
     }
     if n > 0 {
@@ -2256,17 +2301,21 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Scatter the bytes into the destination buffers in order; each call
         // fills one buffer up to its remaining room, then we move to the next.
         let mut consumed = 0usize;
-        for bb in &targets {
+        for (pin, bb) in pins.iter().zip(targets.iter()) {
             if consumed >= n as usize {
                 break;
             }
-            let written = buffer_write_bytes(ctx, *bb, &buf[consumed..n as usize]);
+            let bb = ctx.read_native_pin(*pin, *bb);
+            let written = buffer_write_bytes(ctx, bb, &buf[consumed..n as usize]);
             if written <= 0 {
                 break;
             }
-            buffer_advance(ctx, *bb, written);
+            buffer_advance(ctx, bb, written);
             consumed += written as usize;
         }
+    }
+    for pin in pins {
+        ctx.unpin_native_roots(pin);
     }
     Ok(Some(Value::Long(n as i64)))
 }
@@ -2502,6 +2551,12 @@ fn sc_supported_options(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     supported_socket_options(ctx)
 }
 
+/// Same set for the asynchronous channels — see `async_socket::
+/// aio_supported_options`.
+pub(crate) fn supported_socket_options_pub(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    supported_socket_options(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // ServerSocketChannel — open / bind / accept / close
 // ---------------------------------------------------------------------------
@@ -2627,7 +2682,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // double-accept bug upstream of `sc_read` entirely; if it shows only
     // ONE id (as expected), the duplicate-CONNECT-dispatch investigation
     // stays focused on `sc_read` / the buffer fill-and-parse path.
-    if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+    if io_flags().dbg_sc_read {
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -3173,7 +3228,7 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // java.net.ServerSocket subclass whose bind/accept/setSoTimeout delegate to
     // the channel and whose construction runs the ServerSocket instance
     // initializers (socketLock = new Object()), so getImpl() is never reached.
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+    if io_flags().real_net_sockets {
         if let Ok(Some(v @ Value::Object(Some(adaptor)))) = ctx.invoke(
             "sun/nio/ch/ServerSocketAdaptor",
             "create",
@@ -3466,6 +3521,8 @@ fn ss_wrapper_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::io::{Read as _, Write as _};
 

@@ -1910,7 +1910,7 @@ fn resolve_service(
     algo: &str,
 ) -> Option<ObjectRef> {
     let entry = get_service_entry(provider, type_str, algo);
-    if std::env::var_os("CRATONVM_DIAG_JCA").is_some() {
+    if crate::nbflags().diag_jca {
         match &entry {
             Some(e) => eprintln!(
                 "[JCA-DIAG] getService({provider},{type_str},{algo}) -> entry algo={:?} class={:?}",
@@ -2001,6 +2001,28 @@ fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCall
         message: msg.to_string(),
     }
     .into()
+}
+
+/// Mirrors real `sun.security.jca.GetInstance.getInstance(String, Class,
+/// String, String)`'s own provider-existence check, which runs BEFORE any
+/// algorithm lookup: an unregistered provider name is a `NoSuchProviderException`
+/// ("no such provider: <name>"), never a `NoSuchAlgorithmException` — even when
+/// no provider on the chain would have supplied the requested algorithm either.
+/// Spring Boot's `JksSslStoreBundleTests.whenHasKeyStoreProvider` depends on this
+/// ordering: it names a provider that was never registered at all, and asserts
+/// the resulting `KeyStoreException`'s message (not a nested cause) contains the
+/// provider name — which only the provider-existence message includes.
+fn throw_no_such_provider(ctx: &mut dyn NativeContext, provider: &str) -> MethodCallFailed {
+    let msg = format!("no such provider: {provider}");
+    let detail = ctx.create_string(&msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/NoSuchProviderException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::SecurityException { message: msg }.into()
 }
 
 /// Return the name of the first provider in chain order whose service table
@@ -2135,6 +2157,9 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let type_str = read_arg_string(ctx, args, 0);
     let algo = read_arg_string(ctx, args, 2);
     let provider = read_arg_string(ctx, args, 3);
+    if find(&provider).is_none() {
+        return Err(throw_no_such_provider(ctx, &provider));
+    }
     match build_jca_instance(ctx, &provider, &type_str, &algo) {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(
@@ -2752,6 +2777,8 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

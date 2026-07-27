@@ -454,7 +454,7 @@ fn impl_slot(ctx: &dyn NativeContext, impl_obj: ObjectRef) -> Option<usize> {
 }
 
 fn atomic_updater_diag_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_ATOMIC_UPDATER").is_some()
+    crate::nbflags().dbg_atomic_updater
 }
 
 fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
@@ -1313,6 +1313,8 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1372,27 +1374,10 @@ mod tests {
     }
 
     // Forward every NativeContext method to `inner` except declared_fields.
-    impl NativeContext for UpdaterMock {
+    impl cratonvm_native_api::NativeClassAccess for UpdaterMock {
+
         fn load_class(&mut self, name: &str) -> MethodCallResult {
             self.inner.load_class(name)
-        }
-        fn new_object(&mut self, class_name: &str) -> MethodCallResult {
-            self.inner.new_object(class_name)
-        }
-        fn invoke(
-            &mut self,
-            class_name: &str,
-            method_name: &str,
-            descriptor: &str,
-            args: &[Value],
-        ) -> MethodCallResult {
-            self.inner.invoke(class_name, method_name, descriptor, args)
-        }
-        fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
-            self.inner.identity_hash_code(obj)
-        }
-        fn record_printed_value(&mut self, value: Value) {
-            self.inner.record_printed_value(value)
         }
         fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
             self.inner.class_name_of_id(class_id)
@@ -1400,87 +1385,8 @@ mod tests {
         fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
             self.inner.class_id_of_object(obj)
         }
-        fn capture_stack_trace(
-            &mut self,
-            throwable_hash: i32,
-        ) -> Vec<cratonvm_native_api::StackTraceEntry> {
-            self.inner.capture_stack_trace(throwable_hash)
-        }
-        fn get_stack_trace(
-            &self,
-            throwable_hash: i32,
-        ) -> Option<Vec<cratonvm_native_api::StackTraceEntry>> {
-            self.inner.get_stack_trace(throwable_hash)
-        }
-        fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
-            self.inner.get_field(obj, index)
-        }
-        fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
-            self.inner.set_field(obj, index, value)
-        }
-        fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
-            self.inner.get_field_by_name(obj, field_name)
-        }
-        fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
-            self.inner.set_field_by_name(obj, field_name, value)
-        }
-        fn resolve_field_index(&self, c: &str, f: &str) -> Option<usize> {
-            self.inner.resolve_field_index(c, f)
-        }
-        fn resolve_field_index_by_class_id(&self, c: ClassId, f: &str) -> Option<usize> {
-            self.inner.resolve_field_index_by_class_id(c, f)
-        }
         fn method_exists(&self, c: &str, m: &str, d: &str) -> bool {
             self.inner.method_exists(c, m, d)
-        }
-        fn new_array(
-            &mut self,
-            element_type: cratonvm_types::ArrayElementType,
-            length: usize,
-        ) -> ObjectRef {
-            self.inner.new_array(element_type, length)
-        }
-        fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
-            self.inner.new_ref_array(class_id, length)
-        }
-        fn array_length(&self, obj: ObjectRef) -> usize {
-            self.inner.array_length(obj)
-        }
-        fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
-            self.inner.get_array_element(obj, index)
-        }
-        fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
-            self.inner.set_array_element(obj, index, value)
-        }
-        fn heap_kind_of(&self, obj: ObjectRef) -> cratonvm_types::ObjectKind {
-            self.inner.heap_kind_of(obj)
-        }
-        fn heap_element_type_of(&self, obj: ObjectRef) -> cratonvm_types::ArrayElementType {
-            self.inner.heap_element_type_of(obj)
-        }
-        fn create_string(&mut self, text: &str) -> ObjectRef {
-            self.inner.create_string(text)
-        }
-        fn read_string(&self, obj: ObjectRef) -> Option<String> {
-            self.inner.read_string(obj)
-        }
-        fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
-            self.inner.get_class_mirror(class_id)
-        }
-        fn record_printed_line(&mut self, text: String) {
-            self.inner.record_printed_line(text)
-        }
-        fn get_system_stream(&self, name: &str) -> Option<ObjectRef> {
-            self.inner.get_system_stream(name)
-        }
-        fn get_system_property(&self, key: &str) -> Option<String> {
-            self.inner.get_system_property(key)
-        }
-        fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
-            self.inner.set_system_property(key, value)
-        }
-        fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-            self.inner.alloc_object(class_id, num_fields)
         }
         fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
             self.inner.ensure_class_initialized(name)
@@ -1490,9 +1396,6 @@ mod tests {
         }
         fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
             self.inner.superclass_of(class_id)
-        }
-        fn is_interface_class(&self, class_id: ClassId) -> bool {
-            self.inner.is_interface_class(class_id)
         }
         fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
             self.inner.class_id_by_name(name)
@@ -1511,45 +1414,6 @@ mod tests {
         }
         fn permitted_subclasses(&self, class_id: ClassId) -> Vec<String> {
             self.inner.permitted_subclasses(class_id)
-        }
-        fn object_num_fields(&self, obj: ObjectRef) -> usize {
-            self.inner.object_num_fields(obj)
-        }
-        fn thread_id(&self) -> u64 {
-            self.inner.thread_id()
-        }
-        fn monitor_enter(&mut self, obj: ObjectRef) {
-            self.inner.monitor_enter(obj)
-        }
-        fn monitor_exit(&mut self, obj: ObjectRef) {
-            self.inner.monitor_exit(obj)
-        }
-        fn monitor_wait(&mut self, obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
-            self.inner.monitor_wait(obj, timeout_ms)
-        }
-        fn monitor_notify(&mut self, obj: ObjectRef) -> MethodCallResult {
-            self.inner.monitor_notify(obj)
-        }
-        fn monitor_notify_all(&mut self, obj: ObjectRef) -> MethodCallResult {
-            self.inner.monitor_notify_all(obj)
-        }
-        fn thread_start(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
-            self.inner.thread_start(thread_obj)
-        }
-        fn thread_join(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
-            self.inner.thread_join(thread_obj)
-        }
-        fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool {
-            self.inner.thread_is_alive(thread_obj)
-        }
-        fn current_thread_object(&mut self) -> ObjectRef {
-            self.inner.current_thread_object()
-        }
-        fn thread_interrupt(&mut self, thread_obj: ObjectRef) {
-            self.inner.thread_interrupt(thread_obj)
-        }
-        fn is_interrupted(&self, clear: bool) -> bool {
-            self.inner.is_interrupted(clear)
         }
         fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
             // SAFETY: single-threaded test code.
@@ -1578,42 +1442,8 @@ mod tests {
         fn class_access_flags(&self, class_id: ClassId) -> u16 {
             self.inner.class_access_flags(class_id)
         }
-        fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value {
-            self.inner.get_static_field(class_id, field_index)
-        }
-        fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
-            self.inner.set_static_field(class_id, field_index, value)
-        }
         fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
             self.inner.primitive_class_mirror(name)
-        }
-        fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
-            self.inner.fd_table()
-        }
-        fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
-            self.inner.get_field_volatile(obj, index)
-        }
-        fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
-            self.inner.set_field_volatile(obj, index, value)
-        }
-        fn compare_and_swap_field(
-            &mut self,
-            obj: ObjectRef,
-            index: usize,
-            expected: Value,
-            new_val: Value,
-        ) -> bool {
-            self.inner
-                .compare_and_swap_field(obj, index, expected, new_val)
-        }
-        fn park(&mut self, timeout: Option<std::time::Duration>) {
-            self.inner.park(timeout)
-        }
-        fn unpark(&self, thread_obj: ObjectRef) {
-            self.inner.unpark(thread_obj)
-        }
-        fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
-            self.inner.allocate_instance(class_name)
         }
         fn class_annotations(&self, class_id: ClassId) -> Vec<cratonvm_native_api::AnnotationData> {
             self.inner.class_annotations(class_id)
@@ -1658,46 +1488,6 @@ mod tests {
         ) -> Option<cratonvm_native_api::AnnotationElementValue> {
             self.inner.method_annotation_default(class_id, m, d)
         }
-        fn invoke_virtual(
-            &mut self,
-            receiver: ObjectRef,
-            method_name: &str,
-            descriptor: &str,
-            args: &[Value],
-        ) -> MethodCallResult {
-            self.inner
-                .invoke_virtual(receiver, method_name, descriptor, args)
-        }
-        fn get_scoped_value(&self, key_id: u64) -> Option<Value> {
-            self.inner.get_scoped_value(key_id)
-        }
-        fn push_scoped_value(&mut self, key_id: u64, value: Value) {
-            self.inner.push_scoped_value(key_id, value)
-        }
-        fn pop_scoped_value(&mut self) {
-            self.inner.pop_scoped_value()
-        }
-        fn scoped_value_depth(&self) -> usize {
-            self.inner.scoped_value_depth()
-        }
-        fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
-            self.inner.allocate_native_memory(size, align)
-        }
-        fn free_native_memory(&mut self, alloc_id: i64) {
-            self.inner.free_native_memory(alloc_id)
-        }
-        fn load_native_library(&mut self, path: &str) -> Result<i64, MethodCallFailed> {
-            self.inner.load_native_library(path)
-        }
-        fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize> {
-            self.inner.find_native_symbol(lib_index, name)
-        }
-        fn register_upcall(&mut self, entry: cratonvm_native_api::ffi::UpcallEntry) -> usize {
-            self.inner.register_upcall(entry)
-        }
-        fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
-            self.inner.get_upcall_info(slot)
-        }
         fn module_name_of_class(&self, class_id: ClassId) -> Option<String> {
             self.inner.module_name_of_class(class_id)
         }
@@ -1727,34 +1517,6 @@ mod tests {
         fn allocate_loader_id(&mut self) -> u32 {
             self.inner.allocate_loader_id()
         }
-        fn discover_reference(
-            &mut self,
-            ref_type: u8,
-            reference_obj: ObjectRef,
-            referent: ObjectRef,
-            queue: Option<ObjectRef>,
-        ) {
-            self.inner
-                .discover_reference(ref_type, reference_obj, referent, queue)
-        }
-        fn active_thread_count(&self) -> i32 {
-            self.inner.active_thread_count()
-        }
-        fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef> {
-            self.inner.enumerate_threads(max)
-        }
-        fn heap_allocated_bytes(&self) -> usize {
-            self.inner.heap_allocated_bytes()
-        }
-        fn loaded_class_count(&self) -> usize {
-            self.inner.loaded_class_count()
-        }
-        fn gc_collection_count(&self) -> u64 {
-            self.inner.gc_collection_count()
-        }
-        fn force_gc(&mut self) {
-            self.inner.force_gc()
-        }
         fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
             self.inner.is_package_exported_unqualified(module_name, pkg)
         }
@@ -1777,6 +1539,274 @@ mod tests {
                 .check_deep_reflection_access(accessor_class_id, target_class_id)
         }
     }
+
+    impl cratonvm_native_api::NativeInvokeAccess for UpdaterMock {
+
+        fn invoke(
+            &mut self,
+            class_name: &str,
+            method_name: &str,
+            descriptor: &str,
+            args: &[Value],
+        ) -> MethodCallResult {
+            self.inner.invoke(class_name, method_name, descriptor, args)
+        }
+        fn invoke_virtual(
+            &mut self,
+            receiver: ObjectRef,
+            method_name: &str,
+            descriptor: &str,
+            args: &[Value],
+        ) -> MethodCallResult {
+            self.inner
+                .invoke_virtual(receiver, method_name, descriptor, args)
+        }
+    }
+
+    impl cratonvm_native_api::NativeHeapAccess for UpdaterMock {
+
+        fn new_object(&mut self, class_name: &str) -> MethodCallResult {
+            self.inner.new_object(class_name)
+        }
+        fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+            self.inner.identity_hash_code(obj)
+        }
+        fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+            self.inner.get_field(obj, index)
+        }
+        fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+            self.inner.set_field(obj, index, value)
+        }
+        fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
+            self.inner.get_field_by_name(obj, field_name)
+        }
+        fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
+            self.inner.set_field_by_name(obj, field_name, value)
+        }
+        fn resolve_field_index(&self, c: &str, f: &str) -> Option<usize> {
+            self.inner.resolve_field_index(c, f)
+        }
+        fn resolve_field_index_by_class_id(&self, c: ClassId, f: &str) -> Option<usize> {
+            self.inner.resolve_field_index_by_class_id(c, f)
+        }
+        fn new_array(
+            &mut self,
+            element_type: cratonvm_types::ArrayElementType,
+            length: usize,
+        ) -> ObjectRef {
+            self.inner.new_array(element_type, length)
+        }
+        fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
+            self.inner.new_ref_array(class_id, length)
+        }
+        fn array_length(&self, obj: ObjectRef) -> usize {
+            self.inner.array_length(obj)
+        }
+        fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
+            self.inner.get_array_element(obj, index)
+        }
+        fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
+            self.inner.set_array_element(obj, index, value)
+        }
+        fn heap_kind_of(&self, obj: ObjectRef) -> cratonvm_types::ObjectKind {
+            self.inner.heap_kind_of(obj)
+        }
+        fn heap_element_type_of(&self, obj: ObjectRef) -> cratonvm_types::ArrayElementType {
+            self.inner.heap_element_type_of(obj)
+        }
+        fn create_string(&mut self, text: &str) -> ObjectRef {
+            self.inner.create_string(text)
+        }
+        fn read_string(&self, obj: ObjectRef) -> Option<String> {
+            self.inner.read_string(obj)
+        }
+        fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
+            self.inner.get_class_mirror(class_id)
+        }
+        fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+            self.inner.alloc_object(class_id, num_fields)
+        }
+        fn object_num_fields(&self, obj: ObjectRef) -> usize {
+            self.inner.object_num_fields(obj)
+        }
+        fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+            self.inner.get_field_volatile(obj, index)
+        }
+        fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+            self.inner.set_field_volatile(obj, index, value)
+        }
+        fn compare_and_swap_field(
+            &mut self,
+            obj: ObjectRef,
+            index: usize,
+            expected: Value,
+            new_val: Value,
+        ) -> bool {
+            self.inner
+                .compare_and_swap_field(obj, index, expected, new_val)
+        }
+        fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
+            self.inner.allocate_instance(class_name)
+        }
+        fn discover_reference(
+            &mut self,
+            ref_type: u8,
+            reference_obj: ObjectRef,
+            referent: ObjectRef,
+            queue: Option<ObjectRef>,
+        ) {
+            self.inner
+                .discover_reference(ref_type, reference_obj, referent, queue)
+        }
+        fn heap_allocated_bytes(&self) -> usize {
+            self.inner.heap_allocated_bytes()
+        }
+    }
+
+    impl cratonvm_native_api::NativeThreadAccess for UpdaterMock {
+
+        fn thread_id(&self) -> u64 {
+            self.inner.thread_id()
+        }
+        fn monitor_enter(&mut self, obj: ObjectRef) {
+            self.inner.monitor_enter(obj)
+        }
+        fn monitor_exit(&mut self, obj: ObjectRef) {
+            self.inner.monitor_exit(obj)
+        }
+        fn monitor_wait(&mut self, obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
+            self.inner.monitor_wait(obj, timeout_ms)
+        }
+        fn monitor_notify(&mut self, obj: ObjectRef) -> MethodCallResult {
+            self.inner.monitor_notify(obj)
+        }
+        fn monitor_notify_all(&mut self, obj: ObjectRef) -> MethodCallResult {
+            self.inner.monitor_notify_all(obj)
+        }
+        fn thread_start(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
+            self.inner.thread_start(thread_obj)
+        }
+        fn thread_join(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
+            self.inner.thread_join(thread_obj)
+        }
+        fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool {
+            self.inner.thread_is_alive(thread_obj)
+        }
+        fn current_thread_object(&mut self) -> ObjectRef {
+            self.inner.current_thread_object()
+        }
+        fn thread_interrupt(&mut self, thread_obj: ObjectRef) {
+            self.inner.thread_interrupt(thread_obj)
+        }
+        fn is_interrupted(&self, clear: bool) -> bool {
+            self.inner.is_interrupted(clear)
+        }
+        fn park(&mut self, timeout: Option<std::time::Duration>) {
+            self.inner.park(timeout)
+        }
+        fn unpark(&self, thread_obj: ObjectRef) {
+            self.inner.unpark(thread_obj)
+        }
+        fn get_scoped_value(&self, key_id: u64) -> Option<Value> {
+            self.inner.get_scoped_value(key_id)
+        }
+        fn push_scoped_value(&mut self, key_id: u64, value: Value) {
+            self.inner.push_scoped_value(key_id, value)
+        }
+        fn pop_scoped_value(&mut self) {
+            self.inner.pop_scoped_value()
+        }
+        fn scoped_value_depth(&self) -> usize {
+            self.inner.scoped_value_depth()
+        }
+        fn active_thread_count(&self) -> i32 {
+            self.inner.active_thread_count()
+        }
+        fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef> {
+            self.inner.enumerate_threads(max)
+        }
+    }
+
+    impl cratonvm_native_api::NativeExceptionAccess for UpdaterMock {
+
+        fn capture_stack_trace(
+            &mut self,
+            throwable_hash: i32,
+        ) -> Vec<cratonvm_native_api::StackTraceEntry> {
+            self.inner.capture_stack_trace(throwable_hash)
+        }
+        fn get_stack_trace(
+            &self,
+            throwable_hash: i32,
+        ) -> Option<Vec<cratonvm_native_api::StackTraceEntry>> {
+            self.inner.get_stack_trace(throwable_hash)
+        }
+    }
+
+    impl cratonvm_native_api::NativeGpuAccess for UpdaterMock {
+
+    }
+
+    impl cratonvm_native_api::NativeSystemAccess for UpdaterMock {
+
+        fn record_printed_value(&mut self, value: Value) {
+            self.inner.record_printed_value(value)
+        }
+        fn record_printed_line(&mut self, text: String) {
+            self.inner.record_printed_line(text)
+        }
+        fn get_system_stream(&self, name: &str) -> Option<ObjectRef> {
+            self.inner.get_system_stream(name)
+        }
+        fn get_system_property(&self, key: &str) -> Option<String> {
+            self.inner.get_system_property(key)
+        }
+        fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
+            self.inner.set_system_property(key, value)
+        }
+        fn is_interface_class(&self, class_id: ClassId) -> bool {
+            self.inner.is_interface_class(class_id)
+        }
+        fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value {
+            self.inner.get_static_field(class_id, field_index)
+        }
+        fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value) {
+            self.inner.set_static_field(class_id, field_index, value)
+        }
+        fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
+            self.inner.fd_table()
+        }
+        fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
+            self.inner.allocate_native_memory(size, align)
+        }
+        fn free_native_memory(&mut self, alloc_id: i64) {
+            self.inner.free_native_memory(alloc_id)
+        }
+        fn load_native_library(&mut self, path: &str) -> Result<i64, MethodCallFailed> {
+            self.inner.load_native_library(path)
+        }
+        fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize> {
+            self.inner.find_native_symbol(lib_index, name)
+        }
+        fn register_upcall(&mut self, entry: cratonvm_native_api::ffi::UpcallEntry) -> usize {
+            self.inner.register_upcall(entry)
+        }
+        fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
+            self.inner.get_upcall_info(slot)
+        }
+        fn loaded_class_count(&self) -> usize {
+            self.inner.loaded_class_count()
+        }
+        fn gc_collection_count(&self) -> u64 {
+            self.inner.gc_collection_count()
+        }
+        fn force_gc(&mut self) {
+            self.inner.force_gc()
+        }
+    }
+
+
+
 
     fn make_class_mirror_um(um: &mut UpdaterMock, name: &str) -> (ObjectRef, ClassId) {
         make_class_mirror(&mut um.inner, name)

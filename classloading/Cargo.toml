@@ -21,11 +21,11 @@ cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-reader = { path = "../reader", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
 cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
-cratonvm-jit = { path = "../jit", version = "0.3.0" }
 tracing.workspace = true
 parking_lot.workspace = true
 zip.workspace = true
 rustc-hash.workspace = true
+memmap2 = "0.9"
 # Round 8 audit fix (CRIT): hashbrown provides stable `raw_entry_mut` API used
 # by `LinkResolver::get` to probe the `(ClassId, Arc<str>, Arc<str>)` cache by
 # `(ClassId, &str, &str)` without paying two Arc clones per hit. std's

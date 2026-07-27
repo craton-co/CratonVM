@@ -341,6 +341,22 @@ fn native_sd_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(o) => o,
         None => return Ok(Some(Value::Int(-1))),
     };
+    // AUDIT 2026-07-26 (native-io-audit): drain the read-ahead queue FIRST.
+    // This native used to go straight to `decode_into`, ignoring
+    // `SdState::pending` entirely, so interleaving `read(char[],int,int)`
+    // (which fills `pending`) with `read()` on the same reader skipped every
+    // queued character and returned the ones *after* them — out-of-order
+    // delivery, then loss at `close()`. It is also what makes the surplus
+    // stashed by `decode_into` reachable on the single-char path.
+    {
+        let key = sd_key(ctx, this);
+        let mut table = sd_table().lock().unwrap();
+        if let Some(state) = table.get_mut(&key) {
+            if let Some(ch) = state.pending.pop_front() {
+                return Ok(Some(Value::Int(ch as i32)));
+            }
+        }
+    }
     // GC-safety: `decode_into` allocates and re-enters Java
     // (`InputStream.read`), either of which can run a moving GC, and this
     // loop re-uses `this` and `out` across those windows. Pin both and
@@ -372,6 +388,8 @@ fn native_sd_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
         Ok(Some(Value::Int(-1)))
     })();
+    // Releases `out_pin` too — `unpin_native_roots` truncates the pin stack
+    // to `base`, and `this_pin` was taken first.
     ctx.unpin_native_roots(this_pin);
     result
 }
@@ -495,13 +513,18 @@ fn native_sd_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         None => return Ok(Some(Value::Int(0))),
     };
     let key = sd_key(ctx, this);
-    let has_carry = sd_table()
+    // AUDIT 2026-07-26 (native-io-audit): `pending` holds FULLY DECODED
+    // read-ahead chars — those are unconditionally ready. Only `carry` (an
+    // incomplete byte sequence) was checked here, so a reader whose surplus
+    // sat in `pending` while the underlying stream had `available() == 0`
+    // reported `ready() == false` with a character immediately deliverable.
+    let has_buffered = sd_table()
         .lock()
         .unwrap()
         .get(&key)
-        .map(|s| !s.carry.is_empty())
+        .map(|s| !s.carry.is_empty() || !s.pending.is_empty())
         .unwrap_or(false);
-    if has_carry {
+    if has_buffered {
         return Ok(Some(Value::Int(1)));
     }
     if let Value::Object(Some(is)) = ctx.get_field_by_name(this, "in") {
@@ -677,6 +700,11 @@ fn decode_into(
     }
 
     if bytes.is_empty() {
+        // NOTE: `unpin_native_roots` TRUNCATES the thread's pin stack to
+        // `base`, so releasing `this_pin` (taken first) also releases
+        // `out_pin` and any nested pin. No separate `out_pin` release is
+        // needed on any exit path here — verified against
+        // `vm/src/vm/vm_exec.rs::unpin_native_roots`.
         ctx.unpin_native_roots(this_pin);
         return Ok(-1);
     }
@@ -725,6 +753,30 @@ fn decode_into(
             prop: None,
         });
         entry.carry = rest;
+        // AUDIT 2026-07-26 (native-io-audit): chars beyond `ncopy` used to be
+        // DROPPED here — not written to `out`, not carried in `rest` (which
+        // only holds *undecoded* bytes). The doc comment above claims the
+        // total byte count is kept <= `len` so this cannot happen, but the
+        // `want = 4` progress-forcing branch (~line 579) deliberately breaks
+        // that invariant whenever the carry alone already fills `len`. That
+        // is the normal state of `StreamDecoder.read()` (len == 1) the moment
+        // it meets a multi-byte character:
+        //
+        //   UTF-8 "eabcd" with a leading 2-byte 'e-acute' (C3 A9 61 62 63 64)
+        //     call 1: len=1, want=1 -> reads C3, incomplete, carry=[C3], ret 0
+        //     call 2: carry fills len -> want=4 -> reads A9 61 62 63
+        //             chars = ['e-acute','a','b','c'], ncopy = 1
+        //             -> 'a','b','c' vanished, and `rest` is empty so the
+        //                carry could not hold them either
+        //   Reader.read() therefore yields "e-acute" then 'd': three
+        //   characters lost silently, no exception, no short-read signal.
+        //
+        // `SdState::pending` already exists for exactly this purpose (see
+        // `native_sd_read_chars`), so stash the surplus there. Both readers
+        // drain it before pulling fresh bytes, which keeps stream order.
+        if chars.len() > ncopy {
+            entry.pending.extend(chars[ncopy..].iter().copied());
+        }
         if new_prop.is_some() {
             entry.prop = new_prop;
         }
@@ -908,6 +960,8 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -1054,6 +1108,146 @@ mod tests {
         assert_eq!(chars.len(), 3, "ISO decodes each byte separately");
         assert!(rest.is_empty());
         assert!(p2.unwrap().fell_back);
+    }
+
+    // --- AUDIT 2026-07-26 (native-io-audit) regressions ---
+    //
+    // These drive the real natives through `MockNativeContext`, whose
+    // `read([BII)I` is scripted to behave like a genuine `InputStream`
+    // (`script_input_stream`). `sd_table` is a process-global keyed by
+    // identity hash, and the mock hands out low, reusable pointers, so these
+    // tests serialize on `confine_test_lock` and clear their own key first.
+
+    use crate::test_support::{confine_test_lock, MockNativeContext};
+
+    /// Build a StreamDecoder-shaped mock object over `bytes`, with a fresh
+    /// `sd_table` entry for `charset`.
+    fn decoder_over(
+        ctx: &mut MockNativeContext,
+        bytes: &[u8],
+        charset: &str,
+    ) -> ObjectRef {
+        let is = ctx.alloc_object(1);
+        let this = ctx.alloc_object(4);
+        ctx.set_field_by_name(this, "in", Value::Object(Some(is)));
+        ctx.script_input_stream(bytes);
+        let key = sd_key(ctx, this);
+        let mut t = sd_table().lock().unwrap();
+        t.remove(&key);
+        t.insert(
+            key,
+            SdState {
+                name: charset.to_string(),
+                carry: Vec::new(),
+                pending: VecDeque::new(),
+                prop: None,
+            },
+        );
+        drop(t);
+        this
+    }
+
+    fn drain_reader(ctx: &mut MockNativeContext, this: ObjectRef) -> String {
+        let mut out = String::new();
+        for _ in 0..64 {
+            match native_sd_read(ctx, &[Value::Object(Some(this))]) {
+                Ok(Some(Value::Int(-1))) => break,
+                Ok(Some(Value::Int(c))) => {
+                    out.push(char::from_u32(c as u32).unwrap_or('\u{fffd}'))
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// The headline defect: `decode_into` truncated its decoded chars to
+    /// `len` and dropped the surplus, so single-char `Reader.read()` over a
+    /// stream containing a multi-byte character silently lost every character
+    /// decoded alongside it. "éabcd" used to read back as "éd".
+    #[test]
+    fn audit_read_single_char_does_not_drop_surplus_after_multibyte() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        // C3 A9 = 'é', then plain ASCII.
+        let this = decoder_over(&mut ctx, "éabcd".as_bytes(), "UTF-8");
+        let got = drain_reader(&mut ctx, this);
+        assert_eq!(
+            got, "éabcd",
+            "every character must survive; the surplus decoded alongside \
+             the multi-byte char used to be discarded"
+        );
+        sd_table().lock().unwrap().remove(&sd_key(&ctx, this));
+    }
+
+    /// Two multi-byte characters back to back — exercises the carry AND the
+    /// surplus path together.
+    #[test]
+    fn audit_read_single_char_handles_consecutive_multibyte() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        let this = decoder_over(&mut ctx, "中文ok".as_bytes(), "UTF-8");
+        let got = drain_reader(&mut ctx, this);
+        assert_eq!(got, "中文ok");
+        sd_table().lock().unwrap().remove(&sd_key(&ctx, this));
+    }
+
+    /// `read()` must consume the read-ahead queue that `read(char[],int,int)`
+    /// fills, rather than pulling fresh bytes past it.
+    #[test]
+    fn audit_read_single_char_drains_pending_before_refilling() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        let this = decoder_over(&mut ctx, b"abcdef", "UTF-8");
+        // Ask for 2 chars; the bulk path reads ahead and parks the rest.
+        let out = ctx.new_array(ArrayElementType::Char, 2);
+        let n = native_sd_read_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(out)),
+                Value::Int(0),
+                Value::Int(2),
+            ],
+        );
+        assert!(matches!(n, Ok(Some(Value::Int(2)))));
+        let queued = sd_table()
+            .lock()
+            .unwrap()
+            .get(&sd_key(&ctx, this))
+            .map(|s| s.pending.len())
+            .unwrap_or(0);
+        assert!(queued > 0, "bulk read should have parked read-ahead chars");
+        // The single-char reader must continue from 'c', not skip the queue.
+        let rest = drain_reader(&mut ctx, this);
+        assert_eq!(rest, "cdef");
+        sd_table().lock().unwrap().remove(&sd_key(&ctx, this));
+    }
+
+    /// `ready()` must report true while fully decoded chars sit in `pending`,
+    /// even though `carry` is empty and the stream has nothing left.
+    #[test]
+    fn audit_ready_accounts_for_decoded_read_ahead() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        let this = decoder_over(&mut ctx, b"abcdef", "UTF-8");
+        let out = ctx.new_array(ArrayElementType::Char, 1);
+        let _ = native_sd_read_chars(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(out)),
+                Value::Int(0),
+                Value::Int(1),
+            ],
+        );
+        // Stream is drained; only `pending` holds the remaining chars.
+        let r = native_sd_ready(&mut ctx, &[Value::Object(Some(this))]);
+        assert!(
+            matches!(r, Ok(Some(Value::Int(1)))),
+            "ready() must be true with decoded chars buffered"
+        );
+        sd_table().lock().unwrap().remove(&sd_key(&ctx, this));
     }
 
     #[test]

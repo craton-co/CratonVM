@@ -111,7 +111,10 @@ fn helpers() -> JitRuntimeHelpers {
         panic!("ARRAYCOPY intrinsic test invoked an unwired runtime helper");
     }
     let s = stub as *const () as usize;
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+        jit_card_table_addr: 0,
+        jit_card_old_base: 0,
+        jit_card_old_end: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,
@@ -447,6 +450,7 @@ fn arraycopy_despec_uses_dispatch_not_intrinsic_sentinel() {
         num_jit_args: 5,
         return_type: b'V',
         invoke_kind: 3,
+        declaring_class_id: 0,
     };
     let helpers = helpers_with_dispatch(recording_invoke_dispatch as *const () as usize);
     let compiled = compile_despec_arraycopy_with_dispatch(method_key, &info, &helpers);

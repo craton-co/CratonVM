@@ -34,6 +34,7 @@
 //!
 //! All public surface is registered via `register_async_socket_real`.
 
+use crate::io_flags;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -54,7 +55,15 @@ use std::time::Duration;
 /// out for the duration of an op without holding the registry lock.
 pub enum AioHandle {
     Stream(Arc<Mutex<TcpStream>>),
-    Listener(Arc<Mutex<TcpListener>>),
+    // The `SocketAddr` is captured once at bind time (before the accept
+    // loop starts) so `getLocalAddress()` never has to contend for the
+    // same `Mutex` the accept worker holds for the full duration of its
+    // blocking `TcpListener::accept()` call — locking it from
+    // `aio_assc_local_address` deadlocked-in-practice (an indefinite wait
+    // whenever it landed between two accepted connections), turning
+    // Tomcat's post-bind `getLocalPort()` call into a startup hang. See
+    // the `aio_assc_local_address` doc comment.
+    Listener(Arc<Mutex<TcpListener>>, SocketAddr),
     Pending,
     Closed,
 }
@@ -161,8 +170,7 @@ fn aio_shutdown_fd_table_stream(ctx: &mut dyn NativeContext, fd: u32) {
 /// as interleaved trace lines with a shared fd tag. Follows the precedent
 /// of `CRATONVM_DBG_SC_READ` / `CRATONVM_DBG_SC_CLOSE` in `socket_channel.rs`.
 fn dbg_aio_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIO").is_some())
+    io_flags().dbg_aio
 }
 macro_rules! dbg_aio {
     ($($arg:tt)*) => {
@@ -186,6 +194,17 @@ pub enum CompletionKind {
     Void,
     /// Read / write — handler gets `Integer.valueOf(n)`.
     IntCount(i32),
+    /// Handler-form write completion: handler gets `Integer.valueOf(n)` AND
+    /// the source `ByteBuffer` held at `buffer_gref` has its `position`
+    /// advanced by `n` first, per `AsynchronousByteChannel.write`'s contract.
+    /// The dispatcher releases the global root after delivery.
+    ///
+    /// AUDIT 2026-07-26 (native-io-audit): the handler form used to report a
+    /// bare `IntCount`, so the source buffer was never advanced — the exact
+    /// defect already fixed for the sibling Future form at `FutureOutcome::
+    /// Count` (see the 2026-07-17 comment there). `Job::Write` even carried
+    /// the buffer as `bb_obj` and then destructured it away with `bb_obj: _`.
+    WriteCount { n: i32, buffer_gref: usize },
     /// Accept — `new_id` is an `AioHandle::Stream` slot in `aio_registry`,
     /// which the dispatch path wraps into a fresh
     /// `AsynchronousSocketChannel` synthetic Java object.
@@ -222,6 +241,9 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
     // dispatch the matching completion — handlers must observe the
     // post-failure state, not the pre-failure optimistic state.
     flush_pending_field_resets(ctx);
+    // Release (and, for handler-less writes, apply) any buffer roots parked
+    // by `Job::Write` workers.
+    flush_pending_root_releases(ctx);
     for _ in 0..DRAIN_LIMIT {
         let next = completion_queue().lock().pop_front();
         let Some(c) = next else { break };
@@ -231,6 +253,37 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
                     CompletionKind::Void => Value::Object(None),
                     CompletionKind::IntCount(n) => {
                         // Wrap into Integer for completed(Object, Object).
+                        match ctx.new_object("java/lang/Integer") {
+                            Ok(Some(Value::Object(Some(boxed)))) => {
+                                ctx.set_field_by_name(boxed, "value", Value::Int(n));
+                                Value::Object(Some(boxed))
+                            }
+                            _ => Value::Int(n),
+                        }
+                    }
+                    CompletionKind::WriteCount { n, buffer_gref } => {
+                        // Advance the source buffer BEFORE invoking the
+                        // handler: a conforming `completed()` re-arms with
+                        // `buf.hasRemaining()`, so it must observe the
+                        // consumed position. Without this the caller resends
+                        // the identical slice forever (Tomcat's
+                        // `WsRemoteEndpointImplBase` write loop).
+                        if buffer_gref != 0 {
+                            if n > 0 {
+                                if let Some(bb) = ctx.resolve_global_root(buffer_gref) {
+                                    let position = match ctx.get_field_by_name(bb, "position") {
+                                        Value::Int(v) if v >= 0 => v,
+                                        _ => 0,
+                                    };
+                                    ctx.set_field_by_name(
+                                        bb,
+                                        "position",
+                                        Value::Int(position.saturating_add(n)),
+                                    );
+                                }
+                            }
+                            ctx.remove_global_root(buffer_gref);
+                        }
                         match ctx.new_object("java/lang/Integer") {
                             Ok(Some(Value::Object(Some(boxed)))) => {
                                 ctx.set_field_by_name(boxed, "value", Value::Int(n));
@@ -252,12 +305,18 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
                     }
                 };
                 let attach = Value::Object(c.attachment);
-                let _ = ctx.invoke(
+                let inv = ctx.invoke(
                     "java/nio/channels/CompletionHandler",
                     "completed",
                     "(Ljava/lang/Object;Ljava/lang/Object;)V",
                     &[Value::Object(Some(c.handler)), result_val, attach],
                 );
+                // A `CompletionHandler.completed` that throws used to be
+                // discarded silently (`let _ = ctx.invoke(..)`), which hid
+                // real failures in the accept path for a long time.
+                if let Err(ref e) = inv {
+                    dbg_aio!("DELIVER completed threw {:?}", e);
+                }
             }
             Err(msg) => {
                 let throw = match ctx.new_object("java/io/IOException") {
@@ -367,6 +426,21 @@ fn push_read_completion(c: ReadCompletion) {
     cv.notify_one();
 }
 
+/// Park a handler-form completion (accept / connect / write / immediate
+/// error) and wake the VM-attached dispatcher.
+///
+/// FIX (sslWithHttp11Nio2Protocol): these used to be pushed straight onto
+/// `completion_queue()` with no wake-up at all. That queue is drained by
+/// `drain_completions`, which only runs when some other AIO native is called
+/// on a VM thread — so a caller that arms one `accept()` and then simply waits
+/// (Tomcat's `Nio2Endpoint`, and any idiomatic NIO2 server) never had its
+/// `CompletionHandler` invoked.
+fn push_handler_completion(c: Completion) {
+    completion_queue().lock().push_back(c);
+    // Same condvar the dispatcher parks on for read/future completions.
+    read_completion_state().1.notify_one();
+}
+
 /// Park a Future-form completion and wake the VM-attached dispatcher.
 fn push_future_completion(c: FutureCompletion) {
     dbg_aio!(
@@ -382,13 +456,23 @@ fn push_future_completion(c: FutureCompletion) {
 /// `true` if one is available. Called by the AIO dispatcher thread while it is
 /// in the GC-blocked idle region (no `NativeContext` needed).
 pub fn wait_for_pending(timeout: std::time::Duration) -> bool {
+    // `completion_queue()` (accept/connect/write handler completions) is
+    // checked alongside the read/future queue — see `push_handler_completion`.
+    // Checked before taking `q`'s lock so the two are never held nested.
+    if !completion_queue().lock().is_empty() {
+        return true;
+    }
     let (q, cv) = read_completion_state();
     let mut guard = q.lock();
     if !guard.is_empty() {
         return true;
     }
     cv.wait_for(&mut guard, timeout);
-    !guard.is_empty()
+    if !guard.is_empty() {
+        return true;
+    }
+    drop(guard);
+    !completion_queue().lock().is_empty()
 }
 
 /// Maximum read completions delivered per dispatcher wake-up.
@@ -398,6 +482,9 @@ const READ_DRAIN_LIMIT: usize = 256;
 /// `CompletionHandler.completed` / `failed` on the calling (dispatcher) thread.
 /// Requires a live `NativeContext`, so it must run on a VM/attached thread.
 pub fn drain_completions_pub(ctx: &mut dyn NativeContext) {
+    // Handler-form accept/connect/write completions live in a separate queue
+    // that used to have no dispatcher at all — see `push_handler_completion`.
+    drain_completions(ctx);
     for _ in 0..READ_DRAIN_LIMIT {
         let next = read_completion_state().0.lock().pop_front();
         let Some(c) = next else { break };
@@ -756,7 +843,12 @@ enum Job {
     Write {
         id: i32,
         data: Vec<u8>,
-        bb_obj: ObjectRef,
+        /// Global-root handle for the source `ByteBuffer`, so the dispatcher
+        /// can advance its `position` by the bytes actually written (see
+        /// `CompletionKind::WriteCount`). This used to be a raw `ObjectRef`
+        /// (`bb_obj`) held across a worker-thread blocking write — both
+        /// unrooted against a moving GC and, worse, simply discarded.
+        bb_gref: usize,
         handler: Option<ObjectRef>,
         attachment: Option<ObjectRef>,
     },
@@ -872,7 +964,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                         .write()
                         .insert(id, AioHandle::Stream(Arc::new(Mutex::new(stream))));
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Ok(CompletionKind::Void),
@@ -903,7 +995,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                         });
                     }
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Err(format!("connect failed: {e}")),
@@ -929,7 +1021,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                     Some(AioHandle::Stream(s)) => Arc::clone(s),
                     _ => {
                         if let Some(h) = handler {
-                            completion_queue().lock().push_back(Completion {
+                            push_handler_completion(Completion {
                                 handler: h,
                                 attachment,
                                 outcome: Err("read: channel closed".to_string()),
@@ -951,7 +1043,7 @@ fn handle_job(job: Job) -> Result<(), String> {
             match read_res {
                 Ok(0) => {
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Ok(CompletionKind::IntCount(-1)),
@@ -988,7 +1080,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                         });
                     }
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Ok(CompletionKind::IntCount(n as i32)),
@@ -997,7 +1089,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                 }
                 Err(e) => {
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Err(format!("read failed: {e}")),
@@ -1009,7 +1101,7 @@ fn handle_job(job: Job) -> Result<(), String> {
         Job::Write {
             id,
             data,
-            bb_obj: _,
+            bb_gref,
             handler,
             attachment,
         } => {
@@ -1018,8 +1110,9 @@ fn handle_job(job: Job) -> Result<(), String> {
                 match map.get(&id) {
                     Some(AioHandle::Stream(s)) => Arc::clone(s),
                     _ => {
+                        queue_root_release(bb_gref);
                         if let Some(h) = handler {
-                            completion_queue().lock().push_back(Completion {
+                            push_handler_completion(Completion {
                                 handler: h,
                                 attachment,
                                 outcome: Err("write: channel closed".to_string()),
@@ -1057,16 +1150,31 @@ fn handle_job(job: Job) -> Result<(), String> {
             match res {
                 Ok(n) => {
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        // `WriteCount` carries the buffer root so the
+                        // dispatcher advances `position` by `n` before
+                        // invoking `completed()`; it also releases the root.
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
-                            outcome: Ok(CompletionKind::IntCount(n as i32)),
+                            outcome: Ok(CompletionKind::WriteCount {
+                                n: n as i32,
+                                buffer_gref: bb_gref,
+                            }),
                         });
+                    } else {
+                        // No handler to deliver to — still advance the
+                        // buffer (a write DID happen) and drop the root.
+                        queue_write_advance(bb_gref, n as i32);
                     }
                 }
                 Err(e) => {
+                    // A partial write before the error still consumed
+                    // `written` bytes from the socket's point of view, but the
+                    // JDK reports the operation as failed and leaves the
+                    // buffer position unspecified; just release the root.
+                    queue_root_release(bb_gref);
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Err(format!("write failed: {e}")),
@@ -1083,10 +1191,10 @@ fn handle_job(job: Job) -> Result<(), String> {
             let listener = {
                 let map = aio_registry().read();
                 match map.get(&id) {
-                    Some(AioHandle::Listener(l)) => Arc::clone(l),
+                    Some(AioHandle::Listener(l, _)) => Arc::clone(l),
                     _ => {
                         if let Some(h) = handler {
-                            completion_queue().lock().push_back(Completion {
+                            push_handler_completion(Completion {
                                 handler: h,
                                 attachment,
                                 outcome: Err("accept: channel closed".to_string()),
@@ -1104,7 +1212,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                 Ok((stream, _peer)) => {
                     let new_id = aio_register(AioHandle::Stream(Arc::new(Mutex::new(stream))));
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Ok(CompletionKind::AcceptedChannel(new_id)),
@@ -1113,7 +1221,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                 }
                 Err(e) => {
                     if let Some(h) = handler {
-                        completion_queue().lock().push_back(Completion {
+                        push_handler_completion(Completion {
                             handler: h,
                             attachment,
                             outcome: Err(format!("accept failed: {e}")),
@@ -1407,6 +1515,60 @@ fn flush_pending_field_resets(ctx: &mut dyn NativeContext) {
         if ctx.object_num_fields(r.target) > r.field {
             ctx.set_field(r.target, r.field, r.value);
         }
+    }
+}
+
+/// A source-`ByteBuffer` global root parked by a worker for the next
+/// user-thread drain. `advance > 0` means "bump `position` by this many bytes
+/// first"; `0` means "just drop the root".
+///
+/// AUDIT 2026-07-26 (native-io-audit): needed because `Job::Write` now holds
+/// its source buffer as a global root (it previously held a bare, unrooted
+/// `ObjectRef` that it discarded). Workers have no `&mut NativeContext`, so
+/// the release has to be parked — same shape as `PendingFieldReset` above.
+/// Every `Job::Write` exit path must reach exactly one of `WriteCount`,
+/// `queue_write_advance`, or `queue_root_release`, or the root leaks.
+struct PendingRootRelease {
+    gref: usize,
+    advance: i32,
+}
+
+fn pending_root_releases() -> &'static Mutex<Vec<PendingRootRelease>> {
+    static V: OnceLock<Mutex<Vec<PendingRootRelease>>> = OnceLock::new();
+    V.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Park a global root for release on the next user-thread drain.
+fn queue_root_release(gref: usize) {
+    if gref != 0 {
+        pending_root_releases()
+            .lock()
+            .push(PendingRootRelease { gref, advance: 0 });
+    }
+}
+
+/// Park a buffer-position advance + root release (handler-less write).
+fn queue_write_advance(gref: usize, advance: i32) {
+    if gref != 0 {
+        pending_root_releases()
+            .lock()
+            .push(PendingRootRelease { gref, advance });
+    }
+}
+
+fn flush_pending_root_releases(ctx: &mut dyn NativeContext) {
+    let parked = std::mem::take(&mut *pending_root_releases().lock());
+    for r in parked {
+        if r.advance > 0 {
+            if let Some(bb) = ctx.resolve_global_root(r.gref) {
+                let position = match ctx.get_field_by_name(bb, "position") {
+                    Value::Int(v) if v >= 0 => v,
+                    _ => 0,
+                };
+                ctx.set_field_by_name(bb, "position", Value::Int(position.saturating_add(r.advance)));
+            }
+        }
+        ctx.remove_global_root(r.gref);
     }
 }
 
@@ -1787,6 +1949,82 @@ fn aio_future_roots(
     Ok((future, future_gref, buffer_gref))
 }
 
+/// Decode the `(long timeout, TimeUnit unit)` pair of the timed
+/// `read`/`write` overloads into a `Duration`.
+///
+/// `None` (block indefinitely) for a non-positive timeout, for `Long.MAX_VALUE`
+/// and other absurd values, and whenever the `TimeUnit` cannot be consulted —
+/// matching the untimed overloads' behaviour, which is the safe default.
+fn aio_timeout_from_args(
+    ctx: &mut dyn NativeContext,
+    timeout: Option<&Value>,
+    unit: Option<&Value>,
+) -> Option<Duration> {
+    let raw = match timeout {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => return None,
+    };
+    if raw <= 0 {
+        return None;
+    }
+    let millis = match unit {
+        Some(Value::Object(Some(u))) => {
+            match ctx.invoke_virtual(*u, "toMillis", "(J)J", &[Value::Long(raw)]) {
+                Ok(Some(Value::Long(ms))) => ms,
+                Ok(Some(Value::Int(ms))) => ms as i64,
+                // Unknown unit: treat the value as milliseconds, which is what
+                // every caller in practice passes.
+                _ => raw,
+            }
+        }
+        _ => raw,
+    };
+    // Guard against `Long.MAX_VALUE`-style "no timeout" sentinels overflowing
+    // `Duration` or setting a socket option the OS rejects.
+    if millis <= 0 || millis > 24 * 60 * 60 * 1000 {
+        return None;
+    }
+    Some(Duration::from_millis(millis as u64))
+}
+
+/// An independent `try_clone()` handle on whichever socket backs an
+/// `AsynchronousSocketChannel`'s slot-2 value: an fd_table fd (channel from the
+/// Future-form `connect`) below `AIO_REG_BASE`, or an `aio_registry` id at or
+/// above it (channel handed to `AsynchronousServerSocketChannel.accept`'s
+/// `CompletionHandler`).
+///
+/// The read/write natives all used to accept only the fd_table form, so every
+/// operation on an ACCEPTED channel failed instantly with "not connected" and
+/// no NIO2 *server* could serve a byte — Tomcat's `Http11Nio2Protocol` drives
+/// its `SecureNio2Channel` TLS handshake through these calls
+/// (`TomcatServletWebServerFactoryTests.sslWithHttp11Nio2Protocol`).
+///
+/// A clone (rather than the shared handle) keeps a blocking read from
+/// contending with concurrent writes on the same connection.
+fn aio_clone_backing_stream(
+    ctx: &dyn NativeContext,
+    slot2: i32,
+) -> Result<TcpStream, std::io::Error> {
+    if (slot2 as i64) < AIO_REG_BASE {
+        return ctx.fd_table().try_clone_tcp(slot2 as u32);
+    }
+    let handle = match aio_registry().read().get(&slot2) {
+        Some(AioHandle::Stream(s)) => Some(Arc::clone(s)),
+        _ => None,
+    };
+    match handle {
+        Some(s) => {
+            let guard = s.lock();
+            guard.try_clone()
+        }
+        None => Err(std::io::Error::new(
+            ErrorKind::NotConnected,
+            "channel closed",
+        )),
+    }
+}
+
 /// Future-form `AsynchronousSocketChannel.read(ByteBuffer)`. Unlike the old
 /// Phase-67 registration, this returns before the blocking recv runs, and its
 /// `Future.get(timeout, unit)` therefore owns the timeout contract.
@@ -1804,7 +2042,7 @@ fn aio_asc_read_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Ok(Some(Value::Object(Some(future))))
     };
     let fd = match ctx.get_field(this, F_REG_ID) {
-        Value::Int(v) if v >= 0 && (v as i64) < AIO_REG_BASE => v as u32,
+        Value::Int(v) if v >= 0 => v,
         _ => return post(FutureOutcome::Error("read: not connected".to_string())),
     };
     let (_, _, _, length) = decode_buffer(ctx, bb);
@@ -1812,7 +2050,7 @@ fn aio_asc_read_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if length <= 0 {
         return post(FutureOutcome::Count(0));
     }
-    let stream = match ctx.fd_table().try_clone_tcp(fd) {
+    let stream = match aio_clone_backing_stream(ctx, fd) {
         Ok(stream) => stream,
         Err(error) => return post(FutureOutcome::Error(format!("read: {error}"))),
     };
@@ -1851,7 +2089,7 @@ fn aio_asc_write_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Ok(Some(Value::Object(Some(future))))
     };
     let fd = match ctx.get_field(this, F_REG_ID) {
-        Value::Int(v) if v >= 0 && (v as i64) < AIO_REG_BASE => v as u32,
+        Value::Int(v) if v >= 0 => v,
         _ => return post(FutureOutcome::Error("write: not connected".to_string())),
     };
     let data = read_buffer_bytes(ctx, bb);
@@ -1866,7 +2104,7 @@ fn aio_asc_write_future(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if data.is_empty() {
         return post(FutureOutcome::Count(0));
     }
-    let stream = match ctx.fd_table().try_clone_tcp(fd) {
+    let stream = match aio_clone_backing_stream(ctx, fd) {
         Ok(stream) => stream,
         Err(error) => return post(FutureOutcome::Error(format!("write: {error}"))),
     };
@@ -1905,8 +2143,22 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         Some(o) => o,
         None => return Err(ioex("read: null ByteBuffer")),
     };
-    let attachment = obj_or_none(args, 2);
-    let handler = match obj_or_none(args, 3) {
+    // Two shapes share this native: the untimed
+    // `read(ByteBuffer, A, CompletionHandler)` and the timed
+    // `read(ByteBuffer, long, TimeUnit, A, CompletionHandler)` — Tomcat's
+    // `SecureNio2Channel` uses only the timed one.
+    let timed = args.len() >= 6;
+    let (attachment, handler_arg) = if timed {
+        (obj_or_none(args, 4), obj_or_none(args, 5))
+    } else {
+        (obj_or_none(args, 2), obj_or_none(args, 3))
+    };
+    let read_timeout = if timed {
+        aio_timeout_from_args(ctx, args.get(2), args.get(3))
+    } else {
+        None
+    };
+    let handler = match handler_arg {
         Some(h) => h,
         // No CompletionHandler ⇒ nothing to deliver (the Future-form read is a
         // separate native registered elsewhere).
@@ -1934,9 +2186,15 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     };
 
     // The channel was connected via the Future-form `connect`, which stores the
-    // fd_table fd in slot 2.
-    let fd = match ctx.get_field(this, 2) {
-        Value::Int(v) if v >= 0 && (v as i64) < AIO_REG_BASE => v as u32,
+    // Slot 2 is either an fd_table fd (channel produced by the Future-form
+    // `connect` — the client path this native was originally written for) or,
+    // for a channel handed to `AsynchronousServerSocketChannel.accept`'s
+    // `CompletionHandler`, an `aio_registry` id >= `AIO_REG_BASE`. Only the
+    // former used to be accepted, so EVERY server-side read failed with
+    // "read: not connected" and no NIO2 server could serve a byte
+    // (`TomcatServletWebServerFactoryTests.sslWithHttp11Nio2Protocol`).
+    let slot2 = match ctx.get_field(this, 2) {
+        Value::Int(v) if v >= 0 => v,
         _ => {
             post_immediate(ctx, ReadOutcome::Error("read: not connected".to_string()));
             return Ok(Some(Value::Object(None)));
@@ -1949,15 +2207,19 @@ fn aio_asc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
         return Ok(Some(Value::Object(None)));
     }
 
-    // Independent read handle so the blocking read does not contend with the
-    // application's Future-form writes on the same fd.
-    let stream = match ctx.fd_table().try_clone_tcp(fd) {
+    // Independent read handle either way, so the blocking read does not
+    // contend with the application's concurrent writes on the same socket.
+    let stream = match aio_clone_backing_stream(ctx, slot2) {
         Ok(s) => s,
         Err(e) => {
             post_immediate(ctx, ReadOutcome::Error(format!("read: {e}")));
             return Ok(Some(Value::Object(None)));
         }
     };
+    // Honour the timed overload's deadline on the worker's private handle.
+    if let Some(d) = read_timeout {
+        let _ = stream.set_read_timeout(Some(d));
+    }
 
     let handler_gref = ctx.add_global_root(handler);
     let attachment_gref = attachment.map(|a| ctx.add_global_root(a)).unwrap_or(0);
@@ -1994,13 +2256,19 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(o) => o,
         None => return Err(ioex("write: null ByteBuffer")),
     };
-    let attachment = obj_or_none(args, 2);
-    let handler = obj_or_none(args, 3);
+    // Untimed `write(ByteBuffer, A, CompletionHandler)` and timed
+    // `write(ByteBuffer, long, TimeUnit, A, CompletionHandler)` share this
+    // native — see the matching comment in `aio_asc_read`.
+    let (attachment, handler) = if args.len() >= 6 {
+        (obj_or_none(args, 4), obj_or_none(args, 5))
+    } else {
+        (obj_or_none(args, 2), obj_or_none(args, 3))
+    };
     let id = read_aio_id(ctx, this).ok_or_else(|| ioex("write: not connected"))?;
     let data = read_buffer_bytes(ctx, bb);
     if data.is_empty() {
         if let Some(h) = handler {
-            completion_queue().lock().push_back(Completion {
+            push_handler_completion(Completion {
                 handler: h,
                 attachment,
                 outcome: Ok(CompletionKind::IntCount(0)),
@@ -2008,13 +2276,19 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         return Ok(Some(Value::Object(None)));
     }
+    // Root the source buffer for the duration of the worker write: the
+    // dispatcher must advance its `position` by the bytes actually written
+    // (`AsynchronousByteChannel.write` contract), and a moving collection can
+    // run while the worker is parked in `write(2)`.
+    let bb_gref = ctx.add_global_root(bb);
     if let Err(e) = job_sender().send(Job::Write {
         id,
         data,
-        bb_obj: bb,
+        bb_gref,
         handler,
         attachment,
     }) {
+        ctx.remove_global_root(bb_gref);
         eprintln!(
             "native-io: aio_asc_write: job channel closed; \
              CompletionHandler will not fire (id={id}, err={e})"
@@ -2042,6 +2316,98 @@ fn aio_assc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(ch))))
 }
 
+/// `NetworkChannel.setOption` on an async channel. Real JDK dispatch would
+/// land on the abstract declaration (no Code attribute) and throw
+/// `AbstractMethodError` — see this module's `aio_set_option` doc and
+/// `socket_channel.rs::supported_socket_options` for the same fix on the
+/// blocking channels. TCP_NODELAY is honoured on the backing socket; the
+/// others are accepted no-ops.
+fn aio_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let opt_name = match obj_or_none(args, 1) {
+        Some(o) => ctx
+            .invoke_virtual(o, "name", "()Ljava/lang/String;", &[])
+            .ok()
+            .flatten()
+            .and_then(|v| match v {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    if opt_name == "TCP_NODELAY" {
+        let on = match args.get(2) {
+            Some(Value::Object(Some(b))) => {
+                !matches!(ctx.get_field_by_name(*b, "value"), Value::Int(0))
+            }
+            Some(Value::Int(v)) => *v != 0,
+            _ => true,
+        };
+        if let Some(id) = read_aio_id(ctx, this) {
+            if (id as i64) < AIO_REG_BASE {
+                let _ = ctx.fd_table().tcp_set_nodelay(id as u32, on);
+            } else if let Some(AioHandle::Stream(s)) = aio_registry().read().get(&id) {
+                let _ = s.lock().set_nodelay(on);
+            }
+        }
+    }
+    // Covariant return: the caller's checkcast expects the channel back.
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `NetworkChannel.getOption` — same abstract-method problem as
+/// `aio_set_option`. Only TCP_NODELAY has a real answer; everything else
+/// reports `null`, which callers treat as "not configured".
+fn aio_get_option(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let _ = ctx;
+    Ok(Some(Value::Object(None)))
+}
+
+fn aio_supported_options(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    crate::socket_channel::supported_socket_options_pub(ctx)
+}
+
+/// `AsynchronousSocketChannel.getRemoteAddress()` — Tomcat's
+/// `SocketWrapperBase.populateRemoteAddr` calls it on every accepted channel.
+fn aio_asc_remote_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let id = match read_aio_id(ctx, this) {
+        Some(id) => id,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let peer = if (id as i64) < AIO_REG_BASE {
+        ctx.fd_table().tcp_peer_addr(id as u32).ok()
+    } else {
+        match aio_registry().read().get(&id) {
+            Some(AioHandle::Stream(s)) => s.lock().peer_addr().ok().map(|a| a.to_string()),
+            _ => None,
+        }
+    };
+    let Some(peer) = peer else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (host, port) = match peer.rsplit_once(':') {
+        Some((h, p)) => (
+            h.trim_start_matches('[').trim_end_matches(']').to_string(),
+            p.parse::<i32>().unwrap_or(0),
+        ),
+        None => (peer.clone(), 0),
+    };
+    let host_obj = ctx.create_string(&host);
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(host_obj)), Value::Int(port)],
+    )
+}
+
 fn aio_assc_open_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     aio_assc_open(ctx, args)
 }
@@ -2058,19 +2424,96 @@ fn aio_assc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let bind_text = decode_addr(ctx, sa).unwrap_or_else(|_| "0.0.0.0:0".to_string());
     let listener =
         TcpListener::bind(&bind_text).map_err(|e| ioex(format!("bind {bind_text}: {e}")))?;
-    let id = aio_register(AioHandle::Listener(Arc::new(Mutex::new(listener))));
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| ioex(format!("bind {bind_text}: local_addr: {e}")))?;
+    let id = aio_register(AioHandle::Listener(
+        Arc::new(Mutex::new(listener)),
+        local_addr,
+    ));
     if ctx.object_num_fields(this) > F_REG_ID {
         ctx.set_field(this, F_REG_ID, Value::Int(id));
     }
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// `SocketAddress getLocalAddress()`. Without this, Tomcat's
+/// `Nio2Endpoint.getLocalPort()` (via
+/// `((InetSocketAddress) serverSock.getLocalAddress()).getPort()`) NPEs on
+/// the missing native — same shape as `ssc_local_address` in
+/// `socket_channel.rs`'s fix for the synchronous `ServerSocketChannel`
+/// (see its comment for the full story: real JDK bytecode expects a real
+/// `InetSocketAddress` with a populated `holder`, not a synthetic stub).
+///
+/// Reads the address captured on `AioHandle::Listener` at bind time —
+/// deliberately NOT `listener.lock().local_addr()`: the accept worker
+/// holds that same `Mutex` for the entire duration of its blocking
+/// `TcpListener::accept()` call (see `Job::Accept`), so locking it here
+/// raced the just-started accept loop and could block this call
+/// indefinitely (observed as a full-suite-timeout HANG on
+/// `TomcatServletWebServerFactoryTests.sslWithHttp11Nio2Protocol`, which
+/// calls this immediately after `start()`).
+fn aio_assc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let id = match read_aio_id(ctx, this) {
+        Some(id) => id,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let addr = match aio_registry().read().get(&id) {
+        Some(AioHandle::Listener(_, addr)) => Some(*addr),
+        _ => None,
+    };
+    let addr = match addr {
+        Some(a) => a,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    // Mirror `new_resolved_inet_socket_address` in `socket_channel.rs`
+    // (go through the real `InetAddress.getByName` + `InetSocketAddress
+    // (InetAddress,int)` ctor, not the `(String,int)` overload) so the
+    // resulting object's `holder` is populated the same proven way that
+    // fixed the identical `getLocalPort()` NPE for the synchronous
+    // `ServerSocketChannel`.
+    let host_str = ctx.create_string(&addr.ip().to_string());
+    if let Ok(Some(Value::Object(Some(inet_addr)))) = ctx.invoke(
+        "java/net/InetAddress",
+        "getByName",
+        "(Ljava/lang/String;)Ljava/net/InetAddress;",
+        &[Value::Object(Some(host_str))],
+    ) {
+        return ctx.new_object_initialized(
+            "java/net/InetSocketAddress",
+            "(Ljava/net/InetAddress;I)V",
+            &[
+                Value::Object(Some(inet_addr)),
+                Value::Int(addr.port() as i32),
+            ],
+        );
+    }
+    let host_str = ctx.create_string(&addr.ip().to_string());
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[
+            Value::Object(Some(host_str)),
+            Value::Int(addr.port() as i32),
+        ],
+    )
+}
+
 fn aio_assc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Start the dispatcher on first use: an idiomatic NIO2 server arms one
+    // `accept()` and then does nothing else, so without this the accept
+    // completion has nobody to deliver it (see `push_handler_completion`).
+    ensure_dispatcher();
     drain_completions(ctx);
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
         None => return Err(ioex("accept: null channel")),
     };
+    dbg_aio!("ACCEPT native entered (arming)");
     let attachment = obj_or_none(args, 1);
     let handler = obj_or_none(args, 2);
     let id = read_aio_id(ctx, this).ok_or_else(|| ioex("accept: not bound"))?;
@@ -2146,6 +2589,25 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
     r.register(asc, "close", "()V", aio_asc_close);
     r.register(
         asc,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/AsynchronousSocketChannel;",
+        aio_set_option,
+    );
+    r.register(
+        asc,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        aio_get_option,
+    );
+    r.register(asc, "supportedOptions", "()Ljava/util/Set;", aio_supported_options);
+    r.register(
+        asc,
+        "getRemoteAddress",
+        "()Ljava/net/SocketAddress;",
+        aio_asc_remote_address,
+    );
+    r.register(
+        asc,
         "connect",
         "(Ljava/net/SocketAddress;Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
         aio_asc_connect,
@@ -2174,6 +2636,22 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/ByteBuffer;Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
         aio_asc_write,
     );
+    // Timed overloads. Tomcat's `SecureNio2Channel` uses ONLY these, so
+    // without them `Http11Nio2Protocol` accepted connections and then never
+    // read or wrote a byte (`sslWithHttp11Nio2Protocol`). Both handlers
+    // detect the wider arg shape themselves.
+    r.register(
+        asc,
+        "read",
+        "(Ljava/nio/ByteBuffer;JLjava/util/concurrent/TimeUnit;Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
+        aio_asc_read,
+    );
+    r.register(
+        asc,
+        "write",
+        "(Ljava/nio/ByteBuffer;JLjava/util/concurrent/TimeUnit;Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
+        aio_asc_write,
+    );
 
     // -- AsynchronousServerSocketChannel --
     r.register(
@@ -2192,8 +2670,36 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
     r.register(assc, "close", "()V", aio_assc_close);
     r.register(
         assc,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/AsynchronousServerSocketChannel;",
+        aio_set_option,
+    );
+    r.register(
+        assc,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        aio_get_option,
+    );
+    r.register(assc, "supportedOptions", "()Ljava/util/Set;", aio_supported_options);
+    r.register(
+        assc,
         "bind",
         "(Ljava/net/SocketAddress;)Ljava/nio/channels/AsynchronousServerSocketChannel;",
+        aio_assc_bind,
+    );
+    // Two-arg overload (explicit `backlog` hint) — real JDK code (e.g.
+    // Tomcat's `Nio2Endpoint.bind`) calls this form. Without this
+    // registration the abstract `AsynchronousServerSocketChannel.bind(SocketAddress,int)`
+    // has no concrete override, so real-JDK-mode dispatch hits it directly
+    // and throws `AbstractMethodError: has no Code attribute` instead of
+    // ever reaching a native. `TcpListener::bind` has no backlog knob to
+    // honor (std doesn't expose one), so this reuses the same handler as
+    // the single-arg form and simply ignores the extra `int` arg — same
+    // behavior the single-arg overload already has.
+    r.register(
+        assc,
+        "bind",
+        "(Ljava/net/SocketAddress;I)Ljava/nio/channels/AsynchronousServerSocketChannel;",
         aio_assc_bind,
     );
     r.register(
@@ -2201,6 +2707,20 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         "accept",
         "(Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
         aio_assc_accept,
+    );
+    r.register(
+        assc,
+        "getLocalAddress",
+        "()Ljava/net/SocketAddress;",
+        aio_assc_local_address,
+    );
+    // Package-private `localAddress()` — same mirrored-alias pattern as
+    // `sc_local_address`'s registration in `socket_channel.rs`.
+    r.register(
+        assc,
+        "localAddress",
+        "()Ljava/net/SocketAddress;",
+        aio_assc_local_address,
     );
 
     // -- AsynchronousChannelGroup --
@@ -2255,7 +2775,90 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    use crate::test_support::{confine_test_lock, MockNativeContext};
+
+    /// AUDIT 2026-07-26 (native-io-audit): the handler form of
+    /// `AsynchronousSocketChannel.write` reported a bare `IntCount` and never
+    /// advanced the source `ByteBuffer` — the same defect already fixed for
+    /// the Future form (see `FutureOutcome::Count`). A conforming caller
+    /// (`while (buf.hasRemaining()) channel.write(buf, att, handler)`,
+    /// re-armed from `completed()`) therefore resubmitted the identical slice
+    /// forever, physically resending the frame on the wire.
+    #[test]
+    fn audit_handler_write_completion_advances_source_buffer() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        completion_queue().lock().clear();
+
+        let bb = ctx.alloc_object(8);
+        ctx.set_field_by_name(bb, "position", Value::Int(5));
+        let buffer_gref = ctx.add_global_root(bb);
+        let handler = ctx.alloc_object(1);
+
+        push_handler_completion(Completion {
+            handler,
+            attachment: None,
+            outcome: Ok(CompletionKind::WriteCount {
+                n: 7,
+                buffer_gref,
+            }),
+        });
+        drain_completions(&mut ctx);
+
+        assert_eq!(
+            ctx.get_field_by_name(bb, "position"),
+            Value::Int(12),
+            "position must advance by the bytes actually written"
+        );
+        assert_eq!(
+            ctx.global_root_count(),
+            0,
+            "the buffer's global root must be released after delivery"
+        );
+    }
+
+    /// The worker-parked release path (handler-less write, and every error
+    /// exit) must also drop the root — otherwise every async write leaks one.
+    #[test]
+    fn audit_parked_root_release_advances_then_frees() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        pending_root_releases().lock().clear();
+
+        let advanced = ctx.alloc_object(8);
+        ctx.set_field_by_name(advanced, "position", Value::Int(2));
+        let g1 = ctx.add_global_root(advanced);
+        queue_write_advance(g1, 3);
+
+        let untouched = ctx.alloc_object(8);
+        ctx.set_field_by_name(untouched, "position", Value::Int(9));
+        let g2 = ctx.add_global_root(untouched);
+        queue_root_release(g2);
+
+        assert_eq!(ctx.global_root_count(), 2);
+        flush_pending_root_releases(&mut ctx);
+
+        assert_eq!(ctx.get_field_by_name(advanced, "position"), Value::Int(5));
+        assert_eq!(
+            ctx.get_field_by_name(untouched, "position"),
+            Value::Int(9),
+            "a failed write must not advance the buffer"
+        );
+        assert_eq!(ctx.global_root_count(), 0, "both roots must be freed");
+    }
+
+    /// A zero handle is the "no root" sentinel and must never be queued.
+    #[test]
+    fn audit_zero_gref_is_not_queued() {
+        let _g = confine_test_lock().lock();
+        pending_root_releases().lock().clear();
+        queue_root_release(0);
+        queue_write_advance(0, 4);
+        assert!(pending_root_releases().lock().is_empty());
+    }
 
     #[test]
     fn registers_without_panic() {

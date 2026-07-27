@@ -714,10 +714,12 @@ pub fn standard_offset_seconds_at_instant(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     fn test_catalog() -> Arc<TzdbCatalog> {
-        let java_home = std::env::var("JAVA_HOME_FOR_TZDB_TEST")
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME_FOR_TZDB_TEST")
             .unwrap_or_else(|_| "/home/victor/jdk25".to_string());
         let path = std::path::Path::new(&java_home).join("lib").join("tzdb.dat");
         let data = std::fs::read(path).expect("tzdb.dat not found for test");
@@ -819,7 +821,7 @@ mod tests {
         // + fixed_offset_rules are the pure, ctx-free half of the fix that
         // `get_zone_rules` delegates to once the tzdb catalog lookup misses);
         // the full ctx-driven path is covered by the Java-level repro in
-        // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md.
+        // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md.
         let rules = parse_fixed_gmt_offset_seconds("GMT+01:00")
             .map(fixed_offset_rules)
             .expect("GMT+01:00 must resolve to a fixed-offset rule set");

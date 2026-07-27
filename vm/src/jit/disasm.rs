@@ -20,7 +20,7 @@ fn filter() -> Option<&'static Vec<String>> {
     static CACHE: OnceLock<Option<Vec<String>>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let v = std::env::var("CRATONVM_DBG_JIT_DISASM").ok()?;
+            let v = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_DISASM").ok()?;
             if v.is_empty() || v == "0" {
                 return None;
             }

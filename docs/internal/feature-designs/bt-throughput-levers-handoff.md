@@ -131,7 +131,7 @@ Build: `build-move.bat` → `cvmove.exe` (this box is slow — 8–24 min/build)
 `C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot`. Throughput is
 load-robust via **min-of-N interleaved** runs (not single wall-clock).
 
-- bt repro: `docs/internal/repros/gc-stress-bintrees-main-args/binarytrees.java`
+- bt repro: `../fixed-suite-bugs/repros/gc-stress-bintrees-main-args/binarytrees.java`
 - Correctness oracles built this session (regenerate as needed):
   `CtorTest` (elision boundary: empty vs field-init vs non-Object-super ctors),
   `CollSmall`/`CollTest` (JDK POJOs), `OsrAlloc` (OSR tier), `IfaceApp`/`CalleeApp`

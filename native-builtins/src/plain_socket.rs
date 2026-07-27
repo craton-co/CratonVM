@@ -104,7 +104,7 @@ fn connectex(addr: SocketAddr, error: std::io::Error) -> MethodCallFailed {
 /// PlainSocketImpl surface vs the NioSocketImpl→sun/nio/ch/Net path.
 macro_rules! dbgplain {
     ($($arg:tt)*) => {
-        if std::env::var_os("CRATONVM_DBG_NET").is_some() {
+        if crate::vmflags().io.dbg_net {
             eprintln!("[PLAIN] {}", format!($($arg)*));
         }
     };
@@ -1050,6 +1050,8 @@ fn _addr_v6_loopback(port: u16) -> SocketAddr {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::io::Read as _;
 

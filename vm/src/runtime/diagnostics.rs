@@ -257,7 +257,7 @@ pub fn check_health(
 /// invokedynamic / native-call paths.
 ///
 /// This helper exists so every swallow site in the VM behaves consistently:
-///   - Increments `shared.swallow_counter` so the CLI can detect a silent
+///   - Increments `shared.debug.swallow_counter` so the CLI can detect a silent
 ///     exit caused by accumulated swallows.
 ///   - Emits a `tracing::warn!` with the site, category, and detail so users
 ///     setting `RUST_LOG=warn` or above see why something failed.
@@ -265,6 +265,7 @@ pub fn check_health(
 ///     to a panic so the culprit is impossible to miss during debugging.
 pub fn record_swallow(shared: &crate::vm::SharedVm, site: &str, category: &str, detail: &str) {
     shared
+        .debug
         .swallow_counter
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tracing::warn!(

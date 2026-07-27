@@ -41,6 +41,7 @@
 //! already hold the `JvmThread` read the flag directly and report via
 //! [`report_blocked_violation`].
 
+use crate::gc_flags;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
@@ -53,12 +54,11 @@ enum Mode {
 }
 
 fn mode() -> Mode {
-    static M: OnceLock<Mode> = OnceLock::new();
-    *M.get_or_init(|| match std::env::var("CRATONVM_DBG_BLOCKED_ACCESS") {
-        Ok(v) if v == "warn" => Mode::Warn,
-        Ok(v) if !v.is_empty() && v != "0" => Mode::Panic,
-        _ => Mode::Off,
-    })
+    match crate::gc_flags().dbg_blocked_access {
+        cratonvm_types::BlockedAccessMode::Off => Mode::Off,
+        cratonvm_types::BlockedAccessMode::Warn => Mode::Warn,
+        cratonvm_types::BlockedAccessMode::Panic => Mode::Panic,
+    }
 }
 
 /// Cheap process-wide gate (cached once, same convention as every other

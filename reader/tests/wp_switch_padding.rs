@@ -74,12 +74,14 @@ fn tableswitch_pc_0_padding_3() {
     let instr = decode_at(&code, 0);
     assert_eq!(
         instr,
-        Instruction::Tableswitch {
-            default: 7,
-            low: 0,
-            high: 0,
-            offsets: vec![10],
-        }
+        Instruction::Tableswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::TableSwitch {
+                default: 7,
+                low: 0,
+                high: 0,
+                offsets: vec![10],
+            }
+        ))
     );
 }
 
@@ -89,12 +91,14 @@ fn tableswitch_pc_1_padding_2() {
     let instr = decode_at(&code, 1);
     assert_eq!(
         instr,
-        Instruction::Tableswitch {
-            default: 7,
-            low: 0,
-            high: 0,
-            offsets: vec![10],
-        }
+        Instruction::Tableswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::TableSwitch {
+                default: 7,
+                low: 0,
+                high: 0,
+                offsets: vec![10],
+            }
+        ))
     );
 }
 
@@ -104,12 +108,14 @@ fn tableswitch_pc_2_padding_1() {
     let instr = decode_at(&code, 2);
     assert_eq!(
         instr,
-        Instruction::Tableswitch {
-            default: 7,
-            low: 0,
-            high: 0,
-            offsets: vec![10],
-        }
+        Instruction::Tableswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::TableSwitch {
+                default: 7,
+                low: 0,
+                high: 0,
+                offsets: vec![10],
+            }
+        ))
     );
 }
 
@@ -121,12 +127,14 @@ fn tableswitch_pc_3_padding_0() {
     let instr = decode_at(&code, 3);
     assert_eq!(
         instr,
-        Instruction::Tableswitch {
-            default: 7,
-            low: 0,
-            high: 0,
-            offsets: vec![10],
-        }
+        Instruction::Tableswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::TableSwitch {
+                default: 7,
+                low: 0,
+                high: 0,
+                offsets: vec![10],
+            }
+        ))
     );
 }
 
@@ -138,10 +146,12 @@ fn lookupswitch_pc_0_padding_3() {
     let instr = decode_at(&code, 0);
     assert_eq!(
         instr,
-        Instruction::Lookupswitch {
-            default: 11,
-            pairs: vec![(42, 20)],
-        }
+        Instruction::Lookupswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::LookupSwitch {
+                default: 11,
+                pairs: vec![(42, 20)],
+            }
+        ))
     );
 }
 
@@ -151,10 +161,12 @@ fn lookupswitch_pc_1_padding_2() {
     let instr = decode_at(&code, 1);
     assert_eq!(
         instr,
-        Instruction::Lookupswitch {
-            default: 11,
-            pairs: vec![(42, 20)],
-        }
+        Instruction::Lookupswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::LookupSwitch {
+                default: 11,
+                pairs: vec![(42, 20)],
+            }
+        ))
     );
 }
 
@@ -164,10 +176,12 @@ fn lookupswitch_pc_2_padding_1() {
     let instr = decode_at(&code, 2);
     assert_eq!(
         instr,
-        Instruction::Lookupswitch {
-            default: 11,
-            pairs: vec![(42, 20)],
-        }
+        Instruction::Lookupswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::LookupSwitch {
+                default: 11,
+                pairs: vec![(42, 20)],
+            }
+        ))
     );
 }
 
@@ -177,9 +191,11 @@ fn lookupswitch_pc_3_padding_0() {
     let instr = decode_at(&code, 3);
     assert_eq!(
         instr,
-        Instruction::Lookupswitch {
-            default: 11,
-            pairs: vec![(42, 20)],
-        }
+        Instruction::Lookupswitch(std::sync::Arc::new(
+            cratonvm_reader::instruction::LookupSwitch {
+                default: 11,
+                pairs: vec![(42, 20)],
+            }
+        ))
     );
 }

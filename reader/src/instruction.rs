@@ -10,6 +10,35 @@
 /// ~8.6 GB) while accepting any switch that can fit in a real method body.
 pub const MAX_SWITCH_ENTRIES: usize = 16_384;
 
+/// Out-of-line payload of a `tableswitch`.
+///
+/// Held behind an `Arc` inside [`Instruction::Tableswitch`] so that the
+/// `Instruction` enum stays a small fixed-size record with no owned `Vec` in
+/// any variant. That is what lets a pre-decoded (quickened) instruction stream
+/// be a flat array, and what makes executing a switch allocation-free: the
+/// interpreter borrows the interned table instead of re-decoding (and
+/// re-allocating) it on every execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableSwitch {
+    /// Branch offset taken when the key is outside `low..=high`.
+    pub default: i32,
+    /// Lowest key covered by `offsets`.
+    pub low: i32,
+    /// Highest key covered by `offsets`.
+    pub high: i32,
+    /// Branch offsets for keys `low..=high`, in order.
+    pub offsets: Vec<i32>,
+}
+
+/// Out-of-line payload of a `lookupswitch`. See [`TableSwitch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupSwitch {
+    /// Branch offset taken when the key matches no pair.
+    pub default: i32,
+    /// `(key, branch offset)` pairs, sorted by key in the classfile.
+    pub pairs: Vec<(i32, i32)>,
+}
+
 /// A JVM bytecode instruction (JVM spec 6.5).
 ///
 /// Each variant represents a single JVM instruction with its operands already decoded.
@@ -164,16 +193,8 @@ pub enum Instruction {
     Goto(i16),
     Jsr(i16),
     Ret(u16),
-    Tableswitch {
-        default: i32,
-        low: i32,
-        high: i32,
-        offsets: Vec<i32>,
-    },
-    Lookupswitch {
-        default: i32,
-        pairs: Vec<(i32, i32)>,
-    },
+    Tableswitch(std::sync::Arc<TableSwitch>),
+    Lookupswitch(std::sync::Arc<LookupSwitch>),
     Ireturn,
     Lreturn,
     Freturn,
@@ -525,17 +546,30 @@ impl Instruction {
                     );
                 }
                 let count = count_i64 as usize;
+                // Bound the reservation by what the method actually holds. A
+                // malformed `high` within `MAX_SWITCH_ENTRIES` can otherwise
+                // reserve up to 64 KB that the very next read fails on. Those
+                // reads already return `UnexpectedEndOfData`, so this only
+                // raises the identical error variant earlier (the reported
+                // position moves to the head of the table).
+                if count.saturating_mul(4) > code.len().saturating_sub(next) {
+                    return Err(
+                        crate::class_reader_error::ClassReaderError::UnexpectedEndOfData {
+                            position: next,
+                        },
+                    );
+                }
                 let mut offsets = Vec::with_capacity(count);
                 for _ in 0..count {
                     offsets.push(Self::read_i32(code, &mut next)?);
                 }
                 let _base_pc = base_pc; // retained for future offset validation
-                Instruction::Tableswitch {
+                Instruction::Tableswitch(std::sync::Arc::new(TableSwitch {
                     default,
                     low,
                     high,
                     offsets,
-                }
+                }))
             }
             0xab => {
                 // lookupswitch — requires 4-byte alignment padding
@@ -561,13 +595,25 @@ impl Instruction {
                     );
                 }
                 let npairs = npairs_raw as usize;
+                // See the `tableswitch` note above: bound the reservation
+                // (128 KB worst case here) by the bytes actually available.
+                if npairs.saturating_mul(8) > code.len().saturating_sub(next) {
+                    return Err(
+                        crate::class_reader_error::ClassReaderError::UnexpectedEndOfData {
+                            position: next,
+                        },
+                    );
+                }
                 let mut pairs = Vec::with_capacity(npairs);
                 for _ in 0..npairs {
                     let key = Self::read_i32(code, &mut next)?;
                     let offset = Self::read_i32(code, &mut next)?;
                     pairs.push((key, offset));
                 }
-                Instruction::Lookupswitch { default, pairs }
+                Instruction::Lookupswitch(std::sync::Arc::new(LookupSwitch {
+                    default,
+                    pairs,
+                }))
             }
             0xac => Instruction::Ireturn,
             0xad => Instruction::Lreturn,
@@ -700,8 +746,8 @@ impl Instruction {
                 | Instruction::IfAcmpne(_)
                 | Instruction::Ifnull(_)
                 | Instruction::Ifnonnull(_)
-                | Instruction::Tableswitch { .. }
-                | Instruction::Lookupswitch { .. }
+                | Instruction::Tableswitch(_)
+                | Instruction::Lookupswitch(_)
         )
     }
 
@@ -951,12 +997,12 @@ mod tests {
         let (instr, next) = Instruction::decode(&code, 0).unwrap();
         assert_eq!(
             instr,
-            Instruction::Tableswitch {
+            Instruction::Tableswitch(std::sync::Arc::new(TableSwitch {
                 default: 10,
                 low: 1,
                 high: 1,
                 offsets: vec![20],
-            }
+            }))
         );
         assert_eq!(next, 20);
     }
@@ -974,10 +1020,44 @@ mod tests {
         let (instr, _) = Instruction::decode(&code, 0).unwrap();
         assert_eq!(
             instr,
-            Instruction::Lookupswitch {
+            Instruction::Lookupswitch(std::sync::Arc::new(LookupSwitch {
                 default: 5,
                 pairs: vec![(100, 30), (200, 40)],
-            }
+            }))
+        );
+    }
+
+    /// A `tableswitch` header may claim up to `MAX_SWITCH_ENTRIES` offsets.
+    /// When the method does not actually contain them we must fail before
+    /// reserving for the claim, not after.
+    #[test]
+    fn tableswitch_header_larger_than_the_code_is_rejected() {
+        let mut code = vec![0xaa, 0, 0, 0];
+        code.extend(&0i32.to_be_bytes()); // default
+        code.extend(&0i32.to_be_bytes()); // low
+        code.extend(&16_383i32.to_be_bytes()); // high -> 16384 offsets, none present
+        let err = Instruction::decode(&code, 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::class_reader_error::ClassReaderError::UnexpectedEndOfData { .. }
+            ),
+            "expected UnexpectedEndOfData, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn lookupswitch_npairs_larger_than_the_code_is_rejected() {
+        let mut code = vec![0xab, 0, 0, 0];
+        code.extend(&0i32.to_be_bytes()); // default
+        code.extend(&16_384i32.to_be_bytes()); // npairs, no pairs present
+        let err = Instruction::decode(&code, 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::class_reader_error::ClassReaderError::UnexpectedEndOfData { .. }
+            ),
+            "expected UnexpectedEndOfData, got {err:?}"
         );
     }
 

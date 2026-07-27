@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::threading::jvm_thread::{GcBlockState, ParkState, ThreadId};
@@ -38,7 +38,7 @@ mod threadreg_perf {
     fn enabled() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| {
-            std::env::var("CRATONVM_DBG_THREADREG_PERF")
+            cratonvm_types::flags::runtime_var("CRATONVM_DBG_THREADREG_PERF")
                 .map(|v| {
                     let t = v.trim();
                     !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
@@ -220,8 +220,51 @@ struct ThreadEntry {
 /// liveness. Thread-safe via `parking_lot::Mutex`.
 pub struct ThreadRegistry {
     /// T10.9.B: FxHashMap — ThreadId is internal.
-    threads: Mutex<FxHashMap<ThreadId, ThreadEntry>>,
+    ///
+    /// ARCH-2026-07-26 — `RwLock`, not `Mutex`. CratonVM runs one real OS
+    /// thread per Java thread, and of the ~50 accessors on this type only 14
+    /// mutate the map (they are all registration / teardown / one-shot
+    /// publication paths). The other ~40 — `is_alive`, `get_park_state`,
+    /// `is_blocked`, `java_block_state`, `frame_trace_of`, the JMX readers, and
+    /// every O(N) safepoint census the collector runs — only need to *find* an
+    /// entry and then operate on the atomics and per-entry locks inside it.
+    /// Under a `Mutex` all of that traffic serialized on one global lock at L5,
+    /// i.e. below the levels that are held across it. As a reader-writer lock
+    /// the reads proceed concurrently and only genuine registration churn
+    /// excludes.
+    ///
+    /// This is sound to do here (and was checked site by site) because no
+    /// accessor calls another accessor while holding a guard: every method
+    /// either scopes the guard to a block and drops it before calling out, or
+    /// holds it for a self-contained walk. `parking_lot::RwLock` reads are NOT
+    /// recursion-safe, so a future edit that nests two acquisitions on one
+    /// thread would deadlock — keep the "acquire, use, drop, then call out"
+    /// discipline, or use `read_recursive()` deliberately.
+    ///
+    /// Level: L5 `thread_registry` (see `cratonvm_types::lock_order`). This
+    /// lock is not yet wrapped in `OrderedPlRwLock`, so the checker does not
+    /// observe it — the level is documentation, exactly as it was before.
+    ///
+    /// AUTO-TRAIT NOTE: this raises a bound. `Mutex<T>: Sync` needs only
+    /// `T: Send`, but `RwLock<T>: Sync` needs `T: Send + Sync`, so
+    /// [`ThreadEntry`] must now be `Sync` for `ThreadRegistry` to be `Sync` —
+    /// which `vm::vm::realms::ThreadRealm` requires, since it holds one by
+    /// value inside the shared VM. It is, but only because
+    /// `ObjectRef` carries an `unsafe impl Sync` (`types/src/value.rs`), which
+    /// the bare `java_thread_obj: Option<ObjectRef>` field relies on, and
+    /// because `std::thread::JoinHandle<T>` is unconditionally `Sync`. If
+    /// either ever changes, put those two fields behind their own locks rather
+    /// than reverting this one.
+    threads: RwLock<FxHashMap<ThreadId, ThreadEntry>>,
     next_id: AtomicU64,
+    /// Process-unique identity for this registry instance, used to key the
+    /// per-thread self-handle cache (see [`ThreadRegistry::self_async_slot`]).
+    ///
+    /// Deliberately NOT the registry's address: a dropped registry's address
+    /// can be reused by a later one, and `ThreadId`s restart per registry, so
+    /// an address-keyed cache could serve one registry's slot to another's
+    /// same-numbered thread. A monotonic id cannot alias.
+    registry_id: u64,
     /// WP4.1 — O(1) reverse index from Java `Thread` object pointer to
     /// its `ParkState`. AQS / `LockSupport.unpark(Thread)` calls this on
     /// the hot path of every queued lock release, so a linear walk over
@@ -280,9 +323,11 @@ impl ThreadRegistry {
     /// Create a new, empty registry. The next thread id will be 1
     /// (id 0 is reserved for the main thread).
     pub fn new() -> Self {
+        static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
         Self {
-            threads: Mutex::new(FxHashMap::default()),
+            threads: RwLock::new(FxHashMap::default()),
             next_id: AtomicU64::new(1),
+            registry_id: NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed),
             thread_obj_to_park: Mutex::new(FxHashMap::default()),
             java_tid_to_id: Mutex::new(FxHashMap::default()),
             former_mirror_addrs: Mutex::new((
@@ -362,7 +407,7 @@ impl ThreadRegistry {
             jvm_thread_addr: std::sync::atomic::AtomicUsize::new(0),
             os_tid: std::sync::atomic::AtomicU32::new(0),
         };
-        self.threads.lock().insert(thread_id, entry);
+        self.threads.write().insert(thread_id, entry);
         if let Some(obj) = java_thread_obj {
             self.thread_obj_to_park
                 .lock()
@@ -375,7 +420,7 @@ impl ThreadRegistry {
     /// starts running (the TLAB lives in the `JvmThread`, whose address is
     /// stable for the thread's life). No-op for an unknown id.
     pub fn set_tlab_addr(&self, thread_id: ThreadId, tlab_addr: usize) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             entry.tlab_addr.store(tlab_addr, Ordering::Release);
         }
@@ -385,7 +430,7 @@ impl ThreadRegistry {
     /// the thread (or its teardown) before its `JvmThread` is dropped so the
     /// collector never dereferences a dangling TLAB pointer.
     pub fn clear_tlab_addr(&self, thread_id: ThreadId) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             entry.tlab_addr.store(0, Ordering::Release);
             // XT-FRAME-SCAN: the JvmThread address shares the TLAB address's
@@ -405,7 +450,7 @@ impl ThreadRegistry {
     /// by [`Self::clear_tlab_addr`] before the `JvmThread` drops. No-op for
     /// an unknown id.
     pub fn set_jvm_thread_addr(&self, thread_id: ThreadId, addr: usize) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             entry.jvm_thread_addr.store(addr, Ordering::Release);
         }
@@ -424,7 +469,7 @@ impl ThreadRegistry {
         if os_tids.is_empty() {
             return Vec::new();
         }
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut out = Vec::new();
         for entry in threads.values() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -460,7 +505,7 @@ impl ThreadRegistry {
     /// `JvmThread` cannot be concurrently dropped (teardown clears the address
     /// and flips `alive` first). Dead / un-published entries are skipped.
     pub fn collect_reserved_tlab_tails(&self) -> Vec<(usize, usize)> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut out = Vec::new();
         for entry in threads.values() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -498,7 +543,7 @@ impl ThreadRegistry {
         if os_tids.is_empty() {
             return Vec::new();
         }
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut out = Vec::new();
         for entry in threads.values() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -522,7 +567,7 @@ impl ThreadRegistry {
     /// Returns `true` if the thread was found, `false` if the id was
     /// unknown.
     pub fn set_daemon(&self, thread_id: ThreadId, daemon: bool) -> bool {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             entry.daemon.store(daemon, Ordering::Release);
             true
@@ -537,7 +582,7 @@ impl ThreadRegistry {
     /// non-daemon threads — the safe default).
     pub fn is_daemon(&self, thread_id: ThreadId) -> bool {
         self.threads
-            .lock()
+            .read()
             .get(&thread_id)
             .map(|e| e.daemon.load(Ordering::Acquire))
             .unwrap_or(false)
@@ -555,7 +600,7 @@ impl ThreadRegistry {
     /// reachable (it previously had to be frame- or static-reachable, which
     /// was not guaranteed for a freshly allocated `Thread.stop` throwable).
     pub fn post_async_exception(&self, thread_id: ThreadId, throwable: ObjectRef) -> bool {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             entry.async_exception_slot.store(
                 throwable.as_ptr() as usize,
@@ -577,7 +622,7 @@ impl ThreadRegistry {
     /// spuriously) and the process aborts immediately after the dump, so the
     /// extra permits never affect correctness.
     pub fn unpark_all_for_stack_dump(&self) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         for entry in threads.values() {
             entry.park_state.unpark();
         }
@@ -593,7 +638,7 @@ impl ThreadRegistry {
     /// native" from "never ran".
     pub fn dump_thread_summary_to_stderr(&self) {
         use std::io::Write;
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let stderr = std::io::stderr();
         let mut h = stderr.lock();
         let _ = writeln!(
@@ -673,16 +718,66 @@ impl ThreadRegistry {
         let _ = h.flush();
     }
 
+    /// ARCH-2026-07-26 — the calling thread's own async-exception slot,
+    /// obtained without touching the global registry map after the first call.
+    ///
+    /// [`Self::take_async_exception`] runs on **every safepoint poll** of
+    /// **every** Java thread. Reaching it through the map meant a global lock
+    /// acquisition per poll per thread — the single hottest "look up my own
+    /// entry" path in the registry, and the one the per-thread-handle idea
+    /// exists for.
+    ///
+    /// Caching is sound because `ThreadEntry::async_exception_slot` is an
+    /// `Arc<AtomicUsize>` created once in `register_with_daemon_stw_ready` and
+    /// **never replaced** — there is no setter for it, and `post_async_exception`
+    /// writes through the very same allocation. So the cached `Arc` is the same
+    /// object the map holds, forever.
+    ///
+    /// The cache is keyed by `(registry_id, thread_id)`. `registry_id` is a
+    /// process-monotonic counter rather than the registry's address, because a
+    /// dropped registry's address can be reused while `ThreadId`s restart at 1
+    /// — an address key could hand one registry's slot to another registry's
+    /// same-numbered thread (a real hazard in the test suite, which builds many
+    /// registries on one OS thread).
+    ///
+    /// Reaping a terminated entry does not invalidate the cache: the `Arc`
+    /// keeps the slot alive, and a thread whose entry is gone is dead, so
+    /// nobody can post to it any more.
+    fn self_async_slot(&self, thread_id: ThreadId) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        thread_local! {
+            static CACHED: std::cell::RefCell<
+                Option<(u64, ThreadId, Arc<std::sync::atomic::AtomicUsize>)>,
+            > = const { std::cell::RefCell::new(None) };
+        }
+        CACHED.with(|c| {
+            if let Some((rid, tid, slot)) = c.borrow().as_ref() {
+                if *rid == self.registry_id && *tid == thread_id {
+                    return Some(Arc::clone(slot));
+                }
+            }
+            // Cold: one read-lock to fetch the `Arc`, then never again for
+            // this (registry, thread) pair.
+            let slot = self
+                .threads
+                .read()
+                .get(&thread_id)
+                .map(|e| Arc::clone(&e.async_exception_slot))?;
+            *c.borrow_mut() = Some((self.registry_id, thread_id, Arc::clone(&slot)));
+            Some(slot)
+        })
+    }
+
     /// T1.5.1 — Take the target thread's pending async exception (if any).
     /// Called from the target thread's `safepoint_check` — never
     /// cross-thread. The consumer is responsible for raising the
     /// exception via the interpreter's normal exception table walk.
+    ///
+    /// Because it is always a self-lookup, it goes through
+    /// [`Self::self_async_slot`] and so takes **no registry lock** after the
+    /// calling thread's first safepoint.
     pub fn take_async_exception(&self, thread_id: ThreadId) -> Option<ObjectRef> {
-        let threads = self.threads.lock();
-        let entry = threads.get(&thread_id)?;
-        let raw = entry
-            .async_exception_slot
-            .swap(0, std::sync::atomic::Ordering::AcqRel);
+        let slot = self.self_async_slot(thread_id)?;
+        let raw = slot.swap(0, std::sync::atomic::Ordering::AcqRel);
         if raw == 0 {
             None
         } else {
@@ -694,7 +789,7 @@ impl ThreadRegistry {
 
     /// Store the OS `JoinHandle` for a spawned thread.
     pub fn set_join_handle(&self, thread_id: ThreadId, handle: JoinHandle<()>) {
-        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+        if let Some(entry) = self.threads.write().get_mut(&thread_id) {
             entry.join_handle = Some(handle);
         }
     }
@@ -705,7 +800,7 @@ impl ThreadRegistry {
         let dead_park_state;
         let mut retired_java_tids = Vec::new();
         {
-            let mut threads = self.threads.lock();
+            let mut threads = self.threads.write();
             let Some(entry) = threads.get_mut(&thread_id) else {
                 return;
             };
@@ -810,7 +905,7 @@ impl ThreadRegistry {
         obj: ObjectRef,
         java_tid: u64,
     ) -> Option<ThreadId> {
-        let mut threads = self.threads.lock();
+        let mut threads = self.threads.write();
         let mut found: Option<ThreadId> = None;
         for (id, entry) in threads.iter() {
             if let Some(thread_obj) = entry.java_thread_obj {
@@ -843,7 +938,7 @@ impl ThreadRegistry {
     /// Check if a thread is still alive.
     pub fn is_alive(&self, thread_id: ThreadId) -> bool {
         self.threads
-            .lock()
+            .read()
             .get(&thread_id)
             .map(|e| e.alive.load(Ordering::Acquire))
             .unwrap_or(false)
@@ -851,7 +946,7 @@ impl ThreadRegistry {
 
     /// Mark a started carrier as able to participate in counted STW barriers.
     pub fn mark_stw_ready(&self, thread_id: ThreadId) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             entry.stw_ready.store(true, Ordering::Release);
         }
@@ -864,7 +959,7 @@ impl ThreadRegistry {
     /// (already joined, or it's the main thread).
     pub fn join(&self, thread_id: ThreadId) -> bool {
         let handle = {
-            let mut threads = self.threads.lock();
+            let mut threads = self.threads.write();
             threads
                 .get_mut(&thread_id)
                 .and_then(|e| e.join_handle.take())
@@ -898,7 +993,7 @@ impl ThreadRegistry {
     /// Get the Java Thread object for a given ThreadId.
     pub fn java_thread_obj(&self, thread_id: ThreadId) -> Option<ObjectRef> {
         self.threads
-            .lock()
+            .read()
             .get(&thread_id)
             .and_then(|e| e.java_thread_obj)
     }
@@ -948,7 +1043,7 @@ impl ThreadRegistry {
         self.set_java_thread_obj(thread_id, obj);
         if java_tid != 0 {
             {
-                let mut threads = self.threads.lock();
+                let mut threads = self.threads.write();
                 if let Some(entry) = threads.get_mut(&thread_id) {
                     entry.java_tid = java_tid;
                 } else {
@@ -964,7 +1059,7 @@ impl ThreadRegistry {
         let park_state_clone;
         let prev_obj;
         {
-            let mut threads = self.threads.lock();
+            let mut threads = self.threads.write();
             if let Some(entry) = threads.get_mut(&thread_id) {
                 prev_obj = entry.java_thread_obj;
                 entry.java_thread_obj = Some(obj);
@@ -987,13 +1082,13 @@ impl ThreadRegistry {
 
     /// Get the name of a thread.
     pub fn thread_name(&self, thread_id: ThreadId) -> Option<String> {
-        self.threads.lock().get(&thread_id).map(|e| e.name.clone())
+        self.threads.read().get(&thread_id).map(|e| e.name.clone())
     }
 
     /// Publish a monitor acquisition attempt before it can block. The object
     /// is rooted by this registry entry until the acquire completes.
     pub fn set_jmx_contended_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
-        if let Some(entry) = self.threads.lock().get(&thread_id) {
+        if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_contended_monitor.lock() = Some(monitor);
         }
     }
@@ -1001,7 +1096,7 @@ impl ThreadRegistry {
     /// Finish an acquisition attempt. Successful acquisitions become owned
     /// monitor roots; failed/aborted attempts simply lose the contention root.
     pub fn complete_jmx_monitor_enter(&self, thread_id: ThreadId, monitor: ObjectRef) {
-        if let Some(entry) = self.threads.lock().get(&thread_id) {
+        if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_contended_monitor.lock() = None;
             let mut owned = entry.jmx_locked_monitors.lock();
             if !owned.iter().any(|o| o.as_ptr() == monitor.as_ptr()) {
@@ -1011,7 +1106,7 @@ impl ThreadRegistry {
     }
 
     pub fn remove_jmx_locked_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
-        if let Some(entry) = self.threads.lock().get(&thread_id) {
+        if let Some(entry) = self.threads.read().get(&thread_id) {
             entry
                 .jmx_locked_monitors
                 .lock()
@@ -1020,13 +1115,13 @@ impl ThreadRegistry {
     }
 
     pub fn set_jmx_waiting_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
-        if let Some(entry) = self.threads.lock().get(&thread_id) {
+        if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_waiting_monitor.lock() = Some(monitor);
         }
     }
 
     pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
-        if let Some(entry) = self.threads.lock().get(&thread_id) {
+        if let Some(entry) = self.threads.read().get(&thread_id) {
             return entry.jmx_waiting_monitor.lock().take();
         }
         None
@@ -1035,7 +1130,7 @@ impl ThreadRegistry {
     /// `AbstractOwnableSynchronizer` has one exclusive owner. Remove a
     /// synchronizer from any former owner before attaching it to the new one.
     pub fn set_jmx_owned_synchronizer(&self, owner: Option<ThreadId>, synchronizer: ObjectRef) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         for entry in threads.values() {
             entry
                 .jmx_locked_synchronizers
@@ -1058,7 +1153,7 @@ impl ThreadRegistry {
         Vec<ObjectRef>,
         Vec<ObjectRef>,
     )> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let entry = threads.get(&thread_id)?;
         let snapshot = (
             *entry.jmx_contended_monitor.lock(),
@@ -1072,7 +1167,7 @@ impl ThreadRegistry {
     /// Return all (ThreadId, name) pairs for currently registered threads.
     pub fn all_thread_names(&self) -> Vec<(ThreadId, String)> {
         self.threads
-            .lock()
+            .read()
             .iter()
             .map(|(tid, entry)| (*tid, entry.name.clone()))
             .collect()
@@ -1083,7 +1178,7 @@ impl ThreadRegistry {
     pub fn set_park_state(&self, thread_id: ThreadId, state: Arc<ParkState>) {
         let obj_opt;
         {
-            let mut threads = self.threads.lock();
+            let mut threads = self.threads.write();
             if let Some(entry) = threads.get_mut(&thread_id) {
                 entry.park_state = state.clone();
                 obj_opt = entry.java_thread_obj;
@@ -1104,7 +1199,7 @@ impl ThreadRegistry {
     /// Get the park state for a given ThreadId (for unpark from another thread).
     pub fn get_park_state(&self, thread_id: ThreadId) -> Option<Arc<ParkState>> {
         self.threads
-            .lock()
+            .read()
             .get(&thread_id)
             .map(|e| e.park_state.clone())
     }
@@ -1123,7 +1218,7 @@ impl ThreadRegistry {
             return Some(ps.clone());
         }
         // Fallback: legacy registries that bypassed register_with_daemon.
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         for entry in threads.values() {
             if let Some(thread_obj) = entry.java_thread_obj {
                 if std::ptr::eq(thread_obj.as_ptr(), obj.as_ptr()) {
@@ -1140,7 +1235,7 @@ impl ThreadRegistry {
     /// mirror addresses are (a stale `Node.waiter` shows up as a caller
     /// address absent from this list).
     pub fn debug_thread_obj_addrs(&self) -> Vec<(u64, usize, bool)> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         threads
             .iter()
             .map(|(id, e)| {
@@ -1162,7 +1257,7 @@ impl ThreadRegistry {
     /// Pointer-identity comparison matches the existing
     /// `find_park_state_by_thread_obj` helper.
     pub fn find_thread_id_by_thread_obj(&self, obj: ObjectRef) -> Option<ThreadId> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         for (id, entry) in threads.iter() {
             if let Some(thread_obj) = entry.java_thread_obj {
                 if std::ptr::eq(thread_obj.as_ptr(), obj.as_ptr()) {
@@ -1175,7 +1270,7 @@ impl ThreadRegistry {
 
     /// Set the interrupted flag for a thread (cross-thread interrupt).
     pub fn set_interrupted(&self, thread_id: ThreadId, value: bool) {
-        if let Some(entry) = self.threads.lock().get(&thread_id) {
+        if let Some(entry) = self.threads.read().get(&thread_id) {
             entry
                 .interrupted
                 .store(value, std::sync::atomic::Ordering::Release);
@@ -1185,21 +1280,21 @@ impl ThreadRegistry {
     /// Get the interrupted flag Arc for a thread (to share with JvmThread).
     pub fn get_interrupted_flag(&self, thread_id: ThreadId) -> Option<Arc<AtomicBool>> {
         self.threads
-            .lock()
+            .read()
             .get(&thread_id)
             .map(|e| e.interrupted.clone())
     }
 
     /// Set the interrupted flag Arc for a thread (share JvmThread's flag with registry).
     pub fn set_interrupted_flag(&self, thread_id: ThreadId, flag: Arc<AtomicBool>) {
-        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+        if let Some(entry) = self.threads.write().get_mut(&thread_id) {
             entry.interrupted = flag;
         }
     }
 
     /// Set the root snapshot Arc for a thread (share JvmThread's snapshot with registry).
     pub fn set_root_snapshot(&self, thread_id: ThreadId, snapshot: Arc<Mutex<Vec<ObjectRef>>>) {
-        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+        if let Some(entry) = self.threads.write().get_mut(&thread_id) {
             entry.root_snapshot = snapshot;
         }
     }
@@ -1211,26 +1306,68 @@ impl ThreadRegistry {
         thread_id: ThreadId,
         trace: Arc<Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
     ) {
-        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+        if let Some(entry) = self.threads.write().get_mut(&thread_id) {
             entry.frame_trace = trace;
         }
     }
 
     /// Share the JvmThread's VM-state breadcrumb with the registry.
     pub fn set_vm_state(&self, thread_id: ThreadId, state: Arc<Mutex<String>>) {
-        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+        if let Some(entry) = self.threads.write().get_mut(&thread_id) {
             entry.vm_state = state;
         }
     }
 
     /// Read a copy of `thread_id`'s last-published frame trace (call stack),
     /// innermost frame first. Empty if the thread is unknown or never deposited.
+    ///
+    /// **Every entry has `line_number == -1`.** The depositor
+    /// (`stackwalker::capture_frames_no_lines`, called from every blocking
+    /// deposit point) is deliberately lock-free and takes no `ClassStore`
+    /// borrow, so it cannot resolve lines. Prefer
+    /// [`frame_trace_of_resolved`](Self::frame_trace_of_resolved) at any call
+    /// site that has a `ClassStore` in hand — a thread dump then gains source
+    /// lines it does not have today, at zero cost to the deposit path.
     pub fn frame_trace_of(&self, thread_id: ThreadId) -> Vec<cratonvm_native_api::StackTraceEntry> {
         self.threads
-            .lock()
+            .read()
             .get(&thread_id)
             .map(|e| e.frame_trace.lock().clone())
             .unwrap_or_default()
+    }
+
+    /// [`frame_trace_of`](Self::frame_trace_of) with source line numbers filled
+    /// in from `class_store`.
+    ///
+    /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-2 of
+    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). The published
+    /// snapshot is line-less because the *depositor* must stay lock-free; the
+    /// *reader* usually does hold a `ClassStore` (cross-thread
+    /// `Thread.getStackTrace()`, `dumpThreads()`, the JMX thread dump), so it
+    /// can pay for the resolution once, only when a dump is actually taken.
+    ///
+    /// Strictly additive: `stackwalker::resolve_line_numbers_in_place` is
+    /// fail-closed — it yields the line an eager capture would have produced or
+    /// leaves `-1` — so this can only replace unknowns with correct lines. It
+    /// never produces a wrong line, and it never touches an entry that already
+    /// has one (including the `-2` native sentinel).
+    ///
+    /// Resolution is exact for frames carrying `StackTraceEntry::method_index`;
+    /// the deposit path cannot compute one (it has no `ClassStore`), so those
+    /// frames fall back to the unambiguous-name rule and overloaded frames stay
+    /// at `-1`. That is still strictly more than the all-`-1` snapshot.
+    ///
+    /// The registry lock is released before the resolution runs: the walk over
+    /// the returned `Vec` touches no registry state, and holding L5 across a
+    /// `ClassStore` walk would invert the usual acquisition order.
+    pub fn frame_trace_of_resolved(
+        &self,
+        thread_id: ThreadId,
+        class_store: &crate::classloading::ClassStore,
+    ) -> Vec<cratonvm_native_api::StackTraceEntry> {
+        let mut trace = self.frame_trace_of(thread_id);
+        crate::runtime::stackwalker::resolve_line_numbers_in_place(class_store, &mut trace);
+        trace
     }
 
     /// xt-hardening follow-up (2026-07-03): OS tids of alive threads
@@ -1243,7 +1380,7 @@ impl ThreadRegistry {
     /// over-retention risk. Threads with `os_tid == 0` (registered but not
     /// yet started) cannot be blocked, so they never contribute a false 0.
     pub fn blocked_os_tids(&self) -> Vec<u32> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         threads
             .values()
             .filter(|e| {
@@ -1261,7 +1398,7 @@ impl ThreadRegistry {
     /// authoritative root snapshot is empty. The flag still matters: moving-GC
     /// fixups and STW diagnostics use it to classify the thread as blocked.
     pub fn mark_native_thread_blocked(&self, thread_id: ThreadId) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             entry.root_snapshot.lock().clear();
             entry.frame_trace.lock().clear();
@@ -1278,7 +1415,7 @@ impl ThreadRegistry {
     /// `Thread.State.WAITING`: it is published before monitor/AQS/native waits
     /// and cleared only after the thread wakes and applies post-GC fixups.
     pub fn is_blocked(&self, thread_id: ThreadId) -> bool {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         threads.get(&thread_id).is_some_and(|entry| {
             entry.alive.load(Ordering::Acquire)
                 && entry
@@ -1288,10 +1425,11 @@ impl ThreadRegistry {
         })
     }
 
-    /// The Java blocking state for a currently blocked thread: 1 is WAITING
-    /// and 2 is BLOCKED. Returns 0 for running, dead, and unknown threads.
+    /// The Java blocking state for a currently blocked thread: 1 is WAITING,
+    /// 2 is BLOCKED, 3 is TIMED_WAITING. Returns 0 for running, dead, and
+    /// unknown threads.
     pub fn java_block_state(&self, thread_id: ThreadId) -> u8 {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         threads
             .get(&thread_id)
             .filter(|entry| {
@@ -1307,11 +1445,11 @@ impl ThreadRegistry {
 
     /// Clear the GC-blocked mark for a VM-registered native carrier thread.
     pub fn mark_native_thread_unblocked(&self, thread_id: ThreadId) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         if let Some(entry) = threads.get(&thread_id) {
             {
                 let mut f = entry.gc_block_state.fixup.lock();
-                if !f.is_empty() && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                if !f.is_empty() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
                     eprintln!(
                         "[blockgc] native-unblock DISCARDS {} fixups tid={}",
                         f.len(),
@@ -1335,7 +1473,7 @@ impl ThreadRegistry {
     /// the barrier `expected`) while actually running — the multi-thread
     /// root-coverage gap.
     pub fn dump_blocked_states(&self) -> Vec<(u64, bool, usize)> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut v = Vec::new();
         for (tid, entry) in threads.iter() {
             if entry.alive.load(Ordering::Acquire) {
@@ -1357,7 +1495,7 @@ impl ThreadRegistry {
     pub fn debug_thread_census(&self) -> String {
         use std::fmt::Write as _;
 
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut out = String::new();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {
@@ -1417,12 +1555,12 @@ impl ThreadRegistry {
     pub fn collect_all_root_snapshots(&self) -> Vec<ObjectRef> {
         static PERF: threadreg_perf::Counters =
             threadreg_perf::Counters::new("collect_all_root_snapshots");
-        let len = self.threads.lock().len();
+        let len = self.threads.read().len();
         PERF.time(len, || self.collect_all_root_snapshots_inner())
     }
 
     fn collect_all_root_snapshots_inner(&self) -> Vec<ObjectRef> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut all_roots = Vec::new();
         for entry in threads.values() {
             if entry.alive.load(Ordering::Acquire) {
@@ -1474,7 +1612,7 @@ impl ThreadRegistry {
     /// Set the blocked-region GC state Arc for a thread (share JvmThread's
     /// state with the registry, like `set_root_snapshot`).
     pub fn set_gc_block_state(&self, thread_id: ThreadId, state: Arc<GcBlockState>) {
-        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+        if let Some(entry) = self.threads.write().get_mut(&thread_id) {
             entry.gc_block_state = state;
         }
     }
@@ -1495,7 +1633,7 @@ impl ThreadRegistry {
         if pointer_map.is_empty() {
             return;
         }
-        let mut threads = self.threads.lock();
+        let mut threads = self.threads.write();
         let mut rekeyed: Vec<(usize, usize)> = Vec::new();
         // Vacated mirror addresses + owning tid, recorded into
         // `former_mirror_addrs` AFTER `threads` is dropped (lock order).
@@ -1593,8 +1731,8 @@ impl ThreadRegistry {
         if pointer_map.is_empty() {
             return;
         }
-        let dbg = std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some();
-        let threads = self.threads.lock();
+        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some();
+        let threads = self.threads.read();
         for (tid, entry) in threads.iter() {
             if !entry.alive.load(Ordering::Acquire) {
                 continue;
@@ -1663,13 +1801,13 @@ impl ThreadRegistry {
 
     /// Get the number of registered threads.
     pub fn count(&self) -> usize {
-        self.threads.lock().len()
+        self.threads.read().len()
     }
 
     /// Get the number of alive threads.
     pub fn alive_count(&self) -> usize {
         self.threads
-            .lock()
+            .read()
             .values()
             .filter(|e| e.alive.load(Ordering::Acquire))
             .count()
@@ -1688,7 +1826,7 @@ impl ThreadRegistry {
         // per thread) pins the flag's address for the process lifetime, which
         // is the safety contract `register_self_blocked_flag` requires.
         if cratonvm_gc::blocked_access_debug::enabled() {
-            let threads = self.threads.lock();
+            let threads = self.threads.read();
             if let Some(entry) = threads.get(&thread_id) {
                 let keep = entry.gc_block_state.clone();
                 let flag: *const std::sync::atomic::AtomicBool = &keep.in_blocked_region;
@@ -1706,7 +1844,7 @@ impl ThreadRegistry {
                 fn GetCurrentThreadId() -> u32;
             }
             let os_tid = unsafe { GetCurrentThreadId() };
-            let threads = self.threads.lock();
+            let threads = self.threads.read();
             if let Some(entry) = threads.get(&thread_id) {
                 entry.os_tid.store(os_tid, Ordering::Release);
             }
@@ -1714,7 +1852,7 @@ impl ThreadRegistry {
         #[cfg(target_os = "linux")]
         {
             let os_tid = unsafe { libc::syscall(libc::SYS_gettid) as u32 };
-            let threads = self.threads.lock();
+            let threads = self.threads.read();
             if let Some(entry) = threads.get(&thread_id) {
                 entry.os_tid.store(os_tid, Ordering::Release);
             }
@@ -1737,12 +1875,12 @@ impl ThreadRegistry {
     pub fn alive_count_and_os_tids(&self) -> (usize, Vec<u32>) {
         static PERF: threadreg_perf::Counters =
             threadreg_perf::Counters::new("alive_count_and_os_tids");
-        let len = self.threads.lock().len();
+        let len = self.threads.read().len();
         PERF.time(len, || self.alive_count_and_os_tids_inner())
     }
 
     fn alive_count_and_os_tids_inner(&self) -> (usize, Vec<u32>) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut n = 0usize;
         let mut tids = Vec::with_capacity(threads.len());
         for e in threads.values() {
@@ -1798,12 +1936,12 @@ impl ThreadRegistry {
     pub fn alive_count_blocked_and_os_tids(&self) -> (usize, usize, Vec<u32>, Vec<u64>) {
         static PERF: threadreg_perf::Counters =
             threadreg_perf::Counters::new("alive_count_blocked_and_os_tids");
-        let len = self.threads.lock().len();
+        let len = self.threads.read().len();
         PERF.time(len, || self.alive_count_blocked_and_os_tids_inner())
     }
 
     fn alive_count_blocked_and_os_tids_inner(&self) -> (usize, usize, Vec<u32>, Vec<u64>) {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         let mut alive = 0usize;
         let mut blocked = 0usize;
         let mut tids = Vec::with_capacity(threads.len());
@@ -1834,7 +1972,7 @@ impl ThreadRegistry {
     /// `in_blocked_region` in a way that would matter between the two calls
     /// for diagnostic purposes.
     pub fn alive_thread_ids_excluding(&self, excluded: &[u64]) -> Vec<u64> {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         threads
             .iter()
             .filter(|(tid, e)| {
@@ -1849,7 +1987,7 @@ impl ThreadRegistry {
     /// Get Java Thread objects for all alive threads (up to `max` entries).
     pub fn alive_thread_objects(&self, max: usize) -> Vec<ObjectRef> {
         self.threads
-            .lock()
+            .read()
             .values()
             .filter(|e| e.alive.load(Ordering::Acquire))
             .filter_map(|e| e.java_thread_obj)
@@ -1869,7 +2007,7 @@ impl ThreadRegistry {
     /// non-zero ids to exercise the join path.
     pub fn alive_non_daemon_thread_ids(&self) -> Vec<ThreadId> {
         self.threads
-            .lock()
+            .read()
             .iter()
             .filter(|(tid, e)| {
                 tid.0 != 0 && e.alive.load(Ordering::Acquire) && !e.daemon.load(Ordering::Acquire)
@@ -1946,7 +2084,7 @@ impl Default for ThreadRegistry {
 
 impl std::fmt::Debug for ThreadRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let threads = self.threads.lock();
+        let threads = self.threads.read();
         f.debug_struct("ThreadRegistry")
             .field("total", &threads.len())
             .field(
@@ -2033,6 +2171,151 @@ mod tests {
     fn unknown_thread_not_alive() {
         let registry = ThreadRegistry::new();
         assert!(!registry.is_alive(ThreadId(99)));
+    }
+
+    // -----------------------------------------------------------------------
+    // ARCH-2026-07-26 `cross-owner-closeout` (CR-SW-2): thread dumps get line
+    // numbers. The depositor publishes a line-less snapshot (it must stay
+    // lock-free), so the reader resolves — but only fail-closed.
+    // -----------------------------------------------------------------------
+
+    use crate::runtime::stackwalker::test_support::{named_method, store_with};
+    use crate::runtime::stackwalker::{LINE_NUMBER_NATIVE, LINE_NUMBER_UNKNOWN};
+    use cratonvm_native_api::StackTraceEntry;
+    use cratonvm_reader::attribute::LineNumberEntry;
+
+    fn deposited_entry(
+        class_id: crate::classloading::ClassId,
+        method: &str,
+        bci: i32,
+    ) -> StackTraceEntry {
+        // Exactly the shape `stackwalker::capture_frames_no_lines` deposits.
+        StackTraceEntry {
+            class_name: Arc::from("probe/Target"),
+            method_name: Arc::from(method),
+            source_file: Some(Arc::from("Target.java")),
+            line_number: LINE_NUMBER_UNKNOWN,
+            byte_code_index: bci,
+            class_id: Some(class_id),
+            method_index: None,
+        }
+    }
+
+    fn registry_with_trace(trace: Vec<StackTraceEntry>) -> (ThreadRegistry, ThreadId) {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "worker-1", None);
+        registry.set_frame_trace(tid, Arc::new(Mutex::new(trace)));
+        (registry, tid)
+    }
+
+    #[test]
+    fn frame_trace_of_is_line_less_and_resolved_reader_fills_it_in() {
+        let (store, cid) = store_with(vec![named_method(
+            "compute",
+            "()I",
+            vec![
+                LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 40,
+                },
+                LineNumberEntry {
+                    start_pc: 4,
+                    line_number: 41,
+                },
+            ],
+        )]);
+        let (registry, tid) = registry_with_trace(vec![
+            deposited_entry(cid, "compute", 0),
+            deposited_entry(cid, "compute", 6),
+        ]);
+
+        // What every consumer sees today.
+        let raw = registry.frame_trace_of(tid);
+        assert_eq!(raw.len(), 2);
+        assert!(raw.iter().all(|e| e.line_number == LINE_NUMBER_UNKNOWN));
+
+        // What a reader holding a ClassStore can see instead.
+        let resolved = registry.frame_trace_of_resolved(tid, &store);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].line_number, 40);
+        assert_eq!(resolved[1].line_number, 41);
+
+        // Resolution is non-destructive: the published snapshot is untouched,
+        // so a second reader still starts from the deposited state.
+        assert!(registry
+            .frame_trace_of(tid)
+            .iter()
+            .all(|e| e.line_number == LINE_NUMBER_UNKNOWN));
+    }
+
+    #[test]
+    fn resolved_reader_leaves_overloaded_and_native_frames_alone() {
+        let (store, cid) = store_with(vec![
+            named_method(
+                "run",
+                "(I)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 11,
+                }],
+            ),
+            named_method(
+                "run",
+                "(J)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 22,
+                }],
+            ),
+        ]);
+        let mut native = deposited_entry(cid, "run", -1);
+        native.line_number = LINE_NUMBER_NATIVE;
+        let (registry, tid) = registry_with_trace(vec![deposited_entry(cid, "run", 0), native]);
+
+        let resolved = registry.frame_trace_of_resolved(tid, &store);
+        assert_eq!(
+            resolved[0].line_number, LINE_NUMBER_UNKNOWN,
+            "a deposited frame has no method_index, so an overload set must \
+             stay unknown rather than print a line from the wrong body"
+        );
+        assert_eq!(resolved[1].line_number, LINE_NUMBER_NATIVE);
+        // Frame identity is never lost, which is the property a dump needs.
+        assert_eq!(&*resolved[0].class_name, "probe/Target");
+        assert_eq!(&*resolved[0].method_name, "run");
+    }
+
+    #[test]
+    fn resolved_reader_on_an_unknown_thread_is_empty_not_a_panic() {
+        let (store, _cid) = store_with(vec![named_method("compute", "()I", Vec::new())]);
+        let registry = ThreadRegistry::new();
+        assert!(registry
+            .frame_trace_of_resolved(ThreadId(99), &store)
+            .is_empty());
+    }
+
+    #[test]
+    fn resolved_reader_after_class_unload_keeps_the_frame_and_drops_only_the_line() {
+        let (mut store, cid) = store_with(vec![named_method(
+            "compute",
+            "()I",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 40,
+            }],
+        )]);
+        let (registry, tid) = registry_with_trace(vec![deposited_entry(cid, "compute", 0)]);
+        assert_eq!(
+            registry.frame_trace_of_resolved(tid, &store)[0].line_number,
+            40
+        );
+
+        // ClassIds are monotonic and never reused, so a stale id can only miss.
+        let _ = store.remove(cid);
+        let after = registry.frame_trace_of_resolved(tid, &store);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].line_number, LINE_NUMBER_UNKNOWN);
+        assert_eq!(&*after[0].method_name, "compute");
     }
 
     #[test]
@@ -2670,5 +2953,182 @@ mod tests {
             "deadline must bound the wait: {:?}",
             start.elapsed(),
         );
+    }
+
+    // -----------------------------------------------------------------
+    // ARCH-2026-07-26 — registry contention
+    // -----------------------------------------------------------------
+
+    /// Registry reads are concurrent: many threads must be able to be inside
+    /// `is_alive` / `get_park_state` / `is_blocked` at the same instant.
+    ///
+    /// Proven by holding a *read* guard on the map for the whole window and
+    /// requiring readers on other threads to complete anyway. Under the old
+    /// `Mutex` this would deadlock; under an `RwLock` the readers share.
+    #[test]
+    fn registry_reads_do_not_exclude_each_other() {
+        let registry = Arc::new(ThreadRegistry::new());
+        for i in 0..8u64 {
+            registry.register(ThreadId(i), &format!("t{i}"), None);
+        }
+
+        let held = registry.threads.read();
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut workers = Vec::new();
+        for i in 0..8u64 {
+            let r = registry.clone();
+            let tx = tx.clone();
+            workers.push(std::thread::spawn(move || {
+                assert!(r.is_alive(ThreadId(i)));
+                assert!(!r.is_blocked(ThreadId(i)));
+                assert_eq!(r.java_block_state(ThreadId(i)), 0);
+                assert!(r.get_park_state(ThreadId(i)).is_some());
+                assert_eq!(r.thread_name(ThreadId(i)), Some(format!("t{i}")));
+                assert_eq!(r.alive_count(), 8);
+                let _ = tx.send(());
+            }));
+        }
+        drop(tx);
+
+        let mut done = 0;
+        while done < 8 {
+            if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
+                break;
+            }
+            done += 1;
+        }
+        // Release before asserting/joining so a regression fails the assert
+        // instead of hanging the suite.
+        drop(held);
+        for w in workers {
+            w.join().unwrap();
+        }
+        assert_eq!(
+            done, 8,
+            "registry readers blocked each other — `threads` must be an RwLock \
+             so concurrent lookups do not serialize"
+        );
+    }
+
+    /// Registration still excludes readers: a write guard must block a reader,
+    /// which is what keeps the map's invariants intact across insert/remove.
+    #[test]
+    fn registry_writes_still_exclude_readers() {
+        let registry = Arc::new(ThreadRegistry::new());
+        registry.register(ThreadId(1), "t", None);
+
+        let held = registry.threads.write();
+        let r = registry.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let alive = r.is_alive(ThreadId(1));
+            let _ = tx.send(());
+            alive
+        });
+
+        let blocked = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err();
+        drop(held);
+        let alive = worker.join().unwrap();
+        assert!(blocked, "a writer must exclude readers");
+        assert!(
+            alive,
+            "the reader must still get the right answer afterwards"
+        );
+    }
+
+    /// The per-thread self-handle must return the *same* slot the registry
+    /// holds, so a cross-thread `post_async_exception` is visible to the
+    /// cached, lock-free `take_async_exception` on the target thread.
+    #[test]
+    fn cached_self_async_slot_is_the_registrys_slot() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "victim", None);
+
+        // Prime the thread-local cache.
+        assert!(registry.take_async_exception(tid).is_none());
+
+        let cached = registry.self_async_slot(tid).expect("slot");
+        let in_map = {
+            let threads = registry.threads.read();
+            Arc::clone(&threads.get(&tid).unwrap().async_exception_slot)
+        };
+        assert!(
+            Arc::ptr_eq(&cached, &in_map),
+            "the cached slot must BE the registry's slot, not a copy — \
+             otherwise a posted async exception is never observed"
+        );
+
+        // Round-trip through the cache after priming.
+        let mut backing = [0u64; 2];
+        let throwable = dummy_aligned_objref(&mut backing);
+        assert!(registry.post_async_exception(tid, throwable));
+        let taken = registry.take_async_exception(tid).expect("posted");
+        assert_eq!(taken.as_ptr(), throwable.as_ptr());
+        assert!(registry.take_async_exception(tid).is_none());
+    }
+
+    /// The self-handle cache is keyed by a process-monotonic registry id, so a
+    /// second registry that reuses the same `ThreadId` on the same OS thread
+    /// never sees the first registry's slot.
+    ///
+    /// Keying by the registry's *address* would be unsound here: `ThreadId`s
+    /// restart at 1 for every registry and a dropped registry's address can be
+    /// reused.
+    #[test]
+    fn self_slot_cache_does_not_leak_between_registries() {
+        let tid = ThreadId(1);
+
+        let first_slot = {
+            let a = ThreadRegistry::new();
+            a.register(tid, "a", None);
+            // Prime the cache for (a, tid).
+            assert!(a.take_async_exception(tid).is_none());
+            a.self_async_slot(tid).expect("slot")
+        };
+
+        let b = ThreadRegistry::new();
+        b.register(tid, "b", None);
+        let second_slot = b.self_async_slot(tid).expect("slot");
+
+        assert!(
+            !Arc::ptr_eq(&first_slot, &second_slot),
+            "the self-slot cache served a stale registry's slot"
+        );
+
+        // And the second registry's posts really land in the second slot.
+        let mut backing = [0u64; 2];
+        let throwable = dummy_aligned_objref(&mut backing);
+        assert!(b.post_async_exception(tid, throwable));
+        assert_eq!(
+            b.take_async_exception(tid).map(|o| o.as_ptr()),
+            Some(throwable.as_ptr())
+        );
+    }
+
+    /// A reaped (terminated, purged) entry must not make a cached slot unsafe:
+    /// the `Arc` keeps it alive, and the thread is dead so nobody can post to
+    /// it any more.
+    #[test]
+    fn cached_slot_survives_entry_reaping() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "victim", None);
+        assert!(registry.take_async_exception(tid).is_none()); // prime
+
+        registry.mark_dead(tid);
+        // Force the terminated-entry purge by exceeding the retention cap.
+        for i in 0..(TERMINATED_THREAD_ENTRY_CAP as u64 + 8) {
+            let t = ThreadId(i + 2);
+            registry.register(t, "filler", None);
+            registry.mark_dead(t);
+        }
+
+        // Still answerable, still `None`, and crucially still sound.
+        assert!(registry.take_async_exception(tid).is_none());
+        assert!(!registry.is_alive(tid));
     }
 }

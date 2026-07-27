@@ -887,10 +887,7 @@ fn discover_providers(
         })
         .unwrap_or(false);
 
-    let diag_sl = matches!(
-        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    );
+    let diag_sl = crate::nbflags().diag_serviceloader;
 
     if loader_is_jboss_module {
         if let Some(loader_r) = loader_ref_opt {
@@ -1209,10 +1206,7 @@ fn discover_providers(
 
     providers.sort();
     providers.dedup();
-    if matches!(
-        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    ) {
+    if crate::nbflags().diag_serviceloader {
         eprintln!(
             "[SL-DBG] ServiceLoader service={} loader_delegation={} descriptors={} providers={} ({:?})",
             service_name,
@@ -1389,10 +1383,7 @@ fn native_sl_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     list = ctx.read_native_pin(list_pin, list);
     ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
 
-    let diag = matches!(
-        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    );
+    let diag = crate::nbflags().diag_serviceloader;
     if diag {
         eprintln!(
             "[SL-DBG] iterator() entering loop with {} providers",
@@ -1601,10 +1592,7 @@ fn native_sl_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         // `.count()` / `.filter()` natives have a valid receiver.
         _ => return alloc_synthetic_stream(ctx, &[]),
     };
-    let diag = matches!(
-        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    );
+    let diag = crate::nbflags().diag_serviceloader;
 
     // Pin the ServiceLoader receiver — every `invoke` below can trigger a
     // moving GC that relocates it.
@@ -2451,6 +2439,8 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 

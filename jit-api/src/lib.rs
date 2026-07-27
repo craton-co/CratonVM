@@ -29,9 +29,147 @@ use std::sync::Arc;
 use cratonvm_reader::attribute::ExceptionTableEntry;
 use cratonvm_types::ClassId;
 
+/// Count Java parameters using CratonVM's compact one-slot-per-value calling
+/// convention. `long` and `double` each occupy one compact argument slot.
+///
+/// This descriptor contract belongs in the backend-neutral JIT API because
+/// class loading needs it while constructing cached call metadata. Keeping it
+/// in the concrete compiler crate inverted the intended
+/// `classloading -> jit-api <- jit` dependency direction.
+pub fn count_param_slots(descriptor: &str) -> usize {
+    let bytes = descriptor.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return 0;
+    }
+    let mut i = 1;
+    let mut slots = 0;
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'I' | b'F' | b'B' | b'C' | b'S' | b'Z' | b'J' | b'D' => {
+                slots += 1;
+                i += 1;
+            }
+            b'L' => {
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += usize::from(i < bytes.len());
+                slots += 1;
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    if bytes[i] == b'L' {
+                        while i < bytes.len() && bytes[i] != b';' {
+                            i += 1;
+                        }
+                        i += usize::from(i < bytes.len());
+                    } else {
+                        i += 1;
+                    }
+                }
+                slots += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    slots
+}
+
+#[cfg(test)]
+mod descriptor_contract_tests {
+    use super::count_param_slots;
+
+    #[test]
+    fn compact_parameter_count_is_backend_neutral() {
+        assert_eq!(count_param_slots("()V"), 0);
+        assert_eq!(count_param_slots("(IJDF)V"), 4);
+        assert_eq!(
+            count_param_slots("([[I[Ljava/lang/Object;Ljava/lang/String;)V"),
+            3
+        );
+        assert_eq!(count_param_slots("not-a-method-descriptor"), 0);
+    }
+}
+
 /// Cached bytecode method info — everything needed to create a Frame without
 /// any lock acquisitions or string allocations.
-#[derive(Clone)]
+///
+/// `Clone` is implemented by hand rather than derived because
+/// [`Self::jit_probe_generation`] is an `AtomicU64` (not `Clone`). The manual
+/// impl snapshots its current value, which is semantically right: the field is
+/// a *memo*, and copying a memo forward is always sound (at worst the clone
+/// re-probes once).
+///
+/// # Adding a field to this struct is a four-crate change
+///
+/// There are **38 struct literals** of this type, in
+/// `vm/src/runtime/interpreter.rs`, `vm/src/runtime/vtable.rs`,
+/// `vm/src/jit/helpers.rs`, `vm/src/runtime/lockfree_resolve.rs`,
+/// `vm/src/vm.rs`, `classloading/src/resolution.rs`, `jit/src/lib.rs`,
+/// `jit/tests/ir_vs_singlepass.rs` and this file — spanning
+/// `cratonvm-jit-api`, `cratonvm-jit`, `cratonvm-classloading` and
+/// `cratonvm-vm`. Only five have a `..expr` functional-update tail (the
+/// `..make_cached_method()` literals in this file's `mod tests`), and those are
+/// the ones to watch: they keep compiling silently while every other literal
+/// errors. A `Default` impl does not help — a struct literal must name every
+/// field unless it ends in `..expr`.
+///
+/// Changing an existing field's **type** is far cheaper: all 38 literals spell
+/// the four `OnceLock` fields as `std::sync::OnceLock::new()`, which re-infers,
+/// so an `OnceLock<T>` → `OnceLock<U>` change touches only this file and the
+/// handful of named readers. That is why [`Self::native_callback_cache`] still
+/// carries its old name while holding a `NativeCallSite`.
+///
+/// # CR-CLO-2 — the `method_index` field this struct still wants
+///
+/// **Not landed.** Specified here because the pass that needed it
+/// (`frame-index-and-crash-trace`, 2026-07-26) owned this file but none of the
+/// eight *production* sites that would populate the field, so landing it would
+/// have left the workspace non-compiling for eight concurrent agents while
+/// still producing `None` everywhere.
+///
+/// *What.* `pub method_index: Option<u32>` — this method's slot in its
+/// declaring class's `Class::methods` list. The value belongs here rather than
+/// on `Frame` because this entry is built once per call site and `Arc`-shared
+/// across every call through it, so the slot is resolved **once per method**
+/// instead of once per frame push.
+///
+/// *Why.* `stackwalker::capture_frames_no_lines` — the thread-dump depositor
+/// that runs at every blocking/safepoint deposit and therefore must not take a
+/// `ClassStore` borrow — publishes `StackTraceEntry::method_index: None`, so
+/// deferred resolution (`stackwalker::resolve_line_numbers_in_place`) falls
+/// back to the unambiguous-name rule and leaves every **overloaded** frame with
+/// no line number at all. A `u32` copied out of the frame costs no borrow, no
+/// lock and no allocation.
+///
+/// *How to land it.* Add the field, then populate it at the six sites that
+/// already hold a live `ClassStore` borrow plus the resolved `&ClassFileMethod`
+/// and declaring `ClassId` — `vm/src/runtime/interpreter.rs` in
+/// `try_invoke_cached_lambda_impl`, `populate_invoke_cache`,
+/// `try_jit_upgrade_with_gate`, `try_jit_compile_callee_slow`,
+/// `populate_virtual_invoke_cache`, and `vm/src/jit/helpers.rs` in
+/// `try_resume_trapped_callee`. `vm/src/runtime/vtable.rs`'s
+/// `vtable_install_adapter` has no store but does have
+/// `VtableSlotDescriptor::method_index` already resolved at link time, so it
+/// can pass it straight through. The one production site with neither is the
+/// first-call tier-up deopt-resume path in `interpreter.rs::execute`, which
+/// drops its `class_manager` guard before building the entry; `None` there is
+/// correct and costs only that one path the fallback rule.
+///
+/// Then `Frame::new_pooled_cached` (`vm/src/runtime/frame.rs`) seeds
+/// `Frame::method_index` from `cached.method_index` — one line, already
+/// commented in place — and `capture_frames_no_lines` swaps its `None` for
+/// `f.method_index()`.
+///
+/// *What it must NOT be used for.* It does not make deferring the `Throwable`
+/// capture path safe. Index verification is by *name*, so a redefinition that
+/// reorders an overload set across the capture/read window is the one case
+/// verification cannot catch, and eager capture has no such window. See
+/// `docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6.
 pub struct CachedBytecodeMethod {
     pub declaring_class_id: ClassId,
     pub class_name: Arc<str>,
@@ -63,22 +201,233 @@ pub struct CachedBytecodeMethod {
     /// after this entry is populated, so it is still re-evaluated on every
     /// hit (cheap: a single generation-counter read plus a short allowlist).
     pub force_native_cache: std::sync::OnceLock<bool>,
+    /// Per-call-site native-dispatch memo. **Read it through
+    /// [`Self::native_call_site`], never directly.**
+    ///
     /// Perf follow-up (2026-07-19, TestResponsePerformance interpreter-
-    /// throughput residual): memoizes the resolved `NativeCallback` (or
-    /// `None`) for this callsite, mirroring `force_native_cache` above.
-    /// `intercept_force_registered_native_cached` previously called
+    /// throughput residual): `intercept_force_registered_native_cached` called
     /// `NativeMethodRegistry::find` (a hash-keyed lookup over all three of
     /// class/method/descriptor) on every single cached-invoke hit whose
     /// force-native decision was `true` -- confirmed via `perf` to be the
-    /// #2 hottest symbol (~7% of samples) on this same benchmark, second
-    /// only to the interpreter's own frame-dispatch loop. Native-method
-    /// registration is immutable after VM boot (no redefinition path
-    /// touches the registry), so the same (class, method, descriptor)
-    /// triple always resolves to the same callback for the life of the
-    /// process -- caching it here is sound by the same argument already
-    /// used for `force_native_cache`. See docs/known-issues/tomcat-08-07/
-    /// silent-hang-no-signature-cluster.md.
-    pub native_callback_cache: std::sync::OnceLock<Option<cratonvm_native_api::NativeCallback>>,
+    /// #2 hottest symbol (~7% of samples) on that benchmark, second only to
+    /// the interpreter's own frame-dispatch loop. See
+    /// docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
+    ///
+    /// # Why this holds a `NativeCallSite` and not an `Option<NativeCallback>`
+    ///
+    /// It used to be `OnceLock<Option<NativeCallback>>`, whose soundness
+    /// argument was "native registration is immutable after VM boot". That is
+    /// true of the steady state but **not of boot itself**, and not of
+    /// `alias_class` or of the lazy `register_*` passes that run after the
+    /// first bytecode executes. A `None` memoized before those run stayed
+    /// wrong forever: a native that *is* registered, and that dispatches fine
+    /// through `find`, was invisible at this call site for the life of the
+    /// process. `cratonvm_native_api::NativeCallSite` keys its memo on the
+    /// registry generation instead, so a stale negative self-heals at the cost
+    /// of one `u32` compare -- the same argument
+    /// [`Self::jit_probe_generation`] below already relies on. See
+    /// `docs/internal/arch-2026-07-26/native-dispatch-memoization.md` §3
+    /// Steps 0 and 2 (sites A1-A3).
+    ///
+    /// # ONE CELL, ONE TRIPLE
+    ///
+    /// A `NativeCallSite` memo is `(generation << 32) | slot`, validated
+    /// against the generation *alone* -- the triple is deliberately not
+    /// re-checked on a warm hit, because re-hashing three strings is the exact
+    /// cost the cell exists to remove. A cell reached with two different
+    /// triples silently serves the second whatever the first memoized. This
+    /// cell therefore answers for **this entry's own
+    /// `(class_name, method_name, method_descriptor)` and nothing else**. A
+    /// call site that needs a *different* triple (e.g. the
+    /// `java/lang/ClassLoader` re-target inside
+    /// `intercept_force_registered_native_cached`) must use its own cell or
+    /// plain `find`. Pinned by
+    /// `sharing_one_memo_cell_across_two_triples_silently_mis_answers` in
+    /// `vm/src/runtime/interpreter.rs`.
+    ///
+    /// # Field name
+    ///
+    /// Still `native_callback_cache` only because ~20 struct literals live in
+    /// crates the wave that changed this could not write to, and the literals
+    /// all read `std::sync::OnceLock::new()`, which type-infers unchanged. The
+    /// rename to `native_call_site` is a pure mechanical follow-up; see the
+    /// cross-owner request in
+    /// `docs/internal/arch-2026-07-26/interpreter-completion.md`.
+    pub native_callback_cache: std::sync::OnceLock<cratonvm_native_api::NativeCallSite>,
+    /// T2.5 — memoized JIT invocation-counter key for this method, i.e. the
+    /// packed `(declaring_class_id << 32) | hash(method_name ++ descriptor)`
+    /// u64 that the interpreter uses to index
+    /// `ProfileStore::increment_invocation`.
+    ///
+    /// The interpreter's `Bytecode` / `VirtualBytecode` dispatch arms recomputed
+    /// this key on EVERY interpreted invocation of a not-yet-compiled method by
+    /// running a 31-multiplier byte loop over both the method name and the full
+    /// descriptor — pure per-call overhead on the hottest interpreter path, for
+    /// a value that is a pure function of three immutable fields of this entry.
+    /// Memoized here for exactly the same reason (and by exactly the same
+    /// argument) as [`Self::force_native_cache`] and
+    /// [`Self::native_callback_cache`] above. Read via [`Self::invoc_key`].
+    pub invoc_key: std::sync::OnceLock<u64>,
+    /// T2.2 — epoch memo for "this method has no published JIT body".
+    ///
+    /// Holds the value of `cratonvm_jit::jit_cache_generation()` as of the last
+    /// time an interpreter dispatch arm probed the shared JIT cache for this
+    /// method and found *nothing*. `0` means "never probed" (the live generation
+    /// starts at 1 and only ever increases, so `0` can never compare equal to
+    /// it).
+    ///
+    /// Why this exists: the interpreter's cached-invoke `Bytecode` arms had to
+    /// call `JitCache::get(class, method, descriptor, class_id)` on every single
+    /// interpreted call, purely to notice that a background compile had
+    /// published a body for this method. That lookup hashes all three strings
+    /// and then re-compares all three with full string equality — the exact
+    /// re-resolution the per-call-site inline cache exists to avoid. Because
+    /// *every* JIT-cache publication and invalidation bumps the global
+    /// generation, comparing this snapshot against it is an equivalent test:
+    /// equal ⇒ the cache content has not changed since we last looked and found
+    /// nothing, so looking again cannot find anything. Steady state therefore
+    /// costs two integer loads and a compare instead of three string hashes and
+    /// three string comparisons.
+    ///
+    /// Correctness rests on the generation being bumped by every writer of the
+    /// JIT cache; see `JitCache::put` / `put_osr` / `invalidate_matching` /
+    /// `clear_all` in `jit/src/lib.rs`, which are the only mutators.
+    pub jit_probe_generation: std::sync::atomic::AtomicU64,
+    /// Perf (2026-07-25, bytecode quickening): memoizes this method's
+    /// pre-decoded instruction stream, mirroring `force_native_cache` above.
+    ///
+    /// The interpreter's spec-correct dispatch path used to call
+    /// `Instruction::decode` on *every* execution of *every* bytecode -- a
+    /// full opcode match plus operand reads, and a heap allocation for the
+    /// out-of-line payload of every `tableswitch` / `lookupswitch` that
+    /// executed. `cratonvm_reader::QuickenedCode` does that decode once and
+    /// hands out borrowed `&Instruction` records thereafter.
+    ///
+    /// `None` means "this method could not be pre-decoded" (a linear walk
+    /// from pc 0 hit a decode error); such methods keep using the original
+    /// on-demand decode, so quickening can never change behaviour.
+    ///
+    /// The stream itself is interned process-wide on the identity of the
+    /// bytecode allocation (`cratonvm_reader::quickened::intern`), so the
+    /// several `CachedBytecodeMethod`s that a hot method accumulates across
+    /// call sites all share one copy rather than each building their own.
+    pub quickened: std::sync::OnceLock<Option<std::sync::Arc<cratonvm_reader::QuickenedCode>>>,
+}
+
+impl Clone for CachedBytecodeMethod {
+    fn clone(&self) -> Self {
+        Self {
+            declaring_class_id: self.declaring_class_id,
+            class_name: Arc::clone(&self.class_name),
+            method_name: Arc::clone(&self.method_name),
+            method_descriptor: Arc::clone(&self.method_descriptor),
+            source_file: self.source_file.clone(),
+            code: Arc::clone(&self.code),
+            exception_table: Arc::clone(&self.exception_table),
+            max_stack: self.max_stack,
+            max_locals: self.max_locals,
+            num_params: self.num_params,
+            is_synchronized: self.is_synchronized,
+            is_static: self.is_static,
+            force_native_cache: self.force_native_cache.clone(),
+            // `NativeCallSite: Clone` snapshots the memo word. Carrying it
+            // forward is sound for the same reason `jit_probe_generation`'s
+            // snapshot is: the memo is generation-keyed, so a clone that
+            // inherits a stale word re-resolves on its first read after the
+            // registry moves. The clone answers for the same triple, because
+            // the triple fields are `Arc`-shared with it.
+            native_callback_cache: self.native_callback_cache.clone(),
+            invoc_key: self.invoc_key.clone(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(
+                self.jit_probe_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            // Cloning the memo is correct and desirable: the quickened stream is
+            // a pure function of `code`, which is `Arc`-shared with the clone, so
+            // the clone would derive an identical stream. Carrying it over just
+            // avoids re-deriving it (and the intern-table probe) on first use.
+            quickened: self.quickened.clone(),
+        }
+    }
+}
+
+impl CachedBytecodeMethod {
+    /// This entry's native-dispatch memo cell — see
+    /// [`Self::native_callback_cache`] for the full contract.
+    ///
+    /// The returned cell is a drop-in for
+    /// `shared.natives.native_methods.find(class, method, desc)`:
+    ///
+    /// ```ignore
+    /// let cb = cached.native_call_site().callback(
+    ///     &shared.natives.native_methods,
+    ///     cached.class_name.as_ref(),
+    ///     cached.method_name.as_ref(),
+    ///     cached.method_descriptor.as_ref(),
+    /// );
+    /// ```
+    ///
+    /// It must only ever be handed this entry's own triple — the memo is per
+    /// call site, not per triple, and is not re-validated against the strings
+    /// on a warm hit. The `OnceLock` wrapper exists purely so that the ~20
+    /// `CachedBytecodeMethod` struct literals that spell this field
+    /// `std::sync::OnceLock::new()` keep compiling; it costs one already-hot
+    /// acquire load ahead of the memo's relaxed load.
+    #[inline]
+    pub fn native_call_site(&self) -> &cratonvm_native_api::NativeCallSite {
+        self.native_callback_cache
+            .get_or_init(cratonvm_native_api::NativeCallSite::new)
+    }
+
+    /// The memoized JIT invocation-counter key for this method — see
+    /// [`Self::invoc_key`]. Computed on first use, then read straight out of the
+    /// `OnceLock`.
+    ///
+    /// The hash must stay bit-identical to the two open-coded loops this
+    /// replaced (`vm/src/runtime/interpreter.rs`, the invokestatic `Bytecode`
+    /// arm and the instance tier-up path), because both keyed the *same*
+    /// `ProfileStore` invocation counters: a different key would silently reset
+    /// every method's warmup count.
+    #[inline]
+    pub fn invoc_key(&self) -> u64 {
+        *self.invoc_key.get_or_init(|| {
+            let mut h = 0u32;
+            for &b in self.method_name.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+            }
+            for &b in self.method_descriptor.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+            }
+            // Widening: class ID to u64 for hash key
+            ((self.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
+        })
+    }
+
+    /// T2.2 — has this method already been probed against the shared JIT cache
+    /// at generation `current_generation` and found to have no compiled body?
+    ///
+    /// `current_generation` must come from `cratonvm_jit::jit_cache_generation()`
+    /// (an `Acquire` load). A `true` answer means the caller may skip the
+    /// string-keyed `JitCache::get` entirely.
+    #[inline]
+    pub fn jit_probe_is_current(&self, current_generation: u64) -> bool {
+        self.jit_probe_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == current_generation
+    }
+
+    /// T2.2 — record that a `JitCache::get` for this method returned `None`
+    /// while the cache was at `generation`.
+    ///
+    /// `Relaxed` is sufficient: the value is only ever used to skip a lookup
+    /// that would have returned `None` anyway, and the *global* generation read
+    /// that guards it is an `Acquire` load, so a reader that observes a newer
+    /// generation also observes the publication that caused it.
+    #[inline]
+    pub fn record_jit_probe_miss(&self, generation: u64) {
+        self.jit_probe_generation
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a
@@ -402,6 +751,49 @@ pub struct JitRuntimeHelpers {
     /// returned reference remains valid after a relocating collection; JIT code
     /// must never bake a managed-object address as an immediate.
     pub ldc_string: usize,
+    /// Cooperative JIT safepoint polling (`CRATONVM_JIT_SAFEPOINT_POLLS`, off
+    /// by default) — address of the single STW-requested flag byte
+    /// (`GcBarrier::stw_requested`, see
+    /// `vm/src/threading/gc_barrier.rs::stw_requested_flag_addr`), NOT a
+    /// function pointer. The JIT backend bakes this address as an absolute
+    /// immediate (`MOV R11, imm64`) and emits `TEST byte ptr [R11], 0xFF; JNZ
+    /// slow` at method entry (context methods only) and on every `goto`
+    /// loop back-edge when the flag is wired. `0` = polling disabled
+    /// entirely — the backend emits no poll code and GC continues to rely
+    /// solely on the `SuspendThread`-based conservative scan
+    /// (`vm/src/jit/xt_root_scan.rs`) for threads running JIT code. The
+    /// `GcBarrier` this points at lives inside `Arc<SharedVm>`, so the
+    /// address is stable for the life of the VM (see the stability contract
+    /// on `stw_requested_flag_addr`). Appended at the END of the struct so
+    /// all prior golden offsets stay stable.
+    pub safepoint_flag_addr: usize,
+    /// Cooperative JIT safepoint polling slow path — address of
+    /// `extern "C" fn(vm_ptr: i64)`
+    /// (`vm/src/jit/helpers.rs::jit_safepoint_slow_path`). Called only on a
+    /// poll hit (the inline flag-byte check observed a nonzero value):
+    /// the poll site first performs the existing pre-safepoint register
+    /// spill (`x64.rs::emit_pre_safepoint_spill`) so the frame's oop map is
+    /// valid, THEN calls this helper, which joins the same stop-the-world
+    /// wait the interpreter's own poll hit uses
+    /// (`vm/src/runtime/interpreter.rs::safepoint_check`) so GC observes
+    /// this thread's roots exactly like an interpreter frame.
+    /// `vm/src/jit/helpers.rs::build_helpers` wires this unconditionally
+    /// (the function always exists); [`Self::safepoint_flag_addr`] is what
+    /// actually gates whether the JIT ever emits a `CALL` to it, so this
+    /// field being non-zero while that one is `0` is harmless (dead code,
+    /// never reached). Appended at the END of the struct so all prior
+    /// golden offsets stay stable.
+    pub safepoint_slow_path: usize,
+    /// Stable address of the generational collector's atomic card-byte array.
+    ///
+    /// Together with `jit_card_old_base/end`, this enables the x64 backend to
+    /// emit the post-store card mark inline. All three fields are zero for G1
+    /// and ZGC, whose remembered-set protocols remain helper-owned.
+    pub jit_card_table_addr: usize,
+    /// Inclusive old-generation base covered by `jit_card_table_addr`.
+    pub jit_card_old_base: usize,
+    /// Exclusive old-generation end covered by `jit_card_table_addr`.
+    pub jit_card_old_end: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -545,6 +937,21 @@ helper_fields! {
     // Leaf floor-query helper for the inline self-recursion check.
     (native_stack_floor_fn,          FieldKind::OptionalPtr),
     (ldc_string,                     FieldKind::RequiredPtr),
+    // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
+    // off by default). Address of the STW-requested flag byte, not a
+    // pointer — 0 = polling disabled (matches the region_bounds_addr
+    // "optional address" convention above).
+    (safepoint_flag_addr,            FieldKind::Offset),
+    // Slow-path helper called on a poll hit. build_helpers wires this
+    // unconditionally; safepoint_flag_addr above is what actually gates
+    // whether the JIT ever emits a CALL to it, so 0 here is only ever
+    // "not wired" for a hand-built test helpers table.
+    (safepoint_slow_path,            FieldKind::OptionalPtr),
+    // Optional generational inline-card metadata. These are data addresses /
+    // bounds rather than callable targets and are all zero for G1/ZGC.
+    (jit_card_table_addr,             FieldKind::Offset),
+    (jit_card_old_base,               FieldKind::Offset),
+    (jit_card_old_end,                FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -570,7 +977,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 51,
+    JitRuntimeHelpers::NUM_FIELDS == 56,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -675,7 +1082,226 @@ mod tests {
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         }
+    }
+
+    fn noop_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[cratonvm_types::Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(None)
+    }
+
+    /// Step 0 of `docs/internal/arch-2026-07-26/native-dispatch-memoization.md`
+    /// §3: the per-entry native-dispatch memo must be substitutable for
+    /// `registry.find(class, method, descriptor)` — on a miss, on a hit, and
+    /// warm.
+    #[test]
+    fn native_call_site_is_substitutable_for_find() {
+        let cached = make_cached_method();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+
+        // Miss agrees with `find`.
+        assert!(registry
+            .find(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor
+            )
+            .is_none());
+        assert!(cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .is_none());
+
+        registry.register(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            noop_native,
+        );
+
+        let via_find = registry
+            .find(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("registered native must be findable");
+        let via_cell = cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("the cell must resolve what `find` resolves");
+        assert_eq!(via_find as usize, via_cell as usize);
+
+        // Warm read agrees with itself.
+        let warm = cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("warm read");
+        assert_eq!(warm as usize, via_find as usize);
+    }
+
+    /// THE LATENT BUG THIS FIELD CHANGE FIXES. The old
+    /// `OnceLock<Option<NativeCallback>>` memoized a *negative* permanently, so
+    /// a native registered by `alias_class` or a lazy `register_*` pass — both
+    /// of which run after the first bytecode executes — was invisible at this
+    /// call site for the rest of the process, while `find` kept resolving it.
+    /// The generation-keyed cell must self-heal.
+    #[test]
+    fn native_call_site_heals_a_negative_after_late_registration() {
+        let cached = make_cached_method();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+
+        // Warm the cell with a negative, twice, so a `OnceLock`-shaped memo
+        // would definitely be sealed.
+        for _ in 0..2 {
+            assert!(cached
+                .native_call_site()
+                .callback(
+                    &registry,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                )
+                .is_none());
+        }
+
+        registry.register(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            noop_native,
+        );
+
+        assert!(
+            cached
+                .native_call_site()
+                .callback(
+                    &registry,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                )
+                .is_some(),
+            "a native registered after the call site first ran must become \
+             visible once the registry generation moves"
+        );
+    }
+
+    /// The cell is reached through `&self`, so the same `Arc`-shared entry that
+    /// several call sites hold must hand back one stable cell — and `Clone`
+    /// must carry a usable (not corrupt) memo forward, per the hand-written
+    /// `Clone` impl's comment.
+    #[test]
+    fn native_call_site_is_stable_per_entry_and_survives_clone() {
+        let cached = make_cached_method();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.register(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            noop_native,
+        );
+
+        let first = cached.native_call_site() as *const _;
+        let second = cached.native_call_site() as *const _;
+        assert_eq!(
+            first, second,
+            "`native_call_site()` must return the one cell this entry owns"
+        );
+
+        let warm = cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("warm");
+
+        let cloned = cached.clone();
+        // The clone shares the triple (`Arc`), so the inherited memo answers
+        // for the same triple and must agree.
+        let via_clone = cloned
+            .native_call_site()
+            .callback(
+                &registry,
+                &cloned.class_name,
+                &cloned.method_name,
+                &cloned.method_descriptor,
+            )
+            .expect("clone must resolve the same native");
+        assert_eq!(via_clone as usize, warm as usize);
+        // ...but it is a distinct cell, so mutating one cannot corrupt the other.
+        assert_ne!(
+            cached.native_call_site() as *const _,
+            cloned.native_call_site() as *const _
+        );
+    }
+
+    /// T2.2 — the memo primitive, tested against literal generation values so
+    /// it is completely independent of the process-global counter (and therefore
+    /// race-free under a parallel `cargo test`). The end-to-end protocol against
+    /// a real `JitCache` is tested in the `cratonvm-jit` crate.
+    #[test]
+    fn jit_probe_generation_memo_reports_current_only_for_the_recorded_value() {
+        let cached = make_cached_method();
+        // A fresh entry has never probed: 0 can never equal a live generation
+        // (`JIT_CACHE_GENERATION` starts at 1 and only increases).
+        assert!(!cached.jit_probe_is_current(1));
+        assert!(!cached.jit_probe_is_current(u64::MAX));
+
+        cached.record_jit_probe_miss(17);
+        // Fast path engages only for the exact generation the probe ran at.
+        assert!(cached.jit_probe_is_current(17));
+        assert!(!cached.jit_probe_is_current(18));
+        assert!(!cached.jit_probe_is_current(16));
+
+        // A later probe at a newer generation replaces the memo.
+        cached.record_jit_probe_miss(18);
+        assert!(cached.jit_probe_is_current(18));
+        assert!(!cached.jit_probe_is_current(17));
+    }
+
+    /// The manual `Clone` impl must carry the memos forward, not silently drop
+    /// them (a dropped memo is only a perf regression, but a *wrong* one would
+    /// be a correctness bug, so pin the exact values).
+    #[test]
+    fn clone_preserves_the_memo_fields() {
+        let cached = make_cached_method();
+        cached.record_jit_probe_miss(99);
+        let key = cached.invoc_key();
+        let _ = cached.force_native_cache.set(true);
+
+        let copy = cached.clone();
+        assert!(copy.jit_probe_is_current(99));
+        assert_eq!(copy.invoc_key(), key);
+        assert_eq!(copy.force_native_cache.get(), Some(&true));
+
+        // The clone's atomic is independent of the original's.
+        copy.record_jit_probe_miss(100);
+        assert!(cached.jit_probe_is_current(99));
+        assert!(copy.jit_probe_is_current(100));
     }
 
     fn make_helpers() -> JitRuntimeHelpers {
@@ -731,6 +1357,11 @@ mod tests {
             region_bounds_addr: 0x1148,
             native_stack_floor_fn: 0x1150,
             ldc_string: 0x1158,
+            safepoint_flag_addr: 0x1160,
+            safepoint_slow_path: 0x1168,
+            jit_card_table_addr: 0x1170,
+            jit_card_old_base: 0x1178,
+            jit_card_old_end: 0x1180,
         }
     }
 
@@ -954,6 +1585,11 @@ mod tests {
             region_bounds_addr: 0,
             native_stack_floor_fn: 0,
             ldc_string: 0,
+            safepoint_flag_addr: 0,
+            safepoint_slow_path: 0,
+            jit_card_table_addr: 0,
+            jit_card_old_base: 0,
+            jit_card_old_end: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1129,8 +1765,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 51.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 51);
+        // And the macro-driven count is the canonical 56.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 56);
     }
 
     #[test]
@@ -1383,6 +2019,31 @@ mod tests {
                 "ldc_string",
                 std::mem::offset_of!(JitRuntimeHelpers, ldc_string),
             ),
+            (
+                51,
+                "safepoint_flag_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, safepoint_flag_addr),
+            ),
+            (
+                52,
+                "safepoint_slow_path",
+                std::mem::offset_of!(JitRuntimeHelpers, safepoint_slow_path),
+            ),
+            (
+                53,
+                "jit_card_table_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_card_table_addr),
+            ),
+            (
+                54,
+                "jit_card_old_base",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_card_old_base),
+            ),
+            (
+                55,
+                "jit_card_old_end",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_card_old_end),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1419,12 +2080,12 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 41 RequiredPtr + 5
-        // Offset + 5 OptionalPtr = 51. A new field whose classification
-        // is omitted will fail to compile (the macro requires both
-        // arms); this test pins the *counts* so a reclassification
-        // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
-        // deliberate, reviewed change.
+        // The macro must classify every field. 41 RequiredPtr + 6
+        // 41 RequiredPtr + 6 OptionalPtr + 9 Offset = 56. A new
+        // field whose classification is omitted will fail to compile (the
+        // macro requires both arms); this test pins the *counts* so a
+        // reclassification (e.g. demoting a RequiredPtr to OptionalPtr) is
+        // also a deliberate, reviewed change.
         let h = make_helpers();
         let f = h.all_fields();
         let req = f
@@ -1437,8 +2098,8 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 41, "required-pointer count drifted");
-        assert_eq!(opt, 5, "optional-pointer count drifted");
-        assert_eq!(off, 5, "offset-field count drifted");
+        assert_eq!(opt, 6, "optional-pointer count drifted");
+        assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

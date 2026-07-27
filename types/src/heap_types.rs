@@ -12,19 +12,38 @@ use std::sync::atomic::AtomicU64;
 
 /// Size of `ObjectHeader` in bytes. Must be a multiple of 8 for alignment.
 ///
-/// NOTE: This was increased from 32 to 40 bytes when the `mark_word` field
-/// was appended to support thin-lock monitors. Downstream consumers (JIT, GC)
-/// that reference `HEADER_SIZE` will pick up the new size automatically; any
-/// code that hardcoded `32` must be updated.
-pub const HEADER_SIZE: usize = 40;
+/// The array length and object shape share a word, and age/flags occupy the
+/// first word's two spare bytes, keeping both forwarding and lock words while
+/// avoiding the former 8 bytes of padding/redundant shape state.
+pub const HEADER_SIZE: usize = 32;
 
-// JIT x64 emits array element offsets as signed disp8 = HEADER_SIZE as u8.
-// If HEADER_SIZE exceeds 127, disp8 wraps to negative and produces wrong
-// addresses. Bump to disp32 emission in jit/src/x64.rs:6690-6813 before
-// allowing HEADER_SIZE to grow beyond this limit.
+// JIT x64 emits array element offsets as a *signed* disp8 whose value is
+// HEADER_SIZE. If HEADER_SIZE exceeds 127 the disp8 wraps negative and the
+// emitted code addresses backwards from the object base. Convert the affected
+// emitters to disp32 before allowing HEADER_SIZE to grow beyond this limit;
+// the authoritative site inventory is
+// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §6.2
+// (the older "jit/src/x64.rs:6690-6813" citation was stale — that range holds
+// loop/BCE analysis, not an emitter).
 const _: () = assert!(
     HEADER_SIZE <= 127,
     "HEADER_SIZE must fit in signed disp8 for JIT array access"
+);
+
+// The object body is addressed as a run of qword cells starting at HEADER_SIZE,
+// and both the JIT's inline TLAB bump (`emit_inline_tlab_new`) and its Rust twin
+// (`Tlab::alloc_initialized`) advance the cursor by `HEADER_SIZE + body_size`
+// with an 8-byte alignment grid. `body_size` is always a multiple of 8 (legacy
+// layouts are `n * SLOT_SIZE` = n*16; compact layouts are pinned by
+// `ObjectHeader::set_compact_shape`'s `body_size & 7 == 0` assert), so the whole
+// grid holds iff HEADER_SIZE is itself 8-aligned. This was previously only a
+// `debug_assert` on the allocation path — compiled out in release, where a
+// violation is a silent heap-walk desync rather than a panic. Pin it at compile
+// time so no future HEADER_SIZE can break the grid at all.
+const _: () = assert!(
+    HEADER_SIZE % 8 == 0,
+    "HEADER_SIZE must be 8-aligned or the TLAB bump grid and qword-indexed body \
+     cells desync (silent heap-walk corruption in release builds)"
 );
 
 // --- Mark word (thin-lock / monitor inflation) -----------------------------
@@ -35,9 +54,17 @@ const _: () = assert!(
 //   00 = NEUTRAL      (no lock held)
 //   01 = THIN_LOCKED  (owner thread id + recursion count in upper bits)
 //   10 = INFLATED     (pointer to heap-allocated Monitor in upper 62 bits)
-//   11 = reserved
+//   11 = FORWARDED    (GC relocation target in upper 62 bits)
 //
 // All transitions are performed via atomic CAS on the `mark_word` field.
+//
+// The four states are mutually exclusive: the 2-bit tag is read with
+// `ObjectHeader::mark_state` and compared for *equality*, never tested with a
+// bitwise AND. That is what makes `0b11` claimable — a bitwise `mark &
+// MARK_INFLATED != 0` test would have aliased FORWARDED onto INFLATED and
+// handed a relocation address to `inflated_monitor()` as a `Monitor*`. Every
+// consumer in `vm/src/threading/monitor.rs` was audited for this before the
+// state was claimed; see `docs/internal/arch-2026-07-26/header-shrink.md` §4.
 
 /// Mark word state: no lock held. Identity hash code may live in upper bits
 /// (caller-managed).
@@ -46,6 +73,16 @@ pub const MARK_NEUTRAL: u64 = 0b00;
 pub const MARK_THIN_LOCKED: u64 = 0b01;
 /// Mark word state: object's monitor has been inflated to a heap `Monitor`.
 pub const MARK_INFLATED: u64 = 0b10;
+/// Mark word state: object has been relocated by the GC; the upper 62 bits are
+/// the full 64-bit forwarding target (see [`ObjectHeader::make_forwarded`]).
+///
+/// **Not yet produced by anything.** This is the encoding half of the
+/// `ObjectHeader` 32→24 shrink; the `forwarding_ptr` field is still the live
+/// mechanism and remains the single source of truth until the consumers listed
+/// in `docs/internal/arch-2026-07-26/header-shrink.md` §6 are migrated in one
+/// atomic change. It is landed now, with round-trip coverage, so the second
+/// pass adopts a tested encoding instead of inventing one.
+pub const MARK_FORWARDED: u64 = 0b11;
 /// Mask covering the 2-bit state field of the mark word.
 pub const MARK_STATE_MASK: u64 = 0b11;
 
@@ -65,12 +102,24 @@ pub const THIN_LOCK_OWNER_MASK: u64 = 0xffff_ffffu64 << THIN_LOCK_OWNER_SHIFT;
 /// 8-byte aligned, leaving bit 2 free as well.)
 pub const INFLATED_PTR_MASK: u64 = !MARK_STATE_MASK;
 
+/// Forwarded mark word: relocation target (high 62 bits) | [`MARK_FORWARDED`]
+/// (low 2 bits).
+///
+/// Identical in shape to [`INFLATED_PTR_MASK`], and deliberately so — both
+/// carry a **full 64-bit** pointer with only the low 2 tag bits borrowed. The
+/// address is *not* shifted, so nothing is truncated and no overflow side table
+/// is needed: heap objects are 8-byte aligned (`HEADER_SIZE % 8 == 0` and every
+/// allocator aligns to 8), so bits 0-2 of a legal object address are already
+/// zero and `addr | MARK_FORWARDED` round-trips exactly through
+/// `mark & FORWARDING_PTR_MASK` for any address in the 64-bit space.
+pub const FORWARDING_PTR_MASK: u64 = !MARK_STATE_MASK;
+
 /// Byte offset of `mark_word` within `ObjectHeader`. Documented for downstream
 /// agents (JIT lock fast-path) so they can emit direct atomic loads / CAS.
 ///
-/// Derived from the `#[repr(C)]` layout: HEADER_SIZE(40) - 8 = 32. The
+/// Derived from the `#[repr(C)]` layout: HEADER_SIZE(32) - 8 = 24. The
 /// `_const_check_mark_word_offset` assertion below pins this at compile time.
-pub const MARK_WORD_OFFSET: usize = 32;
+pub const MARK_WORD_OFFSET: usize = 24;
 
 /// Size of each field/array element slot in bytes.
 /// Must be >= size_of::<Value>() (which is 16 bytes: 8 for the payload + 8 for the discriminant).
@@ -164,15 +213,42 @@ pub const MAX_SEQUENTIAL_CLASS_ID: u32 = u32::MAX;
 // pinned at test time rather than compile time (see
 // `autobox_class_id_is_reserved` in the tests module below).
 
-/// Byte offset of the `array_length` field within `ObjectHeader`.
-/// Derived from the `#[repr(C)]` layout: ClassId(4) + kind(1) + element_type(1) + padding(2) + identity_hash_code(4) = 12.
-/// Used by the JIT compiler for inline array length reads.
+/// Byte offset of the array-length/object-shape word.
 pub const ARRAY_LENGTH_OFFSET: usize = 12;
+pub const NUM_SLOTS_OFFSET: usize = 12;
+pub const GC_AGE_OFFSET: usize = 6;
+pub const GC_FLAGS_OFFSET: usize = 7;
+pub const FORWARDING_PTR_OFFSET: usize = 16;
+
+/// Byte offset of the `identity_hash_code` field within [`ObjectHeader`].
+///
+/// Added per request R3 of
+/// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §7: this was
+/// the only header field without a named constant, and it is baked as a literal
+/// in at least two places outside `types` (`jit/src/x64.rs` derived its own via
+/// `offset_of!` to avoid one; `vm/src/jit/helpers.rs` still writes a bare
+/// `raw_ptr.add(8)`). Those should re-export this constant — see
+/// `docs/internal/arch-2026-07-26/header-shrink.md` §6.
+pub const IDENTITY_HASH_CODE_OFFSET: usize = 8;
 
 // Compile-time check that the offset is correct.
 const _: () = assert!(
-    std::mem::offset_of!(ObjectHeader, array_length) == ARRAY_LENGTH_OFFSET,
+    std::mem::offset_of!(ObjectHeader, shape) == ARRAY_LENGTH_OFFSET,
     "ARRAY_LENGTH_OFFSET must match ObjectHeader layout"
+);
+
+const _: () = assert!(
+    std::mem::offset_of!(ObjectHeader, identity_hash_code) == IDENTITY_HASH_CODE_OFFSET,
+    "IDENTITY_HASH_CODE_OFFSET must match ObjectHeader layout"
+);
+
+// The array-length load is emitted as a signed disp8 in 16 places in
+// `jit/src/x64.rs` (§6.2 of the x64 contract doc). A shrink that moves `shape`
+// must keep it addressable, or those sites emit a negative displacement and
+// read backwards from the object base.
+const _: () = assert!(
+    ARRAY_LENGTH_OFFSET <= 127,
+    "ARRAY_LENGTH_OFFSET must fit a signed disp8 for the JIT array-length loads"
 );
 
 // Compile-time check that our header is exactly HEADER_SIZE bytes.
@@ -197,7 +273,12 @@ const _: () = assert!(
 /// Returns the per-element byte size for a given array element type.
 /// Used for compact array storage -- primitive arrays use their native
 /// byte size instead of the full SLOT_SIZE (16 bytes).
-/// Reference arrays use REF_ELEMENT_SIZE (8 bytes) -- compact pointer storage.
+///
+/// Reference arrays use [`crate::narrow_oop::ref_element_size`]: the
+/// [`REF_ELEMENT_SIZE`] (8-byte) raw pointer by default, or 4 bytes when
+/// compressed oops are active for this process. The width is fixed at VM init
+/// before the first allocation, so an array is never read back under a
+/// different element width than it was written with.
 #[inline]
 pub fn element_byte_size(element_type: ArrayElementType) -> usize {
     match element_type {
@@ -205,7 +286,7 @@ pub fn element_byte_size(element_type: ArrayElementType) -> usize {
         ArrayElementType::Char | ArrayElementType::Short => 2,
         ArrayElementType::Int | ArrayElementType::Float => 4,
         ArrayElementType::Long | ArrayElementType::Double => 8,
-        ArrayElementType::Reference => REF_ELEMENT_SIZE,
+        ArrayElementType::Reference => crate::narrow_oop::ref_element_size(),
     }
 }
 
@@ -239,7 +320,7 @@ pub fn array_data_size(
 /// entire region; not a real object, no oops to scan". Without this
 /// sentinel, the zeroed bytes of a continuation region decode as a
 /// well-formed `Object` (kind=0, class_id=0, num_slots=0) and walkers
-/// iterate the region as a 40-byte object, following the next zero header,
+/// iterate the region as a minimum-sized object, following the next zero header,
 /// and so on -- effectively scanning garbage as live objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -296,19 +377,16 @@ pub fn array_element_type_from_tag(tag: u8) -> Option<ArrayElementType> {
 
 /// The header stored at the beginning of every heap-allocated object/array.
 ///
-/// Layout (40 bytes total, 8-byte aligned):
+/// Layout (32 bytes total, 8-byte aligned):
 /// - `class_id`: ClassId (4 bytes) -- MUST stay at offset 0 (JIT contract)
 /// - `kind`: ObjectKind (1 byte)
 /// - `element_type`: ArrayElementType (1 byte, only meaningful for arrays)
-/// - `_padding`: 2 bytes
+/// - `gc_age`: u8
+/// - `gc_flags`: u8
 /// - `identity_hash_code`: i32 (4 bytes)
-/// - `array_length`: u32 (4 bytes, only meaningful for arrays)
-/// - `num_slots`: u32 (4 bytes, field count for objects)
-/// - `gc_age`: u8 (1 byte, times survived minor GC)
-/// - `gc_flags`: u8 (1 byte, bit 0 = in old gen)
-/// - `_gc_reserved`: [u8; 2] (2 bytes padding)
+/// - `shape`: u32 (array length, or full instance-field count)
 /// - `forwarding_ptr`: *mut u8 (8 bytes, used by GC for object relocation)
-/// - `mark_word`: AtomicU64 (8 bytes, thin-lock / monitor state -- offset 32)
+/// - `mark_word`: AtomicU64 (8 bytes, thin-lock / monitor state -- offset 24)
 ///
 /// NOTE: `Clone`/`Copy` were removed when `mark_word: AtomicU64` was added,
 /// since atomics are `!Copy`. Header copies must now go through explicit
@@ -320,23 +398,21 @@ pub struct ObjectHeader {
     pub class_id: ClassId,
     pub kind: ObjectKind,
     pub element_type: ArrayElementType,
-    pub _padding: [u8; 2],
-    pub identity_hash_code: i32,
-    pub array_length: u32,
-    pub num_slots: u32,
     /// GC age -- number of times this object survived a minor GC (0..15).
     pub gc_age: u8,
-    /// GC flags -- bit 0: object is in old generation.
+    /// GC flags -- old/marked/compact layout bits.
     pub gc_flags: u8,
-    /// Reserved padding to maintain header alignment.
-    pub _gc_reserved: [u8; 2],
+    pub identity_hash_code: i32,
+    /// Arrays store their length directly. Objects store the full 32-bit
+    /// hierarchy-wide instance-field count.
+    pub shape: u32,
     /// Forwarding pointer for GC. When an object is copied during collection,
     /// the old header's forwarding_ptr is set to the new location.
     /// Null means the object has not been forwarded.
     pub forwarding_ptr: *mut u8,
     /// Mark word -- thin-lock owner / recursion / inflated-monitor pointer.
     /// State encoded in low 2 bits; see `MARK_NEUTRAL` / `MARK_THIN_LOCKED` /
-    /// `MARK_INFLATED`. Always at byte offset `MARK_WORD_OFFSET` (= 32).
+    /// `MARK_INFLATED`. Always at byte offset `MARK_WORD_OFFSET` (= 24).
     /// Initialized to `MARK_NEUTRAL` by `ObjectHeader::new`.
     pub mark_word: AtomicU64,
 }
@@ -365,9 +441,9 @@ pub const GC_FLAG_MARKED: u8 = 0x02;
 
 /// GC flag: object uses the **compact reference-field layout** — reference
 /// instance fields are stored as bare 8-byte pointers (per the registered
-/// [`crate::field_layout::CompactLayout`] for its class) and the object's body
-/// size in bytes is recorded in the `array_length` header field. Set at
-/// allocation time and never cleared (a permanent property of the object).
+/// [`crate::field_layout::CompactLayout`] version selected by its class and
+/// field count). Set at allocation time and never cleared (a permanent
+/// property of the object).
 ///
 /// Decided per-object so AUTOBOX wrappers, ad-hoc `ClassId(0)` containers, and
 /// objects allocated before a synthetic-stub class grew all stay on the legacy
@@ -390,20 +466,59 @@ impl ObjectHeader {
         array_length: u32,
         num_slots: u32,
     ) -> Self {
+        let shape = if kind == ObjectKind::Array {
+            array_length
+        } else {
+            num_slots
+        };
         Self {
             class_id,
             kind,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code,
-            array_length,
-            num_slots,
             gc_age: 0,
             gc_flags: 0,
-            _gc_reserved: [0; 2],
+            identity_hash_code,
+            shape,
             forwarding_ptr: std::ptr::null_mut(),
             mark_word: AtomicU64::new(MARK_NEUTRAL),
         }
+    }
+
+    #[inline]
+    pub fn array_length(&self) -> u32 {
+        if self.kind == ObjectKind::Array {
+            self.shape
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub fn set_array_length(&mut self, length: u32) {
+        debug_assert_eq!(self.kind, ObjectKind::Array);
+        self.shape = length;
+    }
+
+    #[inline]
+    pub fn num_slots(&self) -> u32 {
+        self.shape
+    }
+
+    #[inline]
+    pub fn set_num_slots(&mut self, slots: u32) {
+        self.shape = slots;
+    }
+
+    /// Mark an object as using its class's compact field layout.
+    ///
+    /// The full 32-bit logical field count remains in the shape word. Body
+    /// size is owned by immutable class metadata and is only reclaimed after
+    /// the loader and all of its instances are proven dead.
+    #[inline]
+    pub fn set_compact_shape(&mut self, slots: u32, body_size: usize) {
+        assert_eq!(body_size & 7, 0, "compact body must be 8-byte aligned");
+        self.shape = slots;
+        self.gc_flags |= GC_FLAG_COMPACT;
     }
 
     /// Returns true if this object has been forwarded by the GC.
@@ -482,6 +597,56 @@ impl ObjectHeader {
     pub fn inflated_monitor(mark: u64) -> *mut () {
         ((mark & INFLATED_PTR_MASK) as usize) as *mut ()
     }
+
+    /// Construct a `MARK_FORWARDED` mark word pointing at an object's new
+    /// location after GC relocation.
+    ///
+    /// The target keeps its **full 64-bit** width: the address is OR-ed with
+    /// the tag rather than shifted, so no high bits are lost and no overflow
+    /// side table is required. Heap objects are 8-byte aligned, so the low 3
+    /// bits are already zero and borrowing 2 of them is free.
+    ///
+    /// # Ordering contract (read before producing this state)
+    ///
+    /// Writing this state **destroys** whatever lock state the mark word held.
+    /// A relocating collector must therefore copy the object *first* — so the
+    /// destination's mark word carries the intact NEUTRAL / THIN_LOCKED /
+    /// INFLATED value — and only then clobber the **source** mark word with
+    /// `make_forwarded(dest)`. For an `INFLATED` source this transfers the one
+    /// strong `Arc<Monitor>` reference the mark word owns to the destination
+    /// copy; it must not be released against the source afterwards, or the
+    /// live destination is left with a dangling `Monitor*`. See
+    /// `docs/internal/arch-2026-07-26/header-shrink.md` §4.
+    #[inline(always)]
+    pub fn make_forwarded(target: usize) -> u64 {
+        assert!(
+            target & (MARK_STATE_MASK as usize) == 0,
+            "forwarding target must have its low 2 bits clear (>= 4-byte aligned)"
+        );
+        assert!(
+            crate::plausible_heap_pointer(target as u64),
+            "forwarding target must be a non-null, 8-byte aligned plausible user-space pointer"
+        );
+        (target as u64) | MARK_FORWARDED
+    }
+
+    /// Decode the relocation target from a `MARK_FORWARDED` mark word.
+    /// Result is meaningless if the mark word is not in forwarded state;
+    /// check with [`ObjectHeader::is_forwarded_mark`] first.
+    #[inline(always)]
+    pub fn forwarding_target(mark: u64) -> *mut u8 {
+        ((mark & FORWARDING_PTR_MASK) as usize) as *mut u8
+    }
+
+    /// Whether a mark word snapshot encodes a GC forwarding pointer.
+    ///
+    /// Uses tag *equality*, not a bitwise test — `mark & MARK_FORWARDED != 0`
+    /// would also be true for every `MARK_THIN_LOCKED` and `MARK_INFLATED`
+    /// word, which is precisely the aliasing this state was audited against.
+    #[inline(always)]
+    pub fn is_forwarded_mark(mark: u64) -> bool {
+        Self::mark_state(mark) == MARK_FORWARDED
+    }
 }
 
 #[cfg(test)]
@@ -504,8 +669,36 @@ mod tests {
 
     #[test]
     fn header_size_is_correct() {
-        assert_eq!(HEADER_SIZE, 40);
+        assert_eq!(HEADER_SIZE, 32);
         assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
+        assert_eq!(std::mem::align_of::<ObjectHeader>(), 8);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, class_id), 0);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, kind), OBJECT_KIND_OFFSET);
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, element_type),
+            ARRAY_ELEMENT_TYPE_OFFSET
+        );
+        assert_eq!(std::mem::offset_of!(ObjectHeader, gc_age), GC_AGE_OFFSET);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, gc_flags), GC_FLAGS_OFFSET);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, identity_hash_code), 8);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, shape), NUM_SLOTS_OFFSET);
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, forwarding_ptr),
+            FORWARDING_PTR_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, mark_word),
+            MARK_WORD_OFFSET
+        );
+    }
+
+    #[test]
+    fn object_shape_preserves_full_u32_field_count() {
+        let mut header = make_header();
+        header.set_compact_shape(0xfeed_beef, 24);
+        assert_eq!(header.num_slots(), 0xfeed_beef);
+        assert_eq!(header.array_length(), 0);
+        assert_eq!(header.gc_flags & GC_FLAG_COMPACT, GC_FLAG_COMPACT);
     }
 
     #[test]
@@ -591,9 +784,9 @@ mod tests {
     }
 
     #[test]
-    fn array_length_offset_matches_layout() {
+    fn packed_shape_offset_matches_array_length_layout() {
         assert_eq!(
-            std::mem::offset_of!(ObjectHeader, array_length),
+            std::mem::offset_of!(ObjectHeader, shape),
             ARRAY_LENGTH_OFFSET
         );
     }
@@ -825,7 +1018,7 @@ mod tests {
         header.gc_age = 3;
         assert_eq!(header.kind, ObjectKind::Array);
         assert_eq!(header.element_type, ArrayElementType::Int);
-        assert_eq!(header.array_length, 100);
+        assert_eq!(header.array_length(), 100);
         assert_eq!(header.identity_hash_code, 12345);
         assert_eq!(header.gc_age, 3);
     }
@@ -929,7 +1122,7 @@ mod tests {
     fn mark_word_offset_is_stable() {
         // The JIT lock fast-path hardcodes this offset; if it ever changes
         // both the constant and every emitter must be updated together.
-        assert_eq!(MARK_WORD_OFFSET, 32);
+        assert_eq!(MARK_WORD_OFFSET, 24);
         assert_eq!(
             std::mem::offset_of!(ObjectHeader, mark_word),
             MARK_WORD_OFFSET
@@ -1004,5 +1197,437 @@ mod tests {
     #[should_panic(expected = "plausible user-space pointer")]
     fn make_inflated_rejects_four_byte_aligned_pointer() {
         let _ = ObjectHeader::make_inflated(0x1004);
+    }
+
+    // ---------------------------------------------------------------------
+    //  Header-shrink contracts (arch-2026-07-26, slug `header-shrink`)
+    //
+    //  See docs/internal/arch-2026-07-26/header-shrink.md. These pin the
+    //  layout arithmetic the shrink depends on and the mark-word encoding it
+    //  will adopt, so a wrong offset trips a test instead of miscomputing a
+    //  heap address.
+    // ---------------------------------------------------------------------
+
+    /// The header is **fully packed**: every one of its `HEADER_SIZE` bytes is a
+    /// live field, with zero padding to reclaim. This is the load-bearing fact
+    /// behind the shrink analysis — it means no shrink is possible without
+    /// *deleting a field*, and the achievable sizes are determined entirely by
+    /// which fields can go. If this ever stops holding, the doc's size
+    /// derivation is stale.
+    #[test]
+    fn header_has_no_reclaimable_padding() {
+        let field_bytes = 4  // class_id
+            + 1              // kind
+            + 1              // element_type
+            + 1              // gc_age
+            + 1              // gc_flags
+            + 4              // identity_hash_code
+            + 4              // shape
+            + 8              // forwarding_ptr
+            + 8; // mark_word
+        assert_eq!(
+            field_bytes, HEADER_SIZE,
+            "ObjectHeader is fully packed; a shrink must delete a field, not padding"
+        );
+    }
+
+    /// The two removable fields, and what each is actually worth once 8-byte
+    /// alignment is applied. Dropping `identity_hash_code` alone buys **zero**
+    /// bytes — `mark_word` is an `AtomicU64` and must stay 8-aligned, so the
+    /// 4 bytes reappear as padding. This is the arithmetic that decides the
+    /// order of operations for the shrink, so it is pinned rather than only
+    /// written down.
+    #[test]
+    fn shrink_candidate_sizes_are_what_the_doc_claims() {
+        // Round a packed field total up to the 8-byte alignment `AtomicU64`
+        // forces on the struct.
+        fn rounded(packed: usize) -> usize {
+            (packed + 7) & !7
+        }
+        assert_eq!(rounded(32), 32, "today");
+        // Drop identity_hash_code (4B) only: 28 packed -> 32 aligned. No gain.
+        assert_eq!(rounded(32 - 4), 32, "dropping the hash alone saves nothing");
+        // Drop forwarding_ptr (8B) only: 24 packed -> 24 aligned. Saves 8.
+        assert_eq!(
+            rounded(32 - 8),
+            24,
+            "dropping the forwarding pointer saves 8"
+        );
+        // Drop both (12B): 20 packed -> 24 aligned. Still 24 — the hash is free
+        // to keep, so keeping it is strictly better than folding it.
+        assert_eq!(
+            rounded(32 - 12),
+            24,
+            "dropping both lands at the same 24 as dropping the forwarding pointer alone"
+        );
+        // Reaching 16 additionally requires deleting the 4-byte
+        // kind/element_type/gc_age/gc_flags word: class_id(4) + shape(4) +
+        // mark_word(8).
+        assert_eq!(rounded(4 + 4 + 8), 16, "16 needs the meta word gone too");
+    }
+
+    /// The TLAB grid invariant, restated as a runtime check over the shapes the
+    /// allocators actually produce. Both `emit_inline_tlab_new` (JIT) and
+    /// `Tlab::alloc_initialized` (Rust) bump a cursor by
+    /// `HEADER_SIZE + body_size` on an 8-byte grid; a `total_size` that is not
+    /// a multiple of 8 desyncs the heap walk *silently in release builds*,
+    /// because the allocation-path guard is a `debug_assert`.
+    #[test]
+    fn tlab_total_size_stays_on_the_eight_byte_grid() {
+        // Legacy layout: body is num_fields * SLOT_SIZE.
+        for num_fields in 0..64usize {
+            let total = HEADER_SIZE + num_fields * SLOT_SIZE;
+            assert_eq!(
+                total % 8,
+                0,
+                "legacy total_size for {num_fields} fields is off the 8-byte grid"
+            );
+        }
+        // Compact layout: body is 8*refs + 16*prims, and `set_compact_shape`
+        // asserts `body_size & 7 == 0`, so any 8-multiple body is admissible.
+        for refs in 0..16usize {
+            for prims in 0..16usize {
+                let body = refs * REF_FIELD_SIZE + prims * SLOT_SIZE;
+                assert_eq!(body % 8, 0, "compact body must be 8-aligned");
+                assert_eq!(
+                    (HEADER_SIZE + body) % 8,
+                    0,
+                    "compact total_size ({refs} refs, {prims} prims) is off the grid"
+                );
+            }
+        }
+        // Arrays: `array_data_size` already rounds up to 8.
+        for len in 0..32usize {
+            for et in [
+                ArrayElementType::Boolean,
+                ArrayElementType::Char,
+                ArrayElementType::Int,
+                ArrayElementType::Long,
+                ArrayElementType::Reference,
+            ] {
+                let total = HEADER_SIZE + array_data_size(len, et).unwrap();
+                assert_eq!(
+                    total % 8,
+                    0,
+                    "array total_size off the grid: {len} x {et:?}"
+                );
+            }
+        }
+    }
+
+    /// Array element addressing: the JIT emits `[obj + HEADER_SIZE + i*scale]`
+    /// with `HEADER_SIZE` as a **signed** disp8. Both the base displacement and
+    /// the array-length displacement must survive any future shrink, and the
+    /// element stride must match `element_byte_size`.
+    #[test]
+    fn array_element_addressing_holds_at_the_current_header_size() {
+        assert!(
+            i8::try_from(HEADER_SIZE).is_ok(),
+            "HEADER_SIZE={HEADER_SIZE} does not fit a SIGNED disp8; the array emitters \
+             would address backwards from the object base"
+        );
+        assert!(
+            i8::try_from(ARRAY_LENGTH_OFFSET).is_ok(),
+            "ARRAY_LENGTH_OFFSET={ARRAY_LENGTH_OFFSET} does not fit a signed disp8"
+        );
+        // The length word must not overlap the element data.
+        assert!(
+            ARRAY_LENGTH_OFFSET + 4 <= HEADER_SIZE,
+            "the array-length word must lie inside the header"
+        );
+        for et in [
+            ArrayElementType::Byte,
+            ArrayElementType::Char,
+            ArrayElementType::Int,
+            ArrayElementType::Long,
+            ArrayElementType::Reference,
+        ] {
+            let scale = element_byte_size(et);
+            for idx in [0usize, 1, 7, 63] {
+                let addr = HEADER_SIZE + idx * scale;
+                assert_eq!(
+                    addr - HEADER_SIZE,
+                    idx * scale,
+                    "element {idx} of {et:?} must sit exactly {scale}B apart"
+                );
+                // Element 0 always lands exactly at the end of the header.
+                if idx == 0 {
+                    assert_eq!(addr, HEADER_SIZE);
+                }
+            }
+        }
+    }
+
+    // -- Mark-word encoding: all four states + co-occurrence ----------------
+
+    #[test]
+    fn mark_forwarded_claims_the_previously_reserved_state() {
+        assert_eq!(MARK_FORWARDED, 0b11);
+        // Distinct from all three pre-existing states.
+        assert_ne!(MARK_FORWARDED, MARK_NEUTRAL);
+        assert_ne!(MARK_FORWARDED, MARK_THIN_LOCKED);
+        assert_ne!(MARK_FORWARDED, MARK_INFLATED);
+        // The four states exhaust the 2-bit tag space, so `mark_state` is total
+        // and every consumer's `match` needs a FORWARDED arm.
+        let seen: std::collections::BTreeSet<u64> = [
+            MARK_NEUTRAL,
+            MARK_THIN_LOCKED,
+            MARK_INFLATED,
+            MARK_FORWARDED,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(seen.len(), 4, "the four state tags must be distinct");
+        for s in 0..=MARK_STATE_MASK {
+            assert!(seen.contains(&s), "tag {s:#b} is not a named state");
+        }
+        assert_eq!(FORWARDING_PTR_MASK, !MARK_STATE_MASK);
+        assert_eq!(FORWARDING_PTR_MASK & MARK_STATE_MASK, 0);
+    }
+
+    #[test]
+    fn make_forwarded_round_trips_a_full_64_bit_target() {
+        let slot: u64 = 0;
+        let real = &slot as *const u64 as usize;
+        let mark = ObjectHeader::make_forwarded(real);
+        assert_eq!(ObjectHeader::mark_state(mark), MARK_FORWARDED);
+        assert!(ObjectHeader::is_forwarded_mark(mark));
+        assert_eq!(ObjectHeader::forwarding_target(mark) as usize, real);
+
+        // Synthetic 8-aligned targets across the whole 47-bit user-space range.
+        // Nothing is shifted, so the top bits survive — this is the
+        // "a folded forwarding pointer must stay 64-bit" constraint.
+        for &p in &[
+            0x1000usize,
+            0xDEAD_BEE0usize,
+            0x0000_1000_0000_0000usize,
+            0x0000_7FFF_FFFF_FFF8usize,
+        ] {
+            let m = ObjectHeader::make_forwarded(p);
+            assert_eq!(ObjectHeader::mark_state(m), MARK_FORWARDED);
+            assert_eq!(
+                ObjectHeader::forwarding_target(m) as usize,
+                p,
+                "forwarding target {p:#x} must round-trip without truncation"
+            );
+        }
+    }
+
+    /// The single most dangerous confusion in this encoding: a FORWARDED word
+    /// and an INFLATED word carry their payload in exactly the same bits. Only
+    /// the tag distinguishes them, and only an *equality* test on the tag is
+    /// safe. A bitwise `mark & MARK_INFLATED != 0` would accept a FORWARDED
+    /// word and hand a heap address to `inflated_monitor()` as a `Monitor*` —
+    /// silent monitor corruption.
+    #[test]
+    fn forwarded_and_inflated_are_only_distinguishable_by_tag_equality() {
+        let slot: u64 = 0;
+        let p = &slot as *const u64 as usize;
+        let fwd = ObjectHeader::make_forwarded(p);
+        let inf = ObjectHeader::make_inflated(p);
+
+        // Same payload bits, different tags.
+        assert_eq!(fwd & FORWARDING_PTR_MASK, inf & INFLATED_PTR_MASK);
+        assert_ne!(fwd, inf);
+
+        // Equality on the tag separates them.
+        assert_eq!(ObjectHeader::mark_state(fwd), MARK_FORWARDED);
+        assert_eq!(ObjectHeader::mark_state(inf), MARK_INFLATED);
+
+        // The unsafe bitwise test does NOT separate them. Asserting the trap
+        // exists is the point: it documents why every consumer must compare.
+        assert_ne!(
+            fwd & MARK_INFLATED,
+            0,
+            "a FORWARDED word has bit 1 set, so `mark & MARK_INFLATED != 0` \
+             misclassifies it as inflated — consumers must use tag equality"
+        );
+        assert_ne!(
+            fwd & MARK_THIN_LOCKED,
+            0,
+            "a FORWARDED word also has bit 0 set, so it misclassifies as \
+             thin-locked under a bitwise test"
+        );
+    }
+
+    /// `identity_hash_code` is a **dedicated header field**, not a mark-word
+    /// resident, so it is orthogonal to every lock transition. This is the
+    /// real co-occurrence matrix for this VM: a hash installed once survives
+    /// NEUTRAL -> THIN_LOCKED -> INFLATED unchanged. (There is deliberately no
+    /// "hashed" mark-word state: folding the hash into the mark word saves
+    /// zero bytes — see `shrink_candidate_sizes_are_what_the_doc_claims` — so
+    /// inventing one would add a collision surface for no gain.)
+    #[test]
+    fn identity_hash_is_orthogonal_to_every_mark_word_state() {
+        let mut header = make_header();
+        header.identity_hash_code = 0x5EED_1234u32 as i32;
+
+        let slot: u64 = 0;
+        let monitor = &slot as *const u64 as usize;
+        let thin = ObjectHeader::make_thin_locked(77, 3);
+        let inflated = ObjectHeader::make_inflated(monitor);
+
+        for state in [MARK_NEUTRAL, thin, inflated] {
+            header.mark_word.store(state, Ordering::Release);
+            assert_eq!(
+                header.identity_hash_code, 0x5EED_1234u32 as i32,
+                "the identity hash must be unaffected by mark-word state {state:#x}"
+            );
+        }
+        // ...and the mark word is likewise unaffected by rewriting the hash.
+        header.mark_word.store(inflated, Ordering::Release);
+        header.identity_hash_code = -1;
+        assert_eq!(header.mark_word.load(Ordering::Acquire), inflated);
+        assert_eq!(
+            ObjectHeader::inflated_monitor(header.mark_word.load(Ordering::Acquire)) as usize,
+            monitor
+        );
+    }
+
+    /// Forwarding is a **destructive** mark-word transition: it overwrites
+    /// whatever lock state was there. That is why the relocation protocol must
+    /// copy the object before clobbering the source word — the destination copy
+    /// is the only surviving carrier of the original mark word (and, for an
+    /// INFLATED source, of the one strong `Arc<Monitor>` reference it owns).
+    #[test]
+    fn forwarding_destroys_prior_lock_state_hence_copy_before_clobber() {
+        let slot: u64 = 0;
+        let monitor = &slot as *const u64 as usize;
+        let dest: u64 = 0;
+        let dest_addr = &dest as *const u64 as usize;
+
+        for prior in [
+            MARK_NEUTRAL,
+            ObjectHeader::make_thin_locked(42, 1),
+            ObjectHeader::make_inflated(monitor),
+        ] {
+            let source = make_header();
+            source.mark_word.store(prior, Ordering::Release);
+
+            // Step 1: the destination copy carries the intact prior word.
+            let destination = make_header();
+            destination
+                .mark_word
+                .store(source.mark_word.load(Ordering::Acquire), Ordering::Release);
+
+            // Step 2: only now clobber the source.
+            source
+                .mark_word
+                .store(ObjectHeader::make_forwarded(dest_addr), Ordering::Release);
+
+            let src_mark = source.mark_word.load(Ordering::Acquire);
+            assert!(ObjectHeader::is_forwarded_mark(src_mark));
+            assert_eq!(
+                ObjectHeader::forwarding_target(src_mark) as usize,
+                dest_addr
+            );
+            // The prior state is genuinely gone from the source.
+            assert_ne!(
+                ObjectHeader::mark_state(src_mark),
+                ObjectHeader::mark_state(prior),
+                "forwarding must be observed as destructive; if it were not, the \
+                 copy-before-clobber ordering would be optional"
+            );
+            // ...and preserved on the destination.
+            assert_eq!(destination.mark_word.load(Ordering::Acquire), prior);
+        }
+    }
+
+    #[test]
+    fn every_mark_state_round_trips_through_a_cas_state_machine() {
+        // NEUTRAL -> THIN_LOCKED -> INFLATED -> FORWARDED, each via CAS, with
+        // the payload decoded at every step.
+        let header = make_header();
+        let slot: u64 = 0;
+        let monitor = &slot as *const u64 as usize;
+        let dest: u64 = 0;
+        let dest_addr = &dest as *const u64 as usize;
+
+        let thin = ObjectHeader::make_thin_locked(0x0BAD_F00D, 9);
+        header
+            .mark_word
+            .compare_exchange(MARK_NEUTRAL, thin, Ordering::AcqRel, Ordering::Acquire)
+            .expect("NEUTRAL -> THIN_LOCKED");
+        let m = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(ObjectHeader::thin_lock_owner(m), 0x0BAD_F00D);
+        assert_eq!(ObjectHeader::thin_lock_recursion(m), 9);
+        assert!(!ObjectHeader::is_forwarded_mark(m));
+
+        let inflated = ObjectHeader::make_inflated(monitor);
+        header
+            .mark_word
+            .compare_exchange(thin, inflated, Ordering::AcqRel, Ordering::Acquire)
+            .expect("THIN_LOCKED -> INFLATED");
+        let m = header.mark_word.load(Ordering::Acquire);
+        assert_eq!(ObjectHeader::inflated_monitor(m) as usize, monitor);
+        assert!(!ObjectHeader::is_forwarded_mark(m));
+
+        let forwarded = ObjectHeader::make_forwarded(dest_addr);
+        header
+            .mark_word
+            .compare_exchange(inflated, forwarded, Ordering::AcqRel, Ordering::Acquire)
+            .expect("INFLATED -> FORWARDED");
+        let m = header.mark_word.load(Ordering::Acquire);
+        assert!(ObjectHeader::is_forwarded_mark(m));
+        assert_eq!(ObjectHeader::forwarding_target(m) as usize, dest_addr);
+    }
+
+    /// While `forwarding_ptr` remains a real field, it and the mark word are
+    /// independent. The shrink's second pass replaces the field with the mark
+    /// word; until then, a header can carry both, and `is_forwarded()` must
+    /// keep answering from the field alone.
+    #[test]
+    fn field_forwarding_and_mark_word_forwarding_coexist_today() {
+        let mut header = make_header();
+        assert!(!header.is_forwarded());
+
+        let dest: u64 = 0;
+        let dest_addr = &dest as *const u64 as usize;
+        header
+            .mark_word
+            .store(ObjectHeader::make_forwarded(dest_addr), Ordering::Release);
+        // The mark word says forwarded; the legacy field still says not.
+        assert!(ObjectHeader::is_forwarded_mark(
+            header.mark_word.load(Ordering::Acquire)
+        ));
+        assert!(
+            !header.is_forwarded(),
+            "`is_forwarded()` must still read the field — the mark-word encoding \
+             is landed but not yet adopted, and a split answer here would mean \
+             two collectors disagreeing about liveness"
+        );
+
+        header.forwarding_ptr = dest_addr as *mut u8;
+        assert!(header.is_forwarded());
+        assert_eq!(header.forwarding_address(), dest_addr as *mut u8);
+        assert_eq!(
+            ObjectHeader::forwarding_target(header.mark_word.load(Ordering::Acquire)),
+            header.forwarding_address(),
+            "when both are set they must agree on the target"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "low 2 bits clear")]
+    fn make_forwarded_rejects_misaligned_target() {
+        let _ = ObjectHeader::make_forwarded(0x1001);
+    }
+
+    #[test]
+    #[should_panic(expected = "plausible user-space pointer")]
+    fn make_forwarded_rejects_null_target() {
+        let _ = ObjectHeader::make_forwarded(0);
+    }
+
+    #[test]
+    fn identity_hash_code_offset_is_named_and_pinned() {
+        assert_eq!(IDENTITY_HASH_CODE_OFFSET, 8);
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, identity_hash_code),
+            IDENTITY_HASH_CODE_OFFSET
+        );
+        // It must not overlap the neighbouring fields.
+        assert!(GC_FLAGS_OFFSET < IDENTITY_HASH_CODE_OFFSET);
+        assert!(IDENTITY_HASH_CODE_OFFSET + 4 <= NUM_SLOTS_OFFSET);
     }
 }

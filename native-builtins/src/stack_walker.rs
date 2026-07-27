@@ -244,7 +244,7 @@ pub(crate) fn native_get_caller_class(
         .map(|e| e.class_name.as_ref())
         .filter(|n| !is_internal(n))
         .collect();
-    if std::env::var("CRATONVM_DBG_CALLER").is_ok() {
+    if crate::nbflags().dbg_caller {
         eprintln!(
             "[DBG_CALLER] getCallerClass trace ({} frames):",
             trace.len()
@@ -475,6 +475,8 @@ pub(crate) fn native_check_stack_walk_modes(
 
 #[cfg(test)]
 mod check_modes_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 
@@ -524,6 +526,8 @@ mod check_modes_tests {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
 

@@ -55,7 +55,7 @@ NPASS=0; NSKIP=0; NFAIL=0; NDEV=0
 # HARD = a fatal GC-root failure (crash / process death) — always a FAIL.
 # SOFT = the GC-array/field guard catching+dropping a stale access; benign IFF the
 # result is still GC-invariant (the "masked, not closed" state from Step 4's
-# gc-stress-bintrees repros). Reported as `guarded(soft=N)` on a passing run.
+# gc-stress-bintrees springboot). Reported as `guarded(soft=N)` on a passing run.
 HARD_CORRUPT='EXCEPTION_ACCESS|SIGSEGV|fatal runtime error|fatal error|thread .* panicked|process::abort|stack overflow'
 SOFT_CORRUPT='stale pointer|implausible|inconsistent header|out-of-bounds field|class_id=ClassId\(0\)'
 

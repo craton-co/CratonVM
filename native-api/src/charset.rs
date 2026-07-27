@@ -118,7 +118,10 @@ pub fn canonical_charset_name(name: &str) -> Option<&'static str> {
         "UTF32BE" => "UTF-32BE",
         "UTF32LE" => "UTF-32LE",
         "USASCII" | "ASCII" => "US-ASCII",
-        "ISO88591" | "LATIN1" | "ISO88591:1987" => "ISO-8859-1",
+        // The JDK also accepts the historic `8859_1` spelling (used by
+        // c3p0's resource-path reader) in addition to the ISO-prefixed
+        // aliases. Underscores are removed above, yielding `88591`.
+        "ISO88591" | "88591" | "LATIN1" | "ISO88591:1987" => "ISO-8859-1",
         "ISO88592" => "ISO-8859-2",
         "ISO88593" | "88593" | "LATIN3" => "ISO-8859-3",
         "ISO88594" | "88594" | "LATIN4" => "ISO-8859-4",
@@ -1001,6 +1004,22 @@ fn encode_utf16_with_bom_strict(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
 }
 
 fn encode_utf16_with_bom(chars: &[u16]) -> Vec<u8> {
+    // FIX (defaultlogbackconfigurationtests-empty-utf16-bom): real JDK's
+    // `"".getBytes(StandardCharsets.UTF_16)` returns an empty array, not a
+    // lone BOM — `UnicodeEncoder`'s BOM write lives inside its per-character
+    // encode loop, which never runs for zero input characters. This helper
+    // (one-shot `String.getBytes(Charset)`/`encode_chars[_lossy]`, NOT the
+    // stateful `CharsetEncoder.encode()` session path in
+    // `native-builtins/src/charset.rs`, which tracks BOM-written state
+    // separately) used to push the BOM unconditionally, so e.g. Logback's
+    // `LayoutWrappingEncoder.headerBytes()` — which always calls
+    // `convertToBytes("")` for an unconfigured header, even when there is
+    // nothing to write — leaked a stray BOM directly into a UTF-16-charset
+    // `ConsoleAppender`'s target stream (real `System.out` by default) the
+    // moment the appender started, before any real log event ever ran.
+    if chars.is_empty() {
+        return Vec::new();
+    }
     // HotSpot writes a BE BOM for UTF-16 output.
     let mut out = Vec::with_capacity(2 + chars.len() * 2);
     out.push(0xFE);
@@ -1396,7 +1415,7 @@ const IBM1047_TO_U16: [u16; 256] = [
 // ASCII-compatible so all 256 byte values are tabulated. Byte-for-byte
 // identical to real JDK25's `sun.nio.cs.ext.IBM500` (verified by dumping
 // `new String(allBytes, Charset.forName("cp500"))` on the HotSpot
-// baseline) — see docs/known-issues/h2-suite-bugs/bug-h2-charset-cp500-unsupported.md.
+// baseline) — see docs/known-issues/h2/bug-h2-charset-cp500-unsupported.md.
 const IBM500_TO_U16: [u16; 256] = [
     0x0000, 0x0001, 0x0002, 0x0003, 0x009C, 0x0009, 0x0086, 0x007F, 0x0097, 0x008D, 0x008E, 0x000B,
     0x000C, 0x000D, 0x000E, 0x000F, 0x0010, 0x0011, 0x0012, 0x0013, 0x009D, 0x000A, 0x0008, 0x0087,
@@ -1861,6 +1880,11 @@ mod tests {
         );
         let back = decode_bytes("IBM1047", &bytes).unwrap();
         assert_eq!(String::from_utf16(&back).unwrap(), s);
+    }
+
+    #[test]
+    fn latin1_historic_8859_1_alias_is_supported() {
+        assert_eq!(canonical_charset_name("8859_1"), Some("ISO-8859-1"));
     }
 
     #[test]

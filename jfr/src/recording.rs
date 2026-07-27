@@ -30,12 +30,42 @@ pub enum RecordingState {
     Closed,
 }
 
+/// Settings for a recording.
+///
+/// ---------------------------------------------------------------------------
+/// FIELD STATUS (observability audit, 2026-07-26; retention fixed same day)
+/// ---------------------------------------------------------------------------
+/// [`Self::enabled_events`] and [`Self::event_thresholds`] are read by
+/// `Recording::record_event` / `Recording::passes_filter`, as before.
+///
+///  * `max_age`, `max_size` — FIXED: `Recording::new` now constructs its
+///    repository via `EventRepository::with_max_age`, so both are real
+///    retention bounds enforced on every push (see `EventRepository::push`).
+///    `max_size` unset keeps the historical 100_000-event default; `max_age`
+///    unset keeps age-based eviction off. Age is measured against each
+///    pushed event's own `start_time`, not wall-clock `SystemTime::now()` —
+///    see `EventRepository::with_max_age`'s doc comment for why.
+///  * `disk` — still **inert**. There is no disk-backed repository;
+///    recordings remain memory-only until an explicit `dump_recording` call.
+///    Not surfaced by the `-XX:StartFlightRecording` CLI flag (see
+///    `vm-cli/src/main.rs`) for this reason.
+///  * `dump_on_exit` — FIXED: `SharedVm`'s shutdown path dumps any recording
+///    with this set before the process exits (see `vm/src/vm/vm_init.rs`).
+///  * `duration` — FIXED: `Vm::new` spawns a watcher thread when a
+///    `-XX:StartFlightRecording` recording sets this, which stops the
+///    recording once the duration elapses (see `vm/src/vm/vm_init.rs`).
 pub struct RecordingSettings {
     pub name: String,
+    /// Enforced by `EventRepository::with_max_age` — see the type-level note.
     pub max_age: Option<Duration>,
+    /// Enforced by `EventRepository::with_max_age` — see the type-level note.
     pub max_size: Option<usize>,
+    /// Inert — see the type-level note. Recordings are memory-only.
     pub disk: bool,
+    /// Enforced by the VM shutdown path — see the type-level note.
     pub dump_on_exit: bool,
+    /// Enforced by a watcher thread started alongside the recording — see
+    /// the type-level note.
     pub duration: Option<Duration>,
     /// T10.9.B: FxHashSet — EventTypeId is internal JFR definition.
     pub enabled_events: FxHashSet<EventTypeId>,
@@ -103,13 +133,23 @@ pub struct Recording {
 
 impl Recording {
     pub fn new(id: u64, settings: RecordingSettings) -> Self {
+        // obsaudit D12 (2026-07-26): max_size/max_age are now enforced —
+        // see the UNENFORCED FIELDS note above, and
+        // `EventRepository::with_max_age`. `max_size` unset keeps the
+        // historical 100_000-event default; `max_age` unset keeps
+        // age-based eviction off, exactly as before this fix for a
+        // recording that never sets it.
+        let repository = EventRepository::with_max_age(
+            settings.max_size.unwrap_or(100_000),
+            settings.max_age.map(|d| d.as_nanos() as u64),
+        );
         Self {
             id,
             settings,
             state: RecordingState::New,
             start_time: None,
             stop_time: None,
-            repository: EventRepository::default(),
+            repository,
             events_filtered_out: AtomicU64::new(0),
         }
     }
@@ -669,6 +709,84 @@ mod tests {
         let mut s = RecordingSettings::new("aged");
         s.max_age = Some(Duration::from_secs(60));
         assert_eq!(s.max_age.unwrap(), Duration::from_secs(60));
+    }
+
+    /// obsaudit D12 (2026-07-26): `max_size`/`max_age` are now enforced —
+    /// renamed from `obsaudit_max_size_and_max_age_are_not_enforced`, which
+    /// pinned the opposite (inert) behaviour. With `max_age` set to 1ns and
+    /// events spaced 1 second apart, every push's age-based eviction pass
+    /// clears everything older than (this event's time - 1ns) — which is
+    /// every prior event, since 1s >> 1ns — so only the just-pushed event
+    /// ever survives. `max_size = Some(2)` is strictly looser than that and
+    /// never binds first.
+    #[test]
+    fn obsaudit_max_size_and_max_age_are_enforced() {
+        let mut settings = RecordingSettings::new("capped");
+        settings.max_size = Some(2); // "keep at most 2 events"
+        settings.max_age = Some(Duration::from_nanos(1)); // "keep only the newest"
+
+        let mut rec = Recording::new(1, settings);
+        rec.start();
+        for i in 0..10u64 {
+            rec.record_event(EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i * 1_000_000_000,
+                end_time: i * 1_000_000_000 + 1,
+                thread_id: 1,
+                fields: smallvec::SmallVec::new(),
+            });
+        }
+
+        assert_eq!(
+            rec.event_count(),
+            1,
+            "max_age=1ns evicts every event older than the one just pushed"
+        );
+    }
+
+    /// obsaudit D12: `max_size` alone (age unset) behaves like a smaller
+    /// version of the default ring — a plain, size-only cap.
+    #[test]
+    fn obsaudit_max_size_alone_caps_without_age_eviction() {
+        let mut settings = RecordingSettings::new("size-capped");
+        settings.max_size = Some(3);
+
+        let mut rec = Recording::new(1, settings);
+        rec.start();
+        for i in 0..10u64 {
+            rec.record_event(EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i * 1_000_000_000,
+                end_time: i * 1_000_000_000 + 1,
+                thread_id: 1,
+                fields: smallvec::SmallVec::new(),
+            });
+        }
+
+        assert_eq!(rec.event_count(), 3);
+    }
+
+    /// The bound that *does* apply: `EventRepository::default()`'s fixed ring.
+    /// A recording cannot grow without limit even though `max_size` is inert.
+    #[test]
+    fn obsaudit_recording_memory_is_bounded_by_repository_ring() {
+        let mut repo = crate::repository::EventRepository::default();
+        let cap = 100_000usize;
+        for i in 0..(cap + 500) {
+            repo.push(EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i as u64,
+                end_time: i as u64 + 1,
+                thread_id: 1,
+                fields: smallvec::SmallVec::new(),
+            });
+        }
+        assert_eq!(
+            repo.len(),
+            cap,
+            "the default repository ring must be bounded"
+        );
+        assert_eq!(repo.total_recorded(), (cap + 500) as u64);
     }
 
     #[test]

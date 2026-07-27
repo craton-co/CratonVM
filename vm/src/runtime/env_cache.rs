@@ -4,7 +4,7 @@
 //! Process-lifetime cache for the `CRATONVM_*` debug/trace environment
 //! variables that are read from interpreter and JIT hot paths.
 //!
-//! `std::env::var` / `std::env::var_os` are surprisingly expensive on every
+//! `cratonvm_types::flags::runtime_var` / `cratonvm_types::flags::runtime_var_os` are surprisingly expensive on every
 //! platform:
 //!
 //! * On Linux they take a global mutex in `libc::getenv` plus an `OsString`
@@ -30,18 +30,18 @@ use std::sync::OnceLock;
 
 /// Build a boolean predicate that returns `true` iff the named env var is
 /// **set** (any value, including the empty string), matching the semantics
-/// of `std::env::var_os(NAME).is_some()`.
+/// of `cratonvm_types::flags::runtime_var_os(NAME).is_some()`.
 macro_rules! cached_is_set {
     ($name:ident, $env:literal) => {
         #[inline]
         pub fn $name() -> bool {
             static CACHE: OnceLock<bool> = OnceLock::new();
-            *CACHE.get_or_init(|| std::env::var_os($env).is_some())
+            *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os($env).is_some())
         }
     };
 }
 
-/// Build a boolean predicate matching `std::env::var(NAME).is_ok()` —
+/// Build a boolean predicate matching `cratonvm_types::flags::runtime_var(NAME).is_ok()` —
 /// behaviourally identical to `is_set` on every platform we target, but
 /// kept as a separate macro so the call sites that previously used `var`
 /// instead of `var_os` keep their exact semantics (e.g. the var being
@@ -52,7 +52,7 @@ macro_rules! cached_is_ok {
         #[inline]
         pub fn $name() -> bool {
             static CACHE: OnceLock<bool> = OnceLock::new();
-            *CACHE.get_or_init(|| std::env::var($env).is_ok())
+            *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var($env).is_ok())
         }
     };
 }
@@ -66,11 +66,7 @@ macro_rules! cached_is_ok {
 /// inline check.
 #[inline]
 pub fn disable_jit() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_DISABLE_JIT") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
-    })
+    cratonvm_types::flags().jit.disable_jit
 }
 
 /// `CRATONVM_JIT_THRESHOLD` — invocation count at which a method becomes
@@ -85,7 +81,7 @@ pub fn disable_jit() -> bool {
 pub fn jit_invocation_threshold() -> u32 {
     static CACHE: OnceLock<u32> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("CRATONVM_JIT_THRESHOLD")
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_THRESHOLD")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|v| v.max(1))
@@ -122,12 +118,23 @@ fn parse_osr_backedge_enabled(raw: Option<&str>) -> bool {
 pub fn osr_backedge_enabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        parse_osr_backedge_enabled(std::env::var("CRATONVM_JIT_OSR").ok().as_deref())
+        parse_osr_backedge_enabled(cratonvm_types::flags::runtime_var("CRATONVM_JIT_OSR").ok().as_deref())
     })
 }
 
 /// `CRATONVM_LOADER_AWARE_RESOLUTION` — loader-faithful `CONSTANT_Class`
 /// resolution (ProxyClassReuseTest / IsoProbe family).
+///
+/// **Loader-identity consolidation:** this used to be one of THREE
+/// independent copies of the same env-var parse (this file, a
+/// `classloading::class_manager` copy, and a `native-builtins::classloader`
+/// copy) — they drifted out of lock-step at least once in production (see
+/// `docs/internal/loader-identity.md`). `cratonvm_classloading::
+/// loader_aware_resolution` is now the single source of truth; this
+/// function is kept (same name, same signature, own doc history below) so
+/// none of ITS callers have to change, but it simply forwards to the
+/// classloading crate's `OnceLock`-cached copy rather than maintaining a
+/// second cache of its own.
 ///
 /// **Default: ON** (flipped from off during the `context.groovy` bug-cluster
 /// fix — see below). When on, an implicit class-constant reference (`ldc
@@ -200,18 +207,12 @@ pub fn osr_backedge_enabled() -> bool {
 /// off) rather than reverting the loader-aware resolution logic itself, which
 /// is independently correct.
 ///
-/// Empty or `"0"` ⇒ disabled; any other value ⇒ enabled. Read once and cached.
+/// Empty or `"0"` ⇒ disabled; any other value ⇒ enabled. Read once and
+/// cached (in `cratonvm_classloading`'s own `OnceLock` — see the
+/// consolidation note above; this function no longer keeps a second cache).
 #[inline]
 pub fn loader_aware_resolution() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
-        // Explicitly set: preserve the original opt-out semantics (empty or
-        // "0" disables; anything else enables) so `CRATONVM_LOADER_AWARE_
-        // RESOLUTION=0` still forces the old (gate-off) behavior verbatim.
-        Ok(v) => !v.is_empty() && v != "0",
-        // Unset: new default is enabled (see doc comment above).
-        Err(_) => true,
-    })
+    cratonvm_classloading::loader_aware_resolution()
 }
 
 /// `CRATONVM_TIER_OSR_BACKEDGE` — wire-tiered-manager Step 6 — per-frame
@@ -221,14 +222,14 @@ pub fn loader_aware_resolution() -> bool {
 /// default inline-OSR path and the Step-5 background-OSR path (which is why it
 /// is a VM-side env knob, separate from the tiered manager's policy
 /// `osr_threshold`). Lowering it makes hot loops OSR sooner (useful for
-/// gauntlet tuning / quick repros); raising it defers OSR. Invalid/unset →
+/// gauntlet tuning / quick springboot); raising it defers OSR. Invalid/unset →
 /// useful profile/warmup). `None` when unset/invalid, so the caller keeps its
 /// own default (`OSR_THRESHOLD`); `0` clamps to `1`. Read once and cached.
 #[inline]
 pub fn tier_osr_backedge() -> Option<u32> {
     static CACHE: OnceLock<Option<u32>> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("CRATONVM_TIER_OSR_BACKEDGE")
+        cratonvm_types::flags::runtime_var("CRATONVM_TIER_OSR_BACKEDGE")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|v| v.max(1))
@@ -258,7 +259,7 @@ pub fn tier_osr_backedge() -> Option<u32> {
 #[inline]
 pub fn osr_newarray_allowed() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_OSR_NEWARRAY") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_OSR_NEWARRAY") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     })
@@ -276,7 +277,7 @@ pub fn osr_newarray_allowed() -> bool {
 #[inline]
 pub fn intrinsics_disabled() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_DISABLE_INTRINSICS") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_INTRINSICS") {
         Ok(v) => !v.is_empty() && v != "0",
         Err(_) => false,
     })
@@ -318,7 +319,7 @@ pub fn set_show_code_details_in_exception_messages(on: bool) {
 pub fn helpful_npe_opcodes() -> bool {
     // Explicit env override wins (interim developer knob), parsed once.
     static ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env = *ENV.get_or_init(|| match std::env::var("CRATONVM_HELPFUL_NPE_OPCODES") {
+    let env = *ENV.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_HELPFUL_NPE_OPCODES") {
         Ok(v) => Some(!v.is_empty() && v != "0"),
         Err(_) => None,
     });
@@ -346,7 +347,7 @@ pub fn helpful_npe_opcodes() -> bool {
 #[inline]
 pub fn real_proxy_super() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| match std::env::var("CRATONVM_REAL_PROXY_SUPER") {
+    *GATE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_REAL_PROXY_SUPER") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -381,7 +382,7 @@ cached_is_set!(real_forkjoinpool, "CRATONVM_REAL_FORKJOINPOOL");
 #[inline]
 pub fn rootsnap_cache() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_ROOTSNAP_CACHE") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE") {
         // Explicit opt-out only: `0` / `false` disable; unset or any other
         // value (incl. `1`, empty) enables.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -414,7 +415,7 @@ pub fn rootsnap_cache() -> bool {
 pub fn rootsnap_cache_survive_gc() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(
-        || match std::env::var("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC") {
+        || match cratonvm_types::flags::runtime_var("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         },
@@ -429,7 +430,7 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 // wire-tiered-manager: OFF-THREAD codegen for the invocation tier-up trigger.
 // When on, the interpreter's invocation tier-up trigger ENQUEUES a
 // `CompilationTask` for the background compile thread (which runs the real
-// codegen via `try_jit_compile_callee` and publishes into `shared.jit_cache`)
+// codegen via `try_jit_compile_callee` and publishes into `shared.jit.jit_cache`)
 // and DOES NOT compile inline on the mutator — the mutator keeps interpreting
 // until the worker publishes, at which point the `jit_cache` fast-path flips the
 // call site to `Jit`. Step-5 OSR likewise compiles off-thread when on.
@@ -456,7 +457,7 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 #[inline]
 pub fn bg_compile() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_BG_COMPILE") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_BG_COMPILE") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     })
@@ -464,7 +465,7 @@ pub fn bg_compile() -> bool {
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
 // When set, `SharedVm::new` calls `jit::profile::enable_profiling(true)` once at
 // VM init, so the interpreter's existing branch / receiver / back-edge recording
-// sites populate `shared.profile_store` during the interpreted ("C1"/warmup)
+// sites populate `shared.jit.profile_store` during the interpreted ("C1"/warmup)
 // phase. The optimizing C2 compile then consumes that profile — the single-pass
 // backend already biases branch layout + pre-populates virtual-call MICs from it,
 // and (Step 4) the optimizing IR pipeline now reads branch bias too. Default-OFF:
@@ -486,7 +487,7 @@ cached_is_set!(tier_pgo, "CRATONVM_TIER_PGO");
 #[inline]
 pub fn jit_virtual_tierup() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_VIRTUAL_TIERUP") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_VIRTUAL_TIERUP") {
         // Explicit opt-out only: `0` / `false` disable; unset or any other
         // value (incl. `1`, empty) enables.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -512,7 +513,7 @@ pub fn jit_virtual_tierup() -> bool {
 #[inline]
 pub fn native_string_regex() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_NATIVE_STRING_REGEX") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_STRING_REGEX") {
         // Explicit opt-out only: `0` / `false` disable; unset or any other
         // value (incl. `1`, empty) enables.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -554,7 +555,7 @@ pub fn native_string_regex() -> bool {
 #[inline]
 pub fn native_matcher_find() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_NATIVE_MATCHER_FIND") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_NATIVE_MATCHER_FIND") {
         // Explicit opt-out only: `0` / `false` disable; unset or any other
         // value (incl. `1`, empty) enables.
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -619,7 +620,7 @@ cached_is_set!(field_addr_dbg, "CRATONVM_DBG_FIELDADDR");
 /// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.
 cached_is_set!(dbg_jetty, "CRATONVM_DBG_JETTY");
 /// `CRATONVM_DBG_JETTY2` — Jetty classpath dispatch trace, read with an
-/// UNCACHED `std::env::var_os(...).is_some()` inside `execute_invokevirtual_vtable_fast`
+/// UNCACHED `cratonvm_types::flags::runtime_var_os(...).is_some()` inside `execute_invokevirtual_vtable_fast`
 /// (i.e. a `GetEnvironmentVariableW` syscall on the virtual-call dispatch path).
 /// Cached.
 cached_is_set!(dbg_jetty2, "CRATONVM_DBG_JETTY2");
@@ -666,19 +667,85 @@ cached_is_set!(dbg_bytecode_dump, "CRATONVM_DBG_BYTECODE_DUMP");
 /// already registered" duplicate-registration failure).
 cached_is_set!(dbg_dupcall_filter, "CRATONVM_DBG_DUPCALL_FILTER");
 
+/// `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` — AOT management-context trace
+/// (`aotContributedInitializerStartsManagementContext`), on the
+/// `invoke_on_class_shared_inner` lambda-dispatch path.
+///
+/// PERF (2026-07-25): the two call sites read this with an **uncached**
+/// `cratonvm_types::flags::runtime_var_os` on *every* `invokevirtual` entry, and — because the env
+/// probe was the left operand of the `&&` — paid a `getenv` before the cheap
+/// `method_name ==` compare could short-circuit it. `getenv` takes the process
+/// environ lock and linearly scans environ, so this alone was ~10% of the
+/// CratonBench `hashmap` phase (10M virtual calls). Same class of bug as the
+/// `CRATONVM_DBG_BLOCKGC` note in `vm_exec.rs`. Keep this predicate as the
+/// left operand: a `OnceLock<bool>` read is cheaper than the string compare,
+/// so it short-circuits the common (unset) case in a single load.
+cached_is_set!(invoke_virtual_entry_trace, "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE");
+
+// ── PERF 2026-07-25: the five `getenv` hogs found by an LD_PRELOAD tally ──
+//
+// An `LD_PRELOAD` shim counting `getenv()` by name over the CratonBench
+// `hashmap` phase (10M put/get) recorded **~130 million calls**, ≈13 per
+// benchmark iteration:
+//
+//     60,008,062  CRATONVM_DBG_LOADER_TRACE
+//     20,001,011  CRATONVM_DBG_MH_STACK
+//     20,001,011  CRATONVM_DBG_MH_ADAPTER
+//     20,001,005  CRATONVM_DBG_STACKLESS
+//     10,002,013  CRATONVM_DBG_H2TRACE
+//
+// All were uncached `cratonvm_types::flags::runtime_var`/`var_os` probes sitting on the `new`
+// opcode and `try_stackless_invoke` paths, and most had the env probe as the
+// LEFT operand of an `&&` whose right operand is a cheap string compare — so
+// the `getenv` (which takes the process environ lock and linearly scans
+// environ) ran unconditionally and the cheap test could never short-circuit
+// it. Together they were ~11% of the phase's CPU. Caching is the fix; keep
+// these predicates as the left operand, since a `OnceLock<bool>` read is
+// cheaper than the string compares they guard.
+cached_is_set!(dbg_mh_stack, "CRATONVM_DBG_MH_STACK");
+cached_is_set!(dbg_mh_adapter, "CRATONVM_DBG_MH_ADAPTER");
+cached_is_set!(dbg_stackless, "CRATONVM_DBG_STACKLESS");
+cached_is_set!(dbg_h2trace, "CRATONVM_DBG_H2TRACE");
+
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
 /// `CRATONVM_NO_LOCAL_LIVENESS` — disable the per-bci local-variable
 /// liveness filter in the interpreter frame GC root scan (restores the
 /// scan-every-object-typed-slot behaviour; see `runtime::local_liveness`).
 cached_is_ok!(no_local_liveness, "CRATONVM_NO_LOCAL_LIVENESS");
+/// `CRATONVM_DBG_ARRLEN` — diagnostic for a non-array reaching
+/// `NativeContextImpl::array_length`. PERF (2026-07-25): was an uncached
+/// `cratonvm_types::flags::runtime_var` (which allocates a `String` on a hit and takes the environ
+/// lock either way) evaluated on every `array_length` call whose receiver is
+/// not an array. Cached for the same reason as
+/// [`invoke_virtual_entry_trace`].
+cached_is_ok!(dbg_arrlen, "CRATONVM_DBG_ARRLEN");
+/// `CRATONVM_DBG_LOADER_TRACE` — MVStore `RootReference` loader-identity
+/// trace. The single worst `getenv` offender on the interpreter hot path
+/// (60M calls in one CratonBench `hashmap` run): ~33 uncached call sites,
+/// several on the `new` opcode path. See the tally note above
+/// [`dbg_mh_stack`]. Both `.is_ok()` and `.is_some()` spellings existed at
+/// the call sites; they are equivalent here (the flag is never set to
+/// non-UTF-8), so one predicate serves both.
+cached_is_ok!(dbg_loader_trace, "CRATONVM_DBG_LOADER_TRACE");
+/// `CRATONVM_DBG_ISOLATED_CNF` — narrow trace for the isolated-URLClassLoader
+/// "class not found" hard-fail in [`resolve_class_loader_aware`]: prints the
+/// name, the referencing class, and the Java frames whenever an isolating
+/// loader's own `loadClass` declined a name and the VM therefore refuses to
+/// fall back to the global store. Fires at most a handful of times per run,
+/// unlike `dbg_loader_trace`.
+cached_is_ok!(dbg_isolated_cnf, "CRATONVM_DBG_ISOLATED_CNF");
 cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
 cached_is_ok!(athrow_dbg, "CRATONVM_DBG_ATHROW");
+/// `CRATONVM_DBG_STUBLOADER` -- trace the "would fabricate a synthetic stub,
+/// ask the calling class's own ClassLoader first" fallback in
+/// `NativeContextImpl::load_class`.
+cached_is_ok!(dbg_stub_loader, "CRATONVM_DBG_STUBLOADER");
 cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
 /// `CRATONVM_DBG_MODSTATIC` — JBoss-Modules `<clinit>`/static-dispatch
-/// diagnostic. This was read with an UNCACHED `std::env::var(...).is_ok()`
+/// diagnostic. This was read with an UNCACHED `cratonvm_types::flags::runtime_var(...).is_ok()`
 /// from `ensure_class_initialized_shared` (the per-barrier class-init gate
 /// fired on every getstatic/putstatic/new/invokestatic, *before* the
 /// fast-path "already initialized" check) and from two method-resolution
@@ -688,13 +755,13 @@ cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
 /// measured ~567 ns/iter, most of it this call). Cached like its siblings.
 cached_is_ok!(modstatic_dbg, "CRATONVM_DBG_MODSTATIC");
 /// `CRATON_HASHTABLEOFINT_TRACE` — niche getfield/putfield diagnostic that was
-/// read with an UNCACHED `std::env::var(...).is_ok()` on EVERY getfield and
+/// read with an UNCACHED `cratonvm_types::flags::runtime_var(...).is_ok()` on EVERY getfield and
 /// putfield (the two most common opcodes in object-oriented bytecode) — a
 /// per-field-access `GetEnvironmentVariableW` syscall. Cached.
 cached_is_ok!(hashtableofint_trace, "CRATON_HASHTABLEOFINT_TRACE");
 cached_is_ok!(dbg_toarray, "CRATONVM_DBG_TOARRAY");
 /// `CRATON_BAOS_DBG` — ByteArrayOutputStream `buf`/`count` putfield diagnostic,
-/// read with an UNCACHED `std::env::var_os(...).is_some()` on EVERY putfield.
+/// read with an UNCACHED `cratonvm_types::flags::runtime_var_os(...).is_some()` on EVERY putfield.
 /// Cached.
 cached_is_set!(baos_dbg, "CRATON_BAOS_DBG");
 
@@ -724,8 +791,8 @@ pub fn any_field_diag() -> bool {
             || hashtableofint_trace()
             || bd_debug()
             || baos_dbg()
-            || std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some()
-            || std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STRAYSTACK").is_some()
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NULLTHIS").is_some()
     })
 }
 
@@ -747,7 +814,7 @@ cached_is_ok!(charset_dbg, "CRATONVM_DBG_CHARSET");
 #[inline]
 pub fn strict_swallows() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_STRICT_SWALLOWS") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_STRICT_SWALLOWS") {
         Ok(v) => v == "1",
         Err(_) => false,
     })
@@ -756,7 +823,7 @@ pub fn strict_swallows() -> bool {
 #[inline]
 pub fn jit_scalar_new() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_SCALAR_NEW").map_or(true, |v| v != "0"))
 }
 
 /// C1→C2 supersede (default-ON): after the background worker publishes a C1
@@ -769,44 +836,47 @@ pub fn jit_scalar_new() -> bool {
 pub fn c2_supersede() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("CRATONVM_C2_SUPERSEDE").map_or(true, |v| v != "0" && v != "false")
+        cratonvm_types::flags::runtime_var("CRATONVM_C2_SUPERSEDE").map_or(true, |v| v != "0" && v != "false")
     })
 }
 
 #[inline]
 pub fn jit_ir_call() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL").map_or(true, |v| v != "0"))
 }
 
 #[inline]
 pub fn jit_ir_call_special() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_SPECIAL").map_or(true, |v| v != "0"))
 }
 
 #[inline]
 pub fn jit_ir_long() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_LONG").map_or(true, |v| v != "0"))
 }
 
 #[inline]
 pub fn jit_ir_call_virtual() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some())
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_CALL_VIRTUAL")
+            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
 }
 
 #[inline]
 pub fn jit_ir_fp() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"))
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_FP").map_or(true, |v| v != "0"))
 }
 
 #[inline]
 pub fn inline_allow_static() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_INLINE_ALLOW_STATIC").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_INLINE_ALLOW_STATIC").is_some())
 }
 
 // NOTE (real-cdi-bean-container Step 3): the former `real_spring_startup()` gate
@@ -895,6 +965,48 @@ impl RealSelector {
     }
 }
 
+// ── Ad-hoc debug traces on interpreter hot paths ────────────────────────
+//
+// Each of these was an inline `cratonvm_types::flags::runtime_var_os(...)` sitting on a path the
+// interpreter runs per invoke / per putfield / per `if_acmpne`. An
+// `LD_PRELOAD` `getenv` tally over `RrwlSingle` (300k uncontended
+// `ReentrantReadWriteLock`/`ReentrantLock` lock-unlock pairs, the reduced form
+// of H2 `TestFileSystem.testConcurrent`) counted **6.9 million** `getenv`
+// calls — about 23 per lock/unlock — with these six names accounting for
+// 6,900,696 of them:
+//
+// ```text
+// 4501107  CRATONVM_DBG_GSE                          (invoke-cache lookup, twice per lookup)
+// 1101202  CRATONVM_DBG_FIELD_WATCH                  (every putfield + every field retarget)
+//  599999  CRATONVM_DBG_WATCHREF
+//  398881  CRATONVM_DBG_ASSERTEQ                     (every JIT-ABI invoke)
+//  199000  CRATONVM_EXEC_FRAME_TRACE                 (every frame entry)
+//  100507  CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE   (every if_acmpne)
+// ```
+//
+// `perf record -F 999` attributed ~3.5% of the run to `getenv` and its
+// callers. This is the same defect class as the 2026-07-23 fix for
+// `callee_saved_gpr_local_homes_enabled()` in `vm/src/jit/skip_list.rs` — see
+// `docs/known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md`,
+// which is where that one was found and where these were.
+//
+// NOTE: like every other helper in this module, these read the legacy
+// per-flag variable directly rather than through
+// `cratonvm_types::flags()`, so the grouped `CRATONVM_DBG=gse` spelling does
+// not reach them. That is pre-existing behaviour for all 30 helpers here, not
+// something this change introduced; the direct `CRATONVM_DBG_GSE=1` spelling
+// works exactly as before.
+
+cached_is_set!(dbg_gse, "CRATONVM_DBG_GSE");
+cached_is_set!(dbg_field_watch, "CRATONVM_DBG_FIELD_WATCH");
+cached_is_set!(dbg_watchref, "CRATONVM_DBG_WATCHREF");
+cached_is_set!(dbg_asserteq, "CRATONVM_DBG_ASSERTEQ");
+cached_is_set!(exec_frame_trace, "CRATONVM_EXEC_FRAME_TRACE");
+cached_is_set!(
+    active_profiles_identity_trace,
+    "CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE"
+);
+
 /// Once-initialized accessor for the `CRATONVM_REAL` / `CRATONVM_REAL_JCA`
 /// differential switch. Parses the env vars exactly once; every subsequent
 /// call serves the cached [`RealSelector`].
@@ -902,8 +1014,8 @@ impl RealSelector {
 pub fn real_bytecode_selector() -> &'static RealSelector {
     static CACHE: OnceLock<RealSelector> = OnceLock::new();
     CACHE.get_or_init(|| {
-        let real = std::env::var("CRATONVM_REAL").ok();
-        let jca_legacy = std::env::var_os("CRATONVM_REAL_JCA")
+        let real = cratonvm_types::flags::runtime_var("CRATONVM_REAL").ok();
+        let jca_legacy = cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_JCA")
             .map(|v| !v.is_empty())
             .unwrap_or(false);
         RealSelector::parse(real.as_deref(), jca_legacy)

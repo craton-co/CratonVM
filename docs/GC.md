@@ -143,6 +143,9 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
 | `CRATONVM_G1_PARALLEL_EVAC=1` | Opt-in parallel young evacuator (known race — testing only) |
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
+| `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
+| `CRATONVM_GC_PAR_MIN_BYTES=<bytes>` | Young-gen size floor below which the young GC stays sequential (default 16 MiB) |
+| `CRATONVM_GC_SWEEP_ANCHOR_STRIDE=<bytes>` | Byte spacing of the parallel-sweep anchors (default 8 MiB). Lower it to drive the parallel sweep on a small young gen under `CRATONVM_DBG_GC_STRESS` |
 
 Note: `tracing::debug!` is compiled out of release builds
 (`release_max_level_info`); for cycle-phase confirmation attach gdb to
@@ -160,7 +163,40 @@ collection's copy-time budget), `-XX:MaxHeapSize`,
 **Generational.** Young is a pair of semi-spaces with TLAB bump
 allocation; while any thread holds a JIT frame the young collection is a
 non-moving sweep with selective promotion (this is the load-bearing
-reason conservative JIT roots are safe here). Old gen is a free-list
+reason conservative JIT roots are safe here). That default young
+collection is PARALLEL in two phases. The transitive closure is drained
+by several workers over a lock-free mark bitmap (one bit per 8 bytes of
+from-space) — sound because the phase is pure and read-only on a frozen
+heap and the only write is an atomic bit claim. The sweep walk, a linear
+header chase that is inherently sequential, is split at anchors the
+ALLOCATOR supplies rather than ones a walk rediscovers. `arena.rs` keeps
+one verified object start per 4 KiB bucket, armed on `new`/`grow`,
+cleared on `reset`, and recorded by the TLAB-refill, young slow-path and
+Cheney-copy paths for a shift, a bounds-checked load, a compare and a
+per-bucket-once store under a lock the caller already holds. The grid is
+completed by the END of every pre-existing free/TLAB-skip block -- a
+sweep coalesces dead spans up to a survivor and never past one, so a
+region that survived an earlier collection is never re-handed-out and
+would otherwise contribute no anchor -- plus offset 0 and `used` as
+terminals. Anchors landing inside a free block are filtered out, because
+one minted by adjacent uncoalesced blocks would abort the whole parallel
+attempt. This replaced a full-arena exact-base oracle walk costing ~240
+ms and 2 GiB walked per collection; the same grid, subsampled at
+`CRATONVM_GC_SWEEP_ANCHOR_STRIDE`, now costs ~0 ms and 4.7 MB walked,
+and the conservative-candidate oracle traverses only those anchor
+intervals that actually contain a candidate. The 2026-07-18
+truncated-oracle fail-safe survives as `verified_spans`: an interval
+counts as proved only if its chain lands EXACTLY on the next anchor, an
+unproved interval has its ranges discarded rather than trusted, and a
+candidate outside every proved span falls back to direct validation. Each chunk
+re-proves its own anchor by requiring its chain to land exactly on the
+next one, and the parallel walker writes nothing — on any grid anomaly
+it is abandoned wholesale and the untouched sequential walk (which owns
+every diagnostic and the unwind/re-anchor recovery) runs from scratch.
+Parallel EVACUATION does not exist here. The moving young gen's
+JIT-held-oop corruption is fixed (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+but it remains opt-in behind `CRATONVM_MOVING_YOUNG` on throughput grounds.
+Old gen is a free-list
 allocator collected by a VM-driven concurrent cycle (initial mark STW →
 concurrent trace → remark STW → concurrent sweep, with a remark-time
 TAMS snapshot gating the sweep).

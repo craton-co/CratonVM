@@ -364,6 +364,10 @@ enum InitArgsError {
     InvalidArgs(&'static str),
     InvalidOption(String),
     UnrecognizedOption(String),
+    /// The selected JDK mode has no backing class library in this
+    /// build/environment. Carries the full, actionable message produced by
+    /// `require_real_jdk` / `require_synthetic_jdk`.
+    JdkModeUnavailable(String),
 }
 
 impl fmt::Display for InitArgsError {
@@ -377,6 +381,7 @@ impl fmt::Display for InitArgsError {
             InitArgsError::UnrecognizedOption(opt) => {
                 write!(f, "unrecognized JavaVM option {opt:?}")
             }
+            InitArgsError::JdkModeUnavailable(msg) => f.write_str(msg),
         }
     }
 }
@@ -417,6 +422,46 @@ unsafe fn option_to_str<'a>(
     }
 }
 
+/// Validate that the class library the config selected actually exists, and
+/// pin the resolved `JAVA_HOME` onto the config when it does.
+///
+/// **This is the C-ABI equivalent of `vm-cli`'s `resolve_jdk_mode`.** Without
+/// it, `JNI_CreateJavaVM` / `cratonvm_create` could start in a mode whose
+/// backing library is not there:
+///
+/// * real-JDK mode with no usable JDK on the host boots with an empty boot
+///   classpath, surfacing much later as an unexplained `NoClassDefFoundError`
+///   on the first JDK class reference;
+/// * synthetic mode in a build without the `synthetic-jdk` Cargo feature
+///   registers none of the ~5,200 stubs **and** suppresses boot-classpath
+///   discovery, i.e. a VM with no class library at all.
+///
+/// Both are hard errors at the launcher; they must be hard errors here too.
+/// See `docs/internal/arch-2026-07-26/jdk-mode-determinism.md` §2.3 and §6.4.
+///
+/// The resolved root is written back to `java_home` (when not already set) for
+/// the same reason the launcher does it: so the VM's boot-classpath discovery
+/// resolves the installation that was just validated instead of re-running the
+/// environment probe and possibly landing somewhere else.
+fn validate_jdk_mode(cfg: VmConfig) -> Result<VmConfig, InitArgsError> {
+    use cratonvm_vm::config as vmcfg;
+    match cfg.jdk_mode() {
+        vmcfg::JdkMode::Synthetic => {
+            vmcfg::require_synthetic_jdk().map_err(InitArgsError::JdkModeUnavailable)?;
+            Ok(cfg)
+        }
+        vmcfg::JdkMode::Real => {
+            let home = vmcfg::require_real_jdk(cfg.java_home.as_deref())
+                .map_err(InitArgsError::JdkModeUnavailable)?;
+            if cfg.java_home.is_none() {
+                Ok(cfg.with_java_home(home.to_string_lossy().into_owned()))
+            } else {
+                Ok(cfg)
+            }
+        }
+    }
+}
+
 /// Parse a `JavaVMInitArgs` into a [`VmConfig`].
 ///
 /// Recognises the common HotSpot option forms an embedder is likely to pass:
@@ -424,13 +469,24 @@ unsafe fn option_to_str<'a>(
 /// next option or glued as `-cp=<path>`), and `-D<key>=<value>`. Unrecognised
 /// options are ignored only when `ignoreUnrecognized` is non-zero.
 ///
+/// # JDK mode
+///
+/// The base config is [`VmConfig::for_launcher`] (via the retained
+/// `with_host_jdk_default` alias): deterministic real-JDK mode, never
+/// host-detected. `--real-jdk` / `--synthetic-jdk` are accepted as JavaVM
+/// options with exactly the launcher's spelling and exactly the launcher's
+/// mutual-exclusion rule, so an embedder is not silently locked out of the
+/// synthetic library that host autodetection used to hand it on a JDK-less
+/// machine. Whichever mode results is then validated by [`validate_jdk_mode`]
+/// — this entry point performed no validation at all before.
+///
 /// # Safety
 /// `args` must be a valid `*const JavaVMInitArgs` with `options` pointing at
 /// `n_options` valid, NUL-terminated [`JavaVMOption`] strings.
 unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, InitArgsError> {
     let mut cfg = VmConfig::with_host_jdk_default();
     if args.is_null() {
-        return Ok(cfg);
+        return validate_jdk_mode(cfg);
     }
     let init = &*args;
     if !is_supported_jni_version(init.version) {
@@ -442,7 +498,7 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
         ));
     }
     if init.n_options == 0 {
-        return Ok(cfg);
+        return validate_jdk_mode(cfg);
     }
     if init.options.is_null() {
         return Err(InitArgsError::InvalidArgs(
@@ -453,6 +509,9 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
     let ignore_unrecognized = init.ignore_unrecognized != 0;
 
     let mut classpath: Vec<String> = Vec::new();
+    // Same flags, same spelling, same mutual exclusion as the launcher.
+    let mut synthetic_flag = false;
+    let mut real_flag = false;
     let mut i = 0usize;
     while i < opts.len() {
         let Some(s) = option_to_str(opts, i, ignore_unrecognized)? else {
@@ -512,6 +571,10 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
             } else {
                 cfg.system_properties.push((def.to_string(), String::new()));
             }
+        } else if s == "--synthetic-jdk" {
+            synthetic_flag = true;
+        } else if s == "--real-jdk" {
+            real_flag = true;
         } else if matches!(s, "vfprintf" | "exit" | "abort") {
             // Standard Invocation API callbacks are recognized but unused.
         } else {
@@ -526,7 +589,26 @@ unsafe fn config_from_args(args: *const JavaVMInitArgs) -> Result<VmConfig, Init
     if !classpath.is_empty() {
         cfg = cfg.with_classpath(classpath);
     }
-    Ok(cfg)
+
+    // Mode selection. Passing both is an error rather than a silent
+    // last-one-wins: they select two different standard-library
+    // implementations, so guessing is never the right answer. `ignoreUnrecognized`
+    // does NOT soften this — the flags were recognized, they just contradict.
+    if synthetic_flag && real_flag {
+        return Err(InitArgsError::InvalidOption(format!(
+            "--synthetic-jdk and --real-jdk are mutually exclusive: they select two \
+             different standard-library implementations. Pass exactly one (or neither, \
+             for the default {}).",
+            cratonvm_vm::config::LAUNCHER_DEFAULT_JDK_MODE
+        )));
+    }
+    if synthetic_flag {
+        cfg = cfg.with_jdk_mode(cratonvm_vm::config::JdkMode::Synthetic);
+    } else if real_flag {
+        cfg = cfg.with_jdk_mode(cratonvm_vm::config::JdkMode::Real);
+    }
+
+    validate_jdk_mode(cfg)
 }
 
 /// Split a classpath string on the platform separator and append the parts.
@@ -569,7 +651,7 @@ fn bootstrap(vm: &mut Vm) {
             .is_err()
         {
             vm.main_thread.invoke_cache.clear();
-            vm.shared.resolution_cache.write().clear();
+            vm.shared.classes.resolution_cache.write().clear();
         }
         vm.shared.set_init_level(2);
     }
@@ -930,7 +1012,7 @@ impl CratonValue {
 // before it is ever turned back into an `ObjectRef`.
 //
 // The table is layered on top of the VM's existing `JniGlobalRefs`
-// (`shared.jni_global_refs`), which is the only channel that (a) keeps the
+// (`shared.natives.jni_global_refs`), which is the only channel that (a) keeps the
 // referenced object alive as a GC root and (b) has its stored `ObjectRef`s
 // rewritten by the moving collector via `update_after_gc`. We never retain a
 // raw object address in this table; dedup compares against the current address
@@ -997,7 +1079,7 @@ fn register_handle(shared: &SharedVm, o: Option<ObjectRef>) -> CratonRef {
         Err(_) => return 0,
     };
     let table = tables.entry(vm_key(shared)).or_default();
-    let mut grefs = shared.jni_global_refs.lock();
+    let mut grefs = shared.natives.jni_global_refs.lock();
     // Dedup by resolving each global ref to its current post-GC address. This
     // keeps the table correct when a moving collector rewrites the global refs.
     for (&tok, entry) in &mut table.by_token {
@@ -1030,7 +1112,7 @@ fn resolve_handle(shared: &SharedVm, h: CratonRef) -> Option<ObjectRef> {
     let gref = tables.get(&vm_key(shared))?.by_token.get(&h)?.gref;
     // `JniGlobalRefs::resolve` validates the gref is still live and returns the
     // current (post-GC) address.
-    shared.jni_global_refs.lock().resolve(gref)
+    shared.natives.jni_global_refs.lock().resolve(gref)
 }
 
 fn release_handle(shared: &SharedVm, h: CratonRef) -> bool {
@@ -1055,7 +1137,7 @@ fn release_handle(shared: &SharedVm, h: CratonRef) -> bool {
         .by_token
         .remove(&h)
         .expect("entry was present while releasing handle");
-    shared.jni_global_refs.lock().remove(entry.gref)
+    shared.natives.jni_global_refs.lock().remove(entry.gref)
 }
 
 fn decode_craton_args(api: &str, shared: &SharedVm, args: &[CratonValue]) -> Option<Vec<Value>> {
@@ -1087,7 +1169,7 @@ fn decode_craton_value(api: &str, shared: &SharedVm, value: CratonValue) -> Opti
 fn drop_handle_table(shared: &SharedVm) {
     if let Ok(mut tables) = handle_tables().lock() {
         if let Some(table) = tables.remove(&vm_key(shared)) {
-            let mut grefs = shared.jni_global_refs.lock();
+            let mut grefs = shared.natives.jni_global_refs.lock();
             for entry in table.by_token.into_values() {
                 grefs.remove(entry.gref);
             }
@@ -1569,7 +1651,7 @@ pub extern "C" fn cratonvm_string_utf8(vm: *mut CratonVm, str: CratonRef) -> *mu
                 };
                 // Reuse the VM's String reader (`vm::read_java_string`), the same
                 // primitive the JNIEnv `GetStringUTFChars` slot uses.
-                match cratonvm_vm::vm::read_java_string(&h.vm.shared.heap, oref) {
+                match cratonvm_vm::vm::read_java_string(&h.vm.shared.mem.heap, oref) {
                     Some(s) => {
                         // Strip interior NULs so `CString::new` cannot fail; the
                         // buffer is caller-owned (freed via cratonvm_free_string).
@@ -1726,7 +1808,7 @@ pub extern "C" fn cratonvm_invoke_virtual(
                 // most-derived class is exactly virtual dispatch (the same
                 // pattern `Vm::run_pending_finalizers` uses to virtual-dispatch
                 // `finalize()` on an object's concrete class).
-                let class_id = h.vm.shared.heap.class_id_of(recv);
+                let class_id = h.vm.shared.mem.heap.class_id_of(recv);
                 let class_name = match h.vm.class_name(class_id) {
                     Some(n) => n,
                     None => {
@@ -1792,7 +1874,7 @@ pub extern "C" fn cratonvm_object_class(
                         return JNI_ERR;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 if !out_class.is_null() {
                     // SAFETY: `out_class` checked non-null; writable per contract.
                     *out_class = class_id.as_u32() as CratonClass;
@@ -1871,9 +1953,10 @@ pub extern "C" fn cratonvm_field_count(vm: *mut CratonVm, obj: CratonRef) -> JIn
                         return -1;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let n =
                     h.vm.shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)
@@ -1923,9 +2006,10 @@ pub extern "C" fn cratonvm_get_field(
                         return CratonValue::error();
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let nfields =
                     h.vm.shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)
@@ -1938,7 +2022,7 @@ pub extern "C" fn cratonvm_get_field(
                     return CratonValue::error();
                 }
                 // Bounds-checked above; `heap.get_field` reads the slot value.
-                let v = h.vm.shared.heap.get_field(oref, index as usize);
+                let v = h.vm.shared.mem.heap.get_field(oref, index as usize);
                 CratonValue::from_value(&h.vm.shared, v)
             })
         }
@@ -2119,7 +2203,7 @@ pub extern "C" fn cratonvm_get_field_by_name(
                     Some(s) => s,
                     None => return CratonValue::error(),
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
                         CratonValue::from_value(&h.vm.shared, h.vm.get_instance_field(oref, idx))
@@ -2171,7 +2255,7 @@ pub extern "C" fn cratonvm_set_field(
                         return JNI_ERR;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let nfields = h.vm.instance_field_count(class_id);
                 if index < 0 || (index as usize) >= nfields {
                     set_last_error(format!(
@@ -2228,7 +2312,7 @@ pub extern "C" fn cratonvm_set_field_by_name(
                     Some(s) => s,
                     None => return JNI_ERR,
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
                         let value = match decode_craton_value(
@@ -2345,6 +2429,108 @@ mod tests {
         assert_eq!(out, vec!["a.jar", "b.jar", "c.jar"]);
     }
 
+    // ── JDK-mode validation fixtures ──────────────────────────────────────
+    //
+    // `config_from_args` now validates that the selected class library really
+    // exists (see `validate_jdk_mode`). That makes it host-dependent unless
+    // the test points it at a JDK, so these helpers synthesise a minimal one
+    // — the same trick `vm/src/config.rs`'s detection tests use. Without them
+    // the suite would pass or fail depending on whether the machine running it
+    // happens to have a JDK installed, which is exactly the non-determinism
+    // this whole change exists to remove.
+
+    /// `JAVA_HOME` / `CRATONVM_JAVA_HOME` are process-wide; serialise.
+    fn jdk_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let prev = std::env::var_os(key);
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        let result = f();
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        result
+    }
+
+    /// A scratch directory removed on drop. With `jmods = true` it looks
+    /// enough like a JDK 9+ root for `require_real_jdk`; with `jmods = false`
+    /// it is a bare directory that `resolve_java_home` accepts but
+    /// `detect_real_jdk` must reject.
+    struct ScratchJdk(std::path::PathBuf);
+
+    impl ScratchJdk {
+        fn new(tag: &str, jmods: bool) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "cratonvm-libjni-jdk-{}-{}-{:?}",
+                tag,
+                std::process::id(),
+                std::thread::current().id(),
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            if jmods {
+                let dir = root.join("jmods");
+                std::fs::create_dir_all(&dir).expect("create scratch jmods dir");
+                std::fs::write(dir.join("java.base.jmod"), b"JM\x01\x00")
+                    .expect("write scratch jmod");
+            } else {
+                std::fs::create_dir_all(&root).expect("create scratch dir");
+            }
+            Self(root)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().expect("utf-8 temp path")
+        }
+    }
+
+    impl Drop for ScratchJdk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Run `f` with the process pointed at a synthesised real JDK.
+    fn with_fake_jdk<R>(tag: &str, f: impl FnOnce() -> R) -> R {
+        let _guard = jdk_env_lock();
+        let jdk = ScratchJdk::new(tag, true);
+        with_env("CRATONVM_JAVA_HOME", Some(jdk.path()), || {
+            with_env("JAVA_HOME", None, f)
+        })
+    }
+
+    /// Run `f` with no usable JDK.
+    ///
+    /// Points `CRATONVM_JAVA_HOME` at an *empty real directory* rather than
+    /// emptying `PATH`: on Windows `CreateProcess` can still resolve a system
+    /// `java` with an empty `PATH`, which would make the test flaky on
+    /// developer machines. Same rationale as
+    /// `config.rs::launcher_default_never_falls_back_to_synthetic_when_no_jdk`.
+    fn with_no_jdk<R>(tag: &str, f: impl FnOnce() -> R) -> R {
+        let _guard = jdk_env_lock();
+        let empty = ScratchJdk::new(tag, false);
+        with_env("CRATONVM_JAVA_HOME", Some(empty.path()), || {
+            with_env("JAVA_HOME", None, f)
+        })
+    }
+
+    // `JavaVMInitArgs::ignoreUnrecognized` is a JNI `jboolean` (`u8`), not a
+    // `jint`; all three call sites pass an untyped literal, so taking `u8`
+    // here is exact rather than a lossy conversion at the struct literal.
+    fn args_with(opts: &mut [JavaVMOption], ignore_unrecognized: u8) -> JavaVMInitArgs {
+        JavaVMInitArgs {
+            version: JNI_VERSION,
+            n_options: opts.len() as JInt,
+            options: opts.as_mut_ptr(),
+            ignore_unrecognized,
+        }
+    }
+
     #[test]
     fn config_from_args_rejects_unsupported_jni_version() {
         let args = JavaVMInitArgs {
@@ -2382,8 +2568,153 @@ mod tests {
             ))
         );
 
+        // With `ignoreUnrecognized` the unknown option is dropped — but the
+        // config still has to name a class library that exists, so this half
+        // runs against a synthesised JDK.
         args.ignore_unrecognized = 1;
-        assert!(unsafe { config_from_args(&args) }.is_ok());
+        with_fake_jdk("ignore-unrecognized", || {
+            assert!(unsafe { config_from_args(&args) }.is_ok());
+        });
+    }
+
+    // ── JDK-mode validation on the C-ABI entry point ──────────────────────
+    //
+    // `jdk-mode-determinism.md` §6.4: this path called
+    // `VmConfig::with_host_jdk_default()` and performed *no* validation, so an
+    // embedder could boot into a mode whose backing library is not present and
+    // only find out much later, as an unexplained `NoClassDefFoundError`.
+
+    #[test]
+    fn config_from_args_defaults_to_real_jdk() {
+        with_fake_jdk("default-mode", || {
+            let args = JavaVMInitArgs {
+                version: JNI_VERSION,
+                n_options: 0,
+                options: std::ptr::null_mut(),
+                ignore_unrecognized: 1,
+            };
+            let cfg = unsafe { config_from_args(&args) }.expect("fake JDK is usable");
+            assert_eq!(cfg.jdk_mode(), cratonvm_vm::config::JdkMode::Real);
+            assert_eq!(
+                cfg.jdk_mode(),
+                cratonvm_vm::config::LAUNCHER_DEFAULT_JDK_MODE,
+                "the embedding entry point must agree with the launcher default"
+            );
+        });
+    }
+
+    #[test]
+    fn config_from_args_pins_the_validated_java_home() {
+        // The point of pinning: boot-classpath discovery inside the VM must
+        // resolve the installation that was just validated, not re-run the
+        // environment probe and possibly land somewhere else.
+        with_fake_jdk("pin-home", || {
+            let args = JavaVMInitArgs {
+                version: JNI_VERSION,
+                n_options: 0,
+                options: std::ptr::null_mut(),
+                ignore_unrecognized: 1,
+            };
+            let cfg = unsafe { config_from_args(&args) }.expect("fake JDK is usable");
+            assert!(
+                cfg.java_home.is_some(),
+                "the resolved JDK root must be pinned onto the config"
+            );
+        });
+    }
+
+    #[test]
+    fn config_from_args_fails_loudly_when_no_jdk_is_available() {
+        with_no_jdk("no-jdk", || {
+            let args = JavaVMInitArgs {
+                version: JNI_VERSION,
+                n_options: 0,
+                options: std::ptr::null_mut(),
+                ignore_unrecognized: 1,
+            };
+            let err = unsafe { config_from_args(&args) }
+                .expect_err("real-JDK mode with no JDK must not boot an empty VM");
+            match err {
+                InitArgsError::JdkModeUnavailable(msg) => {
+                    assert!(msg.contains("no usable JDK was found"), "{msg}");
+                    // The message must be actionable, not just a verdict.
+                    assert!(msg.contains("JAVA_HOME"), "{msg}");
+                    assert!(msg.contains("--java-home"), "{msg}");
+                }
+                other => panic!("expected JdkModeUnavailable, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn config_from_args_rejects_both_mode_flags() {
+        let synth = std::ffi::CString::new("--synthetic-jdk").unwrap();
+        let real = std::ffi::CString::new("--real-jdk").unwrap();
+        let mut opts = [
+            JavaVMOption {
+                option_string: synth.as_ptr() as *mut c_char,
+                extra_info: std::ptr::null_mut(),
+            },
+            JavaVMOption {
+                option_string: real.as_ptr() as *mut c_char,
+                extra_info: std::ptr::null_mut(),
+            },
+        ];
+        // `ignoreUnrecognized` must NOT soften this: both flags were
+        // recognized, they just contradict each other.
+        let args = args_with(&mut opts, 1);
+        let err = unsafe { config_from_args(&args) }.expect_err("both flags must be rejected");
+        match err {
+            InitArgsError::InvalidOption(msg) => {
+                assert!(msg.contains("mutually exclusive"), "{msg}")
+            }
+            other => panic!("expected InvalidOption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_from_args_honours_the_synthetic_flag_subject_to_the_cargo_feature() {
+        let synth = std::ffi::CString::new("--synthetic-jdk").unwrap();
+        let mut opts = [JavaVMOption {
+            option_string: synth.as_ptr() as *mut c_char,
+            extra_info: std::ptr::null_mut(),
+        }];
+        let args = args_with(&mut opts, 1);
+        // Deliberately run with NO usable JDK: synthetic mode must not consult
+        // the host at all. The outcome depends only on whether the stubs were
+        // compiled in.
+        with_no_jdk("synthetic-flag", || {
+            let result = unsafe { config_from_args(&args) };
+            if cratonvm_vm::config::SYNTHETIC_JDK_COMPILED_IN {
+                let cfg = result.expect("synthetic mode is available in this build");
+                assert_eq!(cfg.jdk_mode(), cratonvm_vm::config::JdkMode::Synthetic);
+            } else {
+                match result.expect_err("synthetic mode without the feature must be rejected") {
+                    InitArgsError::JdkModeUnavailable(msg) => {
+                        assert!(msg.contains("synthetic-jdk"), "{msg}");
+                        assert!(
+                            msg.contains("Cargo feature"),
+                            "the error must name the fix: {msg}"
+                        );
+                    }
+                    other => panic!("expected JdkModeUnavailable, got {other:?}"),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn config_from_args_honours_the_real_flag() {
+        let real = std::ffi::CString::new("--real-jdk").unwrap();
+        let mut opts = [JavaVMOption {
+            option_string: real.as_ptr() as *mut c_char,
+            extra_info: std::ptr::null_mut(),
+        }];
+        let args = args_with(&mut opts, 0);
+        with_fake_jdk("real-flag", || {
+            let cfg = unsafe { config_from_args(&args) }.expect("fake JDK is usable");
+            assert_eq!(cfg.jdk_mode(), cratonvm_vm::config::JdkMode::Real);
+        });
     }
 
     // -- Layer 2 flat C API ------------------------------------------------
@@ -2492,7 +2823,11 @@ mod tests {
         let first = register_handle(&shared, Some(old));
         let mut pointer_map = std::collections::HashMap::new();
         pointer_map.insert(old.as_ptr() as usize, moved.as_ptr() as usize);
-        shared.jni_global_refs.lock().update_after_gc(&pointer_map);
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .update_after_gc(&pointer_map);
 
         let after_move = register_handle(&shared, Some(moved));
         assert_eq!(
@@ -3213,10 +3548,12 @@ mod tests {
         // cycle counter (to prove a collection actually fired under the churn).
         let baseline = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm published")
+            .threads
             .thread_registry
             .alive_count();
         let gc_before = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm published")
+            .mem
             .heap
             .collection_count();
 
@@ -3356,14 +3693,14 @@ mod tests {
                 if let Some(vm) = cratonvm_vm::native::jni::process_vm() {
                     eprintln!(
                         "[soak/watchdog] alive={} stw_requested={} blocked={} pending(expected-arrived)={}",
-                        vm.thread_registry.alive_count(),
-                        vm.gc_barrier
+                        vm.threads.thread_registry.alive_count(),
+                        vm.mem.gc_barrier
                             .stw_requested
                             .load(std::sync::atomic::Ordering::Acquire),
-                        vm.gc_barrier.blocked_count(),
-                        vm.gc_barrier.pending_count(),
+                        vm.mem.gc_barrier.blocked_count(),
+                        vm.mem.gc_barrier.pending_count(),
                     );
-                    for (tid, blocked, snap) in vm.thread_registry.dump_blocked_states() {
+                    for (tid, blocked, snap) in vm.threads.thread_registry.dump_blocked_states() {
                         eprintln!(
                             "[soak/watchdog]   tid={tid} blocked={blocked} snapshot_len={snap}"
                         );
@@ -3401,6 +3738,7 @@ mod tests {
         // matched by a detach that deregistered its thread.
         let after = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm still live")
+            .threads
             .thread_registry
             .alive_count();
         assert_eq!(
@@ -3413,6 +3751,7 @@ mod tests {
         // the caller forced a large heap / few iterations for bisection.)
         let gc_after = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm still live")
+            .mem
             .heap
             .collection_count();
         if iters >= 64 {

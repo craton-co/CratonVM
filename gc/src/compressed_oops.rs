@@ -16,21 +16,97 @@
 //! | ZeroBased | 0 | 0 / 3 | `addr >> shift` |
 //! | HeapBased | > 0 | 0 / 3 | `(addr - base) >> shift` |
 //!
-//! # Wiring status
+//! # Wiring status (re-audited 2026-07-26 — the previous note was wrong)
 //!
-//! This module is **implemented but not yet wired into the live heap**. The
-//! encode/decode/`encode_klass`/`decode_klass` surface is complete, tested, and
-//! correct, but the VM currently stores all object/class references as full
-//! 64-bit pointers — nothing in the running heap calls these encoders yet. The
-//! code is therefore *unwired*, not dead or broken: it is a self-contained,
-//! ready-to-wire feature.
+//! This module is wired into the live heap behind the **opt-in**
+//! `-XX:+UseCompressedOops` / `CRATONVM_COMPRESSED_OOPS=1` gate, which is
+//! **off by default**. See [`enable_for_live_heap`] for the geometry the VM
+//! fixes at init, and `cratonvm_types::narrow_oop` for the mechanism the hot
+//! paths use (that module owns the base/shift pair because the compact field
+//! accessors live below this crate in the dependency graph).
 //!
-//! Wiring compressed oops into the live heap is a sizeable feature (narrow-oop
-//! field layout, JIT load/store barriers, GC root re-encoding, klass-pointer
-//! compression in object headers) and is tracked as a separate follow-up. Until
-//! that lands, keep the encodability guard in [`CompressedOops::encode`] correct
-//! so that callers wired in later cannot silently truncate a non-encodable
-//! address into a wrong narrow oop.
+//! What is narrowed when the gate is on: **reference instance fields** and
+//! **reference array elements**, from 8 bytes to 4. Nothing else.
+//!
+//! ## The gate is NOT off for throughput reasons. Two correctness holes remain.
+//!
+//! This header previously claimed the only reason the gate stays off is that
+//! the JIT's inline compact-field fast paths are disabled, i.e. "a throughput
+//! regression, not incompleteness". A full sweep of every reference-slot access
+//! in the workspace found that to be false. Under the *generational* backend
+//! (the only one the gate permits — `vm/src/vm/vm_init.rs:862`) two paths still
+//! read or write a reference slot at the wrong width:
+//!
+//! 1. **`jit/src/x64.rs:14639` `emit_load_string_value_ptr`.** Emits an
+//!    unconditional 64-bit `MOV dst, [base + compact_offset]` for the
+//!    `String.value` `byte[]` field. Unlike the `getfield`/`putfield` arms
+//!    (`x64.rs:16495`, `:22032`, `:22497`) it is **not** gated on
+//!    `jit::x64::narrow_oops_block_inline_fields` (`x64.rs:2119`). Under narrow
+//!    oops it loads 4 bytes of
+//!    narrow oop plus 4 bytes of the adjacent `coder`/`hash` field and
+//!    dereferences the result: a deterministic wild-pointer SIGSEGV on every
+//!    inlined `charAt`/`length`/`indexOf`/`hashCode`/`equals`/`compareTo`
+//!    (10 call sites, `x64.rs:25018`-`:25654`). The one-line unblock is to
+//!    short-circuit `try_resolve_string_intrinsic` (`jit/src/lib.rs:3931`) on
+//!    `narrow_oops_enabled()`; the real fix is a narrow arm in that emitter,
+//!    mirroring `emit_narrow_ref_aload_regs` (`x64.rs:17132`).
+//! 2. **`gc/src/gen_heap.rs:8261` `mark_young_to_old_refs` and `:8369`
+//!    `rewrite_stretch_conservatively`.** Both scan an unparseable heap stretch
+//!    in aligned 8-byte words looking for old-gen object bases. A pair of
+//!    adjacent narrow oops never matches, so marks are missed (premature
+//!    reclamation) and refs to moved objects are left unrewritten (dangling).
+//!    Fallback paths — but they are the paths that run when the parseable walk
+//!    has already failed, which is exactly when correctness matters most.
+//!
+//! Because of these, `enable_for_live_heap` prints an explicit unsoundness
+//! warning on success. **Do not flip the default until both are closed.**
+//!
+//! ## Verified NOT needed (contrary to the older remaining-work list)
+//!
+//! * **Klass-pointer compression.** `ObjectHeader::class_id` is already a `u32`,
+//!   so there is nothing to narrow. [`CompressedOops::encode_klass`] /
+//!   [`CompressedOops::decode_klass`], [`NarrowKlass`] and
+//!   [`CompressedOopArray`] have **zero callers** anywhere in the workspace and
+//!   exist only for their unit tests; they are dead weight, not pending work.
+//! * **GC root re-encoding.** Frame locals, operand-stack slots and JIT stack
+//!   spills are *not* heap slots and must stay 64-bit: they are bounded by stack
+//!   depth, not live-set size, and narrowing them would add an encode/decode to
+//!   every `aload`/`astore` for no footprint win. `vm/src/jit/conservative_roots.rs`
+//!   and `vm/src/jit/xt_root_scan.rs` walk 8-byte words and are correct as-is.
+//!   This item must never be actioned.
+//! * **`Unsafe.arrayIndexScale`.** `native-builtins/src/lib.rs:25404` reports 8
+//!   for reference arrays. This looks like a bug and is not: `arrayBaseOffset`
+//!   (16) and the scale form a *self-consistent fiction* that
+//!   `unsafe_array_index_from_offset` (`unsafe_natives_ext.rs:1401`) decodes back
+//!   to an element index, which then goes through the narrow-aware
+//!   `get_array_element`. The synthetic offset is never dereferenced. Changing
+//!   the scale to 4 without changing the decoder in lockstep would **break**
+//!   `ConcurrentHashMap` and `AtomicReferenceArray`.
+//!
+//! ## Still open, in priority order
+//!
+//! 3. `jit/src/x64.rs:2119` `narrow_oops_block_inline_fields` and its four call
+//!    sites — the inline compact `getfield`/`putfield` fast paths bail out, so
+//!    field access falls back to the (correct but slower) helpers. This is the
+//!    *throughput* item, and it is item 3, not item 1.
+//! 4. `jit/src/x64.rs:17141` / `:17178` hardcode shift 3 in the narrow
+//!    `aaload`/`aastore` emitters instead of reading `narrow_shift()`. Correct
+//!    today only because [`enable_for_live_heap`] pins shift 3 — but
+//!    [`CompressedOops::determine_shift`] returns 0 for heaps under 4 GiB, so
+//!    wiring that in would silently miscompile every reference-array access.
+//! 5. `vm/src/runtime/serviceability.rs:1460` — the hprof *instance* dump reads
+//!    ref fields as `*const u64` and emits garbage object ids. (The sibling
+//!    *array* dump at `:1548` was migrated; the instance path was missed.)
+//!    Diagnostic-only.
+//! 6. `gc/src/g1.rs` (~20 sites, including the main mark loop at `:5211` and
+//!    every evacuation/remembered-set path), `gc/src/zgc.rs:1788`, and
+//!    `gc/src/region.rs:957`/`:993` are entirely unmigrated. These are held off
+//!    solely by the backend check at `vm/src/vm/vm_init.rs:862`, which is
+//!    therefore load-bearing and must not be relaxed before they are.
+//!
+//! Full derivation, including the honest footprint arithmetic and how this
+//! interacts with shrinking `ObjectHeader` from 32 to 16 bytes, is in
+//! `docs/internal/arch-2026-07-26/value-repr-and-compressed-oops.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -365,22 +441,50 @@ impl CompressedOops {
         }
     }
 
-    /// Estimate percent savings for a given heap size.
+    /// Rough upper bound on the percent footprint saving, for reporting only.
     ///
-    /// * Heaps within 32 GB: ~20-30 % savings depending on reference density.
-    ///   We use 25 % as a reasonable default.
-    /// * Larger heaps: no savings (compressed oops disabled).
+    /// # This is deliberately NOT the HotSpot 20-30 % figure
+    ///
+    /// The old value here was a flat 25-30 %, copied from HotSpot's published
+    /// range. That range assumes HotSpot's **12-byte** object header. CratonVM's
+    /// `cratonvm_types::ObjectHeader` is **32 bytes** (`HEADER_SIZE`, see
+    /// `types/src/heap_types.rs:18`), which changes the arithmetic completely — the header,
+    /// not the references, dominates a small object. Worked from the actual
+    /// layouts (compact body, 8-byte object alignment):
+    ///
+    /// | object | wide | narrow | saving |
+    /// |---|---|---|---|
+    /// | `java.lang.Integer` (autoboxed ⇒ legacy 16-byte cell) | 48 | 48 | **0 %** |
+    /// | `java.lang.String` `{byte[] value, byte coder, int hash}` | 48 | 48 | **0 %** — 13 B and 9 B both round to 16 |
+    /// | `ArrayList` `{Object[], int, int}` | 48 | 48 | **0 %** — same rounding |
+    /// | binary-tree node `{left, right}` | 48 | 40 | 16.7 % |
+    /// | `HashMap.Node` `{int hash, K, V, next}` | 64 | 48 | 25 % |
+    /// | `Object[16]` | 160 | 96 | 40 % |
+    /// | `Object[n]`, large `n` | `32+8n` | `32+4n` | → 50 % |
+    ///
+    /// The pattern: **reference arrays are where compressed oops pay**, and
+    /// they pay a lot. Reference-dense small objects pay 17-25 %. Boxed
+    /// primitives, `String` and single-reference containers pay **nothing at
+    /// all**, because saving 4 bytes on an 8-byte-aligned body is frequently
+    /// rounded straight back. Halving the header would help every one of those.
+    ///
+    /// A whole-heap number therefore depends entirely on the object mix and
+    /// cannot be derived from `heap_size`. This function keeps the signature for
+    /// its callers but reports a defensible ceiling rather than a fabricated
+    /// point estimate: no live heap of ordinary Java objects reaches the 50 %
+    /// asymptote, and many workloads land in single digits.
     pub fn estimate_savings_percent(heap_size: u64) -> f64 {
         if heap_size > Self::MAX_HEAP_FOR_COMPRESSED {
             return 0.0;
         }
-        // Smaller heaps have higher reference density → higher savings.
-        if heap_size <= Self::MAX_HEAP_ZERO_SHIFT {
-            30.0
-        } else {
-            25.0
-        }
+        // Ceiling, not an expectation: the 50 % asymptote is reached only by a
+        // heap that is entirely large reference arrays. See the table above.
+        Self::MAX_SAVINGS_PERCENT
     }
+
+    /// Upper bound reported by [`Self::estimate_savings_percent`]: a heap made
+    /// entirely of large `Object[]` halves its reference bytes and nothing else.
+    pub const MAX_SAVINGS_PERCENT: f64 = 50.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -654,19 +758,63 @@ mod tests {
         assert!(s.estimated_savings_percent > 0.0);
     }
 
+    /// The estimate is a *ceiling*, not the HotSpot 20-30 % point estimate that
+    /// used to live here — CratonVM's 32-byte header makes a per-heap-size
+    /// figure meaningless. Pins that it no longer varies with heap size.
     #[test]
-    fn savings_small_heap() {
-        assert_eq!(CompressedOops::estimate_savings_percent(2 * GB), 30.0);
-    }
-
-    #[test]
-    fn savings_medium_heap() {
-        assert_eq!(CompressedOops::estimate_savings_percent(16 * GB), 25.0);
+    fn savings_is_a_size_independent_ceiling() {
+        assert_eq!(
+            CompressedOops::estimate_savings_percent(2 * GB),
+            CompressedOops::MAX_SAVINGS_PERCENT
+        );
+        assert_eq!(
+            CompressedOops::estimate_savings_percent(16 * GB),
+            CompressedOops::MAX_SAVINGS_PERCENT
+        );
+        assert_eq!(CompressedOops::MAX_SAVINGS_PERCENT, 50.0);
     }
 
     #[test]
     fn savings_large_heap() {
         assert_eq!(CompressedOops::estimate_savings_percent(64 * GB), 0.0);
+    }
+
+    /// The documented footprint table is the load-bearing part of the savings
+    /// story, so compute it rather than trusting the prose. `round8` models the
+    /// 8-byte object alignment that erases the saving on one-reference objects.
+    #[test]
+    fn documented_object_footprint_arithmetic_holds() {
+        const HEADER: usize = 32; // cratonvm_types::HEADER_SIZE
+        fn round8(n: usize) -> usize {
+            (n + 7) & !7
+        }
+        // (wide body bytes before rounding, narrow body bytes) -> (wide, narrow)
+        fn total(wide_body: usize, narrow_body: usize) -> (usize, usize) {
+            (HEADER + round8(wide_body), HEADER + round8(narrow_body))
+        }
+
+        // String {byte[] value, byte coder, int hash}: 8+4+1=13 vs 4+4+1=9.
+        // Both round to 16 -- compressed oops save NOTHING here.
+        assert_eq!(total(13, 9), (48, 48));
+
+        // ArrayList {Object[] elementData, int size, int modCount}: same shape.
+        assert_eq!(total(16, 12), (48, 48));
+
+        // Binary-tree node {left, right}: 16 -> 8.
+        assert_eq!(total(16, 8), (48, 40));
+
+        // HashMap.Node {int hash, K key, V value, Node next}: 4+pad4+8+8+8 = 32
+        // vs 4+4+4+4 = 16.
+        assert_eq!(total(32, 16), (64, 48));
+
+        // Reference arrays are the real win and are not eroded by rounding.
+        assert_eq!((HEADER + 8 * 16, HEADER + 4 * 16), (160, 96));
+        // ...and approach the 50 % ceiling as length grows.
+        let big = 1_000_000usize;
+        let wide = HEADER + 8 * big;
+        let narrow = HEADER + 4 * big;
+        let pct = 100.0 * (wide - narrow) as f64 / wide as f64;
+        assert!(pct > 49.9 && pct < CompressedOops::MAX_SAVINGS_PERCENT);
     }
 
     // -- multiple addresses -------------------------------------------------
@@ -741,5 +889,149 @@ mod tests {
         let nk = NarrowKlass::from_raw(0xBEEF);
         assert_eq!(nk.raw(), 0xBEEF);
         assert!(!nk.is_null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live-heap wiring
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::OnceLock;
+
+/// Virtual-address headroom reserved **below** the lowest live heap region when
+/// the narrow-oop base is chosen.
+///
+/// The heap's backing stores are ordinary large allocations (`Vec<u8>`), so
+/// their addresses come from the system allocator's `mmap` region rather than
+/// from one reservation the VM controls. Linux hands successive large mappings
+/// out *downwards*, so a young-gen arena that is grown after init typically
+/// lands BELOW everything that existed at init. Anchoring the base a long way
+/// under the initial low-water mark keeps those later mappings encodable
+/// instead of turning heap growth into a hard failure.
+///
+/// 8 GiB of the 32 GiB shift-3 window is spent on this; the remaining 24 GiB is
+/// far more than any heap this VM is used with.
+pub const NARROW_OOP_HEADROOM: u64 = 8 * 1024 * 1024 * 1024;
+
+static ACTIVE: OnceLock<CompressedOops> = OnceLock::new();
+
+/// The configuration fixed at VM init, or `None` when compressed oops are off.
+pub fn active() -> Option<&'static CompressedOops> {
+    ACTIVE.get()
+}
+
+/// Fix the compressed-oop geometry from the live heap's published regions and
+/// switch narrow oops on process-wide.
+///
+/// **Mode: `HeapBased`, shift 3.** The base is
+/// `lowest_region_base - NARROW_OOP_HEADROOM`, page-aligned down; a narrow oop
+/// is `(addr - base) >> 3` and encoding `0` is reserved for null (the base sits
+/// far below any object, so no live object can encode to zero). Shift 3 is
+/// sound because every object starts on the 8-byte object grid, and it buys a
+/// 32 GiB window — a shift of 0 would cap the encodable range at 4 GiB measured
+/// from a base 8 GiB below the heap, i.e. nothing would be encodable at all.
+///
+/// Must be called **exactly once**, at VM init: after the heap's backing stores
+/// exist (so their addresses are known) and before the first object is
+/// allocated or the first class layout is registered (so no object is ever read
+/// back under a different width than it was written).
+///
+/// Returns the `(base, shift)` it fixed, or an error describing why the heap
+/// geometry is unusable — in which case narrow oops stay OFF and the VM runs
+/// with full 64-bit references exactly as before.
+pub fn enable_for_live_heap() -> Result<(u64, u8), String> {
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
+    for i in 0..3 {
+        let base =
+            crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2].load(AtomicOrdering::Acquire) as u64;
+        let end = crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2 + 1].load(AtomicOrdering::Acquire)
+            as u64;
+        if base == 0 || end <= base {
+            continue;
+        }
+        if base % 8 != 0 {
+            return Err(format!(
+                "heap region {i} base {base:#x} is not 8-byte aligned; shift-3 \
+                 narrow oops would be misaligned"
+            ));
+        }
+        lo = lo.min(base);
+        hi = hi.max(end);
+    }
+    if lo == u64::MAX {
+        return Err("no live heap regions published (non-generational backend?)".to_string());
+    }
+    if lo <= NARROW_OOP_HEADROOM {
+        return Err(format!(
+            "lowest heap region {lo:#x} sits below the {NARROW_OOP_HEADROOM:#x} base headroom"
+        ));
+    }
+    let base = (lo - NARROW_OOP_HEADROOM) & !0xfff;
+    let shift: u8 = 3;
+    let limit = base + ((u32::MAX as u64) << shift);
+    if hi >= limit {
+        return Err(format!(
+            "heap spans {lo:#x}..{hi:#x}, which does not fit the narrow-oop window \
+             {base:#x}..{limit:#x}"
+        ));
+    }
+    if !cratonvm_types::narrow_oop::enable(base, shift as usize) {
+        return Err("cratonvm_types::narrow_oop::enable rejected the geometry".to_string());
+    }
+    let _ = ACTIVE.set(CompressedOops::new(
+        base,
+        CompressedOops::MAX_HEAP_FOR_COMPRESSED,
+    ));
+    warn_known_unsound();
+    Ok((base, shift))
+}
+
+/// Announce, once, that this run has two known correctness holes.
+///
+/// The caller (`vm/src/vm/vm_init.rs:884`) already prints a success line saying
+/// narrow oops are on. That line reads like an endorsement. Until the two
+/// blockers in the module header are closed, anyone who flips
+/// `-XX:+UseCompressedOops` is running a VM that will SIGSEGV in the String
+/// intrinsics and can miss GC marks, and they must be told so at the moment
+/// they opt in — not discover it from a crash dump.
+///
+/// This is **not** a new gate. The gate already exists and is already off by
+/// default; this only makes the existing opt-in honest about what it buys.
+fn warn_known_unsound() {
+    eprintln!(
+        "[cratonvm] WARNING: compressed oops have two KNOWN correctness holes and \
+         are not production-ready:\n\
+         [cratonvm]   1. jit/src/x64.rs emit_load_string_value_ptr loads String.value \
+         at 8 bytes with no narrow-oop gate -> wild-pointer SIGSEGV in every inlined \
+         charAt/length/indexOf/hashCode/equals/compareTo.\n\
+         [cratonvm]   2. gc/src/gen_heap.rs mark_young_to_old_refs / \
+         rewrite_stretch_conservatively scan unparseable heap stretches in 8-byte \
+         words -> missed marks and unrewritten references.\n\
+         [cratonvm] Disabling the JIT avoids (1) but not (2). See \
+         gc/src/compressed_oops.rs for the full list."
+    );
+}
+
+/// Panic if `[base, end)` has drifted outside the encodable window.
+///
+/// Called whenever the heap republishes its region bounds (young-gen growth
+/// reallocates the arena, which can move it anywhere the allocator likes). A
+/// region outside the window means references into it cannot be encoded, which
+/// would be silent heap corruption — fail loudly at the moment it happens
+/// instead.
+#[inline]
+pub fn assert_region_encodable(base: usize, end: usize) {
+    if !cratonvm_types::narrow_oop::narrow_oops_enabled() || base == 0 || end <= base {
+        return;
+    }
+    let lo = cratonvm_types::narrow_oop::narrow_base();
+    let hi = cratonvm_types::narrow_oop::narrow_limit();
+    if (base as u64) <= lo || (end as u64) > hi {
+        panic!(
+            "compressed oops: heap region {base:#x}..{end:#x} moved outside the \
+             narrow-oop window {lo:#x}..{hi:#x} — references into it cannot be encoded"
+        );
     }
 }

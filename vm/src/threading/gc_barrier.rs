@@ -92,6 +92,36 @@ struct GcBarrierInner {
 }
 
 impl GcBarrier {
+    /// Cooperative JIT safepoint polling (`CRATONVM_JIT_SAFEPOINT_POLLS`) —
+    /// stable address of the raw byte backing [`Self::stw_requested`], for
+    /// baking into JIT-compiled code as an absolute poll target.
+    ///
+    /// `AtomicBool` has the same in-memory representation as `bool` (a
+    /// single byte, `0` = false / nonzero = true), so a poll can read this
+    /// address with a plain non-atomic byte load (`TEST byte ptr [addr],
+    /// 0xFF`) and branch on nonzero — no atomic instruction is required at
+    /// the poll site. A false-negative race (the poll observes `false` a
+    /// few cycles before a concurrent `store(true, Release)` becomes
+    /// globally visible) merely defers the thread noticing the request
+    /// until its NEXT poll, the same latency bound the interpreter's own
+    /// `stw_requested` poll (`vm/src/runtime/interpreter.rs`) already
+    /// accepts.
+    ///
+    /// **Stability contract:** the returned pointer is valid for as long as
+    /// this `GcBarrier` is alive. `GcBarrier` is a plain (non-`Box`/non-
+    /// `Arc`-wrapped) field of `SharedVm`, and `SharedVm` itself is always
+    /// held behind `Arc<SharedVm>` for the life of the VM (see
+    /// `vm/src/vm/vm_init.rs::Vm::new`, which heap-allocates it once via
+    /// `Arc::new` and never moves or reallocates it thereafter) — so a
+    /// caller that keeps the same `Arc<SharedVm>` alive (or reaches it via
+    /// the process-global `crate::native::jni::process_vm()` singleton) may
+    /// treat this address as valid for the VM's entire lifetime and bake it
+    /// as an immediate into generated code. The pointer must NOT outlive
+    /// the `Arc<SharedVm>` it was obtained from.
+    pub fn stw_requested_flag_addr(&self) -> *const u8 {
+        &self.stw_requested as *const AtomicBool as *const u8
+    }
+
     /// Create a new GC barrier with no active STW.
     pub fn new() -> Self {
         Self {
@@ -223,7 +253,7 @@ impl GcBarrier {
             .saturating_sub(1)
             .saturating_sub(effective_blocked);
         inner.arrived = 0;
-        if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
             eprintln!(
                 "[stw-request] initiator={} alive={} blocked={} live_blocked={} effective_blocked={} expected={}",
                 initiator.0,
@@ -445,7 +475,7 @@ impl GcBarrier {
             let arrival_gen = self.gc_generation.load(Ordering::Acquire);
             if participating {
                 inner.arrived += 1;
-                if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
                     eprintln!(
                         "[stw-arrive] tid={} gen={} arrived={} expected={} (leave-blocked drain)",
                         tid.0, arrival_gen, inner.arrived, inner.expected
@@ -613,7 +643,7 @@ impl GcBarrier {
         // arrived and prematurely release `wait_for_all`.
         if participating {
             inner.arrived += 1;
-            if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_CENSUS").is_some() {
                 eprintln!(
                     "[stw-arrive] tid={} gen={} arrived={} expected={}",
                     tid.0, arrival_gen, inner.arrived, inner.expected
@@ -772,6 +802,28 @@ mod tests {
         let barrier = GcBarrier::new();
         assert!(!barrier.stw_requested.load(Ordering::Relaxed));
         assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 0);
+    }
+
+    /// Cooperative JIT safepoint polling — the raw byte address must alias
+    /// `stw_requested` exactly: a plain byte read through the pointer must
+    /// track every transition the atomic makes.
+    #[test]
+    fn stw_requested_flag_addr_aliases_the_atomic_byte() {
+        let barrier = GcBarrier::new();
+        let addr = barrier.stw_requested_flag_addr();
+        assert!(!addr.is_null());
+        // SAFETY: `addr` points at `barrier.stw_requested`, which is alive
+        // for the whole scope of this test.
+        assert_eq!(unsafe { *addr }, 0, "expected false (0) initially");
+
+        assert!(barrier.request_stw(ThreadId(0), 1));
+        // SAFETY: same as above.
+        assert_ne!(unsafe { *addr }, 0, "expected nonzero after request_stw");
+
+        barrier.wait_for_all();
+        barrier.complete_gc(HashMap::new());
+        // SAFETY: same as above.
+        assert_eq!(unsafe { *addr }, 0, "expected false (0) after complete_gc");
     }
 
     #[test]

@@ -58,8 +58,7 @@ static DBG_METHOD_INVOKE_BOX: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 fn dbg_method_invoke_box_enabled() -> bool {
-    *DBG_METHOD_INVOKE_BOX
-        .get_or_init(|| std::env::var_os("CRATONVM_DBG_METHOD_INVOKE_BOX").is_some())
+    *DBG_METHOD_INVOKE_BOX.get_or_init(|| crate::nbflags().dbg_method_invoke_box)
 }
 
 // ---------------------------------------------------------------------------
@@ -381,16 +380,30 @@ pub(crate) fn native_parameter_is_synthetic(
 /// falls back to when `MethodParameters` is absent. (`Parameter` is a concrete
 /// class, so this same-class native wins over the JDK bytecode — unlike the
 /// inherited-default-method case in #1.)
+///
+/// getNestMembers0-sibling regression: `build_parameter_array` writes the
+/// name to the real `name` FIELD BY NAME whenever that field genuinely
+/// exists on the loaded `Parameter` class (`by_name_landed`), and only
+/// falls back to writing synthetic slot 0 when it doesn't. Reading slot 0
+/// FIRST — as this used to — is backwards for the (common, real-JDK) case:
+/// slot 0 was never written on that path, so it holds whatever the
+/// allocator happened to leave there (zeroed on some runs, stale/reused
+/// object-header bytes on others), not reliably the name. That produced a
+/// real, intermittent misclassification (e.g. leftover bytes resembling an
+/// `argN` placeholder) which silently poisoned Spring's whole-method name
+/// discovery — see the Spring Boot WebSocket `subProtocolWebSocketHandler`
+/// multi-candidate-autowire regression this was found from. Try the
+/// by-name field first (matching the writer's own priority); fall back to
+/// slot 0 only when the class has no such declared field (pure synthetic
+/// layout).
 pub(crate) fn native_parameter_is_name_present(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Name lives at synthetic slot 0 (matching `is_synthetic`'s slot-1 read);
-    // fall back to the real `name` field if the slot isn't a String.
-    let name = match ctx.get_field(this, 0) {
+    let name = match ctx.get_field_by_name(this, "name") {
         Value::Object(Some(s)) => ctx.read_string(s),
-        _ => match ctx.get_field_by_name(this, "name") {
+        _ => match ctx.get_field(this, 0) {
             Value::Object(Some(s)) => ctx.read_string(s),
             _ => None,
         },
@@ -714,6 +727,7 @@ pub(crate) fn native_method_get_default_value(
         ctx,
         &default,
         ret_desc.as_deref(),
+        Some(class_id),
         container_loader,
     )))
 }
@@ -2491,6 +2505,8 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// Smoke: registry exposes the WP2.1 surface without panicking and

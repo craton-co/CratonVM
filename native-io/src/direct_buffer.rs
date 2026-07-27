@@ -94,7 +94,7 @@ fn bits() -> &'static Bits {
 /// `DEFAULT_MAX_DIRECT_BYTES` for any caller (e.g. unit tests) that never
 /// boots a full VM and so never calls this.
 ///
-/// See docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md:
+/// See docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md:
 /// before this, the cap was hardcoded to 256 MiB regardless of `-Xmx`, so a
 /// `-Xmx 1g` H2 MVStore workload with genuine ~250 MiB peak direct-buffer
 /// usage (chunk writer thread) hit a ceiling HotSpot doesn't impose at the
@@ -1321,6 +1321,8 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
 

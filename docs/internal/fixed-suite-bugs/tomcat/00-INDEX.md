@@ -27,7 +27,16 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 | [14](14-classpath-url-protocol-not-registered-FIXED.md) | `classpath:` URL scheme unresolvable (`VM.isBooted` false → factory bypassed; pre-clinit factory publish; synthetic `URI.toURL` allowlist; webapp-TCCL resource scoping; `file:`-dir listing) | TestClasspathUrlStreamHandler, TestConfigFileLoader, TestPropertiesRoleMappingListener | FAIL | ✅ **FIXED** |
 | [16](16-full-suite-6shard-rerun-20260721.md) | Full 646-class Linux 6-shard run + HotSpot control diff (corrected 2026-07-24 for a harness CWD bug) | **91 classes** (was miscounted as 23) | FAIL/HANG/CRASH | 🔴 **OPEN** (individually undiagnosed, like 05) |
-| [18](18-fixture-environment-gaps-20260724.md) | True Linux fixture gaps (httpd/OCSP/LargeHeap/missing conf-Catalina-localhost/missing ant.jar), categorized by root cause | 35 classes | FAIL/HANG/CRASH | 🔴 **OPEN** (not CratonVM bugs — fixture completion work) |
+| [18](18-fixture-environment-gaps-20260724.md) | True Linux fixture gaps (httpd/OCSP/LargeHeap/missing conf-Catalina-localhost/missing ant.jar), categorized by root cause | 35 classes | FAIL/HANG/CRASH | 🔴 **OPEN** (not CratonVM bugs — fixture completion work); its category J (9 classes, HANG-classification) turned out NOT to be a fixture gap at all — ✅ **FIXED**, see [hang-classification-unconfirmed-host-contention-FIXED.md](hang-classification-unconfirmed-host-contention-FIXED.md) |
+| [21](21-tls-handshake-enforcement-gap.md) | TLS handshake enforcement too loose/too strict (SNI, cipher/protocol allow-lists, client-cert) | 8 classes (TestSsl, TestSSLHostConfig{Compat,Cipher,Protocol}, TestSslHandshakeFailure, TestClientCert, TestCustomSslTrustManager, TestResolverSSL) | FAIL | 🔴 **OPEN** |
+| [22](22-tribes-realnetwork-membership-bug.md) | Tribes real-socket group-membership undercounting | TestTcpFailureDetector, TestNonBlockingCoordinator | FAIL | 🔴 **OPEN** |
+| [23](23-charsetcache-pathological-slowdown.md) | `CharsetCache`'s "cached" path is 3x SLOWER than uncached | TestCharsetCachePerformance | FAIL/perf | 🔴 **OPEN** |
+| [24](24-stringcache-oom-under-load.md) | `StringCache.toString()` OOMs under sustained load at a heap HotSpot handles fine | TestMethodPerformance | FAIL | 🔴 **OPEN** |
+| [25](25-charchunk-tostring-null-vs-empty.md) | `CharChunk.toString()` returns `""` not `null` when empty/recycled | TestCharChunk | FAIL | 🔴 **OPEN** (small, well-isolated) |
+| [26](26-defaultinstancemanager-classunload-offbyone.md) | Class-unload count off-by-one (9 vs 8) | TestDefaultInstanceManager | FAIL | 🔴 **OPEN** |
+| [27](27-xxxendpoint-unix-domain-socket-init-failure.md) | Unix domain socket connector init fails | TestXxxEndpoint | FAIL | 🔴 **OPEN** |
+| [28](28-http2-largeupload-byte-mismatch.md) | HTTP/2 large POST truncated to ~1/5 expected bytes (flow-control suspect) | TestLargeUpload | FAIL | 🔴 **OPEN** |
+| [29](29-throughput-wall-recurrence-and-unconfirmed.md) | Throughput-wall recurrence (HostConfig/Http2Section_8_2), relative-perf-assertion family, 2 contention-suspected, 1 Windows-only fixture gap | ~11 classes | mixed | see doc (not new bugs) |
 
 9 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
@@ -86,6 +95,18 @@ in the remaining 11. Also flagged: two remaining-11 classes
 this directory claiming they're already fixed, but both still fail/hang on
 current `dev` — not reconciled yet. See group 16's addendum for full detail.
 
+> **`TestJNDIRealmIntegration` reconciled 2026-07-26/27.** The class is 76/76
+> with the JIT fully enabled on `com/unboundid/`, and its real producer
+> (TOMCAT-JNDIREALM-JIT.3 — `string_case_cache` published only to the GC
+> initiator, so any peer-initiated sweep reclaimed the cached case-conversion
+> Strings) is fixed, with both JIT guards removed. **Verified on BOTH hosts**:
+> 47 runs on the Windows box and 5 runs on the Azure Linux host against its own
+> fixture, all `OK (76 tests)` with zero stale-pointer events — so its **HANG**
+> row in the group-18/RESULTS-20260724 Linux table is resolved, not merely
+> untested. See
+> [jndirealmintegration-unboundid-jit-corruption-FIXED.md](jndirealmintegration-unboundid-jit-corruption-FIXED.md).
+> `TestMapperPerformance` remains unreconciled.
+
 > ⚠️ **The 172-fixture-gap figure above (both 2026-07-21 and 2026-07-23) is
 > WRONG — corrected 2026-07-24.** `run-tomcat-suite.sh` never `cd`'d into the
 > Tomcat checkout root before launching each test, so relative-path resource
@@ -97,3 +118,28 @@ current `dev` — not reconciled yet. See group 16's addendum for full detail.
 > [18](18-fixture-environment-gaps-20260724.md)). See group 16's
 > "CORRECTED addendum, 2026-07-24" for full detail — treat the 23/11/172
 > numbers anywhere above this notice as historical, not current.
+
+## Full 8-parallel LOCAL WINDOWS run, 2026-07-27/28 (groups 21-29)
+
+Complete 646-class run on the local Windows box (`apps\tomcat`,
+`apps\tomcat-suite-runner`, worktree `CratonVM-tomcat-full-suite-local-20260728`,
+branch `test/tomcat-full-suite-local-20260728`), `dev` @ `60a710ad8`,
+real JDK 25, 8-way `-Parallel`, 300s timeout: **547 PASS / 58 HANG / 40 FAIL
+/ 1 NOSUMMARY**. Reran all 99 non-PASS classes at `-TimeoutSec 1500` (5x):
+most HANGs turned out to be the known throughput wall finishing given
+enough time — confirmed **31 classes still FAIL/HANG at 1500s that PASS on
+a same-run HotSpot control** (7 of those still HANG even at 1500s).
+
+Merged `origin/dev` again (`→ 12c79a0ee`, 250+ more commits) and rebuilt
+before writing anything up — several classes in the 31 turned out to
+already be fixed or explained by concurrent sessions' work (`TestDeployTask`
+%20-decode fix, the Hashtable size-doubling fix that also explains
+`TestGenerator`'s NPE, `*LargeHeap` needing `-XX:+UseG1GC -Xmx10g` per
+[20](20-fixture-completion-regressions-closure-FIXED.md)) — reran the same
+99 classes again on the fresh binary before finalizing. **8 genuinely new,
+well-isolated CratonVM-only bugs** confirmed reproducing identically across
+both binaries, written up individually: groups 21-28. Everything else
+(throughput-wall recurrence, relative-performance-assertion family, 2
+contention-suspected findings, 1 Windows-only fixture gap) is in
+[29](29-throughput-wall-recurrence-and-unconfirmed.md), not treated as new
+bugs.

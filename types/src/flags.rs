@@ -1,0 +1,2419 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! One typed, process-lifetime configuration for the `CRATONVM_*` flags.
+//!
+//! # Why this lives in `cratonvm-types`
+//!
+//! `vm/src/runtime/env_cache.rs` already caches ~100 flags behind per-flag
+//! `OnceLock`s and is the right idea, but it lives in `cratonvm-vm`. `types`,
+//! `gc`, `jit` and `classloading` all sit *below* `vm` in the dependency graph
+//! and cannot reach it, so each of them grew its own private copy of the same
+//! parse — and the copies have drifted at least once in production (see the
+//! three-way `CRATONVM_LOADER_AWARE_RESOLUTION` split documented in
+//! `env_cache::loader_aware_resolution`).
+//!
+//! `cratonvm-types` is the one crate every other crate already depends on, and
+//! it is where the previous cross-crate concept — `LockLevel` in
+//! [`crate::lock_order`] — was put for exactly this reason. So the config goes
+//! here.
+//!
+//! The alternative — a per-crate once-cell that `vm` populates at startup —
+//! was rejected because it cannot preserve current behaviour. Today every flag
+//! self-initialises on *first read*, from wherever that read happens, and a
+//! number of those reads run before `vm` initialises anything:
+//! `types::field_layout`'s compact-reference decision, `native_io`'s certified
+//! deployment profile, `classloading`'s class-path setup. A config that is only
+//! valid after `vm` installs it would silently serve defaults to all of them,
+//! which is precisely the silent behaviour change this refactor exists to avoid.
+//!
+//! # Latching semantics
+//!
+//! [`flags()`] returns a `&'static VmFlags` initialised on first use from the
+//! process environment. This preserves the existing convention — "setting the
+//! variable after the first read has no effect" — but *widens* it: the first
+//! read of **any** flag now latches **all** of them, where previously each flag
+//! latched independently.
+//!
+//! In practice only three test binaries depend on the old behaviour, and each
+//! already documents that it must be its own binary and must `set_var` before
+//! anything else runs (`gc/tests/stale_objref_debug_assertion.rs`,
+//! `gc/tests/stale_objref_quarantine_ring.rs`). Those remain correct. New tests
+//! should use [`VmFlags::from_source`] with a [`MapSource`] instead of mutating
+//! the process environment, which is also what makes them safe under Rust 2024,
+//! where `set_var` is `unsafe`.
+//!
+//! [`install`] lets a launcher build the config explicitly — environment plus
+//! `-XX:` command-line flags — and publish it before anything reads a flag.
+//!
+//! # Truth tables
+//!
+//! There is no single answer in this tree to "what does `CRATONVM_FOO=false`
+//! mean": the [`parse`] module carries five *different* boolean parsers because
+//! five different ones are in use today. `docs/internal/flag-census.md` §10 has
+//! the full matrix. Unifying them is a behaviour change and is deliberately not
+//! part of this refactor; naming each parser at each field is what makes the
+//! divergence visible enough to retire later, flag by flag, with benchmarks.
+
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::sync::OnceLock;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Sources
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Where flag values come from.
+///
+/// Production uses [`EnvSource`]; tests use [`MapSource`] so they never mutate
+/// process-global state.
+pub trait FlagSource {
+    /// Raw value for `name`, exactly as `std::env::var_os` would return it.
+    fn get(&self, name: &str) -> Option<OsString>;
+}
+
+/// The process environment.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnvSource;
+
+impl FlagSource for EnvSource {
+    #[inline]
+    fn get(&self, name: &str) -> Option<OsString> {
+        std::env::var_os(name)
+    }
+}
+
+/// An explicit map, for tests and for launchers that layer `-XX:` flags over
+/// the environment.
+#[derive(Debug, Clone, Default)]
+pub struct MapSource(HashMap<String, OsString>);
+
+impl MapSource {
+    /// Build from `(name, value)` pairs.
+    pub fn new<'a, I>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        Self(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), OsString::from(v)))
+                .collect(),
+        )
+    }
+
+    /// A source with nothing set — the "no environment at all" baseline.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot of the process environment.
+    ///
+    /// Taken with **one** walk of `environ` (`std::env::vars_os`) rather than
+    /// one `getenv` per field. That matters at this size: `getenv` takes the
+    /// environ lock and linearly scans, and [`VmFlags`] now has enough fields
+    /// that a per-field probe would be a measurable fixed startup cost — and
+    /// would grow with every crate still to be migrated.
+    ///
+    /// Semantics match `var_os` exactly: `getenv` returns the **first** match
+    /// for a duplicated name, so the first entry wins here too. Names that are
+    /// not valid UTF-8 are dropped, which is not observable — every lookup is
+    /// by `&str`, so such a name could never be matched anyway.
+    pub fn from_process_env() -> Self {
+        let mut map: HashMap<String, OsString> = HashMap::new();
+        for (name, value) in std::env::vars_os() {
+            if let Ok(name) = name.into_string() {
+                map.entry(name).or_insert(value);
+            }
+        }
+        Self(map)
+    }
+
+    fn declared_snapshot(src: &dyn FlagSource) -> Self {
+        let mut map = HashMap::new();
+        for &name in declared_flag_names() {
+            if let Some(value) = src.get(name) {
+                map.insert(name.to_string(), value);
+            }
+        }
+        Self(map)
+    }
+
+    /// Set one entry, builder-style.
+    pub fn with(mut self, name: &str, value: &str) -> Self {
+        self.0.insert(name.to_string(), OsString::from(value));
+        self
+    }
+}
+
+impl FlagSource for MapSource {
+    fn get(&self, name: &str) -> Option<OsString> {
+        self.0.get(name).cloned()
+    }
+}
+
+/// The process environment, overlaid with an explicit map that wins.
+///
+/// This is how a launcher applies `-XX:` flags without calling `set_var`.
+#[derive(Debug, Clone, Default)]
+pub struct OverlaySource(MapSource);
+
+impl OverlaySource {
+    /// Overlay `pairs` on top of the process environment.
+    pub fn new(overrides: MapSource) -> Self {
+        Self(overrides)
+    }
+}
+
+impl FlagSource for OverlaySource {
+    fn get(&self, name: &str) -> Option<OsString> {
+        self.0.get(name).or_else(|| std::env::var_os(name))
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Parsers
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The boolean and value parsers in use across the tree.
+///
+/// Each function reproduces one existing call-site idiom **byte for byte**.
+/// Every field in [`VmFlags`] names the parser it was built with, so a reviewer
+/// can check the migration against the pre-refactor source without re-deriving
+/// the semantics.
+pub mod parse {
+    use super::FlagSource;
+
+    /// `std::env::var_os(NAME).is_some()` — presence is truth.
+    ///
+    /// The overwhelming majority idiom (~600 sites). Note that `NAME=0` and
+    /// `NAME=` (empty) are both **enabled** under this parser.
+    #[inline]
+    pub fn present(src: &dyn FlagSource, name: &str) -> bool {
+        src.get(name).is_some()
+    }
+
+    /// `std::env::var(NAME).is_ok()` — presence is truth, but invalid UTF-8
+    /// reads as absent. Kept distinct from [`present`] so `var` call sites keep
+    /// their exact semantics.
+    #[inline]
+    pub fn present_utf8(src: &dyn FlagSource, name: &str) -> bool {
+        utf8(src, name).is_some()
+    }
+
+    /// The value as a `String`, matching `std::env::var(NAME).ok()`.
+    #[inline]
+    pub fn utf8(src: &dyn FlagSource, name: &str) -> Option<String> {
+        src.get(name).and_then(|v| v.into_string().ok())
+    }
+
+    /// `match var(NAME) { Ok(v) => !v.is_empty() && v != "0", Err(_) => false }`
+    ///
+    /// Used by `env_cache::disable_jit` and friends: unset, empty and `"0"` are
+    /// all **off**; anything else is on.
+    #[inline]
+    pub fn non_empty_non_zero(src: &dyn FlagSource, name: &str) -> bool {
+        match utf8(src, name) {
+            Some(v) => !v.is_empty() && v != "0",
+            None => false,
+        }
+    }
+
+    /// `!(empty | "0" | "false" | "off" | "no")`, case-insensitive, trimmed.
+    ///
+    /// Used by `native_io::env_flag_enabled` for the certified/untrusted
+    /// deployment profile.
+    #[inline]
+    pub fn truthy_word(src: &dyn FlagSource, name: &str) -> bool {
+        match utf8(src, name) {
+            Some(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+            }
+            None => false,
+        }
+    }
+
+    /// `"1" | "true" | "yes" | "on"`, case-insensitive, trimmed; everything
+    /// else — including `"2"` — is false.
+    ///
+    /// Used by `lock_order::compute_enforced`.
+    #[inline]
+    pub fn affirmative_word(src: &dyn FlagSource, name: &str) -> bool {
+        match utf8(src, name) {
+            Some(v) => {
+                let v = v.trim();
+                v.eq_ignore_ascii_case("1")
+                    || v.eq_ignore_ascii_case("true")
+                    || v.eq_ignore_ascii_case("yes")
+                    || v.eq_ignore_ascii_case("on")
+            }
+            None => false,
+        }
+    }
+
+    /// `"1" | "true"` (case-insensitive on `true` only), default `false`.
+    ///
+    /// Used by `g1::parallel_evac_enabled`.
+    #[inline]
+    pub fn one_or_true(src: &dyn FlagSource, name: &str) -> bool {
+        utf8(src, name)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    /// Default-ON opt-out: `var(NAME).map(|v| v != "0").unwrap_or(true)`.
+    ///
+    /// Used by `gen_heap`'s old-gen sweep gate.
+    #[inline]
+    pub fn on_unless_zero(src: &dyn FlagSource, name: &str) -> bool {
+        utf8(src, name).map(|v| v != "0").unwrap_or(true)
+    }
+
+    /// Trimmed decimal `usize`, `None` if unset or unparseable.
+    #[inline]
+    pub fn usize_opt(src: &dyn FlagSource, name: &str) -> Option<usize> {
+        utf8(src, name).and_then(|v| v.trim().parse::<usize>().ok())
+    }
+
+    /// Trimmed decimal `usize` clamped to `>= 1`, `None` if unset/unparseable.
+    #[inline]
+    pub fn usize_min1(src: &dyn FlagSource, name: &str) -> Option<usize> {
+        usize_opt(src, name).map(|v| v.max(1))
+    }
+
+    /// Trimmed decimal `usize`, kept only when `> 0`. Lifted from
+    /// `native_builtins::net_phase_e`'s `CRATONVM_HTTP_MAX_BODY`.
+    #[inline]
+    pub fn usize_positive(src: &dyn FlagSource, name: &str) -> Option<usize> {
+        usize_opt(src, name).filter(|&n| n > 0)
+    }
+
+    /// Decimal `u64` with **no** trimming, matching the `s.parse::<u64>()`
+    /// call sites that do not trim.
+    #[inline]
+    pub fn u64_opt_untrimmed(src: &dyn FlagSource, name: &str) -> Option<u64> {
+        utf8(src, name).and_then(|v| v.parse::<u64>().ok())
+    }
+
+    /// Decimal `i64` with **no** trimming.
+    #[inline]
+    pub fn i64_opt_untrimmed(src: &dyn FlagSource, name: &str) -> Option<i64> {
+        utf8(src, name).and_then(|v| v.parse::<i64>().ok())
+    }
+
+    /// Hexadecimal address, with an optional `0x` / `0X` prefix; `0` when
+    /// unset or unparseable.
+    #[inline]
+    pub fn hex_addr_or_zero(src: &dyn FlagSource, name: &str) -> usize {
+        utf8(src, name)
+            .and_then(|s| {
+                let s = s.trim();
+                let s = s
+                    .strip_prefix("0x")
+                    .or_else(|| s.strip_prefix("0X"))
+                    .unwrap_or(s);
+                usize::from_str_radix(s, 16).ok()
+            })
+            .unwrap_or(0)
+    }
+
+    /// `match var(NAME) { Ok(v) => !v.is_empty() && v != "0", Err(_) => true }`
+    ///
+    /// The default-**ON** twin of [`non_empty_non_zero`]. Used by
+    /// `classloading::class_manager::loader_aware_resolution`.
+    #[inline]
+    pub fn non_empty_non_zero_default_true(src: &dyn FlagSource, name: &str) -> bool {
+        match utf8(src, name) {
+            Some(v) => !v.is_empty() && v != "0",
+            None => true,
+        }
+    }
+
+    /// `!matches!(value.as_deref(), Ok("0") | Ok("false") | Ok("no"))` — default
+    /// ON, disabled only by those three exact lowercase spellings. Used by
+    /// `classloading`'s boot module registry.
+    #[inline]
+    pub fn on_unless_off_word(src: &dyn FlagSource, name: &str) -> bool {
+        !matches!(
+            utf8(src, name).as_deref(),
+            Some("0") | Some("false") | Some("no")
+        )
+    }
+
+    /// Trimmed `!empty && != "0" && !~ "false"` — default OFF. Used by
+    /// `native_io::nio_selector` and `native_io::socket_channel`.
+    #[inline]
+    pub fn non_empty_non_zero_non_false(src: &dyn FlagSource, name: &str) -> bool {
+        utf8(src, name)
+            .map(|v| {
+                let t = v.trim();
+                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    }
+
+    /// `var(NAME).as_deref() == Ok("1")` — only the exact string `1` counts.
+    #[inline]
+    pub fn exactly_one(src: &dyn FlagSource, name: &str) -> bool {
+        utf8(src, name).as_deref() == Some("1")
+    }
+
+    /// `matches!(var(NAME).as_deref(), Ok("1") | Ok("true") | Ok("yes"))` —
+    /// exact, lowercase-only, untrimmed; `"on"` is **false** here, unlike
+    /// [`affirmative_word`]. Truth table 8 (see the module docs and
+    /// `docs/internal/flag-census.md` §10). Lifted from
+    /// `native_builtins::service_loader`'s `CRATONVM_DIAG_SERVICELOADER`.
+    #[inline]
+    pub fn one_true_yes_exact(src: &dyn FlagSource, name: &str) -> bool {
+        matches!(
+            utf8(src, name).as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    }
+
+    /// `match var(NAME) { Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+    /// Err(_) => true }` — default **ON**, off only for an untrimmed `0` or
+    /// `false` in any case. The empty string is **on** here, which is what
+    /// separates it from [`non_empty_non_zero_non_false`]. Truth table 9.
+    /// Lifted from `native_builtins::lang_system`'s
+    /// `CRATONVM_INHERIT_THREAD_CCL`.
+    #[inline]
+    pub fn on_unless_zero_or_false(src: &dyn FlagSource, name: &str) -> bool {
+        match utf8(src, name) {
+            Some(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            None => true,
+        }
+    }
+
+    /// Default **ON**, off only for the five exact spellings `0`, `false`,
+    /// `FALSE`, `off`, `OFF`. Mixed case such as `False` leaves it **on**,
+    /// which is what separates it from [`on_unless_off_word`]. Truth table 10.
+    /// Lifted from `native_builtins::jboss_msc`'s `CRATONVM_MSC_REAL_START`.
+    #[inline]
+    pub fn on_unless_off_word_cased(src: &dyn FlagSource, name: &str) -> bool {
+        !matches!(
+            utf8(src, name).as_deref(),
+            Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF")
+        )
+    }
+
+    /// The default-**ON** twin of [`truthy_word`], and not only in the default:
+    /// the empty string is **on** here and **off** there. Trimmed and
+    /// lowercased; off for `0` / `false` / `off` / `no`. Truth table 11.
+    /// Lifted from `native_builtins::reflect_annotations::real_proxy_enabled`.
+    #[inline]
+    pub fn truthy_word_default_true(src: &dyn FlagSource, name: &str) -> bool {
+        match utf8(src, name) {
+            Some(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            }
+            None => true,
+        }
+    }
+
+    /// A non-empty value, `None` when unset or empty.
+    #[inline]
+    pub fn non_empty_string(src: &dyn FlagSource, name: &str) -> Option<String> {
+        utf8(src, name).filter(|s| !s.is_empty())
+    }
+
+    /// Trimmed decimal `usize` with no trimming of the *input* — matches the
+    /// `s.parse::<usize>()` call sites that do not trim.
+    #[inline]
+    pub fn usize_opt_untrimmed(src: &dyn FlagSource, name: &str) -> Option<usize> {
+        utf8(src, name).and_then(|v| v.parse::<usize>().ok())
+    }
+
+    /// Trimmed decimal `i32`, kept only when `> 0`.
+    #[inline]
+    pub fn i32_positive(src: &dyn FlagSource, name: &str) -> Option<i32> {
+        utf8(src, name)
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|&n| n > 0)
+    }
+
+    /// Trimmed decimal `u64`, kept only when `> 0`.
+    #[inline]
+    pub fn u64_positive(src: &dyn FlagSource, name: &str) -> Option<u64> {
+        utf8(src, name)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// GC flags
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Blocked-access debug mode (`CRATONVM_DBG_BLOCKED_ACCESS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockedAccessMode {
+    /// Not set, empty, or `0`.
+    #[default]
+    Off,
+    /// Exactly `warn`.
+    Warn,
+    /// Any other non-empty, non-`0` value.
+    Panic,
+}
+
+/// Compiled-in default for the moving (compacting) young generation.
+///
+/// # This is the flip
+///
+/// `ARCHITECTURE.md` advertises a "generational semi-space collector (Cheney
+/// moving young gen)". Making that true is a **one-constant change here** —
+/// once, and only once, the codegen side reads [`GcFlags::moving_young`]
+/// instead of parsing `CRATONVM_MOVING_YOUNG` itself.
+///
+/// ## The remaining blocker (exact)
+///
+/// `jit/src/x64.rs::moving_young_enabled()` is
+/// `*G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())`.
+/// It decides whether the JIT emits the shadow-stack push/reload sequences at
+/// all, whether `collect_live_oop_homes` publishes the *complete* home set,
+/// and whether `OopMapEntry::moving_young_coverage_complete` can ever be true.
+/// Nothing outside that file can cause a rewritable root map to be emitted, so
+/// a collector that relocates while it is `false` relocates objects whose only
+/// home is a JIT register that nothing will ever rewrite.
+///
+/// Its body must become:
+///
+/// ```ignore
+/// pub fn moving_young_enabled() -> bool {
+///     cratonvm_types::flags().gc.moving_young
+/// }
+/// ```
+///
+/// (`cratonvm-jit` already depends on `cratonvm-types`.) After that, flipping
+/// this constant to `true` flips codegen, root gathering and the collector
+/// together, and no skew between them is representable.
+///
+/// Until then this stays `false`, because the three layers agree today only
+/// because all three parse the same variable the same way — and flipping any
+/// subset is heap corruption, not a risk of it.
+///
+/// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
+pub const DEFAULT_MOVING_YOUNG: bool = false;
+
+/// Flags read by `cratonvm-gc` (and, for the shared ones, by `jit` and `vm`).
+///
+/// Unless a field says otherwise it was built with [`parse::present`], i.e. it
+/// is `true` whenever the variable is set to anything at all.
+#[derive(Debug, Clone, Default)]
+pub struct GcFlags {
+    // ── Semantics-changing ────────────────────────────────────────────────
+    /// The moving (compacting, Cheney) young generation.
+    ///
+    /// Shaped as an **opt-OUT** (`CRATONVM_NO_MOVING_YOUNG`) over
+    /// [`DEFAULT_MOVING_YOUNG`]; `CRATONVM_MOVING_YOUNG` is retained as a
+    /// backwards-compatible opt-IN that becomes a no-op once the default
+    /// flips. Not [`parse::present`] — see [`GcFlags::from_source`].
+    ///
+    /// `DEFAULT_MOVING_YOUNG` is currently `false`, and the one remaining
+    /// reason is recorded in
+    /// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`:
+    /// `jit/src/x64.rs::moving_young_enabled` still reads
+    /// `CRATONVM_MOVING_YOUNG` from the environment directly instead of from
+    /// this field, so flipping the constant here would make the COLLECTOR
+    /// relocate while the CODEGEN emits no rewritable root map.
+    ///
+    /// The former companion flag `CRATONVM_ALLOW_MOVING_YOUNG` is **gone**. It
+    /// was a second opt-in that had to be set *in addition* to this one before
+    /// `gen_heap` would run a moving cycle under a live JIT frame — i.e. in
+    /// the only situation the feature exists for — which is why the feature
+    /// was repeatedly "implemented" and repeatedly still a gap. A flag whose
+    /// sole job is to permit correct behaviour is not a safety mechanism; the
+    /// per-cycle coverage proof is.
+    pub moving_young: bool,
+    /// `CRATONVM_MOVING_YOUNG_FALLBACKS` — **verbosity only.**
+    ///
+    /// Coverage-fallback reporting is now unconditional and at `warn` level
+    /// (`gc::gc_quiescence::record_moving_young_coverage_fallback`), because a
+    /// silent slide back to the non-moving sweep is exactly how the young
+    /// generation stopped being a copying collector unnoticed. This flag now
+    /// only asks for *every* occurrence instead of the rate-limited subset.
+    pub moving_young_fallbacks: bool,
+    /// `CRATONVM_NO_GC_PROMOTION_GUARD` — opt **out** of the promotion-OOM
+    /// guard. Consumers want `!no_gc_promotion_guard`.
+    pub no_gc_promotion_guard: bool,
+    /// `CRATONVM_PROMOTION_OOM_GUARD_BROAD` — widen the promotion-OOM guard.
+    pub promotion_oom_guard_broad: bool,
+    /// `CRATONVM_NO_SELECTIVE_PROMOTE` — opt **out** of selective promotion,
+    /// which is on by default. (The `CRATONVM_SELECTIVE_PROMOTE` spelling
+    /// found in 13 documents has never been read; see the census §3.)
+    pub no_selective_promote: bool,
+    /// `CRATONVM_SP_NO_COALESCE` — opt **out** of selective-promotion region
+    /// coalescing.
+    pub sp_no_coalesce: bool,
+    /// `CRATONVM_CARD_TABLE_ONLY` — restrict old→young discovery to the card
+    /// table.
+    pub card_table_only: bool,
+    /// `CRATONVM_OLD_SWEEP_JIT` — default **ON** opt-out for the old-gen
+    /// non-moving sweep. [`parse::on_unless_zero`].
+    pub old_sweep_jit: bool,
+    /// `CRATONVM_G1_PARALLEL_EVAC` — parallel STW evacuation.
+    /// [`parse::one_or_true`].
+    pub g1_parallel_evac: bool,
+    /// `CRATONVM_G1_NO_EVAC_RETRY` — do not retry a failed evacuation.
+    pub g1_no_evac_retry: bool,
+    /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
+    /// [`parse::usize_min1`].
+    pub g1_workers: Option<usize>,
+    /// `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` — byte spacing at which the parallel
+    /// young sweep subsamples the allocator-recorded object grid. Values below
+    /// 64 are ignored; default 8 MiB. Lowering it is how the GC-stress matrix
+    /// forces multiple sweep chunks on a small young gen.
+    pub gc_sweep_anchor_stride: usize,
+    /// `CRATONVM_GC_PAR_THREADS` — explicit young-collector worker count.
+    /// `0`/`1` disable parallelism; `>= 2` forces that many workers regardless
+    /// of heap size. `None` = automatic. **Not** clamped to `>= 1`: zero is a
+    /// meaningful value here, so this is [`parse::usize_opt`], not
+    /// [`parse::usize_min1`].
+    pub gc_par_threads: Option<usize>,
+    /// `CRATONVM_GC_PAR_MIN_BYTES` — young-gen size below which parallelism
+    /// never pays for itself; default 16 MiB.
+    pub gc_par_min_bytes: usize,
+    /// `CRATONVM_DBG_GC_STRESS`, falling back to `CRATONVM_GC_STRESS` — force
+    /// a GC every N bytes allocated. Values `<= 0` and unparseable values are
+    /// treated as unset. Despite the `DBG_` name this changes GC scheduling,
+    /// so it is classed as semantics-changing.
+    pub gc_stress_bytes: Option<usize>,
+    /// `CRATONVM_DBG_FORCE_MOVING` — force the moving collector.
+    pub dbg_force_moving: bool,
+    /// `CRATONVM_DBG_NO_NONMOVING_RECLAIM` — defer non-moving reclamation.
+    pub dbg_no_nonmoving_reclaim: bool,
+    /// `CRATONVM_DBG_COMPACT_LEGACY` — take the legacy compaction path.
+    pub dbg_compact_legacy: bool,
+    /// `CRATONVM_DBG_SEED_ALL_OLD` — seed marking from every old-gen object.
+    pub dbg_seed_all_old: bool,
+    /// `CRATONVM_DBG_STALE_OBJREF` — quarantine evacuated young arenas and
+    /// panic on a stale `ObjectRef` read.
+    pub dbg_stale_objref: bool,
+    /// `CRATONVM_DBG_STALE_OBJREF_CYCLES` — how many minor cycles a quarantined
+    /// arena is kept. Default 1; values below 1 are ignored.
+    /// [`parse::usize_min1`], defaulted.
+    pub dbg_stale_objref_cycles: usize,
+    /// `CRATONVM_DBG_BLOCKED_ACCESS` — off / warn / panic.
+    pub dbg_blocked_access: BlockedAccessMode,
+
+    // ── Verification / assertions ─────────────────────────────────────────
+    /// `CRATONVM_FWD_RESOLVE_STRICT` — hard-fail instead of warning when a
+    /// forwarding pointer cannot be resolved.
+    pub fwd_resolve_strict: bool,
+    /// `CRATONVM_MOVING_YOUNG_VERIFY` — run the post-evacuation verifier.
+    pub moving_young_verify: bool,
+    /// `CRATONVM_SP_VERIFY` — verify selective promotion.
+    pub sp_verify: bool,
+    /// `CRATONVM_GC_ARRAY_GUARD_BT` — include a backtrace in the array-guard
+    /// panic message.
+    pub gc_array_guard_bt: bool,
+
+    // ── Pure diagnostics ──────────────────────────────────────────────────
+    /// `CRATONVM_DBG_A2`
+    pub dbg_a2: bool,
+    /// `CRATONVM_DBG_BADREF`
+    pub dbg_badref: bool,
+    /// `CRATONVM_DBG_CELLCORRUPT`
+    pub dbg_cellcorrupt: bool,
+    /// `CRATONVM_DBG_DESCTRACE`
+    pub dbg_desctrace: bool,
+    /// `CRATONVM_DBG_FWDGUARD`
+    pub dbg_fwdguard: bool,
+    /// `CRATONVM_DBG_GCPAUSE`
+    pub dbg_gcpause: bool,
+    /// `CRATONVM_DBG_GCPHASE`
+    pub dbg_gcphase: bool,
+    /// `CRATONVM_DBG_GCWRITE`
+    pub dbg_gcwrite: bool,
+    /// `CRATONVM_DBG_HEAP_TRACE`
+    pub dbg_heap_trace: bool,
+    /// `CRATONVM_DBG_MIRRORPIN`
+    pub dbg_mirrorpin: bool,
+    /// `CRATONVM_DBG_OOBFIELD` — presence gate. [`parse::present`].
+    pub dbg_oobfield: bool,
+    /// `CRATONVM_DBG_OOBFIELD` — the value, when it is valid UTF-8; the same
+    /// variable is read both ways at different sites. [`parse::utf8`].
+    pub dbg_oobfield_value: Option<String>,
+    /// `CRATONVM_DBG_PRECISE`
+    pub dbg_precise: bool,
+    /// `CRATONVM_DBG_RSET_AUDIT`
+    pub dbg_rset_audit: bool,
+    /// `CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN`
+    pub dbg_rset_audit_young_scan: bool,
+    /// `CRATONVM_DBG_SEEDHUNT`
+    pub dbg_seedhunt: bool,
+    /// `CRATONVM_DBG_SWEEP_CENSUS`
+    pub dbg_sweep_census: bool,
+    /// `CRATONVM_DBG_SWEEP_EDGES`
+    pub dbg_sweep_edges: bool,
+    /// `CRATONVM_DBG_SWEEP_ZERO`
+    pub dbg_sweep_zero: bool,
+    /// `CRATONVM_DBG_WATCHREF`
+    pub dbg_watchref: bool,
+    /// `CRATONVM_DBG_WATCH_CELL` — hex address to watch, `0` when disabled.
+    /// [`parse::hex_addr_or_zero`].
+    pub dbg_watch_cell: usize,
+    /// `CRATONVM_DBG_YOUNGSTATE`
+    pub dbg_youngstate: bool,
+    /// `CRATONVM_DBG_ZERO_RANGES`
+    pub dbg_zero_ranges: bool,
+    /// `CRATONVM_DIAG_HIB32`
+    pub diag_hib32: bool,
+    /// `CRATONVM_G1_DBG_HEADERS`
+    pub g1_dbg_headers: bool,
+    /// `CRATONVM_DBG_G1DIAG` — print region-type counts (free/eden/survivor/
+    /// old/pinned) before and after every `collect_garbage()` call, and a
+    /// fuller breakdown (incl. humongous) right before the "out of heap
+    /// space" abort. Diagnostic aid for tracing G1 region-pool exhaustion;
+    /// see docs/internal/fixed-suite-bugs/
+    /// g1-native-alloc-no-safepoint-oom-FIXED.md.
+    pub g1_dbg_diag: bool,
+    /// `CRATONVM_G1_DBG_PINS`
+    pub g1_dbg_pins: bool,
+    /// `CRATONVM_G1_DBG_REACH`
+    pub g1_dbg_reach: bool,
+    /// `CRATONVM_G1_DBG_ROOTCENSUS`
+    pub g1_dbg_rootcensus: bool,
+    /// `CRATONVM_G1_DBG_ZERO`
+    pub g1_dbg_zero: bool,
+    /// `CRATONVM_SP_STATS`
+    pub sp_stats: bool,
+    /// `CRATONVM_SP_TRACE`
+    pub sp_trace: bool,
+}
+
+impl GcFlags {
+    fn from_source(src: &dyn FlagSource) -> Self {
+        use parse::*;
+        Self {
+            // Opt-OUT over the compiled-in default, with the historical
+            // opt-in still honoured. Deliberately NOT `present`: this is the
+            // one gate that decides whether the young generation compacts,
+            // and it must be flippable by changing `DEFAULT_MOVING_YOUNG`
+            // alone. See that constant for the remaining blocker.
+            moving_young: if present(src, "CRATONVM_NO_MOVING_YOUNG") {
+                false
+            } else if present(src, "CRATONVM_MOVING_YOUNG") {
+                true
+            } else {
+                DEFAULT_MOVING_YOUNG
+            },
+            moving_young_fallbacks: present(src, "CRATONVM_MOVING_YOUNG_FALLBACKS"),
+            no_gc_promotion_guard: present(src, "CRATONVM_NO_GC_PROMOTION_GUARD"),
+            promotion_oom_guard_broad: present(src, "CRATONVM_PROMOTION_OOM_GUARD_BROAD"),
+            no_selective_promote: present(src, "CRATONVM_NO_SELECTIVE_PROMOTE"),
+            sp_no_coalesce: present(src, "CRATONVM_SP_NO_COALESCE"),
+            card_table_only: present(src, "CRATONVM_CARD_TABLE_ONLY"),
+            old_sweep_jit: on_unless_zero(src, "CRATONVM_OLD_SWEEP_JIT"),
+            g1_parallel_evac: one_or_true(src, "CRATONVM_G1_PARALLEL_EVAC"),
+            g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
+            g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
+            gc_sweep_anchor_stride: usize_opt(src, "CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
+                .filter(|&n| n >= 64)
+                .unwrap_or(8 * 1024 * 1024),
+            gc_par_threads: usize_opt(src, "CRATONVM_GC_PAR_THREADS"),
+            gc_par_min_bytes: usize_opt(src, "CRATONVM_GC_PAR_MIN_BYTES")
+                .unwrap_or(16 * 1024 * 1024),
+            gc_stress_bytes: utf8(src, "CRATONVM_DBG_GC_STRESS")
+                .or_else(|| utf8(src, "CRATONVM_GC_STRESS"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&v| v > 0),
+            dbg_force_moving: present(src, "CRATONVM_DBG_FORCE_MOVING"),
+            dbg_no_nonmoving_reclaim: present(src, "CRATONVM_DBG_NO_NONMOVING_RECLAIM"),
+            dbg_compact_legacy: present(src, "CRATONVM_DBG_COMPACT_LEGACY"),
+            dbg_seed_all_old: present(src, "CRATONVM_DBG_SEED_ALL_OLD"),
+            dbg_stale_objref: present(src, "CRATONVM_DBG_STALE_OBJREF"),
+            dbg_stale_objref_cycles: usize_opt_untrimmed(src, "CRATONVM_DBG_STALE_OBJREF_CYCLES")
+                .filter(|&n| n >= 1)
+                .unwrap_or(1),
+            dbg_blocked_access: match utf8(src, "CRATONVM_DBG_BLOCKED_ACCESS") {
+                Some(ref v) if v == "warn" => BlockedAccessMode::Warn,
+                Some(ref v) if !v.is_empty() && v != "0" => BlockedAccessMode::Panic,
+                _ => BlockedAccessMode::Off,
+            },
+
+            fwd_resolve_strict: present(src, "CRATONVM_FWD_RESOLVE_STRICT"),
+            moving_young_verify: present(src, "CRATONVM_MOVING_YOUNG_VERIFY"),
+            sp_verify: present(src, "CRATONVM_SP_VERIFY"),
+            gc_array_guard_bt: present(src, "CRATONVM_GC_ARRAY_GUARD_BT"),
+
+            dbg_a2: present(src, "CRATONVM_DBG_A2"),
+            dbg_badref: present(src, "CRATONVM_DBG_BADREF"),
+            dbg_cellcorrupt: present(src, "CRATONVM_DBG_CELLCORRUPT"),
+            dbg_desctrace: present(src, "CRATONVM_DBG_DESCTRACE"),
+            dbg_fwdguard: present(src, "CRATONVM_DBG_FWDGUARD"),
+            dbg_gcpause: present(src, "CRATONVM_DBG_GCPAUSE"),
+            dbg_gcphase: present(src, "CRATONVM_DBG_GCPHASE"),
+            dbg_gcwrite: present(src, "CRATONVM_DBG_GCWRITE"),
+            dbg_heap_trace: present(src, "CRATONVM_DBG_HEAP_TRACE"),
+            dbg_mirrorpin: present(src, "CRATONVM_DBG_MIRRORPIN"),
+            dbg_oobfield: present(src, "CRATONVM_DBG_OOBFIELD"),
+            dbg_oobfield_value: utf8(src, "CRATONVM_DBG_OOBFIELD"),
+            dbg_precise: present(src, "CRATONVM_DBG_PRECISE"),
+            dbg_rset_audit: present(src, "CRATONVM_DBG_RSET_AUDIT"),
+            dbg_rset_audit_young_scan: present(src, "CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN"),
+            dbg_seedhunt: present(src, "CRATONVM_DBG_SEEDHUNT"),
+            dbg_sweep_census: present(src, "CRATONVM_DBG_SWEEP_CENSUS"),
+            dbg_sweep_edges: present(src, "CRATONVM_DBG_SWEEP_EDGES"),
+            dbg_sweep_zero: present(src, "CRATONVM_DBG_SWEEP_ZERO"),
+            dbg_watchref: present(src, "CRATONVM_DBG_WATCHREF"),
+            dbg_watch_cell: hex_addr_or_zero(src, "CRATONVM_DBG_WATCH_CELL"),
+            dbg_youngstate: present(src, "CRATONVM_DBG_YOUNGSTATE"),
+            dbg_zero_ranges: present(src, "CRATONVM_DBG_ZERO_RANGES"),
+            diag_hib32: present(src, "CRATONVM_DIAG_HIB32"),
+            g1_dbg_headers: present(src, "CRATONVM_G1_DBG_HEADERS"),
+            g1_dbg_diag: present(src, "CRATONVM_DBG_G1DIAG"),
+            g1_dbg_pins: present(src, "CRATONVM_G1_DBG_PINS"),
+            g1_dbg_reach: present(src, "CRATONVM_G1_DBG_REACH"),
+            g1_dbg_rootcensus: present(src, "CRATONVM_G1_DBG_ROOTCENSUS"),
+            g1_dbg_zero: present(src, "CRATONVM_G1_DBG_ZERO"),
+            sp_stats: present(src, "CRATONVM_SP_STATS"),
+            sp_trace: present(src, "CRATONVM_SP_TRACE"),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// JIT flags
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Flags read by `cratonvm-jit`. Only the entries that are *shared* with other
+/// crates are here so far; the rest arrive with the `jit` migration.
+#[derive(Debug, Clone, Default)]
+pub struct JitFlags {
+    /// `CRATONVM_DISABLE_JIT` — process-wide interpreter-only kill switch.
+    ///
+    /// This is typed because the launcher must be able to overlay `--nojit`
+    /// before publishing the immutable configuration snapshot.
+    pub disable_jit: bool,
+    /// `CRATONVM_SHADOW_STACK` — use the JIT shadow stack for root discovery.
+    /// Read from `gc`, `jit` and `vm`, which is why it is in the shared config
+    /// rather than a crate-private cache.
+    pub shadow_stack: bool,
+    /// `CRATONVM_DBG_JIT_METHOD_STATS=1` — emit the tier/promotion summary
+    /// exactly once during controlled VM shutdown. Kept in the shared snapshot
+    /// so the supported `CRATONVM_DBG=jit-method-stats` spelling and the legacy
+    /// spelling cannot diverge at the launcher.
+    pub method_stats: bool,
+}
+
+impl JitFlags {
+    fn from_source(src: &dyn FlagSource) -> Self {
+        Self {
+            disable_jit: parse::non_empty_non_zero(src, "CRATONVM_DISABLE_JIT"),
+            shadow_stack: parse::present(src, "CRATONVM_SHADOW_STACK"),
+            method_stats: parse::exactly_one(src, "CRATONVM_DBG_JIT_METHOD_STATS"),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Class-loading flags
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Flags read by `cratonvm-classloading`.
+#[derive(Debug, Clone)]
+pub struct LoaderFlags {
+    /// `CRATONVM_LOADER_AWARE_RESOLUTION` — resolve implicit class constants
+    /// through the defining class's own loader. **Default ON**; empty or `0`
+    /// turns it off. [`parse::non_empty_non_zero_default_true`].
+    pub loader_aware_resolution: bool,
+    /// `CRATONVM_BOOT_MODULE_REGISTRY` — register JDK modules at boot.
+    /// **Default ON**; `0` / `false` / `no` turn it off.
+    /// [`parse::on_unless_off_word`].
+    pub boot_module_registry: bool,
+    /// `CRATONVM_ALLOW_JSR_RET` — accept `jsr`/`ret` in the verifier.
+    /// [`parse::non_empty_non_zero`].
+    pub allow_jsr_ret: bool,
+    /// `CRATONVM_HARDEN_MANIFEST_CLASSPATH` — drop manifest `Class-Path`
+    /// entries that escape the JAR's directory. [`parse::non_empty_non_zero`].
+    pub harden_manifest_classpath: bool,
+    /// `CRATONVM_DISABLE_JAR_MMAP` — read JARs with `read()` instead of `mmap`.
+    pub disable_jar_mmap: bool,
+    /// `CRATONVM_TRUST_PEM` — path to an extra PEM trust bundle.
+    /// [`parse::utf8`].
+    pub trust_pem: Option<String>,
+    /// `CRATONVM_TRACE_UNIMPLEMENTED`
+    pub trace_unimplemented: bool,
+    /// `CRATONVM_DBG_ACCESS` — [`parse::present_utf8`].
+    pub dbg_access: bool,
+    /// `CRATONVM_DBG_CLASSPATH`
+    pub dbg_classpath: bool,
+    /// `CRATONVM_DBG_DEFINE` — [`parse::present_utf8`].
+    pub dbg_define: bool,
+    /// `CRATONVM_DBG_DUPCLASS` — [`parse::present_utf8`].
+    pub dbg_dupclass: bool,
+    /// `CRATONVM_DBG_DUPCLASS_BT`
+    pub dbg_dupclass_bt: bool,
+    /// `CRATONVM_DBG_DUPCLASS_FILTER` -- [`parse::utf8`]. Restricts the
+    /// `CRATONVM_DBG_DUPCLASS` trace to class names containing this substring.
+    pub dbg_dupclass_filter: Option<String>,
+    /// `CRATONVM_DBG_FBCGLIB`
+    pub dbg_fbcglib: bool,
+    /// `CRATONVM_DBG_GETRESOURCES` — [`parse::non_empty_non_zero`].
+    pub dbg_getresources: bool,
+    /// `CRATONVM_DBG_LAYOUT`
+    pub dbg_layout: bool,
+    /// `CRATONVM_DBG_LOADCLASS`
+    pub dbg_loadclass: bool,
+    /// `CRATONVM_DBG_MODPROV` — [`parse::present_utf8`].
+    pub dbg_modprov: bool,
+    /// `CRATONVM_DBG_OBSREG`
+    pub dbg_obsreg: bool,
+    /// `CRATONVM_DBG_RESOURCE_TIMING`
+    pub dbg_resource_timing: bool,
+}
+
+impl Default for LoaderFlags {
+    fn default() -> Self {
+        Self::from_source(&MapSource::empty())
+    }
+}
+
+impl LoaderFlags {
+    fn from_source(src: &dyn FlagSource) -> Self {
+        use parse::*;
+        Self {
+            loader_aware_resolution: non_empty_non_zero_default_true(
+                src,
+                "CRATONVM_LOADER_AWARE_RESOLUTION",
+            ),
+            boot_module_registry: on_unless_off_word(src, "CRATONVM_BOOT_MODULE_REGISTRY"),
+            allow_jsr_ret: non_empty_non_zero(src, "CRATONVM_ALLOW_JSR_RET"),
+            harden_manifest_classpath: non_empty_non_zero(
+                src,
+                "CRATONVM_HARDEN_MANIFEST_CLASSPATH",
+            ),
+            disable_jar_mmap: present(src, "CRATONVM_DISABLE_JAR_MMAP"),
+            trust_pem: utf8(src, "CRATONVM_TRUST_PEM"),
+            trace_unimplemented: present(src, "CRATONVM_TRACE_UNIMPLEMENTED"),
+            dbg_access: present_utf8(src, "CRATONVM_DBG_ACCESS"),
+            dbg_classpath: present(src, "CRATONVM_DBG_CLASSPATH"),
+            dbg_define: present_utf8(src, "CRATONVM_DBG_DEFINE"),
+            dbg_dupclass: present_utf8(src, "CRATONVM_DBG_DUPCLASS"),
+            dbg_dupclass_bt: present(src, "CRATONVM_DBG_DUPCLASS_BT"),
+            dbg_dupclass_filter: utf8(src, "CRATONVM_DBG_DUPCLASS_FILTER"),
+            dbg_fbcglib: present(src, "CRATONVM_DBG_FBCGLIB"),
+            dbg_getresources: non_empty_non_zero(src, "CRATONVM_DBG_GETRESOURCES"),
+            dbg_layout: present(src, "CRATONVM_DBG_LAYOUT"),
+            dbg_loadclass: present(src, "CRATONVM_DBG_LOADCLASS"),
+            dbg_modprov: present_utf8(src, "CRATONVM_DBG_MODPROV"),
+            dbg_obsreg: present(src, "CRATONVM_DBG_OBSREG"),
+            dbg_resource_timing: present(src, "CRATONVM_DBG_RESOURCE_TIMING"),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// I/O and networking flags
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Flags read by `cratonvm-native-io`.
+#[derive(Debug, Clone, Default)]
+pub struct IoFlags {
+    /// `CRATONVM_CONFINE_IO` — certified deployment profile: enable CWD
+    /// confinement, fail closed. [`parse::truthy_word`].
+    pub confine_io: bool,
+    /// `CRATONVM_UNTRUSTED_CODE` — untrusted-bytecode profile: enable CWD
+    /// confinement, warn loudly. [`parse::truthy_word`].
+    pub untrusted_code: bool,
+    /// `CRATONVM_BLOCK_PRIVATE_NETS` — deny outbound to loopback and RFC1918.
+    /// [`parse::truthy_word`].
+    pub block_private_nets: bool,
+    /// `CRATONVM_RESOLVE_OUTBOUND_HOST` — resolve outbound hostnames and apply
+    /// the per-IP policy to every address. [`parse::truthy_word`].
+    pub resolve_outbound_host: bool,
+    /// `CRATONVM_REAL_NET_SOCKETS` — use real OS sockets instead of the
+    /// synthetic implementations.
+    pub real_net_sockets: bool,
+    /// `CRATONVM_SYNTHETIC_FILEWRITER=1` — opt back into the synthetic (known
+    /// lossy) `FileWriter`. Consumers want `!synthetic_filewriter_forced`.
+    /// [`parse::exactly_one`].
+    pub synthetic_filewriter_forced: bool,
+    /// `CRATONVM_SYNTHETIC_RAF=1` — opt back into the synthetic
+    /// `RandomAccessFile`. Consumers want `!synthetic_raf_forced`.
+    /// [`parse::exactly_one`].
+    pub synthetic_raf_forced: bool,
+    /// `CRATONVM_SOCKET_CAPTURE` — non-empty path prefix for socket capture
+    /// files. [`parse::non_empty_string`].
+    pub socket_capture_prefix: Option<String>,
+    /// `CRATONVM_SELECT_MAX_BLOCK_MS` — cap on an indefinite
+    /// `Selector.select()`, in ms; the caller supplies the default.
+    /// [`parse::i32_positive`].
+    pub select_max_block_ms: Option<i32>,
+    /// `CRATONVM_NO_SELECTOR_CONNECT_PROBE` — disable the Windows selector's
+    /// connect-completion probe. [`parse::non_empty_non_zero_non_false`].
+    pub no_selector_connect_probe: bool,
+    /// `CRATONVM_ZIP_MAX_ENTRY_BYTES` — per-entry inflate cap; the caller
+    /// supplies the default. [`parse::u64_positive`].
+    pub zip_max_entry_bytes: Option<u64>,
+    /// `CRATONVM_DIAG_JAR_LIST` — path to a classpath file for the jar-open
+    /// timing probe. [`parse::utf8`].
+    pub diag_jar_list: Option<String>,
+    /// `CRATONVM_DBG_SELECTOR` — [`parse::non_empty_non_zero_non_false`].
+    pub dbg_selector: bool,
+    /// `CRATONVM_SUREFIRE_IPC_DBG` — [`parse::non_empty_non_zero_non_false`].
+    pub surefire_ipc_dbg: bool,
+    /// `CRATONVM_DBG_AIO`
+    pub dbg_aio: bool,
+    /// `CRATONVM_DBG_JAR`
+    pub dbg_jar: bool,
+    /// `CRATONVM_DBG_JETTY` — [`parse::present_utf8`].
+    pub dbg_jetty: bool,
+    /// `CRATONVM_DBG_NET`
+    pub dbg_net: bool,
+    /// `CRATONVM_DBG_PB`
+    pub dbg_pb: bool,
+    /// `CRATONVM_DBG_SC_CLOSE`
+    pub dbg_sc_close: bool,
+    /// `CRATONVM_DBG_SC_READ`
+    pub dbg_sc_read: bool,
+    /// `CRATONVM_DBG_SC_WRITE`
+    pub dbg_sc_write: bool,
+}
+
+impl IoFlags {
+    fn from_source(src: &dyn FlagSource) -> Self {
+        use parse::*;
+        Self {
+            confine_io: truthy_word(src, "CRATONVM_CONFINE_IO"),
+            untrusted_code: truthy_word(src, "CRATONVM_UNTRUSTED_CODE"),
+            block_private_nets: truthy_word(src, "CRATONVM_BLOCK_PRIVATE_NETS"),
+            resolve_outbound_host: truthy_word(src, "CRATONVM_RESOLVE_OUTBOUND_HOST"),
+            real_net_sockets: present(src, "CRATONVM_REAL_NET_SOCKETS"),
+            synthetic_filewriter_forced: exactly_one(src, "CRATONVM_SYNTHETIC_FILEWRITER"),
+            synthetic_raf_forced: exactly_one(src, "CRATONVM_SYNTHETIC_RAF"),
+            socket_capture_prefix: non_empty_string(src, "CRATONVM_SOCKET_CAPTURE"),
+            select_max_block_ms: i32_positive(src, "CRATONVM_SELECT_MAX_BLOCK_MS"),
+            no_selector_connect_probe: non_empty_non_zero_non_false(
+                src,
+                "CRATONVM_NO_SELECTOR_CONNECT_PROBE",
+            ),
+            zip_max_entry_bytes: u64_positive(src, "CRATONVM_ZIP_MAX_ENTRY_BYTES"),
+            diag_jar_list: utf8(src, "CRATONVM_DIAG_JAR_LIST"),
+            dbg_selector: non_empty_non_zero_non_false(src, "CRATONVM_DBG_SELECTOR"),
+            surefire_ipc_dbg: non_empty_non_zero_non_false(src, "CRATONVM_SUREFIRE_IPC_DBG"),
+            dbg_aio: present(src, "CRATONVM_DBG_AIO"),
+            dbg_jar: present(src, "CRATONVM_DBG_JAR"),
+            dbg_jetty: present_utf8(src, "CRATONVM_DBG_JETTY"),
+            dbg_net: present(src, "CRATONVM_DBG_NET"),
+            dbg_pb: present(src, "CRATONVM_DBG_PB"),
+            dbg_sc_close: present(src, "CRATONVM_DBG_SC_CLOSE"),
+            dbg_sc_read: present(src, "CRATONVM_DBG_SC_READ"),
+            dbg_sc_write: present(src, "CRATONVM_DBG_SC_WRITE"),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// native-builtins flags
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Flags read by `cratonvm-native-builtins`.
+///
+/// That crate reads 156 flag names directly and 127 of them are read *only*
+/// there, so they get their own struct rather than being folded into the
+/// per-subsystem ones. Unless a field says otherwise it was built with
+/// [`parse::present`], i.e. it is `true` whenever the variable is set to
+/// anything at all — including `0` and the empty string.
+#[derive(Debug, Clone, Default)]
+pub struct NativeFlags {
+    /// `CRATONVM_ANN_TRACE` — [`parse::present_utf8`].
+    pub ann_trace: bool,
+
+    /// `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` — [`parse::i64_opt_untrimmed`].
+    ///
+    /// handoff sleep floor, milliseconds
+    pub async_handoff_sleep_floor_ms: Option<i64>,
+
+    /// `CRATONVM_ASYNC_SUBMIT_GRACE_MS` — [`parse::u64_opt_untrimmed`].
+    ///
+    /// submit grace period, milliseconds; `None` falls back to 20
+    pub async_submit_grace_ms: Option<u64>,
+
+    /// `CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS` — [`parse::i64_opt_untrimmed`].
+    ///
+    /// worker sleep floor, milliseconds
+    pub async_worker_sleep_floor_ms: Option<i64>,
+
+    /// `CRATONVM_AWAIT_NO_SHORTCIRCUIT`
+    pub await_no_shortcircuit: bool,
+
+    /// `CRATONVM_BD_DEBUG`
+    pub bd_debug: bool,
+
+    /// `CRATONVM_CANON_OPENFILE`
+    pub canon_openfile: bool,
+
+    /// `CRATONVM_CL_BOOTSTRAP_SCOPED` — [`parse::on_unless_zero`].
+    pub cl_bootstrap_scoped: bool,
+
+    /// `CRATONVM_DBG`
+    pub dbg: bool,
+
+    /// `CRATONVM_DBG_ANNPROXY_WRAP`
+    pub dbg_annproxy_wrap: bool,
+
+    /// `CRATONVM_DBG_AQS_TRACE`
+    pub dbg_aqs_trace: bool,
+
+    /// `CRATONVM_DBG_ARRAYCOPY` — [`parse::exactly_one`].
+    pub dbg_arraycopy: bool,
+
+    /// `CRATONVM_DBG_ASSERTJ_ARR`
+    pub dbg_assertj_arr: bool,
+
+    /// `CRATONVM_DBG_ATOMIC_UPDATER`
+    pub dbg_atomic_updater: bool,
+
+    /// `CRATONVM_DBG_BB` — [`parse::present_utf8`].
+    pub dbg_bb: bool,
+
+    /// `CRATONVM_DBG_CALLER` — [`parse::present_utf8`].
+    pub dbg_caller: bool,
+
+    /// `CRATONVM_DBG_CAPVAL`
+    pub dbg_capval: bool,
+
+    /// `CRATONVM_DBG_CATALINA` — [`parse::present_utf8`].
+    pub dbg_catalina: bool,
+
+    /// `CRATONVM_DBG_CAUSE`
+    pub dbg_cause: bool,
+
+    /// `CRATONVM_DBG_CCECACHE`
+    pub dbg_ccecache: bool,
+
+    /// `CRATONVM_DBG_CCE_BT`
+    pub dbg_cce_bt: bool,
+
+    /// `CRATONVM_DBG_CLONE`
+    pub dbg_clone: bool,
+
+    /// `CRATONVM_DBG_COERCE`
+    pub dbg_coerce: bool,
+
+    /// `CRATONVM_DBG_COMPONENT_TYPE` — [`parse::present_utf8`].
+    pub dbg_component_type: bool,
+
+    /// `CRATONVM_DBG_DEFLATE`
+    pub dbg_deflate: bool,
+
+    /// `CRATONVM_DBG_DOPRIV`
+    pub dbg_dopriv: bool,
+
+    /// `CRATONVM_DBG_EQE`
+    pub dbg_eqe: bool,
+
+    /// `CRATONVM_DBG_EXEC`
+    pub dbg_exec: bool,
+
+    /// `CRATONVM_DBG_EXIT` — [`parse::exactly_one`].
+    pub dbg_exit: bool,
+
+    /// `CRATONVM_DBG_FBREF`
+    pub dbg_fbref: bool,
+
+    /// `CRATONVM_DBG_FIELD_GET` — [`parse::present_utf8`].
+    pub dbg_field_get: bool,
+
+    /// `CRATONVM_DBG_FSP` — [`parse::present_utf8`].
+    pub dbg_fsp: bool,
+
+    /// `CRATONVM_DBG_GOCBF`
+    pub dbg_gocbf: bool,
+
+    /// `CRATONVM_DBG_H2TRACE`
+    pub dbg_h2trace: bool,
+
+    /// `CRATONVM_DBG_HTTPSRV`
+    pub dbg_httpsrv: bool,
+
+    /// `CRATONVM_DBG_INVOKE_COERCE` — [`parse::exactly_one`].
+    pub dbg_invoke_coerce: bool,
+
+    /// `CRATONVM_DBG_ISINSTANCE`
+    pub dbg_isinstance: bool,
+
+    /// `CRATONVM_DBG_JLM` — [`parse::present_utf8`].
+    pub dbg_jlm: bool,
+
+    /// `CRATONVM_DBG_LAMBDA_GENERIC` — [`parse::present_utf8`].
+    pub dbg_lambda_generic: bool,
+
+    /// `CRATONVM_DBG_LINKER`
+    pub dbg_linker: bool,
+
+    /// `CRATONVM_DBG_LOADER_TRACE`
+    pub dbg_loader_trace: bool,
+
+    /// `CRATONVM_DBG_LOGPROV`
+    pub dbg_logprov: bool,
+
+    /// `CRATONVM_DBG_LOOKUP` — [`parse::present_utf8`].
+    pub dbg_lookup: bool,
+
+    /// `CRATONVM_DBG_MCL`
+    pub dbg_mcl: bool,
+
+    /// `CRATONVM_DBG_METHOD_INVOKE_BOX`
+    pub dbg_method_invoke_box: bool,
+
+    /// `CRATONVM_DBG_MH_DISPATCH`
+    pub dbg_mh_dispatch: bool,
+
+    /// `CRATONVM_DBG_MINVOKE`
+    pub dbg_minvoke: bool,
+
+    /// `CRATONVM_DBG_MSC`
+    pub dbg_msc: bool,
+
+    /// `CRATONVM_DBG_NETTY_QUEUE`
+    pub dbg_netty_queue: bool,
+
+    /// `CRATONVM_DBG_NEXTINT` — [`parse::present_utf8`].
+    pub dbg_nextint: bool,
+
+    /// `CRATONVM_DBG_NIO_BIND`
+    pub dbg_nio_bind: bool,
+
+    /// `CRATONVM_DBG_NULL_NATIVE`
+    pub dbg_null_native: bool,
+
+    /// `CRATONVM_DBG_OBJECTS`
+    pub dbg_objects: bool,
+
+    /// `CRATONVM_DBG_OBJ_EQUALS`
+    pub dbg_obj_equals: bool,
+
+    /// `CRATONVM_DBG_PBE`
+    pub dbg_pbe: bool,
+
+    /// `CRATONVM_DBG_PICOCLI_STYLE` — [`parse::present_utf8`].
+    pub dbg_picocli_style: bool,
+
+    /// `CRATONVM_DBG_PROXY` — [`parse::present_utf8`].
+    pub dbg_proxy: bool,
+
+    /// `CRATONVM_DBG_RAF_GETFD`
+    pub dbg_raf_getfd: bool,
+
+    /// `CRATONVM_DBG_RAF_INIT`
+    pub dbg_raf_init: bool,
+
+    /// `CRATONVM_DBG_RE5`
+    pub dbg_re5: bool,
+
+    /// `CRATONVM_DBG_REFERSTO`
+    pub dbg_refersto: bool,
+
+    /// `CRATONVM_DBG_REFLECTION_FACTORY`
+    pub dbg_reflection_factory: bool,
+
+    /// `CRATONVM_DBG_REPLOVR`
+    pub dbg_replovr: bool,
+
+    /// `CRATONVM_DBG_RESOLVE_SHIM`
+    pub dbg_resolve_shim: bool,
+
+    /// `CRATONVM_DBG_SBLOAD`
+    pub dbg_sbload: bool,
+
+    /// `CRATONVM_DBG_SEL`
+    pub dbg_sel: bool,
+
+    /// `CRATONVM_DBG_SLEEP_TRACE`
+    pub dbg_sleep_trace: bool,
+
+    /// `CRATONVM_DBG_SOCK`
+    pub dbg_sock: bool,
+
+    /// `CRATONVM_DBG_SOCK_BYTES`
+    pub dbg_sock_bytes: bool,
+
+    /// `CRATONVM_DBG_STREAMSUPP` — [`parse::present_utf8`].
+    pub dbg_streamsupp: bool,
+
+    /// `CRATONVM_DBG_STTRACE`
+    pub dbg_sttrace: bool,
+
+    /// `CRATONVM_DBG_TLS_AUTH`
+    ///
+    /// This crate probes the flag with BOTH `var_os(..).is_some()` and
+    /// `var(..).is_ok()`. The two disagree on a non-UTF-8 value, so both are
+    /// kept rather than silently unified.
+    pub dbg_tls_auth: bool,
+
+    /// `CRATONVM_DBG_TLS_AUTH` — [`parse::present_utf8`].
+    pub dbg_tls_auth_ok: bool,
+
+    /// `CRATONVM_DBG_TLS_HS`
+    ///
+    /// This crate probes the flag with BOTH `var_os(..).is_some()` and
+    /// `var(..).is_ok()`. The two disagree on a non-UTF-8 value, so both are
+    /// kept rather than silently unified.
+    pub dbg_tls_hs: bool,
+
+    /// `CRATONVM_DBG_TLS_HS` — [`parse::present_utf8`].
+    pub dbg_tls_hs_ok: bool,
+
+    /// `CRATONVM_DBG_TLS_PLS`
+    pub dbg_tls_pls: bool,
+
+    /// `CRATONVM_DBG_TLS_SOCK`
+    pub dbg_tls_sock: bool,
+
+    /// `CRATONVM_DBG_TLS_SRV`
+    pub dbg_tls_srv: bool,
+
+    /// `CRATONVM_DBG_TOARRAY`
+    ///
+    /// This crate probes the flag with BOTH `var_os(..).is_some()` and
+    /// `var(..).is_ok()`. The two disagree on a non-UTF-8 value, so both are
+    /// kept rather than silently unified.
+    pub dbg_toarray: bool,
+
+    /// `CRATONVM_DBG_TOARRAY` — [`parse::present_utf8`].
+    pub dbg_toarray_ok: bool,
+
+    /// `CRATONVM_DBG_TOHEX`
+    pub dbg_tohex: bool,
+
+    /// `CRATONVM_DBG_UCLREG`
+    pub dbg_uclreg: bool,
+
+    /// `CRATONVM_DBG_UCLRES`
+    pub dbg_uclres: bool,
+
+    /// `CRATONVM_DBG_URLCL`
+    pub dbg_urlcl: bool,
+
+    /// `CRATONVM_DBG_UTE`
+    pub dbg_ute: bool,
+
+    /// `CRATONVM_DBG_VDISP`
+    pub dbg_vdisp: bool,
+
+    /// `CRATONVM_DBG_VISITFILE`
+    pub dbg_visitfile: bool,
+
+    /// `CRATONVM_DBG_WATCH_CAUSE_SELF` — [`parse::utf8`].
+    ///
+    /// class name to watch for self-causing Throwables
+    pub dbg_watch_cause_self: Option<String>,
+
+    /// `CRATONVM_DBG_WF`
+    pub dbg_wf: bool,
+
+    /// `CRATONVM_DBG_XNIO_TCP`
+    pub dbg_xnio_tcp: bool,
+
+    /// `CRATONVM_DEBUG_SFI`
+    pub debug_sfi: bool,
+
+    /// `CRATONVM_DEBUG_STACKWALK`
+    pub debug_stackwalk: bool,
+
+    /// `CRATONVM_DIAG_JBOSS_SERVICES` — [`parse::utf8`].
+    ///
+    /// raw value: this flag falls back to `CRATONVM_DIAG_SERVICELOADER` only
+    /// when it is *unset*, which needs the raw Option
+    pub diag_jboss_services: Option<String>,
+
+    /// `CRATONVM_DIAG_JCA`
+    pub diag_jca: bool,
+
+    /// `CRATONVM_DIAG_METHOD_INVOKE_NULL`
+    pub diag_method_invoke_null: bool,
+
+    /// `CRATONVM_DIAG_PROPERTIES` — [`parse::one_true_yes_exact`].
+    pub diag_properties: bool,
+
+    /// `CRATONVM_DIAG_SERVICELOADER` — [`parse::one_true_yes_exact`].
+    pub diag_serviceloader: bool,
+
+    /// `CRATONVM_ENABLE_ASSERTIONS`
+    pub enable_assertions: bool,
+
+    /// `CRATONVM_EQE_SYNC_EXECUTE`
+    pub eqe_sync_execute: bool,
+
+    /// `CRATONVM_FORNAME_TRACE`
+    pub forname_trace: bool,
+
+    /// `CRATONVM_HTTP_MAX_BODY` — [`parse::usize_positive`].
+    ///
+    /// HTTP response body cap, bytes
+    pub http_max_body: Option<usize>,
+
+    /// `CRATONVM_IAE_TRACE`
+    ///
+    /// This crate probes the flag with BOTH `var_os(..).is_some()` and
+    /// `var(..).is_ok()`. The two disagree on a non-UTF-8 value, so both are
+    /// kept rather than silently unified.
+    pub iae_trace: bool,
+
+    /// `CRATONVM_IAE_TRACE` — [`parse::present_utf8`].
+    pub iae_trace_ok: bool,
+
+    /// `CRATONVM_IAE_TRACE2` — [`parse::present_utf8`].
+    pub iae_trace2: bool,
+
+    /// `CRATONVM_INHERIT_THREAD_CCL` — [`parse::on_unless_zero_or_false`].
+    pub inherit_thread_ccl: bool,
+
+    /// `CRATONVM_INHERIT_TL_WORKAROUND` — [`parse::on_unless_zero_or_false`].
+    pub inherit_tl_workaround: bool,
+
+    /// `CRATONVM_JBOSS_BOOT_LOG_FILE` — [`parse::utf8`].
+    ///
+    /// path for the JBoss boot log
+    pub jboss_boot_log_file: Option<String>,
+
+    /// `CRATONVM_JBOSS_BRUTE_FORCE_JARS` — [`parse::exactly_one`].
+    pub jboss_brute_force_jars: bool,
+
+    /// `CRATONVM_JBOSS_LOGGER_BASE_EMIT` — [`parse::exactly_one`].
+    pub jboss_logger_base_emit: bool,
+
+    /// `CRATONVM_LOADER_UNLOAD` — [`parse::on_unless_zero`].
+    pub loader_unload: bool,
+
+    /// `CRATONVM_MAX_INFLATED_BYTES` — [`parse::utf8`].
+    ///
+    /// raw value: the gzip cap distinguishes unparseable (default) from an
+    /// explicit `0` (disabled), so the bespoke parse stays at the call site
+    pub max_inflated_bytes: Option<String>,
+
+    /// `CRATONVM_MSC_REAL_START` — [`parse::on_unless_off_word_cased`].
+    pub msc_real_start: bool,
+
+    /// `CRATONVM_NATIVE_EC_MULTIPLY`
+    pub native_ec_multiply: bool,
+
+    /// `CRATONVM_NATIVE_MATCHER_FIND` — [`parse::on_unless_zero_or_false`].
+    pub native_matcher_find: bool,
+
+    /// `CRATONVM_NATIVE_PBE_KEYFACTORY` — [`parse::exactly_one`].
+    pub native_pbe_keyfactory: bool,
+
+    /// `CRATONVM_NATIVE_STRING_REGEX` — [`parse::on_unless_zero_or_false`].
+    pub native_string_regex: bool,
+
+    /// `CRATONVM_NETTY_QUEUE_BRIDGE` — [`parse::on_unless_zero_or_false`].
+    pub netty_queue_bridge: bool,
+
+    /// `CRATONVM_REAL_AGROAL`
+    pub real_agroal: bool,
+
+    /// `CRATONVM_REAL_ANNOTATIONS` — [`parse::on_unless_off_word_cased`].
+    pub real_annotations: bool,
+
+    /// `CRATONVM_REAL_AQS`
+    pub real_aqs: bool,
+
+    /// `CRATONVM_REAL_JCA`
+    pub real_jca: bool,
+
+    /// `CRATONVM_REAL_PROXY` — [`parse::truthy_word_default_true`].
+    pub real_proxy: bool,
+
+    /// `CRATONVM_REAL_PROXY_STRICT` — [`parse::affirmative_word`].
+    pub real_proxy_strict: bool,
+
+    /// `CRATONVM_REAL_PROXY_SUPER` — [`parse::truthy_word_default_true`].
+    pub real_proxy_super: bool,
+
+    /// `CRATONVM_REAL_PROXY_SUPER`
+    ///
+    /// Bare presence of the same variable: one test-only site probes
+    /// `var_os(..).is_none()` rather than the value.
+    pub real_proxy_super_set: bool,
+
+    /// `CRATONVM_REAL_QUARKUS_START`
+    pub real_quarkus_start: bool,
+
+    /// `CRATONVM_REAL_STAX_FACTORY` — [`parse::on_unless_zero`].
+    pub real_stax_factory: bool,
+
+    /// `CRATONVM_REAL_VERTX`
+    pub real_vertx: bool,
+
+    /// `CRATONVM_REQUIRE_POLICY`
+    pub require_policy: bool,
+
+    /// `CRATONVM_S111_DBG` — [`parse::present_utf8`].
+    pub s111_dbg: bool,
+
+    /// `CRATONVM_SFI_NULL_TRACE`
+    pub sfi_null_trace: bool,
+
+    /// `CRATONVM_SOFT_EXIT` — [`parse::exactly_one`].
+    pub soft_exit: bool,
+
+    /// `CRATONVM_SPRING_DBG`
+    pub spring_dbg: bool,
+
+    /// `CRATONVM_SYNTHETIC_AGROAL`
+    pub synthetic_agroal: bool,
+
+    /// `CRATONVM_SYNTHETIC_ANNOTATIONS`
+    pub synthetic_annotations: bool,
+
+    /// `CRATONVM_SYNTHETIC_AQS`
+    pub synthetic_aqs: bool,
+
+    /// `CRATONVM_SYNTHETIC_BUFFERED_WRITER` — [`parse::exactly_one`].
+    pub synthetic_buffered_writer: bool,
+
+    /// `CRATONVM_SYNTHETIC_DSA`
+    pub synthetic_dsa: bool,
+
+    /// `CRATONVM_SYNTHETIC_EC`
+    pub synthetic_ec: bool,
+
+    /// `CRATONVM_SYNTHETIC_EQE` — [`parse::present_utf8`].
+    pub synthetic_eqe: bool,
+
+    /// `CRATONVM_SYNTHETIC_PQC`
+    pub synthetic_pqc: bool,
+
+    /// `CRATONVM_SYNTHETIC_RSA`
+    pub synthetic_rsa: bool,
+
+    /// `CRATONVM_SYNTHETIC_VERTX`
+    pub synthetic_vertx: bool,
+
+    /// `CRATONVM_TRACE_ARRAYS_HASHCODE`
+    pub trace_arrays_hashcode: bool,
+
+    /// `CRATONVM_TRACE_CLASSVALUE`
+    pub trace_classvalue: bool,
+
+    /// `CRATONVM_TRACE_PTI_ARGS`
+    pub trace_pti_args: bool,
+
+    /// `CRATONVM_UEH_DEBUG`
+    pub ueh_debug: bool,
+
+    /// `CRATONVM_URI_STRICT_CHARS` — [`parse::on_unless_zero`].
+    pub uri_strict_chars: bool,
+
+    /// `CRATONVM_USE_WILDFLY_REFLECT_SHIM` — [`parse::exactly_one`].
+    pub use_wildfly_reflect_shim: bool,
+
+    /// `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` — [`parse::exactly_one`].
+    pub use_wildfly_synth_bytecode: bool,
+}
+
+impl NativeFlags {
+    fn from_source(src: &dyn FlagSource) -> Self {
+        use parse::*;
+        Self {
+            ann_trace: present_utf8(src, "CRATONVM_ANN_TRACE"),
+            async_handoff_sleep_floor_ms: i64_opt_untrimmed(
+                src,
+                "CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS",
+            ),
+            async_submit_grace_ms: u64_opt_untrimmed(src, "CRATONVM_ASYNC_SUBMIT_GRACE_MS"),
+            async_worker_sleep_floor_ms: i64_opt_untrimmed(
+                src,
+                "CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS",
+            ),
+            await_no_shortcircuit: present(src, "CRATONVM_AWAIT_NO_SHORTCIRCUIT"),
+            bd_debug: present(src, "CRATONVM_BD_DEBUG"),
+            canon_openfile: present(src, "CRATONVM_CANON_OPENFILE"),
+            cl_bootstrap_scoped: on_unless_zero(src, "CRATONVM_CL_BOOTSTRAP_SCOPED"),
+            // Was the bare `CRATONVM_DBG`. That name is now the debug *group*
+            // variable (`CRATONVM_DBG=topic,topic`), so this one call site —
+            // `quarkus_staticinit.rs` — gets an ordinary topic of its own:
+            // `CRATONVM_DBG=quarkus-staticinit`.
+            dbg: present(src, "CRATONVM_DBG_QUARKUS_STATICINIT"),
+            dbg_annproxy_wrap: present(src, "CRATONVM_DBG_ANNPROXY_WRAP"),
+            dbg_aqs_trace: present(src, "CRATONVM_DBG_AQS_TRACE"),
+            dbg_arraycopy: exactly_one(src, "CRATONVM_DBG_ARRAYCOPY"),
+            dbg_assertj_arr: present(src, "CRATONVM_DBG_ASSERTJ_ARR"),
+            dbg_atomic_updater: present(src, "CRATONVM_DBG_ATOMIC_UPDATER"),
+            dbg_bb: present_utf8(src, "CRATONVM_DBG_BB"),
+            dbg_caller: present_utf8(src, "CRATONVM_DBG_CALLER"),
+            dbg_capval: present(src, "CRATONVM_DBG_CAPVAL"),
+            dbg_catalina: present_utf8(src, "CRATONVM_DBG_CATALINA"),
+            dbg_cause: present(src, "CRATONVM_DBG_CAUSE"),
+            dbg_ccecache: present(src, "CRATONVM_DBG_CCECACHE"),
+            dbg_cce_bt: present(src, "CRATONVM_DBG_CCE_BT"),
+            dbg_clone: present(src, "CRATONVM_DBG_CLONE"),
+            dbg_coerce: present(src, "CRATONVM_DBG_COERCE"),
+            dbg_component_type: present_utf8(src, "CRATONVM_DBG_COMPONENT_TYPE"),
+            dbg_deflate: present(src, "CRATONVM_DBG_DEFLATE"),
+            dbg_dopriv: present(src, "CRATONVM_DBG_DOPRIV"),
+            dbg_eqe: present(src, "CRATONVM_DBG_EQE"),
+            dbg_exec: present(src, "CRATONVM_DBG_EXEC"),
+            dbg_exit: exactly_one(src, "CRATONVM_DBG_EXIT"),
+            dbg_fbref: present(src, "CRATONVM_DBG_FBREF"),
+            dbg_field_get: present_utf8(src, "CRATONVM_DBG_FIELD_GET"),
+            dbg_fsp: present_utf8(src, "CRATONVM_DBG_FSP"),
+            dbg_gocbf: present(src, "CRATONVM_DBG_GOCBF"),
+            dbg_h2trace: present(src, "CRATONVM_DBG_H2TRACE"),
+            dbg_httpsrv: present(src, "CRATONVM_DBG_HTTPSRV"),
+            dbg_invoke_coerce: exactly_one(src, "CRATONVM_DBG_INVOKE_COERCE"),
+            dbg_isinstance: present(src, "CRATONVM_DBG_ISINSTANCE"),
+            dbg_jlm: present_utf8(src, "CRATONVM_DBG_JLM"),
+            dbg_lambda_generic: present_utf8(src, "CRATONVM_DBG_LAMBDA_GENERIC"),
+            dbg_linker: present(src, "CRATONVM_DBG_LINKER"),
+            dbg_loader_trace: present(src, "CRATONVM_DBG_LOADER_TRACE"),
+            dbg_logprov: present(src, "CRATONVM_DBG_LOGPROV"),
+            dbg_lookup: present_utf8(src, "CRATONVM_DBG_LOOKUP"),
+            dbg_mcl: present(src, "CRATONVM_DBG_MCL"),
+            dbg_method_invoke_box: present(src, "CRATONVM_DBG_METHOD_INVOKE_BOX"),
+            dbg_mh_dispatch: present(src, "CRATONVM_DBG_MH_DISPATCH"),
+            dbg_minvoke: present(src, "CRATONVM_DBG_MINVOKE"),
+            dbg_msc: present(src, "CRATONVM_DBG_MSC"),
+            dbg_netty_queue: present(src, "CRATONVM_DBG_NETTY_QUEUE"),
+            dbg_nextint: present_utf8(src, "CRATONVM_DBG_NEXTINT"),
+            dbg_nio_bind: present(src, "CRATONVM_DBG_NIO_BIND"),
+            dbg_null_native: present(src, "CRATONVM_DBG_NULL_NATIVE"),
+            dbg_objects: present(src, "CRATONVM_DBG_OBJECTS"),
+            dbg_obj_equals: present(src, "CRATONVM_DBG_OBJ_EQUALS"),
+            dbg_pbe: present(src, "CRATONVM_DBG_PBE"),
+            dbg_picocli_style: present_utf8(src, "CRATONVM_DBG_PICOCLI_STYLE"),
+            dbg_proxy: present_utf8(src, "CRATONVM_DBG_PROXY"),
+            dbg_raf_getfd: present(src, "CRATONVM_DBG_RAF_GETFD"),
+            dbg_raf_init: present(src, "CRATONVM_DBG_RAF_INIT"),
+            dbg_re5: present(src, "CRATONVM_DBG_RE5"),
+            dbg_refersto: present(src, "CRATONVM_DBG_REFERSTO"),
+            dbg_reflection_factory: present(src, "CRATONVM_DBG_REFLECTION_FACTORY"),
+            dbg_replovr: present(src, "CRATONVM_DBG_REPLOVR"),
+            dbg_resolve_shim: present(src, "CRATONVM_DBG_RESOLVE_SHIM"),
+            dbg_sbload: present(src, "CRATONVM_DBG_SBLOAD"),
+            dbg_sel: present(src, "CRATONVM_DBG_SEL"),
+            dbg_sleep_trace: present(src, "CRATONVM_DBG_SLEEP_TRACE"),
+            dbg_sock: present(src, "CRATONVM_DBG_SOCK"),
+            dbg_sock_bytes: present(src, "CRATONVM_DBG_SOCK_BYTES"),
+            dbg_streamsupp: present_utf8(src, "CRATONVM_DBG_STREAMSUPP"),
+            dbg_sttrace: present(src, "CRATONVM_DBG_STTRACE"),
+            dbg_tls_auth: present(src, "CRATONVM_DBG_TLS_AUTH"),
+            dbg_tls_auth_ok: present_utf8(src, "CRATONVM_DBG_TLS_AUTH"),
+            dbg_tls_hs: present(src, "CRATONVM_DBG_TLS_HS"),
+            dbg_tls_hs_ok: present_utf8(src, "CRATONVM_DBG_TLS_HS"),
+            dbg_tls_pls: present(src, "CRATONVM_DBG_TLS_PLS"),
+            dbg_tls_sock: present(src, "CRATONVM_DBG_TLS_SOCK"),
+            dbg_tls_srv: present(src, "CRATONVM_DBG_TLS_SRV"),
+            dbg_toarray: present(src, "CRATONVM_DBG_TOARRAY"),
+            dbg_toarray_ok: present_utf8(src, "CRATONVM_DBG_TOARRAY"),
+            dbg_tohex: present(src, "CRATONVM_DBG_TOHEX"),
+            dbg_uclreg: present(src, "CRATONVM_DBG_UCLREG"),
+            dbg_uclres: present(src, "CRATONVM_DBG_UCLRES"),
+            dbg_urlcl: present(src, "CRATONVM_DBG_URLCL"),
+            dbg_ute: present(src, "CRATONVM_DBG_UTE"),
+            dbg_vdisp: present(src, "CRATONVM_DBG_VDISP"),
+            dbg_visitfile: present(src, "CRATONVM_DBG_VISITFILE"),
+            dbg_watch_cause_self: utf8(src, "CRATONVM_DBG_WATCH_CAUSE_SELF"),
+            dbg_wf: present(src, "CRATONVM_DBG_WF"),
+            dbg_xnio_tcp: present(src, "CRATONVM_DBG_XNIO_TCP"),
+            debug_sfi: present(src, "CRATONVM_DEBUG_SFI"),
+            debug_stackwalk: present(src, "CRATONVM_DEBUG_STACKWALK"),
+            diag_jboss_services: utf8(src, "CRATONVM_DIAG_JBOSS_SERVICES"),
+            diag_jca: present(src, "CRATONVM_DIAG_JCA"),
+            diag_method_invoke_null: present(src, "CRATONVM_DIAG_METHOD_INVOKE_NULL"),
+            diag_properties: one_true_yes_exact(src, "CRATONVM_DIAG_PROPERTIES"),
+            diag_serviceloader: one_true_yes_exact(src, "CRATONVM_DIAG_SERVICELOADER"),
+            enable_assertions: present(src, "CRATONVM_ENABLE_ASSERTIONS"),
+            eqe_sync_execute: present(src, "CRATONVM_EQE_SYNC_EXECUTE"),
+            forname_trace: present(src, "CRATONVM_FORNAME_TRACE"),
+            http_max_body: usize_positive(src, "CRATONVM_HTTP_MAX_BODY"),
+            iae_trace: present(src, "CRATONVM_IAE_TRACE"),
+            iae_trace_ok: present_utf8(src, "CRATONVM_IAE_TRACE"),
+            iae_trace2: present_utf8(src, "CRATONVM_IAE_TRACE2"),
+            inherit_thread_ccl: on_unless_zero_or_false(src, "CRATONVM_INHERIT_THREAD_CCL"),
+            inherit_tl_workaround: on_unless_zero_or_false(src, "CRATONVM_INHERIT_TL_WORKAROUND"),
+            jboss_boot_log_file: utf8(src, "CRATONVM_JBOSS_BOOT_LOG_FILE"),
+            jboss_brute_force_jars: exactly_one(src, "CRATONVM_JBOSS_BRUTE_FORCE_JARS"),
+            jboss_logger_base_emit: exactly_one(src, "CRATONVM_JBOSS_LOGGER_BASE_EMIT"),
+            loader_unload: on_unless_zero(src, "CRATONVM_LOADER_UNLOAD"),
+            max_inflated_bytes: utf8(src, "CRATONVM_MAX_INFLATED_BYTES"),
+            msc_real_start: on_unless_off_word_cased(src, "CRATONVM_MSC_REAL_START"),
+            native_ec_multiply: present(src, "CRATONVM_NATIVE_EC_MULTIPLY"),
+            native_matcher_find: on_unless_zero_or_false(src, "CRATONVM_NATIVE_MATCHER_FIND"),
+            native_pbe_keyfactory: exactly_one(src, "CRATONVM_NATIVE_PBE_KEYFACTORY"),
+            native_string_regex: on_unless_zero_or_false(src, "CRATONVM_NATIVE_STRING_REGEX"),
+            netty_queue_bridge: on_unless_zero_or_false(src, "CRATONVM_NETTY_QUEUE_BRIDGE"),
+            real_agroal: present(src, "CRATONVM_REAL_AGROAL"),
+            real_annotations: on_unless_off_word_cased(src, "CRATONVM_REAL_ANNOTATIONS"),
+            real_aqs: present(src, "CRATONVM_REAL_AQS"),
+            real_jca: present(src, "CRATONVM_REAL_JCA"),
+            real_proxy: truthy_word_default_true(src, "CRATONVM_REAL_PROXY"),
+            real_proxy_strict: affirmative_word(src, "CRATONVM_REAL_PROXY_STRICT"),
+            real_proxy_super: truthy_word_default_true(src, "CRATONVM_REAL_PROXY_SUPER"),
+            real_proxy_super_set: present(src, "CRATONVM_REAL_PROXY_SUPER"),
+            real_quarkus_start: present(src, "CRATONVM_REAL_QUARKUS_START"),
+            real_stax_factory: on_unless_zero(src, "CRATONVM_REAL_STAX_FACTORY"),
+            real_vertx: present(src, "CRATONVM_REAL_VERTX"),
+            require_policy: present(src, "CRATONVM_REQUIRE_POLICY"),
+            s111_dbg: present_utf8(src, "CRATONVM_S111_DBG"),
+            sfi_null_trace: present(src, "CRATONVM_SFI_NULL_TRACE"),
+            soft_exit: exactly_one(src, "CRATONVM_SOFT_EXIT"),
+            spring_dbg: present(src, "CRATONVM_SPRING_DBG"),
+            synthetic_agroal: present(src, "CRATONVM_SYNTHETIC_AGROAL"),
+            synthetic_annotations: present(src, "CRATONVM_SYNTHETIC_ANNOTATIONS"),
+            synthetic_aqs: present(src, "CRATONVM_SYNTHETIC_AQS"),
+            synthetic_buffered_writer: exactly_one(src, "CRATONVM_SYNTHETIC_BUFFERED_WRITER"),
+            synthetic_dsa: present(src, "CRATONVM_SYNTHETIC_DSA"),
+            synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
+            synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
+            synthetic_pqc: present(src, "CRATONVM_SYNTHETIC_PQC"),
+            synthetic_rsa: present(src, "CRATONVM_SYNTHETIC_RSA"),
+            synthetic_vertx: present(src, "CRATONVM_SYNTHETIC_VERTX"),
+            trace_arrays_hashcode: present(src, "CRATONVM_TRACE_ARRAYS_HASHCODE"),
+            trace_classvalue: present(src, "CRATONVM_TRACE_CLASSVALUE"),
+            trace_pti_args: present(src, "CRATONVM_TRACE_PTI_ARGS"),
+            ueh_debug: present(src, "CRATONVM_UEH_DEBUG"),
+            uri_strict_chars: on_unless_zero(src, "CRATONVM_URI_STRICT_CHARS"),
+            use_wildfly_reflect_shim: exactly_one(src, "CRATONVM_USE_WILDFLY_REFLECT_SHIM"),
+            use_wildfly_synth_bytecode: exactly_one(src, "CRATONVM_USE_WILDFLY_SYNTH_BYTECODE"),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Root
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The whole typed configuration, populated once from a [`FlagSource`].
+#[derive(Debug, Clone, Default)]
+pub struct VmFlags {
+    /// Garbage-collector flags.
+    pub gc: GcFlags,
+    /// JIT flags.
+    pub jit: JitFlags,
+    /// Class-loading flags.
+    pub loader: LoaderFlags,
+    /// I/O and networking flags.
+    pub io: IoFlags,
+    /// Flags read only by `native-builtins`.
+    pub natives: NativeFlags,
+    /// Resolved legacy values retained for configuration consumers that have
+    /// not yet been converted to a typed field. Private so new code cannot
+    /// widen the public configuration surface.
+    legacy_values: MapSource,
+}
+
+impl VmFlags {
+    /// Build from an explicit source. This is the testable entry point — it
+    /// touches no globals, so unit tests never have to mutate process
+    /// environment.
+    pub fn from_source(src: &dyn FlagSource) -> Self {
+        Self {
+            gc: GcFlags::from_source(src),
+            jit: JitFlags::from_source(src),
+            loader: LoaderFlags::from_source(src),
+            io: IoFlags::from_source(src),
+            natives: NativeFlags::from_source(src),
+            legacy_values: MapSource::declared_snapshot(src),
+        }
+    }
+
+    fn legacy_var_os(&self, name: &str) -> Option<OsString> {
+        self.legacy_values.get(name)
+    }
+
+    /// Build from the process environment.
+    ///
+    /// Snapshots `environ` once via [`MapSource::from_process_env`] instead of
+    /// calling `getenv` per field; the values are identical.
+    ///
+    /// The snapshot is passed through [`crate::flag_groups::resolve`] first, so
+    /// the ten grouped variables (`CRATONVM_JIT=-bce,unroll` and friends) reach
+    /// every field below. Legacy per-flag names are what the grouped tokens
+    /// expand *to*, so setting one directly still works unchanged.
+    pub fn from_env() -> Self {
+        Self::from_env_with_overrides(MapSource::empty())
+    }
+
+    /// Build from one process-environment snapshot plus launcher overrides.
+    ///
+    /// Overrides win over inherited variables, then grouped flag expressions
+    /// are resolved across the combined source. Launchers should use this
+    /// instead of mutating `environ` after argument parsing: once any
+    /// CratonVM flag is read, the process configuration is immutable.
+    pub fn from_env_with_overrides(overrides: MapSource) -> Self {
+        let mut raw = MapSource::from_process_env();
+        raw.0.extend(overrides.0);
+        Self::from_source(&crate::flag_groups::resolve(&raw))
+    }
+}
+
+static FLAGS: OnceLock<VmFlags> = OnceLock::new();
+
+fn declared_flag_names() -> &'static HashSet<&'static str> {
+    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = HashSet::new();
+        for entry in crate::flag_groups::INVENTORY {
+            if let Some(name) = entry.on_key {
+                names.insert(name);
+            }
+            if let Some(name) = entry.off_key {
+                names.insert(name);
+            }
+        }
+        names.extend(crate::flag_groups::SCALARS.iter().copied());
+        names.extend(
+            crate::flag_groups::Group::ALL
+                .iter()
+                .copied()
+                .map(crate::flag_groups::Group::var),
+        );
+        names
+    })
+}
+
+/// The process-wide configuration.
+///
+/// Initialised from the environment on first call. See the module docs for the
+/// latching rules.
+#[inline]
+pub fn flags() -> &'static VmFlags {
+    FLAGS.get_or_init(VmFlags::from_env)
+}
+
+/// Read an environment value through the runtime configuration boundary.
+///
+/// Declared CratonVM flags come from the one immutable [`VmFlags`] snapshot.
+/// Ordinary process variables (`HOME`, `TZ`, application `System.getenv`
+/// names, and so on) retain `std::env`'s live-read semantics.
+#[inline]
+pub fn runtime_var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError> {
+    let key = key.as_ref();
+    if let Some(name) = key.to_str() {
+        if declared_flag_names().contains(name) {
+            return match flags().legacy_var_os(name) {
+                Some(value) => value.into_string().map_err(std::env::VarError::NotUnicode),
+                None => Err(std::env::VarError::NotPresent),
+            };
+        }
+    }
+    std::env::var(key)
+}
+
+/// OS-native sibling of [`runtime_var`].
+#[inline]
+pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
+    let key = key.as_ref();
+    if let Some(name) = key.to_str() {
+        if declared_flag_names().contains(name) {
+            return flags().legacy_var_os(name);
+        }
+    }
+    std::env::var_os(key)
+}
+
+/// Publish an explicitly-built configuration.
+///
+/// Call this from the launcher, before anything reads a flag, to layer `-XX:`
+/// options over the environment. Returns `Err` with the rejected value if the
+/// configuration has already been latched — which means something read a flag
+/// first, and the caller's overrides would have been silently ignored.
+pub fn install(cfg: VmFlags) -> Result<(), VmFlags> {
+    FLAGS.set(cfg)
+}
+
+/// Whether the configuration has been latched yet.
+pub fn is_installed() -> bool {
+    FLAGS.get().is_some()
+}
+
+/// Opt back in to the pre-2026-07-27 Mockito selector overrides.
+///
+/// CratonVM used to intercept `LocationFactory.create` and
+/// `ModuleMemberAccessor.delegate` with natives that unconditionally produced
+/// Mockito's *fallback* implementations (a `Java8LocationImpl` carrying a
+/// hardcoded `"-> at <<unknown line>>"`, and `ReflectionMemberAccessor`).
+/// HotSpot picks `LocationImpl` (StackWalker) and
+/// `InstrumentationMemberAccessor`; both real selectors now run here too.
+///
+/// `CRATONVM_COMPAT=mockito-legacy-selectors` (or the legacy spelling
+/// `CRATONVM_MOCKITO_LEGACY_SELECTORS=1`) restores the old interception as an
+/// escape hatch. Read through `runtime_var` so it stays inside the declared
+/// flag surface; cached, and not on any hot path — every caller gates on a
+/// class-name match first.
+pub fn mockito_legacy_selectors() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            runtime_var("CRATONVM_MOCKITO_LEGACY_SELECTORS").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn src(pairs: &[(&str, &str)]) -> MapSource {
+        MapSource::new(pairs.iter().copied())
+    }
+
+    #[test]
+    fn vm_flags_retain_resolved_legacy_values_for_boundary_reads() {
+        let f = VmFlags::from_source(&src(&[("CRATONVM_DBG_DEOPT", "enabled")]));
+        assert_eq!(
+            f.legacy_var_os("CRATONVM_DBG_DEOPT"),
+            Some(OsString::from("enabled"))
+        );
+        assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
+    }
+
+    #[test]
+    fn undeclared_process_values_keep_live_standard_environment_semantics() {
+        let key = if cfg!(windows) { "PATH" } else { "HOME" };
+        assert_eq!(runtime_var_os(key), std::env::var_os(key));
+        assert_eq!(runtime_var(key), std::env::var(key));
+    }
+
+    #[test]
+    fn empty_source_matches_all_documented_defaults() {
+        let f = VmFlags::from_source(&MapSource::empty());
+        // Every opt-in flag is off…
+        // `moving_young` is no longer an opt-in — it tracks
+        // `DEFAULT_MOVING_YOUNG`, which is the single constant that flips the
+        // young generation to a copying collector. Assert against the constant,
+        // not against `false`, so the flip does not have to edit this test (and
+        // so this test cannot silently become the thing that blocks it).
+        assert_eq!(f.gc.moving_young, DEFAULT_MOVING_YOUNG);
+        assert!(!f.gc.card_table_only);
+        assert!(!f.gc.dbg_a2);
+        assert!(!f.jit.shadow_stack);
+        assert!(!f.jit.method_stats);
+        // …and every default-ON flag is on.
+        assert!(f.gc.old_sweep_jit);
+        // Value flags fall back.
+        assert_eq!(f.gc.g1_workers, None);
+        assert_eq!(f.gc.gc_stress_bytes, None);
+        assert_eq!(f.gc.dbg_stale_objref_cycles, 1);
+        assert_eq!(f.gc.dbg_watch_cell, 0);
+        assert_eq!(f.gc.dbg_blocked_access, BlockedAccessMode::Off);
+        assert!(!f.jit.disable_jit);
+    }
+
+    #[test]
+    fn launcher_override_and_grouped_flags_share_one_resolved_snapshot() {
+        let mut raw = src(&[("CRATONVM_DBG", "jit-method-stats")]);
+        raw.0
+            .extend(MapSource::empty().with("CRATONVM_DISABLE_JIT", "1").0);
+        let f = VmFlags::from_source(&crate::flag_groups::resolve(&raw));
+        assert!(f.jit.disable_jit);
+        assert!(f.jit.method_stats);
+    }
+
+    #[test]
+    fn jit_method_stats_uses_the_grouped_and_legacy_spelling_consistently() {
+        let grouped = src(&[("CRATONVM_DBG", "jit-method-stats")]);
+        let grouped = crate::flag_groups::resolve(&grouped);
+        assert!(VmFlags::from_source(&grouped).jit.method_stats);
+
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_JIT_METHOD_STATS", "1")]))
+                .jit
+                .method_stats
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_DBG_JIT_METHOD_STATS", "0")]))
+                .jit
+                .method_stats
+        );
+    }
+
+    #[test]
+    fn gc_par_threads_keeps_zero_because_zero_disables_parallelism() {
+        // `CRATONVM_GC_PAR_THREADS=0` means "no parallel young GC". It is
+        // therefore `usize_opt`, NOT `usize_min1` like its neighbour
+        // `CRATONVM_G1_WORKERS` — clamping it to >= 1 would silently turn the
+        // documented kill-switch into "one worker", and the caller
+        // (`young_mark::young_gc_threads`) already does its own `.max(1)`.
+        let f = VmFlags::from_source(&src(&[("CRATONVM_GC_PAR_THREADS", "0")]));
+        assert_eq!(f.gc.gc_par_threads, Some(0));
+        // The lookalike really is clamped — the two must not be unified.
+        let g = VmFlags::from_source(&src(&[("CRATONVM_G1_WORKERS", "0")]));
+        assert_eq!(g.gc.g1_workers, Some(1));
+    }
+
+    #[test]
+    fn gc_sweep_anchor_stride_ignores_values_below_64() {
+        // Sub-64-byte strides would mint an anchor inside almost every object;
+        // the pre-config code filtered them out and fell back to the default.
+        let lo = VmFlags::from_source(&src(&[("CRATONVM_GC_SWEEP_ANCHOR_STRIDE", "32")]));
+        assert_eq!(lo.gc.gc_sweep_anchor_stride, 8 * 1024 * 1024);
+        let ok = VmFlags::from_source(&src(&[("CRATONVM_GC_SWEEP_ANCHOR_STRIDE", "64")]));
+        assert_eq!(ok.gc.gc_sweep_anchor_stride, 64);
+        let junk = VmFlags::from_source(&src(&[("CRATONVM_GC_SWEEP_ANCHOR_STRIDE", "nope")]));
+        assert_eq!(junk.gc.gc_sweep_anchor_stride, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn gc_parallel_value_flags_default_as_documented() {
+        let f = VmFlags::from_source(&MapSource::empty());
+        assert_eq!(f.gc.gc_sweep_anchor_stride, 8 * 1024 * 1024);
+        assert_eq!(f.gc.gc_par_threads, None);
+        assert_eq!(f.gc.gc_par_min_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn presence_parser_treats_zero_as_set() {
+        // This is the surprising-but-existing majority semantics: `X=0` is ON
+        // for every `var_os(..).is_some()` site. Locked down so the migration
+        // cannot quietly "fix" it. `moving_young` keeps this semantics for its
+        // compatibility opt-in — `jit/src/x64.rs` still parses the same
+        // variable with `var_os(..).is_some()`, and the two MUST agree.
+        let f = VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "0")]));
+        assert!(f.gc.moving_young);
+        let f = VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "")]));
+        assert!(f.gc.moving_young);
+    }
+
+    /// The moving-young gate is an opt-OUT over [`DEFAULT_MOVING_YOUNG`], not
+    /// an opt-in, and the opt-out wins over the compatibility opt-in.
+    ///
+    /// There is deliberately no second flag to also satisfy: the removed
+    /// `CRATONVM_ALLOW_MOVING_YOUNG` had to be set *in addition* to
+    /// `CRATONVM_MOVING_YOUNG` before `gen_heap` would run a moving cycle under
+    /// a live JIT frame, so the documented way to enable the feature could
+    /// never actually enable it in the case it exists for.
+    #[test]
+    fn moving_young_is_an_opt_out_with_a_compatibility_opt_in() {
+        assert!(!VmFlags::from_source(&src(&[("CRATONVM_NO_MOVING_YOUNG", "1")])).gc.moving_young);
+        // Opt-out beats opt-in — "turn it off" must always be honoured.
+        let both = VmFlags::from_source(&src(&[
+            ("CRATONVM_MOVING_YOUNG", "1"),
+            ("CRATONVM_NO_MOVING_YOUNG", "1"),
+        ]));
+        assert!(!both.gc.moving_young);
+        // And the opt-in alone is sufficient: nothing else has to be set.
+        assert!(VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "1")])).gc.moving_young);
+    }
+
+    #[test]
+    fn old_sweep_jit_is_opt_out_on_zero_only() {
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_OLD_SWEEP_JIT", "1")]))
+                .gc
+                .old_sweep_jit
+        );
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_OLD_SWEEP_JIT", "no")]))
+                .gc
+                .old_sweep_jit
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_OLD_SWEEP_JIT", "0")]))
+                .gc
+                .old_sweep_jit
+        );
+    }
+
+    #[test]
+    fn g1_parallel_evac_accepts_one_or_true_only() {
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "1")]))
+                .gc
+                .g1_parallel_evac
+        );
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "TRUE")]))
+                .gc
+                .g1_parallel_evac
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "yes")]))
+                .gc
+                .g1_parallel_evac
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_G1_PARALLEL_EVAC", "2")]))
+                .gc
+                .g1_parallel_evac
+        );
+    }
+
+    #[test]
+    fn g1_workers_clamps_to_one() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_G1_WORKERS", "0")]))
+                .gc
+                .g1_workers,
+            Some(1)
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_G1_WORKERS", " 6 ")]))
+                .gc
+                .g1_workers,
+            Some(6)
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_G1_WORKERS", "many")]))
+                .gc
+                .g1_workers,
+            None
+        );
+    }
+
+    #[test]
+    fn gc_stress_prefers_dbg_spelling_and_rejects_zero() {
+        let f = VmFlags::from_source(&src(&[
+            ("CRATONVM_DBG_GC_STRESS", "4096"),
+            ("CRATONVM_GC_STRESS", "8192"),
+        ]));
+        assert_eq!(f.gc.gc_stress_bytes, Some(4096));
+        let f = VmFlags::from_source(&src(&[("CRATONVM_GC_STRESS", "8192")]));
+        assert_eq!(f.gc.gc_stress_bytes, Some(8192));
+        let f = VmFlags::from_source(&src(&[("CRATONVM_GC_STRESS", "0")]));
+        assert_eq!(f.gc.gc_stress_bytes, None);
+    }
+
+    #[test]
+    fn blocked_access_modes() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_BLOCKED_ACCESS", "warn")]))
+                .gc
+                .dbg_blocked_access,
+            BlockedAccessMode::Warn
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_BLOCKED_ACCESS", "1")]))
+                .gc
+                .dbg_blocked_access,
+            BlockedAccessMode::Panic
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_BLOCKED_ACCESS", "0")]))
+                .gc
+                .dbg_blocked_access,
+            BlockedAccessMode::Off
+        );
+    }
+
+    #[test]
+    fn watch_cell_accepts_hex_with_or_without_prefix() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_WATCH_CELL", "0x7fff00")]))
+                .gc
+                .dbg_watch_cell,
+            0x7fff00
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_WATCH_CELL", "7fff00")]))
+                .gc
+                .dbg_watch_cell,
+            0x7fff00
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_WATCH_CELL", "zzz")]))
+                .gc
+                .dbg_watch_cell,
+            0
+        );
+    }
+
+    #[test]
+    fn stale_objref_cycles_defaults_and_floors_at_one() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_STALE_OBJREF_CYCLES", "4")]))
+                .gc
+                .dbg_stale_objref_cycles,
+            4
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_STALE_OBJREF_CYCLES", "0")]))
+                .gc
+                .dbg_stale_objref_cycles,
+            1
+        );
+    }
+
+    #[test]
+    fn oobfield_is_readable_both_as_gate_and_as_value() {
+        let f = VmFlags::from_source(&src(&[("CRATONVM_DBG_OOBFIELD", "myField")]));
+        assert!(f.gc.dbg_oobfield);
+        assert_eq!(f.gc.dbg_oobfield_value.as_deref(), Some("myField"));
+    }
+
+    #[test]
+    fn overlay_source_beats_environment() {
+        // No env var set for this name, so the overlay is what shows through.
+        let overlay = OverlaySource::new(MapSource::empty().with("CRATONVM_CARD_TABLE_ONLY", "1"));
+        assert!(VmFlags::from_source(&overlay).gc.card_table_only);
+    }
+
+    #[test]
+    fn loader_defaults_are_on_where_the_call_sites_defaulted_on() {
+        let f = VmFlags::from_source(&MapSource::empty());
+        assert!(f.loader.loader_aware_resolution);
+        assert!(f.loader.boot_module_registry);
+        assert!(!f.loader.allow_jsr_ret);
+        assert!(!f.loader.harden_manifest_classpath);
+    }
+
+    #[test]
+    fn loader_aware_resolution_is_off_only_for_empty_or_zero() {
+        for (v, want) in [("", false), ("0", false), ("1", true), ("no", true)] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_LOADER_AWARE_RESOLUTION", v)]))
+                    .loader
+                    .loader_aware_resolution,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_module_registry_off_words_are_exact_and_lowercase() {
+        for (v, want) in [
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("NO", true),
+            ("", true),
+        ] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_BOOT_MODULE_REGISTRY", v)]))
+                    .loader
+                    .boot_module_registry,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn io_profile_flags_use_the_word_truth_table() {
+        for (v, want) in [
+            ("1", true),
+            ("yes", true),
+            ("0", false),
+            ("off", false),
+            ("FALSE", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_CONFINE_IO", v)]))
+                    .io
+                    .confine_io,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_opt_ins_need_the_exact_string_one() {
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_RAF", "1")]))
+                .io
+                .synthetic_raf_forced
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_RAF", "true")]))
+                .io
+                .synthetic_raf_forced
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_RAF", "01")]))
+                .io
+                .synthetic_raf_forced
+        );
+    }
+
+    #[test]
+    fn selector_flags_reject_zero_empty_and_false() {
+        for (v, want) in [
+            ("1", true),
+            ("  x ", true),
+            ("0", false),
+            ("", false),
+            ("FaLsE", false),
+        ] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_DBG_SELECTOR", v)]))
+                    .io
+                    .dbg_selector,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_io_caps_reject_non_positive() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SELECT_MAX_BLOCK_MS", "0")]))
+                .io
+                .select_max_block_ms,
+            None
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SELECT_MAX_BLOCK_MS", "250")]))
+                .io
+                .select_max_block_ms,
+            Some(250)
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_ZIP_MAX_ENTRY_BYTES", "0")]))
+                .io
+                .zip_max_entry_bytes,
+            None
+        );
+    }
+
+    #[test]
+    fn socket_capture_empty_is_none() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SOCKET_CAPTURE", "")]))
+                .io
+                .socket_capture_prefix,
+            None
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SOCKET_CAPTURE", "/tmp/cap")]))
+                .io
+                .socket_capture_prefix
+                .as_deref(),
+            Some("/tmp/cap")
+        );
+    }
+
+    #[test]
+    fn stale_objref_cycles_does_not_trim_matching_the_original_call_site() {
+        // The pre-refactor parse was `s.parse::<usize>()` with no `.trim()`,
+        // so a padded value fell back to the default. Locked down so the
+        // migration is byte-exact rather than merely "reasonable".
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_STALE_OBJREF_CYCLES", " 4 ")]))
+                .gc
+                .dbg_stale_objref_cycles,
+            1
+        );
+    }
+
+    #[test]
+    fn boolean_parsers_disagree_exactly_as_documented() {
+        // Regression lock on census §10: five parsers, five answers for "0".
+        let s = src(&[("X", "0")]);
+        assert!(parse::present(&s, "X"));
+        assert!(!parse::non_empty_non_zero(&s, "X"));
+        assert!(!parse::truthy_word(&s, "X"));
+        assert!(!parse::affirmative_word(&s, "X"));
+        assert!(!parse::one_or_true(&s, "X"));
+        assert!(!parse::on_unless_zero(&s, "X"));
+
+        let s = src(&[("X", "off")]);
+        assert!(parse::present(&s, "X"));
+        assert!(parse::non_empty_non_zero(&s, "X"));
+        assert!(!parse::truthy_word(&s, "X"));
+        assert!(!parse::affirmative_word(&s, "X"));
+        assert!(parse::on_unless_zero(&s, "X"));
+    }
+
+    /// The `native-builtins` migration (T3.5b) surfaced four more parsers that
+    /// no existing one matched. Census §10 said the count of disagreeing truth
+    /// tables was a lower bound; it was. This locks the new ones apart from
+    /// their nearest neighbours so none of them can be quietly unified.
+    #[test]
+    fn native_builtins_parsers_add_four_more_truth_tables() {
+        let empty = MapSource::empty();
+
+        // Unset splits the two default-ON word parsers from their default-OFF
+        // twins, and `one_true_yes_exact` from everything default-ON.
+        assert!(!parse::truthy_word(&empty, "X"));
+        assert!(parse::truthy_word_default_true(&empty, "X"));
+        assert!(parse::on_unless_zero_or_false(&empty, "X"));
+        assert!(parse::on_unless_off_word_cased(&empty, "X"));
+        assert!(!parse::one_true_yes_exact(&empty, "X"));
+
+        // The empty string is OFF for `truthy_word` and ON for its twin — the
+        // divergence is not only in the default.
+        let s = src(&[("X", "")]);
+        assert!(!parse::truthy_word(&s, "X"));
+        assert!(parse::truthy_word_default_true(&s, "X"));
+        assert!(parse::on_unless_zero_or_false(&s, "X"));
+        assert!(!parse::non_empty_non_zero_non_false(&s, "X"));
+
+        // Mixed case is a genuine three-way split.
+        let s = src(&[("X", "False")]);
+        assert!(!parse::on_unless_zero_or_false(&s, "X"));
+        assert!(parse::on_unless_off_word_cased(&s, "X"));
+        assert!(parse::on_unless_off_word(&s, "X"));
+        assert!(!parse::truthy_word_default_true(&s, "X"));
+
+        // `OFF` splits the two `on_unless_off_word*` parsers the other way.
+        let s = src(&[("X", "OFF")]);
+        assert!(!parse::on_unless_off_word_cased(&s, "X"));
+        assert!(parse::on_unless_off_word(&s, "X"));
+        assert!(!parse::truthy_word_default_true(&s, "X"));
+
+        // `on` is affirmative but not one-true-yes; whitespace is trimmed by
+        // `affirmative_word` and not by `one_true_yes_exact`.
+        let s = src(&[("X", "on")]);
+        assert!(parse::affirmative_word(&s, "X"));
+        assert!(!parse::one_true_yes_exact(&s, "X"));
+        let s = src(&[("X", " 1 ")]);
+        assert!(parse::affirmative_word(&s, "X"));
+        assert!(!parse::one_true_yes_exact(&s, "X"));
+        assert!(!parse::exactly_one(&s, "X"));
+    }
+
+    /// `VmFlags::from_env` snapshots `environ` once instead of calling `getenv`
+    /// per field. The values must be identical to reading through `EnvSource`.
+    #[test]
+    fn environ_snapshot_matches_per_lookup_env_source() {
+        let snapshot = MapSource::from_process_env();
+        for (name, _) in std::env::vars_os() {
+            let Ok(name) = name.into_string() else {
+                continue;
+            };
+            assert_eq!(
+                snapshot.get(&name),
+                EnvSource.get(&name),
+                "snapshot disagrees with var_os for {name}"
+            );
+        }
+        // And the whole config built either way is the same shape.
+        assert_eq!(
+            format!("{:?}", VmFlags::from_source(&snapshot)),
+            format!("{:?}", VmFlags::from_source(&EnvSource)),
+        );
+    }
+
+    /// Nothing in `NativeFlags` is accidentally default-ON.
+    #[test]
+    fn native_flags_defaults_match_the_original_call_sites() {
+        let f = VmFlags::from_source(&MapSource::empty());
+        // Opt-in debug gates are off…
+        assert!(!f.natives.dbg_loader_trace);
+        assert!(!f.natives.dbg_h2trace);
+        assert!(!f.natives.soft_exit);
+        assert!(!f.natives.diag_serviceloader);
+        assert!(!f.natives.real_proxy_strict);
+        // …and every gate whose call site defaulted ON still does.
+        assert!(f.natives.cl_bootstrap_scoped);
+        assert!(f.natives.loader_unload);
+        assert!(f.natives.uri_strict_chars);
+        assert!(f.natives.real_stax_factory);
+        assert!(f.natives.real_proxy);
+        assert!(f.natives.real_proxy_super);
+        assert!(f.natives.real_annotations);
+        assert!(f.natives.msc_real_start);
+        assert!(f.natives.inherit_thread_ccl);
+        assert!(f.natives.inherit_tl_workaround);
+        assert!(f.natives.native_string_regex);
+        assert!(f.natives.native_matcher_find);
+        assert!(f.natives.netty_queue_bridge);
+        // Value flags fall back to None so the call site's default applies.
+        assert_eq!(f.natives.http_max_body, None);
+        assert_eq!(f.natives.async_submit_grace_ms, None);
+        assert_eq!(f.natives.max_inflated_bytes, None);
+    }
+}

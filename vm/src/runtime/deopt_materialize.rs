@@ -339,11 +339,14 @@ fn object_ref_from_addr(addr: u64) -> Option<ObjectRef> {
 /// field, but kept for correctness/future-proofing), then `set_field`, which
 /// fires the post / card-marking barrier internally.
 fn store_field_barriered(shared: &SharedVm, obj: ObjectRef, index: usize, value: Value) {
-    let old = shared.heap.get_field(obj, index);
+    let old = shared.mem.heap.get_field(obj, index);
     if let Value::Object(Some(old_ref)) = old {
-        shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
+        shared
+            .mem
+            .heap
+            .write_barrier_pre(std::ptr::null_mut(), old_ref);
     }
-    shared.heap.set_field(obj, index, value);
+    shared.mem.heap.set_field(obj, index, value);
 }
 
 /// Count top-level `FrameValue::VirtualObject` occurrences in a frame's locals +
@@ -456,7 +459,7 @@ mod tests {
             assert_eq!(frame_slot(&frame, slot), &FrameValue::Object(addr));
             let obj = unsafe { ObjectRef::from_raw(addr as usize as *mut u8) };
             assert_eq!(
-                shared.heap.class_id_of(obj),
+                shared.mem.heap.class_id_of(obj),
                 ClassId::new(0),
                 "shell header must carry the requested class id post-GC"
             );
@@ -472,7 +475,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // A pre-existing real object to reference from a field.
-        let real = shared.heap.alloc_object(ClassId::new(7), 0);
+        let real = shared.mem.heap.alloc_object(ClassId::new(7), 0);
         let real_addr = real.as_ptr() as usize as u64;
 
         // One virtual object (id 0, class 5, 3 fields): [Int(42), Object(real), Undefined].
@@ -502,10 +505,13 @@ mod tests {
         assert_eq!(frame.locals[0], FrameValue::Object(addr));
 
         let shell = unsafe { ObjectRef::from_raw(addr as usize as *mut u8) };
-        assert_eq!(shared.heap.class_id_of(shell), ClassId::new(5));
-        assert_eq!(shared.heap.get_field(shell, 0), Value::Int(42));
-        assert_eq!(shared.heap.get_field(shell, 1), Value::Object(Some(real)));
-        assert_eq!(shared.heap.get_field(shell, 2), Value::Int(0)); // Undefined -> 0
+        assert_eq!(shared.mem.heap.class_id_of(shell), ClassId::new(5));
+        assert_eq!(shared.mem.heap.get_field(shell, 0), Value::Int(42));
+        assert_eq!(
+            shared.mem.heap.get_field(shell, 1),
+            Value::Object(Some(real))
+        );
+        assert_eq!(shared.mem.heap.get_field(shell, 2), Value::Int(0)); // Undefined -> 0
     }
 
     /// Step-6 cyclic graph: two objects referencing each other materialize to two
@@ -548,8 +554,8 @@ mod tests {
         let ob = unsafe { ObjectRef::from_raw(addr_b as usize as *mut u8) };
 
         // The cycle is wired: A.field0 == B and B.field0 == A.
-        assert_eq!(shared.heap.get_field(oa, 0), Value::Object(Some(ob)));
-        assert_eq!(shared.heap.get_field(ob, 0), Value::Object(Some(oa)));
+        assert_eq!(shared.mem.heap.get_field(oa, 0), Value::Object(Some(ob)));
+        assert_eq!(shared.mem.heap.get_field(ob, 0), Value::Object(Some(oa)));
         // Frame slots rewritten.
         assert_eq!(frame.locals[0], FrameValue::Object(addr_a));
         assert_eq!(frame.locals[1], FrameValue::Object(addr_b));

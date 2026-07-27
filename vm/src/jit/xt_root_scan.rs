@@ -45,11 +45,20 @@
 //!
 //! ## Why this is sound
 //!
-//!   * A frozen in-JIT peer keeps its JIT-entry guard live, so
-//!     `gc_quiescence::is_active()` stays `true` for the whole collection and
-//!     the heap performs a **non-moving** sweep. Conservatively-discovered
-//!     roots are therefore never relocated — pinning is implicit and an
+//!   * The conservative roots contributed here are never relocated, so an
 //!     interior / false-positive pointer can never be mis-rewritten.
+//!
+//!     arch-2026-07-26 (`moving-young-precise-roots`): this used to be stated
+//!     as a *consequence* — "a frozen in-JIT peer keeps its JIT-entry guard
+//!     live, so `gc_quiescence::is_active()` stays true for the whole
+//!     collection and the heap performs a non-moving sweep". That inference
+//!     held only while `is_active()` unconditionally forced the non-moving
+//!     sweep. Under a moving young generation it does not: `is_active()` is
+//!     precisely the condition moving-young is designed to run *through*. Each
+//!     pass below therefore asserts the obligation itself, calling
+//!     `gc_quiescence::mark_moving_young_coverage_incomplete_because` whenever
+//!     it actually contributes a peer's conservative roots — this collection
+//!     cannot rewrite a frozen peer's registers, so it must not move.
 //!   * `is_object_address` is lock-free and inclusive: a false positive only
 //!     inflates retention; a real object is never missed.
 //!   * Only threads whose `Rip` is in JIT code (lock-free instruction stream)
@@ -92,7 +101,7 @@ pub fn enabled() -> bool {
     }
     // On unless explicitly disabled.
     let on = !matches!(
-        std::env::var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
         Ok("0") | Ok("false") | Ok("off")
     );
     CACHE.store(on as u64, Ordering::Relaxed);
@@ -124,7 +133,7 @@ pub fn helper_window_scan_enabled() -> bool {
         return c == 1;
     }
     let on = !matches!(
-        std::env::var("CRATONVM_XT_HELPER_WINDOW_SCAN").as_deref(),
+        cratonvm_types::flags::runtime_var("CRATONVM_XT_HELPER_WINDOW_SCAN").as_deref(),
         Ok("0") | Ok("false") | Ok("off")
     );
     CACHE.store(on as u64, Ordering::Relaxed);
@@ -162,7 +171,7 @@ where
 
 #[inline]
 fn dbg() -> bool {
-    std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
+    cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
 }
 
 /// Handles of peer threads that were suspended in JIT code and must be
@@ -372,6 +381,23 @@ mod imp {
                         newly += 1;
                         XT_THREADS_TAKEN_OVER.fetch_add(1, Ordering::Relaxed);
                         XT_ROOTS_FOUND.fetch_add(found as u64, Ordering::Relaxed);
+                        // The roots we just contributed came from a FROZEN
+                        // peer's register file and raw stack — conservatively
+                        // discovered and, critically, not rewritable: this
+                        // collection never applies its pointer map to a frozen
+                        // peer (it is excused from the barrier and resumes
+                        // straight back into compiled code). The module's
+                        // soundness argument used to lean on "a frozen in-JIT
+                        // peer keeps its JIT-entry guard live, so `is_active()`
+                        // stays true and the heap performs a non-moving sweep" —
+                        // which stopped being automatic the moment moving-young
+                        // could run under `is_active()`. State the obligation
+                        // directly instead of inheriting it. (Also asserted at
+                        // the call site; kept here so any future caller of this
+                        // pass inherits the guarantee.)
+                        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                            cratonvm_gc::gc_quiescence::incomplete_reason::XT_TAKEOVER,
+                        );
                         if dbg() {
                             eprintln!(
                                 "[xt-jit-roots] took over tid={tid} (Rip in JIT): {found} conservative roots"
@@ -579,6 +605,14 @@ mod imp {
         unsafe { CloseHandle(snap) };
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
+        if windows > 0 {
+            // Helper-window roots are a blocked peer's register file + raw
+            // stack: conservative and un-rewritable, exactly like the takeover
+            // pass. This collection must not relocate.
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
+            );
+        }
         if dbg() {
             eprintln!(
                 "[xt-jit-roots] helper-window pass: {windows} window(s), {found_total} conservative root(s)"
@@ -1106,6 +1140,12 @@ mod imp {
                     newly += 1;
                     XT_THREADS_TAKEN_OVER.fetch_add(1, Ordering::Relaxed);
                     XT_ROOTS_FOUND.fetch_add(found as u64, Ordering::Relaxed);
+                    // See the Windows arm: a frozen peer's conservatively
+                    // scanned registers/stack are not rewritable by this
+                    // collection, so it must not be a moving one.
+                    cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                        cratonvm_gc::gc_quiescence::incomplete_reason::XT_TAKEOVER,
+                    );
                     if dbg() {
                         eprintln!(
                             "[xt-jit-roots] linux took over tid={tid} rip=0x{:x}: {found} conservative roots",
@@ -1213,6 +1253,12 @@ mod imp {
         }
         XT_HELPER_WINDOWS_SCANNED.fetch_add(windows as u64, Ordering::Relaxed);
         XT_HELPER_WINDOW_ROOTS.fetch_add(found_total as u64, Ordering::Relaxed);
+        if windows > 0 {
+            // See the Windows arm.
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                cratonvm_gc::gc_quiescence::incomplete_reason::XT_HELPER_WINDOW,
+            );
+        }
         if dbg() {
             eprintln!(
                 "[xt-jit-roots] linux helper-window pass: examined {examined} blocked peer(s), {windows} window(s), {found_total} conservative root(s)"

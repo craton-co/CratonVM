@@ -1016,7 +1016,7 @@ fn native_login_context_init_name_handler(
     // <init>(String, CallbackHandler)V — the overload H2's
     // `JaasCredentialsValidator` uses. Previously unregistered, so it ran as
     // un-intercepted real JDK bytecode and never populated the side-table
-    // `login()` depends on (see docs/known-issues/h2-suite-bugs/
+    // `login()` depends on (see docs/known-issues/h2/
     // bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
     let this = obj_arg(args, 0)?;
     let name_obj = optional_obj_arg(args, 1);
@@ -1376,7 +1376,7 @@ fn run_java_configuration_login(
 /// relies on exactly this path via the 2-arg `(String, CallbackHandler)`
 /// constructor — it calls `Configuration.setConfiguration(...)` itself and
 /// never touches the Rust-side security-domain registry (see
-/// docs/known-issues/h2-suite-bugs/bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
+/// docs/known-issues/h2/bug-h2-jaas-logincontext-two-arg-ctor-gap.md).
 /// Only consulted by the caller when the Rust-side registry
 /// (`LoginContext::modules`, populated by WildFly/Keycloak bootstrap) has no
 /// entry for `name`, so WildFly/Keycloak's own domains are unaffected.
@@ -1665,7 +1665,12 @@ fn native_access_control_context_init(
 // Registration.
 // ===========================================================================
 
-pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
+/// Register the JAAS and access-control bridges that belong to JDK modules.
+///
+/// These are deliberately independent of the WildFly security compatibility
+/// pack: ordinary applications use `Subject` and `LoginContext` too, so their
+/// availability must not depend on a WildFly classpath witness.
+pub fn register_jdk_security_natives(r: &mut NativeMethodRegistry) {
     let subject = "javax/security/auth/Subject";
     r.register(subject, "<init>", "()V", native_subject_init);
     r.register(
@@ -1719,7 +1724,7 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
     // JDK-legal construction path has to populate the side-table before
     // `login()` (unconditionally a native override) can find it. H2's
     // `JaasCredentialsValidator` uses the 2-arg (String, CallbackHandler)
-    // form; see docs/known-issues/h2-suite-bugs/
+    // form; see docs/known-issues/h2/
     // bug-h2-jaas-logincontext-two-arg-ctor-gap.md.
     r.register(lc, "<init>", "(Ljava/lang/String;)V", native_login_context_init_name_only);
     r.register(
@@ -1743,6 +1748,22 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
         native_login_context_get_subject,
     );
 
+    // Register only the <init>(ProtectionDomain[]) — the
+    // checkPermission(Permission) native is already owned by
+    // `security_manager.rs` (Session 86/87) and we share the same
+    // underlying `policy_allows` check path via
+    // [`access_control_context_check_permission`].
+    let acc = "java/security/AccessControlContext";
+    r.register(
+        acc,
+        "<init>",
+        "([Ljava/security/ProtectionDomain;)V",
+        native_access_control_context_init,
+    );
+}
+
+/// Register only the WildFly-owned security compatibility pack.
+pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
     let sds = "org/jboss/as/security/SecurityDomainService";
     r.register(
         sds,
@@ -1764,19 +1785,6 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/lang/Object;",
         native_security_identity_run_as,
     );
-
-    // Register only the <init>(ProtectionDomain[]) — the
-    // checkPermission(Permission) native is already owned by
-    // `security_manager.rs` (Session 86/87) and we share the same
-    // underlying `policy_allows` check path via
-    // [`access_control_context_check_permission`].
-    let acc = "java/security/AccessControlContext";
-    r.register(
-        acc,
-        "<init>",
-        "([Ljava/security/ProtectionDomain;)V",
-        native_access_control_context_init,
-    );
 }
 
 // ===========================================================================
@@ -1785,6 +1793,8 @@ pub fn register_wildfly_security_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_types::ArrayElementType;
@@ -2373,6 +2383,7 @@ mod tests {
     #[test]
     fn t19_2_c_register_wildfly_security_natives_installs_each_method() {
         let mut r = NativeMethodRegistry::new();
+        register_jdk_security_natives(&mut r);
         register_wildfly_security_natives(&mut r);
         assert!(r
             .find(

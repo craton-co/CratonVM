@@ -62,7 +62,7 @@ fn register_url_array(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value)
     // callers like Tomcat's `StandardJarScanner`. Runs before classpath
     // registration so it happens even when no path is extractable.
     crate::classloader::record_ucl_urls(ctx, this, urls);
-    let dbg = std::env::var_os("CRATONVM_DBG_UCLREG").is_some();
+    let dbg = crate::nbflags().dbg_uclreg;
     let arr = match urls {
         Value::Object(Some(a)) => a,
         _ => {
@@ -253,7 +253,7 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // constructor appears to have initialized it. Tomcat's
     // WebappLoader.buildClassPath then immediately dereferences that field.
     let this_pin = ctx.pin_native_root(this);
-    let diag = std::env::var_os("CRATONVM_DBG_URLCL").is_some();
+    let diag = crate::nbflags().dbg_urlcl;
     // `closeables` — WeakHashMap. `getResourceAsStream` synchronizes on it.
     // Only populate when currently null so a real `<init>` that already ran
     // (e.g. the name-carrying constructor whose bytecode we don't override)
@@ -513,8 +513,13 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         "getUnnamedModule",
         "()Ljava/lang/Module;",
         |ctx, _args| {
-            let m = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
-            ctx.set_field(m, 0, Value::Object(None)); // null name => unnamed => isNamed() == false
+            // Return the ONE canonical unnamed-module mirror rather than a fresh
+            // allocation per call: the JDK compares Modules by identity, so
+            // `Foo.class.getModule() == loader.getUnnamedModule()` (and Mockito's
+            // `assureCanReadMockito` / ResourceBundle's caller-module checks) must
+            // see the same object. It also carries a non-null `loader`, matching
+            // HotSpot. See `lang_class::canonical_unnamed_module`.
+            let m = crate::lang_class::canonical_unnamed_module(ctx);
             Ok(Some(Value::Object(Some(m))))
         },
     );
@@ -1014,6 +1019,19 @@ pub(crate) fn no_class_def_found_error(
 /// Reached when the receiver does NOT override `loadClass(String,boolean)`, and
 /// via `super.loadClass(name, resolve)` (the base native) from a subclass that
 /// wants standard parent-first delegation as its fallback.
+/// Legacy escape hatch for the "no fabricated stubs from `loadClass`" rule in
+/// [`cl_real_load_class_base`]: `CRATONVM_CL_STUB_DELEGATION=1` lets parent
+/// delegation answer with a synthetic stub again, as it did before 2026-07-27.
+fn stub_may_answer_load_class() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CRATONVM_CL_STUB_DELEGATION")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 fn cl_real_load_class_base(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1021,8 +1039,8 @@ fn cl_real_load_class_base(
 ) -> cratonvm_types::error::MethodCallResult {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
-    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
-        && internal.contains("ObservationRegistry");
+    let __obsreg_dbg =
+        crate::vmflags().loader.dbg_obsreg && internal.contains("ObservationRegistry");
     if __obsreg_dbg {
         let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
         let parent_field = ctx.get_field_by_name(this, "parent");
@@ -1151,10 +1169,12 @@ fn cl_real_load_class_base(
             .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
     });
     let overrides_find_class = crate::classloader::receiver_overrides_find_class(ctx, this);
+    let bootstrap_appended = cratonvm_classloading::is_bootstrap_appended_class(&internal);
     let defer_to_find_class = overrides_find_class
         && (parent_is_null || parent_is_platform)
         && crate::classloader::cl_bootstrap_scoped()
-        && !crate::classloader::is_bootstrap_class_name(&internal);
+        && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !bootstrap_appended;
     // JVMS 5.3-faithful scoping of the flat-store fallback (real-JDK-mode
     // counterpart of the same fix in classloader.rs's synthetic-mode base
     // delegation — this file has its OWN parallel loadClass implementation,
@@ -1171,7 +1191,7 @@ fn cl_real_load_class_base(
     // only override-less chains change.
     let scoped_user_chain = crate::classloader::cl_bootstrap_scoped()
         && !crate::classloader::is_bootstrap_class_name(&internal)
-        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+        && !bootstrap_appended
         && !crate::classloader::builtin_loader_reachable(ctx, this);
 
     // A URLClassLoader parented only by bootstrap/platform is intentionally
@@ -1182,6 +1202,7 @@ fn cl_real_load_class_base(
     // recorded URLs, then make the miss authoritative.
     if crate::classloader::url_classloader_isolated_from_app(ctx, this)
         && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !bootstrap_appended
     {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
             return result;
@@ -1215,22 +1236,75 @@ fn cl_real_load_class_base(
     //    path below; a miss or exception here is swallowed (`_ => {}`) so
     //    every existing fallback (global store, `findClass` override,
     //    deferred resolution) still runs exactly as before.
+    // Set when the user-defined parent's own `loadClass` was actually
+    // invoked (real bytecode) and did NOT hand back a class. That refusal
+    // is authoritative — the parent already ran its own full delegation/
+    // exclusion logic (which, for a loader like Spring Boot's
+    // `ModifiedClassPathClassLoader`, deliberately narrows its own URL list
+    // via `@ClassPathExclusions`), and CratonVM's flat global store mixes
+    // together every loader's classpath, so it can still find a class the
+    // parent specifically hid. Falling through to "standard VM class
+    // loading" below after such a refusal defeats the exclusion: a
+    // `ResourcesClassLoader` (installed by `@WithPackageResources`) wrapping
+    // a correctly-exclusion-aware `ModifiedClassPathClassLoader` parent got
+    // `ClassNotFoundException` from the parent's own `loadClass`, but that
+    // `Err` doesn't match the `Ok(Some(Object(Some(_))))` pattern above, so
+    // it was silently swallowed and step 1 re-resolved the excluded class
+    // globally anyway — `@ConditionalOnClass` checks made through such a
+    // loader then saw a class the exclusion was written to hide. See
+    // docs/known-issues/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md.
+    let mut parent_user_defined_authoritative_miss = false;
     if let Some(parent) = parent {
         if crate::classloader::is_user_defined_loader(ctx, parent) {
-            if let Ok(Some(Value::Object(Some(mirror)))) = ctx.invoke_virtual(
+            match ctx.invoke_virtual(
                 parent,
                 "loadClass",
                 "(Ljava/lang/String;)Ljava/lang/Class;",
                 &[Value::Object(Some(class_name_obj))],
             ) {
-                return Ok(Some(Value::Object(Some(mirror))));
+                Ok(Some(Value::Object(Some(mirror)))) => {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+                _ => {
+                    parent_user_defined_authoritative_miss = true;
+                }
             }
         }
     }
 
     // 1. Standard VM class loading (skipped when deferring to a custom findClass,
-    //    or when the loader's chain cannot reach a built-in loader).
-    if !defer_to_find_class && !scoped_user_chain {
+    //    or when the loader's chain cannot reach a built-in loader, or when a
+    //    user-defined parent already authoritatively refused above).
+    // `ClassLoader.loadClass` must never answer with a FABRICATED synthetic
+    // stub. The stub mechanism exists so enterprise *bytecode* can link
+    // against classes that are genuinely absent (`is_enterprise_stub_prefix`:
+    // `io/quarkus/`, `org/jboss/`, `io/smallrye/`, ...); HotSpot's
+    // `loadClass` has no such notion and throws `ClassNotFoundException`.
+    // Returning one here breaks every loader that *depends* on the parent
+    // refusing:
+    //
+    //   Quarkus's fast-jar `RunnerClassLoader` lists `io.quarkus.value.registry`
+    //   (among 40 packages) as PARENT-FIRST. It calls
+    //   `getParent().loadClass(name)` inside `try { } catch
+    //   (ClassNotFoundException)` and, on the expected refusal, falls through
+    //   to its own index -- which has the class, in
+    //   `lib/quarkus/generated-bytecode.jar`. CratonVM's app loader instead
+    //   answered with a stub, so Arc's generated `ValueRegistry_..._Synthetic_Bean`
+    //   became a method-less, interface-less class registered globally under
+    //   `Application`, and `ArcContainerImpl` died casting it to
+    //   `InjectableBean`.
+    //
+    // The stub is still minted by CratonVM's own constant-pool / `Class.forName`
+    // fallbacks when nothing else can supply the name -- this only stops the
+    // explicit `loadClass` API from manufacturing one mid-delegation.
+    // `CRATONVM_CL_STUB_DELEGATION=1` restores the legacy behaviour.
+    let stub_would_answer_delegation =
+        !stub_may_answer_load_class() && ctx.would_fabricate_synthetic_stub(&internal);
+    if !parent_user_defined_authoritative_miss
+        && !defer_to_find_class
+        && !scoped_user_chain
+        && !stub_would_answer_delegation
+    {
         match load_class_visible_to(ctx, this, &internal) {
             ClassLookup::Found(mirror) => return Ok(Some(mirror)),
             ClassLookup::DependencyMissing(missing) => {
@@ -1251,8 +1325,10 @@ fn cl_real_load_class_base(
     // URLClassLoader searches its recorded URLs after parent delegation. The
     // helper is a no-op for loaders without recorded URLs, and subclasses do
     // not always expose their inherited URLClassLoader identity here.
-    if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-        return result;
+    if !bootstrap_appended {
+        if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+            return result;
+        }
     }
 
     // 2. Custom-classloader extension point: if the receiver overrides
@@ -1372,7 +1448,9 @@ pub fn ucl_real_find_class(
     if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
         return result;
     }
-    if crate::classloader::url_classloader_isolated_from_app(ctx, this) {
+    if crate::classloader::url_classloader_isolated_from_app(ctx, this)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+    {
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",

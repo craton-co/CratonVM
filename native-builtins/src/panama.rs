@@ -1461,8 +1461,7 @@ fn pe_segment_get_impl(
             _ => Value::Int(0),
         }
     };
-    if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() && kind == LAYOUT_FLOAT && offset == 0
-    {
+    if crate::nbflags().dbg_mh_dispatch && kind == LAYOUT_FLOAT && offset == 0 {
         eprintln!(
             "[PANAMA_GET_FLOAT] runtime={} ptr={:?} base_offset={:?} value={value:?}",
             ctx.class_name_of_id(ctx.class_id_of_object(seg))
@@ -1867,7 +1866,7 @@ fn register_pe_linker(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            if std::env::var_os("CRATONVM_DBG_LINKER").is_some() {
+            if crate::nbflags().dbg_linker {
                 eprintln!(
                     "[PANAMA_LINKER] option downcall addr=0x{fn_addr:x} options={}",
                     args.get(3).is_some()
@@ -2270,10 +2269,7 @@ pub(crate) fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     }
 
-    if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some()
-        && return_layout.is_none()
-        && call_args.len() == 5
-    {
+    if crate::nbflags().dbg_mh_dispatch && return_layout.is_none() && call_args.len() == 5 {
         if let Some(Value::Object(Some(out))) = call_args.last() {
             if let Value::Long(ptr) = ctx.get_field(*out, 0) {
                 if ptr != 0 {
@@ -3816,6 +3812,8 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     // FIX(test): RAII guard that enables the process-wide native-access gate

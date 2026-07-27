@@ -3,11 +3,11 @@
 
 //! Object helpers: Java String interning, Class mirrors, static field access.
 
-use std::cell::Cell;
 use crate::classloading::ClassId;
 use crate::memory::heap::ArrayElementType;
 use crate::memory::vm_heap::VmHeap;
 use crate::types::{ObjectRef, Value};
+use std::cell::Cell;
 
 use super::SharedVm;
 
@@ -40,12 +40,12 @@ const CODER_UTF16: i32 = 1;
 ///   (field 1).
 pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
     // Fast path: check pool
-    if let Some(&obj) = shared.string_pool.read().get(text) {
+    if let Some(&obj) = shared.mem.string_pool.read().get(text) {
         return obj;
     }
 
     // Slow path: create new string object
-    let mut pool = shared.string_pool.write();
+    let mut pool = shared.mem.string_pool.write();
     // Double-check after acquiring write lock
     if let Some(&obj) = pool.get(text) {
         return obj;
@@ -63,10 +63,10 @@ pub fn create_java_string(shared: &SharedVm, text: &str) -> ObjectRef {
 /// catchable `OutOfMemoryError` (caller falls back to the pre-allocated
 /// singleton) rather than the VM hard-aborting.
 pub fn try_create_java_string(shared: &SharedVm, text: &str) -> Option<ObjectRef> {
-    if let Some(&obj) = shared.string_pool.read().get(text) {
+    if let Some(&obj) = shared.mem.string_pool.read().get(text) {
         return Some(obj);
     }
-    let mut pool = shared.string_pool.write();
+    let mut pool = shared.mem.string_pool.write();
     if let Some(&obj) = pool.get(text) {
         return Some(obj);
     }
@@ -99,30 +99,56 @@ pub fn create_java_string_uninterned_gc_safe_threaded(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     text: &str,
 ) -> ObjectRef {
-    if shared.compact_strings.load(std::sync::atomic::Ordering::Relaxed) && text.is_ascii() {
+    if shared
+        .classes
+        .compact_strings
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && text.is_ascii()
+    {
         let (class_id, fields) = java_string_allocation_layout(shared);
         use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
         let object_size = HEADER_SIZE + fields.saturating_mul(SLOT_SIZE);
         let str_obj = crate::runtime::interpreter::tlab_alloc_object(
-            thread, shared, class_id, fields, object_size,
+            thread,
+            shared,
+            class_id,
+            fields,
+            object_size,
         )
-        .or_else(|| shared.heap.try_alloc_object_full(class_id, fields))
+        .or_else(|| shared.mem.heap.try_alloc_object_full(class_id, fields))
         .unwrap_or_else(|| alloc_java_string_object(shared, text));
-        let byte_array = crate::runtime::interpreter::tlab_alloc_byte_array(thread, shared, text.len())
-            .or_else(|| shared.heap.try_alloc_array_full(ClassId::new(0), ArrayElementType::Byte, text.len()))
-            .unwrap_or_else(|| return alloc_java_string_object(shared, text));
-        if let Some(base) = shared.heap.array_data_ptr(byte_array) {
+        let byte_array =
+            crate::runtime::interpreter::tlab_alloc_byte_array(thread, shared, text.len())
+                .or_else(|| {
+                    shared.mem.heap.try_alloc_array_full(
+                        ClassId::new(0),
+                        ArrayElementType::Byte,
+                        text.len(),
+                    )
+                })
+                .unwrap_or_else(|| return alloc_java_string_object(shared, text));
+        if let Some(base) = shared.mem.heap.array_data_ptr(byte_array) {
             // SAFETY: the fresh byte array has exactly `text.len()` elements.
             unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), base, text.len()) };
         } else {
             for (index, byte) in text.bytes().enumerate() {
-                let _ = shared.heap.set_array_element(byte_array, index, Value::Int(byte as i32));
+                let _ =
+                    shared
+                        .mem
+                        .heap
+                        .set_array_element(byte_array, index, Value::Int(byte as i32));
             }
         }
-        shared.heap.set_field(str_obj, 0, Value::Object(Some(byte_array)));
-        shared.heap.set_field(str_obj, 1, Value::Int(CODER_LATIN1));
-        shared.heap.set_field(str_obj, 2, Value::Int(0));
-        shared.heap.set_field(str_obj, 3, Value::Int(0));
+        shared
+            .mem
+            .heap
+            .set_field(str_obj, 0, Value::Object(Some(byte_array)));
+        shared
+            .mem
+            .heap
+            .set_field(str_obj, 1, Value::Int(CODER_LATIN1));
+        shared.mem.heap.set_field(str_obj, 2, Value::Int(0));
+        shared.mem.heap.set_field(str_obj, 3, Value::Int(0));
         return str_obj;
     }
     alloc_java_string_object(shared, text)
@@ -151,6 +177,7 @@ pub fn try_create_java_string_from_units(shared: &SharedVm, units: &[u16]) -> Op
 /// Performs no pool lookup or insertion — callers decide pooling policy.
 fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
     if shared
+        .classes
         .compact_strings
         .load(std::sync::atomic::Ordering::Relaxed)
         && text.is_ascii()
@@ -205,6 +232,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
     // restoring full parallelism. The write lock is reserved for the genuine
     // cache-miss / first-resolution path below.
     let cached = shared
+        .classes
         .cached_string_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     // Every dynamic compact String reaches this function. After first
@@ -226,6 +254,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
             }
             _ => {
                 let resolved = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_loaded_class_id("java/lang/String")
@@ -244,7 +273,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
         None => {
             // Slow path: first resolution (or read-probe miss). Take the write
             // lock to load the class and compute + cache the field count.
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id = cm.load_class("java/lang/String").unwrap_or(ClassId::new(0));
             let count = if cached != 0 {
                 cached
@@ -266,6 +295,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
                 // Safety net: never allocate zero fields
                 let c = if c == 0 { STRING_NUM_FIELDS_DEFAULT } else { c };
                 shared
+                    .classes
                     .cached_string_num_fields
                     .store(c, std::sync::atomic::Ordering::Relaxed);
                 c
@@ -284,18 +314,21 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
 fn try_alloc_java_string_object_from_ascii(shared: &SharedVm, ascii: &[u8]) -> Option<ObjectRef> {
     debug_assert!(ascii.is_ascii());
     debug_assert!(shared
+        .classes
         .compact_strings
         .load(std::sync::atomic::Ordering::Relaxed));
     let (string_class_id, field_count) = java_string_allocation_layout(shared);
     let str_obj = shared
+        .mem
         .heap
         .try_alloc_object_full(string_class_id, field_count)?;
-    let byte_array =
-        shared
-            .heap
-            .try_alloc_array_full(ClassId::new(0), ArrayElementType::Byte, ascii.len())?;
+    let byte_array = shared.mem.heap.try_alloc_array_full(
+        ClassId::new(0),
+        ArrayElementType::Byte,
+        ascii.len(),
+    )?;
     if !ascii.is_empty() {
-        match shared.heap.array_data_ptr(byte_array) {
+        match shared.mem.heap.array_data_ptr(byte_array) {
             Some(base) => unsafe {
                 cratonvm_gc::heap::cell_watch_check(
                     base as usize,
@@ -308,6 +341,7 @@ fn try_alloc_java_string_object_from_ascii(shared: &SharedVm, ascii: &[u8]) -> O
             None => {
                 for (i, &byte) in ascii.iter().enumerate() {
                     if shared
+                        .mem
                         .heap
                         .set_array_element(byte_array, i, Value::Int(byte as i32))
                         .is_err()
@@ -319,11 +353,15 @@ fn try_alloc_java_string_object_from_ascii(shared: &SharedVm, ascii: &[u8]) -> O
         }
     }
     shared
+        .mem
         .heap
         .set_field(str_obj, 0, Value::Object(Some(byte_array)));
-    shared.heap.set_field(str_obj, 1, Value::Int(CODER_LATIN1));
-    shared.heap.set_field(str_obj, 2, Value::Int(0));
-    shared.heap.set_field(str_obj, 3, Value::Int(0));
+    shared
+        .mem
+        .heap
+        .set_field(str_obj, 1, Value::Int(CODER_LATIN1));
+    shared.mem.heap.set_field(str_obj, 2, Value::Int(0));
+    shared.mem.heap.set_field(str_obj, 3, Value::Int(0));
     Some(str_obj)
 }
 
@@ -333,6 +371,7 @@ fn try_alloc_java_string_object_from_ascii(shared: &SharedVm, ascii: &[u8]) -> O
 fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> Option<ObjectRef> {
     let (string_class_id, field_count) = java_string_allocation_layout(shared);
     let str_obj = shared
+        .mem
         .heap
         .try_alloc_object_full(string_class_id, field_count)?;
 
@@ -365,6 +404,7 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
 /// string-creation call sites that use the aborting `alloc_*` wrappers.
 pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units: &[u16]) -> bool {
     let compact = shared
+        .classes
         .compact_strings
         .load(std::sync::atomic::Ordering::Relaxed);
 
@@ -376,7 +416,7 @@ pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units:
         // Field 3: boolean hashIsZero (false)
         if units.iter().all(|&u| u <= 0xFF) {
             // LATIN1: one byte per char
-            let byte_array = match shared.heap.try_alloc_array_full(
+            let byte_array = match shared.mem.heap.try_alloc_array_full(
                 ClassId::new(0),
                 ArrayElementType::Byte,
                 units.len(),
@@ -385,15 +425,21 @@ pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units:
                 None => return false,
             };
             for (i, &u) in units.iter().enumerate() {
-                let _ = shared
-                    .heap
-                    .set_array_element(byte_array, i, Value::Int((u & 0xFF) as i32));
+                let _ =
+                    shared
+                        .mem
+                        .heap
+                        .set_array_element(byte_array, i, Value::Int((u & 0xFF) as i32));
             }
             shared
+                .mem
                 .heap
                 .set_field(str_obj, 0, Value::Object(Some(byte_array)));
             // write_barrier fires automatically inside set_field
-            shared.heap.set_field(str_obj, 1, Value::Int(CODER_LATIN1));
+            shared
+                .mem
+                .heap
+                .set_field(str_obj, 1, Value::Int(CODER_LATIN1));
         } else {
             // UTF16: two bytes per char. HotSpot's `StringUTF16` stores each
             // char in the host's native byte order — `StringUTF16.isBigEndian()`
@@ -405,7 +451,7 @@ pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units:
             // byte-swaps every non-LATIN-1 char and corrupts e.g.
             // `CharacterData00`'s packed lookup tables.
             let byte_len = units.len() * 2;
-            let byte_array = match shared.heap.try_alloc_array_full(
+            let byte_array = match shared.mem.heap.try_alloc_array_full(
                 ClassId::new(0),
                 ArrayElementType::Byte,
                 byte_len,
@@ -418,25 +464,32 @@ pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units:
                 let lo = (unit & 0xFF) as u8;
                 let hi = (unit >> 8) as u8;
                 let _ = shared
+                    .mem
                     .heap
                     .set_array_element(byte_array, i * 2, Value::Int(lo as i32));
-                let _ = shared
-                    .heap
-                    .set_array_element(byte_array, i * 2 + 1, Value::Int(hi as i32));
+                let _ =
+                    shared
+                        .mem
+                        .heap
+                        .set_array_element(byte_array, i * 2 + 1, Value::Int(hi as i32));
             }
             shared
+                .mem
                 .heap
                 .set_field(str_obj, 0, Value::Object(Some(byte_array)));
             // write_barrier fires automatically inside set_field
-            shared.heap.set_field(str_obj, 1, Value::Int(CODER_UTF16));
+            shared
+                .mem
+                .heap
+                .set_field(str_obj, 1, Value::Int(CODER_UTF16));
         }
-        shared.heap.set_field(str_obj, 2, Value::Int(0)); // hash
-        shared.heap.set_field(str_obj, 3, Value::Int(0)); // hashIsZero
+        shared.mem.heap.set_field(str_obj, 2, Value::Int(0)); // hash
+        shared.mem.heap.set_field(str_obj, 3, Value::Int(0)); // hashIsZero
     } else {
         // ---- Legacy / synthetic layout ----
         // Field 0: char[] value (UTF-16)
         // Field 1: int hash
-        let char_array = match shared.heap.try_alloc_array_full(
+        let char_array = match shared.mem.heap.try_alloc_array_full(
             ClassId::new(0),
             ArrayElementType::Char,
             units.len(),
@@ -446,14 +499,16 @@ pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units:
         };
         for (i, &ch) in units.iter().enumerate() {
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(char_array, i, Value::Int(ch as i32));
         }
         shared
+            .mem
             .heap
             .set_field(str_obj, 0, Value::Object(Some(char_array)));
         // write_barrier fires automatically inside set_field
-        shared.heap.set_field(str_obj, 1, Value::Int(0));
+        shared.mem.heap.set_field(str_obj, 1, Value::Int(0));
     }
 
     true
@@ -658,10 +713,15 @@ fn read_java_string_inner(
 const CLASS_MIRROR_NUM_FIELDS: usize = 2;
 
 /// Look up the ClassId backing a java.lang.Class mirror via the reverse
-/// map in `SharedVm.class_mirrors_reverse`.  Returns `None` for primitive
+/// map in `SharedVm.classes.class_mirrors_reverse`.  Returns `None` for primitive
 /// mirrors and for non-mirror objects.
 pub fn class_id_from_mirror(shared: &SharedVm, mirror: ObjectRef) -> Option<ClassId> {
-    shared.class_mirrors_reverse.read().get(&mirror).copied()
+    shared
+        .classes
+        .class_mirrors_reverse
+        .read()
+        .get(&mirror)
+        .copied()
 }
 
 /// Absolute heap-slot indices of the `java/lang/Class` instance fields that
@@ -762,16 +822,16 @@ fn resolve_class_mirror_slots(
 /// Whether the `CRATONVM_DBG_TOARRAY` diagnostic is enabled.
 ///
 /// Resolved once from the environment and cached for the process lifetime,
-/// so the class-mirror hot path does not pay a per-call `std::env::var`
+/// so the class-mirror hot path does not pay a per-call `cratonvm_types::flags::runtime_var`
 /// (String allocation + global env-mutex acquisition) on every lookup.
 fn dbg_toarray_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CRATONVM_DBG_TOARRAY").is_ok())
+    *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok())
 }
 
 /// Get or create a java.lang.Class mirror object for the given ClassId.
 ///
-/// Class mirrors are cached in `SharedVm.class_mirrors` to ensure identity:
+/// Class mirrors are cached in `SharedVm.classes.class_mirrors` to ensure identity:
 /// `a.getClass() == a.getClass()` is always true.
 ///
 /// Layout: the mirror is sized to the real `java/lang/Class` class
@@ -783,18 +843,19 @@ fn dbg_toarray_enabled() -> bool {
 /// [`resolve_class_mirror_slots`]) so the mirror stays correct regardless of the
 /// JDK's private field order.
 ///
-/// The class_id ↔ mirror mapping is maintained by `SharedVm.class_mirrors`
-/// (forward) and `SharedVm.class_mirrors_reverse` (reverse), which lets
+/// The class_id ↔ mirror mapping is maintained by `SharedVm.classes.class_mirrors`
+/// (forward) and `SharedVm.classes.class_mirrors_reverse` (reverse), which lets
 /// `mirror_class_id` recover the ClassId without encoding it in the mirror's
 /// Java-visible fields.
 pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> ObjectRef {
     // PERF: read the CRATONVM_DBG_TOARRAY flag once, not on every mirror
-    // lookup. `std::env::var` allocates a String and touches a global env
+    // lookup. `cratonvm_types::flags::runtime_var` allocates a String and touches a global env
     // mutex on every call; this runs on the class-mirror hot path. Cache the
     // resolved bool in a process-wide OnceLock (the env var is fixed for the
     // process lifetime).
     if dbg_toarray_enabled() {
         let nm = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -805,12 +866,12 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
         );
     }
     // Fast path: check cache
-    if let Some(&mirror) = shared.class_mirrors.read().get(&class_id) {
+    if let Some(&mirror) = shared.classes.class_mirrors.read().get(&class_id) {
         return mirror;
     }
 
     // Slow path: create new mirror
-    let mut mirrors = shared.class_mirrors.write();
+    let mut mirrors = shared.classes.class_mirrors.write();
     // Double-check after acquiring write lock
     if let Some(&mirror) = mirrors.get(&class_id) {
         return mirror;
@@ -818,10 +879,11 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
 
     // Load java/lang/Class and resolve field count (cached after first call).
     let cached = shared
+        .classes
         .cached_class_mirror_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     let (class_class_id, mirror_field_count) = {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.load_class("java/lang/Class").unwrap_or(ClassId::new(0));
         let count = if cached != 0 {
             cached
@@ -838,6 +900,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
                 .unwrap_or(CLASS_MIRROR_NUM_FIELDS);
             let c = if c == 0 { CLASS_MIRROR_NUM_FIELDS } else { c };
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .store(c, std::sync::atomic::Ordering::Relaxed);
             c
@@ -845,7 +908,10 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
         (id, count)
     };
 
-    let mirror = shared.heap.alloc_object(class_class_id, mirror_field_count);
+    let mirror = shared
+        .mem
+        .heap
+        .alloc_object(class_class_id, mirror_field_count);
 
     // Populate the `java.lang.Class` mirror. The JDK lays out `Class`'s private
     // instance fields (`name`, `modifiers`, `primitive`, `classRedefinedCount`,
@@ -857,7 +923,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // value differs from that default — and only when the field is present in
     // the loaded layout (synthetic stubs resolve nothing).
     let (class_name, access_flags, slots) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let name = cm
             .get_class(class_id)
             .map(|c| c.name.to_string())
@@ -884,6 +950,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // as an invalid reference (effectively null) — safe because the field is
     // always read under an `if (cachedConstructor == null)` guard.
     shared
+        .mem
         .heap
         .set_field(mirror, 0, Value::Int(class_id.as_u32() as i32));
 
@@ -891,28 +958,30 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     if let Some(idx) = slots.name {
         let name_obj = create_java_string(shared, &class_name);
         shared
+            .mem
             .heap
             .set_field(mirror, idx, Value::Object(Some(name_obj)));
     }
     // modifiers → access flags as int.
     if let Some(idx) = slots.modifiers {
         shared
+            .mem
             .heap
             .set_field(mirror, idx, Value::Int(access_flags as i32));
     }
     // primitive → false (0) for regular class mirrors.
     if let Some(idx) = slots.primitive {
-        shared.heap.set_field(mirror, idx, Value::Int(0));
+        shared.mem.heap.set_field(mirror, idx, Value::Int(0));
     }
     // reflectionData → null (SoftReference<ReflectionData>); already the heap
     // default, but set explicitly to document the contract.
     if let Some(idx) = slots.reflection_data {
-        shared.heap.set_field(mirror, idx, Value::Object(None));
+        shared.mem.heap.set_field(mirror, idx, Value::Object(None));
     }
     // classRedefinedCount → 0 (critical for Class.reflectionData(), which reads
     // it directly via bytecode).
     if let Some(idx) = slots.class_redefined_count {
-        shared.heap.set_field(mirror, idx, Value::Int(0));
+        shared.mem.heap.set_field(mirror, idx, Value::Int(0));
     }
     // A live Class mirror must keep its defining user loader live. Without
     // this real heap edge, the loader-unload pass can prune the side-table
@@ -924,6 +993,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
         cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32()),
     ) {
         shared
+            .mem
             .heap
             .set_field(mirror, idx, Value::Object(Some(loader)));
     }
@@ -931,6 +1001,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     mirrors.insert(class_id, mirror);
     // Reverse map for mirror_class_id (`class_id_from_mirror`).
     shared
+        .classes
         .class_mirrors_reverse
         .write()
         .insert(mirror, class_id);
@@ -951,8 +1022,9 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     if let Some(loader) =
         cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
     {
-        if std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
             let name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -983,12 +1055,12 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     let prim_name = canonical_primitive_mirror_name(prim_name);
 
     // Fast path: check cache
-    if let Some(&mirror) = shared.primitive_mirrors.read().get(prim_name) {
+    if let Some(&mirror) = shared.classes.primitive_mirrors.read().get(prim_name) {
         return mirror;
     }
 
     // Slow path
-    let mut mirrors = shared.primitive_mirrors.write();
+    let mut mirrors = shared.classes.primitive_mirrors.write();
     if let Some(&mirror) = mirrors.get(prim_name) {
         return mirror;
     }
@@ -998,10 +1070,11 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // allocated with the correct number of fields when running against
     // real JDK classes. Falls back to CLASS_MIRROR_NUM_FIELDS for synthetic mode.
     let cached = shared
+        .classes
         .cached_class_mirror_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     let (class_class_id, mirror_field_count) = {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.load_class("java/lang/Class").unwrap_or(ClassId::new(0));
         let count = if cached != 0 {
             cached
@@ -1018,6 +1091,7 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
                 .unwrap_or(CLASS_MIRROR_NUM_FIELDS);
             let c = if c == 0 { CLASS_MIRROR_NUM_FIELDS } else { c };
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .store(c, std::sync::atomic::Ordering::Relaxed);
             c
@@ -1025,12 +1099,15 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
         (id, count)
     };
 
-    let mirror = shared.heap.alloc_object(class_class_id, mirror_field_count);
+    let mirror = shared
+        .mem
+        .heap
+        .alloc_object(class_class_id, mirror_field_count);
 
     // Resolve the writable `java/lang/Class` mirror slots by name (see
     // `get_or_create_class_mirror` for why this is layout-independent).
     let slots = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(class_class_id)
             .map(|c| resolve_class_mirror_slots(c, mirror_field_count))
             .unwrap_or_default()
@@ -1038,22 +1115,23 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
 
     // Slot 0: Int(-1) marks this as a primitive Class mirror (legacy
     // VM-internal convention, not a JDK field — fixed slot).
-    shared.heap.set_field(mirror, 0, Value::Int(-1));
+    shared.mem.heap.set_field(mirror, 0, Value::Int(-1));
 
     // name → primitive type name as String.
     if let Some(idx) = slots.name {
         let name_obj = create_java_string(shared, prim_name);
         shared
+            .mem
             .heap
             .set_field(mirror, idx, Value::Object(Some(name_obj)));
     }
     // primitive → true (1): this IS a primitive mirror.
     if let Some(idx) = slots.primitive {
-        shared.heap.set_field(mirror, idx, Value::Int(1));
+        shared.mem.heap.set_field(mirror, idx, Value::Int(1));
     }
     // classRedefinedCount → 0.
     if let Some(idx) = slots.class_redefined_count {
-        shared.heap.set_field(mirror, idx, Value::Int(0));
+        shared.mem.heap.set_field(mirror, idx, Value::Int(0));
     }
 
     mirrors.insert(prim_name.to_string(), mirror);
@@ -1082,6 +1160,7 @@ fn canonical_primitive_mirror_name(name: &str) -> &str {
 /// Get a static field value from the shared state.
 pub fn get_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usize) -> Value {
     shared
+        .classes
         .statics
         .read()
         .get(&class_id)
@@ -1092,12 +1171,13 @@ pub fn get_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
 
 /// Set a static field value in the shared state.
 pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usize, value: Value) {
-    let mut statics = shared.statics.write();
+    let mut statics = shared.classes.statics.write();
     let fields = statics.entry(class_id).or_insert_with(|| {
         // Reading class_manager while holding statics write is fine because
         // class_manager read is non-exclusive, and no code path holds
         // class_manager write while trying to acquire statics.
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -1121,7 +1201,7 @@ pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
     // referent → cleanup frees a live region (hidden-pointer SATB hole).
     // `satb_barrier` is a cheap no-op when no marking cycle is active.
     if let Value::Object(Some(_)) = fields[field_index] {
-        shared.heap.satb_barrier(fields[field_index]);
+        shared.mem.heap.satb_barrier(fields[field_index]);
     }
     fields[field_index] = value;
 }
@@ -1143,10 +1223,10 @@ pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
 ///   - LATIN1 = 0 (field "LATIN1")
 ///   - UTF16 = 1 (field "UTF16")
 ///
-/// Also sets `SharedVm.compact_strings` flag so `create_java_string` and
+/// Also sets `SharedVm.classes.compact_strings` flag so `create_java_string` and
 /// `read_java_string` use the correct layout.
 pub fn pre_init_string_statics(shared: &SharedVm) {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let string_id = match cm.get_loaded_class_id("java/lang/String") {
         Some(id) => id,
         None => return, // String not loaded yet
@@ -1192,6 +1272,7 @@ pub fn pre_init_string_statics(shared: &SharedVm) {
 
     // Enable compact string mode in the VM
     shared
+        .classes
         .compact_strings
         .store(true, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
@@ -1206,7 +1287,7 @@ pub fn pre_init_string_statics(shared: &SharedVm) {
 /// static fields, we pre-set:
 ///   - EMPTY_CLASS_ARRAY = new Class[0] (so Class.getInterfaces() etc. work)
 pub fn pre_init_class_statics(shared: &SharedVm) {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id("java/lang/Class") {
         Some(id) => id,
         None => return,
@@ -1235,6 +1316,7 @@ pub fn pre_init_class_statics(shared: &SharedVm) {
     // Pre-set EMPTY_CLASS_ARRAY to an empty Class[] array
     if let Some(idx) = empty_class_array_idx {
         let empty_array = shared
+            .mem
             .heap
             .alloc_array(class_id, ArrayElementType::Reference, 0);
         set_static_shared(shared, class_id, idx, Value::Object(Some(empty_array)));
@@ -1290,7 +1372,7 @@ fn wrapper_type_static_index(class: &crate::classloading::Class) -> Option<usize
 /// This helper repairs that already-initialized path and is idempotent.
 pub fn pre_init_wrapper_type_field_for_class(shared: &SharedVm, class_id: ClassId) -> bool {
     let (type_idx, prim_name) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let Some(cls) = cm.get_class(class_id) else {
             return false;
         };
@@ -1317,7 +1399,7 @@ pub fn pre_init_wrapper_type_field_for_class(shared: &SharedVm, class_id: ClassI
 
 pub fn pre_init_wrapper_type_fields(shared: &SharedVm) {
     let class_ids: Vec<ClassId> = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         [
             "java/lang/Integer",
             "java/lang/Long",
@@ -1422,7 +1504,7 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
     let mut covered = Vec::new();
     let mut missing = Vec::new();
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     // Iterate over all loaded classes in the ClassStore
     for class_id_u32 in 0..cm.class_store.len() as u32 {
         let class_id = ClassId::new(class_id_u32);
@@ -1444,6 +1526,7 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
                 descriptor: method.descriptor.to_string(),
             };
             if shared
+                .natives
                 .native_methods
                 .find(&class.name, &method.name, &method.descriptor)
                 .is_some()
@@ -1462,7 +1545,7 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
 
 /// Scan a single class for its ACC_NATIVE methods.
 pub fn scan_class_natives(shared: &SharedVm, class_name: &str) -> Vec<NativeMethodInfo> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
         Some(id) => id,
         None => return Vec::new(),
@@ -1561,7 +1644,7 @@ mod tests {
     fn create_and_read_string() {
         let shared = test_shared();
         let obj = create_java_string(&shared, "Hello");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some("Hello".to_string()));
     }
 
@@ -1569,7 +1652,7 @@ mod tests {
     fn create_empty_string() {
         let shared = test_shared();
         let obj = create_java_string(&shared, "");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some(String::new()));
     }
 
@@ -1577,7 +1660,7 @@ mod tests {
     fn create_unicode_string() {
         let shared = test_shared();
         let obj = create_java_string(&shared, "\u{1F600} emoji");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some("\u{1F600} emoji".to_string()));
     }
 
@@ -1601,18 +1684,18 @@ mod tests {
     fn read_string_non_string_object() {
         let shared = test_shared();
         // Create a plain object (not a string -- field 0 is not an array)
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(obj, 0, Value::Int(0));
-        let result = read_java_string(&shared.heap, obj);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(obj, 0, Value::Int(0));
+        let result = read_java_string(&shared.mem.heap, obj);
         assert!(result.is_none());
     }
 
     #[test]
     fn read_string_null_value_field() {
         let shared = test_shared();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(obj, 0, Value::Object(None));
-        let result = read_java_string(&shared.heap, obj);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(obj, 0, Value::Object(None));
+        let result = read_java_string(&shared.mem.heap, obj);
         assert!(result.is_none());
     }
 
@@ -1625,16 +1708,18 @@ mod tests {
         let shared = test_shared();
         // Enable compact string mode
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // Reset cached field count so it re-resolves (synthetic stub → 2 fields,
         // but we need 4 for compact layout). Manually set to 4.
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
         let obj = create_java_string(&shared, "Hello");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some("Hello".to_string()));
     }
 
@@ -1642,14 +1727,16 @@ mod tests {
     fn compact_string_utf16_roundtrip() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
         let obj = create_java_string(&shared, "\u{1F600} emoji");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some("\u{1F600} emoji".to_string()));
     }
 
@@ -1657,14 +1744,16 @@ mod tests {
     fn compact_string_empty_roundtrip() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
         let obj = create_java_string(&shared, "");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some(String::new()));
     }
 
@@ -1672,15 +1761,17 @@ mod tests {
     fn compact_string_latin1_boundary() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
         // Latin-1 boundary: U+00FF (ÿ) is the last Latin-1 char
         let obj = create_java_string(&shared, "café\u{00FF}");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some("café\u{00FF}".to_string()));
     }
 
@@ -1688,15 +1779,17 @@ mod tests {
     fn compact_string_beyond_latin1() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
         // U+0100 (Ā) is beyond Latin-1 → must use UTF16 coder
         let obj = create_java_string(&shared, "Hello\u{0100}World");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some("Hello\u{0100}World".to_string()));
     }
 
@@ -1704,9 +1797,11 @@ mod tests {
     fn compact_string_pool_deduplicates() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1719,9 +1814,11 @@ mod tests {
     fn compact_ascii_uninterned_strings_are_fresh_and_roundtrip() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1729,11 +1826,11 @@ mod tests {
         let obj2 = create_java_string_uninterned(&shared, "5888890");
         assert_ne!(obj1.as_ptr(), obj2.as_ptr());
         assert_eq!(
-            read_java_string(&shared.heap, obj1),
+            read_java_string(&shared.mem.heap, obj1),
             Some("5888890".to_string())
         );
         assert_eq!(
-            read_java_string(&shared.heap, obj2),
+            read_java_string(&shared.mem.heap, obj2),
             Some("5888890".to_string())
         );
     }
@@ -1746,10 +1843,14 @@ mod tests {
     /// dropped, matching the previous `len / 2` per-element loop).
     fn make_byte_array(shared: &SharedVm, bytes: &[u8]) -> ObjectRef {
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, bytes.len());
         for (i, &b) in bytes.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i32));
         }
         arr
     }
@@ -1761,21 +1862,21 @@ mod tests {
         // LATIN1: one byte per char, U+0000..U+00FF map directly.
         let latin1 = make_byte_array(&shared, &[b'H', b'i', 0xFF]);
         assert_eq!(
-            decode_java_string_value_array(&shared.heap, latin1, CODER_LATIN1),
+            decode_java_string_value_array(&shared.mem.heap, latin1, CODER_LATIN1),
             Some("Hi\u{00FF}".to_string())
         );
 
         // UTF16 little-endian: low byte at even index. "Ā" = U+0100 → [0x00,0x01].
         let utf16 = make_byte_array(&shared, &[b'A', 0x00, 0x00, 0x01]);
         assert_eq!(
-            decode_java_string_value_array(&shared.heap, utf16, CODER_UTF16),
+            decode_java_string_value_array(&shared.mem.heap, utf16, CODER_UTF16),
             Some("A\u{0100}".to_string())
         );
 
         // Empty byte[] decodes to the empty string under either coder.
         let empty = make_byte_array(&shared, &[]);
         assert_eq!(
-            decode_java_string_value_array(&shared.heap, empty, CODER_LATIN1),
+            decode_java_string_value_array(&shared.mem.heap, empty, CODER_LATIN1),
             Some(String::new())
         );
 
@@ -1783,7 +1884,7 @@ mod tests {
         // as the previous `num_units = len / 2` per-element loop did.
         let odd = make_byte_array(&shared, &[b'A', 0x00, 0x42]);
         assert_eq!(
-            decode_java_string_value_array(&shared.heap, odd, CODER_UTF16),
+            decode_java_string_value_array(&shared.mem.heap, odd, CODER_UTF16),
             Some("A".to_string())
         );
     }
@@ -1799,28 +1900,32 @@ mod tests {
     #[test]
     fn read_string_returns_none_for_reference_array_field() {
         let shared = test_shared();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        let elem_a = shared.heap.alloc_object(ClassId::new(0), 0);
-        let elem_b = shared.heap.alloc_object(ClassId::new(0), 0);
-        let elem_c = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let elem_a = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let elem_b = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let elem_c = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(elem_a)))
             .unwrap();
         shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(elem_b)))
             .unwrap();
         shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(elem_c)))
             .unwrap();
-        shared.heap.set_field(obj, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(arr)));
         // Pre-fix this returned Some(garbage); post-fix must return None.
-        assert_eq!(read_java_string(&shared.heap, obj), None);
+        assert_eq!(read_java_string(&shared.mem.heap, obj), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1833,9 +1938,14 @@ mod tests {
         let class_id = ClassId::new(42);
         let mirror = get_or_create_class_mirror(&shared, class_id);
         // Field 0 still stores Int(class_id) for legacy compatibility.
-        assert_eq!(shared.heap.get_field(mirror, 0), Value::Int(42));
+        assert_eq!(shared.mem.heap.get_field(mirror, 0), Value::Int(42));
         // But class_id is also recoverable via the reverse map.
-        let recovered = shared.class_mirrors_reverse.read().get(&mirror).copied();
+        let recovered = shared
+            .classes
+            .class_mirrors_reverse
+            .read()
+            .get(&mirror)
+            .copied();
         assert_eq!(recovered, Some(class_id));
     }
 
@@ -1862,10 +1972,10 @@ mod tests {
         let class_id = ClassId::new(999); // non-existent class
         let mirror = get_or_create_class_mirror(&shared, class_id);
         // Field 1 should contain a name string
-        let name_val = shared.heap.get_field(mirror, 1);
+        let name_val = shared.mem.heap.get_field(mirror, 1);
         match name_val {
             Value::Object(Some(name_ref)) => {
-                let name = read_java_string(&shared.heap, name_ref);
+                let name = read_java_string(&shared.mem.heap, name_ref);
                 // For unknown class, falls back to "unknown_999"
                 assert!(name.is_some());
                 assert!(name.unwrap().contains("999"));
@@ -1889,12 +1999,12 @@ mod tests {
         // `classRedefinedCount` at slot 12. Reaching this line at all proves
         // the slot gate kept those writes in bounds (an ungated write would
         // have panicked in `set_field`).
-        let n = shared.heap.num_fields(mirror);
+        let n = shared.mem.heap.num_fields(mirror);
         assert!(n >= CLASS_MIRROR_NUM_FIELDS);
         // Slot 0 holds the class id; the legacy name slot (1) holds the name.
-        assert_eq!(shared.heap.get_field(mirror, 0), Value::Int(123));
+        assert_eq!(shared.mem.heap.get_field(mirror, 0), Value::Int(123));
         assert!(matches!(
-            shared.heap.get_field(mirror, LEGACY_NAME_SLOT),
+            shared.mem.heap.get_field(mirror, LEGACY_NAME_SLOT),
             Value::Object(Some(_))
         ));
     }
@@ -1908,12 +2018,12 @@ mod tests {
         let shared = test_shared();
         let mirror = get_or_create_primitive_mirror(&shared, "int");
         // Field 0 = Int(-1) marker for primitive mirrors.
-        assert_eq!(shared.heap.get_field(mirror, 0), Value::Int(-1));
+        assert_eq!(shared.mem.heap.get_field(mirror, 0), Value::Int(-1));
         // Field 1 should be "int" string
-        let name_val = shared.heap.get_field(mirror, 1);
+        let name_val = shared.mem.heap.get_field(mirror, 1);
         match name_val {
             Value::Object(Some(name_ref)) => {
-                let name = read_java_string(&shared.heap, name_ref);
+                let name = read_java_string(&shared.mem.heap, name_ref);
                 assert_eq!(name, Some("int".to_string()));
             }
             _ => panic!("Expected name string in field 1"),

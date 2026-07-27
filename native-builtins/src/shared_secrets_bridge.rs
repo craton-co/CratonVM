@@ -1749,7 +1749,7 @@ fn jnio_new_direct_byte_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     let addr = args.get(1).cloned().unwrap_or(Value::Long(0));
     let cap = args.get(2).cloned().unwrap_or(Value::Int(0));
     let att = args.get(3).cloned().unwrap_or(Value::Object(None));
-    if std::env::var_os("CRATONVM_DBG_NET").is_some() {
+    if crate::vmflags().io.dbg_net {
         eprintln!("[NET] newDirectByteBuffer addr={:?} cap={:?}", addr, cap);
     }
     ctx.new_object_initialized(
@@ -2298,6 +2298,8 @@ pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

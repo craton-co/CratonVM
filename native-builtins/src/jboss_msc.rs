@@ -2593,19 +2593,13 @@ pub fn gc_update_msc_service_refs(pointer_map: &std::collections::HashMap<usize,
 /// Cached check of the real-MSC mode. It is the production default; accept a
 /// conventional false value only as a diagnostic escape hatch.
 fn msc_real_start_enabled() -> bool {
-    static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| {
-        !matches!(
-            std::env::var("CRATONVM_MSC_REAL_START"),
-            Ok(value) if matches!(value.as_str(), "0" | "false" | "FALSE" | "off" | "OFF")
-        )
-    })
+    crate::nbflags().msc_real_start
 }
 
 /// Cached check of the `CRATONVM_DBG_MSC` trace flag.
 fn msc_dbg() -> bool {
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var_os("CRATONVM_DBG_MSC").is_some())
+    *F.get_or_init(|| crate::nbflags().dbg_msc)
 }
 
 thread_local! {
@@ -4367,7 +4361,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
 /// honoured. Any failure (no class, empty loader, provider <init> error) yields
 /// `None` and the safe JDK fallback.
 fn jboss_logging_serviceloader_provider(ctx: &mut dyn NativeContext) -> Option<Value> {
-    let dbg = std::env::var_os("CRATONVM_DBG_LOGPROV").is_some();
+    let dbg = crate::nbflags().dbg_logprov;
     if dbg {
         eprintln!("[LOGPROV] findProvider serviceloader called");
     }
@@ -4505,6 +4499,8 @@ fn native_construct_message_logger(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

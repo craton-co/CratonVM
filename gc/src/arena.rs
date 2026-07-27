@@ -16,6 +16,7 @@
 /// allocator satisfy requests from holes *below* the cursor without
 /// relocating any survivor (which is what makes the collection
 /// JIT-frame-safe — see `gen_heap::sweep_young_non_moving`).
+use crate::gc_flags;
 #[derive(Debug, Clone, Copy)]
 pub struct FreeBlock {
     /// Byte offset from the start of the backing buffer.
@@ -42,13 +43,79 @@ pub struct FreeBlock {
 /// (holes are node-sized) and chunk-sized requests consult ONLY the short
 /// span list. 4 KiB sits far above any normal object (72 B nodes) and far
 /// below the minimum TLAB refill (16 KiB+).
+///
+/// The boundary now also separates two DIFFERENT structures, not just two
+/// lists: below it, exact 8-byte size classes plus an occupancy bitmap (see
+/// [`Arena::free_small`]); at or above it, a short first-fit span list.
 const LARGE_BLOCK_MIN: usize = 4096;
 
-/// Per-allocation scan budget for the small-hole tier — see
-/// [`Arena::first_fit`]. 16 keeps the uniform-hole case (hit at ~index 0)
-/// untouched while capping the dust-prefix walk at a handful of compares;
-/// a miss falls through to the bump tail / caller's old-gen spill.
-const SMALL_TIER_SCAN_BUDGET: usize = 16;
+/// `log2` of the small tier's size-class granularity. The whole heap runs on
+/// an 8-byte object grid (`Arena::alloc` rounds every request up to 8, the
+/// sweep only ever publishes 8-aligned spans), so one class per 8 bytes gives
+/// the small tier EXACT size classes with no rounding loss.
+const SMALL_GRAIN_SHIFT: u32 = 3;
+
+/// Small-tier size-class granularity (8 bytes).
+const SMALL_GRAIN: usize = 1 << SMALL_GRAIN_SHIFT;
+
+/// Number of small-tier size classes: every size below [`LARGE_BLOCK_MIN`],
+/// one class per [`SMALL_GRAIN`] bytes (512 classes).
+const SMALL_BUCKETS: usize = LARGE_BLOCK_MIN >> SMALL_GRAIN_SHIFT;
+
+/// `u64` words in the small-tier occupancy bitmap (512 buckets → 8 words).
+const SMALL_MASK_WORDS: usize = SMALL_BUCKETS / 64;
+
+/// Size class for a small block: bucket `k` holds every block whose size is
+/// in `[k * SMALL_GRAIN, (k + 1) * SMALL_GRAIN)`. Indexing by the FLOOR means
+/// every block in bucket `k` is guaranteed to be at least `k * SMALL_GRAIN`
+/// bytes — that guarantee is what makes the escalating search in
+/// [`Arena::small_fit`] sound without re-reading block sizes.
+#[inline]
+fn small_bucket_for(size: usize) -> usize {
+    (size >> SMALL_GRAIN_SHIFT).min(SMALL_BUCKETS - 1)
+}
+
+#[inline]
+fn mask_set(mask: &mut [u64; SMALL_MASK_WORDS], k: usize) {
+    mask[k >> 6] |= 1u64 << (k & 63);
+}
+
+#[inline]
+fn mask_clear(mask: &mut [u64; SMALL_MASK_WORDS], k: usize) {
+    mask[k >> 6] &= !(1u64 << (k & 63));
+}
+
+/// Lowest occupied bucket index `>= from`, or `None`.
+#[inline]
+fn mask_first_from(mask: &[u64; SMALL_MASK_WORDS], from: usize) -> Option<usize> {
+    if from >= SMALL_BUCKETS {
+        return None;
+    }
+    let mut w = from >> 6;
+    // `from & 63` is in 0..=63, so the shift never overflows.
+    let mut word = mask[w] & (!0u64 << (from & 63));
+    loop {
+        if word != 0 {
+            return Some((w << 6) | word.trailing_zeros() as usize);
+        }
+        w += 1;
+        if w >= SMALL_MASK_WORDS {
+            return None;
+        }
+        word = mask[w];
+    }
+}
+
+/// Highest occupied bucket index, or `None` when the small tier is empty.
+#[inline]
+fn mask_last(mask: &[u64; SMALL_MASK_WORDS]) -> Option<usize> {
+    for w in (0..SMALL_MASK_WORDS).rev() {
+        if mask[w] != 0 {
+            return Some((w << 6) | (63 - mask[w].leading_zeros() as usize));
+        }
+    }
+    None
+}
 
 pub struct Arena {
     /// Backing storage. Pre-allocated to `capacity` bytes.
@@ -56,9 +123,34 @@ pub struct Arena {
     /// Next free byte offset within `data` (bump-allocation high-water mark).
     cursor: usize,
     /// Reclaimed regions below `cursor` SMALLER than [`LARGE_BLOCK_MIN`],
-    /// produced by the non-moving sweep (typically object-sized holes).
+    /// produced by the non-moving sweep (typically object-sized holes),
+    /// **segregated by exact 8-byte size class** ([`small_bucket_for`]).
     /// Empty unless a JIT-frame-safe mark-sweep has run.
-    free_small: Vec<FreeBlock>,
+    ///
+    /// WHY SEGREGATED (perf/gc-allocation-fastpath, 2026-07-26). This tier was
+    /// a single flat `Vec` walked first-fit with a 16-block scan budget. Under
+    /// the non-moving sweep — the collector that actually runs in steady state
+    /// — `swap_remove` back-fills the scan prefix with freshly split "dust",
+    /// so a same-shaped request stopped first-fitting at index 0 and the
+    /// bounded scan started missing satisfiable blocks; the misses fell
+    /// through to the bump tail (gone, once the cursor pins at capacity) and
+    /// then to a full unbounded rescue scan. Worse, `largest_free_block` —
+    /// consulted by `gen_heap::refill_tlab`'s fragmentation fallback on every
+    /// mini-TLAB refill, i.e. once per ~85 objects in the degraded mode — was
+    /// an O(free-list) walk of exactly this list (measured live: 33 MB of
+    /// uniform 4080-byte remnants, ~8500 blocks, rescanned per refill).
+    ///
+    /// One bucket per 8-byte size class removes all three at once: a request
+    /// lands on its own class (exact fit, NO remainder, so the allocator stops
+    /// manufacturing dust), a miss escalates through a 512-bit occupancy
+    /// bitmap instead of a linear walk, and the largest-block query is the
+    /// bitmap's high bit.
+    free_small: Vec<Vec<FreeBlock>>,
+    /// Occupancy bitmap over [`Self::free_small`]: bit `k` set iff bucket `k`
+    /// is non-empty. Kept in lockstep at every push/pop so the "smallest
+    /// class that can serve this request" and "largest available block"
+    /// queries are a handful of word operations rather than a list walk.
+    small_mask: [u64; SMALL_MASK_WORDS],
     /// Reclaimed regions of at least [`LARGE_BLOCK_MIN`] bytes — the
     /// coalesced spans TLAB refills and array allocations carve from. Stays
     /// short (the post-sweep coalescer merges adjacent holes into a handful
@@ -83,9 +175,22 @@ pub struct Arena {
     /// * [`Self::clear_free_list`] / [`Self::reset`] / [`Self::reset_no_zero`]
     ///   zero it alongside the list.
     max_free_upper: usize,
+    /// Memoised EXACT maximum over [`Self::free_large`], or `None` when it
+    /// must be recomputed. Unlike [`Self::max_free_upper`] (a bound that may
+    /// over-estimate) this is the precise value [`Self::largest_free_block`]
+    /// owes its callers — `gen_heap::refill_tlab` sizes a mini-TLAB from it
+    /// and then *allocates* that many bytes, so an over-estimate turns into a
+    /// failed refill and an allocation wedge.
+    ///
+    /// Maintained rather than recomputed because the span tier is the only
+    /// part of the free list a scan still has to walk: a push can only raise
+    /// the maximum (folded in on the spot), and only consuming a block can
+    /// lower it (invalidates). `Cell` because the query takes `&self` —
+    /// `Arena` always lives inside a `Mutex`, which needs `Send`, not `Sync`.
+    large_max_exact: std::cell::Cell<Option<usize>>,
     /// Running total of bytes currently held across both free-list tiers,
     /// maintained incrementally at every mutation site (`push_block_routed`
-    /// adds a pushed block's size; `first_fit`'s consuming hit subtracts the
+    /// adds a pushed block's size; `small_fit`/`large_fit` subtract the
     /// whole consumed block's size before its remainder is re-routed;
     /// `clear_free_list` / `reset` / `reset_no_zero` zero it alongside the
     /// list). This replaced an epoch-gated cache (2026-07-15) that was only
@@ -97,6 +202,35 @@ pub struct Arena {
     /// sum incrementally instead of gating a from-scratch recompute makes
     /// `free_list_bytes()` unconditionally O(1), including under churn.
     free_bytes_total: usize,
+    /// perf/gc-oracle-anchors (2026-07-25): allocator-recorded object starts,
+    /// one per `1 << anchor_shift`-byte bucket of this arena. `usize::MAX`
+    /// means "nothing recorded in this bucket during the current epoch".
+    ///
+    /// WHY the allocator and not a GC-time walk. Both consumers of an "object
+    /// grid split point" — the parallel sweep's chunk anchors and the mark
+    /// oracle's exact-base lookup for CONSERVATIVE candidates — used to get
+    /// their split points from one sequential linear header chase over the
+    /// whole young arena (`report_phase("mark-oracle-walk")`), which on a
+    /// 2 GiB from-space measured 233–368 ms, the single largest young-GC
+    /// phase left after the sweep went parallel. But the allocator already
+    /// KNOWS every boundary it hands out; rediscovering them by chasing
+    /// `gen_object_total_size` over 36M objects is redundant work. Recording
+    /// them here costs a shift, a bounds-checked load, a compare and a
+    /// per-bucket-once store on the arena slow path (TLAB refill + non-TLAB
+    /// young object), all of which already hold this arena's lock.
+    ///
+    /// COVERAGE IS A HINT, NEVER A CORRECTNESS INPUT. The JIT's inline TLAB
+    /// fast path bumps a pointer without ever entering this file, so the
+    /// objects inside a TLAB are not individually recorded — only the TLAB's
+    /// start is (a TLAB is 256 KiB–1 MiB, see `tlab::DEFAULT_TLAB_SIZE`), and
+    /// regions holding survivors of an earlier collection are not re-recorded
+    /// at all. That is fine by construction: every consumer re-proves an
+    /// anchor by chaining to the next one, so a MISSING anchor only means a
+    /// longer chunk / a longer local walk, and a WRONG one only means the
+    /// chain fails to land and the caller falls back to its sequential path.
+    alloc_anchors: Vec<usize>,
+    /// `log2` of the anchor bucket width. See [`Arena::rearm_alloc_anchors`].
+    anchor_shift: u32,
 }
 
 /// Alignment tripwire (perf/halfgap residuals, 2026-07-18): every free-list
@@ -136,14 +270,101 @@ impl Arena {
         // We need the Vec to have length == capacity so we can
         // hand out pointers into it. We zero-initialize for safety.
         let data = vec![0u8; capacity];
-        Self {
+        let mut a = Self {
             data,
             cursor: 0,
-            free_small: Vec::new(),
+            free_small: (0..SMALL_BUCKETS).map(|_| Vec::new()).collect(),
+            small_mask: [0u64; SMALL_MASK_WORDS],
             free_large: Vec::new(),
             max_free_upper: 0,
+            large_max_exact: std::cell::Cell::new(Some(0)),
             free_bytes_total: 0,
+            alloc_anchors: Vec::new(),
+            anchor_shift: 0,
+        };
+        a.rearm_alloc_anchors();
+        a
+    }
+
+    /// (Re)size the allocator-anchor bucket table for the current capacity.
+    ///
+    /// Called from [`Arena::new`] and [`Arena::grow`] — the only two places
+    /// `data.len()` changes. Armed on EVERY arena rather than only the young
+    /// from-space so that the moving collector's `mem::swap` of from/to (and
+    /// the `Arena::new(0)` + `grow` reuse path in the major collector) cannot
+    /// hand out an un-armed arena; recording only happens where a caller
+    /// explicitly calls [`Arena::note_object_start`], so an unused table costs
+    /// nothing but its (bounded) allocation.
+    fn rearm_alloc_anchors(&mut self) {
+        const MAX_BUCKETS: usize = 1 << 16;
+        let cap = self.data.len().max(1);
+        // Bucket width. Deliberately NOT `sweep_anchor_stride()`: this table
+        // feeds the mark oracle's per-candidate local walk as well as the
+        // sweep's chunk split, and those want opposite things — the oracle
+        // wants the FINEST grid it can get (its walk is `O(bucket width)` per
+        // candidate cluster), the sweep wants ~one chunk per few MiB. So
+        // record fine here and let `sweep_young_non_moving` subsample down to
+        // the sweep stride. It also keeps the GC-stress knob
+        // `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` (legal down to 64 bytes) from
+        // sizing this table: at 64 bytes a 2 GiB arena would want 256 MB of
+        // buckets.
+        //
+        // 4 KiB is already finer than the smallest TLAB (`MIN_TLAB_SIZE`,
+        // 8 KiB), so the recording rate — not the bucket width — is what
+        // actually bounds anchor density; widening only kicks in to cap the
+        // table at MAX_BUCKETS (512 KiB of table on a 2 GiB from-space).
+        let mut shift = 12u32;
+        while (cap >> shift) >= MAX_BUCKETS {
+            shift += 1;
         }
+        self.anchor_shift = shift;
+        self.alloc_anchors = vec![usize::MAX; (cap >> shift) + 1];
+    }
+
+    /// Record `offset` as a VERIFIED object start (the allocator just handed
+    /// this exact offset out as the base of an object or of a TLAB, whose
+    /// first byte is an object base too — a TLAB is tail-filled at retire, so
+    /// it is object-covered end to end).
+    ///
+    /// One store per bucket per epoch; every later offset in the same bucket
+    /// is a load + compare + not-taken branch.
+    #[inline]
+    pub fn note_object_start(&mut self, offset: usize) {
+        if let Some(slot) = self.alloc_anchors.get_mut(offset >> self.anchor_shift) {
+            if *slot == usize::MAX {
+                *slot = offset;
+            }
+        }
+    }
+
+    /// Drain the epoch's anchors as a strictly-increasing offset list, leaving
+    /// the table empty for the next epoch.
+    ///
+    /// STRICTLY INCREASING BY CONSTRUCTION: bucket `i` only ever stores an
+    /// offset in `[i << shift, (i+1) << shift)`, so iterating buckets in order
+    /// yields offsets in order with no duplicates. Consumers rely on that (a
+    /// non-monotonic anchor list would make the sweep's chunk split invalid).
+    ///
+    /// DRAINING IS MANDATORY, NOT AN OPTIMISATION: an anchor describes the
+    /// object grid of the epoch that just ended. The collection about to run
+    /// reclaims dead spans into the free list, so an offset kept across it can
+    /// end up INSIDE a free block, where a chunk walk resyncs past its own
+    /// upper bound and the whole parallel attempt aborts. Cheap to be wrong,
+    /// but pointlessly so.
+    pub fn take_alloc_anchors(&mut self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for slot in self.alloc_anchors.iter_mut() {
+            let v = std::mem::replace(slot, usize::MAX);
+            if v != usize::MAX {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// Forget every recorded anchor without collecting them.
+    pub fn clear_alloc_anchors(&mut self) {
+        self.alloc_anchors.fill(usize::MAX);
     }
 
     /// Route a block to its size tier. Does NOT touch `max_free_upper` — the
@@ -159,62 +380,182 @@ impl Arena {
             warn_unaligned_block("route", block.offset, block.size);
         }
         if block.size < LARGE_BLOCK_MIN {
-            self.free_small.push(block);
+            let k = small_bucket_for(block.size);
+            self.free_small[k].push(block);
+            mask_set(&mut self.small_mask, k);
         } else {
             self.free_large.push(block);
+            // A push can only RAISE the span-tier maximum; fold it in so the
+            // memo survives (invalidating here would make every sweep's
+            // reclaim cost the next `largest_free_block` a full rescan).
+            if let Some(m) = self.large_max_exact.get() {
+                self.large_max_exact.set(Some(m.max(block.size)));
+            }
         }
         self.free_bytes_total += block.size;
     }
 
-    /// First-fit scan of ONE tier, visiting at most `max_scan` blocks. On a
-    /// fit: removes the block (O(1) `swap_remove`), returns the aligned
-    /// allocation offset plus up to two remainder blocks (head alignment
-    /// padding, tail leftover) for the caller to re-route by size. `None` =
-    /// nothing within the scan budget fits.
-    ///
-    /// The budget exists for the SMALL tier: `swap_remove` back-fills with
-    /// the most recently pushed block, so tiny split remainders ("dust")
-    /// drift toward the scan prefix, and an unbounded first-fit paid an
-    /// ever-growing dust walk on every object-sized allocation
-    /// (binarytrees-18: `Arena::alloc` was 47% of wall). A bounded scan
-    /// keeps the uniform-hole hit at ~index 0 while a dusty prefix gives up
-    /// quickly — the caller falls through to the bump tail / old-gen spill,
-    /// both valid homes for the object. Skipped blocks stay on the list, so
-    /// the sweep walker's hole map (`free_blocks_sorted`) is unaffected.
+    /// True when both tiers are empty.
     #[inline]
-    fn first_fit(
-        list: &mut Vec<FreeBlock>,
+    fn free_is_empty(&self) -> bool {
+        self.free_large.is_empty() && self.small_mask.iter().all(|&w| w == 0)
+    }
+
+    /// GUARANTEED-available largest small block: every block in the highest
+    /// occupied bucket `k` is at least `k * SMALL_GRAIN` bytes, so this value
+    /// is always actually allocatable. Used where an over-estimate would turn
+    /// into a failed allocation (see [`Self::largest_free_block`]).
+    #[inline]
+    fn small_max_floor(&self) -> usize {
+        mask_last(&self.small_mask).map_or(0, |k| k * SMALL_GRAIN)
+    }
+
+    /// UPPER bound on the largest small block: bucket `k` caps at
+    /// `k * SMALL_GRAIN + SMALL_GRAIN - 1`. Used where soundness requires the
+    /// bound never to under-state the truth ([`Self::max_free_upper`]).
+    ///
+    /// Floor and ceiling coincide for every block the heap actually produces
+    /// (all spans sit on the 8-byte object grid; the `warn_unaligned_block`
+    /// tripwire fires at the producer otherwise), so the 7-byte spread only
+    /// exists to keep both directions sound under a grid violation.
+    #[inline]
+    fn small_max_ceil(&self) -> usize {
+        mask_last(&self.small_mask).map_or(0, |k| k * SMALL_GRAIN + (SMALL_GRAIN - 1))
+    }
+
+    /// Carve `size` bytes out of `block` at `padding`, yielding the allocation
+    /// offset plus the head-padding and tail remainders for re-routing.
+    #[inline]
+    fn split(block: FreeBlock, padding: usize, size: usize) -> (usize, [Option<FreeBlock>; 2]) {
+        let alloc_offset = block.offset + padding;
+        let remaining = block.size - padding - size;
+        let head = (padding > 0).then_some(FreeBlock {
+            offset: block.offset,
+            size: padding,
+        });
+        let tail = (remaining > 0).then_some(FreeBlock {
+            offset: alloc_offset + size,
+            size: remaining,
+        });
+        (alloc_offset, [head, tail])
+    }
+
+    /// Serve `size` bytes at `align` from the segregated small tier.
+    ///
+    /// Two steps, both bounded:
+    ///
+    /// 1. **Exact size class.** Bucket `size / SMALL_GRAIN` holds blocks of
+    ///    at least `size` bytes, so a zero-padding block there is an exact
+    ///    fit that leaves NO remainder — the steady state for a workload that
+    ///    keeps recycling one node shape, and the reason this tier stops
+    ///    generating dust. Padding is still checked per block (the free list
+    ///    is keyed by size, not by alignment), but padding is zero for every
+    ///    block on the 8-byte grid, so the loop exits at index 0.
+    /// 2. **Escalate.** Otherwise take the first block of the lowest occupied
+    ///    class that is provably big enough — `ceil((size + align - 1) /
+    ///    SMALL_GRAIN)`, and never the class already scanned in step 1. Every
+    ///    block in that class covers `size` plus the worst-case alignment
+    ///    padding, so the head of the bucket is taken without a scan.
+    ///
+    /// `size` must already be rounded up to a multiple of [`SMALL_GRAIN`] —
+    /// [`Self::alloc`] does that for every request before calling in. Without
+    /// it the floor-indexed class in step 1 could sit below the class holding
+    /// an exactly-sized block.
+    fn small_fit(
+        &mut self,
         base: usize,
         size: usize,
         align: usize,
-        max_scan: usize,
-        total: &mut usize,
     ) -> Option<(usize, [Option<FreeBlock>; 2])> {
-        for i in 0..list.len().min(max_scan) {
-            let block = list[i];
+        debug_assert_eq!(
+            size % SMALL_GRAIN,
+            0,
+            "small_fit requires a grid-rounded size (got {size})",
+        );
+        let exact = size >> SMALL_GRAIN_SHIFT;
+        if exact < SMALL_BUCKETS {
+            let list = &mut self.free_small[exact];
+            for i in 0..list.len() {
+                let block = list[i];
+                let block_addr = base + block.offset;
+                let aligned_addr = (block_addr + align - 1) & !(align - 1);
+                let padding = aligned_addr - block_addr;
+                // Overflow means this block can't satisfy the request; skip
+                // it rather than aborting the whole search.
+                let Some(total_needed) = padding.checked_add(size) else {
+                    continue;
+                };
+                if total_needed <= block.size {
+                    list.swap_remove(i);
+                    if list.is_empty() {
+                        mask_clear(&mut self.small_mask, exact);
+                    }
+                    self.free_bytes_total -= block.size;
+                    return Some(Self::split(block, padding, size));
+                }
+            }
+        }
+        let from = if align <= SMALL_GRAIN {
+            // Padding is at most `align - 1 <= SMALL_GRAIN - 1`, and every
+            // block in bucket `exact + 1` is at least
+            // `(exact + 1) * SMALL_GRAIN == size + SMALL_GRAIN` bytes — so
+            // the very next occupied class always covers size + padding, and
+            // no satisfiable class is skipped.
+            exact.saturating_add(1)
+        } else {
+            // Alignments wider than the grid need a conservative start (no
+            // production caller uses one; the arena is an 8-aligned world).
+            let need = size.checked_add(align - 1)?;
+            need.div_ceil(SMALL_GRAIN).max(exact.saturating_add(1))
+        };
+        let k = mask_first_from(&self.small_mask, from)?;
+        let list = &mut self.free_small[k];
+        let block = list.swap_remove(0);
+        if list.is_empty() {
+            mask_clear(&mut self.small_mask, k);
+        }
+        self.free_bytes_total -= block.size;
+        let block_addr = base + block.offset;
+        let aligned_addr = (block_addr + align - 1) & !(align - 1);
+        let padding = aligned_addr - block_addr;
+        debug_assert!(
+            padding + size <= block.size,
+            "escalated small-tier bucket must cover size + worst-case padding",
+        );
+        Some(Self::split(block, padding, size))
+    }
+
+    /// First-fit scan of the span tier. On a fit: removes the block (O(1)
+    /// `swap_remove`), returns the aligned allocation offset plus up to two
+    /// remainder blocks (head alignment padding, tail leftover) for the
+    /// caller to re-route by size.
+    ///
+    /// Unbounded on purpose: this tier stays short (the post-sweep coalescer
+    /// merges adjacent holes into a handful of spans) and, unlike the small
+    /// tier, a miss here has to be authoritative — [`Self::alloc`] and
+    /// [`Self::has_free_block_at_least`] tighten [`Self::max_free_upper`]
+    /// from it. The O(1) `max_free_upper` fail-fast keeps hopeless requests
+    /// from reaching the loop at all.
+    fn large_fit(
+        &mut self,
+        base: usize,
+        size: usize,
+        align: usize,
+    ) -> Option<(usize, [Option<FreeBlock>; 2])> {
+        for i in 0..self.free_large.len() {
+            let block = self.free_large[i];
             let block_addr = base + block.offset;
             let aligned_addr = (block_addr + align - 1) & !(align - 1);
             let padding = aligned_addr - block_addr;
-            // Overflow means this block can't satisfy the request; skip it
-            // rather than aborting the whole `alloc` (the bump path below
-            // may still succeed).
             let Some(total_needed) = padding.checked_add(size) else {
                 continue;
             };
             if total_needed <= block.size {
-                let alloc_offset = block.offset + padding;
-                let remaining = block.size - padding - size;
-                list.swap_remove(i);
-                *total -= block.size;
-                let head = (padding > 0).then_some(FreeBlock {
-                    offset: block.offset,
-                    size: padding,
-                });
-                let tail = (remaining > 0).then_some(FreeBlock {
-                    offset: alloc_offset + size,
-                    size: remaining,
-                });
-                return Some((alloc_offset, [head, tail]));
+                self.free_large.swap_remove(i);
+                self.free_bytes_total -= block.size;
+                // The consumed block may have been the maximum.
+                self.large_max_exact.set(None);
+                return Some(Self::split(block, padding, size));
             }
         }
         None
@@ -254,46 +595,22 @@ impl Arena {
         // `total_needed >= size`; if even the (upper bound of the) largest
         // block is smaller than `size`, no block can satisfy the request —
         // skip the scans entirely and go straight to the bump path.
-        if (!self.free_small.is_empty() || !self.free_large.is_empty())
-            && alloc_size <= self.max_free_upper
-        {
+        if !self.free_is_empty() && alloc_size <= self.max_free_upper {
             let base = self.data.as_ptr() as usize;
             // Tier selection: a request whose worst-case need (size + max
             // alignment padding) reaches LARGE_BLOCK_MIN can never be served
-            // by a small block — skip the (potentially long) small list
-            // entirely. Smaller requests try the small tier first: its
-            // blocks are object-sized holes, so a same-shaped request
-            // first-fits at ~index 0.
+            // by a small block — skip the small tier entirely. Smaller
+            // requests try the small tier first: its blocks are object-sized
+            // holes, so a same-shaped request lands on its own size class.
             let worst_need = alloc_size.saturating_add(align - 1);
-            let hit = if worst_need < LARGE_BLOCK_MIN {
-                Self::first_fit(
-                    &mut self.free_small,
-                    base,
-                    alloc_size,
-                    align,
-                    SMALL_TIER_SCAN_BUDGET,
-                    &mut self.free_bytes_total,
-                )
-                .or_else(|| {
-                    Self::first_fit(
-                        &mut self.free_large,
-                        base,
-                        alloc_size,
-                        align,
-                        usize::MAX,
-                        &mut self.free_bytes_total,
-                    )
-                })
+            let mut hit = if worst_need < LARGE_BLOCK_MIN {
+                self.small_fit(base, alloc_size, align)
             } else {
-                Self::first_fit(
-                    &mut self.free_large,
-                    base,
-                    alloc_size,
-                    align,
-                    usize::MAX,
-                    &mut self.free_bytes_total,
-                )
+                None
             };
+            if hit.is_none() {
+                hit = self.large_fit(base, alloc_size, align);
+            }
             if let Some((alloc_offset, remainders)) = hit {
                 for r in remainders.into_iter().flatten() {
                     self.push_block_routed(r);
@@ -302,20 +619,14 @@ impl Arena {
                 // block, which came from a region inside the buffer.
                 return Some(unsafe { self.data.as_mut_ptr().add(alloc_offset) });
             }
-            // No fit. Tighten the upper bound only when the failure was a
-            // FULL view of the relevant tiers (a bounded small-tier scan
-            // may have skipped bigger blocks, so its miss proves nothing).
-            if worst_need >= LARGE_BLOCK_MIN {
-                // The whole span tier was scanned; the small tier caps below
-                // LARGE_BLOCK_MIN <= worst_need by construction.
-                let large_max = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
-                let small_cap = if self.free_small.is_empty() {
-                    0
-                } else {
-                    LARGE_BLOCK_MIN - 1
-                };
-                self.max_free_upper = self.max_free_upper.min(large_max.max(small_cap));
-            }
+            // No fit anywhere, and BOTH tiers were viewed in full (the
+            // segregated small tier has no scan budget to hide behind any
+            // more), so the miss is a proof: tighten the bound to the exact
+            // span-tier maximum folded with the small tier's ceiling.
+            let large_max = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
+            self.large_max_exact.set(Some(large_max));
+            let small_cap = self.small_max_ceil();
+            self.max_free_upper = self.max_free_upper.min(large_max.max(small_cap));
         }
 
         // Bump-allocation path: align the cursor up (checked to prevent
@@ -332,39 +643,21 @@ impl Arena {
             }
         }
 
-        // The bump tail `SMALL_TIER_SCAN_BUDGET`'s design assumed would
-        // always be available as a fallback (see its doc comment: "a miss
-        // falls through to the bump tail... both valid") is itself
-        // exhausted. A bounded small-tier miss above proved nothing about
-        // whether a fit exists further down the list — `swap_remove`
-        // back-fills the scan prefix with freshly split "dust" remainders,
-        // which can bury a genuinely-sized match past the scan budget
-        // indefinitely once the arena stops growing (the non-moving young
-        // collector never resets its cursor, so this is the steady state
-        // for the rest of the process's life, not a transient blip). Before
-        // declaring the allocation impossible, pay for one full, unbounded
-        // scan of both tiers — this only costs anything in the
-        // already-degenerate case where the bump tail is gone, which the
-        // common case (tail available) never reaches.
+        // The bump tail is exhausted too, so the free list is the only home
+        // left for this object. The guarded search above is skipped whenever
+        // the cached `max_free_upper` says no block can fit — that bound only
+        // ever over-estimates, so a skip is a proof of no fit and this retry
+        // is (now) redundant. It is kept because it costs nothing on the
+        // common path: reaching here already means the allocation was about
+        // to fail. Historically this arm also covered a real blind spot — the
+        // small tier's bounded first-fit could bury a satisfiable block
+        // behind a prefix of `swap_remove`-shuffled dust — which the
+        // segregated size classes have since eliminated (see `small_fit`).
         let base = self.data.as_ptr() as usize;
-        let hit = Self::first_fit(
-            &mut self.free_small,
-            base,
-            alloc_size,
-            align,
-            usize::MAX,
-            &mut self.free_bytes_total,
-        )
-        .or_else(|| {
-            Self::first_fit(
-                &mut self.free_large,
-                base,
-                alloc_size,
-                align,
-                usize::MAX,
-                &mut self.free_bytes_total,
-            )
-        });
+        let mut hit = self.small_fit(base, alloc_size, align);
+        if hit.is_none() {
+            hit = self.large_fit(base, alloc_size, align);
+        }
         if let Some((alloc_offset, remainders)) = hit {
             for r in remainders.into_iter().flatten() {
                 self.push_block_routed(r);
@@ -404,9 +697,15 @@ impl Arena {
     /// Drop every reclaimed region. Called when the arena is about to be
     /// swapped or reset so the next collection cycle starts clean.
     pub fn clear_free_list(&mut self) {
-        self.free_small.clear();
+        // Clear the buckets in place (keeping their allocations) rather than
+        // dropping the outer Vec — the table is rebuilt on every cycle.
+        for bucket in self.free_small.iter_mut() {
+            bucket.clear();
+        }
+        self.small_mask = [0u64; SMALL_MASK_WORDS];
         self.free_large.clear();
         self.max_free_upper = 0;
+        self.large_max_exact.set(Some(0));
         self.free_bytes_total = 0;
     }
 
@@ -439,13 +738,33 @@ impl Arena {
     /// Unlike [`Self::free_list_bytes`], this reflects what a *single*
     /// allocation can actually use (the free list is non-coalescing across
     /// blocks within one request).
+    ///
+    /// PERF (perf/gc-allocation-fastpath, 2026-07-26): this was a full walk of
+    /// BOTH tiers. `gen_heap::refill_tlab`'s fragmentation fallback calls it on
+    /// every refill that the main path could not serve, and in the degraded
+    /// mode that fallback hands out `FRAG_TLAB_FLOOR`-sized mini-TLABs — a few
+    /// dozen objects each — so the walk was effectively per-allocation over a
+    /// free list of thousands of uniform remnants. It is now a bitmap probe
+    /// for the small tier and a memoised value for the span tier.
+    ///
+    /// The answer is a value that can actually be ALLOCATED, never an
+    /// over-estimate: callers size a subsequent `alloc` from it.
     pub fn largest_free_block(&self) -> usize {
-        self.free_small
-            .iter()
-            .chain(self.free_large.iter())
-            .map(|b| b.size)
-            .max()
-            .unwrap_or(0)
+        let large = match self.large_max_exact.get() {
+            Some(m) => m,
+            None => {
+                let m = self.free_large.iter().map(|b| b.size).max().unwrap_or(0);
+                self.large_max_exact.set(Some(m));
+                m
+            }
+        };
+        // Any span is >= LARGE_BLOCK_MIN, which is larger than every block in
+        // the small tier by construction — so a non-zero span maximum is the
+        // overall maximum and the small tier need not be consulted.
+        if large > 0 {
+            return large;
+        }
+        self.small_max_floor()
     }
 
     /// Early-exit probe: is there any single free block of at least `size`
@@ -460,9 +779,13 @@ impl Arena {
     ///   long small-hole tier can never satisfy it.
     /// * A full failed scan tightens `max_free_upper` to the exact maximum,
     ///   so subsequent same-or-larger probes become O(1).
+    ///
+    /// PERF (perf/gc-allocation-fastpath, 2026-07-26): the sub-`LARGE_BLOCK_MIN`
+    /// arm used to walk the whole small tier on a miss. It is now a bitmap
+    /// probe — the highest occupied size class answers directly.
     pub fn has_free_block_at_least(&mut self, size: usize) -> bool {
         if size == 0 {
-            return !self.free_small.is_empty() || !self.free_large.is_empty();
+            return !self.free_is_empty();
         }
         if size > self.max_free_upper {
             return false;
@@ -471,14 +794,24 @@ impl Arena {
             if !self.free_large.is_empty() {
                 return true; // every span is >= LARGE_BLOCK_MIN > size
             }
-            let mut scan_max = 0usize;
-            for b in &self.free_small {
-                if b.size >= size {
-                    return true;
-                }
-                scan_max = scan_max.max(b.size);
+            // Every block in the highest occupied class is at least
+            // `small_max_floor()` bytes, so this "yes" is a guarantee.
+            if self.small_max_floor() >= size {
+                return true;
             }
-            self.max_free_upper = scan_max;
+            let ceil = self.small_max_ceil();
+            self.max_free_upper = self.max_free_upper.min(ceil);
+            // Ambiguity window: `size` lands strictly inside the highest
+            // occupied size class, so only that class's blocks can decide it.
+            // Unreachable while every span sits on the 8-byte object grid
+            // (floor == ceil then), which the `warn_unaligned_block` tripwire
+            // enforces at every producer — and bounded to a single class even
+            // when it is not.
+            if size <= ceil {
+                if let Some(k) = mask_last(&self.small_mask) {
+                    return self.free_small[k].iter().any(|b| b.size >= size);
+                }
+            }
             false
         } else {
             let mut scan_max = 0usize;
@@ -488,13 +821,12 @@ impl Arena {
                 }
                 scan_max = scan_max.max(b.size);
             }
-            // The small tier caps below LARGE_BLOCK_MIN; fold it into the
-            // tightened bound conservatively rather than scanning it.
-            self.max_free_upper = scan_max.max(if self.free_small.is_empty() {
-                0
-            } else {
-                LARGE_BLOCK_MIN - 1
-            });
+            // The whole span tier was viewed, so its maximum is now exact.
+            self.large_max_exact.set(Some(scan_max));
+            // The small tier caps below LARGE_BLOCK_MIN <= size; fold in its
+            // (bitmap-derived) ceiling rather than scanning it.
+            let ceil = self.small_max_ceil();
+            self.max_free_upper = scan_max.max(ceil);
             false
         }
     }
@@ -506,6 +838,7 @@ impl Arena {
         let mut v: Vec<(usize, usize)> = self
             .free_small
             .iter()
+            .flatten()
             .chain(self.free_large.iter())
             .map(|b| (b.offset, b.size))
             .collect();
@@ -550,10 +883,9 @@ impl Arena {
         // Zero out used region for safety (prevents stale data reads)
         self.data[..self.cursor].fill(0);
         self.cursor = 0;
-        self.free_small.clear();
-        self.free_large.clear();
-        self.max_free_upper = 0;
-        self.free_bytes_total = 0;
+        self.clear_free_list();
+        // Every recorded object start just became zeroed bytes.
+        self.clear_alloc_anchors();
     }
 
     /// Reset the arena without zeroing memory.
@@ -574,10 +906,8 @@ impl Arena {
     #[allow(dead_code)]
     pub unsafe fn reset_no_zero(&mut self) {
         self.cursor = 0;
-        self.free_small.clear();
-        self.free_large.clear();
-        self.max_free_upper = 0;
-        self.free_bytes_total = 0;
+        self.clear_free_list();
+        self.clear_alloc_anchors();
     }
 
     /// Returns true if the given pointer falls within this arena's storage.
@@ -641,7 +971,11 @@ impl Arena {
         let old_base = self.data.as_ptr();
         let old_capacity = self.data.len();
         self.data.resize(new_capacity, 0);
-        if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+        // The bucket table is indexed by capacity; `grow` is the only other
+        // place `data.len()` moves. `cursor == 0` was just asserted, so there
+        // is nothing recorded to preserve.
+        self.rearm_alloc_anchors();
+        if gc_flags().dbg_youngstate {
             eprintln!("[youngstate] arena-grow {old_capacity} -> {new_capacity} bytes");
         }
         old_base
@@ -686,17 +1020,19 @@ mod tests {
         assert_eq!(arena.used(), 64);
     }
 
-    /// dohead-oom (2026-07-19): a bounded small-tier scan miss must not be
-    /// the final word once the bump tail is also exhausted. Simulate the
-    /// non-moving young collector's steady state (cursor pinned at
-    /// capacity, so every further allocation must come from the free list):
-    /// register `SMALL_TIER_SCAN_BUDGET` too-small holes followed by one
-    /// genuinely-sized hole past the scan budget, then request exactly that
-    /// size. Without the post-bump fallback scan in `alloc`, this returns
-    /// `None` despite a valid block existing.
+    /// dohead-oom (2026-07-19): a satisfiable hole must be found no matter
+    /// how much dust was reclaimed ahead of it, once the bump tail is also
+    /// exhausted. Simulate the non-moving young collector's steady state
+    /// (cursor pinned at capacity, so every further allocation must come from
+    /// the free list): register a long run of too-small holes followed by one
+    /// genuinely-sized hole, then request that size. This used to depend on a
+    /// post-bump rescue scan because the small tier was a flat first-fit list
+    /// with a 16-block budget; with segregated size classes the fit-sized
+    /// hole is found directly in its own class, and the dust is never even
+    /// visited.
     #[test]
     fn arena_alloc_finds_fit_past_scan_budget_when_bump_tail_exhausted() {
-        let dust_count = SMALL_TIER_SCAN_BUDGET + 4;
+        let dust_count = 20usize;
         let dust_size = 8usize;
         let fit_size = 32usize;
         let capacity = dust_count * dust_size + fit_size + 256;
@@ -926,5 +1262,229 @@ mod tests {
         assert!(arena.alloc(64, 8).is_none());
         // Fits the hole → allocates from the free list.
         assert!(arena.alloc(16, 8).is_some());
+    }
+
+    // ----- Allocator-recorded sweep anchors (perf/gc-oracle-anchors) --------
+
+    #[test]
+    fn alloc_anchors_are_one_per_bucket_and_strictly_increasing() {
+        let mut arena = Arena::new(64 * 1024);
+        let bucket = 1usize << arena.anchor_shift;
+        // Three offsets in bucket 0, one in bucket 1, one in bucket 3 —
+        // recorded out of bucket order on purpose.
+        arena.note_object_start(3 * bucket + 24);
+        arena.note_object_start(0);
+        arena.note_object_start(64);
+        arena.note_object_start(128);
+        arena.note_object_start(bucket + 8);
+        let a = arena.take_alloc_anchors();
+        // First-in-bucket wins, and draining yields ascending offsets.
+        assert_eq!(a, vec![0, bucket + 8, 3 * bucket + 24]);
+        assert!(a.windows(2).all(|w| w[0] < w[1]));
+        // Draining leaves the table empty for the next epoch.
+        assert!(arena.take_alloc_anchors().is_empty());
+    }
+
+    #[test]
+    fn alloc_anchors_bucket_table_stays_bounded_and_in_range() {
+        // A 2 GiB arena must not mint a per-4 KiB table (that would be 512 K
+        // entries); the shift widens until the bucket count fits the cap.
+        let mut arena = Arena::new(64 * 1024);
+        arena.rearm_alloc_anchors();
+        assert!(arena.alloc_anchors.len() <= (1 << 16) + 1);
+        // Out-of-range offsets are ignored rather than panicking (a caller
+        // handing over a stale offset must never take the VM down).
+        arena.note_object_start(usize::MAX);
+        arena.note_object_start(arena.capacity() * 4);
+        assert!(arena.take_alloc_anchors().is_empty());
+    }
+
+    #[test]
+    fn reset_clears_alloc_anchors() {
+        // An anchor describes the object grid of the epoch that just ended;
+        // `reset` zeroes the arena, so every recorded offset is now dead.
+        let mut arena = Arena::new(64 * 1024);
+        assert!(arena.alloc(64, 8).is_some());
+        arena.note_object_start(0);
+        arena.reset();
+        assert!(arena.take_alloc_anchors().is_empty());
+    }
+
+    // ----- Segregated small tier (perf/gc-allocation-fastpath) --------------
+
+    /// The bitmap helpers are the load-bearing part of the small tier: a wrong
+    /// answer either loses a satisfiable block (spurious OOM / forced GC) or
+    /// claims one that does not exist (failed refill).
+    #[test]
+    fn small_bucket_mask_probes_are_exact() {
+        let mut mask = [0u64; SMALL_MASK_WORDS];
+        assert_eq!(mask_first_from(&mask, 0), None);
+        assert_eq!(mask_last(&mask), None);
+
+        // One bit in each word, including the last.
+        for k in [0usize, 1, 63, 64, 65, 127, 200, SMALL_BUCKETS - 1] {
+            mask_set(&mut mask, k);
+        }
+        assert_eq!(mask_first_from(&mask, 0), Some(0));
+        assert_eq!(mask_first_from(&mask, 1), Some(1));
+        assert_eq!(mask_first_from(&mask, 2), Some(63));
+        assert_eq!(mask_first_from(&mask, 64), Some(64));
+        assert_eq!(mask_first_from(&mask, 66), Some(127));
+        assert_eq!(mask_first_from(&mask, 128), Some(200));
+        assert_eq!(mask_first_from(&mask, 201), Some(SMALL_BUCKETS - 1));
+        // A start past the table must not index out of bounds.
+        assert_eq!(mask_first_from(&mask, SMALL_BUCKETS), None);
+        assert_eq!(mask_first_from(&mask, usize::MAX), None);
+        assert_eq!(mask_last(&mask), Some(SMALL_BUCKETS - 1));
+
+        mask_clear(&mut mask, SMALL_BUCKETS - 1);
+        assert_eq!(mask_last(&mask), Some(200));
+        for k in [0usize, 1, 63, 64, 65, 127, 200] {
+            mask_clear(&mut mask, k);
+        }
+        assert_eq!(mask_last(&mask), None);
+        assert_eq!(mask_first_from(&mask, 0), None);
+    }
+
+    /// A same-shaped request must land in its own size class and consume the
+    /// hole WHOLE — no split, therefore no dust for the next request to walk
+    /// past. This is the property the flat first-fit list could not hold.
+    #[test]
+    fn small_tier_exact_class_reuses_holes_without_splitting() {
+        let node = 72usize;
+        let count = 500usize;
+        let mut arena = Arena::new(count * node + 4096);
+        let mut offsets = Vec::new();
+        for _ in 0..count {
+            let p = arena.alloc(node, 8).unwrap();
+            offsets.push(unsafe { p.offset_from(arena.base_ptr_mut()) } as usize);
+        }
+        // Exhaust the bump tail so only the free list can serve.
+        let tail = arena.capacity() - arena.used();
+        arena.alloc(tail, 8).unwrap();
+        for &off in &offsets {
+            arena.add_free_block(off, node);
+        }
+        let reclaimed = arena.free_list_bytes();
+        assert_eq!(reclaimed, count * node);
+
+        // Every re-allocation is an exact-class hit: the free list shrinks by
+        // exactly one node each time and never grows a remainder block.
+        for i in 0..count {
+            assert!(
+                arena.alloc(node, 8).is_some(),
+                "exact-class reuse failed at iteration {i}"
+            );
+            assert_eq!(arena.free_list_bytes(), reclaimed - (i + 1) * node);
+        }
+        assert_eq!(arena.free_list_bytes(), 0);
+        assert_eq!(arena.largest_free_block(), 0);
+        assert!(arena.alloc(node, 8).is_none());
+    }
+
+    /// `largest_free_block` must stay EXACTLY allocatable: `refill_tlab` sizes
+    /// a mini-TLAB from it and immediately allocates that many bytes, so an
+    /// over-estimate turns into a wedge. Check it against a brute-force
+    /// maximum across both tiers, through pushes, splits and clears.
+    #[test]
+    fn largest_free_block_is_allocatable_across_tiers() {
+        let mut arena = Arena::new(256 * 1024);
+        let cap = arena.capacity();
+        arena.alloc(cap, 8).unwrap(); // exhaust the bump tail
+        assert_eq!(arena.largest_free_block(), 0);
+
+        // Small tier only.
+        arena.add_free_block(0, 40);
+        arena.add_free_block(64, 4088); // top small class
+        assert_eq!(arena.largest_free_block(), 4088);
+        // ...and it really is allocatable.
+        assert!(arena.alloc(4088, 8).is_some());
+        assert_eq!(arena.largest_free_block(), 40);
+
+        // Span tier dominates whenever it is non-empty.
+        arena.add_free_block(8192, 64 * 1024);
+        assert_eq!(arena.largest_free_block(), 64 * 1024);
+        assert!(arena.alloc(64 * 1024, 8).is_some());
+        // The span was consumed whole, so the small tier is the maximum again.
+        assert_eq!(arena.largest_free_block(), 40);
+
+        arena.clear_free_list();
+        assert_eq!(arena.largest_free_block(), 0);
+        assert_eq!(arena.free_list_bytes(), 0);
+    }
+
+    /// The `max_free_upper` fail-fast gate must never under-state the truth:
+    /// an under-estimate makes `alloc` skip a free list that could have served
+    /// the request and report a false OOM (which the JIT slow path turns into
+    /// a forced GC). Drive it through the small-tier tightening path.
+    #[test]
+    fn max_free_upper_stays_a_sound_upper_bound() {
+        let mut arena = Arena::new(1024);
+        arena.alloc(1024, 8).unwrap(); // exhaust the bump tail
+        arena.add_free_block(0, 128);
+        arena.add_free_block(256, 64);
+
+        // A miss tightens the bound; the bound must still cover every block.
+        assert!(!arena.has_free_block_at_least(129));
+        assert!(arena.max_free_upper >= 128);
+        assert!(arena.alloc(128, 8).is_some());
+
+        // After the 128 block is gone the bound may still read 128 (it only
+        // ever over-estimates) but a 64-byte request must still be served.
+        assert!(arena.alloc(64, 8).is_some());
+        assert!(arena.alloc(8, 8).is_none());
+        assert_eq!(arena.free_list_bytes(), 0);
+    }
+
+    /// A reclaimed hole smaller than the request must not be handed out, and
+    /// the escalating class search must not skip a class that could serve it.
+    #[test]
+    fn small_tier_escalates_to_the_next_occupied_class() {
+        let mut arena = Arena::new(1024);
+        arena.alloc(1024, 8).unwrap();
+        arena.add_free_block(0, 24);
+        arena.add_free_block(64, 56);
+
+        // 32 bytes: class 4 is empty, class 7 (56) is the next occupied one.
+        let p = arena.alloc(32, 8).unwrap();
+        assert_eq!(unsafe { p.offset_from(arena.base_ptr_mut()) }, 64);
+        // The 24-byte remainder went back as its own class, alongside the
+        // untouched 24-byte hole.
+        assert_eq!(arena.free_list_bytes(), 24 + 24);
+        assert_eq!(arena.largest_free_block(), 24);
+        // Nothing can serve 32 any more.
+        assert!(arena.alloc(32, 8).is_none());
+        // But two 24s can still be served.
+        assert!(arena.alloc(24, 8).is_some());
+        assert!(arena.alloc(24, 8).is_some());
+        assert!(arena.alloc(8, 8).is_none());
+    }
+
+    /// The sweep's hole map must see every block regardless of which class it
+    /// landed in, in ascending offset order.
+    #[test]
+    fn free_blocks_sorted_spans_every_size_class() {
+        let mut arena = Arena::new(64 * 1024);
+        let cap = arena.capacity();
+        arena.alloc(cap, 8).unwrap();
+        arena.add_free_block(16 * 1024, 8 * 1024); // span tier
+        arena.add_free_block(0, 4080); // top small class
+        arena.add_free_block(8 * 1024, 40); // low small class
+        let sorted = arena.free_blocks_sorted();
+        assert_eq!(
+            sorted,
+            vec![(0, 4080), (8 * 1024, 40), (16 * 1024, 8 * 1024)]
+        );
+    }
+
+    #[test]
+    fn grow_rearms_alloc_anchors_for_the_new_capacity() {
+        let mut arena = Arena::new(4 * 1024);
+        arena.grow(1024 * 1024);
+        // The table must cover the grown capacity, or every offset past the
+        // old end would silently fail to record.
+        let last = arena.capacity() - 8;
+        arena.note_object_start(last);
+        assert_eq!(arena.take_alloc_anchors(), vec![last]);
     }
 }

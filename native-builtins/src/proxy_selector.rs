@@ -130,36 +130,49 @@ fn read_settings(ctx: &dyn NativeContext) -> ProxySettings {
     // Case-insensitive lookup: try lowercase first (the common Unix
     // convention) then uppercase (the Windows convention). Spec-wise both
     // are accepted — we honour whichever exists.
-    let env_get = |k: &str| -> Option<String> {
-        std::env::var(k.to_ascii_lowercase())
-            .or_else(|_| std::env::var(k.to_ascii_uppercase()))
+    //
+    // PERF: `read_settings` runs once per `ProxySelector.select(URI)`, i.e.
+    // once per outbound connection. The previous form took a single key and
+    // derived both cases with `to_ascii_lowercase()` / `to_ascii_uppercase()`,
+    // so every probe allocated two `String`s just to name a constant, and each
+    // call site then wrote `env_get("http_proxy").or_else(|| env_get("HTTP_PROXY"))`
+    // — but `env_get` already tried *both* cases, so the `or_else` arm re-ran
+    // the identical pair of lookups. Net cost per `select`: 16 `getenv` calls
+    // (each taking the process environ lock and scanning `environ` linearly)
+    // and 32 throwaway allocations, for 4 distinct settings. Passing both
+    // spellings as `&'static str` removes the allocations, and dropping the
+    // duplicate `or_else` arms halves the `getenv` traffic. Semantics are
+    // unchanged: same keys, same lowercase-wins precedence.
+    let env_get = |lower: &'static str, upper: &'static str| -> Option<String> {
+        cratonvm_types::flags::runtime_var(lower)
+            .or_else(|_| cratonvm_types::flags::runtime_var(upper))
             .ok()
             .filter(|s| !s.is_empty())
     };
 
     if s.http.is_none() {
-        if let Some(v) = env_get("http_proxy").or_else(|| env_get("HTTP_PROXY")) {
+        if let Some(v) = env_get("http_proxy", "HTTP_PROXY") {
             if let Some((h, p)) = parse_proxy_url(&v, 80) {
                 s.http = Some((h, p));
             }
         }
     }
     if s.https.is_none() {
-        if let Some(v) = env_get("https_proxy").or_else(|| env_get("HTTPS_PROXY")) {
+        if let Some(v) = env_get("https_proxy", "HTTPS_PROXY") {
             if let Some((h, p)) = parse_proxy_url(&v, 443) {
                 s.https = Some((h, p));
             }
         }
     }
     if s.socks.is_none() {
-        if let Some(v) = env_get("all_proxy").or_else(|| env_get("ALL_PROXY")) {
+        if let Some(v) = env_get("all_proxy", "ALL_PROXY") {
             if let Some((h, p)) = parse_proxy_url(&v, 1080) {
                 s.socks = Some((h, p));
             }
         }
     }
 
-    if let Some(no) = env_get("no_proxy").or_else(|| env_get("NO_PROXY")) {
+    if let Some(no) = env_get("no_proxy", "NO_PROXY") {
         for raw in no.split(',') {
             let pat = raw.trim();
             if !pat.is_empty() {
@@ -696,7 +709,120 @@ pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    use crate::test_utils::MockNativeContext;
+
+    /// `read_settings` reads process-global environment variables, so the
+    /// tests that mutate them must not run concurrently with each other.
+    fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Save/clear/restore the proxy env vars around a closure so a failing
+    /// assertion cannot leak state into the next test.
+    fn with_proxy_env<R>(pairs: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+        const KEYS: [&str; 8] = [
+            "http_proxy",
+            "HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ];
+        let _guard = env_test_lock();
+        let saved: Vec<(&str, Option<String>)> =
+            KEYS.iter().map(|k| (*k, cratonvm_types::flags::runtime_var(k).ok())).collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        for (key, value) in pairs {
+            std::env::set_var(key, value);
+        }
+        let out = f();
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        out
+    }
+
+    /// PERF-fix guard. `read_settings` runs once per `ProxySelector.select`,
+    /// and the env probe used to allocate a lowercased *and* an uppercased
+    /// `String` per key, then have the call site redundantly ask for both
+    /// spellings again via `or_else`. The keys are now `&'static str` pairs
+    /// and the duplicate arms are gone — these tests pin the semantics that
+    /// change had to preserve: both spellings are still honoured, and
+    /// lowercase still wins when both are set.
+    #[test]
+    fn env_proxy_lookup_accepts_lowercase_spelling() {
+        let settings = with_proxy_env(&[("http_proxy", "http://lower.corp:8080")], || {
+            read_settings(&MockNativeContext::new())
+        });
+        assert_eq!(
+            settings.http,
+            Some(("lower.corp".to_string(), 8080)),
+            "the Unix-convention lowercase spelling must still be honoured"
+        );
+    }
+
+    #[test]
+    fn env_proxy_lookup_accepts_uppercase_spelling() {
+        let settings = with_proxy_env(&[("HTTPS_PROXY", "http://upper.corp:3128")], || {
+            read_settings(&MockNativeContext::new())
+        });
+        assert_eq!(
+            settings.https,
+            Some(("upper.corp".to_string(), 3128)),
+            "the Windows-convention uppercase spelling must still be honoured; \
+             dropping the duplicate `or_else` arm must not have dropped this case"
+        );
+    }
+
+    #[test]
+    fn env_proxy_lookup_prefers_lowercase_when_both_are_set() {
+        let settings = with_proxy_env(
+            &[
+                ("all_proxy", "socks://lower.corp:1080"),
+                ("ALL_PROXY", "socks://upper.corp:1081"),
+            ],
+            || read_settings(&MockNativeContext::new()),
+        );
+        assert_eq!(
+            settings.socks,
+            Some(("lower.corp".to_string(), 1080)),
+            "lowercase-wins precedence must survive the key-pair rewrite"
+        );
+    }
+
+    #[test]
+    fn env_no_proxy_patterns_are_lowercased_from_either_spelling() {
+        let settings = with_proxy_env(&[("NO_PROXY", "Example.COM, .Internal ")], || {
+            read_settings(&MockNativeContext::new())
+        });
+        assert_eq!(
+            settings.no_proxy_patterns,
+            vec!["example.com".to_string(), ".internal".to_string()],
+            "NO_PROXY entries are comma-separated, trimmed and lowercased"
+        );
+    }
+
+    #[test]
+    fn absent_proxy_env_leaves_settings_empty() {
+        let settings = with_proxy_env(&[], || read_settings(&MockNativeContext::new()));
+        assert_eq!(settings.http, None);
+        assert_eq!(settings.https, None);
+        assert_eq!(settings.socks, None);
+        assert!(settings.no_proxy_patterns.is_empty());
+    }
 
     #[test]
     fn parse_proxy_url_handles_scheme_user_path() {

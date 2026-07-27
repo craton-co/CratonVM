@@ -40,34 +40,36 @@ fn t10_9_e_1_heap_j_get_field_as_normalizes_double_to_long() {
     // bits ARE the intended long bits. get_field_as(b'J') must surface
     // Value::Long, never Value::Double.
     let vm = shared();
-    let obj = vm.heap.alloc_object(ClassId::new(1), 1);
-    vm.heap.set_field(obj, 0, Value::Double(f64::from_bits(5)));
+    let obj = vm.mem.heap.alloc_object(ClassId::new(1), 1);
+    vm.mem
+        .heap
+        .set_field(obj, 0, Value::Double(f64::from_bits(5)));
     // Legacy get_field returns the drifted Double.
-    match vm.heap.get_field(obj, 0) {
+    match vm.mem.heap.get_field(obj, 0) {
         Value::Double(_) => {}
         other => panic!("expected legacy Double leak, got {other:?}"),
     }
     // Descriptor-aware read normalises.
-    assert_eq!(vm.heap.get_field_as(obj, 0, b'J'), Value::Long(5));
+    assert_eq!(vm.mem.heap.get_field_as(obj, 0, b'J'), Value::Long(5));
 }
 
 #[test]
 fn t10_9_e_1_heap_j_roundtrips_large_magnitude_longs() {
     let vm = shared();
-    let obj = vm.heap.alloc_object(ClassId::new(2), 1);
+    let obj = vm.mem.heap.alloc_object(ClassId::new(2), 1);
     for v in [0i64, 1, -1, i64::MIN, i64::MAX, 12345, -987_654_321] {
-        vm.heap.set_field_as(obj, 0, Value::Long(v), b'J');
-        assert_eq!(vm.heap.get_field_as(obj, 0, b'J'), Value::Long(v));
+        vm.mem.heap.set_field_as(obj, 0, Value::Long(v), b'J');
+        assert_eq!(vm.mem.heap.get_field_as(obj, 0, b'J'), Value::Long(v));
     }
 }
 
 #[test]
 fn t10_9_e_1_heap_d_preserves_doubles() {
     let vm = shared();
-    let obj = vm.heap.alloc_object(ClassId::new(3), 1);
+    let obj = vm.mem.heap.alloc_object(ClassId::new(3), 1);
     for v in [0.0f64, 1.0, -1.0, std::f64::consts::PI, 2.5e-323] {
-        vm.heap.set_field_as(obj, 0, Value::Double(v), b'D');
-        match vm.heap.get_field_as(obj, 0, b'D') {
+        vm.mem.heap.set_field_as(obj, 0, Value::Double(v), b'D');
+        match vm.mem.heap.get_field_as(obj, 0, b'D') {
             Value::Double(d) => assert_eq!(d.to_bits(), v.to_bits()),
             other => panic!("expected Double({v}), got {other:?}"),
         }
@@ -77,10 +79,11 @@ fn t10_9_e_1_heap_d_preserves_doubles() {
 #[test]
 fn t10_9_e_1_heap_volatile_normalizes_j() {
     let vm = shared();
-    let obj = vm.heap.alloc_object(ClassId::new(4), 1);
-    vm.heap
+    let obj = vm.mem.heap.alloc_object(ClassId::new(4), 1);
+    vm.mem
+        .heap
         .set_field_volatile(obj, 0, Value::Double(f64::from_bits(42)));
-    match vm.heap.get_field_volatile_as(obj, 0, b'J') {
+    match vm.mem.heap.get_field_volatile_as(obj, 0, b'J') {
         Value::Long(l) => assert_eq!(l, 42),
         other => panic!("expected Long(42), got {other:?}"),
     }
@@ -89,10 +92,10 @@ fn t10_9_e_1_heap_volatile_normalizes_j() {
 #[test]
 fn t10_9_e_1_heap_reference_passthrough() {
     let vm = shared();
-    let host = vm.heap.alloc_object(ClassId::new(5), 1);
-    let tgt = vm.heap.alloc_object(ClassId::new(6), 0);
-    vm.heap.set_field(host, 0, Value::Object(Some(tgt)));
-    match vm.heap.get_field_as(host, 0, b'L') {
+    let host = vm.mem.heap.alloc_object(ClassId::new(5), 1);
+    let tgt = vm.mem.heap.alloc_object(ClassId::new(6), 0);
+    vm.mem.heap.set_field(host, 0, Value::Object(Some(tgt)));
+    match vm.mem.heap.get_field_as(host, 0, b'L') {
         Value::Object(Some(o)) => assert_eq!(o.as_ptr(), tgt.as_ptr()),
         other => panic!("expected Object(Some), got {other:?}"),
     }
@@ -186,7 +189,7 @@ fn t10_9_e_3_coerce_unknown_descriptor_preserves_value() {
 #[test]
 fn t10_9_e_4_cache_is_empty_at_startup() {
     let vm = shared();
-    assert_eq!(vm.field_descriptor_cache.read().len(), 0);
+    assert_eq!(vm.classes.field_descriptor_cache.read().len(), 0);
 }
 
 #[test]
@@ -194,13 +197,13 @@ fn t10_9_e_4_cache_miss_on_unloaded_class_does_not_poison() {
     // When a class isn't loaded, the cache MUST NOT record an entry —
     // a later class-load must be able to resolve the descriptor fresh.
     let vm = shared();
-    let before = vm.field_descriptor_cache.read().len();
+    let before = vm.classes.field_descriptor_cache.read().len();
     // Access via the heap API to trigger the cache path indirectly —
     // but since we don't have a class loaded here, no cache entry
     // should be written. (The NativeContextImpl::get_field path is
     // exercised by the interpreter smoke; here we just assert the
     // cache semantics.)
-    let _ = vm.heap; // keep the heap alive for the scope
-    let after = vm.field_descriptor_cache.read().len();
+    let _ = vm.mem.heap; // keep the heap alive for the scope
+    let after = vm.classes.field_descriptor_cache.read().len();
     assert_eq!(before, after);
 }

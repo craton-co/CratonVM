@@ -66,6 +66,7 @@ use std::collections::HashMap;
 use std::sync::{Once, OnceLock, PoisonError, RwLock};
 
 use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use cratonvm_types::narrow_oop::ref_element_size;
 use cratonvm_types::{
     error::{MethodCallFailed, MethodCallResult, VmError},
     ArrayElementType, ClassId, ObjectKind, ObjectRef, Value,
@@ -288,7 +289,7 @@ pub fn approximate_object_size(
     let body = match kind {
         ObjectKind::Object => (num_slots * SLOT_SIZE) as i64,
         ObjectKind::Array => match element_type {
-            ArrayElementType::Reference => (length * REF_ELEMENT_SIZE) as i64,
+            ArrayElementType::Reference => (length * ref_element_size()) as i64,
             other => {
                 let raw = length.saturating_mul(element_byte_size(other));
                 // 8-byte align like the heap does.
@@ -478,7 +479,7 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => return Ok(None),
     };
     let n = ctx.array_length(arr);
-    if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
         eprintln!("[RETRANSFORM] retransformClasses0 called with {n} classes");
     }
     for i in 0..n {
@@ -490,7 +491,7 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
             Some(cid) => cid,
             None => continue,
         };
-        if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
             let nm = ctx.class_name_of_id(class_id).unwrap_or_default();
             let ob = original_class_bytes(ctx, class_id);
             eprintln!("[RETRANSFORM]   [{i}] {nm} original_bytes={}", ob.len());
@@ -872,7 +873,7 @@ fn run_transformer_chain(
     inst_receiver: Option<ObjectRef>,
 ) -> Vec<u8> {
     let rust_chain = snapshot_transformer_chain();
-    if std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok() {
         eprintln!(
             "[RETRANSFORM]   run_transformer_chain: rust_chain={} entries, initial_bytes={}, retransform_only={retransform_only}",
             rust_chain.len(),
@@ -937,7 +938,7 @@ fn run_transformer_chain(
         let descriptor = "(Ljava/lang/ClassLoader;Ljava/lang/String;Ljava/lang/Class;\
                           Ljava/security/ProtectionDomain;[B)[B";
         let result = ctx.invoke_virtual(entry.transformer_ref, "transform", descriptor, &args);
-        let dbg = std::env::var("CRATONVM_DBG_RETRANSFORM").is_ok();
+        let dbg = cratonvm_types::flags::runtime_var("CRATONVM_DBG_RETRANSFORM").is_ok();
         match result {
             Ok(Some(Value::Object(Some(out_obj)))) => {
                 let out_bytes = read_byte_array(ctx, out_obj);
@@ -987,6 +988,32 @@ fn run_transformer_chain(
 /// the transformer chain with the bytecode the class was loaded from.
 /// Falls back to looking up the resource by `<name>.class` on the
 /// application classpath when the per-class cache is unreachable.
+/// Observability audit (2026-07-26) — DEFECT FIXED.
+///
+/// The preferred source, `ctx.class_bytes(class_id)`, reads the
+/// `ClassManager::class_bytes_cache`. That cache is **FIFO-evicted at a
+/// 16 MiB soft cap** (`classloading::DEFAULT_CLASS_BYTES_CACHE_CAP`). Any
+/// real application blows through 16 MiB of class bytes during startup, so by
+/// the time an agent calls `retransformClasses` — Mockito's inline mock maker
+/// and JaCoCo both do, late, on demand — the target's original bytes have
+/// very often been evicted. The fallback then reads
+/// `find_resource("<name>.class")` off the **application classpath**, which
+/// is not the class's defining loader.
+///
+/// Before this fix the fallback bytes were used unconditionally. The failure
+/// scenario: two loaders each define their own `com/foo/Bar`, or a shaded jar
+/// carries a `com/foo/Bar.class` that shadows the one actually loaded. The
+/// retransform chain would then be seeded with a *different class body*, the
+/// transformer would instrument that, and `retransform_class` would install
+/// the result over the live class. A silently wrong class definition is far
+/// harder to diagnose than a failed retransform, and there is no signal at
+/// all that the cache missed.
+///
+/// We now (a) verify the fallback bytes really are a class file whose
+/// `this_class` matches the class we were asked about, rejecting them
+/// otherwise, and (b) log the cache miss so the eviction is visible. An
+/// empty result makes `native_retransform_classes0` skip the class, which is
+/// the safe outcome.
 fn original_class_bytes(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<u8> {
     // Prefer the ClassManager's class_bytes_cache (populated by every
     // define_class_with_options call). This is the only path that finds
@@ -1002,7 +1029,103 @@ fn original_class_bytes(ctx: &dyn NativeContext, class_id: ClassId) -> Vec<u8> {
         None => return Vec::new(),
     };
     let resource = format!("{name}.class");
-    ctx.find_resource(&resource).unwrap_or_default()
+    let fallback = ctx.find_resource(&resource).unwrap_or_default();
+    if fallback.is_empty() {
+        tracing::debug!(
+            "retransform: no original bytes for `{name}` \
+             (class_bytes_cache miss and no `{resource}` on the classpath); skipping"
+        );
+        return Vec::new();
+    }
+    match class_file_this_class(&fallback) {
+        Some(found) if found == name => {
+            tracing::debug!(
+                "retransform: `{name}` bytes came from the classpath, not the \
+                 class_bytes_cache (16 MiB FIFO cap — likely evicted)"
+            );
+            fallback
+        }
+        Some(found) => {
+            tracing::warn!(
+                "retransform: refusing to seed `{name}` from classpath resource \
+                 `{resource}` — those bytes define `{found}`. Seeding the \
+                 transformer chain with a different class would install a wrong \
+                 class body. Skipping this retransform."
+            );
+            Vec::new()
+        }
+        None => {
+            tracing::warn!(
+                "retransform: refusing to seed `{name}` from classpath resource \
+                 `{resource}` — not a parseable class file. Skipping."
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Extract the internal-form `this_class` name (e.g. `java/lang/String`) from
+/// raw class-file bytes, without a full parse.
+///
+/// Returns `None` for anything that is not a well-formed enough class file to
+/// answer the question. Used by [`original_class_bytes`] to make sure a
+/// classpath-sourced fallback really describes the class being retransformed.
+fn class_file_this_class(bytes: &[u8]) -> Option<String> {
+    fn u16_at(b: &[u8], off: usize) -> Option<u16> {
+        Some(u16::from_be_bytes([*b.get(off)?, *b.get(off + 1)?]))
+    }
+
+    if bytes.len() < 10 || bytes[0..4] != [0xCA, 0xFE, 0xBA, 0xBE] {
+        return None;
+    }
+    let cp_count = u16_at(bytes, 8)? as usize;
+    if cp_count == 0 {
+        return None;
+    }
+
+    // Byte offset of each constant-pool entry's *tag*, indexed by CP index.
+    // Index 0 is unused; long/double consume two indices.
+    let mut offsets: Vec<usize> = vec![0; cp_count];
+    let mut pos = 10usize;
+    let mut idx = 1usize;
+    while idx < cp_count {
+        offsets[idx] = pos;
+        let tag = *bytes.get(pos)?;
+        pos += 1;
+        let (payload, slots) = match tag {
+            1 => {
+                // Utf8: u2 length + that many bytes
+                let len = u16_at(bytes, pos)? as usize;
+                (2 + len, 1)
+            }
+            3 | 4 | 9 | 10 | 11 | 12 | 17 | 18 => (4, 1), // Integer/Float/refs/NameAndType/(Invoke)Dynamic
+            5 | 6 => (8, 2),                              // Long/Double take two CP slots
+            7 | 8 | 16 | 19 | 20 => (2, 1),               // Class/String/MethodType/Module/Package
+            15 => (3, 1),                                 // MethodHandle
+            _ => return None,                             // unknown tag — bail rather than guess
+        };
+        pos = pos.checked_add(payload)?;
+        if pos > bytes.len() {
+            return None;
+        }
+        idx += slots;
+    }
+
+    // access_flags (u2), this_class (u2)
+    let this_class_idx = u16_at(bytes, pos + 2)? as usize;
+    let class_entry = *offsets.get(this_class_idx)?;
+    if class_entry == 0 || *bytes.get(class_entry)? != 7 {
+        return None;
+    }
+    let name_idx = u16_at(bytes, class_entry + 1)? as usize;
+    let utf8_entry = *offsets.get(name_idx)?;
+    if utf8_entry == 0 || *bytes.get(utf8_entry)? != 1 {
+        return None;
+    }
+    let len = u16_at(bytes, utf8_entry + 1)? as usize;
+    let start = utf8_entry + 3;
+    let raw = bytes.get(start..start.checked_add(len)?)?;
+    std::str::from_utf8(raw).ok().map(|s| s.to_string())
 }
 
 /// Inspect a `Class<?>` mirror and return `(is_primitive, is_array, is_hidden)`.
@@ -1658,6 +1781,96 @@ mod tests {
         unsafe { std::mem::transmute::<usize, ObjectRef>(addr) }
     }
 
+    // ---- Observability audit (2026-07-26): retransform seed validation ----
+
+    /// Build a minimal, well-formed class file whose only constant-pool
+    /// entries are the `this_class` Class entry and its Utf8 name.
+    fn minimal_class_file(name: &str) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // magic
+        b.extend_from_slice(&0u16.to_be_bytes()); // minor
+        b.extend_from_slice(&52u16.to_be_bytes()); // major
+        b.extend_from_slice(&3u16.to_be_bytes()); // cp_count (indices 1..2)
+                                                  // #1: CONSTANT_Class -> name_index 2
+        b.push(7);
+        b.extend_from_slice(&2u16.to_be_bytes());
+        // #2: CONSTANT_Utf8
+        b.push(1);
+        b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        b.extend_from_slice(name.as_bytes());
+        // access_flags, this_class
+        b.extend_from_slice(&0x0021u16.to_be_bytes());
+        b.extend_from_slice(&1u16.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn obsaudit_this_class_extracted_from_minimal_class_file() {
+        let bytes = minimal_class_file("com/foo/Bar");
+        assert_eq!(
+            class_file_this_class(&bytes).as_deref(),
+            Some("com/foo/Bar")
+        );
+    }
+
+    /// Long/Double constant-pool entries occupy two indices. If the walker
+    /// got that wrong every subsequent offset would shift and `this_class`
+    /// would resolve to the wrong entry — silently, since the result is still
+    /// a plausible string.
+    #[test]
+    fn obsaudit_this_class_handles_long_double_double_slots() {
+        let name = "a/B";
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(&52u16.to_be_bytes());
+        // indices: 1 = Long (eats 1 and 2), 3 = Class, 4 = Utf8 => cp_count 5
+        b.extend_from_slice(&5u16.to_be_bytes());
+        b.push(5); // CONSTANT_Long
+        b.extend_from_slice(&1234i64.to_be_bytes());
+        b.push(7); // #3 CONSTANT_Class -> name_index 4
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.push(1); // #4 CONSTANT_Utf8
+        b.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        b.extend_from_slice(name.as_bytes());
+        b.extend_from_slice(&0x0021u16.to_be_bytes()); // access_flags
+        b.extend_from_slice(&3u16.to_be_bytes()); // this_class = #3
+
+        assert_eq!(class_file_this_class(&b).as_deref(), Some("a/B"));
+    }
+
+    #[test]
+    fn obsaudit_this_class_rejects_non_class_files() {
+        assert_eq!(class_file_this_class(&[]), None);
+        assert_eq!(class_file_this_class(b"PK\x03\x04not a class"), None);
+        // Right magic, truncated before the constant pool.
+        assert_eq!(
+            class_file_this_class(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 52]),
+            None
+        );
+        // Truncated mid-Utf8: length claims more bytes than are present.
+        let mut short = minimal_class_file("com/foo/Bar");
+        short.truncate(short.len() - 6);
+        assert_eq!(class_file_this_class(&short), None);
+    }
+
+    /// The point of the extractor: a classpath resource that defines a
+    /// *different* class must be distinguishable from the right one, so
+    /// `original_class_bytes` can refuse to seed a retransform with it. The
+    /// scenario is a shaded jar (or a second class loader) carrying its own
+    /// `com/foo/Bar.class` while the live `com/foo/Bar` came from elsewhere
+    /// and has since been evicted from the 16 MiB class_bytes_cache.
+    #[test]
+    fn obsaudit_this_class_distinguishes_shadowed_resource() {
+        let wanted = "com/foo/Bar";
+        let shadowed = minimal_class_file("shaded/com/foo/Bar");
+        let found = class_file_this_class(&shadowed).expect("parseable");
+        assert_ne!(
+            found, wanted,
+            "a shadowed resource must not be mistaken for the requested class"
+        );
+    }
+
     #[test]
     fn add_then_remove_transformer_roundtrip() {
         reset_transformer_chain();
@@ -1818,38 +2031,31 @@ mod tests {
 
     #[test]
     fn approximate_object_size_object() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 5 slots * 16 = 40 + 80 = 120.
+        // The compact header folds locking state into its metadata words:
+        // header (32) + 5 legacy Value slots * 16 = 112.
         let sz = approximate_object_size(ObjectKind::Object, ArrayElementType::Reference, 0, 5);
-        assert_eq!(sz, 120);
+        assert_eq!(sz, 112);
     }
 
     #[test]
     fn approximate_object_size_byte_array() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 10 bytes aligned-up-to-8 = 40 + 16 = 56.
+        // Header (32) + 10 bytes aligned up to 8 = 48.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Byte, 10, 0);
-        assert_eq!(sz, 56);
+        assert_eq!(sz, 48);
     }
 
     #[test]
     fn approximate_object_size_long_array() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 4 * 8 = 40 + 32 = 72.
+        // Header (32) + 4 * 8 = 64.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Long, 4, 0);
-        assert_eq!(sz, 72);
+        assert_eq!(sz, 64);
     }
 
     #[test]
     fn approximate_object_size_ref_array() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 3 refs * 8 = 40 + 24 = 64.
+        // Header (32) + 3 refs * 8 = 56.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Reference, 3, 0);
-        assert_eq!(sz, 64);
+        assert_eq!(sz, 56);
     }
 
     #[test]

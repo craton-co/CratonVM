@@ -7,7 +7,9 @@
 //! The `synthetic-jdk` feature enables additional synthetic-stub-only
 //! registrations for minimal harnesses that do not load the full JDK classes.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{
+    ClassDiscriminator, NativeContext, NativeMethodRegistry, WellKnownClass,
+};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ArrayElementType;
 use cratonvm_types::ClassId;
@@ -20,6 +22,398 @@ use rustc_hash::FxHashMap;
 #[doc(hidden)]
 pub mod identity_hash;
 use identity_hash::seed as ih_seed;
+
+// ---------------------------------------------------------------------------
+// Receiver classification memo (perf/collections-classification-cost)
+//
+// THE COST THIS REMOVES. `NativeContext::class_name_of_id` returns
+// `Option<String>` and the VM implements it as a `class_manager` **RwLock read
+// acquisition plus a heap `String` allocation**, per call
+// (`vm/src/vm/vm_exec.rs`, `…classes.class_manager.read().get_class(id).map(|c|
+// c.name.to_string())`). The receiver-classification predicates below
+// (`is_tree_map_receiver`, `is_chm_receiver`, `is_lhm_receiver`,
+// `is_unmod_wrapper`, `is_bare_java_lang_object`, `uses_native_hashtable_layout`,
+// `unwrap_unmod`, and `map_state`'s own `receiver_class_name`) each called it
+// once per superclass hop, and they compose: `HashMap.get` took 3,
+// `HashMap.put` 3-4 plus 2 more through `map_state` plus a further full walk
+// inside `native_map_put_evict`, `HashMap.remove` 4. A node-path `put`
+// therefore paid on the order of **5-6 lock acquisitions and 5-6 `String`
+// allocations of pure classification overhead before any lookup work** —
+// recomputed on every call, for a receiver whose `ClassId` never changes. That
+// is the shape of the measured 21.2x `HashMap` benchmark row against JDK 25 C2
+// (versus 2.2-2.9x on arithmetic / sieve / matrix) and of its sub-linear
+// scaling: a large fixed per-op constant, not a fragmentation signature.
+//
+// THE FIX. Every one of those questions is a pure function of the receiver's
+// `ClassId`: it depends only on the class's own name and its superclass chain,
+// both immutable after linking (JVMTI redefinition may not change either — the
+// structural check rejects a changed name or supertype). So classify each
+// `ClassId` ONCE into a bitset and answer every later query from a
+// thread-local direct-mapped cache: no lock, no allocation, no `str` compare.
+//
+// WHY A `ClassId` KEY NEEDS NO GENERATION STAMP. Class unloading landed on
+// `dev` this wave, which would ordinarily make a bare `ClassId` key unsound —
+// a recycled id could carry a dead class's classification onto a live one.
+// It does not, because `ClassId`s are never reissued:
+//
+//   * `ClassStore` is a `Vec<Option<Class>>` (`classloading/src/class.rs:892`).
+//   * `ClassStore::remove` (`:1096`) does `…get_mut(id)?.take()?` — it leaves a
+//     `None` TOMBSTONE in the slot; it never shortens the vector.
+//   * `ClassStore::next_id` (`:909`) is `ClassId::new(self.classes.len())` —
+//     the SLOT VECTOR's length, deliberately not `live_count` (which `remove`
+//     does decrement). Its doc comment states the intent: "ClassIds are
+//     deliberately never reused".
+//   * `add` (`:917`) only ever `push`es. Auditing every write to the slot
+//     vector confirms it: the sole mutating accesses in the whole file are that
+//     `push` and the `take` above — nothing ever stores `Some(_)` back into an
+//     existing slot.
+//   * The invariant is pinned by the test
+//     `unloaded_slots_are_tombstoned_and_never_reused` (`:3034`), which unloads
+//     id 0, then asserts `next_id() == 2` and that the next `add` returns 2.
+//
+// So a `ClassId` that once denoted `java/util/TreeMap` denotes it or nothing,
+// forever. A memo entry for an unloaded class is stale but unreachable: the
+// only key that could reach it can never be handed out again. No generation
+// stamp, no unload hook, no invalidation.
+//
+// The cache is still scoped by `vm_identity`, for the unrelated reason that
+// Rust tests stand up several `Vm`s in one process and `ClassId` spaces are
+// per-VM (the same precedent as `PRIMITIVE_WRAPPER_CLASS_CACHE`).
+// ---------------------------------------------------------------------------
+
+/// Exact class is `java/lang/Object` (backs `is_bare_java_lang_object`).
+const CF_EXACT_OBJECT: u16 = 1 << 0;
+/// Exact class is `java/util/HashMap` (backs the integer-overlay entry test in
+/// `native_map_put_evict`).
+const CF_EXACT_HASHMAP: u16 = 1 << 1;
+/// Exact class is one of the seven `cratonvm/internal/Unmodifiable*` views
+/// (backs both `is_unmod_wrapper` and `unwrap_unmod`, whose name sets are
+/// identical).
+const CF_UNMOD_WRAPPER: u16 = 1 << 2;
+/// `is_tree_map_receiver`: `TreeMap` met before `HashMap` / `Object`.
+const CF_TREE_MAP: u16 = 1 << 3;
+/// `is_chm_receiver`: `ConcurrentHashMap` met before `HashMap` / `TreeMap` /
+/// `Object`.
+const CF_CHM: u16 = 1 << 4;
+/// `is_lhm_receiver`: `LinkedHashMap` met before `HashMap` / `TreeMap` /
+/// `Object`.
+const CF_LHM: u16 = 1 << 5;
+/// `uses_native_hashtable_layout`: `Hashtable` ancestry with `Properties`
+/// EXCLUDED — JDK 25 backs `Properties` with a side `ConcurrentHashMap`, not
+/// the native Hashtable bucket layout.
+const CF_HASHTABLE_LAYOUT: u16 = 1 << 6;
+/// Hashtable ancestry with `Properties` INCLUDED. `native_map_put_evict`'s
+/// walk wants this one: a `Properties` receiver still needs
+/// `ensure_hashtable_load_factor`, which `CF_HASHTABLE_LAYOUT` would skip.
+const CF_HASHTABLE_ANCESTRY: u16 = 1 << 7;
+/// `is_native_bucket_map`'s own walk: `HashMap` or `Hashtable` met before
+/// `Object`.
+const CF_BUCKET_MAP_NAME: u16 = 1 << 8;
+/// `class_name_of_id` returned `Some` for this exact class.
+///
+/// `native_map_put_evict` gates its whole family-dispatch block on
+/// `if let Some(name) = ctx.class_name_of_id(cid)`, falling through to the
+/// plain bucket path for a nameless receiver (a class-id-0 synthetic
+/// allocation). Preserving that guard needs the *presence* of a name, not the
+/// name, so it becomes a bit here.
+///
+/// Caching it is sound in both directions. `class_name_of_id` answers `None`
+/// only when `ClassStore::get` misses, i.e. the id is unloaded or not yet
+/// filled — and in either state no live object carries that `ClassId`, so the
+/// stale bit is unreachable: `receiver_facts` is only ever asked about the
+/// runtime class of an object that exists.
+const CF_HAS_NAME: u16 = 1 << 9;
+
+/// Cached classification of one `ClassId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ClassFacts(u16);
+
+impl ClassFacts {
+    #[inline]
+    fn has(self, flag: u16) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+/// How far up a superclass chain the shared walk looks.
+///
+/// The predicates this replaces used `for _ in 0..32` (four of them) or an
+/// unbounded `loop` with a self-cycle guard (`is_tree_map_receiver`). 64 is at
+/// least as permissive as every one of them, so no receiver that used to be
+/// recognised stops being recognised; a chain deeper than 64 does not occur
+/// (`TreeMap` sits 2 hops below `Object`).
+const FACTS_WALK_LIMIT: usize = 64;
+
+/// How many well-known classes the shared walk records along one chain. Every
+/// predicate's decision is made by the FIRST member of its interest set met,
+/// and a real chain crosses at most a couple of them; the cap only bounds the
+/// scratch array.
+const FACTS_CHAIN_MAX: usize = 8;
+
+/// Reproduce one of the original `match`-arm superclass walks: `true` iff a
+/// member of `yes` is met before any member of `no`, scanning the recorded
+/// chain in superclass order. `false` when neither is met (the exhausted-walk
+/// arm every original shared).
+#[inline]
+fn chain_decides(chain: &[WellKnownClass], yes: &[WellKnownClass], no: &[WellKnownClass]) -> bool {
+    for entry in chain {
+        if yes.contains(entry) {
+            return true;
+        }
+        if no.contains(entry) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Classify `cid` — the cold path, run once per `ClassId` per thread.
+///
+/// One superclass walk answers every predicate, where the originals each ran
+/// their own. `ClassDiscriminator::well_known_class` is itself allocation-free
+/// once the handful of interesting classes have resolved, so even this path no
+/// longer materialises a `String` per hop.
+fn classify_class(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
+    use WellKnownClass as W;
+
+    let exact = ctx.well_known_class(cid);
+    let mut chain = [W::Object; FACTS_CHAIN_MAX];
+    let mut len = 0usize;
+    let mut cur = cid;
+    for _ in 0..FACTS_WALK_LIMIT {
+        if let Some(found) = ctx.well_known_class(cur) {
+            if len < FACTS_CHAIN_MAX {
+                chain[len] = found;
+                len += 1;
+            }
+            if matches!(found, W::Object) {
+                // Every original walk treats `java/lang/Object` as terminal.
+                break;
+            }
+        }
+        match ctx.superclass_of(cur) {
+            // `p != cur` is the self-cycle guard the originals carried; a
+            // malformed chain must not spin.
+            Some(parent) if parent != cur => cur = parent,
+            _ => break,
+        }
+    }
+    let chain = &chain[..len];
+
+    let mut flags = 0u16;
+    if matches!(exact, Some(W::Object)) {
+        flags |= CF_EXACT_OBJECT;
+    }
+    if matches!(exact, Some(W::HashMap)) {
+        flags |= CF_EXACT_HASHMAP;
+    }
+    if matches!(
+        exact,
+        Some(
+            W::UnmodifiableMap
+                | W::UnmodifiableList
+                | W::UnmodifiableSet
+                | W::UnmodifiableSortedSet
+                | W::UnmodifiableNavigableSet
+                | W::UnmodifiableEntrySet
+                | W::UnmodifiableCollection
+        )
+    ) {
+        flags |= CF_UNMOD_WRAPPER;
+    }
+    if chain_decides(chain, &[W::TreeMap], &[W::HashMap, W::Object]) {
+        flags |= CF_TREE_MAP;
+    }
+    if chain_decides(
+        chain,
+        &[W::ConcurrentHashMap],
+        &[W::HashMap, W::TreeMap, W::Object],
+    ) {
+        flags |= CF_CHM;
+    }
+    if chain_decides(
+        chain,
+        &[W::LinkedHashMap],
+        &[W::HashMap, W::TreeMap, W::Object],
+    ) {
+        flags |= CF_LHM;
+    }
+    if chain_decides(
+        chain,
+        &[W::Hashtable],
+        &[W::Properties, W::HashMap, W::Object],
+    ) {
+        flags |= CF_HASHTABLE_LAYOUT;
+    }
+    if chain_decides(chain, &[W::Hashtable], &[W::HashMap, W::Object]) {
+        flags |= CF_HASHTABLE_ANCESTRY;
+    }
+    if chain_decides(chain, &[W::HashMap, W::Hashtable], &[W::Object]) {
+        flags |= CF_BUCKET_MAP_NAME;
+    }
+    // The one remaining `class_name_of_id` on this path, and it runs once per
+    // `ClassId` per thread rather than once per map operation. A well-known
+    // class necessarily has a name, so the common case skips the call.
+    if exact.is_some() || ctx.class_name_of_id(cid).is_some() {
+        flags |= CF_HAS_NAME;
+    }
+    ClassFacts(flags)
+}
+
+/// Ways in the direct-mapped classification cache. A power of two so the index
+/// is a mask.
+///
+/// Direct-mapped rather than a growable map on purpose: a `Vec` indexed by
+/// `ClassId` would be sound (ids are never reissued — see the module comment)
+/// but its footprint scales with the application's class count, per thread. A
+/// fixed 512 slots is ~4 KiB per thread and holds every map class a workload
+/// actually dispatches on. A tag collision costs a re-classification, never a
+/// wrong answer: the slot stores the `ClassId` it was filled for and is only
+/// trusted on an exact match.
+const RECEIVER_FACTS_WAYS: usize = 512;
+
+/// Empty-slot marker. A real `ClassId` is an index into `ClassStore`'s slot
+/// vector, so `u32::MAX` is unreachable.
+const RECEIVER_FACTS_EMPTY: u32 = u32::MAX;
+
+#[derive(Clone, Copy)]
+struct FactsSlot {
+    class_id: u32,
+    facts: ClassFacts,
+}
+
+impl FactsSlot {
+    const EMPTY: Self = Self {
+        class_id: RECEIVER_FACTS_EMPTY,
+        facts: ClassFacts(0),
+    };
+}
+
+struct ReceiverFactsCache {
+    /// `None` until first use; see the module comment on `vm_identity` scoping.
+    vm: Option<usize>,
+    slots: [FactsSlot; RECEIVER_FACTS_WAYS],
+}
+
+impl ReceiverFactsCache {
+    const fn new() -> Self {
+        Self {
+            vm: None,
+            slots: [FactsSlot::EMPTY; RECEIVER_FACTS_WAYS],
+        }
+    }
+}
+
+thread_local! {
+    static RECEIVER_FACTS: std::cell::RefCell<ReceiverFactsCache> =
+        const { std::cell::RefCell::new(ReceiverFactsCache::new()) };
+}
+
+/// Direct-mapped slot for `class_id`. Multiplicative mix then take the high
+/// bits, the same shape as `obj_key_shard_for`, so ids loaded consecutively
+/// (as the `java/util` classes are) do not all land in one slot.
+#[inline]
+fn facts_slot_index(class_id: u32) -> usize {
+    let mixed = (class_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((mixed >> 55) as usize) & (RECEIVER_FACTS_WAYS - 1)
+}
+
+/// Every classification question about `cid`, answered from the thread-local
+/// cache. Lock-free and allocation-free after the first call per `ClassId`.
+#[inline]
+fn class_facts(ctx: &dyn NativeContext, cid: ClassId) -> ClassFacts {
+    let raw = cid.as_u32();
+    if raw == RECEIVER_FACTS_EMPTY {
+        // Not a reachable id; never let it match the empty marker.
+        return classify_class(ctx, cid);
+    }
+    let vm = ctx.vm_identity();
+    let index = facts_slot_index(raw);
+    let hit = RECEIVER_FACTS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.vm != Some(vm) {
+            *cache = ReceiverFactsCache::new();
+            cache.vm = Some(vm);
+        }
+        let slot = cache.slots[index];
+        (slot.class_id == raw).then_some(slot.facts)
+    });
+    if let Some(facts) = hit {
+        return facts;
+    }
+    // Cold. The borrow above is released first: `classify_class` re-enters the
+    // VM, which must never find this `RefCell` already borrowed.
+    let facts = classify_class(ctx, cid);
+    RECEIVER_FACTS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.vm == Some(vm) {
+            cache.slots[index] = FactsSlot {
+                class_id: raw,
+                facts,
+            };
+        }
+    });
+    facts
+}
+
+/// `class_facts` for a heap object's runtime class.
+#[inline]
+fn receiver_facts(ctx: &dyn NativeContext, obj: ObjectRef) -> ClassFacts {
+    class_facts(ctx, ctx.class_id_of_object(obj))
+}
+
+/// Ways in the direct-mapped receiver-class-NAME cache.
+///
+/// Separate from `RECEIVER_FACTS` because an `Rc<str>` is not `Copy`, and much
+/// smaller because only two callers need the name itself rather than a
+/// classification (`map_state`, which passes it to `resolve_field_index`, and
+/// `native_map_put_evict`'s `ensure_hashtable_load_factor`).
+const RECEIVER_NAMES_WAYS: usize = 64;
+
+thread_local! {
+    /// `(vm_identity, [(ClassId, name); WAYS])`. Handing out an
+    /// `Rc<str>` clone is a non-atomic refcount bump — no lock, no allocation,
+    /// where `class_name_of_id` was a `class_manager` read lock plus a fresh
+    /// `String` every call. Sound for the same never-reissued-`ClassId` reason
+    /// as `RECEIVER_FACTS`; a class name is immutable after linking.
+    static RECEIVER_NAMES: std::cell::RefCell<(
+        Option<usize>,
+        [Option<(u32, std::rc::Rc<str>)>; RECEIVER_NAMES_WAYS],
+    )> = std::cell::RefCell::new((None, std::array::from_fn(|_| None)));
+}
+
+/// The binary name of `cid`, memoized per thread.
+///
+/// `None` exactly when `class_name_of_id` returns `None` (unnamed / synthetic
+/// class), and a `None` is deliberately not cached — the classification memo's
+/// argument for caching successes does not extend to a lookup that can start
+/// succeeding later.
+fn class_name_rc(ctx: &dyn NativeContext, cid: ClassId) -> Option<std::rc::Rc<str>> {
+    let raw = cid.as_u32();
+    let vm = ctx.vm_identity();
+    let index = (facts_slot_index(raw)) & (RECEIVER_NAMES_WAYS - 1);
+    let hit = RECEIVER_NAMES.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0 != Some(vm) {
+            *cache = (Some(vm), std::array::from_fn(|_| None));
+        }
+        match &cache.1[index] {
+            Some((cached_id, name)) if *cached_id == raw => Some(name.clone()),
+            _ => None,
+        }
+    });
+    if hit.is_some() {
+        return hit;
+    }
+    let name: std::rc::Rc<str> = std::rc::Rc::from(ctx.class_name_of_id(cid)?.as_str());
+    RECEIVER_NAMES.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.0 == Some(vm) {
+            cache.1[index] = Some((raw, name.clone()));
+        }
+    });
+    Some(name)
+}
 
 // ---------------------------------------------------------------------------
 // Widened side-table key (MEDIUM finding: 32-bit identity-hash aliasing).
@@ -202,7 +596,7 @@ fn obj_key_shard_for(hash: u32) -> &'static ObjKeyShard {
 /// Locks are poison-recovered (`into_inner`) so a panic elsewhere can never
 /// leave stale state stranded and re-aliasable.
 fn clear_overlay_entries_for_key(key: usize, owner_addr: usize) {
-    hm_int_fast_table()
+    hm_int_fast_shard_for(key)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&key);
@@ -474,6 +868,8 @@ impl DenseIntEntries {
 
 #[cfg(test)]
 mod dense_int_entries_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     fn object(address: usize) -> ObjectRef {
@@ -510,36 +906,144 @@ mod dense_int_entries_tests {
 #[derive(Default)]
 struct HmIntFastState {
     entries: DenseIntEntries,
+    /// Runtime class of every key currently stored in `entries`; `None` only
+    /// before the overlay's first insert.
+    ///
+    /// CORRECTNESS (cross-wrapper key aliasing). `unbox_wrapper` collapses
+    /// `Integer`, `Short`, `Byte`, `Character` AND `Boolean` onto the same
+    /// `Value::Int`, so keying this overlay on that `i32` alone made
+    /// `Integer.valueOf(65)` and `Character.valueOf('A')` — or `Boolean.TRUE`
+    /// and `Integer.valueOf(1)` — the SAME overlay entry. Real `HashMap` keeps
+    /// them apart: every JDK wrapper's `equals` starts with an `instanceof` of
+    /// its own type, so wrappers of different classes are never equal. The
+    /// symptom was a silent wrong answer, not a crash:
+    ///
+    /// ```java
+    /// Map<Object, String> m = new HashMap<>();
+    /// m.put(Integer.valueOf(65), "int");
+    /// m.put(Character.valueOf('A'), "char");
+    /// m.size();                        // JDK 2, overlay 1
+    /// m.get(Integer.valueOf(65));      // JDK "int", overlay "char"
+    /// ```
+    ///
+    /// Recording the wrapper class of the first key an overlay ever saw and
+    /// refusing any later key of a different class restores the contract: the
+    /// mismatching key falls through to `materialize_hm_int_fast` plus the
+    /// ordinary node path, which compares through `map_keys_equal` (itself
+    /// class-guarded — see there). The check costs one `class_id_of_object`,
+    /// a heap-header read with no `class_manager` lock and no `String`
+    /// allocation, so the Integer-keyed path this overlay exists for is
+    /// unaffected.
+    key_class: Option<ClassId>,
 }
 
-fn hm_int_fast_table() -> &'static Mutex<FxHashMap<usize, HmIntFastState>> {
-    static TABLE: std::sync::OnceLock<Mutex<FxHashMap<usize, HmIntFastState>>> =
+/// True when `key_class` may be stored in / looked up against `state`.
+/// A `None` (fresh) overlay accepts any wrapper class and adopts it.
+#[inline]
+fn hm_int_fast_key_class_ok(state: &HmIntFastState, key_class: ClassId) -> bool {
+    match state.key_class {
+        Some(existing) => existing == key_class,
+        None => true,
+    }
+}
+
+// PERF (hm-int-fast-shard): the exact-`HashMap` integer overlay used to be a
+// SINGLE process-global `Mutex<FxHashMap<..>>`, taken on EVERY overlay
+// `put`/`get`/`remove`/`containsKey`/`size`/`clear`/`keySet`/`values`/
+// `entrySet` — for all maps, on all threads. Since the overlay is the
+// authoritative store for a fresh `HashMap<Integer, ?>`, that one lock
+// serialized the single hottest collection path in the VM across every thread
+// in the process.
+//
+// Sharding follows the identity-hash registry precedent immediately above
+// (`OBJ_KEY_SHARDS`, `PERF (registry-shard)`), and the monitor table sharded 64
+// ways elsewhere this wave. It is semantics-preserving for the same reason:
+// the shard is chosen deterministically from the overlay key alone, and an
+// entry lives entirely inside one shard, so every keyed operation sees exactly
+// the map it saw before — only the lock granularity changes.
+//
+// ENUMERATION. Three paths walk the whole table rather than one key, and each
+// must iterate all shards to stay equivalent to the former single map:
+//   * `for_each_overlay_ref` — GC root scan and post-move remap. Missing a
+//     shard here would drop a root (use-after-free), so it iterates every
+//     shard, poison-recovering each guard exactly as before.
+//   * `gc_prune_dead_collection_overlays` — batched removal of dead keys. It
+//     now groups the dead keys by shard so the per-GC lock count stays
+//     proportional to the shard count, not to the number of dead keys.
+//   * `overlay_roots_for_owner` — per-owner root collection; it looks each key
+//     up individually, so it simply routes through `hm_int_fast_shard_for`.
+const HM_INT_FAST_SHARDS: usize = 64;
+
+type HmIntFastShard = Mutex<FxHashMap<usize, HmIntFastState>>;
+
+fn hm_int_fast_shards() -> &'static [HmIntFastShard; HM_INT_FAST_SHARDS] {
+    static TABLE: std::sync::OnceLock<[HmIntFastShard; HM_INT_FAST_SHARDS]> =
         std::sync::OnceLock::new();
-    TABLE.get_or_init(|| Mutex::new(FxHashMap::default()))
+    TABLE.get_or_init(|| std::array::from_fn(|_| Mutex::new(FxHashMap::default())))
+}
+
+/// The one shard that may hold overlay key `key`.
+///
+/// An overlay key is `widened_obj_key`'s packed `(identity_hash << 32) |
+/// generation`, so the low bits are a small dense generation and the entropy
+/// lives high. Mix then take the top bits, the same shape as
+/// `obj_key_shard_for`, so keys do not pile into one shard.
+#[inline]
+fn hm_int_fast_shard_index(key: usize) -> usize {
+    let mixed = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((mixed >> 58) as usize) & (HM_INT_FAST_SHARDS - 1)
+}
+
+#[inline]
+fn hm_int_fast_shard_for(key: usize) -> &'static HmIntFastShard {
+    &hm_int_fast_shards()[hm_int_fast_shard_index(key)]
 }
 
 thread_local! {
-    static HM_INT_FAST_LAST_KEY: std::cell::Cell<Option<(usize, usize)>> =
+    /// Single-entry memo for [`hm_int_fast_obj_key`]:
+    /// `(raw pointer, identity hash, overlay key)`.
+    static HM_INT_FAST_LAST_KEY: std::cell::Cell<Option<(usize, i32, usize)>> =
         const { std::cell::Cell::new(None) };
 }
 
 #[inline]
 fn hm_int_fast_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let ptr = this.as_ptr() as usize;
-    if let Some((_, key)) = HM_INT_FAST_LAST_KEY
+    // GC-SOUNDNESS: the memo used to be validated by raw pointer ALONE. A raw
+    // address is not a stable object identity under a moving/compacting
+    // collector: once a map dies and its address is handed to a fresh
+    // allocation, the pointer test still passed and this returned the DEAD
+    // map's overlay key. The new map would then read and write its entries
+    // under the wrong key — invisible to any other thread (whose own memo is
+    // cold and resolves the correct key through `widened_obj_key`), and
+    // invisible to `gc_prune_dead_collection_overlays`, which walks the key
+    // registry and would drop those entries as belonging to a dead object.
+    //
+    // Identity hashes are minted from a counter at allocation
+    // (`VmHeap::next_identity_hash`), never derived from the address, so the
+    // recycling object always presents a different hash — validating it closes
+    // the hole. `native_map_init` still purges a same-address predecessor's
+    // overlay entry (see there); that stays a pointer-only match on purpose,
+    // since its job is precisely to evict the previous tenant.
+    //
+    // Cost: `identity_hash_code` is a header word read. The memo still earns
+    // its keep — the path it skips (`widened_obj_key`) takes a sharded global
+    // mutex and scans the hash's slot vector.
+    let hash = ctx.identity_hash_code(this);
+    if let Some((_, _, key)) = HM_INT_FAST_LAST_KEY
         .with(|cache| cache.get())
-        .filter(|(cached_ptr, _)| *cached_ptr == ptr)
+        .filter(|(cached_ptr, cached_hash, _)| *cached_ptr == ptr && *cached_hash == hash)
     {
         return key;
     }
     let key = widened_obj_key(ctx, this);
-    HM_INT_FAST_LAST_KEY.with(|cache| cache.set(Some((ptr, key))));
+    HM_INT_FAST_LAST_KEY.with(|cache| cache.set(Some((ptr, hash, key))));
     key
 }
 
 fn hm_int_fast_len(ctx: &dyn NativeContext, this: ObjectRef) -> Option<usize> {
     let key = hm_int_fast_obj_key(ctx, this);
-    hm_int_fast_table()
+    hm_int_fast_shard_for(key)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
@@ -561,11 +1065,21 @@ fn try_hm_int_fast_put(
         _ => return None,
     };
     let object_key = hm_int_fast_obj_key(ctx, this);
+    // See `HmIntFastState::key_class`: a key whose wrapper class differs from
+    // the one the overlay already holds is a DIFFERENT `HashMap` key in the
+    // JDK, so it must not reuse the overlay's `i32` slot. Returning `None`
+    // sends the caller down the materialize + node path, which distinguishes
+    // the two through `map_keys_equal`.
+    let key_class = ctx.class_id_of_object(key_ref);
     {
-        let mut table = hm_int_fast_table()
+        let mut table = hm_int_fast_shard_for(object_key)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(state) = table.get_mut(&object_key) {
+            if !hm_int_fast_key_class_ok(state, key_class) {
+                return None;
+            }
+            state.key_class = Some(key_class);
             let old = state
                 .entries
                 .insert(int_key, (key_ref, value))
@@ -579,10 +1093,14 @@ fn try_hm_int_fast_put(
     }
 
     let old = {
-        let mut table = hm_int_fast_table()
+        let mut table = hm_int_fast_shard_for(object_key)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let state = table.entry(object_key).or_default();
+        if !hm_int_fast_key_class_ok(state, key_class) {
+            return None;
+        }
+        state.key_class = Some(key_class);
         let old = state
             .entries
             .insert(int_key, (key_ref, value))
@@ -606,10 +1124,17 @@ fn try_hm_int_fast_get(
         _ => return None,
     };
     let object_key = hm_int_fast_obj_key(ctx, this);
-    let table = hm_int_fast_table()
+    let key_class = ctx.class_id_of_object(key_ref);
+    let table = hm_int_fast_shard_for(object_key)
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let state = table.get(&object_key)?;
+    // Wrapper-class mismatch (see `HmIntFastState::key_class`): this is not a
+    // key this overlay can answer for. Fall through to the node path rather
+    // than reporting the numerically-equal entry of a different wrapper type.
+    if !hm_int_fast_key_class_ok(state, key_class) {
+        return None;
+    }
     Some(Ok(Some(
         state
             .entries
@@ -625,7 +1150,7 @@ fn materialize_hm_int_fast(
 ) -> Result<ObjectRef, MethodCallFailed> {
     let object_key = hm_int_fast_obj_key(ctx, this);
     let int_keys: Vec<i32> = {
-        let table = hm_int_fast_table()
+        let table = hm_int_fast_shard_for(object_key)
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let Some(state) = table.get(&object_key) else {
@@ -639,7 +1164,7 @@ fn materialize_hm_int_fast(
     set_map_size(ctx, current, 0);
     for int_key in int_keys {
         let (key_ref, value) = {
-            let table = hm_int_fast_table()
+            let table = hm_int_fast_shard_for(object_key)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             table
@@ -665,7 +1190,7 @@ fn materialize_hm_int_fast(
         )?;
         ctx.unpin_native_roots(iter_pin_base);
     }
-    hm_int_fast_table()
+    hm_int_fast_shard_for(object_key)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&object_key);
@@ -708,7 +1233,7 @@ pub fn jit_overlay_hashmap_put(
 // Cached debug-flag probes.
 //
 // These flags are read from the OS environment on every native call in the
-// original code (`std::env::var`/`var_os`), which is a syscall-backed lookup
+// original code (`cratonvm_types::flags::runtime_var`/`var_os`), which is a syscall-backed lookup
 // on the hot path. The values never change for the lifetime of the process,
 // so we resolve each exactly once into a `OnceLock<bool>` and reference the
 // cached boolean thereafter. Behaviour is identical — the flag is still
@@ -718,19 +1243,19 @@ pub fn jit_overlay_hashmap_put(
 /// `true` iff `CRATONVM_HM_TRACE` is set (HashMap equals/contract tracing).
 fn dbg_hm_trace() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HM_TRACE").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_HM_TRACE").is_some())
 }
 
 /// `true` iff `CRATONVM_HS_ITR_DBG` is set (HashSet iterator tracing).
 fn dbg_hs_itr() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HS_ITR_DBG").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_HS_ITR_DBG").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_SBLOAD` is set (synthetic-build-load tracing).
 fn dbg_sbload() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_SBLOAD").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SBLOAD").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_KCBOOL` is set — traces enum-keyed map lookups,
@@ -742,14 +1267,14 @@ fn dbg_sbload() -> bool {
 /// constant object exists (same `(class_id, ordinal)`, different pointer).
 fn dbg_kcbool() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_KCBOOL").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_KCBOOL").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_HMPUT` is set (HashMap put node-walk tracing).
 /// Cached to avoid a syscall-backed env probe per node on the hot put path.
 fn dbg_hmput() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_HMPUT").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HMPUT").is_some())
 }
 
 /// Diagnostic: on an enum-keyed `Map.get` miss, dump the lookup key's enum
@@ -808,6 +1333,7 @@ fn native_unsorted_set_comparator(
 
 /// Register all collection native methods.
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
+    register_gc_root_provider();
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_arraylist_natives(registry);
@@ -1547,6 +2073,28 @@ fn normalize_for_compare(ctx: &dyn NativeContext, v: &Value) -> Value {
 /// Check if two Values refer to the same object (by identity) or are equal
 /// strings/wrapper values. Used by ArrayList.contains/indexOf and HashMap key lookup.
 fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
+    // Two BOXED wrappers of different runtime classes are never `equals` in
+    // Java (each wrapper's `equals` opens with an `instanceof` of its own
+    // type), but `normalize_for_compare` below erases the class and leaves
+    // only the primitive — so `list.contains(Long.valueOf(1L))` reported true
+    // for a list holding `Integer.valueOf(1)`, and `map.containsValue('A')`
+    // reported true for a map holding `Integer.valueOf(65)`. Mirrors the guard
+    // in `map_keys_equal`; see there for the full rationale.
+    //
+    // Scoped to the object/object case on purpose: when one side is a RAW
+    // `Value::Int`/`Value::Long` there is no Java wrapper class to compare and
+    // the cross-type numeric arms below stay in force, since that comparison
+    // is about how the VM represented the value, not about two Java objects.
+    // The ClassId inequality test short-circuits the two `unbox_wrapper` calls
+    // in the overwhelmingly common same-class case.
+    if let (Value::Object(Some(oa)), Value::Object(Some(ob))) = (a, b) {
+        if ctx.class_id_of_object(*oa) != ctx.class_id_of_object(*ob)
+            && unbox_wrapper(ctx, *oa).is_some()
+            && unbox_wrapper(ctx, *ob).is_some()
+        {
+            return false;
+        }
+    }
     // Normalize: unbox wrapper objects to primitives for comparison
     let na = normalize_for_compare(ctx, a);
     let nb = normalize_for_compare(ctx, b);
@@ -1572,8 +2120,18 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
         (Value::Object(None), Value::Object(None)) => true,
         (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Double(a), Value::Double(b)) => a == b,
+        // `Float.equals`/`Double.equals` compare bit patterns, not `==`:
+        // NaN equals itself and +0.0 != -0.0. Every caller of `values_equal`
+        // implements a Java `equals`-semantics operation (`List.contains`,
+        // `List.indexOf`, `List.remove(Object)`, `Map.containsValue`), so the
+        // bit semantics is the correct one for all of them. With `==`,
+        // `list.contains(Double.NaN)` was false for a list that held NaN.
+        (Value::Float(a), Value::Float(b)) => {
+            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+        }
+        (Value::Double(a), Value::Double(b)) => {
+            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+        }
         // Cross-type numeric: Int vs Long
         (Value::Int(a), Value::Long(b)) => (*a as i64) == *b,
         (Value::Long(a), Value::Int(b)) => *a == (*b as i64),
@@ -1771,8 +2329,10 @@ fn alloc_arraylist_with(ctx: &mut dyn NativeContext, buf: ObjectRef, init_size: 
 
 #[inline]
 fn is_bare_java_lang_object(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    ctx.object_num_fields(obj) == 0
-        && ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some("java/lang/Object")
+    // PERF (collections-classification-cost): field count first — it is a
+    // header read, and it is false for every real map, so the memo lookup is
+    // usually skipped outright. `native_map_put_evict` calls this on entry.
+    ctx.object_num_fields(obj) == 0 && receiver_facts(ctx, obj).has(CF_EXACT_OBJECT)
 }
 
 /// `true` iff `obj` actually has the `java.util.ArrayList` field layout, so
@@ -2350,7 +2910,7 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn altrace_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some())
 }
 
 // ALTRACE helper: resolve a Value to "ptr cls=... [str=...]" so a trace line
@@ -2724,7 +3284,7 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs={}",
             args.len()
@@ -2824,7 +3384,7 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let elems = al_or_collection_elements(ctx, this);
     let size = elems.len();
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array_typed HIT nargs={} size={} template_some={}",
             args.len(),
@@ -3980,7 +4540,11 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     // `new AnnotationAttributes(annotationType, false)`), the absolute
     // slot 0 is NOT necessarily the `table` field. Fall back to the
     // JDK-resolved `table` slot when slot 0 doesn't yield a bucket array.
+    let hashtable_layout = uses_native_hashtable_layout(ctx, this);
     let buckets = buckets_slot0.or_else(|| {
+        if hashtable_layout {
+            return None;
+        }
         let slot = ctx.resolve_field_index("java/util/HashMap", "table")?;
         if slot == MAP_FIELD_BUCKETS || slot >= ctx.object_num_fields(this) {
             return None;
@@ -4005,8 +4569,57 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     // so subsequent reads see `Object(None)` instead of `Int(0)` and we
     // would fall through to slot 2 (`MAP_FIELD_CAPACITY`) and report the
     // bucket count as the size.
+    // BUG fix (Tomcat Jasper/ecj JSP-compile NPE — TestDefaultServlet
+    // .testBug57601 / TestMapperWebapps.testWelcomeFileStrict): this used to
+    // hardcode `"java/util/HashMap"` regardless of the receiver's actual
+    // class. For a genuine `HashMap`/`LinkedHashMap` that is harmless (same
+    // class, same slot). For a `Hashtable` receiver — a completely
+    // different, unrelated class hierarchy that merely shares this generic
+    // bucket-map native machinery — resolving "size" against HashMap's OWN
+    // layout can land on whatever field happens to sit at that same
+    // absolute index in Hashtable's layout, which is NOT a "size" field at
+    // all (Hashtable's own count-tracking field is named `count`, and
+    // separately `bump_map_mod_count` — correctly, via `get/set_field_by_name`
+    // — resolves and increments Hashtable's real `modCount` field by the
+    // OBJECT's own class). If HashMap's "size" slot and Hashtable's
+    // "modCount" slot coincide, `set_map_size`'s write and the very next
+    // `bump_map_mod_count` call both land on the identical physical slot:
+    // size is set to N, then immediately incremented again to N+1 as a
+    // side effect of "bumping modCount" — silently DOUBLING the tracked
+    // size on every put. That corrupted `Hashtable(11).size()` (used by
+    // ecj's `CompilationResult.getClassFiles()`: `new
+    // ClassFile[compiledTypes.size()]` then `.toArray(classFiles)`),
+    // leaving the caller-supplied array null-padded past the real entry
+    // count and NPEing in `CompilationUnitDeclaration.cleanUp()`. Resolve
+    // against the RECEIVER's own actual class (matching
+    // `get_field_by_name`/`bump_map_mod_count`) instead of a hardcoded
+    // class name — for HashMap/LinkedHashMap this is a no-op (same
+    // inherited field, same index); for every other class it correctly
+    // returns `None` (they have no field literally named "size") and falls
+    // through to the legacy slot-1 convention below, which nothing else
+    // independently mutates.
+    //
+    // PERF (collections-classification-cost): `class_name_of_id` is a
+    // `class_manager` read lock plus a fresh heap `String` on every call, and
+    // `map_state` runs on every node-path map operation. `class_name_rc`
+    // memoizes the name per `ClassId` (sound because ids are never reissued —
+    // see the `class_facts` module comment) and hands out an `Rc<str>` clone:
+    // a non-atomic refcount bump, no lock, no allocation. The resolved name is
+    // byte-identical, so `resolve_field_index` sees exactly what it saw before;
+    // the field index itself is deliberately NOT memoized, since JVMTI
+    // redefinition may change a class's field layout while its name and
+    // supertypes stay fixed.
+    let receiver_class_name: std::rc::Rc<str> =
+        class_name_rc(ctx, ctx.class_id_of_object(this)).unwrap_or_else(|| std::rc::Rc::from(""));
     let size_by_name = ctx
-        .resolve_field_index("java/util/HashMap", "size")
+        .resolve_field_index(
+            if hashtable_layout {
+                "java/util/Hashtable"
+            } else {
+                &*receiver_class_name
+            },
+            if hashtable_layout { "count" } else { "size" },
+        )
         .filter(|&slot| slot < ctx.object_num_fields(this))
         .map(|slot| ctx.get_field(this, slot));
     // spring-bug-09: bound the slot-2 fallbacks below. `map_state` is invoked on
@@ -4060,7 +4673,22 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
 /// coercion that mangles slot 1 (= `AbstractMap.values: Collection`).
 fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
     ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
-    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "size") {
+    // See the matching comment in `map_state` — resolve "size" against the
+    // RECEIVER's own actual class, not a hardcoded "java/util/HashMap". For
+    // a non-HashMap-family receiver (e.g. `Hashtable`) this correctly finds
+    // no such field instead of colliding with an unrelated field (observed:
+    // Hashtable's own `modCount`) at whatever index HashMap's "size"
+    // happens to occupy.
+    // PERF (collections-classification-cost): memoized per `ClassId` — see the
+    // matching note in `map_state`.
+    let receiver_class_name: std::rc::Rc<str> =
+        class_name_rc(ctx, ctx.class_id_of_object(this)).unwrap_or_else(|| std::rc::Rc::from(""));
+    let (class_name, field_name) = if uses_native_hashtable_layout(ctx, this) {
+        ("java/util/Hashtable", "count")
+    } else {
+        (&*receiver_class_name, "size")
+    };
+    if let Some(slot) = ctx.resolve_field_index(class_name, field_name) {
         if slot != MAP_FIELD_SIZE && slot < ctx.object_num_fields(this) {
             ctx.set_field(this, slot, Value::Int(size));
         }
@@ -4348,11 +4976,52 @@ fn map_keys_equal(
     // `class_manager` RwLock read + allocating class-name lookup per call
     // just to fail for every Integer/Long/etc. key).
     if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
+        // JDK contract: every wrapper's `equals(Object)` opens with an
+        // `instanceof` of its OWN type, so two wrappers of DIFFERENT classes
+        // are never equal. Without this guard the unboxed comparison below
+        // conflated key types that real `HashMap` keeps apart, because
+        // `unbox_wrapper` maps Integer/Short/Byte/Character/Boolean onto the
+        // same `Value::Int` and the Int-vs-Long arms cross-compare explicitly:
+        //
+        //   Map<Object,String> m = new HashMap<>();
+        //   m.put(Integer.valueOf(1), "int");
+        //   m.put(Long.valueOf(1L),   "long");   // JDK: 2 entries
+        //
+        // `Integer.hashCode()==1` and `Long.hashCode()==1`, so both keys land
+        // in the same bucket; the chain walk then found the Integer node
+        // "equal" and OVERWROTE it -> size()==1 and get(1) == "long". Same for
+        // Integer.valueOf(65) vs Character.valueOf('A') (both hash 65) and
+        // Boolean.TRUE vs Integer.valueOf(1) (Boolean unboxes to Int(1)).
+        //
+        // Deliberately compared by ClassId, not by class name: it is a
+        // heap-header read, with no `class_manager` lock and no `String`
+        // allocation, on the hottest comparison in the map natives. The
+        // same-class Int-vs-Long arms are KEPT: within one wrapper class they
+        // only paper over a representational difference in how the VM stored
+        // the value field, never over two genuinely distinct Java keys.
+        if ctx.class_id_of_object(a) != ctx.class_id_of_object(b) {
+            return Ok(false);
+        }
         return Ok(match (pa, pb) {
             (Value::Int(x), Value::Int(y)) => x == y,
             (Value::Long(x), Value::Long(y)) => x == y,
-            (Value::Float(x), Value::Float(y)) => x == y,
-            (Value::Double(x), Value::Double(y)) => x == y,
+            // `Float.equals`/`Double.equals` compare floatToIntBits /
+            // doubleToLongBits, NOT `==`. Two consequences that plain `==` got
+            // backwards, both silent-wrong-answer:
+            //   * NaN equals itself, so `m.put(Double.NaN, v)` followed by
+            //     `m.get(Double.NaN)` MUST find the entry; with `==` the key
+            //     could never be looked up again (get/remove/containsKey all
+            //     returned "absent" for a key the map demonstrably held).
+            //   * +0.0 does NOT equal -0.0, so they are two distinct keys;
+            //     with `==` the second put silently overwrote the first.
+            // `is_nan() || to_bits()` reproduces floatToIntBits exactly,
+            // including its canonicalisation of every NaN payload.
+            (Value::Float(x), Value::Float(y)) => {
+                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+            }
+            (Value::Double(x), Value::Double(y)) => {
+                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+            }
             (Value::Int(x), Value::Long(y)) => (x as i64) == y,
             (Value::Long(x), Value::Int(y)) => x == (y as i64),
             _ => false,
@@ -4552,11 +5221,25 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
         None
     };
 
-    let (_old_buckets0, size, old_cap) = map_state(ctx, this);
+    let (old_buckets0, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
         return; // cannot grow further
     }
-    let new_cap = std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY);
+    // `native_map_put` also routes here to MATERIALISE a table for a map that
+    // has none (a JDK-bytecode constructor that leaves `table` null, or any
+    // path that skipped the synthetic `<init>` native). That is not a growth
+    // step: HotSpot's `resize()` on a null table allocates
+    // DEFAULT_INITIAL_CAPACITY buckets, it does not double. Doubling gave
+    // every lazily-initialised map a 32-bucket table where HotSpot has 16,
+    // which shifts every key's bucket index and makes iteration order diverge
+    // from HotSpot for the identical set of keys (found via a json-smart
+    // parse -> serialize -> re-parse round trip, where one map came from the
+    // interpreter and the other from JIT-compiled code).
+    let new_cap = if old_buckets0.is_none() {
+        std::cmp::max(old_cap, MAP_DEFAULT_CAPACITY as i32)
+    } else {
+        std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY)
+    };
     // gcstress residual face-1 fix — `alloc_ref_array` can trigger a moving
     // young GC (deterministic under CRATONVM_DBG_GC_STRESS) that relocates
     // `this` and its bucket array. Both were captured as bare Rust locals
@@ -4759,14 +5442,20 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
     // reads slot 0) would see the new buckets, but any JDK-bytecode path
     // that reads `table` directly would see null. Also keeps the two
     // storage locations in sync.
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(slot) = table_slot {
-        if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
-            ctx.set_field_volatile(this, slot, Value::Object(Some(new_buckets)));
+    if !uses_native_hashtable_layout(ctx, this) {
+        let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+        if let Some(slot) = table_slot {
+            if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
+                ctx.set_field_volatile(this, slot, Value::Object(Some(new_buckets)));
+            }
         }
-    }
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+        if table_slot != Some(MAP_FIELD_CAPACITY) {
+            ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+        }
+    } else if let Some(slot) = ctx.resolve_field_index("java/util/Hashtable", "threshold") {
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Int((new_cap * 3) / 4));
+        }
     }
     ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
 }
@@ -4807,17 +5496,18 @@ fn properties_backing_chm(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Ob
 /// backing collection it wraps (recursing through nested wrappers); otherwise
 /// return `obj` unchanged. Lets the bucket-walking map helpers transparently
 /// see through `Collections.unmodifiableMap` / `Map.of` results.
+///
+/// PERF (collections-classification-cost): the name set tested here is exactly
+/// `is_unmod_wrapper`'s (`{Map, List, Set, SortedSet, NavigableSet, EntrySet,
+/// Collection}`), so both read the one `CF_UNMOD_WRAPPER` bit out of the
+/// per-`ClassId` memo instead of allocating a `String` under the
+/// `class_manager` lock. `unwrap_unmod` is called from `map_state` and from
+/// every `map_collect_*`, so it was on the `HashMap` hot path for maps that are
+/// not wrappers at all.
 fn unwrap_unmod(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
-    let cid = ctx.class_id_of_object(obj);
-    if let Some(name) = ctx.class_name_of_id(cid) {
-        if name == UNMOD_MAP_CLASS
-            || name == UNMOD_LIST_CLASS
-            || is_unmod_set_class(&name)
-            || name == UNMOD_COLLECTION_CLASS
-        {
-            if let Value::Object(Some(inner)) = ctx.get_field(obj, UNMOD_FIELD_BACKING) {
-                return unwrap_unmod(ctx, inner);
-            }
+    if receiver_facts(ctx, obj).has(CF_UNMOD_WRAPPER) {
+        if let Value::Object(Some(inner)) = ctx.get_field(obj, UNMOD_FIELD_BACKING) {
+            return unwrap_unmod(ctx, inner);
         }
     }
     obj
@@ -4826,7 +5516,7 @@ fn unwrap_unmod(ctx: &dyn NativeContext, obj: ObjectRef) -> ObjectRef {
 fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let this = unwrap_unmod(ctx, this);
     let object_key = hm_int_fast_obj_key(ctx, this);
-    if let Some(keys) = hm_int_fast_table()
+    if let Some(keys) = hm_int_fast_shard_for(object_key)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&object_key)
@@ -4880,7 +5570,7 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     let this = unwrap_unmod(ctx, this);
     let object_key = hm_int_fast_obj_key(ctx, this);
-    if let Some(values) = hm_int_fast_table()
+    if let Some(values) = hm_int_fast_shard_for(object_key)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&object_key)
@@ -4924,7 +5614,7 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
 fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, Value)> {
     let this = unwrap_unmod(ctx, this);
     let object_key = hm_int_fast_obj_key(ctx, this);
-    if let Some(entries) = hm_int_fast_table()
+    if let Some(entries) = hm_int_fast_shard_for(object_key)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&object_key)
@@ -5213,12 +5903,22 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if uses_native_hashtable_layout(ctx, this) {
+        let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+        ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        set_map_size(ctx, this, 0);
+        let cname = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_else(|| "java/util/Hashtable".to_string());
+        ensure_hashtable_load_factor(ctx, this, &cname);
+        return Ok(None);
+    }
     let ptr = this.as_ptr() as usize;
-    if let Some((_, stale_key)) = HM_INT_FAST_LAST_KEY
+    if let Some((_, _, stale_key)) = HM_INT_FAST_LAST_KEY
         .with(|cache| cache.get())
-        .filter(|(cached_ptr, _)| *cached_ptr == ptr)
+        .filter(|(cached_ptr, _, _)| *cached_ptr == ptr)
     {
-        hm_int_fast_table()
+        hm_int_fast_shard_for(stale_key)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&stale_key);
@@ -5416,19 +6116,15 @@ pub fn native_map_to_string_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// FeaturePropertyMappers stores feature→mapper entries in a TreeMap, and
 /// when the JDK's TreeMap.keySpliteratorFor ran it traversed a null root
 /// because the put native had never reached `tm_put`.
+///
+/// PERF (collections-classification-cost): this used to walk the superclass
+/// chain calling `class_name_of_id` — a `class_manager` read lock plus a heap
+/// `String` — once per hop, on every `Map.get`/`put`/`remove`/`size`. It now
+/// reads a bit out of the per-`ClassId` classification memo; see
+/// `CF_TREE_MAP` and the module comment on `class_facts`.
+#[inline]
 fn is_tree_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    let mut cur = ctx.class_id_of_object(this);
-    loop {
-        match ctx.class_name_of_id(cur) {
-            Some(n) if n == "java/util/TreeMap" => return true,
-            Some(n) if n == "java/util/HashMap" || n == "java/lang/Object" => return false,
-            _ => {}
-        }
-        match ctx.superclass_of(cur) {
-            Some(p) if p != cur => cur = p,
-            _ => return false,
-        }
-    }
+    receiver_facts(ctx, this).has(CF_TREE_MAP)
 }
 
 /// True when `this`'s runtime class is `java/util/concurrent/ConcurrentHashMap`.
@@ -5444,26 +6140,12 @@ fn is_tree_map_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 /// synthetic map) as a 4-field `HashMap$Node`, reading field index 3 past the
 /// end (the recurring `AnonymousObject$3` out-of-bounds-field-read error).
 /// The plain-Map natives consult this and reroute to the CHM natives.
+///
+/// PERF (collections-classification-cost): memoized per `ClassId` — see
+/// `CF_CHM`.
+#[inline]
 fn is_chm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    let mut cur = ctx.class_id_of_object(this);
-    for _ in 0..32 {
-        match ctx.class_name_of_id(cur) {
-            Some(n) if n == "java/util/concurrent/ConcurrentHashMap" => return true,
-            Some(n)
-                if n == "java/util/HashMap"
-                    || n == "java/util/TreeMap"
-                    || n == "java/lang/Object" =>
-            {
-                return false
-            }
-            _ => {}
-        }
-        match ctx.superclass_of(cur) {
-            Some(p) if p != cur => cur = p,
-            _ => return false,
-        }
-    }
-    false
+    receiver_facts(ctx, this).has(CF_CHM)
 }
 
 /// True when `source` is a `Map` whose entries CratonVM stores in a native
@@ -5490,34 +6172,27 @@ fn is_native_bucket_map(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
     if properties_backing_chm(ctx, source).is_some() {
         return true;
     }
-    let mut cur = ctx.class_id_of_object(source);
-    for _ in 0..32 {
-        match ctx.class_name_of_id(cur) {
-            Some(n) if n == "java/util/HashMap" => return true,
-            // A plain `java/util/Hashtable` stores its entries in the same
-            // synthetic HashMap-style bucket table (`native_map_put` on
-            // `java/util/Hashtable` — its `size()`/`keySet()` read those buckets
-            // via `map_state`/`map_collect_keys`). Without recognising it here,
-            // `collect_entries_any` skipped the direct `map_collect_entries`
-            // bucket walk and fell through to the polymorphic
-            // `entrySet().iterator()` path — which re-enters the very
-            // `Hashtable.entrySet()` view being resynced and comes back EMPTY.
-            // That made `entrySet()` iterate zero times while `keySet()` worked,
-            // breaking `new ObjectName(domain, Hashtable)` (Spring JMX naming).
-            // `Properties` (a Hashtable subclass) keeps its data in a side-table
-            // so `map_collect_entries` returns empty for it — the caller's
-            // `!entries.is_empty()` guard then falls through to the existing
-            // Properties path, so this does not disturb Properties.
-            Some(n) if n == "java/util/Hashtable" => return true,
-            Some(n) if n == "java/lang/Object" => return false,
-            _ => {}
-        }
-        match ctx.superclass_of(cur) {
-            Some(p) if p != cur => cur = p,
-            _ => return false,
-        }
-    }
-    false
+    // PERF (collections-classification-cost): the `HashMap`-or-`Hashtable`
+    // ancestry walk below is memoized per `ClassId` as `CF_BUCKET_MAP_NAME`.
+    // The reasoning it encodes is unchanged and preserved here:
+    //
+    //   * `java/util/HashMap` in the chain -> true.
+    //   * A plain `java/util/Hashtable` stores its entries in the same
+    //     synthetic HashMap-style bucket table (`native_map_put` on
+    //     `java/util/Hashtable` — its `size()`/`keySet()` read those buckets
+    //     via `map_state`/`map_collect_keys`), so it is true as well. Without
+    //     recognising it, `collect_entries_any` skipped the direct
+    //     `map_collect_entries` bucket walk and fell through to the polymorphic
+    //     `entrySet().iterator()` path — which re-enters the very
+    //     `Hashtable.entrySet()` view being resynced and comes back EMPTY. That
+    //     made `entrySet()` iterate zero times while `keySet()` worked,
+    //     breaking `new ObjectName(domain, Hashtable)` (Spring JMX naming).
+    //     `Properties` (a Hashtable subclass) keeps its data in a side-table so
+    //     `map_collect_entries` returns empty for it — the caller's
+    //     `!entries.is_empty()` guard then falls through to the existing
+    //     Properties path, so this does not disturb Properties.
+    //   * `java/lang/Object` reached first -> false.
+    receiver_facts(ctx, source).has(CF_BUCKET_MAP_NAME)
 }
 
 /// True when `this`'s runtime class is `java/util/LinkedHashMap` or a subclass.
@@ -5529,26 +6204,12 @@ fn is_native_bucket_map(ctx: &dyn NativeContext, source: ObjectRef) -> bool {
 /// `native_map_get` / `native_map_contains_key` use the bucket code and return
 /// null/false for every key — causing e.g. JBoss DMR `ObjectModelValue.getChild`
 /// to return UNDEFINED for all ModelNode keys (the WildFly WFLYCTL0013 bug).
+///
+/// PERF (collections-classification-cost): memoized per `ClassId` — see
+/// `CF_LHM`.
+#[inline]
 fn is_lhm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    let mut cur = ctx.class_id_of_object(this);
-    for _ in 0..32 {
-        match ctx.class_name_of_id(cur) {
-            Some(n) if n == "java/util/LinkedHashMap" => return true,
-            Some(n)
-                if n == "java/util/HashMap"
-                    || n == "java/util/TreeMap"
-                    || n == "java/lang/Object" =>
-            {
-                return false
-            }
-            _ => {}
-        }
-        match ctx.superclass_of(cur) {
-            Some(p) if p != cur => cur = p,
-            _ => return false,
-        }
-    }
-    false
+    receiver_facts(ctx, this).has(CF_LHM)
 }
 
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5599,18 +6260,12 @@ fn native_map_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 /// True when `obj` is one of CratonVM's unmodifiable wrapper views.
+///
+/// PERF (collections-classification-cost): memoized per `ClassId` — see
+/// `CF_UNMOD_WRAPPER`.
+#[inline]
 fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
-    let cid = ctx.class_id_of_object(obj);
-    matches!(
-        ctx.class_name_of_id(cid).as_deref(),
-        Some(UNMOD_MAP_CLASS)
-            | Some(UNMOD_LIST_CLASS)
-            | Some(UNMOD_SET_CLASS)
-            | Some(UNMOD_SORTED_SET_CLASS)
-            | Some(UNMOD_NAVIGABLE_SET_CLASS)
-            | Some(UNMOD_ENTRY_SET_CLASS)
-            | Some(UNMOD_COLLECTION_CLASS)
-    )
+    receiver_facts(ctx, obj).has(CF_UNMOD_WRAPPER)
 }
 
 /// Initialize a `Hashtable`/`Properties` instance's own `loadFactor` (and a
@@ -5702,8 +6357,16 @@ fn native_map_put_evict(
     let cid = ctx.class_id_of_object(this);
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
-    if let Some(name) = ctx.class_name_of_id(cid) {
-        if name == "java/util/HashMap" {
+    // PERF (collections-classification-cost): this block used to be a
+    // `class_name_of_id` for the exact-HashMap test PLUS a second full
+    // superclass walk in the `else` arm, each hop of which allocated a
+    // `String` under the `class_manager` read lock — on top of the three
+    // predicate walks above. All of it is now bits out of the per-`ClassId`
+    // memo. `class_name_rc` is consulted only for the `Hashtable` arm, which
+    // genuinely needs the name string.
+    let facts = class_facts(ctx, cid);
+    if facts.has(CF_HAS_NAME) {
+        if facts.has(CF_EXACT_HASHMAP) {
             // Exact dispatch is installed only after the callsite becomes
             // hot. Start the integer overlay during the generic tiering
             // window; once real nodes exist the fresh-map guard must refuse
@@ -5731,42 +6394,39 @@ fn native_map_put_evict(
             // which broke Keycloak FeatureOptions.<clinit> (the JDK
             // TreeMap.keySpliteratorFor NPE was downstream — actual data
             // never reached the tree).
-            let mut cur = cid;
-            let mut is_lhm = false;
-            let mut is_tm = false;
-            let mut is_ht = false;
-            while let Some(n) = ctx.class_name_of_id(cur) {
-                if n == "java/util/LinkedHashMap" {
-                    is_lhm = true;
-                    break;
-                }
-                if n == "java/util/TreeMap" {
-                    is_tm = true;
-                    break;
-                }
-                if n == "java/util/Hashtable" {
-                    is_ht = true;
-                    break;
-                }
-                if n == "java/util/HashMap" || n == "java/lang/Object" {
-                    break;
-                }
-                match ctx.superclass_of(cur) {
-                    Some(p) => cur = p,
-                    None => break,
-                }
-            }
-            if is_lhm {
+            // PERF (collections-classification-cost): this was a fourth full
+            // `class_name_of_id` walk on the `put` hot path. Its three outcomes
+            // are `CF_LHM`, `CF_TREE_MAP` and `CF_HASHTABLE_ANCESTRY` in the
+            // per-`ClassId` memo, which decide identically:
+            //
+            //   * `LinkedHashMap` and `TreeMap` live in disjoint hierarchies
+            //     (`LinkedHashMap extends HashMap`, `TreeMap extends
+            //     AbstractMap`), and `Hashtable extends Dictionary` is disjoint
+            //     from both, so no chain contains two of them. The extra
+            //     sentinels each arm listed can therefore never fire ahead of
+            //     the arm that matters, and dropping them changes nothing.
+            //   * The Hashtable arm needs `Properties` INCLUDED — it must still
+            //     run `ensure_hashtable_load_factor` — which is exactly why
+            //     `CF_HASHTABLE_ANCESTRY` exists alongside the
+            //     `Properties`-excluding `CF_HASHTABLE_LAYOUT`.
+            if facts.has(CF_LHM) {
                 return native_lhm_put_evict(ctx, args, evict);
             }
-            if is_tm {
+            if facts.has(CF_TREE_MAP) {
                 return native_tm_put(ctx, args);
             }
-            if is_ht {
+            if facts.has(CF_HASHTABLE_ANCESTRY) {
                 // Hashtable/Properties run the plain-bucket path below (table +
                 // count get set), but their OWN loadFactor/threshold fields
                 // (they extend Dictionary, not HashMap) are never initialized.
-                ensure_hashtable_load_factor(ctx, this, &name);
+                //
+                // This arm is the only consumer of the receiver's name string
+                // here, and it is off the common path, so it pays a memoized
+                // `class_name_rc` rather than keeping the whole block's
+                // `class_name_of_id` alive.
+                if let Some(name) = class_name_rc(ctx, cid) {
+                    ensure_hashtable_load_factor(ctx, this, &name);
+                }
             }
         }
     }
@@ -6325,12 +6985,19 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         if let Value::Object(Some(key_ref)) = key_val {
             if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
                 let object_key = hm_int_fast_obj_key(ctx, this);
-                let mut table = hm_int_fast_table()
+                let key_class = ctx.class_id_of_object(key_ref);
+                let mut table = hm_int_fast_shard_for(object_key)
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if let Some(state) = table.get_mut(&object_key) {
-                    let old = state.entries.remove(&int_key).map(|(_, value)| value);
-                    return Ok(Some(old.unwrap_or(Value::Object(None))));
+                    // Wrapper-class mismatch: `remove(Character.valueOf('A'))`
+                    // must NOT delete the `Integer.valueOf(65)` entry (see
+                    // `HmIntFastState::key_class`). Drop out of the overlay and
+                    // let the node path decide.
+                    if hm_int_fast_key_class_ok(state, key_class) {
+                        let old = state.entries.remove(&int_key).map(|(_, value)| value);
+                        return Ok(Some(old.unwrap_or(Value::Object(None))));
+                    }
                 }
             }
         }
@@ -6536,13 +7203,19 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if let Value::Object(Some(key_ref)) = key_val {
         if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
             let object_key = hm_int_fast_obj_key(ctx, this);
-            let table = hm_int_fast_table()
+            let key_class = ctx.class_id_of_object(key_ref);
+            let table = hm_int_fast_shard_for(object_key)
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(state) = table.get(&object_key) {
-                return Ok(Some(
-                    Value::Int(state.entries.contains_key(&int_key) as i32),
-                ));
+                // Wrapper-class mismatch: `containsKey(Character.valueOf('A'))`
+                // is false for a map holding `Integer.valueOf(65)` (see
+                // `HmIntFastState::key_class`). Fall through to the node path.
+                if hm_int_fast_key_class_ok(state, key_class) {
+                    return Ok(Some(
+                        Value::Int(state.entries.contains_key(&int_key) as i32),
+                    ));
+                }
             }
         }
     }
@@ -6731,7 +7404,7 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         return native_chm_clear(ctx, args);
     }
     let object_key = hm_int_fast_obj_key(ctx, this);
-    if hm_int_fast_table()
+    if hm_int_fast_shard_for(object_key)
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&object_key)
@@ -6802,6 +7475,43 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     al_set_size(ctx, list, values.len() as i32);
     ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
+}
+
+/// Build a live-view `java.util.ArrayList` from an already-collected `values`
+/// slice, tagging it with `source` in the trailing capacity slot exactly like
+/// [`native_map_values`] does -- so it participates in the same already-hardened
+/// `values_view_source`/`resync_values_view`/`propagate_list_removal` machinery
+/// used by `native_al_remove_obj`/`native_al_clear`/iterator `.remove()`
+/// (`values().remove(v)`, `.iterator().remove()`, and `.clear()` write through
+/// to `source` via its virtual `remove`/`clear`).
+///
+/// Exposed for callers (e.g. `java.util.Properties`'s side-table-backed
+/// `values()`) whose data does not live in a native bucket table, so
+/// `map_collect_values` cannot be reused directly -- the caller collects the
+/// correct value list itself and hands it here just to get live-view wiring.
+pub fn make_live_values_list(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    values: &[Value],
+) -> ObjectRef {
+    let source_pin = ctx.pin_native_root(source);
+    let (_, val_handles) = pin_value_slice(ctx, values);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let list_pin = ctx.pin_native_root(list);
+    let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in values.iter().enumerate() {
+        let val = read_pinned_elem(ctx, val_handles[i], *val);
+        ctx.set_array_element(buf, i, val);
+    }
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
+    let list = ctx.read_native_pin(list_pin, list);
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, values.len() as i32);
+    ctx.unpin_native_roots(source_pin);
+    list
 }
 
 fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -8596,6 +9306,22 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// LETSGO_S1: HashSet.hashCode — sum of `hashCode()` over elements
 /// (matches `AbstractSet.hashCode` semantics).
+///
+/// This native is registered on `java/util/AbstractSet` (where HashSet's
+/// inherited `hashCode()` resolves), so it intercepts *every* `AbstractSet`
+/// subclass — including user/library sets whose elements do not live in a
+/// HashSet-shaped backing map, e.g. Weld's `ImmutableTinySet$Doubleton`
+/// (members held in named `element1`/`element2` fields). For those
+/// `hs_backing_map` is `None`, and the bare `collect_collection_elements`
+/// extractor — which only knows fixed collection layouts — returned an empty
+/// Vec, so `hashCode()` was silently 0 instead of the `AbstractSet` contract's
+/// element-hash sum. A 0 hash still compares `equals` correctly but lands in
+/// the wrong HashMap bucket, so a `Map<Set<..>, ..>` keyed by such a set is
+/// unfindable with an equal `HashSet` probe (the `getSharedSet` shape from
+/// HIB-CV-25; caught by regression-suite `RCollections` "set-key true hit").
+/// Use the `_or_real` variant — the same fix already applied to
+/// `containsAll`/`retainAll`/`removeAll` — which falls back to the
+/// collection's real `toArray()`.
 fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -8603,7 +9329,7 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let keys = match hs_backing_map(ctx, this) {
         Some(m) => map_collect_keys(ctx, m),
-        None => collect_collection_elements(ctx, this),
+        None => collect_collection_elements_or_real(ctx, this),
     };
     let mut h: i32 = 0;
     for k in &keys {
@@ -8834,6 +9560,28 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let old = native_map_put(ctx, &put_args)?;
     let was_new = matches!(old, Some(Value::Object(None)));
     Ok(Some(Value::Int(if was_new { 1 } else { 0 })))
+}
+
+/// `HashSet.remove(Object)` against this VM's native backing map, for callers
+/// that registered their own override on a `HashSet` subclass and need the
+/// ordinary behaviour as a fallback.
+///
+/// Returns `None` when `this` has no native backing map, so the caller can
+/// still fall through to real bytecode. Falling through UNCONDITIONALLY is not
+/// safe: real `HashSet.remove` is `return map.remove(o) == PRESENT;`, and the
+/// synthetic backing map stores an `Int(1)` sentinel rather than JDK
+/// `HashSet.PRESENT` — so that identity comparison is always false and
+/// `remove()` deletes the element while reporting `false`.
+pub fn try_native_hashset_remove(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    hs_backing_map(ctx, this)?;
+    Some(native_hs_remove(ctx, args))
 }
 
 fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10416,7 +11164,7 @@ fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// branch when unset.
 fn dbg_cce_backtrace(site: &str, ctx: &dyn NativeContext, ao: ObjectRef, bo: Option<ObjectRef>) {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*E.get_or_init(|| std::env::var_os("CRATONVM_DBG_CCE_BT").is_some()) {
+    if !*E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CCE_BT").is_some()) {
         return;
     }
     let a_name = object_class_name(ctx, ao);
@@ -11871,6 +12619,17 @@ fn is_hashtable_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     false
 }
 
+/// True for `Hashtable` and its ordinary subclasses. `Properties` is excluded:
+/// JDK 25 backs it with a separate `ConcurrentHashMap` and is handled by the
+/// properties side-table path rather than the native Hashtable bucket layout.
+///
+/// PERF (collections-classification-cost): memoized per `ClassId` — see
+/// `CF_HASHTABLE_LAYOUT`, which keeps the `Properties` exclusion.
+#[inline]
+fn uses_native_hashtable_layout(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    receiver_facts(ctx, this).has(CF_HASHTABLE_LAYOUT)
+}
+
 // ===========================================================================
 // ArrayList.removeIf / replaceAll
 // ===========================================================================
@@ -13061,10 +13820,10 @@ const LAZY_OP_FLAT_MAP: i32 = 5;
 fn lazy_streams_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        if std::env::var_os("CRATONVM_LAZY_STREAMS").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_LAZY_STREAMS").is_some() {
             return true; // explicit force-on wins
         }
-        std::env::var_os("CRATONVM_EAGER_STREAMS").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_EAGER_STREAMS").is_none()
     })
 }
 
@@ -23703,7 +24462,7 @@ fn native_random_next_int_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // CRATONVM_DBG_NEXTINT=1 — dump the Java caller chain. See the twin
         // diagnostic in native-builtins securerandom.rs for rationale (locating
         // the empty-collection divergence in ES/Lucene test-framework setup).
-        if std::env::var("CRATONVM_DBG_NEXTINT").is_ok() {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_NEXTINT").is_ok() {
             eprintln!("NEXTINT-BAD(coll) bound={bound} caller-chain (inner→outer):");
             let frames = ctx.capture_stack_trace(0);
             for f in frames.iter().rev().take(20) {
@@ -26500,7 +27259,7 @@ fn native_lhm_put_evict(
     // `ExplicitQueryStatsMaxSizeTest` (query-plan stats trimmed at 100 entries).
     let (this_cid, this_class_name, is_plain_lhm, invoke_remove_eldest) =
         lhm_remove_eldest_hook_decision(ctx, this);
-    if std::env::var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
         eprintln!(
             "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={} invoke_remove_eldest={} evict={}",
             this_cid,
@@ -29325,6 +30084,13 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Live `values()` view: a modifying retainAll must also drop the removed
+    // elements' entries from the source map. Unlike native_al_remove_obj /
+    // native_al_clear, this native previously never consulted
+    // values_view_source at all -- a generic gap (affects retainAll() on
+    // ANY Map's values() view, not just Properties') found 2026-07-26 while
+    // auditing Properties.values() liveness. See properties-keyset-view-not-live.md.
+    let view_src = values_view_source(ctx, this);
     let coll_elems = collect_collection_elements(ctx, coll);
     let (data, size) = al_state(ctx, this);
     let buf = match data {
@@ -29335,13 +30101,16 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // backing array (capacity == size) is handled correctly.
     //
     // Family-1 fix (cce0079): pinned walk + kept INDICES — see
-    // `native_al_remove_all` for the full rationale.
+    // `native_al_remove_all` for the full rationale. `removed_idx` mirrors
+    // `kept_idx` for the view-source propagation below.
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
+    let vh = view_src.map(|v| ctx.pin_native_root(v));
     let (_, ce_handles) = pin_value_slice(ctx, &coll_elems);
     let mut this = this;
     let mut buf = buf;
     let mut kept_idx: Vec<usize> = Vec::with_capacity(size as usize);
+    let mut removed_idx: Vec<usize> = Vec::new();
     let mut modified = false;
     for read_idx in 0..(size as usize) {
         let elem0 = ctx.get_array_element(buf, read_idx);
@@ -29366,10 +30135,22 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             kept_idx.push(read_idx);
         } else {
             modified = true;
+            removed_idx.push(read_idx);
         }
     }
     this = ctx.read_native_pin(this_pin, this);
     buf = ctx.read_native_pin(buf_pin, buf);
+    let view_src = match (view_src, vh) {
+        (Some(v), Some(h)) => Some(ctx.read_native_pin(h, v)),
+        _ => None,
+    };
+    // Snapshot the removed elements' current values before compaction
+    // overwrites their slots below (the compaction itself is a local array
+    // shift, not GC-capable, but the propagation loop after it is).
+    let removed_vals: Vec<Value> = removed_idx
+        .iter()
+        .map(|&i| ctx.get_array_element(buf, i))
+        .collect();
     ctx.unpin_native_roots(this_pin);
     if modified {
         for (k, &idx) in kept_idx.iter().enumerate() {
@@ -29388,6 +30169,17 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             ctx.set_array_element(buf, i, Value::Object(None));
         }
         al_set_size(ctx, this, kept_idx.len() as i32);
+        if let Some(source) = view_src {
+            let source_pin = ctx.pin_native_root(source);
+            let (_, removed_handles) = pin_value_slice(ctx, &removed_vals);
+            let mut source = source;
+            for (i, &orig) in removed_vals.iter().enumerate() {
+                let v = read_pinned_elem(ctx, removed_handles[i], orig);
+                source = ctx.read_native_pin(source_pin, source);
+                propagate_list_removal(ctx, source, v)?;
+            }
+            ctx.unpin_native_roots(source_pin);
+        }
     }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
@@ -30612,10 +31404,19 @@ fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     //
     // Fresh exact HashMap<Integer, ?> fast stores. Both the canonical key
     // object and value are authoritative roots until lazy materialization.
-    {
-        let mut maps = hm_int_fast_table()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    // PERF (hm-int-fast-shard): the overlay is sharded, so this walks EVERY
+    // shard. Iterating all `HM_INT_FAST_SHARDS` is exactly equivalent to
+    // iterating the former single map — every entry lives in exactly one
+    // shard, chosen deterministically from its key — and skipping even one
+    // would drop a root: during a moving GC the shard's `ObjectRef`s would be
+    // neither traced (`for_rooting=true`) nor remapped (`false`), i.e. a
+    // use-after-free. Each shard's guard is poison-recovered individually for
+    // the same reason.
+    for shard in hm_int_fast_shards().iter() {
+        let mut maps = shard.lock().unwrap_or_else(|e| e.into_inner());
+        if maps.is_empty() {
+            continue;
+        }
         for state in maps.values_mut() {
             for (key, value) in state.entries.values_mut() {
                 f(key);
@@ -30722,6 +31523,46 @@ pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
     for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
+/// Publish the collection-overlay root contract to the collector abstraction.
+///
+/// Registration is deliberately performed from native initialization rather
+/// than from the GC crate: this keeps the collector independent of collection
+/// implementations and guarantees the provider exists before an overlay can be
+/// created through a registered native.
+fn register_gc_root_provider() {
+    cratonvm_gc::external_roots::register_external_root_provider(
+        cratonvm_gc::external_roots::ExternalRootProvider {
+            name: "native-collection-overlays",
+            scan: gc_scan_collection_overlay_roots,
+            owner_addrs: gc_overlay_owner_addrs,
+            roots_for_owner: gc_overlay_roots_for_collection,
+            roots_for_matching_owners: gc_overlay_roots_for_matching_owners,
+            remap: gc_update_collection_overlay_refs,
+            prune: gc_prune_dead_collection_overlays,
+        },
+    );
+}
+
+/// Owner addresses that have at least one overlay key registered.
+///
+/// `gc_overlay_roots_for_collection` locks the owner index on every call and
+/// returns an empty `Vec` for an owner that has no overlay -- which is every
+/// object in a run that never touches an overlay-backed collection. A
+/// stop-the-world marker can take this set once and consult it lock-free per
+/// object, which is what makes a multi-threaded young marker viable (the
+/// per-object `Mutex` would otherwise serialise it). `None` means the index
+/// is empty, so the marker can skip the check entirely.
+pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
+    let index = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if index.is_empty() {
+        None
+    } else {
+        Some(index.keys().copied().collect())
+    }
+}
+
 /// Return the Rust-side references owned by one already-marked collection.
 ///
 /// On the Generational non-moving collector this is the conditional replacement
@@ -30742,7 +31583,7 @@ pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
 
     let mut roots = Vec::new();
     for key in keys {
-        if let Some(state) = hm_int_fast_table()
+        if let Some(state) = hm_int_fast_shard_for(key)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
@@ -30830,7 +31671,7 @@ pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
 /// retain them for the minor collection, then let the major marker apply the
 /// precise per-owner rule before old-space compaction.
 pub fn gc_overlay_roots_for_matching_owners(
-    owner_matches: impl Fn(usize) -> bool,
+    owner_matches: &dyn Fn(usize) -> bool,
 ) -> Vec<ObjectRef> {
     let owners: Vec<usize> = {
         let index = overlay_owner_keys()
@@ -30932,7 +31773,7 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
 /// this crate's scope and is flagged in the change report rather than edited
 /// here.
 pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
-    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
     if dbg {
         let total_slots: usize = obj_key_shards()
             .iter()
@@ -30986,12 +31827,25 @@ pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
         return;
     }
 
+    // PERF (hm-int-fast-shard): the overlay is sharded, so a dead key must be
+    // removed from ITS shard. Grouping the keys by shard first keeps the
+    // batching property the single-map version had — lock each shard at most
+    // once per GC, so the lock count stays bounded by the shard count rather
+    // than growing with the number of dead keys. A shard with no dead keys is
+    // never locked at all.
     {
-        let mut hm = hm_int_fast_table()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut by_shard: [Vec<usize>; HM_INT_FAST_SHARDS] = std::array::from_fn(|_| Vec::new());
         for (k, _) in &dead_keys {
-            hm.remove(k);
+            by_shard[hm_int_fast_shard_index(*k)].push(*k);
+        }
+        for (shard, keys) in hm_int_fast_shards().iter().zip(by_shard.iter()) {
+            if keys.is_empty() {
+                continue;
+            }
+            let mut hm = shard.lock().unwrap_or_else(|e| e.into_inner());
+            for k in keys {
+                hm.remove(k);
+            }
         }
     }
 
@@ -45303,7 +46157,7 @@ fn native_tp_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// native-builtins helper of the same shape (kept separate to avoid a crate
 /// dependency cycle).
 fn interrupt_tpe_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
-    let dbg = std::env::var_os("CRATONVM_DBG_EXEC").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXEC").is_some();
     let tpe = match ctx.get_field_by_name(exec, "e") {
         Value::Object(Some(inner)) => inner,
         _ => exec,
@@ -45544,6 +46398,8 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     // Unit tests for helper functions only.
@@ -45554,7 +46410,7 @@ mod tests {
         // The cached helper must report exactly "env var is set" — identical
         // truthiness to the original `env::var(...).is_ok()` check.
         use super::dbg_hmput;
-        let expected = std::env::var_os("CRATONVM_DBG_HMPUT").is_some();
+        let expected = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HMPUT").is_some();
         assert_eq!(dbg_hmput(), expected);
         // Cached: second call returns the same value.
         assert_eq!(dbg_hmput(), expected);
@@ -47043,6 +47899,8 @@ mod tests {
     // ===================================================================
 
     mod lbq_blocking_tests {
+        #[allow(unused_imports)]
+        use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
         use super::super::*;
         use cratonvm_native_api::{
             AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, StackTraceEntry,
@@ -47134,17 +47992,37 @@ mod tests {
             ptr_to_index: HashMap<usize, usize>,
             object_classes: HashMap<usize, ClassId>,
             class_names: HashMap<ClassId, String>,
+            /// Modelled superclass edges, so a `MockCtx` can present a real
+            /// class hierarchy to `classify_class`. Empty by default, which
+            /// reproduces the previous always-`None` `superclass_of` stub.
+            superclasses: HashMap<ClassId, ClassId>,
+            /// Distinct per `Shared`, so two `MockCtx`s in one process are two
+            /// different "VMs".
+            ///
+            /// `NativeContext::vm_identity` defaults to `0` for every mock,
+            /// which is fine while nothing caches against it — but the
+            /// per-`ClassId` classification memo does, and it is thread-local.
+            /// Two tests running on the same thread with different
+            /// `ClassId`-to-name mappings would otherwise read each other's
+            /// cached classifications. Minted from a process-global counter
+            /// rather than the `Arc` address, because a dropped `Shared`'s
+            /// address can be handed straight to the next one.
+            vm_id: usize,
             next_ptr: usize,
             monitors: HashMap<usize, Arc<ObjMonitor>>,
         }
 
         impl Shared {
             fn new() -> Self {
+                static NEXT_VM_ID: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(1);
                 Shared {
                     heap: Vec::new(),
                     ptr_to_index: HashMap::new(),
                     object_classes: HashMap::new(),
                     class_names: HashMap::new(),
+                    superclasses: HashMap::new(),
+                    vm_id: NEXT_VM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                     next_ptr: 8,
                     monitors: HashMap::new(),
                 }
@@ -47215,9 +48093,202 @@ mod tests {
                     .class_names
                     .insert(class_id, name.to_string());
             }
+
+            /// Record `child extends parent`, so `superclass_of` walks.
+            pub(super) fn define_superclass(&self, child: ClassId, parent: ClassId) {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .superclasses
+                    .insert(child, parent);
+            }
+
+            /// Model `ClassStore::remove`: the class becomes invisible to
+            /// `class_name_of_id` / `class_id_by_name`, and — crucially — its
+            /// `ClassId` is NOT handed back out, exactly as the tombstoned slot
+            /// vector guarantees in `classloading/src/class.rs`.
+            pub(super) fn unload_class(&self, class_id: ClassId) {
+                let mut s = self.shared.lock().unwrap();
+                s.class_names.remove(&class_id);
+                s.superclasses.remove(&class_id);
+            }
         }
 
-        impl NativeContext for MockCtx {
+        impl cratonvm_native_api::NativeClassAccess for MockCtx {
+
+
+            // --- default stubs for everything else ---------------------
+            fn load_class(&mut self, _n: &str) -> MethodCallResult {
+                Ok(None)
+            }
+            fn class_name_of_id(&self, c: ClassId) -> Option<String> {
+                self.shared.lock().unwrap().class_names.get(&c).cloned()
+            }
+            fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .object_classes
+                    .get(&(o.as_ptr() as usize))
+                    .copied()
+                    .unwrap_or_else(|| ClassId::new(0))
+            }
+            fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
+                false
+            }
+            fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
+                Ok(ClassId::new(0))
+            }
+            fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool {
+                false
+            }
+            fn superclass_of(&self, c: ClassId) -> Option<ClassId> {
+                if let Some(parent) = self.shared.lock().unwrap().superclasses.get(&c) {
+                    return Some(*parent);
+                }
+                // No modelled edge: same as the previous always-`None` stub.
+                None
+            }
+            /// Reverse of `class_name_of_id` over the classes this mock has
+            /// actually been told about. Previously an unconditional `None`,
+            /// which made `ClassDiscriminator` unable to resolve anything and
+            /// so untestable here. A name that was never `define_class`d — or
+            /// that has been `unload_class`d — still answers `None`, so no
+            /// existing test's expectations move.
+            fn class_id_by_name(&self, n: &str) -> Option<ClassId> {
+                let s = self.shared.lock().unwrap();
+                s.class_names
+                    .iter()
+                    .find(|(_, name)| name.as_str() == n)
+                    .map(|(id, _)| *id)
+            }
+            fn loader_id_of_class(&self, _c: ClassId) -> i32 {
+                2
+            }
+            fn is_record_class(&self, _c: ClassId) -> bool {
+                false
+            }
+            fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
+                Vec::new()
+            }
+            fn is_sealed_class(&self, _c: ClassId) -> bool {
+                false
+            }
+            fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
+                Vec::new()
+            }
+            fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
+                Vec::new()
+            }
+            fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
+                Vec::new()
+            }
+            fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
+                Vec::new()
+            }
+            fn class_access_flags(&self, _c: ClassId) -> u16 {
+                0
+            }
+            fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
+                Vec::new()
+            }
+            fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
+                Vec::new()
+            }
+            fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
+                Vec::new()
+            }
+            fn method_parameter_annotations(
+                &self,
+                _c: ClassId,
+                _m: &str,
+                _d: &str,
+            ) -> Vec<Vec<AnnotationData>> {
+                Vec::new()
+            }
+            fn class_signature(&self, _c: ClassId) -> Option<String> {
+                None
+            }
+            fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
+                None
+            }
+            fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
+                None
+            }
+            fn method_annotation_default(
+                &self,
+                _c: ClassId,
+                _m: &str,
+                _d: &str,
+            ) -> Option<AnnotationElementValue> {
+                None
+            }
+            fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
+                None
+            }
+            fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
+                None
+            }
+            fn list_application_class_names(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn register_dynamic_classpath(&mut self, _p: &[String]) {}
+            fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
+                None
+            }
+            fn define_class_with_loader(
+                &mut self,
+                _n: &str,
+                _b: &[u8],
+                _l: u32,
+            ) -> Option<ClassId> {
+                None
+            }
+            fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
+                None
+            }
+            fn allocate_loader_id(&mut self) -> u32 {
+                0
+            }
+            fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
+                true
+            }
+            fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+                true
+            }
+            fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
+                true
+            }
+            fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+                true
+            }
+            fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
+
+            fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
+                Ok(None)
+            }
+            fn invoke_virtual(
+                &mut self,
+                _r: ObjectRef,
+                _m: &str,
+                _d: &str,
+                _a: &[Value],
+            ) -> MethodCallResult {
+                Ok(None)
+            }
+        }
+
+        impl cratonvm_native_api::NativeHeapAccess for MockCtx {
+
             // Pre-existing test-fixture gap (unrelated to this session's fix):
             // `c812b622` added this trait method with no default impl but
             // never updated this inline mock, breaking `cargo test -p
@@ -47317,6 +48388,63 @@ mod tests {
             fn heap_element_type_of(&self, _o: ObjectRef) -> ArrayElementType {
                 ArrayElementType::Reference
             }
+            fn new_object(&mut self, _c: &str) -> MethodCallResult {
+                Ok(None)
+            }
+            fn identity_hash_code(&self, o: ObjectRef) -> i32 {
+                o.as_ptr() as i32
+            }
+            fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {
+                Value::Object(None)
+            }
+            fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
+            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
+                None
+            }
+            fn create_string(&mut self, _t: &str) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn read_string(&self, _o: ObjectRef) -> Option<String> {
+                None
+            }
+            fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
+                let mut s = self.shared.lock().unwrap();
+                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
+            }
+            fn heap_allocated_bytes(&self) -> usize {
+                0
+            }
+            fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value {
+                self.get_field(o, i)
+            }
+            fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) {
+                self.set_field(o, i, v)
+            }
+            fn compare_and_swap_field(
+                &mut self,
+                _o: ObjectRef,
+                _i: usize,
+                _e: Value,
+                _n: Value,
+            ) -> bool {
+                false
+            }
+            fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {
+                None
+            }
+            fn discover_reference(
+                &mut self,
+                _t: u8,
+                _r: ObjectRef,
+                _f: ObjectRef,
+                _q: Option<ObjectRef>,
+            ) {
+            }
+        }
+
+        impl cratonvm_native_api::NativeThreadAccess for MockCtx {
+
 
             // --- monitor primitives (the load-bearing bit) -------------
             fn thread_id(&self) -> u64 {
@@ -47364,109 +48492,6 @@ mod tests {
                 m.notify_all();
                 Ok(None)
             }
-
-            // --- default stubs for everything else ---------------------
-            fn load_class(&mut self, _n: &str) -> MethodCallResult {
-                Ok(None)
-            }
-            fn new_object(&mut self, _c: &str) -> MethodCallResult {
-                Ok(None)
-            }
-            fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
-                Ok(None)
-            }
-            fn invoke_virtual(
-                &mut self,
-                _r: ObjectRef,
-                _m: &str,
-                _d: &str,
-                _a: &[Value],
-            ) -> MethodCallResult {
-                Ok(None)
-            }
-            fn identity_hash_code(&self, o: ObjectRef) -> i32 {
-                o.as_ptr() as i32
-            }
-            fn record_printed_value(&mut self, _v: Value) {}
-            fn class_name_of_id(&self, c: ClassId) -> Option<String> {
-                self.shared.lock().unwrap().class_names.get(&c).cloned()
-            }
-            fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
-                self.shared
-                    .lock()
-                    .unwrap()
-                    .object_classes
-                    .get(&(o.as_ptr() as usize))
-                    .copied()
-                    .unwrap_or_else(|| ClassId::new(0))
-            }
-            fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
-                Vec::new()
-            }
-            fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
-                None
-            }
-            fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value {
-                Value::Object(None)
-            }
-            fn set_field_by_name(&self, _o: ObjectRef, _n: &str, _v: Value) {}
-            fn resolve_field_index(&self, _c: &str, _f: &str) -> Option<usize> {
-                None
-            }
-            fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
-                false
-            }
-            fn create_string(&mut self, _t: &str) -> ObjectRef {
-                let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
-            }
-            fn read_string(&self, _o: ObjectRef) -> Option<String> {
-                None
-            }
-            fn get_class_mirror(&mut self, _c: ClassId) -> ObjectRef {
-                let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
-            }
-            fn record_printed_line(&mut self, _t: String) {}
-            fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
-                None
-            }
-            fn get_system_property(&self, _k: &str) -> Option<String> {
-                None
-            }
-            fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
-                None
-            }
-            fn ensure_class_initialized(&mut self, _n: &str) -> Result<ClassId, MethodCallFailed> {
-                Ok(ClassId::new(0))
-            }
-            fn is_subclass(&self, _c: ClassId, _p: ClassId) -> bool {
-                false
-            }
-            fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
-                None
-            }
-            fn is_interface_class(&self, _c: ClassId) -> bool {
-                false
-            }
-            fn class_id_by_name(&self, _n: &str) -> Option<ClassId> {
-                None
-            }
-            fn loader_id_of_class(&self, _c: ClassId) -> i32 {
-                2
-            }
-            fn is_record_class(&self, _c: ClassId) -> bool {
-                false
-            }
-            fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
-                Vec::new()
-            }
-            fn is_sealed_class(&self, _c: ClassId) -> bool {
-                false
-            }
-            fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
-                Vec::new()
-            }
             fn thread_start(&mut self, _o: ObjectRef) -> MethodCallResult {
                 Ok(None)
             }
@@ -47490,8 +48515,50 @@ mod tests {
             fn enumerate_threads(&self, _m: usize) -> Vec<ObjectRef> {
                 Vec::new()
             }
-            fn heap_allocated_bytes(&self) -> usize {
+            fn park(&mut self, _t: Option<std::time::Duration>) {}
+            fn unpark(&self, _o: ObjectRef) {}
+            fn get_scoped_value(&self, _k: u64) -> Option<Value> {
+                None
+            }
+            fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
+            fn pop_scoped_value(&mut self) {}
+            fn scoped_value_depth(&self) -> usize {
                 0
+            }
+        }
+
+        impl cratonvm_native_api::NativeExceptionAccess for MockCtx {
+
+            fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
+                Vec::new()
+            }
+            fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
+                None
+            }
+        }
+
+        impl cratonvm_native_api::NativeGpuAccess for MockCtx {
+
+        }
+
+        impl cratonvm_native_api::NativeSystemAccess for MockCtx {
+
+            fn record_printed_value(&mut self, _v: Value) {}
+            fn record_printed_line(&mut self, _t: String) {}
+            fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
+                None
+            }
+            fn get_system_property(&self, _k: &str) -> Option<String> {
+                None
+            }
+            fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
+                None
+            }
+            fn vm_identity(&self) -> usize {
+                self.shared.lock().unwrap().vm_id
+            }
+            fn is_interface_class(&self, _c: ClassId) -> bool {
+                false
             }
             fn loaded_class_count(&self) -> usize {
                 0
@@ -47500,93 +48567,15 @@ mod tests {
                 0
             }
             fn force_gc(&mut self) {}
-            fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
-                Vec::new()
-            }
-            fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
-                Vec::new()
-            }
-            fn class_interfaces(&self, _c: ClassId) -> Vec<ClassId> {
-                Vec::new()
-            }
-            fn class_access_flags(&self, _c: ClassId) -> u16 {
-                0
-            }
             fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
                 Value::Int(0)
             }
             fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
-            fn primitive_class_mirror(&mut self, _n: &str) -> ObjectRef {
-                let mut s = self.shared.lock().unwrap();
-                s.alloc_entry(HeapEntry::Object { fields: Vec::new() })
-            }
             fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
                 use std::sync::OnceLock;
                 static FD: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> =
                     OnceLock::new();
                 FD.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
-            }
-            fn get_field_volatile(&self, o: ObjectRef, i: usize) -> Value {
-                self.get_field(o, i)
-            }
-            fn set_field_volatile(&self, o: ObjectRef, i: usize, v: Value) {
-                self.set_field(o, i, v)
-            }
-            fn compare_and_swap_field(
-                &mut self,
-                _o: ObjectRef,
-                _i: usize,
-                _e: Value,
-                _n: Value,
-            ) -> bool {
-                false
-            }
-            fn park(&mut self, _t: Option<std::time::Duration>) {}
-            fn unpark(&self, _o: ObjectRef) {}
-            fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {
-                None
-            }
-            fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
-                Vec::new()
-            }
-            fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
-                Vec::new()
-            }
-            fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
-                Vec::new()
-            }
-            fn method_parameter_annotations(
-                &self,
-                _c: ClassId,
-                _m: &str,
-                _d: &str,
-            ) -> Vec<Vec<AnnotationData>> {
-                Vec::new()
-            }
-            fn class_signature(&self, _c: ClassId) -> Option<String> {
-                None
-            }
-            fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
-                None
-            }
-            fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
-                None
-            }
-            fn method_annotation_default(
-                &self,
-                _c: ClassId,
-                _m: &str,
-                _d: &str,
-            ) -> Option<AnnotationElementValue> {
-                None
-            }
-            fn get_scoped_value(&self, _k: u64) -> Option<Value> {
-                None
-            }
-            fn push_scoped_value(&mut self, _k: u64, _v: Value) {}
-            fn pop_scoped_value(&mut self) {}
-            fn scoped_value_depth(&self) -> usize {
-                0
             }
             fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> {
                 None
@@ -47604,57 +48593,10 @@ mod tests {
             fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
                 None
             }
-            fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
-                None
-            }
-            fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
-                None
-            }
-            fn list_application_class_names(&self) -> Vec<String> {
-                Vec::new()
-            }
-            fn register_dynamic_classpath(&mut self, _p: &[String]) {}
-            fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
-                None
-            }
-            fn define_class_with_loader(
-                &mut self,
-                _n: &str,
-                _b: &[u8],
-                _l: u32,
-            ) -> Option<ClassId> {
-                None
-            }
-            fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
-                None
-            }
-            fn allocate_loader_id(&mut self) -> u32 {
-                0
-            }
-            fn discover_reference(
-                &mut self,
-                _t: u8,
-                _r: ObjectRef,
-                _f: ObjectRef,
-                _q: Option<ObjectRef>,
-            ) {
-            }
-            fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
-                true
-            }
-            fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-                true
-            }
-            fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
-                true
-            }
-            fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-                true
-            }
-            fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
-                Ok(())
-            }
         }
+
+
+
 
         #[test]
         fn unbox_wrapper_requires_jdk_wrapper_class() {
@@ -47678,6 +48620,526 @@ mod tests {
 
             assert_eq!(unbox_wrapper(&ctx, boxed), Some(Value::Long(42)));
             assert_eq!(element_hash_code(&mut ctx, &Value::Object(Some(boxed))), 42);
+        }
+
+        // ------------------------------------------------------------------
+        // Cross-wrapper key aliasing (silent wrong answer).
+        //
+        // `unbox_wrapper` maps Integer / Short / Byte / Character / Boolean
+        // onto the same `Value::Int`, and the wrapper-comparison arms also
+        // cross-compare Int against Long. Both the exact-HashMap integer
+        // overlay and the ordinary bucket-node path keyed off that, so keys
+        // real `HashMap` keeps apart collapsed onto one entry. Every assertion
+        // below fails against the pre-fix code.
+        // ------------------------------------------------------------------
+
+        /// Allocate a JDK wrapper instance of `class_name` holding `value`.
+        fn boxed_wrapper(
+            ctx: &mut MockCtx,
+            cid: ClassId,
+            class_name: &str,
+            value: Value,
+        ) -> ObjectRef {
+            ctx.define_class(cid, class_name);
+            let obj = ctx.alloc_object(cid, 1);
+            ctx.set_field(obj, 0, value);
+            obj
+        }
+
+        #[test]
+        fn wrapper_keys_of_different_classes_are_never_map_equal() {
+            let mut ctx = MockCtx::new(1);
+            let int_cid = ClassId::new(2001);
+            let i65 = boxed_wrapper(&mut ctx, int_cid, "java/lang/Integer", Value::Int(65));
+            let i65_other = boxed_wrapper(&mut ctx, int_cid, "java/lang/Integer", Value::Int(65));
+            let i1 = boxed_wrapper(&mut ctx, int_cid, "java/lang/Integer", Value::Int(1));
+            let c65 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2002),
+                "java/lang/Character",
+                Value::Int(65),
+            );
+            let true_box = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2003),
+                "java/lang/Boolean",
+                Value::Int(1),
+            );
+            let l1 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2004),
+                "java/lang/Long",
+                Value::Long(1),
+            );
+
+            // Unchanged: same wrapper class, same value, distinct objects.
+            assert!(
+                map_keys_equal(&mut ctx, i65, i65_other).unwrap(),
+                "two distinct Integer(65) boxes are the same HashMap key"
+            );
+
+            // All four returned `true` before the fix, silently collapsing two
+            // distinct JDK keys (which share a bucket, since their hashCodes
+            // agree) into one entry on `put`.
+            assert!(
+                !map_keys_equal(&mut ctx, i65, c65).unwrap(),
+                "Integer.valueOf(65) vs Character.valueOf('A')"
+            );
+            assert!(
+                !map_keys_equal(&mut ctx, i1, true_box).unwrap(),
+                "Integer.valueOf(1) vs Boolean.TRUE"
+            );
+            assert!(
+                !map_keys_equal(&mut ctx, i1, l1).unwrap(),
+                "Integer.valueOf(1) vs Long.valueOf(1L)"
+            );
+            assert!(
+                !map_keys_equal(&mut ctx, l1, i1).unwrap(),
+                "Long.valueOf(1L) vs Integer.valueOf(1) (symmetry)"
+            );
+        }
+
+        #[test]
+        fn double_wrapper_keys_use_jdk_bit_equality() {
+            let mut ctx = MockCtx::new(1);
+            let dbl = ClassId::new(2010);
+            let nan_a = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(f64::NAN));
+            let nan_b = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(f64::NAN));
+            let pos_zero = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(0.0));
+            let neg_zero = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(-0.0));
+
+            // `Double.valueOf(NaN).equals(Double.valueOf(NaN))` is TRUE in Java
+            // (doubleToLongBits). Was `false` under the old `x == y`, so a NaN
+            // key could be stored by `put` and never found again by
+            // `get`/`remove`/`containsKey`.
+            assert!(
+                map_keys_equal(&mut ctx, nan_a, nan_b).unwrap(),
+                "a NaN key must find itself"
+            );
+            // `Double.valueOf(0.0).equals(Double.valueOf(-0.0))` is FALSE in
+            // Java. Was `true`, so `put(-0.0, ...)` overwrote the `0.0` entry.
+            assert!(
+                !map_keys_equal(&mut ctx, pos_zero, neg_zero).unwrap(),
+                "+0.0 and -0.0 are distinct HashMap keys"
+            );
+        }
+
+        #[test]
+        fn values_equal_rejects_cross_wrapper_boxes() {
+            let mut ctx = MockCtx::new(1);
+            let i1 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2020),
+                "java/lang/Integer",
+                Value::Int(1),
+            );
+            let l1 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2021),
+                "java/lang/Long",
+                Value::Long(1),
+            );
+
+            // `List.of(Integer.valueOf(1)).contains(Long.valueOf(1L))` is false;
+            // so is `map.containsValue(...)` across wrapper types.
+            assert!(
+                !values_equal(&ctx, &Value::Object(Some(i1)), &Value::Object(Some(l1))),
+                "boxed Integer(1) and boxed Long(1L) are not equal"
+            );
+            // Raw VM-level primitives keep the cross-type numeric comparison —
+            // no Java wrapper class is involved there.
+            assert!(values_equal(&ctx, &Value::Int(1), &Value::Long(1)));
+            // Java `equals` bit semantics for floating point.
+            assert!(values_equal(
+                &ctx,
+                &Value::Double(f64::NAN),
+                &Value::Double(f64::NAN)
+            ));
+            assert!(!values_equal(
+                &ctx,
+                &Value::Double(0.0),
+                &Value::Double(-0.0)
+            ));
+        }
+
+        #[test]
+        fn int_overlay_refuses_a_foreign_wrapper_class() {
+            // The overlay side-tables are process-global and keyed by identity
+            // hash, which this mock derives from the raw pointer — every
+            // `MockCtx` otherwise starts allocating at the same address. Give
+            // each overlay-touching test its own pointer range.
+            static PTR_SPREAD: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let pad = PTR_SPREAD.fetch_add(256, std::sync::atomic::Ordering::Relaxed);
+            let mut ctx = MockCtx::new(1);
+            let filler = ClassId::new(2030);
+            ctx.define_class(filler, "java/lang/Object");
+            for _ in 0..pad {
+                let _ = ctx.alloc_object(filler, 0);
+            }
+
+            let map_cid = ClassId::new(2031);
+            ctx.define_class(map_cid, "java/util/HashMap");
+            let map = ctx.alloc_object(map_cid, 3);
+
+            let i65 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2032),
+                "java/lang/Integer",
+                Value::Int(65),
+            );
+            let c65 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2033),
+                "java/lang/Character",
+                Value::Int(65),
+            );
+
+            // First put seeds the overlay and adopts Integer as its key class.
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(i65)), Value::Int(1))
+                    .is_some(),
+                "fresh exact HashMap with an Integer key takes the overlay"
+            );
+            // A Character key unboxes to the same `Value::Int(65)`. Before the
+            // fix it landed on the SAME overlay slot and overwrote the Integer
+            // entry (map.size() stayed 1, get(65) returned the Character's
+            // value); now the overlay declines and the caller materializes into
+            // real nodes, where `map_keys_equal` keeps the two keys apart.
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(c65)), Value::Int(2))
+                    .is_none(),
+                "a Character key must not reuse the Integer overlay slot"
+            );
+            let got = try_hm_int_fast_get(&ctx, map, Value::Object(Some(i65)));
+            assert!(
+                matches!(got, Some(Ok(Some(Value::Int(1))))),
+                "Integer entry survives the rejected Character put: {got:?}"
+            );
+            assert!(
+                try_hm_int_fast_get(&ctx, map, Value::Object(Some(c65))).is_none(),
+                "a Character lookup must fall through to the node path"
+            );
+            assert_eq!(hm_int_fast_len(&ctx, map), Some(1));
+
+            // Leave the process-global overlay as we found it.
+            let overlay_key = hm_int_fast_obj_key(&ctx, map);
+            hm_int_fast_shard_for(overlay_key)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&overlay_key);
+        }
+
+        // ===============================================================
+        // Receiver classification memo
+        // (perf/collections-classification-cost)
+        // ===============================================================
+
+        /// Declare `id` as `name`, optionally extending `parent`.
+        fn declare(ctx: &MockCtx, id: u32, name: &str, parent: Option<u32>) -> ClassId {
+            let cid = ClassId::new(id);
+            ctx.define_class(cid, name);
+            if let Some(p) = parent {
+                ctx.define_superclass(cid, ClassId::new(p));
+            }
+            cid
+        }
+
+        /// A miniature `java.util` hierarchy, shaped like the real one:
+        /// `AbstractMap` and `Dictionary` are deliberately NOT well-known, so
+        /// the walk has to pass through classes it does not recognise.
+        fn declare_map_hierarchy(ctx: &MockCtx) {
+            declare(ctx, 100, "java/lang/Object", None);
+            declare(ctx, 101, "java/util/AbstractMap", Some(100));
+            declare(ctx, 102, "java/util/HashMap", Some(101));
+            declare(ctx, 103, "java/util/LinkedHashMap", Some(102));
+            declare(ctx, 104, "java/util/TreeMap", Some(101));
+            declare(ctx, 105, "java/util/Dictionary", Some(100));
+            declare(ctx, 106, "java/util/Hashtable", Some(105));
+            declare(ctx, 107, "java/util/Properties", Some(106));
+            declare(
+                ctx,
+                108,
+                "java/util/concurrent/ConcurrentHashMap",
+                Some(101),
+            );
+            // An application subclass, the case the predicates exist for.
+            declare(ctx, 109, "app/AnnotationAttributes", Some(103));
+            declare(ctx, 110, "cratonvm/internal/UnmodifiableMap", Some(100));
+        }
+
+        #[test]
+        fn class_facts_classifies_every_map_family() {
+            let ctx = MockCtx::new(1);
+            declare_map_hierarchy(&ctx);
+            let facts = |id: u32| class_facts(&ctx, ClassId::new(id));
+
+            // Exact `java/util/HashMap` — the class the integer overlay is
+            // entered for.
+            let hm = facts(102);
+            assert!(hm.has(CF_EXACT_HASHMAP));
+            assert!(hm.has(CF_BUCKET_MAP_NAME));
+            assert!(hm.has(CF_HAS_NAME));
+            assert!(!hm.has(CF_LHM));
+            assert!(!hm.has(CF_TREE_MAP));
+            assert!(!hm.has(CF_CHM));
+            assert!(!hm.has(CF_HASHTABLE_LAYOUT));
+            assert!(!hm.has(CF_HASHTABLE_ANCESTRY));
+            assert!(!hm.has(CF_UNMOD_WRAPPER));
+
+            // LinkedHashMap routes to the LHM overlay but still reads as a
+            // bucket map (it reaches `HashMap` before `Object`), matching the
+            // original walks exactly.
+            let lhm = facts(103);
+            assert!(lhm.has(CF_LHM));
+            assert!(lhm.has(CF_BUCKET_MAP_NAME));
+            assert!(!lhm.has(CF_EXACT_HASHMAP));
+            assert!(!lhm.has(CF_TREE_MAP));
+
+            // The WFLYCTL0013 case: an application subclass of LinkedHashMap
+            // must still route to the LHM natives.
+            let app = facts(109);
+            assert!(app.has(CF_LHM));
+            assert!(!app.has(CF_EXACT_HASHMAP));
+
+            // TreeMap: field 0 is `root`, not a bucket array (the Keycloak
+            // FeatureOptions bug), so it must NOT read as a bucket map.
+            let tm = facts(104);
+            assert!(tm.has(CF_TREE_MAP));
+            assert!(!tm.has(CF_BUCKET_MAP_NAME));
+            assert!(!tm.has(CF_LHM));
+            assert!(!tm.has(CF_CHM));
+
+            let chm = facts(108);
+            assert!(chm.has(CF_CHM));
+            assert!(!chm.has(CF_LHM));
+            assert!(!chm.has(CF_TREE_MAP));
+
+            // Hashtable uses the native bucket layout...
+            let ht = facts(106);
+            assert!(ht.has(CF_HASHTABLE_LAYOUT));
+            assert!(ht.has(CF_HASHTABLE_ANCESTRY));
+            assert!(ht.has(CF_BUCKET_MAP_NAME));
+
+            // ...but `Properties` does not: JDK 25 backs it with a side CHM.
+            // It must still be seen as Hashtable ANCESTRY, so that
+            // `native_map_put_evict` runs `ensure_hashtable_load_factor` on it.
+            // This is the one place the two Hashtable bits differ, and it is
+            // why both exist.
+            let props = facts(107);
+            assert!(!props.has(CF_HASHTABLE_LAYOUT));
+            assert!(props.has(CF_HASHTABLE_ANCESTRY));
+            assert!(props.has(CF_BUCKET_MAP_NAME));
+
+            let object = facts(100);
+            assert!(object.has(CF_EXACT_OBJECT));
+            assert!(!object.has(CF_BUCKET_MAP_NAME));
+
+            let unmod = facts(110);
+            assert!(unmod.has(CF_UNMOD_WRAPPER));
+
+            // An id that was never defined has no name, so
+            // `native_map_put_evict`'s family-dispatch block stays skipped.
+            let unknown = facts(999);
+            assert!(!unknown.has(CF_HAS_NAME));
+            assert_eq!(unknown, ClassFacts(0));
+        }
+
+        #[test]
+        fn class_facts_is_stable_across_repeated_lookups() {
+            let ctx = MockCtx::new(1);
+            declare_map_hierarchy(&ctx);
+            // First call classifies, the rest must be served from the memo and
+            // agree with a fresh, uncached classification.
+            for id in [100u32, 102, 103, 104, 106, 107, 108, 109, 110, 999] {
+                let cid = ClassId::new(id);
+                let fresh = classify_class(&ctx, cid);
+                assert_eq!(class_facts(&ctx, cid), fresh, "first lookup, id {id}");
+                assert_eq!(class_facts(&ctx, cid), fresh, "memoized lookup, id {id}");
+                assert_eq!(class_facts(&ctx, cid), fresh, "memoized again, id {id}");
+            }
+        }
+
+        #[test]
+        fn class_facts_is_scoped_per_vm() {
+            // The memo is thread-local, so two VMs on one thread would share it
+            // if it were not keyed by `vm_identity` — and `ClassId` spaces are
+            // per-VM, so the same id means different classes in each.
+            let a = MockCtx::new(1);
+            let b = MockCtx::new(1);
+            assert_ne!(a.vm_identity(), b.vm_identity());
+            declare(&a, 42, "java/util/TreeMap", None);
+            declare(&b, 42, "java/util/HashMap", None);
+
+            assert!(class_facts(&a, ClassId::new(42)).has(CF_TREE_MAP));
+            assert!(class_facts(&b, ClassId::new(42)).has(CF_EXACT_HASHMAP));
+            // Re-reading A must not return B's answer.
+            assert!(class_facts(&a, ClassId::new(42)).has(CF_TREE_MAP));
+            assert!(!class_facts(&a, ClassId::new(42)).has(CF_EXACT_HASHMAP));
+        }
+
+        #[test]
+        fn class_facts_survives_a_direct_mapped_tag_collision() {
+            // Two `ClassId`s that share a cache slot must each get their own
+            // answer: the slot carries the id it was filled for and is only
+            // trusted on an exact match, so a collision costs a
+            // re-classification, never a wrong classification.
+            let ctx = MockCtx::new(1);
+            let base = 700u32;
+            let slot = facts_slot_index(base);
+            let other = (base + 1..base + 400_000)
+                .find(|&id| facts_slot_index(id) == slot)
+                .expect("some later id shares the slot");
+            assert_ne!(base, other);
+
+            declare(&ctx, base, "java/util/TreeMap", None);
+            declare(&ctx, other, "java/util/HashMap", None);
+
+            // Alternate, so each lookup evicts the other from the shared slot.
+            for _ in 0..4 {
+                assert!(class_facts(&ctx, ClassId::new(base)).has(CF_TREE_MAP));
+                assert!(!class_facts(&ctx, ClassId::new(base)).has(CF_EXACT_HASHMAP));
+                assert!(class_facts(&ctx, ClassId::new(other)).has(CF_EXACT_HASHMAP));
+                assert!(!class_facts(&ctx, ClassId::new(other)).has(CF_TREE_MAP));
+            }
+            for id in 0u32..2048 {
+                assert!(facts_slot_index(id) < RECEIVER_FACTS_WAYS);
+            }
+        }
+
+        #[test]
+        fn unloaded_class_ids_are_never_reissued_so_the_memo_needs_no_generation() {
+            // Class unloading landed on `dev` this wave. A `ClassId`-keyed memo
+            // is only sound because `ClassStore` never hands an id back out:
+            // `remove` leaves a `None` tombstone (`Option::take`) and
+            // `next_id()` is the slot VECTOR's length, not `live_count`
+            // (`classloading/src/class.rs:909`, `:1096`, pinned by the test
+            // `unloaded_slots_are_tombstoned_and_never_reused`). This test
+            // exercises both halves of that argument.
+            let ctx = MockCtx::new(1);
+            let dead = 300u32;
+            declare(&ctx, dead, "java/util/TreeMap", None);
+            assert!(class_facts(&ctx, ClassId::new(dead)).has(CF_TREE_MAP));
+
+            ctx.unload_class(ClassId::new(dead));
+
+            // Half one — the real invariant. The class loaded after the unload
+            // gets a FRESH id, so it can never read the dead class's memo
+            // entry, and no generation stamp or unload hook is needed.
+            let fresh = dead + 1;
+            declare(&ctx, fresh, "java/util/HashMap", None);
+            let facts = class_facts(&ctx, ClassId::new(fresh));
+            assert!(facts.has(CF_EXACT_HASHMAP));
+            assert!(!facts.has(CF_TREE_MAP), "no bleed from the unloaded class");
+
+            // Half two — why the invariant is load-bearing rather than
+            // incidental. If an id COULD be recycled, the memo would answer for
+            // the dead class. Asserting the stale answer here documents the
+            // exact dependency: if `ClassStore` ever starts reusing slots, this
+            // assertion flips and the memo needs a generation stamp.
+            declare(&ctx, dead, "java/util/HashMap", None);
+            assert!(
+                class_facts(&ctx, ClassId::new(dead)).has(CF_TREE_MAP),
+                "memo is `ClassId`-keyed with no generation — sound ONLY because \
+                 `ClassStore` tombstones unloaded slots and never reissues an id"
+            );
+        }
+
+        // ===============================================================
+        // Sharded integer overlay (perf/hm-int-fast-shard)
+        // ===============================================================
+
+        #[test]
+        fn hm_int_fast_shard_index_is_in_range_and_spreads() {
+            let mut seen = [false; HM_INT_FAST_SHARDS];
+            for key in 0usize..4096 {
+                let idx = hm_int_fast_shard_index(key);
+                assert!(idx < HM_INT_FAST_SHARDS, "shard {idx} out of range");
+                seen[idx] = true;
+            }
+            assert!(
+                seen.iter().all(|hit| *hit),
+                "a 4096-key sample must reach all {HM_INT_FAST_SHARDS} shards"
+            );
+            // Deterministic: the same key always resolves to the same shard,
+            // which is what makes per-key routing equivalent to the old single
+            // map.
+            for key in [0usize, 1, 12345, usize::MAX / 3] {
+                assert_eq!(hm_int_fast_shard_index(key), hm_int_fast_shard_index(key));
+            }
+        }
+
+        #[test]
+        fn sharded_overlay_enumeration_visits_every_shard() {
+            // The GC root scan / post-move remap walks the overlay through
+            // `for_each_overlay_ref`. With the table sharded, missing a shard
+            // silently drops a root — so prove the walk reaches entries planted
+            // in several DIFFERENT shards, not just the first.
+            let mut ctx = MockCtx::new(1);
+            let cid = ClassId::new(400);
+            ctx.define_class(cid, "java/lang/Object");
+
+            // One key per target shard, tagged well clear of the packed
+            // `widened_obj_key` values real maps produce.
+            // Built by shifting rather than written as a 64-bit literal, so the
+            // test still compiles if this is ever built for a 32-bit target.
+            let tag = 0xC0FF_EE00usize.wrapping_shl(32);
+            let mut planted: Vec<(usize, usize)> = Vec::new(); // (key, key-object ptr)
+            let mut targets: Vec<usize> = Vec::new();
+            let mut probe = 0usize;
+            while targets.len() < 8 {
+                let key = tag | (probe << 8) | targets.len();
+                let shard = hm_int_fast_shard_index(key);
+                if !targets.contains(&shard) {
+                    targets.push(shard);
+                    let key_obj = ctx.alloc_object(cid, 0);
+                    let value_obj = ctx.alloc_object(cid, 0);
+                    let mut state = HmIntFastState::default();
+                    state
+                        .entries
+                        .insert(7, (key_obj, Value::Object(Some(value_obj))));
+                    let prev = hm_int_fast_shard_for(key)
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(key, state);
+                    assert!(prev.is_none(), "test key collided with a live overlay");
+                    planted.push((key, key_obj.as_ptr() as usize));
+                    planted.push((key, value_obj.as_ptr() as usize));
+                }
+                probe += 1;
+                assert!(probe < 100_000, "could not find 8 distinct shards");
+            }
+            assert!(
+                targets.len() > 1,
+                "the point of the test is entries in more than one shard"
+            );
+
+            let mine: std::collections::HashSet<usize> =
+                planted.iter().map(|(_, ptr)| *ptr).collect();
+            let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            for_each_overlay_ref(true, |r| {
+                let ptr = r.as_ptr() as usize;
+                if mine.contains(&ptr) {
+                    visited.insert(ptr);
+                }
+            });
+
+            // Clean up before asserting, so a failure does not poison the
+            // process-global tables for every other test.
+            for (key, _) in &planted {
+                hm_int_fast_shard_for(*key)
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(key);
+            }
+
+            assert_eq!(
+                visited.len(),
+                mine.len(),
+                "every planted key and value across {} shards must be visited; \
+                 a missed shard is a dropped GC root",
+                targets.len()
+            );
         }
 
         /// Helper: initialise a fresh LBQ instance with the given capacity.

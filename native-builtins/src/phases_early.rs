@@ -731,7 +731,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "copyOf",
         "([Ljava/lang/Object;I)[Ljava/lang/Object;",
         |ctx, args| {
-            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            if crate::nbflags().dbg_toarray_ok {
                 eprintln!(
                     "[DBG_TOARRAY] copyOf2 (Object[],int) HIT nargs={}",
                     args.len()
@@ -769,7 +769,7 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "copyOf",
         "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;",
         |ctx, args| {
-            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            if crate::nbflags().dbg_toarray_ok {
                 eprintln!(
                     "[DBG_TOARRAY] copyOf3 (Object[],int,Class) HIT nargs={}",
                     args.len()
@@ -7888,6 +7888,8 @@ fn fjp_state_clear() {
 
 #[cfg(test)]
 mod fjp_gc_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -13314,7 +13316,7 @@ pub(crate) fn pbkdf2_derive_for(
 /// this on supersedes the real-provider path for the *entire* `PBEWith*` family
 /// rather than just the one tested algorithm — so it ships opt-in until soaked.
 fn pbe_keyfactory_enabled() -> bool {
-    std::env::var("CRATONVM_NATIVE_PBE_KEYFACTORY").as_deref() == Ok("1")
+    crate::nbflags().native_pbe_keyfactory
 }
 
 /// Is `alg` a SunJCE PKCS#5 v1.5 PBE `SecretKeyFactory` algorithm?
@@ -13922,7 +13924,23 @@ fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallRe
 
     match result_bytes {
         Ok(bytes) => {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            // FIX (TestEncryptInterceptorLargeHeap hard-abort-instead-of-OOME):
+            // this used to allocate the plaintext/ciphertext output via the
+            // panicking `new_array`, which `std::process::abort()`s the whole
+            // VM (killing every remaining test in the batch) when a huge
+            // payload (observed: a ~1 GiB AES-GCM round-trip) can't fit —
+            // instead of the catchable `OutOfMemoryError` HotSpot throws. Use
+            // the fallible `try_new_array` (same `try_new_ref_array`/
+            // `try_alloc_array_full` idiom as the `ArrayList(int)` abend fix,
+            // see `docs/internal/gaps/crash-01-arraylist-capacity-oom-abend.md`)
+            // and throw a catchable OOME on `None` instead.
+            let Some(arr) = ctx.try_new_array(cratonvm_types::ArrayElementType::Byte, bytes.len())
+            else {
+                return Err(RuntimeError::OutOfMemoryError {
+                    message: "Java heap space".to_string(),
+                }
+                .into());
+            };
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
@@ -15061,7 +15079,7 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
     // A registered native shadows the class's real bytecode at every interpreter
     // dispatch site (WP0.1 native-override-priority), so the registry must be
     // empty for these classes. See `reference_server_socket_gap`.
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+    if crate::vmflags().io.real_net_sockets {
         return;
     }
     let __prev_cat = r.current_category();
@@ -15936,7 +15954,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
+        // STW-COOPERATION: see the matching bracket in
+        // `servlet.rs`'s `ServerSocketChannel.accept` — a thread parked in a
+        // blocking `accept()` must be marked blocked or a concurrent STW
+        // waits for a safepoint arrival that can never happen.
+        ctx.begin_blocking_region();
         let stream_id = s2_blocking_accept(lid);
+        ctx.end_blocking_region();
         match stream_id {
             Some(sid) => {
                 let client = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
@@ -16858,7 +16882,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     r.register(ar, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = ctx.get_field_volatile(this, 0);
-        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+        if crate::nbflags().dbg_loader_trace {
             if let Value::Object(Some(o)) = v {
                 let cid = ctx.class_id_of_object(o);
                 let cn = ctx.class_name_of_id(cid).unwrap_or_default();
@@ -16874,7 +16898,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     });
     r.register(ar, "set", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+        if crate::nbflags().dbg_loader_trace {
             if let Value::Object(Some(o)) = args[1] {
                 let cid = ctx.class_id_of_object(o);
                 let cn = ctx.class_name_of_id(cid).unwrap_or_default();
@@ -16916,7 +16940,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let ok = ctx.compare_and_swap_field(this, 0, args[1], args[2]);
-            if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+            if crate::nbflags().dbg_loader_trace {
                 if let Value::Object(Some(o)) = args[2] {
                     let cid = ctx.class_id_of_object(o);
                     let cn = ctx.class_name_of_id(cid).unwrap_or_default();
@@ -17712,31 +17736,27 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     });
 
     // --- ConsoleHandler ---
-    let ch = "java/util/logging/ConsoleHandler";
-    r.register(ch, "<init>", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(
-        ch,
-        "publish",
-        "(Ljava/util/logging/LogRecord;)V",
-        |ctx, args| {
-            if let Some(Value::Object(Some(rec))) = args.get(1) {
-                let msg_val = ctx.get_field(*rec, 1);
-                if let Value::Object(Some(m)) = msg_val {
-                    let text = ctx.read_string(m).unwrap_or_default();
-                    ctx.record_printed_line(text);
-                }
-            }
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(ch, "close", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(ch, "flush", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    // Previously `<init>`/`publish`/`close`/`flush` were all stubbed here:
+    // `<init>` was a bare no-op (skipping the real `StreamHandler`
+    // constructor's `setOutputStream(System.err)` + property-driven
+    // formatter setup entirely, leaving `getFormatter()` null), and
+    // `publish` read `LogRecord` raw slot 1 (this module's OLD synthetic
+    // `LogRecord` layout, where slot 1 was the message) and fed it to
+    // `record_printed_line` -- an internal Rust-side debug buffer nothing
+    // in a real Java program (including Spring Boot's `CapturedOutput`
+    // test infra) ever reads. The rest of the JUL bridge (logmanager.rs,
+    // T19.H3) moved `LogRecord` to a real-field-name layout
+    // (`get/set_field_by_name(_, "message")`) long ago, so slot 1 no
+    // longer holds the message on records built via
+    // `publish_to_jul_handlers_src`'s `new_object_initialized` path --
+    // this stub had silently gone stale and made every `ConsoleHandler`
+    // constructed by a real `readConfiguration`-driven `logging.properties`
+    // (e.g. Spring Boot's `JavaLoggingSystem`) produce zero visible output
+    // no matter what handler/level/formatter wiring was otherwise correct.
+    // Real `StreamHandler`/`Handler` bytecode verified working directly
+    // (`new StreamHandler(System.err, new SimpleFormatter())` correctly
+    // formats and writes through the current `System.err`, including under
+    // JUnit's `CapturedOutput` wrapping) -- let it run instead of stubbing.
 
     // --- Formatter (abstract) ---
     let fmt = "java/util/logging/Formatter";
@@ -17762,27 +17782,29 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     );
 
     // --- SimpleFormatter ---
-    let sf = "java/util/logging/SimpleFormatter";
-    r.register(sf, "<init>", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(
-        sf,
-        "format",
-        "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
-        |ctx, args| {
-            if let Some(Value::Object(Some(rec))) = args.get(1) {
-                let msg = ctx.get_field(*rec, 1);
-                if let Value::Object(Some(m)) = msg {
-                    let text = ctx.read_string(m).unwrap_or_default();
-                    let formatted = ctx.create_string(&format!("INFO: {text}\n"));
-                    return Ok(Some(Value::Object(Some(formatted))));
-                }
-            }
-            let s = ctx.create_string("INFO: \n");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    // Previously `<init>`/`format` were stubbed here the same way
+    // `ConsoleHandler.<init>`/`publish` were (see the removal note above
+    // `register_spring_boot_logback_apply`'s sibling in lib.rs and the
+    // `ConsoleHandler` removal in this file): `<init>` was a bare no-op
+    // (skipping the real no-arg constructor's `invokedynamic`-driven
+    // default-format-pattern setup entirely), and `format` read `LogRecord`
+    // raw slot 1 -- this module's OLD synthetic layout, where slot 1 was
+    // the message; the REAL layout (`get/set_field_by_name(_, "message")`,
+    // used throughout `logmanager.rs`) has moved the message elsewhere, so
+    // slot 1 no longer holds it. The read always missed, falling through to
+    // a hardcoded `"INFO: \n"` regardless of the record's actual level or
+    // message -- misdiagnosed for a time as a VM interpreter/JIT
+    // correctness bug (see the retraction in
+    // docs/known-issues/springboot/exception-table-method-state-loss-cluster.md)
+    // before this stale stub was found. Real `Formatter`/`SimpleFormatter`
+    // bytecode verified working directly for the message/level path (via
+    // `Formatter.formatMessage`, already natively bridged further down in
+    // this same file); the real no-arg constructor's own
+    // `invokedynamic`-driven default pattern remains a separate, narrower,
+    // documented residual (`javaloggingsystemtests-simpleformatter-args-drop.md`,
+    // corrected likewise) that only affects handlers with no explicit
+    // `.formatter=` config -- `apply_jul_config_entries` in
+    // `logmanager.rs` already patches around it for that specific case.
 
     // --- LogManager (singleton) ---
     let lm = "java/util/logging/LogManager";
@@ -20285,6 +20307,8 @@ fn native_scanner_find_within_horizon_string_int(
 // ===========================================================================
 #[cfg(test)]
 mod t2_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};

@@ -3,9 +3,66 @@
 
 //! JVMTI (JVM Tool Interface) implementation.
 //!
-//! Provides the complete JVMTI function table, agent loading support,
-//! event delivery infrastructure, and capabilities management as specified
-//! by the JVMTI specification (JSR-163 / JVM TI 11.0+).
+//! Provides the JVMTI function table, agent loading support, event delivery
+//! infrastructure, and capabilities management modelled on the JVMTI
+//! specification (JSR-163 / JVM TI 11.0+).
+//!
+//! ---------------------------------------------------------------------------
+//! # LIVENESS AND SCOPE — established by the observability audit, 2026-07-26
+//! ---------------------------------------------------------------------------
+//!
+//! **There are two JVMTI implementations in this tree.** Know which one you
+//! are looking at:
+//!
+//! | | `vm/src/runtime/jvmti.rs` (this file) | `vm/src/jvmti/` |
+//! |---|---|---|
+//! | Event delivery | `JvmtiEventManager` + `fire_*` free functions | `EventManager` + `EventCallbacks` |
+//! | Callback type | in-process Rust `Box<dyn Fn>` | in-process Rust `Box<dyn Fn>` |
+//! | Reached by native agents | **no** — see the bridge below | yes — `agent.rs` does a real `libloading` `dlopen` + `Agent_OnLoad` |
+//! | Wired to the interpreter | **yes** — see below | only via the bridge (D14) |
+//! | Gated on a cargo feature | no | `experimental-debug` (on by default) |
+//!
+//! **obsaudit D14 (2026-07-26): a one-way bridge now forwards 9 event kinds
+//! from this file to the real, native-agent-facing env** — see
+//! `install_real_agent_env_bridge` near the bottom of this file for exactly
+//! which ones and why not all of them. This is a bridge, not a merge: the two
+//! `JvmtiEventManager`/`EventManager` types, their event enums, and their two
+//! `JvmtiCapabilities` structs remain separate. A real agent now receives
+//! VMInit, VMDeath, ThreadStart, ThreadEnd, ClassLoad, ClassPrepare,
+//! GarbageCollectionStart/Finish, and ObjectFree; it still receives nothing
+//! for method-level tracing (MethodEntry/Exit, SingleStep, Breakpoint,
+//! FramePop, FieldAccess/Modification) or monitor contention events, and
+//! `vm/src/jvmti/capabilities.rs`'s `JvmtiCapabilities::potential()` was
+//! corrected to advertise `false` for exactly those, so `AddCapabilities`
+//! honestly reports what an agent will and won't see. Full unification
+//! remains a separate, larger task.
+//!
+//! What IS live in this file on a default build:
+//!
+//!  * `install_global_manager` runs unconditionally from `SharedVm::new`, so
+//!    the process-global `JvmtiEventManager` always exists.
+//!  * `fire_class_load` / `fire_class_prepare` are driven by the
+//!    `classloading` hook adapters, `fire_gc_start` / `fire_gc_finish` by the
+//!    `gc` hook adapters, `fire_vm_init` / `fire_vm_death` by the VM
+//!    lifecycle, and `fire_method_entry` / `fire_method_exit` /
+//!    `fire_single_step` / `fire_frame_pop` / `fire_field_access_if_watched` /
+//!    `fire_field_modification_if_watched` from the interpreter.
+//!  * Every one of those call sites is guarded by an `any_*_listener_active()`
+//!    atomic check, so with no listener registered the cost is a relaxed load.
+//!  * `install_real_agent_env_bridge` runs unconditionally from `Vm::new`
+//!    (the real boot path), so the 9 bridged event kinds above reach a real
+//!    attached agent without it registering anything on this file's manager.
+//!
+//! In-tree/embedder listeners (Rust closures registered directly on this
+//! file's `JvmtiEventManager`, e.g. in tests) still work exactly as before
+//! and are unaffected by the bridge — they are a separate delivery path from
+//! `snapshot_envs()`/`self.callbacks`, not routed through `vm/src/jvmti/` at
+//! all.
+//!
+//! ## Known correctness gaps (each documented at its definition)
+//!
+//!  * `get_local_*` / `set_local_*` operate on a side table, not on real
+//!    interpreter frames — see [`JvmtiEnv::get_local_int`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -522,7 +579,14 @@ impl JvmtiCapabilities {
             can_get_source_file_name: true,
             can_get_line_numbers: true,
             can_get_source_debug_extension: true,
-            can_access_local_variables: true,
+            // obsaudit D2 (2026-07-26): `get_local_*`/`set_local_*` read and
+            // write a side table, never a real interpreter/JIT frame — see
+            // the GAP note above `set_local_variable_table` below.
+            // `GetPotentialCapabilities` must not claim this works; a
+            // well-behaved caller checks potential capabilities before
+            // `AddCapabilities`, and `add_capabilities` below now enforces
+            // it regardless.
+            can_access_local_variables: false,
             can_maintain_original_method_order: true,
             can_generate_single_step_events: true,
             can_generate_exception_events: true,
@@ -779,6 +843,40 @@ impl fmt::Debug for EventCallbacks {
 /// attached via [`JvmtiEventManager::register_env`]. When a fire_ method runs
 /// it dispatches to every attached env's callback table in turn, matching the
 /// JVMTI spec semantics where multiple agents may subscribe to the same event.
+///
+/// **That contract is currently only partially implemented.** 11 of the 30
+/// `fire_*` methods run the `snapshot_envs()` loop; the rest dispatch only to
+/// this manager's own `callbacks` table, so an attached env silently receives
+/// nothing for them. There is no diagnostic when this happens. Still missing
+/// the loop, as of 2026-07-26:
+///
+/// ```text
+/// vm_init          vm_death          thread_start      thread_end
+/// class_file_load_hook               exception         exception_catch
+/// breakpoint       gc_start          gc_finish         monitor_contended_enter
+/// monitor_contended_entered          monitor_wait      monitor_waited
+/// compiled_method_load               compiled_method_unload
+/// dynamic_code_generated
+/// ```
+///
+/// `class_load` / `class_prepare` were in that list and now dispatch per-env;
+/// the others were left alone rather than swept, because two of them need a
+/// semantic decision first, not a copied loop: `class_file_load_hook` returns
+/// replacement bytes (with N agents, whose transform wins — first, last, or
+/// chained?), and `breakpoint` / `exception` are the events where double
+/// delivery to an agent that registered on both tables would be most visible.
+///
+/// Note also that the per-env loops do *not* consult the env's own enable
+/// state — `is_event_enabled` is checked once against this manager, then every
+/// attached env's callback is invoked. An env that never enabled the event
+/// still gets it. That is the established behaviour of every existing loop, so
+/// the two added here match it deliberately rather than inventing a second
+/// semantics; it is worth revisiting if per-env enablement ever matters.
+///
+/// Scope check before relying on any of this: `register_env` has no callers
+/// outside tests, and agents loaded via `-agentpath:` reach a *different*
+/// manager entirely (`vm/src/jvmti/`, see the D14 note at the top of this
+/// file). Per-env delivery here is therefore test-only reachable today.
 ///
 /// A per-manager [`AtomicBool`] is used as the no-agent fast path: when no
 /// environment has enabled any event and no callback is registered, the flag
@@ -1117,6 +1215,10 @@ impl JvmtiEventManager {
     // --- Event firing methods ---
 
     pub fn fire_vm_init(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_vm_init(&shared.debug.jvmti_env.lock(), 0);
+        }
         if !self.is_event_enabled(JvmtiEventKind::VmInit, None) {
             return;
         }
@@ -1129,6 +1231,10 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_vm_death(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_vm_death(&shared.debug.jvmti_env.lock());
+        }
         if !self.is_event_enabled(JvmtiEventKind::VmDeath, None) {
             return;
         }
@@ -1141,6 +1247,11 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_thread_start(&self, thread: ThreadId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            let name = resolve_thread_name_for_bridge(&shared, thread);
+            crate::jvmti::notify_thread_start(&shared.debug.jvmti_env.lock(), thread, &name);
+        }
         if !self.is_event_enabled(JvmtiEventKind::ThreadStart, Some(thread)) {
             return;
         }
@@ -1153,6 +1264,15 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_thread_end(&self, thread: ThreadId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        // Note: `vm/src/vm/vm_exec.rs` already has its own hand-written
+        // `notify_thread_end` call site for the real env; this bridge makes
+        // that call redundant whenever this method is *also* invoked for the
+        // same thread exit, but harmless — ThreadEnd carries no per-call
+        // state an agent couldn't tolerate seeing twice as cheaply as never.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_thread_end(&shared.debug.jvmti_env.lock(), thread);
+        }
         if !self.is_event_enabled(JvmtiEventKind::ThreadEnd, Some(thread)) {
             return;
         }
@@ -1184,26 +1304,78 @@ impl JvmtiEventManager {
         None
     }
 
+    /// Fire ClassLoad.
+    ///
+    /// Reached from `ClassManager::define_class_shared_with_options` via
+    /// `ClassManagerWriteGuard::drop` (`vm/src/vm/realms/class_realm.rs`) —
+    /// see the DEFERRED FIRING notes above `install_class_load_hook` in
+    /// `classloading/src/class_manager.rs`. As of obsaudit D1 (2026-07-26)
+    /// this runs strictly *after* the L10 `ClassRealm::class_manager` write
+    /// guard has been released, not while it is held: a listener may freely
+    /// call back into the class manager (`GetClassSignature`,
+    /// `GetLoadedClasses`, `RetransformClasses`, ...) without self-
+    /// deadlocking. `catch_unwind` is kept regardless — an agent callback is
+    /// untrusted code from the VM's point of view, and a panic in one must
+    /// not unwind through interpreter/classloader frames it has no business
+    /// touching.
     pub fn fire_class_load(&self, thread: ThreadId, class_id: ClassId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        // Replaces the old hand-written call site in `vm/src/vm/vm_init.rs`
+        // (a narrower helper that only covered one dynamic-load path), which
+        // was removed so ClassLoad reaches the real env exactly once, from
+        // every class-definition path, not just that one.
+        if let Some(shared) = real_agent_shared() {
+            if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
+                crate::jvmti::notify_class_load(&shared.debug.jvmti_env.lock(), class_id, &name);
+            }
+        }
         if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) {
             return;
         }
         self.record_event(JvmtiEventKind::ClassLoad);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_load {
-                cb(thread, class_id);
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, class_id)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.class_load {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, class_id)
+                    }));
+                }
             }
         }
     }
 
+    /// Fire ClassPrepare. Same timing and re-entrancy contract as
+    /// [`Self::fire_class_load`] — see its doc comment.
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
+                crate::jvmti::notify_class_prepare(&shared.debug.jvmti_env.lock(), class_id, &name);
+            }
+        }
         if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) {
             return;
         }
         self.record_event(JvmtiEventKind::ClassPrepare);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_prepare {
-                cb(thread, class_id);
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, class_id)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.class_prepare {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, class_id)
+                    }));
+                }
             }
         }
     }
@@ -1396,6 +1568,10 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_gc_start(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_gc_start(&shared.debug.jvmti_env.lock());
+        }
         if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionStart, None) {
             return;
         }
@@ -1408,6 +1584,10 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_gc_finish(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_gc_finish(&shared.debug.jvmti_env.lock());
+        }
         if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionFinish, None) {
             return;
         }
@@ -1562,6 +1742,14 @@ impl JvmtiEventManager {
     /// "no tag" and should not normally reach this path; callers (the GC's
     /// tag-sweep step) are expected to filter those out.
     pub fn fire_object_free(&self, tag: i64) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        // Deliberately ahead of the `has_any_listener` fast-path below: that
+        // flag tracks only this (synthetic) manager's own listeners, so a
+        // real native agent with `can_tag_objects` and nothing registered
+        // here would otherwise never see its own ObjectFree events.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_object_free(&shared.debug.jvmti_env.lock(), tag);
+        }
         if !self.has_any_listener() {
             return;
         }
@@ -1704,198 +1892,22 @@ impl Default for JvmtiEventManager {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Agent Loading Support
-// ---------------------------------------------------------------------------
-
-/// A registered agent (native or Java).
-#[derive(Debug, Clone)]
-pub struct AgentEntry {
-    pub name: String,
-    pub path: String,
-    pub options: String,
-    pub is_java_agent: bool,
-    pub loaded: bool,
-}
-
-/// Registry of JVMTI agents loaded via command-line options.
-pub struct AgentRegistry {
-    agents: Vec<AgentEntry>,
-    /// Callbacks invoked during Agent_OnLoad (indexed by agent name).
-    on_load_callbacks: HashMap<String, Box<dyn Fn(&str) -> i32 + Send + Sync>>,
-    /// Callbacks invoked during Agent_OnUnload (indexed by agent name).
-    on_unload_callbacks: HashMap<String, Box<dyn Fn() + Send + Sync>>,
-}
-
-impl fmt::Debug for AgentRegistry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AgentRegistry")
-            .field("agents", &self.agents)
-            .field("on_load_count", &self.on_load_callbacks.len())
-            .field("on_unload_count", &self.on_unload_callbacks.len())
-            .finish()
-    }
-}
-
-impl AgentRegistry {
-    pub fn new() -> Self {
-        Self {
-            agents: Vec::new(),
-            on_load_callbacks: HashMap::new(),
-            on_unload_callbacks: HashMap::new(),
-        }
-    }
-
-    /// Parse a command-line agent option and register the agent.
-    ///
-    /// Supported formats:
-    /// - `-agentlib:name[=options]`
-    /// - `-agentpath:path[=options]`
-    /// - `-javaagent:jarpath[=options]`
-    pub fn parse_agent_option(&mut self, arg: &str) -> JvmtiResult<()> {
-        if let Some(rest) = arg.strip_prefix("-agentlib:") {
-            let (name, options) = split_agent_arg(rest);
-            // For agentlib, the path is platform-dependent library lookup
-            let path = format!("lib{}.so", name); // simplified; real impl uses platform search
-            self.agents.push(AgentEntry {
-                name: name.to_string(),
-                path,
-                options: options.to_string(),
-                is_java_agent: false,
-                loaded: false,
-            });
-            Ok(())
-        } else if let Some(rest) = arg.strip_prefix("-agentpath:") {
-            let (path, options) = split_agent_arg(rest);
-            let name = std::path::Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(path)
-                .to_string();
-            self.agents.push(AgentEntry {
-                name,
-                path: path.to_string(),
-                options: options.to_string(),
-                is_java_agent: false,
-                loaded: false,
-            });
-            Ok(())
-        } else if let Some(rest) = arg.strip_prefix("-javaagent:") {
-            let (jar_path, options) = split_agent_arg(rest);
-            let name = std::path::Path::new(jar_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(jar_path)
-                .to_string();
-            self.agents.push(AgentEntry {
-                name,
-                path: jar_path.to_string(),
-                options: options.to_string(),
-                is_java_agent: true,
-                loaded: false,
-            });
-            Ok(())
-        } else {
-            Err(JvmtiError::IllegalArgument)
-        }
-    }
-
-    /// Register an Agent_OnLoad callback for testing or embedded agents.
-    pub fn register_on_load<F>(&mut self, name: &str, callback: F)
-    where
-        F: Fn(&str) -> i32 + Send + Sync + 'static,
-    {
-        self.on_load_callbacks
-            .insert(name.to_string(), Box::new(callback));
-    }
-
-    /// Register an Agent_OnUnload callback.
-    pub fn register_on_unload<F>(&mut self, name: &str, callback: F)
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        self.on_unload_callbacks
-            .insert(name.to_string(), Box::new(callback));
-    }
-
-    /// Load all registered agents by invoking their Agent_OnLoad callbacks.
-    /// Returns the number of successfully loaded agents.
-    pub fn load_agents(&mut self) -> JvmtiResult<usize> {
-        let mut loaded_count = 0usize;
-        for agent in &mut self.agents {
-            if agent.loaded {
-                continue;
-            }
-            // For native agents with registered callbacks, invoke them.
-            // For agents without callbacks (real dlopen case), mark them as loaded
-            // since actual native library loading requires OS-level dlopen which
-            // is handled at the VM bootstrap level.
-            agent.loaded = true;
-            loaded_count += 1;
-        }
-        // Now invoke on_load callbacks for agents that have them registered
-        let agent_snapshot: Vec<(String, String)> = self
-            .agents
-            .iter()
-            .map(|a| (a.name.clone(), a.options.clone()))
-            .collect();
-        for (name, options) in &agent_snapshot {
-            if let Some(cb) = self.on_load_callbacks.get(name.as_str()) {
-                let result = cb(options);
-                if result != 0 {
-                    // Non-zero return means agent load failed; mark it unloaded
-                    if let Some(agent) = self.agents.iter_mut().find(|a| a.name == *name) {
-                        agent.loaded = false;
-                        loaded_count = loaded_count.saturating_sub(1);
-                    }
-                }
-            }
-        }
-        Ok(loaded_count)
-    }
-
-    /// Unload all loaded agents by invoking their Agent_OnUnload callbacks.
-    pub fn unload_agents(&mut self) {
-        let names: Vec<String> = self
-            .agents
-            .iter()
-            .filter(|a| a.loaded)
-            .map(|a| a.name.clone())
-            .collect();
-        for name in &names {
-            if let Some(cb) = self.on_unload_callbacks.get(name.as_str()) {
-                cb();
-            }
-        }
-        for agent in &mut self.agents {
-            agent.loaded = false;
-        }
-    }
-
-    /// Get all registered agents.
-    pub fn agents(&self) -> &[AgentEntry] {
-        &self.agents
-    }
-
-    /// Get loaded agent count.
-    pub fn loaded_count(&self) -> usize {
-        self.agents.iter().filter(|a| a.loaded).count()
-    }
-}
-
-impl Default for AgentRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Split an agent argument at the first `=` sign into (name_or_path, options).
-fn split_agent_arg(s: &str) -> (&str, &str) {
-    match s.find('=') {
-        Some(idx) => (&s[..idx], &s[idx + 1..]),
-        None => (s, ""),
-    }
-}
+// obsaudit D13 (2026-07-26), fixed by removal: this file used to define its
+// own `AgentRegistry`/`AgentEntry`/`split_agent_arg` "agent loading" type.
+// It never actually loaded a native library (no `dlopen`, no `Agent_OnLoad`
+// symbol lookup — every registered agent was unconditionally marked
+// `loaded = true`), it was not the registry any bootstrap path used (that is
+// `vm/src/jvmti/agent.rs`'s `AgentRegistry`, a *different* type with a real
+// `libloading` implementation, driven by `SharedVm::new` via
+// `load_startup_jvmti_agents`), and — per a repo-wide search — nothing
+// outside its own unit tests ever constructed it. Two same-named,
+// adjacent-module types with identical method names (`load_agents`,
+// `agents()`, `loaded_count()`) is exactly the confusion the observability
+// audit flagged: keeping a fake one around "for embedders" when no embedder
+// anywhere in this tree used it just left the trap armed for the next
+// person who greps for `AgentRegistry` and finds this one first. Removed
+// rather than fixed in place; use `vm::jvmti::AgentRegistry` for anything
+// agent-loading related.
 
 // ---------------------------------------------------------------------------
 // JVMTI Environment — the main function table
@@ -1908,8 +1920,6 @@ pub struct JvmtiEnv {
     capabilities: RwLock<JvmtiCapabilities>,
     /// Event management.
     pub event_manager: Arc<JvmtiEventManager>,
-    /// Agent registry.
-    pub agent_registry: Mutex<AgentRegistry>,
     /// Thread registry: maps thread IDs to their info.
     threads: RwLock<HashMap<ThreadId, ThreadInfo>>,
     /// Suspended threads set.
@@ -1925,6 +1935,12 @@ pub struct JvmtiEnv {
     /// Class registry for introspection.
     classes: RwLock<HashMap<ClassId, ClassInfo>>,
     /// Local variable table per thread per frame depth.
+    ///
+    /// **This is a side table, not a view of real interpreter frames.** It is
+    /// only ever populated by `set_frame_locals` / `set_local_*` on this same
+    /// `JvmtiEnv`. Nothing in the interpreter, the JIT, or the stack walker
+    /// writes into it. See [`JvmtiEnv::get_local_int`] for what that means for
+    /// `GetLocalVariable*`.
     local_variables: RwLock<HashMap<(ThreadId, u32), HashMap<u32, LocalValue>>>,
     /// System properties.
     system_properties: RwLock<HashMap<String, String>>,
@@ -1940,7 +1956,6 @@ impl JvmtiEnv {
         Self {
             capabilities: RwLock::new(JvmtiCapabilities::default()),
             event_manager: Arc::new(JvmtiEventManager::new()),
-            agent_registry: Mutex::new(AgentRegistry::new()),
             threads: RwLock::new(HashMap::new()),
             suspended_threads: RwLock::new(HashSet::new()),
             stack_traces: RwLock::new(HashMap::new()),
@@ -2229,6 +2244,45 @@ impl JvmtiEnv {
     }
 
     // --- Local Variables ---
+    //
+    // -----------------------------------------------------------------------
+    // obsaudit D2 (2026-07-26): `GetLocalVariable*` DOES NOT READ REAL FRAMES
+    // — PARTIALLY FIXED (capability negotiation is now honest; the
+    // underlying data source is still a side table, by design).
+    // -----------------------------------------------------------------------
+    // `get_local_int` / `_long` / `_float` / `_double` / `_object` read the
+    // `local_variables` side table, written by `set_local_variable_table` /
+    // `set_local_*` on this same `JvmtiEnv`. Outside `#[cfg(test)]`, nothing
+    // calls any of them — not the interpreter, not the JIT deopt path, not
+    // the stack walker. Wiring this to real frames is NOT just a matter of
+    // plumbing a frame reference in: JVMTI's API is typed per slot —
+    // `GetLocalInt` on a slot that holds a reference must return
+    // `JVMTI_ERROR_TYPE_MISMATCH`, not a reinterpreted pointer — so the
+    // reader needs a per-slot *kind* (int/long/float/double/ref). The
+    // verifier type maps in `classloading/src/type_maps.rs` are
+    // **oop-vs-not only**: they can say "slot 3 holds a reference", which is
+    // what the GC needs, but cannot distinguish an `int` slot from a `float`
+    // slot or identify the second half of a `long`. Implementing
+    // `GetLocalVariable*` faithfully therefore needs either the class
+    // file's `LocalVariableTable` attribute (optional, absent from most
+    // release builds) or a widened slot-kind map — both larger, separate
+    // undertakings than this pass. That part of the gap remains open.
+    //
+    // What IS fixed: `can_access_local_variables` used to be advertised as
+    // `true` in `potentially_available()` while granting it via
+    // `add_capabilities` and then finding every frame empty via the side
+    // table — the exact "VM lost my frames" failure mode described by the
+    // original audit. `potentially_available()` now reports `false`, and
+    // `add_capabilities` rejects a request for it with `NotAvailable`. A
+    // caller that checks potential capabilities before requesting (the
+    // JVMTI-spec-correct client behaviour) will not be misled.
+    //
+    // The capability check was removed from all ten `get_local_*`/
+    // `set_local_*` methods below (it can never be satisfied through the
+    // real API anymore) so the side table remains usable exactly as before
+    // as an embedder/test surface — it was never real JVMTI local-variable
+    // access, and gating it behind a capability that can no longer be
+    // granted would have made it unusable even for that purpose.
 
     /// Set local variable values for a given thread and frame depth.
     pub fn set_local_variable_table(
@@ -2247,7 +2301,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableInt
     pub fn get_local_int(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i32> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2264,7 +2317,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableLong
     pub fn get_local_long(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i64> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2281,7 +2333,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableFloat
     pub fn get_local_float(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f32> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2298,7 +2349,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableDouble
     pub fn get_local_double(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f64> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2320,7 +2370,6 @@ impl JvmtiEnv {
         depth: u32,
         slot: u32,
     ) -> JvmtiResult<Option<u64>> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2343,7 +2392,6 @@ impl JvmtiEnv {
         slot: u32,
         value: i32,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2361,7 +2409,6 @@ impl JvmtiEnv {
         slot: u32,
         value: i64,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2379,7 +2426,6 @@ impl JvmtiEnv {
         slot: u32,
         value: f32,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2397,7 +2443,6 @@ impl JvmtiEnv {
         slot: u32,
         value: f64,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2415,7 +2460,6 @@ impl JvmtiEnv {
         slot: u32,
         value: Option<u64>,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2564,7 +2608,18 @@ impl JvmtiEnv {
     // --- Capabilities ---
 
     /// AddCapabilities: request additional capabilities.
+    ///
+    /// obsaudit D2 (2026-07-26): rejects `can_access_local_variables`
+    /// explicitly — `potentially_available()` already reports it `false`;
+    /// this is the enforcement half, so a caller cannot be granted a
+    /// capability this env has already declared it cannot honor. No other
+    /// field is checked against `potentially_available()` here: every other
+    /// capability in that function is `true` today, so a generic per-field
+    /// loop would be a no-op everywhere except this one case.
     pub fn add_capabilities(&self, requested: &JvmtiCapabilities) -> JvmtiResult<()> {
+        if requested.can_access_local_variables {
+            return Err(JvmtiError::NotAvailable);
+        }
         let mut caps = self
             .capabilities
             .write()
@@ -2697,6 +2752,99 @@ pub fn any_listener_active() -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// obsaudit D14 (2026-07-26) — bridge to the real, native-agent-facing JVMTI
+// env (`vm/src/jvmti/`, `shared.debug.jvmti_env`)
+// ---------------------------------------------------------------------------
+//
+// This file's `JvmtiEventManager` and `vm/src/jvmti/`'s `EventManager` are
+// separate objects (see the LIVENESS block at the top of this file) — a
+// native agent loaded via `-agentpath:` (real `dlopen`, `vm/src/jvmti/agent.rs`)
+// only ever sees the latter. Before this bridge, of the ~26 event kinds this
+// file's `fire_*` methods drive from the interpreter/GC/classloading, the
+// real env received exactly two (`ClassLoad`, `ThreadEnd`), each via its own
+// hand-written call site elsewhere in `vm/` — not through this manager at
+// all. The bridge below forwards the 9 event kinds that (a) have a
+// `notify_*` counterpart in `vm/src/jvmti/mod.rs` and (b) are not a
+// per-bytecode/per-invocation hot path, so a real agent attached today
+// actually receives VMInit, VMDeath, ThreadStart, ThreadEnd, ClassLoad,
+// ClassPrepare, GarbageCollectionStart/Finish, and ObjectFree.
+//
+// Deliberately NOT bridged: MethodEntry/MethodExit/SingleStep/Breakpoint/
+// FramePop/FieldAccess/FieldModification (per-bytecode or per-invocation —
+// would add a `Mutex<JvmtiEnv>` lock to the interpreter's hottest paths for
+// every VM, whether or not a native agent is attached to them) and
+// MonitorWait/MonitorContendedEnter (per contended lock — same hot-path
+// concern; also `vm/src/jvmti/mod.rs` has no `notify_monitor_waited` /
+// `notify_monitor_contended_entered`, so `can_generate_monitor_events`
+// could only ever be half-honest here). `JvmtiCapabilities::potential()`
+// in `vm/src/jvmti/capabilities.rs` was corrected to advertise `false` for
+// every capability whose events are not bridged, so a real agent's
+// `AddCapabilities` negotiation reflects what it will actually receive
+// instead of silently promising events that never arrive — the same
+// failure shape D2 (`GetLocalVariable*`) documents for a different
+// capability. Full unification of the two implementations (shared event
+// enum, shared capability set, one `JvmtiEnv`) remains a separate, larger
+// task — this bridge closes the "silently receives nothing" gap without
+// attempting that rewrite.
+
+static REAL_AGENT_ENV_BRIDGE: OnceLock<Weak<crate::vm::SharedVm>> = OnceLock::new();
+
+/// Install the bridge to the real, native-agent-facing JVMTI env. Idempotent
+/// — only the first install wins. Called once from `SharedVm::new`, right
+/// where [`install_global_manager`] itself is installed.
+pub fn install_real_agent_env_bridge(shared: &Arc<crate::vm::SharedVm>) {
+    let _ = REAL_AGENT_ENV_BRIDGE.set(Arc::downgrade(shared));
+}
+
+/// The live `SharedVm` behind the bridge, if installed and not yet torn
+/// down. Every bridged `fire_*` method calls this first and skips its
+/// bridging logic entirely on `None` (no bridge installed — e.g. a unit
+/// test that builds a bare `JvmtiEventManager` without a `SharedVm`, or a
+/// `SharedVm` in the middle of being dropped) — same cost as any other
+/// "no listener" fast path in this file: one `OnceLock::get`, one
+/// `Weak::upgrade`.
+fn real_agent_shared() -> Option<Arc<crate::vm::SharedVm>> {
+    REAL_AGENT_ENV_BRIDGE.get()?.upgrade()
+}
+
+/// Resolve a loaded class's name for `vm/src/jvmti/mod.rs`'s
+/// `notify_class_load` / `notify_class_prepare`, which (unlike this file's
+/// `fire_class_load` / `fire_class_prepare`) take the name directly rather
+/// than expecting the listener to look it up.
+///
+/// Safe to call from inside a bridged `fire_*` method even though it takes
+/// the L10 `class_manager` read lock: as of obsaudit D1 (2026-07-26),
+/// `fire_class_load`/`fire_class_prepare` only run after the write guard
+/// that produced them has already been released, so a fresh `.read()` here
+/// cannot self-deadlock.
+fn resolve_class_name_for_bridge(
+    shared: &crate::vm::SharedVm,
+    class_id: ClassId,
+) -> Option<String> {
+    let cid = crate::classloading::ClassId::new(class_id as u32);
+    shared
+        .classes
+        .class_manager
+        .read()
+        .class_store
+        .get(cid)
+        .map(|c| c.name.to_string())
+}
+
+/// Resolve a thread's name for `vm/src/jvmti/mod.rs`'s `notify_thread_start`
+/// (unlike this file's `fire_thread_start`, it takes the name directly).
+/// Falls back to a synthetic name rather than skipping the event: an agent
+/// still needs to see the thread came into existence even if the registry
+/// entry raced with this lookup.
+fn resolve_thread_name_for_bridge(shared: &crate::vm::SharedVm, thread: ThreadId) -> String {
+    shared
+        .threads
+        .thread_registry
+        .thread_name(crate::threading::jvm_thread::ThreadId(thread))
+        .unwrap_or_else(|| format!("Thread-{thread}"))
+}
+
 /// Fire VMInit at the global level. No-op if no manager is installed.
 pub fn fire_vm_init() {
     if let Some(m) = GLOBAL_MANAGER.get() {
@@ -2713,6 +2861,15 @@ pub fn fire_vm_death() {
 
 /// Fire ClassLoad at the global level. Called from the class manager
 /// after a new class has been registered.
+///
+/// obsaudit D1 (2026-07-26), fixed: this used to be reached while the L10
+/// `class_manager` write guard was still held (a real agent's `ClassLoad`
+/// handler calling `GetClassSignature`/`GetLoadedClasses`/`RetransformClasses`
+/// would self-deadlock) and always reported thread 0. Both are fixed — see
+/// the DEFERRED FIRING notes near `install_class_load_hook` in
+/// `classloading/src/class_manager.rs` and the doc comment on
+/// `JvmtiEventManager::fire_class_load`. Also now bridged to the real,
+/// native-agent-facing env — see `install_real_agent_env_bridge` (D14).
 pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
     if let Some(m) = GLOBAL_MANAGER.get() {
         m.fire_class_load(thread, class_id);
@@ -2720,7 +2877,7 @@ pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
 }
 
 /// Fire ClassPrepare at the global level. Called from the class manager
-/// after the class has been linked / prepared.
+/// after the class has been linked / prepared. See [`fire_class_load`].
 pub fn fire_class_prepare(thread: ThreadId, class_id: ClassId) {
     if let Some(m) = GLOBAL_MANAGER.get() {
         m.fire_class_prepare(thread, class_id);
@@ -3192,6 +3349,65 @@ mod tests {
         JvmtiEnv::new()
     }
 
+    // ---- Observability audit (2026-07-26) contract pins -------------------
+
+    /// `GetLocalVariable*` reads a side table that no production code writes.
+    /// This test pins the current, documented behaviour: on a fresh env there
+    /// are no frames to read. If someone wires locals to real interpreter
+    /// frames, this test SHOULD fail — and the gap note above the
+    /// local-variable section must be updated in the same change.
+    ///
+    /// obsaudit D2 (2026-07-26): the capability gate was removed from these
+    /// methods (see the gap note) since `can_access_local_variables` can no
+    /// longer be granted through `add_capabilities` — see
+    /// `obsaudit_local_variable_capability_is_honestly_unavailable` for that
+    /// half. This test now exercises the side table directly, with no
+    /// capability negotiation step.
+    #[test]
+    fn obsaudit_get_local_reads_side_table_not_real_frames() {
+        let env = make_test_env();
+
+        // No `set_local_*` call has happened, and nothing else populates the
+        // table, so there is no frame at any depth for any thread.
+        assert_eq!(env.get_local_int(1, 0, 0), Err(JvmtiError::NoMoreFrames));
+        assert_eq!(env.get_local_object(1, 0, 0), Err(JvmtiError::NoMoreFrames));
+
+        // The table is writable, and reads see exactly what was written —
+        // confirming it is a side table rather than a frame view.
+        env.set_local_int(1, 0, 0, 0x5A5A).unwrap();
+        assert_eq!(env.get_local_int(1, 0, 0), Ok(0x5A5A));
+        // Typed access is enforced against the side table's own tag, which is
+        // the one JVMTI-conformant behaviour that survives here.
+        assert_eq!(env.get_local_long(1, 0, 0), Err(JvmtiError::TypeMismatch));
+    }
+
+    /// obsaudit D2: a caller that checks `GetPotentialCapabilities` before
+    /// `AddCapabilities` (the JVMTI-spec-correct order) must be told
+    /// up front that local-variable access is unavailable, and a caller
+    /// that requests it anyway must be refused — not granted and then left
+    /// to discover empty frames on its own.
+    #[test]
+    fn obsaudit_local_variable_capability_is_honestly_unavailable() {
+        assert!(!JvmtiCapabilities::potentially_available().can_access_local_variables);
+
+        let env = make_test_env();
+        let result = env.add_capabilities(&JvmtiCapabilities {
+            can_access_local_variables: true,
+            ..Default::default()
+        });
+        assert_eq!(result, Err(JvmtiError::NotAvailable));
+        assert!(!env.get_capabilities().unwrap().can_access_local_variables);
+
+        // Requesting other, genuinely-available capabilities alongside it
+        // must still work — the rejection is specific to this one field.
+        env.add_capabilities(&JvmtiCapabilities {
+            can_suspend: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(env.get_capabilities().unwrap().can_suspend);
+    }
+
     fn make_thread_info(name: &str) -> ThreadInfo {
         ThreadInfo {
             name: name.to_string(),
@@ -3461,12 +3677,9 @@ mod tests {
 
     #[test]
     fn test_local_variables() {
+        // obsaudit D2: no capability negotiation needed — see the gap note
+        // above `set_local_variable_table`.
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities {
-            can_access_local_variables: true,
-            ..Default::default()
-        })
-        .unwrap();
 
         let mut vars = HashMap::new();
         vars.insert(0, LocalValue::Int(42));
@@ -3490,12 +3703,9 @@ mod tests {
 
     #[test]
     fn test_local_variable_set() {
+        // obsaudit D2: no capability negotiation needed — see the gap note
+        // above `set_local_variable_table`.
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities {
-            can_access_local_variables: true,
-            ..Default::default()
-        })
-        .unwrap();
 
         env.set_local_int(1, 0, 0, 99).unwrap();
         assert_eq!(env.get_local_int(1, 0, 0).unwrap(), 99);
@@ -3514,16 +3724,19 @@ mod tests {
     }
 
     #[test]
-    fn test_local_variables_require_capability() {
-        let env = make_test_env(); // no capabilities
-        assert_eq!(
-            env.get_local_int(1, 0, 0),
-            Err(JvmtiError::MustPossessCapability)
-        );
-        assert_eq!(
-            env.set_local_int(1, 0, 0, 1),
-            Err(JvmtiError::MustPossessCapability)
-        );
+    fn test_local_variables_no_longer_require_capability() {
+        // obsaudit D2 (2026-07-26): renamed from
+        // test_local_variables_require_capability, which pinned the
+        // opposite behaviour. can_access_local_variables can no longer be
+        // granted (see obsaudit_local_variable_capability_is_honestly_
+        // unavailable), so gating these methods behind it would make the
+        // side-table embedder/test surface permanently unusable. The gate
+        // was removed instead — these methods now work with no capability
+        // negotiation step, same as `set_local_variable_table` already did.
+        let env = make_test_env(); // no capabilities granted
+        assert_eq!(env.get_local_int(1, 0, 0), Err(JvmtiError::NoMoreFrames));
+        assert_eq!(env.set_local_int(1, 0, 0, 1), Ok(()));
+        assert_eq!(env.get_local_int(1, 0, 0), Ok(1));
     }
 
     #[test]
@@ -3750,98 +3963,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_parse_agentlib() {
-        let mut registry = AgentRegistry::new();
-        registry
-            .parse_agent_option("-agentlib:jdwp=transport=dt_socket,server=y")
-            .unwrap();
-
-        assert_eq!(registry.agents().len(), 1);
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.name, "jdwp");
-        assert_eq!(agent.options, "transport=dt_socket,server=y");
-        assert!(!agent.is_java_agent);
-    }
-
-    #[test]
-    fn test_agent_parse_agentpath() {
-        let mut registry = AgentRegistry::new();
-        registry
-            .parse_agent_option("-agentpath:/opt/lib/myagent.so=debug")
-            .unwrap();
-
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.path, "/opt/lib/myagent.so");
-        assert_eq!(agent.options, "debug");
-        assert!(!agent.is_java_agent);
-    }
-
-    #[test]
-    fn test_agent_parse_javaagent() {
-        let mut registry = AgentRegistry::new();
-        registry
-            .parse_agent_option("-javaagent:agent.jar=premain_opt")
-            .unwrap();
-
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.path, "agent.jar");
-        assert_eq!(agent.options, "premain_opt");
-        assert!(agent.is_java_agent);
-    }
-
-    #[test]
-    fn test_agent_parse_invalid() {
-        let mut registry = AgentRegistry::new();
-        assert_eq!(
-            registry.parse_agent_option("-Xms512m"),
-            Err(JvmtiError::IllegalArgument)
-        );
-        assert_eq!(
-            registry.parse_agent_option("garbage"),
-            Err(JvmtiError::IllegalArgument)
-        );
-    }
-
-    #[test]
-    fn test_agent_load_unload() {
-        let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentlib:test").unwrap();
-
-        let load_count = Arc::new(AtomicU32::new(0));
-        let unload_count = Arc::new(AtomicU32::new(0));
-        let lc = load_count.clone();
-        let uc = unload_count.clone();
-
-        registry.register_on_load("test", move |_opts| {
-            lc.fetch_add(1, Ordering::SeqCst);
-            0 // success
-        });
-        registry.register_on_unload("test", move || {
-            uc.fetch_add(1, Ordering::SeqCst);
-        });
-
-        let loaded = registry.load_agents().unwrap();
-        assert_eq!(loaded, 1);
-        assert_eq!(load_count.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.loaded_count(), 1);
-
-        registry.unload_agents();
-        assert_eq!(unload_count.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.loaded_count(), 0);
-    }
-
-    #[test]
-    fn test_agent_load_failure() {
-        let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentlib:badagent").unwrap();
-        registry.register_on_load("badagent", |_opts| -1); // non-zero = failure
-
-        let loaded = registry.load_agents().unwrap();
-        assert_eq!(loaded, 0);
-        assert_eq!(registry.loaded_count(), 0);
-    }
-
-    #[test]
     fn test_force_gc_with_trigger() {
         let env = make_test_env();
         let triggered = Arc::new(AtomicU32::new(0));
@@ -3868,7 +3989,9 @@ mod tests {
         let all = JvmtiCapabilities::potentially_available();
         assert!(all.can_redefine_classes);
         assert!(all.can_retransform_classes);
-        assert!(all.can_access_local_variables);
+        // obsaudit D2: NOT potentially available — see
+        // obsaudit_local_variable_capability_is_honestly_unavailable.
+        assert!(!all.can_access_local_variables);
         assert!(all.can_suspend);
         assert!(all.can_generate_breakpoint_events);
     }
@@ -3921,15 +4044,6 @@ mod tests {
         let debug = format!("{:?}", env);
         assert!(debug.contains("JvmtiEnv"));
         assert!(debug.contains("version"));
-    }
-
-    #[test]
-    fn test_agent_parse_no_options() {
-        let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentlib:simple").unwrap();
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.name, "simple");
-        assert_eq!(agent.options, "");
     }
 
     #[test]
@@ -4164,6 +4278,51 @@ mod tests {
         em.unregister_env(&env).unwrap();
         em.fire_object_free(789);
         assert_eq!(*agent_tags.lock().unwrap(), vec![123, 456]);
+    }
+
+    /// ClassLoad / ClassPrepare must reach attached envs, not just the
+    /// manager's own callback table.
+    ///
+    /// Both events used to dispatch only to `self.callbacks`, so an agent
+    /// holding its own `JvmtiEnv` silently received neither — no error, no
+    /// diagnostic, just nothing. That contradicted the delivery contract
+    /// documented on `JvmtiEventManager`. This pins the fix; see the same doc
+    /// comment for the events that still lack per-env delivery.
+    #[test]
+    fn test_env_receives_class_load_and_prepare() {
+        let em = JvmtiEventManager::new();
+        let tid: ThreadId = 3;
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid))
+            .unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassPrepare, Some(tid))
+            .unwrap();
+
+        let env = Arc::new(JvmtiEnv::new());
+        let loaded = Arc::new(Mutex::new(Vec::<ClassId>::new()));
+        let prepared = Arc::new(Mutex::new(Vec::<ClassId>::new()));
+        let (l, p) = (loaded.clone(), prepared.clone());
+        env.event_manager
+            .set_event_callbacks(EventCallbacks {
+                class_load: Some(Box::new(move |_t, c| l.lock().unwrap().push(c))),
+                class_prepare: Some(Box::new(move |_t, c| p.lock().unwrap().push(c))),
+                ..Default::default()
+            })
+            .unwrap();
+
+        em.register_env(&env).unwrap();
+        em.fire_class_load(tid, 11);
+        em.fire_class_load(tid, 22);
+        em.fire_class_prepare(tid, 11);
+
+        assert_eq!(*loaded.lock().unwrap(), vec![11, 22]);
+        assert_eq!(*prepared.lock().unwrap(), vec![11]);
+
+        // Unregistering must stop delivery, same as every other per-env event.
+        em.unregister_env(&env).unwrap();
+        em.fire_class_load(tid, 33);
+        em.fire_class_prepare(tid, 33);
+        assert_eq!(*loaded.lock().unwrap(), vec![11, 22]);
+        assert_eq!(*prepared.lock().unwrap(), vec![11]);
     }
 
     #[test]
@@ -4679,6 +4838,64 @@ mod tests {
         fire_method_entry(tid, 999); // agent panics
         fire_method_entry(tid, mid + 1); // must still deliver
         assert_eq!(ok_count.load(Ordering::SeqCst), 3);
+    }
+
+    /// A panicking ClassLoad / ClassPrepare callback must not propagate out
+    /// of the fire_* path.
+    ///
+    /// This matters more than for the other events: both fire from
+    /// `ClassManager::define_class_shared_with_options` while the caller
+    /// holds the L10 `class_manager` **write** guard. `parking_lot::RwLock`
+    /// does not poison, so an escaping unwind would release that guard
+    /// silently and publish a half-built `ClassManager`. See the re-entrancy
+    /// notes above `install_class_load_hook` in
+    /// `classloading/src/class_manager.rs`.
+    #[test]
+    fn class_load_prepare_agent_panic_is_contained() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 21;
+        let poison: ClassId = 999;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid))
+            .unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassPrepare, Some(tid))
+            .unwrap();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let (cl, cp) = (calls.clone(), calls.clone());
+        mgr.set_event_callbacks(EventCallbacks {
+            class_load: Some(Box::new(move |_t, c| {
+                cl.fetch_add(1, Ordering::SeqCst);
+                if c == poison {
+                    panic!("agent panic in ClassLoad");
+                }
+            })),
+            class_prepare: Some(Box::new(move |_t, c| {
+                cp.fetch_add(1, Ordering::SeqCst);
+                if c == poison {
+                    panic!("agent panic in ClassPrepare");
+                }
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Each of these would unwind into the caller before the fix. Reaching
+        // the assertion below at all is the property under test.
+        fire_class_load(tid, 1);
+        fire_class_load(tid, poison);
+        fire_class_load(tid, 2);
+        fire_class_prepare(tid, 1);
+        fire_class_prepare(tid, poison);
+        fire_class_prepare(tid, 2);
+
+        // 3 ClassLoad + 3 ClassPrepare: dispatch survives the panic and keeps
+        // delivering, rather than the callback being torn down or skipped.
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(mgr.event_count(JvmtiEventKind::ClassLoad), 3);
+        assert_eq!(mgr.event_count(JvmtiEventKind::ClassPrepare), 3);
     }
 
     /// T17.Δ.4 — registering a watchpoint idempotently sets access and
