@@ -247,8 +247,8 @@ Vm::new(VmConfig)        // construct + bootstrap to init level 1
 - **One VM per process** is the only tested configuration.
 
 For the full `VmConfig` surface, custom-native registration pattern, the lock
-hierarchy, and GC-safepoint pitfalls, see the in-depth internal guide:
-[`docs/internal/gaps/embedding.md`](internal/gaps/embedding.md). The reference
+hierarchy, and GC-safepoint pitfalls, see the in-depth guide:
+[`docs/EMBEDDING_VM_CRATE.md`](EMBEDDING_VM_CRATE.md). The reference
 embedder is [`vm-cli/src/main.rs`](../vm-cli/src/main.rs).
 
 ---
@@ -320,7 +320,7 @@ that means per embedding path:
   undocumented-but-possible path.
 
 For the state of the offload path itself (independent of this embedding-surface gap), see
-[`docs/internal/gpu-offload-followups-20260711.md`](internal/gpu-offload-followups-20260711.md).
+[`docs/gpu/README.md`](gpu/README.md) and the feature docs it links to.
 
 ## See also
 
@@ -329,7 +329,7 @@ For the state of the offload path itself (independent of this embedding-surface 
 - [`libcratonvm/examples/embed_flat.c`](../libcratonvm/examples/embed_flat.c) /
   [`embed_smoke.c`](../libcratonvm/examples/embed_smoke.c) — buildable C
   harnesses for the flat API and the raw Invocation API.
-- [`docs/internal/gaps/embedding.md`](internal/gaps/embedding.md) — the
+- [`docs/EMBEDDING_VM_CRATE.md`](EMBEDDING_VM_CRATE.md) — the
   in-depth Rust-embedding guide (`VmConfig`, natives, locking, safepoints).
 - [`docs/feature-designs/embedding-api.md`](feature-designs/embedding-api.md) —
   the layered design, risks, and what has landed.

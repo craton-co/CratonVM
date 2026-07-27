@@ -6561,16 +6561,6 @@ fn hsqldb_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
         class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
     }
 }
-fn jaxb_mapping_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
-    const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
-    const DOT_PREFIX: &str = "org.glassfish.jaxb.";
-    if class_name.starts_with(SLASH_PREFIX) {
-        Some(SLASH_PREFIX)
-    } else {
-        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
-    }
-}
-
 fn xerces_schema_jit_deny_prefix(class_name: &str) -> Option<&'static str> {
     const SLASH_PREFIX: &str = "com/sun/org/apache/xerces/internal/";
     const DOT_PREFIX: &str = "com.sun.org.apache.xerces.internal.";
@@ -7136,11 +7126,15 @@ pub fn try_compile_with_invokespecial_resolver(
         }
     }
 
-    if let Some(prefix) = jaxb_mapping_jit_deny_prefix(&cached.class_name) {
-        if !jit_allow_package(prefix) {
-            return None;
-        }
-    }
+    // The `org/glassfish/jaxb/` final-admission mirror of the VM skip-list
+    // guard was removed 2026-07-27. It is the SECOND of the two gates that
+    // enforced that ban, and deleting `jaxb_mapping_residual_skip_prefix` from
+    // `vm/src/jit/skip_list.rs` alone does not lift it: `try_compile` returns
+    // `None` here before any JAXB method can be compiled, so a "ban removed"
+    // run that does not also pass `CRATONVM_JIT_ALLOW_PACKAGES` measures an
+    // uncompiled package. See `docs/internal/jaxb-jit-ban-removed-20260727.md`
+    // ("Completing the removal") for the JIT-entry counts that show the
+    // difference, and for the bisected root cause (`82b78bca5`).
 
     // Keep the final admission gate aligned with the VM-side Xerces parser
     // guard. Background compilation bypasses the VM skip-list, and JITting
@@ -10421,22 +10415,6 @@ mod tests {
             Some("org.hibernate.")
         );
         assert_eq!(hibernate_temporal_jit_deny_prefix("org/example/Foo"), None);
-    }
-
-    #[test]
-    fn jaxb_mapping_jit_deny_matches_slash_and_dot_names() {
-        assert_eq!(
-            jaxb_mapping_jit_deny_prefix("org/glassfish/jaxb/runtime/v2/ContextFactory"),
-            Some("org/glassfish/jaxb/")
-        );
-        assert_eq!(
-            jaxb_mapping_jit_deny_prefix("org.glassfish.jaxb.runtime.v2.ContextFactory"),
-            Some("org.glassfish.jaxb.")
-        );
-        assert_eq!(
-            jaxb_mapping_jit_deny_prefix("org/glassfish/other/Foo"),
-            None
-        );
     }
 
     #[test]

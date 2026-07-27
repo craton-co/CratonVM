@@ -1,5 +1,20 @@
 # 2026-07-17 rerun: 5 fatal CRASHes, 2 distinct clusters — FIXED
 
+> **Update 2026-07-23:** confirming this doc's prediction — the Spring Boot
+> checkout has indeed moved `OpenTelemetryBaggagePropagationIntegrationTests`
+> to package `.opentelemetry.autoconfigure` (visible in `craton-rerun-20260723`'s
+> `group4.tsv`), so it's runnable again (no more `NoClassDefFoundError:
+> ExceptionUtils`, no more fatal CRASH). It now FAILs instead — but on a new,
+> unrelated symptom (`UniqueIdSelector [test-template-invocation:...] could
+> not be resolved`, tied to its `@ForkedClassPath` annotation and the
+> `ModifiedClassPathExtension` mechanism), not the `ExceptionUtils` gap this
+> doc describes. Documented as Case A in
+> [`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](modifiedclasspath-aether-network-hang-cluster-FIXED.md)'s
+> 2026-07-23 update. `BraveBaggagePropagationIntegrationTests` (the sibling
+> class in `spring-boot-micrometer-tracing-brave`) and the two
+> `ModifiedClassPathExtension*ParameterizedTests` classes were not
+> re-checked this session (out of this task's assigned class list).
+
 ## Resolution (2026-07-18)
 
 The late `ExceptionUtils` manifestation was already covered by the current

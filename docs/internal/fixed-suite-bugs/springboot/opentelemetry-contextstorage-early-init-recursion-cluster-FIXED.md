@@ -2,6 +2,17 @@
 
 **Status: FIXED (confirmed already resolved on dev) 2026-07-20**
 
+> **Update 2026-07-23:** both classes below are FAILing again in
+> `craton-rerun-20260723`, but **not** with the recursion/`StackOverflowError`
+> this doc fixed — a different, unrelated new symptom
+> (`UniqueIdSelector [...] could not be resolved`, tied to their
+> `@ForkedClassPath` annotation and the `ModifiedClassPathExtension`
+> mechanism, not to `ContextStorage`/JUnit-interceptor recursion). Documented
+> as Case A in
+> [`modifiedclasspath-aether-network-hang-cluster-FIXED.md`](modifiedclasspath-aether-network-hang-cluster-FIXED.md)'s
+> 2026-07-23 update — not re-filed here since it shares nothing with this
+> doc's root cause beyond the affected class names.
+
 ## Resolution
 
 No new source change was needed this session. Both classes were re-run on current `dev` (`0e743ad6e`, worktree `fix/otel-contextstorage-recursion-20260720`) with a fresh `--release` CratonVM build:
