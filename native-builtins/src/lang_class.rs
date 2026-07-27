@@ -170,6 +170,27 @@ fn append_array_suffix(mut elem_name: String, dims: usize) -> String {
     elem_name
 }
 
+/// Split a REFERENCE-array descriptor into `(dims, element_class_name)` —
+/// `[[LP2$1;` -> `(2, "P2$1")`. `None` for non-arrays and for arrays of a
+/// primitive element (those have no component *class* to consult).
+///
+/// The name-derivation helpers below work off the descriptor string alone, so
+/// they can only guess the component's simple/canonical name by splitting on
+/// `$` — wrong for exactly the cases `own_inner_class_entry` exists to settle
+/// (an anonymous component's simple name is `""` and it has no canonical
+/// name, so `Anon[]` is `"[]"` / `null`, not `"1[]"` / `"P2.1[]"`). The
+/// `Class.getSimpleName()` / `getCanonicalName()` natives use this to resolve
+/// the component CLASS and recurse, falling back to the string-only helpers
+/// when the component is not loaded.
+fn array_reference_element(desc: &str) -> Option<(usize, &str)> {
+    let dims = desc.bytes().take_while(|&b| b == b'[').count();
+    if dims == 0 {
+        return None;
+    }
+    let stripped = desc[dims..].strip_prefix('L')?;
+    Some((dims, stripped.strip_suffix(';').unwrap_or(stripped)))
+}
+
 fn array_descriptor_to_canonical_name(desc: &str) -> Option<String> {
     let dims = desc.bytes().take_while(|&b| b == b'[').count();
     if dims == 0 {
@@ -211,23 +232,24 @@ fn array_descriptor_to_package_name(desc: &str) -> Option<String> {
     primitive_descriptor_name(elem).map(|_| "java.lang".to_string())
 }
 
-/// Last segment of a class's name after `/`, `.`, or `$` (the
-/// `Class.getSimpleName()` rule). Cached per `ClassId`.
+/// Simple name of a TOP-LEVEL class: the last segment after `/` or `.`.
+/// Cached per `ClassId`.
 ///
-/// `is_real_inner` must be true only when this class actually has its own
-/// entry in its `InnerClasses` attribute (i.e. it's a genuine JVM member/
-/// local/anonymous class) — see the caller in `native_class_get_simple_name`.
-/// The `$`-strip only applies then. A top-level class whose *literal* binary
-/// name happens to contain `$` (dynamically-generated proxies from ByteBuddy/
-/// cglib/JDK `Proxy`, e.g. `org.easymock.mocks.InitialDirContext$$$EasyMock$1`)
-/// has no such attribute entry, so real `Class.getSimpleName()` returns the
-/// name unmodified after stripping only the package prefix — splitting on the
-/// last `$` regardless of real nested-class-ness previously made EasyMock's
-/// own `getSimpleName().contains("$$$EasyMock$")` mock-detection check see a
+/// This must only be called for classes with NO entry of their own in their
+/// `InnerClasses` attribute — genuine member/local/anonymous classes take
+/// their simple name straight from that entry's `inner_name` (see
+/// `own_inner_class_entry` and the caller in `native_class_get_simple_name`).
+/// A top-level class whose *literal* binary name happens to contain `$`
+/// (dynamically-generated proxies from ByteBuddy/cglib/JDK `Proxy`, e.g.
+/// `org.easymock.mocks.InitialDirContext$$$EasyMock$1`) has no such entry, so
+/// real `Class.getSimpleName()` returns the name unmodified after stripping
+/// only the package prefix — splitting on the last `$` regardless of real
+/// nested-class-ness previously made EasyMock's own
+/// `getSimpleName().contains("$$$EasyMock$")` mock-detection check see a
 /// truncated name (e.g. just `"1"`) and misreport `Not a mock` for every
 /// class-based mock (see jndirealmintegration-ldap-connection-npe residual /
 /// EasyMock investigation).
-pub(crate) fn simple_class_name(class_id: ClassId, raw: &str, is_real_inner: bool) -> Arc<str> {
+pub(crate) fn simple_class_name(class_id: ClassId, raw: &str) -> Arc<str> {
     if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
         return arc;
     }
@@ -235,37 +257,71 @@ pub(crate) fn simple_class_name(class_id: ClassId, raw: &str, is_real_inner: boo
         let simple: Arc<str> = Arc::from(array_descriptor_to_simple_name(raw).unwrap_or_default());
         return cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple);
     }
-    let after_slash_or_dot = raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw);
-    let simple: Arc<str> = if is_real_inner {
-        Arc::from(
-            after_slash_or_dot
-                .rsplit('$')
-                .next()
-                .unwrap_or(after_slash_or_dot),
-        )
-    } else {
-        Arc::from(after_slash_or_dot)
-    };
+    let simple: Arc<str> = Arc::from(raw.rsplit(&['/', '.'][..]).next().unwrap_or(raw));
     cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, simple)
 }
 
-/// Does `class_id` (named `class_name`) have its own entry in its
-/// `InnerClasses` attribute? True only for genuine JVM member/local/
-/// anonymous classes — a top-level class with literal `$` characters in its
-/// binary name (dynamically-generated proxies) has no such entry. Same
-/// lookup `native_class_get_simple_binary_name` uses.
-fn has_own_inner_classes_entry(
+/// The class's OWN entry in its `InnerClasses` attribute, as
+/// `(outer_class, inner_name)` — present only for genuine JVM member/local/
+/// anonymous classes. A top-level class with literal `$` characters in its
+/// binary name (dynamically-generated proxies) has no such entry. Same lookup
+/// `native_class_get_simple_binary_name` uses.
+///
+/// The two components carry the JVMS §4.7.6 index-0 cases as empty strings
+/// (see `class_manager`'s `Attribute::InnerClasses` decoding):
+///
+///   * `inner_name` empty  → `inner_name_index == 0` → the class is
+///     ANONYMOUS. Its simple name is `""` (JLS 13.1) and it has no canonical
+///     name (JLS 6.7).
+///   * `outer_class` empty, `inner_name` non-empty → `outer_class_info_index
+///     == 0` → the class is LOCAL (declared inside a method). It has a simple
+///     name but, again, no canonical name.
+///   * both non-empty → a member class: `outer.inner_name` is the canonical
+///     name.
+fn own_inner_class_entry(
     ctx: &mut dyn NativeContext,
     class_id: ClassId,
     class_name: &str,
-) -> bool {
+) -> Option<(String, String)> {
     ctx.inner_classes(class_id)
-        .iter()
-        .any(|(inner_class, _, _, _)| inner_class == class_name)
+        .into_iter()
+        .find(|(inner_class, _, _, _)| inner_class == class_name)
+        .map(|(_, outer_class, inner_name, _)| (outer_class, inner_name))
+}
+
+/// `Class.getSimpleName()` for a NON-array class: the `InnerClasses` entry's
+/// `inner_name` when the class has one of its own (which is `""` for an
+/// anonymous class — JLS 13.1), else the top-level derivation. Cached per
+/// `ClassId`.
+fn resolve_simple_name(ctx: &mut dyn NativeContext, class_id: ClassId, name: &str) -> Arc<str> {
+    if let Some(arc) = cache_get(&SIMPLE_CLASS_NAME_CACHE, class_id) {
+        return arc;
+    }
+    match own_inner_class_entry(ctx, class_id, name) {
+        // A genuine member/local/anonymous class reports its `inner_name`
+        // VERBATIM. That both preserves a literal `$` inside a member name
+        // (`TesterFunctions$Inner$Class` -> `Inner$Class`) and — when the
+        // entry's `inner_name_index` is 0, which surfaces here as an empty
+        // string — yields the empty simple name an ANONYMOUS class must have.
+        // Taking the `$`-split tail instead returned the compiler's ordinal
+        // ("1"), which regression-suite `RReflect` catches as
+        // "anonymous getSimpleName empty".
+        Some((_outer, inner_name)) => {
+            cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name))
+        }
+        None => simple_class_name(class_id, name),
+    }
 }
 
 /// Canonical name: dotted form plus inner-class `$` в†’ `.` substitution.
 /// Cached per `ClassId`.
+///
+/// Returns the EMPTY string for a class that has no canonical name (JLS 6.7):
+/// a local or anonymous class, or a member class nested inside one. That
+/// sentinel is what `native_class_get_canonical_name` turns into Java `null`;
+/// no real class canonicalises to `""`. Previously such classes leaked a
+/// `$`-substituted pseudo-name (`RReflect.1` for an anonymous class), which
+/// regression-suite `RReflect` catches as "anonymous getCanonicalName null".
 pub(crate) fn canonical_class_name(
     ctx: &mut dyn NativeContext,
     class_id: ClassId,
@@ -275,12 +331,21 @@ pub(crate) fn canonical_class_name(
         return arc;
     }
     let canonical: Arc<str> = if slashed.starts_with('[') {
-        Arc::from(array_descriptor_to_canonical_name(slashed).unwrap_or_default())
-    } else if let Some((_, outer_class, inner_name, _)) = ctx
-        .inner_classes(class_id)
-        .into_iter()
-        .find(|(inner_class, _, _, _)| inner_class == slashed)
-    {
+        match array_reference_element(slashed)
+            .and_then(|(dims, elem)| ctx.class_id_by_name(elem).map(|id| (dims, elem, id)))
+        {
+            Some((dims, elem, elem_id)) => {
+                let elem_canonical = canonical_class_name(ctx, elem_id, elem).to_string();
+                // An array of a type with no canonical name has none either.
+                if elem_canonical.is_empty() {
+                    Arc::from("")
+                } else {
+                    Arc::from(append_array_suffix(elem_canonical, dims))
+                }
+            }
+            None => Arc::from(array_descriptor_to_canonical_name(slashed).unwrap_or_default()),
+        }
+    } else if let Some((outer_class, inner_name)) = own_inner_class_entry(ctx, class_id, slashed) {
         if !outer_class.is_empty() && !inner_name.is_empty() {
             let outer_name = ctx
                 .declaring_class(class_id)
@@ -290,9 +355,16 @@ pub(crate) fn canonical_class_name(
                     })
                 })
                 .unwrap_or_else(|| outer_class.replace(['/', '$'], "."));
-            Arc::from(format!("{outer_name}.{inner_name}"))
+            // A member class of a class that itself has no canonical name has
+            // none either.
+            if outer_name.is_empty() {
+                Arc::from("")
+            } else {
+                Arc::from(format!("{outer_name}.{inner_name}"))
+            }
         } else {
-            Arc::from(slashed.replace(['/', '$'], "."))
+            // Local (`outer_class` empty) or anonymous (`inner_name` empty).
+            Arc::from("")
         }
     } else {
         Arc::from(slashed.replace('/', "."))
@@ -3245,20 +3317,22 @@ pub(crate) fn native_class_get_simple_name(
             return Ok(Some(Value::Object(Some(result))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
-            if let Some((_, _, inner_name, _)) = ctx
-                .inner_classes(class_id)
-                .into_iter()
-                .find(|(inner_class, _, _, _)| inner_class == &name)
+            // Reference arrays: the component CLASS's simple name plus one
+            // `[]` per dimension, so an array of an anonymous class is `"[]"`
+            // rather than the descriptor-derived `"1[]"`.
+            if let Some((dims, elem, elem_id)) = array_reference_element(&name)
+                .and_then(|(dims, elem)| ctx.class_id_by_name(elem).map(|id| (dims, elem, id)))
             {
-                if !inner_name.is_empty() {
-                    let simple =
-                        cache_insert(&SIMPLE_CLASS_NAME_CACHE, class_id, Arc::from(inner_name));
-                    let result = ctx.create_string(&simple);
-                    return Ok(Some(Value::Object(Some(result))));
-                }
+                let elem_simple = resolve_simple_name(ctx, elem_id, elem).to_string();
+                let simple = cache_insert(
+                    &SIMPLE_CLASS_NAME_CACHE,
+                    class_id,
+                    Arc::from(append_array_suffix(elem_simple, dims)),
+                );
+                let result = ctx.create_string(&simple);
+                return Ok(Some(Value::Object(Some(result))));
             }
-            let is_real_inner = has_own_inner_classes_entry(ctx, class_id, &name);
-            let simple = simple_class_name(class_id, &name, is_real_inner);
+            let simple = resolve_simple_name(ctx, class_id, &name);
             let result = ctx.create_string(&simple);
             return Ok(Some(Value::Object(Some(result))));
         }
@@ -15282,11 +15356,20 @@ pub(crate) fn native_class_get_canonical_name(
         }
     }
     if let Some(class_id) = ctx.class_id_from_mirror(this) {
+        // An empty canonical name is `canonical_class_name`'s sentinel for
+        // "this class has no canonical name" (local / anonymous / nested in
+        // one, JLS 6.7) — `Class.getCanonicalName()` returns null for those.
         if let Some(arc) = cache_get(&CANONICAL_CLASS_NAME_CACHE, class_id) {
+            if arc.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
             return Ok(Some(Value::Object(Some(ctx.create_string(&arc)))));
         }
         if let Some(name) = ctx.class_name_of_id(class_id) {
             let canonical = canonical_class_name(ctx, class_id, &name);
+            if canonical.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
             return Ok(Some(Value::Object(Some(ctx.create_string(&canonical)))));
         }
     }
@@ -18440,6 +18523,65 @@ mod tests {
             ctx.read_string(obj).unwrap(),
             "InitialDirContext$$$EasyMock$1"
         );
+    }
+
+    #[test]
+    fn class_get_simple_name_anonymous_is_empty() {
+        // javac emits `outer_class_info_index == 0` AND `inner_name_index == 0`
+        // for an anonymous class; both surface here as empty strings. Its
+        // simple name is "" (JLS 13.1), NOT the `$`-split tail "1".
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("RReflect$1").unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![("RReflect$1".to_string(), String::new(), String::new(), 0)],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "RReflect$1");
+        let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match r.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(obj).unwrap(), "");
+    }
+
+    #[test]
+    fn class_get_canonical_name_anonymous_is_null() {
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("RReflect$2").unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![("RReflect$2".to_string(), String::new(), String::new(), 0)],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "RReflect$2");
+        let r = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        assert_eq!(r.unwrap(), Some(Value::Object(None)));
+    }
+
+    #[test]
+    fn class_get_names_local_class_has_simple_but_no_canonical_name() {
+        // A local (declared-in-a-method) class: `outer_class_info_index == 0`
+        // but `inner_name_index` names it -> simple name yes, canonical no.
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("RReflect$1Local").unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "RReflect$1Local".to_string(),
+                String::new(),
+                "Local".to_string(),
+                0,
+            )],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "RReflect$1Local");
+        let r = native_class_get_simple_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        let obj = match r.unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected Object, got {other:?}"),
+        };
+        assert_eq!(ctx.read_string(obj).unwrap(), "Local");
+        let r = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
+        assert_eq!(r.unwrap(), Some(Value::Object(None)));
     }
 
     // -----------------------------------------------------------------------

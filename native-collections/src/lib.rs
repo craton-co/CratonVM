@@ -9289,6 +9289,22 @@ fn native_hs_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// LETSGO_S1: HashSet.hashCode — sum of `hashCode()` over elements
 /// (matches `AbstractSet.hashCode` semantics).
+///
+/// This native is registered on `java/util/AbstractSet` (where HashSet's
+/// inherited `hashCode()` resolves), so it intercepts *every* `AbstractSet`
+/// subclass — including user/library sets whose elements do not live in a
+/// HashSet-shaped backing map, e.g. Weld's `ImmutableTinySet$Doubleton`
+/// (members held in named `element1`/`element2` fields). For those
+/// `hs_backing_map` is `None`, and the bare `collect_collection_elements`
+/// extractor — which only knows fixed collection layouts — returned an empty
+/// Vec, so `hashCode()` was silently 0 instead of the `AbstractSet` contract's
+/// element-hash sum. A 0 hash still compares `equals` correctly but lands in
+/// the wrong HashMap bucket, so a `Map<Set<..>, ..>` keyed by such a set is
+/// unfindable with an equal `HashSet` probe (the `getSharedSet` shape from
+/// HIB-CV-25; caught by regression-suite `RCollections` "set-key true hit").
+/// Use the `_or_real` variant — the same fix already applied to
+/// `containsAll`/`retainAll`/`removeAll` — which falls back to the
+/// collection's real `toArray()`.
 fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -9296,7 +9312,7 @@ fn native_hs_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let keys = match hs_backing_map(ctx, this) {
         Some(m) => map_collect_keys(ctx, m),
-        None => collect_collection_elements(ctx, this),
+        None => collect_collection_elements_or_real(ctx, this),
     };
     let mut h: i32 = 0;
     for k in &keys {
