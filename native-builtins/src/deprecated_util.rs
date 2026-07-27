@@ -340,11 +340,33 @@ fn native_date_init_iiiiii(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 /// Date(String) — deprecated; throws UnsupportedOperationException.
-fn native_date_init_string(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Err(RuntimeError::UnsupportedOperationException {
-        message: "Date(String) is deprecated and not supported".to_string(),
-    }
-    .into())
+/// `java.util.Date(String)` — deprecated, but still reachable and still
+/// expected to work: real JDK defines it as `this(parse(s))`, and Spring's
+/// `ObjectToObjectConverter` picks it up as the String -> Date conversion for
+/// anything the formatting conversion service does not handle itself. Throwing
+/// `UnsupportedOperationException` here made `@RequestHeader java.util.Date`
+/// binding fail for an ordinary RFC-1123 header value
+/// (`web.method.annotation.RequestHeaderMethodArgumentResolverTests
+/// .dateConversion` and its `web.reactive` twin).
+///
+/// `Date.parse(String)` has no native override, so this delegates to the real
+/// JDK bytecode for the parsing itself rather than re-implementing the
+/// (surprisingly permissive) legacy grammar.
+fn native_date_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let text = args.get(1).copied().unwrap_or(Value::Object(None));
+    let millis = match ctx.invoke("java/util/Date", "parse", "(Ljava/lang/String;)J", &[text])? {
+        Some(Value::Long(v)) => v,
+        Some(Value::Int(v)) => v as i64,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "Date(String): unparseable date".to_string(),
+            }
+            .into())
+        }
+    };
+    set_date_millis(ctx, this, millis);
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
