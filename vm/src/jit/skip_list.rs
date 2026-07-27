@@ -954,13 +954,44 @@ fn should_skip_jit_internal(
     // invokespecial resolving its target by name instead of through the
     // caller's loader (`f16acca12`, hit by `TestUpgrade`).
     //
-    // What actually holds this ban now is THREE classes — `TestStreamStore`
-    // (an intermittent `Interruptible.interrupt` NPE that also reproduces with
-    // the ban in place, so it may not belong here at all), `TestFreeSpace` and
-    // `TestNestedJoins` (both clean 300s timeouts, nothing known). A fourth,
-    // `TestCompatibility`, now fails with the ban in place too and is no
-    // longer evidence for anything. Per-class detail, repro commands and the
-    // next steps: `docs/known-issues/h2/h2-jitban-residuals-20260726.md`.
+    // 2026-07-27 re-test, and the reason to distrust every per-class verdict
+    // recorded above. All three classes that held this ban on 2026-07-26 are
+    // fixed, and none of them was an H2 bug:
+    //   * `TestStreamStore` -- not intermittent (10/10 vs 0/10). Two stacked
+    //     defects: `ThreadPoolExecutor.shutdown()` interrupted RUNNING workers
+    //     rather than only idle ones (the JDK separates them with
+    //     `w.tryLock()` in `interruptIdleWorkers`), and
+    //     `AbstractInterruptibleChannel.interruptor` was ALWAYS null because
+    //     the `FileChannelImpl` bridge never runs the JDK constructor -- so an
+    //     interrupt during channel I/O NPEd instead of closing the channel.
+    //   * `TestFreeSpace` / `TestNestedJoins` -- never hangs. A JIT-compiled
+    //     caller's `invokevirtual` never reached a JIT-compiled callee, because
+    //     `helpers::direct_virtual_compiled_callee_entry_enabled()` was
+    //     default-OFF and gates the only write of `mic.cached_entry_ptr`.
+    //     Compiling a method made its callees run INTERPRETED; lifting this
+    //     ban is what made the callers compiled, so this ban was hiding a
+    //     general JIT defect rather than an H2 one. Now default-ON.
+    //
+    // The ban still STAYS, on entirely new evidence. Same-binary 218-class A/B
+    // with that dispatch fix in place: 166 PASS with this ban, 155 PASS + 3
+    // CRASH (`TestRunscript`, `TestPageStoreCoverage`, `TestReopen`) without.
+    // `TestReopen` is notable -- it was recorded as CLOSED on 2026-07-26 and
+    // regressed to a CRASH once compiled H2 code actually started running
+    // compiled.
+    //
+    // The sharpest blocker is now a CORRECTNESS failure, not throughput: with
+    // this ban lifted, `TestFileSystem`'s `memLZF:` `testConcurrent` fails
+    // intermittently (2 of 4 runs) with `Expected: 3900 actual: 3897` /
+    // `Expected: 5128 actual: 5168`. The reader holds the same
+    // `AtomicIntegerArray` spin lock the writer held and reads `expected` and
+    // then the file; seeing fresh file bytes with a stale `expected` is a
+    // memory-ordering violation, since the writer wrote the file, then
+    // `expected`, then released the lock. Root-cause that -- compiled `org/h2`
+    // code reordering across `AtomicIntegerArray.set`/`compareAndSet` -- before
+    // attempting this ban again.
+    //
+    // Full evidence, repro commands and the residual-4 measurement:
+    // `docs/known-issues/h2/h2-jitban-residuals-20260726.md`.
     //
     // The `org/antlr/v4/runtime/` half is NOT held by any of that — the H2
     // suite never exercises ANTLR. A concurrent session isolated it against
@@ -1138,6 +1169,54 @@ fn should_skip_jit_internal(
         // reproduces on current dev, same as its sibling JASPER-JDT.2.
         // See docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md
         // for the full evidence for both bans.
+        // JASPER-JDT.3 -- RESTORED 2026-07-27. The removal above is sound for
+        // the configuration it was measured in, and unsound for the one that
+        // now ships. Every one of its four re-verification runs was made while
+        // `helpers::direct_virtual_compiled_callee_entry_enabled()` was
+        // default-OFF, and that flag gates the only write of
+        // `mic.cached_entry_ptr` -- i.e. with it off a JIT-compiled caller's
+        // `invokevirtual` never reaches a JIT-compiled callee at all. The
+        // compiled-to-compiled virtual dispatch this family lives in was
+        // therefore inert during the re-verification: the runs could not have
+        // reproduced it whatever the state of the underlying defect. Same
+        // shadowing shape as the removals this module already annotates as
+        // no-ops, just hidden behind a flag rather than behind another rule.
+        //
+        // Turning that flag on (2026-07-27, for the H2 `TestFreeSpace` /
+        // `TestNestedJoins` residuals) brings the family straight back, with a
+        // new face: real Tomcat `jakarta.el.TestOptionalELResolverInJsp` fails
+        // 2/2 with the flag on and passes 2/2 with it off, on the same binary,
+        // its JSP compile dying with
+        // `ClassCastException: org.eclipse.jdt.internal.compiler.ast.
+        // QualifiedTypeReference cannot be cast to
+        // org.eclipse.jdt.internal.compiler.ast.FieldDeclaration`
+        // (`JasperException: Unable to compile class for JSP` -> HTTP 500).
+        // A wrong-type AST node reaching a cast is the same "dispatch landed on
+        // the wrong target" shape as the original AIOOBE at
+        // `QualifiedNameReference.analyseCode`.
+        //
+        // Liftable for bisection with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`.
+        // Any future attempt to remove this must be measured with the virtual
+        // direct-entry path ON, or it measures nothing.
+        // JASPER-JDT.2 is restored for the same reason and is the half that is
+        // DIRECTLY re-confirmed: with the virtual direct-entry path on,
+        // `CRATONVM_JIT_DENY=org/eclipse/jdt/internal/compiler/parser/` turns
+        // the failing `TestOptionalELResolverInJsp` back to PASS, while denying
+        // `.../ast/`, `.../lookup/` or `.../util/` does not. JASPER-JDT.3
+        // (`ast/`) is restored on the shadowing argument alone -- its own repro
+        // (`TestFormAuthenticatorA`) has not been re-run under the flag, and its
+        // removal evidence is void for exactly the same reason, so leaving it
+        // out would be asserting something no measurement supports.
+        for prefix in [
+            "org/eclipse/jdt/internal/compiler/ast/",
+            "org/eclipse/jdt/internal/compiler/parser/",
+        ] {
+            if class_name.starts_with(prefix) && !package_allowed(prefix, allow_packages) {
+                return Some(SkipReason::RustJvmTestFixture);
+            }
+        }
+
         if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
         {

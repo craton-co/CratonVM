@@ -10,6 +10,39 @@ distinct named ban, its disposition, and — for anything not yet
 individually re-verified — why, and what a future session needs to close
 it.
 
+
+## 2026-07-27 — a whole class of this sweep's removals was verified against an inert code path
+
+`vm/src/jit/helpers.rs`'s `direct_virtual_compiled_callee_entry_enabled()` was
+**default-OFF** for the entire period in which this sweep did its ban removals.
+That flag gates the only write of `mic.cached_entry_ptr`, so with it off the
+inline MIC/PIC cascade the codegen emits at every compiled `invokevirtual` can
+never open, and **a JIT-compiled caller never reaches a JIT-compiled callee** —
+every virtual call out of compiled code falls back into the interpreter.
+
+Any ban whose mechanism is compiled-to-compiled virtual dispatch therefore could
+not reproduce during a default-OFF run, no matter what state the underlying
+defect was in. "Re-verified, no longer reproduces" measured that way measures
+nothing.
+
+Confirmed instance: **JASPER-JDT.2** (`org/eclipse/jdt/internal/compiler/parser/`)
+and **JASPER-JDT.3** (`.../ast/`), both removed 2026-07-26 after four repeat runs
+each on real Tomcat fixtures. With the flag on, real Tomcat
+`jakarta.el.TestOptionalELResolverInJsp` fails 3/3 (JSP compile dies with
+`ClassCastException: ...ast.QualifiedTypeReference cannot be cast to
+...ast.FieldDeclaration` → HTTP 500) and passes 3/3 with `parser/` denied. Both
+bans are RESTORED; `parser/` is directly re-confirmed, `ast/` on the shadowing
+argument.
+
+**Action for the rest of this inventory:** every removal in the 2026-07-25/26
+sweep justified by "no longer reproduces" needs re-checking with
+`CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` **on** before it can be
+trusted. Bans whose mechanism is not virtual dispatch (pure codegen, GC roots,
+class-init ordering) are unaffected.
+
+Full detail: `docs/known-issues/h2/h2-jitban-residuals-20260726.md`.
+
+
 ## REMOVED this multi-session effort (confirmed safe, real testing, code deleted)
 
 TYPES-ERASURE.1 (added then partially superseded — see below),

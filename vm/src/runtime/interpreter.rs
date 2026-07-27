@@ -23062,6 +23062,17 @@ fn checkcast_lambda_instantiated_args(
 /// for maps. The backing map's physical slot layout follows the loaded JDK
 /// class, so resolve its `size` field rather than assuming a fixed slot.
 fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
+    // An array receiver must render as its own type, not its component's.
+    // The header word of a reference array holds the COMPONENT class id, so
+    // the caller's `class_id_of` -> `class.name` lookup yields
+    // `java/lang/String` for a `String[]` and produces the nonsensical, and
+    // actively misleading, `java.lang.String cannot be cast to
+    // java.lang.String` (the TestObjectDataType failure, chased for a session
+    // as a class-identity split). HotSpot renders the descriptor instead:
+    // `[Ljava.lang.String;`.
+    if let Some(desc) = array_descriptor_of(shared, obj_ref) {
+        return desc;
+    }
     if raw_name != "cratonvm/internal/UnmodifiableMap" {
         return raw_name.to_string();
     }
