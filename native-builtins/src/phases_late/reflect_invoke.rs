@@ -1590,6 +1590,45 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
+    // `StackFrame.toString()`. The JDK's `StackFrameInfo.toString()` returns
+    // `toStackTraceElement().toString()`; this synthetic carrier is not a real
+    // class, so without an explicit registration it inherits `Object.toString`
+    // and renders as `java.lang.StackWalker$StackFrame@1f3c`. That leaked
+    // straight into user-visible output: Mockito's `LocationImpl` prints its
+    // frame via `MetadataShim.toString()` → `StackFrame.toString()`, so every
+    // "Wanted N times: -> at …" line named an identity hash instead of the
+    // call site.
+    r.register(sf, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let class_dotted = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => "Unknown".to_string(),
+        };
+        let method_name = match ctx.get_field(this, 1) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => "unknown".to_string(),
+        };
+        let file_name = match ctx.get_field(this, 2) {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        };
+        let line = match ctx.get_field(this, 3) {
+            Value::Int(n) => n,
+            _ => -1,
+        };
+        // Mirrors `StackTraceElement.toString()` (and `native_ste_to_string`):
+        // `Cls.method(File:line)`, degrading to `(File)`, `(Native Method)`
+        // and `(Unknown Source)` exactly as the JDK does.
+        let loc = match (file_name.as_deref(), line) {
+            (Some(f), n) if n >= 0 => format!("{f}:{n}"),
+            (Some(f), _) => f.to_string(),
+            (None, -2) => "Native Method".to_string(),
+            _ => "Unknown Source".to_string(),
+        };
+        let s = format!("{class_dotted}.{method_name}({loc})");
+        let result = ctx.create_string(&s);
+        Ok(Some(Value::Object(Some(result))))
+    });
     r.register(
         sf,
         "toStackTraceElement",

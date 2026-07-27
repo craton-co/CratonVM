@@ -181,7 +181,7 @@ const CANONICALIZE_CACHE_CAP: usize = 1024;
 /// `find_all_resource_urls` is called once per `ClassPath` instance
 /// (bootstrap / extension / application) for every `getResources`
 /// probe — a hot path on Spring-style classpath scans. The env var
-/// can't change after process start, so `std::env::var` (which locks
+/// can't change after process start, so `cratonvm_types::flags::runtime_var` (which locks
 /// the libc environ and allocates a `String`) is read exactly once
 /// here and the boolean verdict reused on every subsequent call.
 static DBG_GETRESOURCES: OnceLock<bool> = OnceLock::new();
@@ -2987,6 +2987,55 @@ impl ClassPath {
         diag_resource_call_wrapper("find_resource", || self.find_resource_impl(resource_name))
     }
 
+    /// Test resource membership without reading or inflating its contents.
+    ///
+    /// VM bootstrap uses this to select optional native compatibility packs.
+    /// Keeping the operation existence-only avoids turning a few classpath
+    /// witnesses into archive decompression and allocation during startup.
+    pub fn contains_resource(&self, resource_name: &str) -> bool {
+        let name = resource_name.trim_start_matches('/');
+        if !is_safe_resource_name(name) {
+            return false;
+        }
+        self.entries.iter().any(|entry| match entry {
+            ClassPathEntry::Directory(dir) => {
+                let full_path = dir.join(Path::new(name));
+                full_path.is_file()
+                    && self
+                        .checked_directory_resource_canonical(dir, &full_path, name)
+                        .is_some()
+            }
+            ClassPathEntry::JarFile { entry_index, .. }
+            | ClassPathEntry::NestedJar { entry_index, .. } => entry_index.contains(name),
+            ClassPathEntry::NestedDirectory { entries_cache, .. } => {
+                entries_cache.contains_key(name)
+            }
+            ClassPathEntry::JmodFile {
+                class_entry_index,
+                all_entry_names,
+                ..
+            } => {
+                let class_name = name.strip_suffix(".class");
+                class_name.is_some_and(|class_name| class_entry_index.contains(class_name))
+                    || all_entry_names.iter().any(|entry| {
+                        entry == name
+                            || entry
+                                .strip_prefix("classes/")
+                                .is_some_and(|entry| entry == name)
+                    })
+            }
+            ClassPathEntry::JImageFile {
+                class_to_module,
+                resource_to_modules,
+                ..
+            } => {
+                name.strip_suffix(".class")
+                    .is_some_and(|class_name| class_to_module.contains_key(class_name))
+                    || resource_to_modules.contains_key(name)
+            }
+        })
+    }
+
     fn find_resource_impl(&self, resource_name: &str) -> Option<Vec<u8>> {
         let name = resource_name.trim_start_matches('/');
         // Path safety: align with `find_class`'s input filter (rejects `..`,
@@ -5292,7 +5341,7 @@ mod tests {
     #[test]
     fn load_real_jdk_jmod() {
         // Skip this test if no JDK is available
-        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME").ok().or_else(|| {
             let candidate = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
             if candidate.exists() {
                 Some(candidate.to_string_lossy().into_owned())
@@ -5430,7 +5479,7 @@ mod tests {
     /// Helper: find java.base.jmod on this machine.
     fn find_java_base_jmod() -> Option<PathBuf> {
         // Try JAVA_HOME first
-        if let Ok(val) = std::env::var("JAVA_HOME") {
+        if let Ok(val) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
             let p = PathBuf::from(&val).join("jmods").join("java.base.jmod");
             if p.exists() {
                 return Some(p);

@@ -3331,6 +3331,8 @@ fn throw_proxy_failure(ctx: &mut dyn NativeContext, stage: &str) -> MethodCallFa
 
 #[cfg(test)]
 mod proxy_strict_gate_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     /// increment 3 (§3): STRICT proxy mode is opt-in and OFF by default, so the
     /// silent-degrade safety net remains the default behaviour until the soak
     /// flips it. (The throw path itself requires a live VM and is exercised by
@@ -3812,6 +3814,8 @@ fn native_proxy_instance_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 #[cfg(test)]
 mod module_can_read_essential_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// `register_p59_module` (phases_late.rs) also registers this triple, but

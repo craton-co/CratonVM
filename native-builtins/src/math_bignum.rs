@@ -799,6 +799,8 @@ pub(crate) fn bi_mod_inverse_str(a: &str, m: &str) -> Option<String> {
 
 #[cfg(test)]
 mod biginteger_modpow_modinverse_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{bi_alloc_int, bi_mod_inverse_str, bi_mod_pow_str};
     use crate::bigint::BigInt;
     use crate::test_utils::mock_ctx;

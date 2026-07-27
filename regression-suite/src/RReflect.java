@@ -93,10 +93,30 @@ public class RReflect {
         // primitive array
         check(int[].class.getSimpleName().equals("int[]"), "primitive-array getSimpleName");
         check(int[].class.getCanonicalName().equals("int[]"), "primitive-array getCanonicalName");
-        // anonymous class: simple name is "", canonical name is null
+        // member (nested) class: keeps both a simple and a canonical name.
+        check(cls.getCanonicalName().equals("RReflect.Annotated"), "member getCanonicalName");
+        // anonymous class: simple name is "", canonical name is null. The
+        // InnerClasses entry of an anonymous class has inner_name_index == 0,
+        // so the simple name must NOT fall back to the `$`-split binary tail
+        // (the compiler's ordinal, e.g. "1").
         Object anon = new Object() {};
         check(anon.getClass().getSimpleName().isEmpty(), "anonymous getSimpleName empty");
         check(anon.getClass().getCanonicalName() == null, "anonymous getCanonicalName null");
+        check(anon.getClass().getName().startsWith("RReflect$"), "anonymous getName");
+        // an ARRAY of an anonymous class inherits both: simple name is just
+        // the "[]" suffix, and there is still no canonical name.
+        Object anonArr = Array.newInstance(anon.getClass(), 0);
+        check(anonArr.getClass().getSimpleName().equals("[]"), "anonymous-array getSimpleName");
+        check(anonArr.getClass().getCanonicalName() == null, "anonymous-array getCanonicalName null");
+        // anonymous implementing an interface behaves identically.
+        Runnable anonRun = new Runnable() { public void run() {} };
+        check(anonRun.getClass().getSimpleName().isEmpty(), "anonymous(iface) getSimpleName empty");
+        check(anonRun.getClass().getCanonicalName() == null, "anonymous(iface) getCanonicalName null");
+        // local (declared-in-a-method) class: outer_class_info_index == 0 but
+        // inner_name_index != 0 -> it HAS a simple name and has NO canonical name.
+        class RReflectLocal {}
+        check(RReflectLocal.class.getSimpleName().equals("RReflectLocal"), "local getSimpleName");
+        check(RReflectLocal.class.getCanonicalName() == null, "local getCanonicalName null");
 
         System.out.println("PASS RReflect (" + checks + " checks)");
     }

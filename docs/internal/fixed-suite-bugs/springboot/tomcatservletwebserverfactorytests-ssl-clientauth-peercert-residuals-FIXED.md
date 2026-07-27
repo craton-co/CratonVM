@@ -152,7 +152,8 @@ distinct, general, already-multiply-fixed VM-concurrency bug category (a
 blocking native call somewhere not bracketed with
 `begin_blocking_region()`/`end_blocking_region()`), not a TLS/peer-cert
 defect. See
-[`../../known-issues/springboot/tomcatservletwebserverfactorytests-stw-takeover-hang.md`](../../known-issues/springboot/tomcatservletwebserverfactorytests-stw-takeover-hang.md).
+[`tomcatservletwebserverfactorytests-stw-takeover-hang-FIXED.md`](tomcatservletwebserverfactorytests-stw-takeover-hang-FIXED.md)
+(since root-caused and FIXED — an unbracketed blocking `SSLSocketInputStream.read`).
 
 ## Affected classes
 

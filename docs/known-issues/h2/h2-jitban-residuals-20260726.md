@@ -311,7 +311,12 @@ re-runs.
 
 ## Related
 
-- `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment.
+- `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment and the restored
+  `JASPER-JDT.2`/`.3` entries.
 - `vm/src/jit/helpers.rs` — `direct_virtual_compiled_callee_entry_enabled`.
-- `docs/known-issues/jit-bans/jit-ban-sweep-20260725.md` — the sweep this came out of.
+- `docs/known-issues/jit-bans/jit-ban-sweep-consolidated-status-20260726.md` — the sweep this came out of.
 - `docs/known-issues/jit-bans/full-ban-inventory-status-20260726.md` — the cross-session ban tracker.
+- `docs/known-issues/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` — the
+  `org/antlr/v4/runtime/` half of this same ban, isolated clean by a concurrent
+  session; the H2 suite never exercises ANTLR, so that half remains the
+  better-evidenced candidate for narrowing.

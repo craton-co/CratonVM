@@ -399,6 +399,8 @@ fn render_java_replacement<'a>(
 
 #[cfg(test)]
 mod java_replacement_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{compile_anchored_cached, compile_java_regex};
 
     fn ra(text: &str, pat: &str, rep: &str) -> String {
@@ -2968,6 +2970,8 @@ fn matcher_realjdk_group_in_bounds(
 
 #[cfg(test)]
 mod matcher_realjdk_layout_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{
         compile_java_regex, is_matcher_realjdk_native_callback,
         matcher_realjdk_build_offset_tables, matcher_realjdk_capture_layout_valid,
@@ -3340,6 +3344,8 @@ pub(crate) fn native_matcher_group_idx_realjdk(
 // ===========================================================================
 #[cfg(test)]
 mod regex_lookbehind_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// The exact pattern Hazelcast's `AbstractXmlConfigHelper.schemaValidation`

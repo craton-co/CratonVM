@@ -18,7 +18,7 @@ use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
 // `NativeContext` trait brought into scope for `ctx.get_class_mirror(...)` on
 // `NativeContextImpl` in the generic-invokedynamic bootstrap path.
-use cratonvm_native_api::NativeContext;
+use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess, NativeInvokeAccess};
 
 use crate::classloading::resolution::{
     LambdaCallSite, MethodHandle, MethodHandleKind, RecordMethodKind, ResolvedCallSite, SwitchLabel,
@@ -70,7 +70,7 @@ const GROOVY_INDY_INTERFACE: &str = "org/codehaus/groovy/vmplugin/v8/IndyInterfa
 
 /// Cached read of a `CRATONVM_DBG_*` env var.
 ///
-/// `std::env::var_os` is a `getenv` mutex + `OsString` allocation on Linux and a
+/// `cratonvm_types::flags::runtime_var_os` is a `getenv` mutex + `OsString` allocation on Linux and a
 /// ~500 ns `GetEnvironmentVariableW` syscall plus a UTF-16 decode on Windows.
 /// Two of the three flags below sat on genuinely hot paths:
 /// `CRATONVM_DBG_INDY_GENERIC` is read on **every execution** of a generic
@@ -84,7 +84,7 @@ macro_rules! cached_env_flag {
         #[inline]
         fn $name() -> bool {
             static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *CACHE.get_or_init(|| std::env::var_os($env).is_some())
+            *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os($env).is_some())
         }
     };
 }
@@ -2956,7 +2956,7 @@ mod tests {
     // Cached debug-flag helpers
     // -----------------------------------------------------------------------
     //
-    // These replaced uncached `std::env::var_os` reads that sat on the
+    // These replaced uncached `cratonvm_types::flags::runtime_var_os` reads that sat on the
     // per-execution generic-indy path. The risk of the swap is a typo in the
     // variable name (the flag would then silently never fire, and a future
     // debugging session would waste hours on a dead switch), or an inverted
@@ -2970,7 +2970,7 @@ mod tests {
             (dbg_lambda_dispatch, "CRATONVM_DBG_LAMBDA_DISPATCH"),
         ];
         for (flag, name) in pairs {
-            let expected = std::env::var_os(name).is_some();
+            let expected = cratonvm_types::flags::runtime_var_os(name).is_some();
             assert_eq!(
                 flag(),
                 expected,

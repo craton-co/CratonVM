@@ -7346,6 +7346,8 @@ pub(crate) fn register_es4_elasticsearch_stubs(_r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod ra1_char_buffer_roundtrip_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -7421,6 +7423,8 @@ mod ra1_char_buffer_roundtrip_tests {
 // =============================================================================
 #[cfg(test)]
 mod nb_core_stubs_fix_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeMethodRegistry;
@@ -7672,6 +7676,8 @@ mod nb_core_stubs_fix_tests {
 
 #[cfg(test)]
 mod nb_phases_late_security_fix_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 
@@ -7772,6 +7778,8 @@ mod nb_phases_late_security_fix_tests {
 
 #[cfg(test)]
 mod nb_phases_late_robustness_fix_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     // -- finding 1: JSON unescape surrogate pairs + multi-byte safety --------
@@ -7874,6 +7882,8 @@ mod nb_phases_late_robustness_fix_tests {
 
 #[cfg(test)]
 mod cert_verify_bounds_security_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     // HIGH (cert-verify): In the default (non-legacy) build the no-op
@@ -7968,6 +7978,8 @@ mod cert_verify_bounds_security_tests {
 
 #[cfg(test)]
 mod ffm_p67_layout_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
 

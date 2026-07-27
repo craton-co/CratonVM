@@ -164,13 +164,16 @@ The bytecode execution engine.
      (`vm/src/runtime/interpreter.rs:7872`), falling back to
      `Instruction::decode` only for frames with no quickened stream.
 
-     The *remaining* cost is the pc→index lookup, not decoding.
-     `QuickenedCode::index_of_pc` (`reader/src/quickened.rs:186`) resolves
-     straight-line execution in a single compare against a `hint`, but every
-     taken branch misses the hint and falls back to a binary search over the
-     pc table. That is the residual to attack.
-- **`frame.rs`** — Stack frame: local variables + operand stack, stored
-  in SoA (Structure-of-Arrays) layout for cache efficiency.
+     The pc→index lookup is now O(1), including taken branches:
+     `QuickenedCode` stores a bitmap of instruction starts plus a cumulative
+     count per 64-byte block, and `resolve(pc)` maps any valid bytecode pc with
+     two loads and a popcount. The interpreter uses this hint-free combined
+     lookup directly. The remaining architectural problem is the duplicated
+     opcode semantics in the fast and slow dispatch paths, not decoding or
+     pc lookup.
+- **`frame.rs`** — Stack frame: local variables and operand stack use
+  8-byte NaN-boxed `CompactValue` slots. A parallel byte array is retained
+  for the ambiguous raw `long`/`double` local cases; tags are otherwise inline.
 - **`call_stack.rs`** — Per-thread call stack of frames.
 - **`value_stack.rs`** — Typed operand stack (SoA encoded).
 - **`exceptions.rs`** — Java exception creation and throw handling.
@@ -276,8 +279,11 @@ new subsystem — see the tracked layout work.
 
 The 32-byte header (`ObjectHeader`, `types/src/heap_types.rs`) spends 8 bytes on
 an always-resident `forwarding_ptr` and 4 on an always-resident
-`identity_hash_code`. HotSpot keeps both in the mark word transiently; folding
-them in the same way would take the header to 16 bytes.
+`identity_hash_code`. Folding the forwarding pointer into the mark word would
+take the header to **24 bytes**. Removing the identity hash alone saves nothing
+because alignment restores four bytes of padding. Reaching 16 bytes is a
+separate design project: the kind/element-type/age/flags word also has to move,
+and the current inflated-monitor mark word has no spare bits.
 
 Arrays use compact element sizes (1/2/4/8 bytes per element depending on type;
 `element_byte_size`), with reference elements at `REF_ELEMENT_SIZE` = 8 B.
@@ -314,31 +320,27 @@ in `ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`), which
 decouples optimization from instruction selection; others fall back to the
 direct single-pass path.
 
-**The IR path's reach is currently narrow, and the split is not on the axis
-you might expect.** `ir_compatible()` (`jit/src/ir.rs`) declines a method that
-contains any `athrow`, any `invokedynamic`, more than 5 invokes, more than 5
-instance-field accesses, more than 5 static-field accesses, or more than 3
-allocations; `ir_compatible_sized` adds a 200-byte bytecode cap. The reason is
-structural: the IR lowers every invoke through the generic `invoke_dispatch`
-helper — no inline caches, no direct calls, no direct self-recursive call — so
-for anything call-heavy an "optimizing" recompile can be a net *regression*
-against the single-pass body, which does have direct calls, constructor
-inlining, and the inline TLAB bump.
+**The IR path is materially wider than the original bring-up path, but the
+two-backend split still leaks capabilities.** `ir_compatible()` now admits up
+to 64 invokes, 64 instance-field operations, 64 static-field operations, and
+16 allocation sites; `ir_compatible_sized` uses an 8,000-byte method cap and a
+20,000-node graph cap. Static calls lower directly and virtual/interface calls
+use the same inline-cache/PIC shape as the single-pass backend, default-on.
 
-The practical consequence: the single-pass backend has the good call support and
-the IR has the good optimization, and **neither has both**. Small arithmetic
-kernels (sieve/matrix/reduction shapes) get the optimizing pipeline; ordinary
-application methods do not. Teaching the IR to lower calls with inline caches,
-then lifting the caps, is the tracked path out.
+Real lowering gaps remain. The IR still declines `athrow`, `invokedynamic`,
+`multianewarray`, and type checks. A surviving allocation cannot be lowered by
+the IR at all: only allocations eliminated by escape analysis stay on the IR
+path; otherwise compilation falls back to single-pass so the inline TLAB bump
+is retained. The design goal is therefore still one shared lowering layer, but
+call dispatch is no longer the blocker described by older audits.
 
 Key optimizations: register allocation for locals, magic division,
 LICM, bounds check elimination, AVX2 SIMD, on-stack replacement (OSR).
-Method inlining exists but is budgeted conservatively —
-`MAX_INLINE_BYTECODE_SIZE` = 35 bytes per callee and `MAX_INLINE_BUDGET` = 250
-bytes total per compiled method (`jit/src/lib.rs`), against HotSpot's
-`FreqInlineSize` = 325 for a single hot callee. There is no cross-call register
-allocation and no recursion inlining; see [BENCHMARK.md](BENCHMARK.md) for what
-that costs on the recursion-bound rows.
+Inlining is tiered: trivial callees up to 6 bytes, cold callees up to 35 bytes,
+and profile-hot callees up to 325 bytes, with total budgets of 750 bytes (cold)
+or 2,000 bytes (hot). There is still no general cross-call register allocation
+and no bounded-depth recursion inlining; see [BENCHMARK.md](BENCHMARK.md) for
+what that costs on recursion-bound rows.
 
 Methods are compiled after `CRATONVM_JIT_THRESHOLD` invocations (default 500;
 see `vm/src/runtime/env_cache.rs`). Codegen runs **off-thread by default** — the
@@ -350,8 +352,10 @@ conventions: **pure** methods (direct call) and **context** methods (receive
 
 ### Native Methods (`native-builtins/`, `native-collections/`, `native-io/` crates)
 
-3,100+ synthetic implementations of Java standard library methods, split across
-domain-specific crates. The `NativeContext` trait lives in `native-api/`.
+A large compatibility surface of native implementations and application
+bridges, split across domain-specific crates. The real-JDK default registers a
+smaller bridge/intrinsic subset; the `synthetic-jdk` feature adds the synthetic
+standard-library surface. The `NativeContext` trait lives in `native-api/`.
 
 - **`native-builtins/`** — java.lang.* native methods.
 - **`native-collections/`** — java.util.* native methods.
@@ -432,34 +436,23 @@ pointer.
    runtime") no longer describes the default build. CratonVM carries **two
    complete implementations of the Java standard library**:
 
-   * **Real-JDK mode (the default).** Class bytecode is loaded from a detected
-     JDK — `$JAVA_HOME/jmods/java.base.jmod` or the `lib/modules` jimage, via
-     the jimage reader — and Rust supplies only the essential native surface
-     underneath it. `vm/Cargo.toml` states this outright: `synthetic-jdk` is
-     deliberately **not** in `default = [...]`, and its comment reads "The
-     default build boots against real JDK bytecode loaded from
-     `$JAVA_HOME/lib/modules`".
-   * **Synthetic mode.** The Rust stub library (the 3,100+ registrations
-     described under *Native Methods* below) stands in for `java.*`, so the VM
-     can run with no JDK on the machine. This is what makes the "runs
-     standalone" claim true — but it is the fallback, not the default. Note
-     also that its *full* surface is itself feature-gated: ~120
-     `#[cfg(feature = "synthetic-jdk")]` sites across the native crates are
-     compiled out of a default build, so `--synthetic-jdk` on a default binary
-     and a `--features synthetic-jdk` build are not the same standard library.
+   * **Real-JDK mode (the deterministic launcher default).** Class bytecode is
+     loaded from an explicitly validated JDK —
+     `$JAVA_HOME/jmods/java.base.jmod` or the `lib/modules` jimage, via the
+     jimage reader — and Rust supplies only the essential native surface
+     underneath it. `VmConfig::for_launcher()` always chooses this mode;
+     detection validates availability but no longer selects the library.
+   * **Synthetic mode.** A large Rust stub library stands in for `java.*`, so
+     the VM can run with no JDK on the machine. It must be selected explicitly
+     with `--synthetic-jdk`, and the launcher rejects that selection when the
+     binary was not built with the `synthetic-jdk` Cargo feature.
 
-   **How the mode is chosen matters.** The launcher path picks by *sniffing the
-   host*: `VmConfig::with_host_jdk_default` does
-   `cfg.use_synthetic_jdk = detect_real_jdk().is_none();`
-   (`vm/src/config.rs:503`). The same binary therefore boots a different
-   standard library on a developer laptop with a JDK installed than on a bare
-   container — which is exactly the kind of implicit, environment-dependent
-   behaviour that makes bug reports hard to reproduce. (Library callers via
-   `VmConfig::new` / `VmConfig::default` always start synthetic; `--java-home`
-   forces real-JDK boot; `--synthetic-jdk` forces synthetic and wins.) Making
-   the mode an explicit, stated choice rather than an autodetection is tracked
-   work — when reading this section, check `config.rs` for which it currently
-   is.
+   `--real-jdk` and `--synthetic-jdk` are symmetric and mutually exclusive.
+   `VmConfig::default()` remains synthetic for hermetic embedding/tests, while
+   the launcher default is the named `LAUNCHER_DEFAULT_JDK_MODE`. Version and
+   fatal-error output identify the selected mode. The change and its
+   compatibility alias are recorded in
+   `docs/internal/arch-2026-07-26/jdk-mode-determinism.md`.
 
    Practical consequence for anyone diagnosing a failure: **establish which
    library the run used before anything else.** A missing real-JDK native and a
@@ -470,8 +463,10 @@ pointer.
    Java-catchable exceptions; `MethodCallFailed::InternalError` wraps VM
    bugs. The interpreter catches the former at catch/finally blocks.
 
-3. **SoA value layout.** Frames and operand stacks store tags and payloads
-   in separate arrays for better cache utilization during GC scanning.
+3. **Compact frame values.** Frames and operand stacks normally encode tag and
+   payload together in an 8-byte `CompactValue`. Locals use a parallel
+   one-byte kind only to disambiguate raw `long`/`double` patterns and preserve
+   JVM category-2 slot semantics.
 
 4. **Direct bytecode-to-x86-64, with an optional IR.** The JIT's default
    path compiles bytecode directly to machine code in a single pass, which
@@ -480,12 +475,13 @@ pointer.
    routed through an optional sea-of-nodes IR that enables broader
    optimization before instruction selection.
 
-5. **FNV-1a native dispatch.** Native methods are looked up by hashing
-   `"class_name.method_name:descriptor"`. O(1) dispatch with collision
-   detection at registration time. Note that `NativeMethodRegistry::find`
-   re-hashes all three strings on **every** call; the JIT path memoizes the
-   resolved callback per call site (`CachedBytecodeMethod::native_callback_cache`),
-   but several interpreter sites still re-resolve per invocation.
+5. **Dense, memoized native dispatch.** Name resolution hashes the
+   `(class, method, descriptor)` triple and verifies the full strings on every
+   digest hit. The result is a stable dense `NativeMethodId`; a
+   `NativeCallSite` caches the registry generation plus slot, so a warm call is
+   an atomic load, generation comparison, and bounds-checked array access.
+   Call sites that still use `NativeMethodRegistry::find` pay the full string
+   hash and should migrate to the shared memo mechanism.
 
 6. **Threading: one OS thread per Java thread.** `thread_start`
    (`vm/src/vm/vm_exec.rs`) spawns a real `std::thread::Builder` per
@@ -497,10 +493,11 @@ pointer.
    `types/src/value.rs`) should be read with that in mind.
 
 7. **Configuration is env-var-driven, and the surface is large.** There are
-   **593** distinct `CRATONVM_*` identifiers across the workspace crates and
-   ~695 bare `std::env::var` / `var_os` call sites (counted 2026-07-26).
-   `types/src/flags.rs` centralises 248 of those identifiers behind 9 reads and
-   `vm/src/runtime/env_cache.rs` another 39; the rest are scattered. Most are
+   hundreds of distinct `CRATONVM_*` identifiers across the workspace. A
+   2026-07-26 recount found 528 direct `std::env::var` / `var_os` source call
+   sites in the selected core directories; `vm/src/runtime/env_cache.rs`
+   contains 40 itself. The typed and grouped flag layers centralise many
+   identifiers, but direct reads remain scattered. Most are
    debug or diagnostic gates, but a meaningful subset changes semantics
    (`CRATONVM_COMPACT_REF_FIELDS`, `CRATONVM_REAL_NET_SOCKETS`,
    `CRATONVM_REAL_FORKJOINPOOL`, `CRATONVM_JIT_GETFIELD_HELPER`,
@@ -523,9 +520,8 @@ pass itself is recorded in
 
 | Capability | Where the default lives | Status |
 |------------|-------------------------|--------|
-| `moving_young` | `types/src/flags.rs:619` | Opt-in, defaults false — the "default" GC does not compact. |
-| `allow_moving_young` | `types/src/flags.rs:620` | Opt-in, defaults false — second gate on the same path (`gc/src/gen_heap.rs:3770`). |
-| `use_compressed_oops` | `vm/src/config.rs:426` | Opt-in, defaults false. Fully wired (`vm/src/vm/vm_init.rs:874`) but never enabled on the default path — and the doc claimed for a while that it was *not* wired, which is the same failure mode in the opposite direction. |
+| `moving_young` | `types/src/flags.rs::DEFAULT_MOVING_YOUNG` | The gate is now structured as opt-out with a compatibility opt-in, but the compiled default is still false. The former independent `allow_moving_young` gate has been deleted. |
+| `use_compressed_oops` | `vm/src/config.rs` | Opt-in, defaults false. Fully wired but never enabled on the default path — and the doc claimed for a while that it was *not* wired, which is the same failure mode in the opposite direction. |
 | `safepoint_reg_spill` | `jit/src/x64.rs:2650` | **Was** the canonical case: several call sites' own comments claimed a register spill as their protection, but that spill "only ran when the SEPARATE `CRATONVM_JIT_SAFEPOINT_REG_SPILL` env var was ALSO set — off by default, so the documented protection never actually happened." Now folded into default-on `precise_maps` and inverted to opt-**out** (`CRATONVM_NO_PRECISE_REG_SPILL`). This is the shape the fix should take. |
 | `precise_maps` register-spill half | `jit/src/x64.rs:2646-2662` | Same item; `precise_maps` was default-on since 2026-07-07 while its register-spill branch was not. A flag being on does not mean all of its branches are. |
 
@@ -538,9 +534,11 @@ pass itself is recorded in
 2. **Check that the default path takes the new branch.** Read the condition
    that guards it with the flag at its default value substituted in. If the
    branch is unreachable that way, the capability does not ship.
-3. **Check for a second gate.** `moving_young` needed `allow_moving_young`
-   too; `precise_maps` needed `safepoint_reg_spill` too. One flag being on is
-   not evidence that a code path runs.
+3. **Check for a second gate.** `moving_young` formerly needed
+   `allow_moving_young` too, and `precise_maps` formerly needed
+   `safepoint_reg_spill`; both duplications have since been removed. They
+   remain examples of why one flag being on is not evidence that a code path
+   runs.
 4. **Check whether the old path was deleted or merely bypassed.** If the
    previous implementation is still present and still reachable, the new one is
    an alternative, not a replacement — and the old one is what most runs use.

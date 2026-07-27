@@ -2806,6 +2806,8 @@ pub(crate) struct ParsedManifest {
 
 #[cfg(test)]
 pub(crate) mod manifest_parser_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -3059,6 +3061,8 @@ pub(crate) fn p59_attrs_populate_real(
 
 #[cfg(test)]
 pub(crate) mod t10_manifest_input_stream_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -3422,6 +3426,8 @@ pub(crate) mod t10_manifest_input_stream_tests {
 // ---------------------------------------------------------------------
 #[cfg(test)]
 pub(crate) mod zip_2x_api_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use std::io::{Cursor, Read, Write};
 
     /// Round-trip a two-entry ZIP through the 2.x writer + reader so a
@@ -3507,6 +3513,8 @@ pub(crate) mod zip_2x_api_tests {
 
 #[cfg(test)]
 pub(crate) mod bc_small_factors_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{bc_has_any_small_factors, BC_SMALL_FACTOR_GROUPS};
 
     fn mag_le(mut v: u128) -> Vec<u32> {

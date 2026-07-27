@@ -48,7 +48,7 @@
 ///
 /// Every `CRATONVM_*` flag this crate reads is a field on
 /// [`cratonvm_types::GcFlags`], parsed once at first use. Before the typed
-/// config existed each of these was an independent `std::env::var_os` call
+/// config existed each of these was an independent `cratonvm_types::flags::runtime_var_os` call
 /// wrapped in its own `OnceLock`; see `docs/internal/flag-census.md` for the
 /// inventory and `cratonvm_types::flags` for the latching rules.
 #[inline]
@@ -65,6 +65,7 @@ pub mod collector;
 pub mod compact_header;
 pub mod compressed_oops;
 pub mod concurrent_mark;
+pub mod external_roots;
 pub mod g1;
 pub mod g1_concurrent;
 pub mod gc;

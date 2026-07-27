@@ -177,7 +177,7 @@ fn canonical_os_version() -> String {
 #[cfg(target_os = "windows")]
 fn windows_build_number() -> Option<u32> {
     // Tests can override via env to validate the threshold logic.
-    if let Ok(override_str) = std::env::var("CRATONVM_FORCE_WIN_BUILD") {
+    if let Ok(override_str) = cratonvm_types::flags::runtime_var("CRATONVM_FORCE_WIN_BUILD") {
         if let Ok(n) = override_str.parse::<u32>() {
             return Some(n);
         }
@@ -198,8 +198,8 @@ fn windows_build_number() -> Option<u32> {
 /// `en_US.UTF-8`.  Windows has no direct env equivalent; we default to
 /// `en`/`US` if the env-var approach fails.
 fn derive_locale() -> (String, String) {
-    let raw = std::env::var("LC_ALL")
-        .or_else(|_| std::env::var("LANG"))
+    let raw = cratonvm_types::flags::runtime_var("LC_ALL")
+        .or_else(|_| cratonvm_types::flags::runtime_var("LANG"))
         .unwrap_or_default();
     // Strip `.<encoding>` suffix and any `@<variant>`.
     let base = raw
@@ -430,6 +430,147 @@ pub struct SharedVm {
     pub init_level_waiters: Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
 }
 
+// ---------------------------------------------------------------------------
+// Typed bootstrap state machine
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct Allocated;
+#[derive(Debug)]
+struct ClassesReady;
+#[derive(Debug)]
+struct NativesReady;
+#[derive(Debug)]
+struct RuntimeReady;
+
+/// Compile-time ordering plus testable runtime invariants for VM startup.
+///
+/// The payload is intentionally small: the large subsystem values remain local
+/// to `SharedVm::new`, while this token is the only value allowed to cross each
+/// phase boundary. A new initialization step therefore cannot be reordered
+/// past classes/native/runtime readiness without changing the token type.
+#[must_use = "a bootstrap phase must be advanced or explicitly finished"]
+struct BootstrapPhase<State> {
+    started: std::time::Instant,
+    _state: std::marker::PhantomData<State>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BootstrapInvariantError {
+    NoClasses,
+    CoreObjectMissing,
+    NoNatives,
+    RuntimeNotWired,
+}
+
+impl BootstrapPhase<Allocated> {
+    fn begin() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            _state: std::marker::PhantomData,
+        }
+    }
+
+    fn classes_ready(
+        self,
+        loaded_classes: usize,
+        core_object_present: bool,
+    ) -> Result<BootstrapPhase<ClassesReady>, BootstrapInvariantError> {
+        if loaded_classes == 0 {
+            return Err(BootstrapInvariantError::NoClasses);
+        }
+        if !core_object_present {
+            return Err(BootstrapInvariantError::CoreObjectMissing);
+        }
+        Ok(BootstrapPhase {
+            started: self.started,
+            _state: std::marker::PhantomData,
+        })
+    }
+}
+
+impl BootstrapPhase<ClassesReady> {
+    fn natives_ready(
+        self,
+        registered_natives: usize,
+    ) -> Result<BootstrapPhase<NativesReady>, BootstrapInvariantError> {
+        if registered_natives == 0 {
+            return Err(BootstrapInvariantError::NoNatives);
+        }
+        Ok(BootstrapPhase {
+            started: self.started,
+            _state: std::marker::PhantomData,
+        })
+    }
+}
+
+impl BootstrapPhase<NativesReady> {
+    fn runtime_ready(
+        self,
+        runtime_wired: bool,
+    ) -> Result<BootstrapPhase<RuntimeReady>, BootstrapInvariantError> {
+        if !runtime_wired {
+            return Err(BootstrapInvariantError::RuntimeNotWired);
+        }
+        Ok(BootstrapPhase {
+            started: self.started,
+            _state: std::marker::PhantomData,
+        })
+    }
+}
+
+impl BootstrapPhase<RuntimeReady> {
+    fn finish(self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+}
+
+#[cfg(test)]
+mod typed_bootstrap_phase_tests {
+    use super::{BootstrapInvariantError, BootstrapPhase};
+
+    #[test]
+    fn phase_invariants_fail_at_the_boundary_that_owns_them() {
+        assert_eq!(
+            BootstrapPhase::begin().classes_ready(0, true).err(),
+            Some(BootstrapInvariantError::NoClasses)
+        );
+        assert_eq!(
+            BootstrapPhase::begin().classes_ready(1, false).err(),
+            Some(BootstrapInvariantError::CoreObjectMissing)
+        );
+        let classes = BootstrapPhase::begin()
+            .classes_ready(1, true)
+            .expect("classes");
+        assert_eq!(
+            classes.natives_ready(0).err(),
+            Some(BootstrapInvariantError::NoNatives)
+        );
+        let natives = BootstrapPhase::begin()
+            .classes_ready(1, true)
+            .expect("classes")
+            .natives_ready(1)
+            .expect("natives");
+        assert_eq!(
+            natives.runtime_ready(false).err(),
+            Some(BootstrapInvariantError::RuntimeNotWired)
+        );
+    }
+
+    #[test]
+    fn valid_bootstrap_can_only_finish_after_all_typed_transitions() {
+        let elapsed = BootstrapPhase::begin()
+            .classes_ready(1, true)
+            .expect("classes")
+            .natives_ready(1)
+            .expect("natives")
+            .runtime_ready(true)
+            .expect("runtime")
+            .finish();
+        assert!(elapsed <= std::time::Duration::from_secs(1));
+    }
+}
+
 impl SharedVm {
     /// Retain a captured Throwable trace independently of the producing Java
     /// thread. The entry is non-owning and is swept by the GC remap hook.
@@ -610,6 +751,10 @@ impl SharedVm {
         // otherwise invisible until someone notices the VM "feels slow".
         let __boot_t0 = std::time::Instant::now();
         let mut class_manager = ClassManager::new(&boot_cp, &ext_cp, &config.classpath);
+        let native_shim_selection =
+            cratonvm_native_builtins::app_shims::ShimSelection::from_resource_probe(
+                |resource| class_manager.application_contains_resource(resource),
+            );
         let __boot_classpath_elapsed = __boot_t0.elapsed();
         tracing::info!(
             "boot phase 1/3 classpath ingestion: {:?} ({} boot entries, {} ext, {} app)",
@@ -910,6 +1055,7 @@ impl SharedVm {
             string_dedup: config.g1_string_dedup,
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
+        let bootstrap_phase = BootstrapPhase::<Allocated>::begin();
 
         // --- Compressed oops -------------------------------------------------
         //
@@ -925,7 +1071,7 @@ impl SharedVm {
         // narrow slots; G1/ZGC keep full 64-bit references.
         let want_compressed_oops = config.use_compressed_oops
             || matches!(
-                std::env::var("CRATONVM_COMPRESSED_OOPS").as_deref(),
+                cratonvm_types::flags::runtime_var("CRATONVM_COMPRESSED_OOPS").as_deref(),
                 Ok("1") | Ok("true")
             );
         if want_compressed_oops {
@@ -1003,6 +1149,15 @@ impl SharedVm {
         cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
         let __boot_t2 = std::time::Instant::now();
+        let bootstrap_phase = bootstrap_phase
+            .classes_ready(
+                class_manager.loaded_count(),
+                class_manager
+                    .get_loaded_class_id("java/lang/Object")
+                    .is_some(),
+            )
+            .expect("bootstrap ClassesReady invariants");
+
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
         {
@@ -1094,7 +1249,10 @@ impl SharedVm {
                 // docs/known-issues/wildfly-standalone-boot-stw-jit-takeover-hang.md's
                 // 2026-07-14 addendum for the WildFly-boot regression this
                 // caused and how it was found (git bisect).
-                register_essential_natives(&mut native_methods);
+                cratonvm_native_builtins::register_essential_natives_with_shims(
+                    &mut native_methods,
+                    native_shim_selection,
+                );
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
                 cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
@@ -1519,7 +1677,10 @@ impl SharedVm {
             // regression + revert, 2026-07-14): several SyntheticStub-tagged
             // register_* clusters (JMX, Function$Identity) are permanent
             // bridges needed in real mode too, not fake-JDK-only shadows.
-            register_essential_natives(&mut native_methods);
+            cratonvm_native_builtins::register_essential_natives_with_shims(
+                &mut native_methods,
+                native_shim_selection,
+            );
             // cratonvm-cli default features omit `synthetic-jdk`; the rich
             // registration block only lives under `cfg(feature = "synthetic-jdk")`
             // above. Real-JDK apps still need ReentrantLock / Condition / LBQ
@@ -2258,7 +2419,7 @@ impl SharedVm {
         // one-flag opt-in for real concurrent CDI. Otherwise (synthetic pool,
         // the default) seed NONE so Weld deploys single-threaded instead of
         // hanging on `ForkJoinPool.commonPool().invokeAll`.
-        if std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_none() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_none() {
             sys_props.insert(
                 "org.jboss.weld.executor.threadPoolType".to_string(),
                 "NONE".to_string(),
@@ -2297,8 +2458,8 @@ impl SharedVm {
         } else {
             sys_props.insert("user.dir".to_string(), ".".to_string());
         }
-        let user_home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
+        let user_home = cratonvm_types::flags::runtime_var("HOME")
+            .or_else(|_| cratonvm_types::flags::runtime_var("USERPROFILE"))
             .unwrap_or_else(|_| {
                 if cfg!(windows) {
                     "C:\\".to_string()
@@ -2309,8 +2470,8 @@ impl SharedVm {
         sys_props.insert("user.home".to_string(), user_home);
         sys_props.insert(
             "user.name".to_string(),
-            std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
+            cratonvm_types::flags::runtime_var("USER")
+                .or_else(|_| cratonvm_types::flags::runtime_var("USERNAME"))
                 .unwrap_or_else(|_| "unknown".to_string()),
         );
         sys_props.insert(
@@ -2328,7 +2489,7 @@ impl SharedVm {
         // the key is at least present.
         sys_props.insert(
             "user.timezone".to_string(),
-            std::env::var("TZ").unwrap_or_default(),
+            cratonvm_types::flags::runtime_var("TZ").unwrap_or_default(),
         );
 
         // ---- Tier 3: env/config-derived keys ----
@@ -2366,7 +2527,7 @@ impl SharedVm {
             // default classpath (notably H2's dynamic CREATE ALIAS compiler).
             crate::classloading::ClassPath::expand_classpath_entries(&config.classpath).join(sep)
         } else {
-            std::env::var("CLASSPATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("CLASSPATH").unwrap_or_default()
         };
         sys_props.insert("java.class.path".to_string(), class_path_val);
 
@@ -2374,11 +2535,11 @@ impl SharedVm {
         // $LD_LIBRARY_PATH on Linux, $DYLD_LIBRARY_PATH on macOS. Always
         // prefix with <java.home>/lib so native-lib lookup still works.
         let lib_path_env = if cfg!(windows) {
-            std::env::var("PATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("PATH").unwrap_or_default()
         } else if cfg!(target_os = "macos") {
-            std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("DYLD_LIBRARY_PATH").unwrap_or_default()
         } else {
-            std::env::var("LD_LIBRARY_PATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("LD_LIBRARY_PATH").unwrap_or_default()
         };
         let sep = if cfg!(windows) { ";" } else { ":" };
         let lib_path_val = if lib_path_env.is_empty() {
@@ -2500,6 +2661,9 @@ impl SharedVm {
             __boot_t2.elapsed(),
             native_methods.len(),
         );
+        let bootstrap_phase = bootstrap_phase
+            .natives_ready(native_methods.len())
+            .expect("bootstrap NativesReady invariants");
 
         let vm = Self {
             vm_identity: NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed),
@@ -2596,6 +2760,8 @@ impl SharedVm {
                 oom_dump_written: std::sync::atomic::AtomicBool::new(false),
                 missing_natives_log: parking_lot::Mutex::new(Vec::new()),
                 flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
+                jfr_dump_on_exit: parking_lot::Mutex::new(None),
+                jcmd_processor: parking_lot::Mutex::new(None),
                 #[cfg(feature = "experimental-debug")]
                 debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
                 #[cfg(feature = "experimental-debug")]
@@ -2803,9 +2969,16 @@ impl SharedVm {
         // regression for every workload. The three phase lines above break the
         // total down; this line is what a `RUST_LOG=info` run can be grepped
         // for to compare two builds.
+        let typed_boot_elapsed = bootstrap_phase
+            .runtime_ready(
+                vm.classes.class_manager.read().loaded_count() > 0
+                    && vm.natives.native_methods.len() > 0,
+            )
+            .expect("bootstrap RuntimeReady invariants")
+            .finish();
         tracing::info!(
             "boot: SharedVm::new total {:?} (phase 1 classpath {:?}, phase 2 core classes {:?})",
-            __boot_t0.elapsed(),
+            typed_boot_elapsed,
             __boot_classpath_elapsed,
             __boot_core_classes_elapsed,
         );
@@ -3675,19 +3848,17 @@ impl SharedVm {
             }
         }
 
-        // Fire JVMTI ClassLoad event on successful load
+        // obsaudit D14 (2026-07-26): the hand-written real-env ClassLoad
+        // notification that used to live here was removed. It fired on
+        // every successful `Ok(class_id)` unconditionally — including a
+        // cache hit against an already-loaded class, which is not a new
+        // ClassLoad and should not re-fire one. ClassLoad now reaches the
+        // real env exactly once per class, from
+        // `JvmtiEventManager::fire_class_load`'s bridge (see
+        // `install_real_agent_env_bridge` in `runtime/jvmti.rs`), which is
+        // driven by `ClassManager::define_class_shared_with_options` and so
+        // only runs when the class is actually newly defined.
         if let Ok(class_id) = &result {
-            #[cfg(feature = "experimental-debug")]
-            {
-                let env = self.debug.jvmti_env.lock();
-                if env
-                    .event_manager
-                    .is_enabled(crate::jvmti::JvmtiEvent::ClassLoad)
-                {
-                    crate::jvmti::notify_class_load(&env, class_id.as_u32() as u64, name);
-                }
-            }
-
             // T5.4.4 — class hierarchy change invalidation.
             //
             // When a new class is loaded, any JIT-compiled method
@@ -4932,6 +5103,89 @@ impl Vm {
         // fixtures that build multiple Vms in-process) are silently
         // ignored, which matches the global vtable hook pattern.
         set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
+
+        // obsaudit D14 (2026-07-26): bridge `runtime::jvmti::JvmtiEventManager`
+        // (interpreter/GC/classloading-sourced events) to the real,
+        // native-agent-facing `shared.debug.jvmti_env` — see the notes above
+        // `install_real_agent_env_bridge` in `runtime/jvmti.rs`. Same `Weak`,
+        // idempotent, last-writer-wins shape as the two hooks just above.
+        crate::runtime::jvmti::install_real_agent_env_bridge(&shared);
+
+        // obsaudit D15 (2026-07-26) — open the real attach-API socket and
+        // register the *live* (real-VM-state-backed) jcmd command set. See
+        // the LIVENESS block and `AttachListener`'s doc comment in
+        // `runtime/serviceability.rs`: this must be `new_with_vm_state`,
+        // never the argument-less `JcmdProcessor::new()` (that one reports
+        // fabricated data for several commands). `shared.clone()` coerces
+        // to `Arc<dyn VmDiagnosticState>` via the `impl VmDiagnosticState
+        // for SharedVm` in this file.
+        *shared.debug.jcmd_processor.lock() = Some(
+            crate::runtime::serviceability::JcmdProcessor::new_with_vm_state(shared.clone()),
+        );
+
+        // obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording`. Before
+        // this, vm-cli never called `start_recording` (see the retracted
+        // claim this comment replaces), so `cratonvm_jfr::is_enabled()` was
+        // permanently false and the ~30 wired `emit_*` call sites never
+        // captured anything. `config.jfr_start_recording` is `None` unless
+        // the flag was passed, so this is a no-op — same cost as before —
+        // on every VM that doesn't request it.
+        if let Some(jfr_cfg) = shared.config.jfr_start_recording.clone() {
+            let mut settings = cratonvm_jfr::RecordingSettings::new("cratonvm");
+            settings.max_age = jfr_cfg.max_age;
+            settings.max_size = jfr_cfg.max_events;
+            settings.duration = jfr_cfg.duration;
+            settings.dump_on_exit = jfr_cfg.dump_on_exit;
+            let recording_id = {
+                let mut fr = shared.debug.flight_recorder.lock();
+                let id = fr.new_recording(settings);
+                fr.start_recording(id);
+                id
+            };
+            if jfr_cfg.dump_on_exit {
+                let filename = jfr_cfg.filename.clone().unwrap_or_else(|| {
+                    format!("./cratonvm-recording-{}.jfr", std::process::id())
+                });
+                *shared.debug.jfr_dump_on_exit.lock() = Some((recording_id, filename));
+            }
+            // obsaudit D12 — the reclamation half of the fix. Before this,
+            // `ThreadRingRegistry::reclaim_retired_shards` only ran from
+            // inside `drain_all`, which only ran at dump time — harmless
+            // only because the disabled gate above kept ordinary threads
+            // from ever registering a shard. A recording that now actually
+            // runs continuously needs its per-thread rings drained
+            // periodically, both to keep events flowing into the
+            // repository (rather than only at final dump) and to let
+            // retired+empty shards from thread churn actually get
+            // reclaimed instead of accumulating in the registry `Vec` for
+            // the recording's whole lifetime. One drain per second is
+            // frequent enough that a 1024-capacity ring on a
+            // moderately-busy thread will not silently drop events
+            // between drains, and cheap enough (an empty repository drain
+            // is a handful of shard-list iterations) to run indefinitely.
+            let weak_shared = Arc::downgrade(&shared);
+            let duration = jfr_cfg.duration;
+            std::thread::Builder::new()
+                .name("JFR-Periodic-Drain".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let Some(shared) = weak_shared.upgrade() else {
+                            break; // VM torn down (e.g. an in-process test) — stop.
+                        };
+                        let mut fr = shared.debug.flight_recorder.lock();
+                        fr.drain_per_thread_into_repository();
+                        if let Some(d) = duration {
+                            if started.elapsed() >= d {
+                                fr.stop_recording(recording_id);
+                                break;
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
 
         // KC16-watchdog: install the wait-site frame dumper so a thread
         // parked in `Object.wait()` (e.g. AsyncFutureTask.await) can emit

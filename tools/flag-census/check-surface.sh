@@ -21,6 +21,10 @@ set -uo pipefail
 ROOT="${1:-$(cd "$(dirname "$0")/../.." && pwd)}"
 FIXTURE="$ROOT/types/tests/flag-surface.txt"
 INVENTORY="$ROOT/types/src/flag_groups.rs"
+CARGO_BIN="${CARGO:-$(command -v cargo 2>/dev/null || true)}"
+if [ -z "$CARGO_BIN" ] && [ -x "$HOME/.cargo/bin/cargo" ]; then
+  CARGO_BIN="$HOME/.cargo/bin/cargo"
+fi
 
 CRATES="reader types native-api native-collections native-io native-builtins
         native-awt jit-api jit jit-cuda cuda-bridge classloading craton-gpu gc
@@ -84,11 +88,32 @@ if [ -n "$bogus" ]; then
 fi
 
 # ── 3. the fixture and the inventory agree ──────────────────────────────────
-if ! (cd "$ROOT" && cargo test -q -p cratonvm-types --test flag_surface >/dev/null 2>&1); then
+if [ -z "$CARGO_BIN" ] ||
+   ! (cd "$ROOT" && "$CARGO_BIN" test -q -p cratonvm-types --test flag_surface >/dev/null 2>&1); then
   fail=1
   echo "error: types/tests/flag_surface.rs fails — the inventory and"
   echo "       types/tests/flag-surface.txt disagree. Run it for the diff:"
   echo "         cargo test -p cratonvm-types --test flag_surface"
+fi
+
+# ── 4. core runtime crates do not bypass the immutable config boundary ──────
+#
+# Non-CratonVM values still have live `std::env` semantics, but they must enter
+# through `flags::runtime_var[_os]`. That function distinguishes declared VM
+# flags (one immutable snapshot) from application/OS variables (live reads).
+CORE_RUNTIME="reader types vm jit gc classloading native-api native-builtins native-collections"
+bypasses=$(
+  for c in $CORE_RUNTIME; do
+    [ -d "$ROOT/$c/src" ] || continue
+    grep -RnE 'std::env::var(_os)?[[:space:]]*\(' --include='*.rs' "$ROOT/$c/src" 2>/dev/null
+  done | grep -v "^$ROOT/types/src/flags.rs:"
+)
+if [ -n "$bypasses" ]; then
+  fail=1
+  echo "error: core runtime code bypasses cratonvm_types::flags::runtime_var[_os]."
+  echo "       VM flags must use the immutable snapshot; ordinary OS/application"
+  echo "       variables retain live-read semantics through the same boundary:"
+  echo "$bypasses" | sed 's/^/         /'
 fi
 
 if [ "$fail" -eq 0 ]; then

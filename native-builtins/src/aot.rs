@@ -268,7 +268,7 @@ impl AotCache {
     /// variable is unset or empty (callers then fall back to a bare SHA-256
     /// content digest).
     fn integrity_key() -> Option<Vec<u8>> {
-        match std::env::var(Self::INTEGRITY_KEY_ENV) {
+        match cratonvm_types::flags::runtime_var(Self::INTEGRITY_KEY_ENV) {
             Ok(k) if !k.is_empty() => Some(k.into_bytes()),
             _ => None,
         }
@@ -1520,6 +1520,8 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod aot_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 

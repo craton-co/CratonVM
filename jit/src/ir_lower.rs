@@ -224,6 +224,9 @@ struct Lowerer<'a> {
     /// instance-field reads route through it so receivers are validated against
     /// the live heap before any object-header dereference.
     getfield: usize,
+    /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
+    /// nodes use the same shared runtime-lowering stub as the baseline tier.
+    new_object: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -282,6 +285,9 @@ struct Lowerer<'a> {
     /// caches. 6 args: `(vm_ptr, info_ptr, args_ptr, num_args, mic, pic)`.
     /// 0 ⇒ no IC site may be planned (the planner checks the same field).
     invoke_virtual_mic: usize,
+    /// Shared post-call frame publication used by direct and hashed dispatch
+    /// stubs. Zero when precise frame tracking is unavailable.
+    frame_record: usize,
     /// wire-tiered-manager Step 4 (PGO handoff C1 → C2): per-bytecode-PC branch
     /// bias, keyed by the conditional-branch instruction's bytecode PC (the same
     /// key the IR builder stamps on each `Op::If` via `Node::bytecode_pc`). Value
@@ -327,6 +333,9 @@ impl<'a> Lowerer<'a> {
                 needs_context = true;
             }
             if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
+                needs_context = true;
+            }
+            if matches!(n.op, Op::New { .. }) {
                 needs_context = true;
             }
         }
@@ -402,6 +411,7 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
+            new_object: helpers.new_object,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -413,6 +423,7 @@ impl<'a> Lowerer<'a> {
             direct_calls,
             ic_slots,
             invoke_virtual_mic: helpers.invoke_virtual_mic,
+            frame_record: helpers.frame_record,
             branch_hints,
             sr_map,
         }
@@ -456,7 +467,7 @@ impl<'a> Lowerer<'a> {
         let s = self.node_slot[id as usize];
         if s == 0 {
             self.unallocated_slot_use.set(true);
-            if std::env::var_os("CRATONVM_DBG_IRSLOT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
                 let n = &self.graph.nodes[id as usize];
                 eprintln!(
                     "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
@@ -615,7 +626,7 @@ impl<'a> Lowerer<'a> {
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
     fn emit_safepoint_poll(&mut self) {
-        let enabled = std::env::var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
+        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
             .and_then(|v| v.into_string().ok())
             .is_none_or(|v| v != "0");
         if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
@@ -629,9 +640,9 @@ impl<'a> Lowerer<'a> {
         self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         let rel = self.buf.pos() as i32 - (clear_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(clear_patch, rel)
-            .expect("IR safepoint poll patch in-bounds");
+        // IR safepoint poll -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, clear_patch, rel);
     }
 
     /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
@@ -1005,9 +1016,9 @@ impl<'a> Lowerer<'a> {
             self.call_exc_patches.push(patch);
         }
         let rel = self.buf.pos() as i32 - (fast_skip_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(fast_skip_patch, rel)
-            .expect("ir_lower self-call stack-sample patch in-bounds");
+        // ir_lower self-call stack-sample -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, fast_skip_patch, rel);
 
         // Marshal args into this method's OWN entry ABI — IDENTICAL to the
         // register list `emit_prologue` reads incoming args from: abi[0] = the
@@ -1050,9 +1061,9 @@ impl<'a> Lowerer<'a> {
         // .keep:
         let keep_off = self.buf.pos();
         let rel = keep_off as i32 - (keep_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(keep_patch, rel)
-            .expect("ir_lower self-call sentinel keep patch in-bounds");
+        // ir_lower self-call sentinel keep -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, keep_patch, rel);
         // Spill the return value.
         self.store_rax(slot);
     }
@@ -1161,17 +1172,22 @@ impl<'a> Lowerer<'a> {
         let _ = self.buf.try_patch_i32(patch, rel);
     }
 
-    /// Marshal a call's arguments into the compiled-callee entry ABI
-    /// ([`ENTRY_ABI_REGS`]) with the hidden VM context pointer in `abi[0]`.
+    /// Marshal a cache hit into the compiled-callee entry ABI.
     ///
-    /// Shared by every inline-cache hit path. Both the MIC and the PIC gate on
-    /// their cached `needs_context` byte before reaching here, so the context
-    /// pointer is always the right ABI shape for the cached target.
-    fn emit_ic_abi_marshal(&mut self, inputs: &[NodeId], num_args: usize) {
-        self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
+    /// Context-using artifacts receive the hidden VM pointer in `abi[0]`;
+    /// context-free artifacts receive Java arg0 there. Inline caches retain the
+    /// callee's ABI bit, so both shapes can use the cache instead of forcing
+    /// context-free methods back through the resolving helper.
+    fn emit_ic_abi_marshal(&mut self, inputs: &[NodeId], num_args: usize, needs_context: bool) {
+        let base = if needs_context {
+            self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
+            1
+        } else {
+            0
+        };
         for i in 0..num_args {
             let arg = inputs[2 + i];
-            self.load_reg_from_frame(ENTRY_ABI_REGS[1 + i], self.slot_of(arg));
+            self.load_reg_from_frame(ENTRY_ABI_REGS[base + i], self.slot_of(arg));
         }
     }
 
@@ -1186,12 +1202,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `CMP BYTE [R10 + disp], 0` — the cached-`needs_context` gate. A cached
-    /// target that does NOT take the VM pointer cannot be reached with this ABI
-    /// marshalling, so such an entry falls through to the helper.
+    /// `CMP BYTE [R10 + disp], 0` — selects the cached target's entry ABI.
     fn emit_cmp_byte_r10_disp_zero(&mut self, disp: u8) {
         // REX.B + 80 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
         self.buf.emit(&[0x41, 0x80, 0x7A, disp, 0x00]);
+    }
+
+    /// `CMP QWORD [R10 + disp], 0` — rejects a profile-seeded cache
+    /// entry whose class id is known but whose compiled target is not yet
+    /// installed.
+    fn emit_cmp_qword_r10_disp_zero(&mut self, disp: u8) {
+        // REX.W+B + 83 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
+        self.buf.emit(&[0x49, 0x83, 0x7A, disp, 0x00]);
     }
 
     /// `MOV R11, qword [R10 + disp] ; CALL R11` — the cached-entry indirect
@@ -1214,7 +1236,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// IR inline-cache lowering — serve a virtual / interface `Op::Call` from a
-    /// monomorphic (`JitMICSlot`) guard, then a 3-way polymorphic
+    /// monomorphic (`JitMICSlot`) guard, then a 4-way polymorphic
     /// (`JitPICSlot`) cascade, then the resolving `jit_invoke_virtual_mic`
     /// helper. This is the IR analogue of the single-pass backend's MIC/PIC
     /// codegen in `x64.rs`.
@@ -1241,15 +1263,19 @@ impl<'a> Lowerer<'a> {
     ///   ; ── monomorphic ──
     ///   MOV  R10, imm64 mic
     ///   CMP  EAX, [R10 + CACHED_CLASS_ID_OFFSET]     ; JNE .pic
-    ///   CMP  BYTE [R10 + CACHED_NEEDS_CONTEXT], 0    ; JE  .pic
-    ///   <marshal entry ABI> ; MOV R11,[R10+8] ; CALL R11 ; JMP .done
-    ///   ; ── polymorphic, 3-way ──
+    ///   CMP  BYTE [R10 + CACHED_NEEDS_CONTEXT], 0    ; JE  .mic_noctx
+    ///   <marshal context ABI> ; JMP .mic_call
+    /// .mic_noctx: <marshal context-free ABI>
+    /// .mic_call: MOV R11,[R10+8] ; CALL R11 ; JMP .done
+    ///   ; ── polymorphic, 4-way ──
     /// .pic:
     ///   MOV  R10, imm64 pic
-    ///   for i in 0..3:
+    ///   for i in 0..4:
     ///     CMP EAX, [R10+CLASS_ID_OFFSETS[i]]  ; JNE .pic_{i+1} (last: .slow)
-    ///     CMP BYTE [R10+NEEDS_CONTEXT[i]], 0  ; JE  .slow
-    ///     <marshal> ; MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11 ; JMP .done
+    ///     CMP BYTE [R10+NEEDS_CONTEXT[i]], 0  ; JE  .entry_noctx
+    ///     <marshal context ABI> ; JMP .entry_call
+    ///   .entry_noctx: <marshal context-free ABI>
+    ///   .entry_call: MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11 ; JMP .done
     ///   ; ── megamorphic / cold ──
     /// .slow:
     ///   <marshal args into the frame staging region>
@@ -1320,16 +1346,21 @@ impl<'a> Lowerer<'a> {
         self.emit_mov_reg_imm64(R10, mic as u64);
         self.emit_cmp_eax_r10_disp(JitMICSlot::CACHED_CLASS_ID_OFFSET as u8);
         let mic_miss = self.emit_jcc_rel32(0x85); // JNE .pic
+        self.emit_cmp_qword_r10_disp_zero(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
         self.emit_cmp_byte_r10_disp_zero(JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8);
-        let mic_noctx = self.emit_jcc_rel32(0x84); // JE .pic
-        self.emit_ic_abi_marshal(inputs, num_args);
+        let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
+        self.emit_ic_abi_marshal(inputs, num_args, true);
+        let mic_call = self.emit_jmp_rel32();
+        self.patch_rel32_to_here(mic_noctx);
+        self.emit_ic_abi_marshal(inputs, num_args, false);
+        self.patch_rel32_to_here(mic_call);
         self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
         done_patches.push(self.emit_jmp_rel32());
 
-        // ── Polymorphic 3-way cascade ───────────────────────────────
+        // ── Polymorphic 4-way cascade ───────────────────────────────
         // .pic:
         self.patch_rel32_to_here(mic_miss);
-        self.patch_rel32_to_here(mic_noctx);
         self.emit_mov_reg_imm64(R10, pic as u64);
         let mut next_entry: Option<usize> = None;
         for i in 0..JIT_PIC_ENTRIES {
@@ -1343,19 +1374,34 @@ impl<'a> Lowerer<'a> {
             } else {
                 next_entry = Some(miss);
             }
-            self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
+            self.emit_cmp_qword_r10_disp_zero(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
-            self.emit_ic_abi_marshal(inputs, num_args);
+            self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
+            let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
+            self.emit_ic_abi_marshal(inputs, num_args, true);
+            let call = self.emit_jmp_rel32();
+            self.patch_rel32_to_here(noctx);
+            self.emit_ic_abi_marshal(inputs, num_args, false);
+            self.patch_rel32_to_here(call);
             self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             done_patches.push(self.emit_jmp_rel32());
         }
         debug_assert!(next_entry.is_none());
 
-        // ── Slow path: the resolving + cache-populating helper ──────
-        // .slow:
+        // ── Shared compact hashed/vtable stub ─────────────────────────────
         for p in slow_patches {
             self.patch_rel32_to_here(p);
         }
+        let arg_offsets: Vec<i32> = (0..num_args).map(|i| self.slot_of(inputs[2 + i])).collect();
+        done_patches.extend(crate::runtime_lowering::emit_hashed_vtable_stub(
+            &mut self.buf,
+            pic,
+            self.context_slot_off,
+            &arg_offsets,
+            self.frame_record,
+        ));
+
+        // ── Slow path: the resolving + cache-populating helper ────────────
         // Args 1..4 use the same ABI as `jit_invoke_dispatch`, so the staging
         // marshalling is identical to the generic path below.
         for i in 0..num_args {
@@ -1435,9 +1481,9 @@ impl<'a> Lowerer<'a> {
             // .keep: patch the JNE above to land here.
             let keep_off = self.buf.pos();
             let rel = keep_off as i32 - (keep_patch as i32 + 4);
-            self.buf
-                .try_patch_i32(keep_patch, rel)
-                .expect("ir_lower call-sentinel keep patch in-bounds");
+            // ir_lower call-sentinel keep -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, keep_patch, rel);
         } else {
             self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
             let patch = self.buf.pos();
@@ -1454,9 +1500,9 @@ impl<'a> Lowerer<'a> {
         for p in patches {
             // rel32 = target - (rel32_field_offset + 4); target = entry = 0.
             let rel = 0i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("ir_lower self-call rel32 patch in-bounds");
+            // ir_lower self-call rel32 -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, p, rel);
         }
     }
 
@@ -1636,6 +1682,40 @@ impl<'a> Lowerer<'a> {
                 // MOV RAX, RDX
                 self.buf.emit(&[0x48, 0x89, 0xD0]);
                 self.patch_div_overflow_after(ovf_after);
+                self.store_rax(slot);
+            }
+            Op::New {
+                class_id,
+                num_fields,
+            } => {
+                let slot = self.alloc_slot(id);
+                crate::runtime_lowering::emit_new_object_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    self.new_object,
+                    *class_id,
+                    *num_fields,
+                    self.frame_record,
+                );
+
+                // `jit_new_object` returns null after publishing a pending
+                // initialization/OOM exception. Convert that private sentinel
+                // to the JIT-wide i64::MIN return before entering the shared
+                // exception epilogue, matching the baseline tier.
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+                self.buf.emit(&[0x0F, 0x85]); // JNZ allocated
+                let allocated_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+                let allocated = self.buf.pos();
+                let rel = allocated as i32 - (allocated_patch as i32 + 4);
+                // allocation success -- tolerated on an overflowed buffer; see
+                // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                Self::patch_or_bail(&mut self.buf, allocated_patch, rel);
                 self.store_rax(slot);
             }
             Op::Neg => {
@@ -1882,9 +1962,9 @@ impl<'a> Lowerer<'a> {
                 // continue: patch the JNZ to here (fall-through past the deopt).
                 let cont = self.buf.pos();
                 let rel = cont as i32 - (jnz_patch as i32 + 4);
-                self.buf
-                    .try_patch_i32(jnz_patch, rel)
-                    .expect("guard JNZ patch in-bounds");
+                // guard JNZ -- tolerated on an overflowed buffer; see
+                // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                Self::patch_or_bail(&mut self.buf, jnz_patch, rel);
             }
             // getfield read — `Op::Load`. The IR builder emits only
             // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
@@ -2103,9 +2183,7 @@ impl<'a> Lowerer<'a> {
                 // stack-argument path — so an over-wide site falls through to
                 // the unchanged helper dispatch below. `lower_data_node` has no
                 // post-`match` code, so an early `return` fully handles the node.
-                if let Some(&(mic, pic)) =
-                    node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc))
-                {
+                if let Some(&(mic, pic)) = node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc)) {
                     if mic != 0
                         && pic != 0
                         && self.invoke_virtual_mic != 0
@@ -2329,9 +2407,9 @@ impl<'a> Lowerer<'a> {
                         // around_first: the jumped-to edge. Patch the Jcc here.
                         let around_first = self.buf.pos();
                         let rel = around_first as i32 - (jcc_patch as i32 + 4);
-                        self.buf
-                            .try_patch_i32(jcc_patch, rel)
-                            .expect("codegen patch in-bounds");
+                        // codegen -- tolerated on an overflowed buffer; see
+                        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                        Self::patch_or_bail(&mut self.buf, jcc_patch, rel);
                         self.emit_phi_copies(block_idx, second_block);
                         self.buf.emit_byte(0xE9); // JMP second_block
                         let jmp_second = self.buf.pos();
@@ -2359,9 +2437,9 @@ impl<'a> Lowerer<'a> {
         for &(patch_pos, target_block) in &self.branch_patches {
             let target_offset = self.block_offsets[target_block];
             let rel32 = target_offset as i32 - (patch_pos as i32 + 4);
-            self.buf
-                .try_patch_i32(patch_pos, rel32)
-                .expect("codegen patch in-bounds");
+            // codegen -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, patch_pos, rel32);
         }
     }
 
@@ -2555,9 +2633,9 @@ impl<'a> Lowerer<'a> {
         let do_div = self.buf.pos();
         for p in [jne1, jne2] {
             let rel = do_div as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("div-overflow JNE patch in-bounds");
+            // div-overflow JNE -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, p, rel);
         }
         after_patch
     }
@@ -2568,9 +2646,9 @@ impl<'a> Lowerer<'a> {
     fn patch_div_overflow_after(&mut self, after_patch: usize) {
         let cont = self.buf.pos();
         let rel = cont as i32 - (after_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(after_patch, rel)
-            .expect("div-overflow JMP patch in-bounds");
+        // div-overflow JMP -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, after_patch, rel);
     }
 
     /// Emit a deopt-on-zero branch, given the caller has already emitted a
@@ -2620,9 +2698,9 @@ impl<'a> Lowerer<'a> {
         // continue:
         let cont = self.buf.pos();
         let rel = cont as i32 - (jcc_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(jcc_patch, rel)
-            .expect("deopt-unless Jcc patch in-bounds");
+        // deopt-unless Jcc -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, jcc_patch, rel);
     }
 
     /// IR FP tier (Slice B) — emit the JVMS null + bounds deopt guards for an
@@ -2674,10 +2752,42 @@ impl<'a> Lowerer<'a> {
         let patches = std::mem::take(&mut self.deopt_stub_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("deopt JMP patch in-bounds");
+            if !Self::patch_or_bail(&mut self.buf, p, rel) {
+                break;
+            }
         }
+    }
+
+    /// Patch one stub-relative `rel32`, tolerating an overflowed buffer.
+    ///
+    /// Returns `false` once the patch could not be applied.
+    /// [`ExecutableBuffer::try_patch_i32`] reports that ONLY by marking the
+    /// buffer overflowed, and an overflowed buffer makes `lower_inner`
+    /// discard the whole `CompiledMethod` and fall back to the single-pass
+    /// backend -- so the error is genuinely ignorable here, exactly as
+    /// `try_patch_i32`'s own contract says ("the caller may ignore the `Err`
+    /// and rely on that bail") and as `patch_rel32_to_here` already does.
+    ///
+    /// It must NOT be an `expect`. `emit_deopt_stub` / `emit_call_exc_stub`
+    /// run BEFORE that bail-out, on a VM thread with no unwinding catch, so a
+    /// body that outgrew its estimated buffer aborted the whole process
+    /// instead of falling back. Real repro (2026-07-27): parsing Groovy
+    /// source through `GroovyClassLoader.parseClass` panicked with
+    /// `call-exc JE patch in-bounds: PatchFailed { kind: "i32", offset: 4125 }`
+    /// -- offset == the emitted length, i.e. the branch's own rel32
+    /// placeholder had already been dropped by the sticky-overflow `emit` --
+    /// and took the VM down with `fatal runtime error: failed to initiate
+    /// panic`. The identical run under `--nojit` is clean.
+    fn patch_or_bail(buf: &mut ExecutableBuffer, offset: usize, rel: i32) -> bool {
+        if buf.try_patch_i32(offset, rel).is_err() {
+            debug_assert!(
+                buf.overflowed(),
+                "try_patch_i32 must mark the buffer overflowed when it fails, \
+                 so that lower_inner discards this compile"
+            );
+            return false;
+        }
+        true
     }
 
     /// Gap B: emit the single shared call-exception bail stub (if any `Op::Call`
@@ -2698,9 +2808,9 @@ impl<'a> Lowerer<'a> {
         let patches = std::mem::take(&mut self.call_exc_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("call-exc JE patch in-bounds");
+            if !Self::patch_or_bail(&mut self.buf, p, rel) {
+                break;
+            }
         }
     }
 
@@ -2720,7 +2830,7 @@ impl<'a> Lowerer<'a> {
         // exactly the historical `frame_value_for` mapping (byte-identical).
         if let Some(sr) = self.sr_map {
             let deopt_block = self.deopt_block_for_bci(sp.bci);
-            if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
                 let matches: Vec<NodeId> = sp
                     .locals
                     .iter()
@@ -2823,7 +2933,7 @@ impl<'a> Lowerer<'a> {
         sr: &ScalarReplacementMap,
         emitted: &mut std::collections::HashSet<NodeId>,
     ) -> FrameValue {
-        let dbg = std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
+        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
         let info = match sr.objects.get(&new_id) {
             Some(i) => i,
             None => return FrameValue::Undefined,
@@ -2900,7 +3010,7 @@ impl<'a> Lowerer<'a> {
             field_values.push(fv);
         }
         emitted.insert(new_id);
-        if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
             eprintln!(
                 "[DBG_SCALAR_DEOPT] emit VirtualObject (new {new_id}, class_id {}, {} field(s)) at deopt block {db}",
                 info.class_id, info.num_fields
@@ -3069,9 +3179,21 @@ pub(crate) fn lower_inner(
     // site keeps the historical helper dispatch.
     ic_slots: &HashMap<usize, (usize, usize)>,
 ) -> Option<CompiledMethod> {
+    // A live object allocation is now supported by the common allocation
+    // stub. A zero helper pointer is only possible in synthetic unit-test
+    // tables; reject it instead of emitting a call through address zero.
+    if helpers.new_object == 0
+        && graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, Op::New { .. }))
+    {
+        return None;
+    }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
-    // MIC + 3-way-PIC inline-cache site emits ~250 and a direct call ~60. With
+    // MIC + 4-way-PIC dual-ABI inline-cache site emits ~360 and a direct call
+    // ~60. With
     // `ir_compatible`'s invoke budget raised to `ir::IR_MAX_INVOKES`,
     // under-estimating here would silently TRUNCATE the body —
     // `ExecutableBuffer::emit` sets a sticky `overflowed` flag and skips the
@@ -3086,7 +3208,7 @@ pub(crate) fn lower_inner(
         .nodes
         .len()
         .saturating_mul(32)
-        .saturating_add(call_nodes.saturating_mul(320))
+        .saturating_add(call_nodes.saturating_mul(448))
         .saturating_add(1024);
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
@@ -3220,6 +3342,97 @@ mod tests {
     }
 
     #[test]
+    fn live_new_uses_shared_allocation_stub_and_context_abi() {
+        extern "C" fn allocate(vm: i64, class_id: i64, num_fields: i64) -> i64 {
+            vm + class_id * 100 + num_fields
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let allocation = graph.add(
+            Op::New {
+                class_id: 23,
+                num_fields: 7,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            Some(0),
+        );
+        graph.exit = graph.add(
+            Op::Return,
+            IrType::Void,
+            vec![ctrl, allocation],
+            Some(3),
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.new_object = allocate as *const () as usize;
+        let compiled =
+            lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation must lower");
+        assert!(compiled.needs_context);
+        // SAFETY: the synthetic helper treats the context as an integer and the
+        // generated method has no Java arguments.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(11, &[])
+                .expect("allocation call")
+        };
+        assert_eq!(result, 11 + 23 * 100 + 7);
+    }
+
+    #[test]
+    fn live_new_converts_null_failure_to_jit_exception_sentinel() {
+        extern "C" fn fail(_: i64, _: i64, _: i64) -> i64 {
+            0
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let allocation = graph.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            Some(0),
+        );
+        graph.exit = graph.add(
+            Op::Return,
+            IrType::Void,
+            vec![ctrl, allocation],
+            Some(3),
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.new_object = fail as *const () as usize;
+        let compiled = lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation");
+        // SAFETY: helper ignores the synthetic context.
+        assert_eq!(
+            unsafe { compiled.try_call_with_context(1, &[]) },
+            Ok(i64::MIN)
+        );
+    }
+
+    #[test]
     fn cooperative_poll_runs_in_a_pure_ir_method() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3314,7 +3527,7 @@ mod tests {
             num_jit_args: 2, // receiver + one int
             return_type: b'I',
             invoke_kind: 0, // virtual
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let info_ptr = info as *const JitInvokeInfo as usize;
 
@@ -3383,11 +3596,11 @@ mod tests {
             contains_seq(&code, &PIC.to_le_bytes()),
             "the PIC slot address must be baked into the cascade"
         );
-        // One MIC entry + three PIC entries = four `CALL R11` cached-entry calls.
+        // MIC + four PIC entries + two hashed ways all call via R11.
         assert_eq!(
             count_seq(&code, &[0x41, 0xFF, 0xD3]),
-            1 + crate::JIT_PIC_ENTRIES,
-            "one cached-entry CALL R11 per inline-cache entry (MIC + 3-way PIC)"
+            1 + crate::JIT_PIC_ENTRIES + crate::JIT_MEGA_WAYS,
+            "one cached-entry CALL R11 per MIC/PIC entry plus the two hashed ways"
         );
         // The miss path resolves AND populates via `jit_invoke_virtual_mic`.
         assert!(
@@ -3432,6 +3645,19 @@ mod tests {
             &code,
             &[0x4D, 0x8B, 0x5A, JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8]
         ));
+        assert!(
+            contains_seq(
+                &code,
+                &[
+                    0x49,
+                    0x83,
+                    0x7A,
+                    JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8,
+                    0x00
+                ]
+            ),
+            "a class-only profiled MIC seed must miss until entry_ptr is populated"
+        );
 
         // PIC: one guard + one needs-context gate + one entry load per entry.
         for i in 0..crate::JIT_PIC_ENTRIES {
@@ -3447,7 +3673,13 @@ mod tests {
             assert!(
                 contains_seq(
                     &code,
-                    &[0x41, 0x80, 0x7A, JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8, 0x00]
+                    &[
+                        0x41,
+                        0x80,
+                        0x7A,
+                        JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8,
+                        0x00
+                    ]
                 ),
                 "PIC entry {i} needs-context gate must be emitted"
             );
@@ -3457,6 +3689,19 @@ mod tests {
                     &[0x4D, 0x8B, 0x5A, JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8]
                 ),
                 "PIC entry {i} cached-entry load must be emitted"
+            );
+            assert!(
+                contains_seq(
+                    &code,
+                    &[
+                        0x49,
+                        0x83,
+                        0x7A,
+                        JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8,
+                        0x00
+                    ]
+                ),
+                "PIC entry {i} must reject a class-only profile seed"
             );
         }
     }
