@@ -2132,8 +2132,16 @@ mod tests {
         assert_eq!(get_date_millis(&ctx, date_obj), 30_000);
     }
 
+    /// `Date(String)` used to be a hard `UnsupportedOperationException` stub.
+    /// It now mirrors the real JDK (`this(parse(s))`) by delegating to
+    /// `Date.parse`, which has no native override and runs as real bytecode --
+    /// so under the mock context, which cannot dispatch that call, the
+    /// constructor must surface the delegation failure rather than the old
+    /// "deprecated and not supported" refusal. What this test pins is that the
+    /// refusal is gone; the end-to-end behaviour is covered by
+    /// `probes/MiscProbe.java` against a real JDK image.
     #[test]
-    fn test_date_init_string_throws() {
+    fn test_date_init_string_no_longer_refuses() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
         let date_obj = alloc_concurrent_synthetic(&mut ctx, "java/util/Date", 4);
@@ -2147,14 +2155,13 @@ mod tests {
             "(Ljava/lang/String;)V",
             &[Value::Object(Some(date_obj)), Value::Object(Some(str_obj))],
         );
+        let msg = match res {
+            Ok(_) => String::new(),
+            Err(err) => format!("{err}"),
+        };
         assert!(
-            res.is_err(),
-            "Date(String) must throw UnsupportedOperationException"
-        );
-        let msg = format!("{}", res.unwrap_err());
-        assert!(
-            msg.contains("UnsupportedOperationException") || msg.contains("deprecated"),
-            "Expected UnsupportedOperationException, got: {msg}"
+            !msg.contains("deprecated and not supported"),
+            "Date(String) must no longer refuse outright, got: {msg}"
         );
     }
 
