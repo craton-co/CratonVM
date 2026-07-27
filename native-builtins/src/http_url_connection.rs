@@ -694,8 +694,8 @@ fn huc_real_perform(
             Ok(p) => p,
             Err(_) => return Ok(-1),
         };
-        let established_https_stream = if parsed.scheme == "https" {
-            huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
+        let tls_restrictions = if parsed.scheme == "https" {
+            huc_client_tls_restrictions(ctx, &parsed.host, parsed.port)?
         } else {
             None
         };
@@ -708,7 +708,7 @@ fn huc_real_perform(
             &body,
             connect_to,
             read_to,
-            established_https_stream,
+            tls_restrictions.as_ref(),
         );
         match resp {
             Ok((status, headers, resp_body))
@@ -1500,146 +1500,112 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
     }
 }
 
-/// FIX (client-cipher-restriction): a thin `Read`/`Write` adapter over a
-/// rustls client stream id already registered in `t27_tls`'s server registry
-/// (`s2_tls_read`/`s2_tls_write` dispatch on `id >= RUSTLS_SOCK_ID_BASE`,
-/// which is exactly the id shape `SSLSocketFactory.createSocket`/
-/// `SSLSocket.setEnabledCipherSuites` (net_phase_e.rs) produce). Lets
-/// `perform` drive its existing request-write / `read_response` logic over a
-/// connection established by a real up-call to a caller-installed
-/// `SSLSocketFactory`, instead of only over its own locally-owned
-/// `StreamOwned`.
-struct RustlsIdStream(i32);
+/// The client-side TLS policy a caller-installed `SSLSocketFactory` would
+/// impose on this request: `(enabled cipher suites, enabled protocols)`,
+/// each empty when that dimension is unrestricted.
+pub(crate) type ClientTlsRestrictions = (Vec<String>, Vec<String>);
 
-impl Read for RustlsIdStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        crate::servlet::s2_tls_read(self.0, buf)
-    }
-}
-
-impl Write for RustlsIdStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        crate::servlet::s2_tls_write(self.0, buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// FIX (client-cipher-restriction): if a real (non-placeholder) default
-/// `SSLSocketFactory` is currently installed via
-/// `HttpsURLConnection.setDefaultSSLSocketFactory`, up-call its real
-/// `createSocket(host, port)` — genuine Java bytecode, so any override (e.g.
-/// Tomcat's `TesterSupport.ClientSSLSocketFactory`, which applies
-/// `setEnabledCipherSuites` right after creating the socket) actually runs —
-/// and return the resulting socket's backing stream id for `perform` to use.
+/// FIX (tls-handshake-enforcement-gap, doc 21): discover the TLS restrictions
+/// the currently-installed default `SSLSocketFactory` applies, by up-calling
+/// its real `createSocket(host, port)` in PROBE mode (see
+/// `net_phase_e::set_huc_factory_probe_mode`).
 ///
-/// Reads the real JDK static field directly (`HttpsURLConnection
-/// .defaultSSLSocketFactory`) rather than caching the factory at
-/// `setDefaultSSLSocketFactory` call time: that setter is real (non-native)
-/// JDK bytecode that the interpreter's native-override-priority rules let
-/// win over any registered native, so a native `setDefaultSSLSocketFactory`
-/// override never actually fires — reading the field it populates avoids
-/// depending on a call that doesn't happen.
+/// Why a probe rather than using the up-called socket directly: real JSSE
+/// runs every `HttpsURLConnection` request over the installed factory's
+/// socket, but CratonVM's native `HttpURLConnection` owns its own rustls
+/// connection, and only THAT connection has the full client feature set —
+/// synchronous Java `KeyManager.chooseClientAlias` consultation for mTLS,
+/// the captured per-`SSLContext` trust roots, and the shared TLS-ticket
+/// cache. Handing `perform` a socket built by `SSLSocketFactory.createSocket`
+/// (which has none of those) silently traded a correct connection for an
+/// enforced restriction. Probing gets both: the factory's own Java code runs
+/// for real — so `setEnabledCipherSuites`/`setEnabledProtocols` overrides
+/// like Tomcat's `TesterSupport.ClientSSLSocketFactory` really are observed —
+/// while the single actual connection stays `perform`'s own.
 ///
-/// Returns `Ok(None)` (falls through to `perform`'s own internal connection)
-/// when no factory is installed, the installed factory is CratonVM's own
+/// It also removes the reason the previous up-call had to be narrowed to
+/// almost nothing: in probe mode `createSocket` performs NO TCP connect and
+/// NO handshake, so the re-entrant `invoke_virtual` can no longer reach the
+/// class-loading/vtable-install lock-ordering deadlock that a nested
+/// blocking connect once exposed (see this function's history in
+/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
+/// The old gate — "only up-call when the factory has a private `ciphers`
+/// field holding at least one rustls-mappable suite name" — was both
+/// test-helper-specific and, since the factory was never published to
+/// `HttpsURLConnection.defaultSSLSocketFactory` at all (see
+/// `t27_tls::publish_default_ssl_socket_factory`), unreachable in practice.
+///
+/// Returns `Ok(None)` — meaning `perform` connects exactly as before — when
+/// no factory is installed, when the installed factory is CratonVM's own
 /// synthetic placeholder (`SSLContext.getSocketFactory()`'s bare return
-/// value), or the factory has no active cipher restriction to apply (see
-/// below) — the common case for every caller that doesn't restrict cipher
-/// suites, which must see the same fast internal path as before this fix.
-///
-/// FIX (client-cipher-restriction, narrowed scope): an earlier version of
-/// this up-called unconditionally whenever ANY real factory subclass was
-/// installed — every one of the ~15 other Tomcat SSL test files that call
-/// `TesterSupport.configureClientSsl()` installs the exact same
-/// `ClientSSLSocketFactory` wrapper, even though only the cipher-restriction
-/// tests actually need real Java semantics for `createSocket`. Routing all
-/// of them through a real, re-entrant `invoke_virtual` up-call (instead of
-/// `perform`'s previously-exclusive internal connect) exposed at least one
-/// unrelated, pre-existing classloading/vtable-install lock-ordering
-/// deadlock (confirmed via gdb on `TestClientCert`'s first test — the
-/// baseline binary runs it cleanly) plus extra failures on
-/// `TestSSLHostConfigCompat` — regressions in VM-core locking code well
-/// outside this fix's scope to safely diagnose or repair. Narrowing the
-/// trigger to "the factory actually has a pending cipher restriction"
-/// confines the up-call — and everything it can newly expose — to exactly
-/// the 2 tests that need it (`TestSSLHostConfigCipher`'s TLS 1.3 cases),
-/// leaving every other caller on the untouched, previously-working path.
-/// `ciphers` is a real, private `String[]` field declared directly on
-/// Tomcat's `TesterSupport.ClientSSLSocketFactory` (set by
-/// `setCipher(String[])`, always called before
-/// `HttpsURLConnection.setDefaultSSLSocketFactory` in every existing
-/// caller) — reading it by name is test-helper-specific, not a general JSSE
-/// mechanism, but the general mechanism (a real `SSLSocketFactory` has no
-/// standard way to expose "sockets from me will restrict ciphers" before a
-/// socket is actually created) doesn't exist, and the up-call's regression
-/// risk is too broad to accept for callers that don't need it.
-///
-/// FIX (client-cipher-restriction, narrowed further): a non-null `ciphers`
-/// alone still wasn't narrow enough — `TestSSLHostConfigCompat`'s
-/// `testHost*With*Client` cases call `setCipher` directly with classic TLS
-/// 1.2 `TLS_DHE_RSA_*` names (same family as `TestSSLHostConfigCipher`'s
-/// unfixable DHE case — see `any_cipher_mappable`'s doc). Since rustls can't
-/// represent those suites in any crypto provider, `SSLSocket
-/// .setEnabledCipherSuites` already no-ops for them (nothing to enforce), so
-/// up-calling for these callers only pays the up-call's risk with zero
-/// enforcement benefit — it can't do anything a non-up-called connection
-/// couldn't already do. Checking mappability here, before deciding to
-/// up-call at all (not just inside the eventual `setEnabledCipherSuites`
-/// call), keeps DHE-restricted callers on the untouched original path.
-fn huc_upcall_create_socket_if_custom_factory(
+/// value, which has no Java code to run), or when the probe came back with
+/// no restriction at all.
+fn huc_client_tls_restrictions(
     ctx: &mut dyn NativeContext,
     host: &str,
     port: u16,
-) -> Result<Option<i32>, MethodCallFailed> {
-    let Some(cid) = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection") else {
-        return Ok(None);
-    };
-    let Some(idx) = ctx.static_field_index_by_name(cid, "defaultSSLSocketFactory") else {
-        return Ok(None);
-    };
-    let factory = match ctx.get_static_field(cid, idx) {
-        Value::Object(Some(f)) => f,
-        _ => return Ok(None),
-    };
-    let factory_class_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(factory))
-        .unwrap_or_default();
-    if factory_class_name == "javax/net/ssl/SSLSocketFactory" {
-        return Ok(None);
-    }
-    let ciphers_arr = match ctx.get_field_by_name(factory, "ciphers") {
-        Value::Object(Some(arr)) => arr,
-        _ => return Ok(None),
-    };
-    let mut ciphers: Vec<String> = Vec::new();
-    let len = ctx.array_length(ciphers_arr);
-    for i in 0..len {
-        if let Value::Object(Some(s)) = ctx.get_array_element(ciphers_arr, i) {
-            if let Some(t) = ctx.read_string(s) {
-                ciphers.push(t);
-            }
+) -> Result<Option<ClientTlsRestrictions>, MethodCallFailed> {
+    let dbg = crate::nbflags().dbg_tls_auth_ok;
+    // Read the factory from the GC-rooted native slot, NOT from the real JDK
+    // static field: writing that field does not stick on this VM (measured —
+    // see `t27_tls::huc_default_factory_slot`), which silently disabled this
+    // whole mechanism.
+    let Some(factory) = crate::t27_tls::huc_default_ssl_socket_factory() else {
+        if dbg {
+            eprintln!("[dbg-tls-auth] huc_client_tls_restrictions: no default factory installed");
         }
+        return Ok(None);
+    };
+    // Our own placeholder carrier has no overriding Java bytecode to run, so
+    // probing it can only ever come back empty. Compare by `ClassId` rather
+    // than by name: `alloc_concurrent_synthetic` documents that
+    // `class_name_of_id` can misreport an interface-like synthetic class
+    // (`SSLSocketFactory` is abstract) as `java/lang/Object`.
+    let placeholder_cid = ctx.class_id_by_name("javax/net/ssl/SSLSocketFactory");
+    let factory_cid = ctx.class_id_of_object(factory);
+    if dbg {
+        eprintln!(
+            "[dbg-tls-auth] huc_client_tls_restrictions: factory class={:?} placeholder={}",
+            ctx.class_name_of_id(factory_cid),
+            placeholder_cid == Some(factory_cid)
+        );
     }
-    if !crate::t27_tls::any_cipher_mappable(&ciphers) {
+    if placeholder_cid == Some(factory_cid) {
+        return Ok(None);
+    }
+    if ctx
+        .class_name_of_id(factory_cid)
+        .is_none_or(|n| n == "java/lang/Object" || n == "javax/net/ssl/SSLSocketFactory")
+    {
         return Ok(None);
     }
     let host_obj = ctx.create_string(host);
-    let socket = match ctx.invoke_virtual(
+    crate::net_phase_e::set_huc_factory_probe_mode(true);
+    let created = ctx.invoke_virtual(
         factory,
         "createSocket",
         "(Ljava/lang/String;I)Ljava/net/Socket;",
         &[Value::Object(Some(host_obj)), Value::Int(port as i32)],
-    )? {
+    );
+    crate::net_phase_e::set_huc_factory_probe_mode(false);
+    let socket = match created? {
         Some(Value::Object(Some(s))) => s,
         _ => return Ok(None),
     };
-    let stream_id = crate::net_phase_e::sock_stream_id_for_upcall(ctx, socket);
-    if stream_id < 0 {
+    let Some((ciphers, protocols)) = crate::net_phase_e::take_probe_restrictions(ctx, socket)
+    else {
+        return Ok(None);
+    };
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] huc_client_tls_restrictions host={host} -> ciphers={ciphers:?} \
+             protocols={protocols:?}"
+        );
+    }
+    if ciphers.is_empty() && protocols.is_empty() {
         return Ok(None);
     }
-    Ok(Some(stream_id))
+    Ok(Some((ciphers, protocols)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1827,7 +1793,7 @@ fn perform(
     body: &[u8],
     connect_timeout: Duration,
     read_timeout: Duration,
-    established_https_stream_id: Option<i32>,
+    tls_restrictions: Option<&ClientTlsRestrictions>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let head = method.eq_ignore_ascii_case("HEAD");
     let req = build_request(method, parsed, headers, body);
@@ -1837,8 +1803,7 @@ fn perform(
     // peek, write, or the bounded first-read — is treated exactly like a
     // pool miss, falling straight through to the ordinary fresh-connect path
     // below with no error surfaced to the caller.
-    let poolable_key = (established_https_stream_id.is_none() && parsed.scheme == "http")
-        .then(|| (parsed.host.clone(), parsed.port));
+    let poolable_key = (parsed.scheme == "http").then(|| (parsed.host.clone(), parsed.port));
     if let Some((host, port)) = &poolable_key {
         if let Some(mut pooled) = pool_take(host, *port) {
             ctx.begin_blocking_region();
@@ -1856,29 +1821,6 @@ fn perform(
         }
     }
 
-    // FIX (client-cipher-restriction): when the caller up-called a real,
-    // caller-installed SSLSocketFactory's createSocket (see
-    // `huc_upcall_create_socket_if_custom_factory`), that socket's handshake
-    // already ran for real — including any `SSLSocket.setEnabledCipherSuites`
-    // restriction the factory's `createSocket` override applied via its own
-    // real bytecode (which `perform`'s own internal connect below never sees,
-    // since it never touches Java-visible objects). Use that connection
-    // directly instead of opening a second one.
-    if let Some(stream_id) = established_https_stream_id {
-        let mut stream = RustlsIdStream(stream_id);
-        // Same blocking-region gap as the plain-HTTP branch below: a real OS
-        // write+read over an already-established connection, no Java-heap
-        // touch in this closure, so a plain begin/end bracket (no ref
-        // re-sync needed) is enough to keep it out of the STW mutator count.
-        ctx.begin_blocking_region();
-        let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
-            stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
-            stream.flush().map_err(|e| format!("flush: {e}"))?;
-            read_response(&mut stream, head)
-        })();
-        ctx.end_blocking_region();
-        return result;
-    }
     let addr = format!("{}:{}", parsed.host, parsed.port);
     let mut last_err: Option<String> = None;
     let mut tcp: Option<TcpStream> = None;
@@ -1971,6 +1913,49 @@ fn perform(
             })
             .or_else(crate::t27_tls::huc_default_client_config)
             .unwrap_or_else(shared_legacy_config);
+        // FIX (tls-handshake-enforcement-gap, doc 21): apply the cipher/
+        // protocol policy the installed `SSLSocketFactory` imposes (probed in
+        // `huc_client_tls_restrictions`). Rebuilt from the SAME captured
+        // ingredients the cached config was built from — client identity,
+        // `KeyManager` context key, trust-manager context key — so narrowing
+        // the handshake never costs mTLS or custom-trust behaviour. Only the
+        // TLS-ticket cache is given up (a fresh `ClientConfig` owns a fresh
+        // session store), which is why this is done ONLY when a restriction
+        // is actually in force.
+        let cfg = match tls_restrictions {
+            Some((ciphers, protocols)) => {
+                match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
+                    &["http/1.1"],
+                    crate::t27_tls::huc_default_client_identity()
+                        .as_ref()
+                        .map(|(c, k)| (c.as_str(), k.as_str())),
+                    crate::t27_tls::huc_default_key_managers_ctx_key(),
+                    crate::t27_tls::huc_default_trust_managers_ctx_key(),
+                    ciphers,
+                    protocols,
+                ) {
+                    Ok(restricted) => restricted,
+                    // Falling back to the unrestricted config here silently
+                    // turns "this handshake must fail" into "this handshake
+                    // succeeded", so make the reason visible rather than
+                    // leaving a mystery pass.
+                    Err(e) => {
+                        if crate::nbflags().dbg_tls_auth_ok {
+                            eprintln!(
+                                "[dbg-tls-auth] perform: restricted client config FAILED \
+                                 (ciphers={ciphers:?} protocols={protocols:?}): {e} — falling \
+                                 back to the unrestricted config"
+                            );
+                        }
+                        cfg
+                    }
+                }
+            }
+            None => cfg,
+        };
+        // Match JSSE's SNI policy for this host — see
+        // `t27_tls::jsse_would_send_sni`.
+        let cfg = crate::t27_tls::client_config_for_host(cfg, &parsed.host);
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
@@ -2062,8 +2047,29 @@ fn perform(
                         )
                     })?;
             }
-            stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
-            stream.flush().map_err(|e| format!("flush: {e}"))?;
+            // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.3 client
+            // finishes its own side of the handshake before the server has
+            // accepted it, so a server that rejects (e.g. a REQUIRED client
+            // certificate that was not presented) sends its alert and closes
+            // while we are already past `is_handshaking()`. That surfaces
+            // here as a failing FIRST write/flush — before a single request
+            // byte has been acknowledged, let alone a response byte read —
+            // and was reported as a bare `IOException`. Real JSSE raises
+            // `SSLHandshakeException`; `TestSslHandshakeFailure
+            // .testMissingClientCertificate` asserts exactly that type. Only
+            // this first write is reclassified: any later write failure
+            // happens on a connection the server already accepted and is a
+            // genuine transport error.
+            stream.write_all(&req).map_err(|e| {
+                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+                         TLS handshake, before the request could be sent — the peer likely \
+                         rejected the handshake: write: {e}")
+            })?;
+            stream.flush().map_err(|e| {
+                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+                         TLS handshake, before the request could be sent — the peer likely \
+                         rejected the handshake: flush: {e}")
+            })?;
             // A TLS 1.3 client considers ITS side of the handshake finished (and so
             // `is_handshaking()` above already flipped false) as soon as it has sent
             // its own Finished — the server can still reject afterwards (e.g. a
@@ -2083,6 +2089,19 @@ fn perform(
                          TLS handshake with no response — the peer likely rejected the handshake \
                          (e.g. a required client certificate was not presented): {e}"
                     )
+                } else if e.contains("received fatal alert") {
+                    // FIX (tls-handshake-enforcement-gap, doc 21): the peer
+                    // rejected the connection with a TLS alert instead of
+                    // closing silently — e.g. `CertificateRequired` from a
+                    // `certificateVerification="required"` connector when the
+                    // client presented none (`TestSslHandshakeFailure
+                    // .testMissingClientCertificate`). No response byte has
+                    // been read at this point, so this is a rejected
+                    // handshake, not a mid-stream transport error, and real
+                    // JSSE raises `SSLHandshakeException` for it. Without
+                    // this it fell through to the generic `IOException`
+                    // wrapper — the exact type mismatch that test asserts on.
+                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}{e}")
                 } else {
                     e
                 }
@@ -2178,7 +2197,7 @@ fn perform_with_retry(
     body: &[u8],
     connect_timeout: Duration,
     read_timeout: Duration,
-    established_https_stream_id: Option<i32>,
+    tls_restrictions: Option<&ClientTlsRestrictions>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let resp = perform(
         ctx,
@@ -2189,10 +2208,23 @@ fn perform_with_retry(
         body,
         connect_timeout,
         read_timeout,
-        established_https_stream_id,
+        tls_restrictions,
     );
     match resp {
-        Err(ref e) if e == "connection closed before response head" && established_https_stream_id.is_none() => {
+        // FIX (tls-handshake-enforcement-gap, doc 21): the second condition
+        // is the "Tomcat wanted to renegotiate for a client certificate and
+        // couldn't" case — see `t27_tls::deferred_client_auth_contexts`. The
+        // server has, by the time it closed this connection, armed itself to
+        // request the certificate on the NEXT handshake, so retrying once on
+        // a fresh connection is what completes the exchange. A server that
+        // rejects for any other reason simply fails the retry the same way
+        // (one extra loopback handshake), and the caller still receives
+        // `SSLHandshakeException`.
+        Err(ref e)
+            if e == "connection closed before response head"
+                || (e.starts_with(TLS_HANDSHAKE_FAILURE_SENTINEL)
+                    && e.contains("connection closed immediately after the TLS handshake")) =>
+        {
             perform(
                 ctx,
                 connection,
@@ -2202,7 +2234,7 @@ fn perform_with_retry(
                 body,
                 connect_timeout,
                 read_timeout,
-                established_https_stream_id,
+                tls_restrictions,
             )
         }
         other => other,
@@ -2567,15 +2599,19 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
     };
 
     // FIX (client-cipher-restriction): resolve any real caller-installed
-    // SSLSocketFactory BEFORE calling perform — the up-call needs `ctx`.
-    let established_https_stream = if parsed.scheme == "https" {
-        huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
+    // SSLSocketFactory BEFORE calling perform — the probe up-call needs `ctx`.
+    let tls_restrictions = if parsed.scheme == "https" {
+        huc_client_tls_restrictions(ctx, &parsed.host, parsed.port)?
     } else {
         None
     };
     // `perform` manages its own (fine-grained) blocking regions internally —
     // see its doc — so this caller must not wrap the whole call in one.
-    let (status, headers, body_bytes) = match perform(
+    // Goes through `perform_with_retry` (like `huc_real_perform` already did)
+    // so `HttpURLConnection.connect()` gets the same one-shot retry on a
+    // connection the peer closed before responding — including the
+    // deferred-client-auth case (doc 21).
+    let (status, headers, body_bytes) = match perform_with_retry(
         ctx,
         Some(this),
         &parsed,
@@ -2584,7 +2620,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
         &body,
         connect_to,
         read_to,
-        established_https_stream,
+        tls_restrictions.as_ref(),
     ) {
         Ok(v) => v,
         // FIX (client-cipher-restriction): mirror `huc_real_perform`'s

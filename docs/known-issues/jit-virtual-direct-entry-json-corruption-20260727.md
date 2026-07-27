@@ -1,5 +1,21 @@
 # JIT: rare json-smart parse corruption on the compiled-callee direct-call path — needs a MOVING young generation
 
+> **RESOLVED later the same day — the corruption is gone once the RBC.6
+> precise-handler-frame relaxation is gated off.** A `git bisect` over the
+> 27-commit merge range, using `-Xmx64m` (which turns "1 error per 1,500,000
+> ops" into "first error by iteration 5,000" and makes each step a 2-minute
+> test), lands on `83e078aa5` — not on `4f280090f`. That commit lets a method
+> whose exception handler reads a non-parameter local be compiled, and the
+> frame it reconstructs drops live locals; a reference dropped there is a root
+> the collector never sees, which is exactly why the failure needs a MOVING
+> young generation, as measured below. With the gate closed: 3 x 200,000 ops at
+> `-Xmx64m` and 1,500,000 ops at the default heap, 0 errors. Evidence, the
+> liveness bug fixed underneath it, and what is still open in that feature:
+> `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+> The analysis below (especially the `CRATONVM_MOVING_YOUNG=0` row and the
+> refutations) is what made that reading possible — it is kept as written.
+
+
 **Status: OPEN**, but re-characterized on 2026-07-27. It is **not** a stale
 inline-cache entry and **not** the NodeConnections SIGSEGV; both of those
 hypotheses were tested and refuted (below). It is a GC defect: the corruption

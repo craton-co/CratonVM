@@ -166,6 +166,18 @@ thread_local! {
     static PENDING_PRE_BARRIER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Opt-out for the young-mirror deferral in [`VmHeap::mirror_pin_deferrable`]
+/// (`CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER=1` restores the old old-gen-only
+/// behaviour). Read once — consulted per class mirror per root scan.
+#[inline]
+fn mirror_pin_young_defer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER").is_none()
+    })
+}
+
 #[cfg(debug_assertions)]
 #[inline]
 fn arm_pending_pre_barrier() {
@@ -1900,6 +1912,46 @@ impl VmHeap {
         }
     }
 
+    /// Same question as [`Self::metadata_pin_deferrable`], but for the
+    /// `mirror_pin` side channel specifically (`vm::memory::roots` step 6 —
+    /// `java.lang.Class` mirrors of user-loader-defined classes).
+    ///
+    /// `metadata_pin_deferrable` is old-gen-only under Generational because
+    /// `metadata_pin`'s guaranteed consumer is `old_gen_gc`'s BFS. `mirror_pin`
+    /// has a SECOND consumer the metadata case cannot rely on:
+    /// `mark_young_precise_object` follows it as an ordinary marking edge — so
+    /// whenever this cycle is certain to take the non-moving young marker, a
+    /// still-YOUNG mirror is reachable through its loader and does not need an
+    /// unconditional root.
+    ///
+    /// This is what makes class unloading work at all for a short-lived loader:
+    /// a webapp/JSP class whose mirror has never been promoted (the common case
+    /// when an explicit `System.gc()` is the first collection of the run) would
+    /// otherwise be rooted directly forever, and — since a mirror's
+    /// `classLoader` field is a real heap edge — would drag its entire defining
+    /// loader and everything that loader references along with it. Symptom:
+    /// `TestDefaultInstanceManager.testClassUnloading` counting 9 cached
+    /// annotation entries where HotSpot has 8, because the evicted JSP's
+    /// `Class` was the sole root-held anchor of the whole compiler graph. See
+    /// `docs/known-issues/tomcat/26-defaultinstancemanager-classunload-offbyone.md`.
+    ///
+    /// Opt out with `CRATONVM_NO_MIRROR_PIN_YOUNG_DEFER=1`, which restores the
+    /// old old-gen-only behaviour for bisection.
+    pub fn mirror_pin_deferrable(&self, addr: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => {
+                if h.is_old_gen_addr(addr) {
+                    return true;
+                }
+                mirror_pin_young_defer_enabled()
+                    && crate::gc_quiescence::young_marker_follows_side_tables()
+            }
+            VmHeap::G1(_) => true,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => true,
+        }
+    }
+
     /// Backend-generic post-GC staleness verdict for a PRE-collection
     /// address: `true` iff the object at `addr` did NOT survive the
     /// collection whose `pointer_map` is supplied — i.e. writing through
@@ -1970,6 +2022,175 @@ impl VmHeap {
             }
         }
         out
+    }
+
+    /// TEMPORARY diagnostic (doc-26 class-unloading investigation): BFS the
+    /// full *referrer* closure of `target_addr` in a SINGLE heap walk, so a
+    /// "why is this still alive" question can be answered without one
+    /// O(live objects) pass per hop.
+    ///
+    /// Returns `(depth, addr, class_id, referrer_count)` for every object that
+    /// transitively references `target_addr`, breadth-first from the target
+    /// (`depth == 0` is the target itself), capped at `max_nodes`. An entry
+    /// with `referrer_count == 0` is held by NO heap field — i.e. it is
+    /// retained by a GC ROOT, which is exactly the interesting case: the
+    /// closure's zero-referrer members enumerate every root that could be
+    /// keeping the target alive.
+    ///
+    /// Same safepoint contract as `walk_objects`. Debug-only.
+    pub fn referrer_closure(
+        &self,
+        target_addr: usize,
+        max_nodes: usize,
+    ) -> Vec<(usize, usize, u32, usize)> {
+        // One walk -> reverse edge map (referent -> [(holder, holder_cid)]).
+        let mut reverse: std::collections::HashMap<usize, Vec<(usize, u32)>> =
+            std::collections::HashMap::new();
+        for (obj_ptr, _size) in self.walk_objects() {
+            // SAFETY: `walk_objects` yields the start of each live object.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let holder = (obj_ptr as usize, header.class_id.as_u32());
+            unsafe {
+                crate::gen_heap::for_each_ref_slot(obj_ptr, header, |ref_ptr, _slot| {
+                    if !ref_ptr.is_null() {
+                        reverse.entry(ref_ptr as usize).or_default().push(holder);
+                    }
+                });
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<(usize, usize, u32)> =
+            std::collections::VecDeque::new();
+        queue.push_back((0, target_addr, u32::MAX));
+        seen.insert(target_addr);
+        while let Some((depth, addr, cid)) = queue.pop_front() {
+            let referrers = reverse.get(&addr).map_or(0, Vec::len);
+            out.push((depth, addr, cid, referrers));
+            if out.len() >= max_nodes {
+                break;
+            }
+            if let Some(holders) = reverse.get(&addr) {
+                for &(holder, holder_cid) in holders {
+                    if seen.insert(holder) {
+                        queue.push_back((depth + 1, holder, holder_cid));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// TEMPORARY diagnostic (doc-26 class-unloading investigation): traverse
+    /// the FULL referrer closure of `target_addr` and report only its
+    /// *root-held* members — objects that no live heap field points at, yet
+    /// which are themselves live. Those are precisely the entry points through
+    /// which a GC root (or a side-table propagation such as `mirror_pin` /
+    /// `loader_pin` / an overlay owner edge) is keeping `target_addr` alive.
+    ///
+    /// Each returned entry is a path `[root_held, .., target]` of
+    /// `(addr, class_id)` pairs, so the retaining chain is readable end to end
+    /// instead of having to be reassembled from a flat node dump. At most
+    /// `max_paths` paths are returned; the traversal itself is bounded by
+    /// `max_nodes` so a pathological heap cannot wedge the diagnostic.
+    ///
+    /// Same safepoint contract as `walk_objects`. Debug-only.
+    pub fn root_held_paths(
+        &self,
+        target_addr: usize,
+        max_nodes: usize,
+        max_paths: usize,
+    ) -> Vec<Vec<(usize, u32)>> {
+        self.retention_paths(target_addr, &|_| false, max_nodes, max_paths)
+    }
+
+    /// As [`Self::root_held_paths`], but additionally terminates a branch at
+    /// any address the caller's `is_root` predicate accepts — i.e. at a member
+    /// of the ACTUAL root vector the collector was handed this cycle.
+    ///
+    /// This is the query that distinguishes the two ways an object can survive:
+    /// a path ending at a root-set member says "a real GC root reaches it, and
+    /// this chain is how"; a path ending at a zero-referrer node inside a
+    /// strongly-connected component says "nothing outside this component
+    /// references it — it was marked through a side-table propagation
+    /// (`loader_pin` / `mirror_pin` / `metadata_pin` / an overlay owner edge)".
+    /// Chasing the wrong one of those wastes an entire investigation cycle.
+    pub fn retention_paths(
+        &self,
+        target_addr: usize,
+        is_root: &dyn Fn(usize) -> bool,
+        max_nodes: usize,
+        max_paths: usize,
+    ) -> Vec<Vec<(usize, u32)>> {
+        let mut reverse: std::collections::HashMap<usize, Vec<(usize, u32)>> =
+            std::collections::HashMap::new();
+        for (obj_ptr, _size) in self.walk_objects() {
+            // SAFETY: `walk_objects` yields the start of each live object.
+            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            let holder = (obj_ptr as usize, header.class_id.as_u32());
+            unsafe {
+                crate::gen_heap::for_each_ref_slot(obj_ptr, header, |ref_ptr, _slot| {
+                    if !ref_ptr.is_null() {
+                        reverse.entry(ref_ptr as usize).or_default().push(holder);
+                    }
+                });
+            }
+        }
+
+        // BFS outwards along reverse edges, remembering each node's parent (the
+        // object it references) so a discovered root-held node can be walked
+        // back down to the target.
+        let mut parent: std::collections::HashMap<usize, (usize, u32)> =
+            std::collections::HashMap::new();
+        let mut cid_of: std::collections::HashMap<usize, u32> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut root_held: Vec<usize> = Vec::new();
+        queue.push_back(target_addr);
+        seen.insert(target_addr);
+        let mut visited = 0usize;
+        while let Some(addr) = queue.pop_front() {
+            visited += 1;
+            if visited >= max_nodes {
+                break;
+            }
+            // A root-set member terminates the branch: we have the answer for
+            // this chain and walking past it would only find its own referrers.
+            if addr != target_addr && is_root(addr) {
+                root_held.push(addr);
+                continue;
+            }
+            match reverse.get(&addr) {
+                None => root_held.push(addr),
+                Some(holders) if holders.is_empty() => root_held.push(addr),
+                Some(holders) => {
+                    for &(holder, holder_cid) in holders {
+                        if seen.insert(holder) {
+                            cid_of.insert(holder, holder_cid);
+                            parent.insert(holder, (addr, holder_cid));
+                            queue.push_back(holder);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut paths = Vec::new();
+        for node in root_held.into_iter().take(max_paths) {
+            let mut path = vec![(node, cid_of.get(&node).copied().unwrap_or(u32::MAX))];
+            let mut cur = node;
+            // Walk parent links down to the target (bounded by `seen`'s size).
+            while let Some(&(next, _)) = parent.get(&cur) {
+                path.push((next, cid_of.get(&next).copied().unwrap_or(u32::MAX)));
+                cur = next;
+                if cur == target_addr || path.len() > 64 {
+                    break;
+                }
+            }
+            paths.push(path);
+        }
+        paths
     }
 
     /// TEMPORARY diagnostic (is_live_young_survivor false-positive

@@ -19462,12 +19462,39 @@ pub(crate) fn resolve_class_loader_aware(
 ) -> Result<ClassId, MethodCallFailed> {
     // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
     //     answer — none of which need a re-entrant call.
-    let isolated_url_definition =
-        is_isolated_url_loader_definition(shared, thread, referencing_class_id);
-    let known = if isolated_url_definition {
-        lookup_loader_defined_exact(shared, referencing_class_id, name)
+    let direct_loader = shared
+        .classes
+        .class_manager
+        .read()
+        .get_loader_id(referencing_class_id);
+    let direct_user_loader = matches!(
+        direct_loader,
+        Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+    );
+    // A class-manager loader id can temporarily disagree with the defining
+    // loader side table for forked loaders, so retain that authoritative
+    // fallback.  Application/bootstrap classes have neither and must not pay
+    // for initiating-resolution map probes merely because another loader was
+    // registered elsewhere in the process.
+    let has_registered_defining_loader =
+        cratonvm_native_builtins::classloader::defining_loader_for(
+            referencing_class_id.as_u32(),
+        )
+        .is_some();
+    let has_loader_namespace = direct_user_loader || has_registered_defining_loader;
+    let isolated_url_definition = if has_registered_defining_loader {
+        is_isolated_url_loader_definition(shared, thread, referencing_class_id)
     } else {
-        lookup_loader_initiated(shared, referencing_class_id, name)
+        false
+    };
+    let known = if has_loader_namespace {
+        if isolated_url_definition {
+            lookup_loader_defined_exact(shared, referencing_class_id, name)
+        } else {
+            lookup_loader_initiated(shared, referencing_class_id, name)
+        }
+    } else {
+        None
     };
     if let Some(id) = known {
         return Ok(id);
@@ -19539,7 +19566,7 @@ pub(crate) fn resolve_class_loader_aware(
     let loader_faithful = should_use_loader_initiated_resolution(shared, referencing_class_id)
         || isolated_url_definition;
     let user_loader =
-        if loader_faithful && !name.starts_with('[') && !is_global_resolution_namespace(name) {
+        if loader_faithful && has_loader_namespace && !name.starts_with('[') && !is_global_resolution_namespace(name) {
             let direct_loader_id = shared
                 .classes
                 .class_manager
@@ -19918,9 +19945,7 @@ fn resolve_field_ref(
         }
     }
 
-    let field_class_id = match loader_local_id
-        .or_else(|| lookup_loader_initiated(shared, current_class_id, &field_class_name))
-    {
+    let field_class_id = match loader_local_id {
         Some(id) => id,
         None if loader_sensitive => {
             return Err(VmError::Internal {
@@ -20048,8 +20073,8 @@ fn resolve_field_ref_loader_aware(
     // it may predate the loader's private definition and point at the
     // application copy. A getstatic against that stale owner shares static
     // annotation metadata caches across otherwise isolated frameworks.
-    let isolated_url_definition =
-        is_isolated_url_loader_definition(shared, thread, current_class_id);
+    let isolated_url_definition = loader_sensitive
+        && is_isolated_url_loader_definition(shared, thread, current_class_id);
     let loader_local_id = if loader_sensitive {
         if isolated_url_definition {
             lookup_loader_defined_exact(shared, current_class_id, &field_class_name)
@@ -22517,6 +22542,27 @@ fn execute_invoke_kind(
         method_descriptor.as_ref(),
         &args,
     ) {
+        // A force-native virtual call used to return before the ordinary
+        // stackless-dispatch epilogue below could warm `invoke_cache`.  That
+        // made every subsequent call to common real-JDK overrides (notably
+        // String's compact-string operations) re-enter full method
+        // resolution, even though `populate_virtual_invoke_cache` already
+        // has a redefine-aware `VirtualNative` representation for exactly
+        // this dispatch.  Keep the private-target exclusion from the normal
+        // virtual epilogue because such a call has a distinct resolution
+        // identity.
+        if !is_special && private_virtual_target.is_none() {
+            if let Some(rcv_cid) = receiver_class_id {
+                populate_virtual_invoke_cache(
+                    thread,
+                    shared,
+                    current_class_id,
+                    cp_index,
+                    rcv_cid,
+                    &args[0],
+                );
+            }
+        }
         return res;
     }
 
@@ -22784,7 +22830,7 @@ fn execute_invoke_kind(
         dispatch_override,
     )? {
         CachedCallResult::FramePushed => {
-            if is_special {
+            if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
@@ -22801,7 +22847,7 @@ fn execute_invoke_kind(
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
-            if is_special {
+            if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
@@ -22903,7 +22949,7 @@ fn execute_invoke_kind(
     }
 
     // Populate cache for future fast-path hits
-    if is_special {
+    if is_special || private_virtual_target.is_some() {
         populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
     } else if private_virtual_target.is_none() {
         if let Some(rcv_cid) = receiver_class_id {
@@ -26313,6 +26359,7 @@ pub(crate) fn is_h2_parser_native_override(
                 | ("setTokenIndex", "(I)V")
                 | ("readIf", "(I)Z")
                 | ("addExpected", "(I)V")
+                | ("testToken", "(Ljava/lang/String;Lorg/h2/command/Token;)Z")
         );
     }
     if class_name == "org/h2/command/Tokenizer" {
@@ -27154,6 +27201,24 @@ pub(crate) fn is_stamped_lock_native_override(
         ) && matches!(
             (method_name, descriptor),
             ("lock", "()V") | ("tryLock", "()Z") | ("unlock", "()V")
+        )
+}
+
+/// The real JDK 25 ReentrantReadWriteLock stores its state in the final
+/// protected helpers inherited from AbstractQueuedLongSynchronizer.  The
+/// native implementations retain the JDK queue algorithm while providing an
+/// atomic scalar state word outside CratonVM's tagged heap slot.
+pub(crate) fn is_aqls_state_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/util/concurrent/locks/AbstractQueuedLongSynchronizer"
+        && matches!(
+            (method_name, descriptor),
+            ("getState", "()J")
+                | ("setState", "(J)V")
+                | ("compareAndSetState", "(JJ)Z")
         )
 }
 
@@ -28358,6 +28423,9 @@ fn force_native_over_real_jdk_bytecode(
     }
 
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_aqls_state_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_bc_crypto_math_native_override(class_name, method_name, method_descriptor) {
@@ -32885,6 +32953,10 @@ fn execute_invokestatic_cached(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
     let continuation_interpreted = matches!(thread.kind, crate::threading::ThreadKind::Virtual);
+    // A --nojit execution can neither enter a cached artifact nor request a
+    // new one.  Keep the call-cache dispatch entirely interpreter-only rather
+    // than paying its JIT generation probes and hotness atomics on every call.
+    let jit_enabled = !crate::runtime::env_cache::disable_jit();
 
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
@@ -33047,7 +33119,7 @@ fn execute_invokestatic_cached(
             // live generation the cache content is unchanged since we last looked
             // and missed, and looking again cannot find anything. Steady state is
             // two integer loads plus a compare: no hashing, no string compares.
-            if !redefine_jit_quiesced && !continuation_interpreted {
+            if jit_enabled && !redefine_jit_quiesced && !continuation_interpreted {
                 // Read the generation BEFORE probing. A publication racing in
                 // after the probe leaves us memoizing an older generation, which
                 // compares unequal next time and re-probes -- safe. Memoizing a
@@ -33160,11 +33232,13 @@ fn execute_invokestatic_cached(
             /// failure is retried within a few hundred calls rather than after
             /// another full warmup threshold.
             const JIT_RETRY_STRIDE: u32 = 64;
-            let invoc_count = shared.jit.profile_store.increment_invocation(invoc_key);
+            let invoc_count = jit_enabled
+                .then(|| shared.jit.profile_store.increment_invocation(invoc_key))
+                .unwrap_or(0);
             // Fire on the first crossing of the threshold, then re-attempt every
             // `JIT_RETRY_STRIDE` calls until the upgrade succeeds (after which
             // the invoke cache routes through JIT and this block is bypassed).
-            let past_threshold = invoc_count >= jit_invocation_threshold;
+            let past_threshold = jit_enabled && invoc_count >= jit_invocation_threshold;
             let should_attempt = past_threshold
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
@@ -40884,6 +40958,7 @@ fn execute_invokevirtual_cached(
                         && !cached.is_synchronized
                         && !has_registered_native
                         && !crate::classloading::any_class_redefined()
+                        && !crate::runtime::env_cache::disable_jit()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?
