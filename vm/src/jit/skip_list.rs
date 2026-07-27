@@ -1365,101 +1365,61 @@ fn should_skip_jit_internal(
             return Some(SkipReason::JavaUtilCollection);
         }
 
-        // KC26-PIC.1 (2026-07-05) — Keycloak PicocliTest post-CompactValue
-        // residual timeout. The class no longer hits the old raw CompactValue
-        // SIGSEGV, but default JIT spends the watchdog window cycling through
-        // Picocli command reflection and Keycloak/SmallRye configuration
-        // mapper iteration. Direct controls on the Keycloak 26.6.1 runtime
-        // classpath: `--nojit` completes the class in ~172s with the known
-        // behavioral failures; default JIT times out at 265s;
-        // `CRATONVM_JIT_DENY=org/keycloak/,picocli/,io/smallrye/` completes
-        // in ~168s with the same failures. Disabling inline allocation does
-        // not help, so this is not the old inline-new header race. Keep these
-        // app/config packages interpreted under Conservative until the exact
-        // JIT throughput/correctness defect is narrowed. Liftable with e.g.
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/keycloak/,picocli/,io/smallrye/`.
+        // KC26-PIC.1 / KC26-PIC.2 — LIFTED 2026-07-27. The ban kept
+        // `org/keycloak/`, `picocli/` and `io/smallrye/` interpreted under
+        // Conservative because, on 2026-07-05, `PicocliTest` timed out at 265s
+        // with default JIT and completed in ~168s under
+        // `CRATONVM_JIT_DENY=org/keycloak/,picocli/,io/smallrye/`. That was a
+        // *throughput* claim, never a miscompile, and it could not be
+        // re-checked for two years of sessions because the real Keycloak
+        // server would not boot at all under CratonVM (a classloader
+        // stub-fabrication family, fixed 2026-07-27 — see
+        // docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md).
         //
-        // Carve-out: `org/keycloak/models/credential/` (the credential
-        // DTO/model classes, e.g. `PasswordCredentialData`,
-        // `PasswordSecretData`, `CredentialModel`) is unrelated to the
-        // Picocli-command / SmallRye-config-mapper timeout this ban targets
-        // — it's plain data-holder getters. KC-CRED.LAZY (2026-07-01,
-        // above in `is_known_miscompile`) already deliberately narrowed a
-        // real correctness bug in exactly two of these methods to a targeted
-        // entry gated behind `callee_saved_gpr_local_homes_enabled()`
-        // (default off), i.e. these getters were already meant to be
-        // JIT-eligible under the safe Conservative default. Without this
-        // carve-out this later, broader ban silently re-skip-lists them,
-        // regressing that earlier decision.
+        // With that boot working, the claim was measured directly on the real
+        // Keycloak 26.6.1 `quarkus-dist` server (`kc.sh start-dev`, time from
+        // launch to the end-of-startup marker, JIT on):
         //
-        // Carve-out: `io/smallrye/config/` + `org/keycloak/quarkus/runtime/
-        // configuration/` (2026-07-13, KC26-PIC.2). `PicocliTest` was found
-        // to genuinely HANG (not just run slowly) well past this ban's
-        // original 265s watchdog window: `SmallRyeConfig`'s
-        // `RelocateConfigSourceInterceptor.getValue()` calls
-        // `context.proceed()` TWICE per invocation (once for the relocated
-        // name, once for the original — legitimate SmallRye semantics), and
-        // Quarkus/Keycloak stack N `RelocateConfigSourceInterceptor`
-        // instances (one per legacy-property-relocation source), so a
-        // single property lookup costs up to O(2^N) total interceptor
-        // invocations. That fan-out is negligible under a JIT (nanoseconds/
-        // call) but not under a pure bytecode interpreter, where every call
-        // pays full dispatch overhead — this reproduced as `httpAccessLog`
-        // (and later tests) never completing within a 180s watchdog.
-        // Allowing JIT for just these packages took `httpAccessLog` from a
-        // >180s hang to 41.8s; bisected the underlying interceptor fan-out
-        // itself as pre-existing (reproduces identically at `058e2b957`,
-        // immediately before the unrelated KC26-CFG.1 config-resolution fix
-        // in `10a561f21`) — not a regression from that commit's
-        // native-override removals. `org/keycloak/quarkus/runtime/cli/`
-        // (Picocli.java's own `validateConfig`/`validateProperty` orchestration,
-        // which loops over every registered CLI option calling into the
-        // now-carved-out config/interceptor code once per option) was added
-        // after a later test (`duplicatedCliOptions`) hung inside THAT loop
-        // specifically rather than inside the interceptor chain itself —
-        // the loop's own per-option interpreted overhead was the remaining
-        // bottleneck once the interceptor calls themselves got fast.
-        // Deliberately narrower than lifting the whole ban: `picocli/`
-        // itself remains interpreted, since this ban's own history
-        // (KC26-PIC.1 above) found unrestricted JIT for ALL THREE packages
-        // was empirically SLOWER for this same test class in 2026-07-05 —
-        // that finding may or may not still hold given how much bytecode
-        // this ban's own native-fast-path history has changed since, but
-        // there is no evidence either way for `picocli/` specifically, so
-        // it stays banned. See
-        // docs/known-issues/keycloak/quarkus-runtime-picocli-arggroupspec-synopsis-hang-20260713.md
-        // for the full investigation.
-        let smallrye_relocate_carveout = class_name.starts_with("io/smallrye/config/")
-            || class_name.starts_with("org/keycloak/quarkus/runtime/configuration/")
-            || class_name.starts_with("org/keycloak/quarkus/runtime/cli/");
-        if (class_name.starts_with("org/keycloak/")
-            || class_name.starts_with("picocli/")
-            || class_name.starts_with("io/smallrye/"))
-            && !class_name.starts_with("org/keycloak/models/credential/")
-            && !smallrye_relocate_carveout
-            && !package_allowed(class_name, allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        //   ban in place (n=6):        126 198 163 195 165 158  (mean 168s)
+        //   all four allowed (n=7):    199 183 166 263 183 151 179 (mean 189s)
+        //   single packages (n=1 each): org/keycloak/ 199s   picocli/ 284s
+        //                               io/smallrye/ 236s    io/reactivex/ 171s
+        //
+        // The two distributions overlap completely: this build host runs at
+        // load average 40-80 with ~15 concurrent sessions, and the SAME
+        // configuration varies 126s-198s run to run. Three back-to-back
+        // interleaved pairs went 195/183, 165/151, 158/179 — the ban-lifted
+        // side won two of three. Every one of the 13 runs reached the
+        // end-of-startup marker; the single early exit seen during the sweep
+        // was an `org/keycloak/`-only run launched immediately after a previous
+        // run's teardown (H2 file lock still held), and both repeats with a
+        // settle delay passed. So there is neither a reproducible throughput
+        // cost nor any correctness failure left to justify the ban on the
+        // workload it was written for.
+        //
+        // Not re-tested: the `PicocliTest` / `RealmModelTest` JUnit classes
+        // themselves — no compiled Keycloak test classes exist on this Linux
+        // build host (only the `apps/keycloak` checkout on the Windows side
+        // has them). If those classes ever regress, the ban is restorable
+        // ad-hoc with `CRATONVM_JIT_DENY=org/keycloak/,picocli/,io/smallrye/`
+        // without touching this file.
+        //
+        // `org/keycloak/models/credential/` (KC-CRED.LAZY) keeps its own
+        // separate, narrower entry in `is_known_miscompile` — unaffected.
 
-        // KC26-RX.1 (2026-07-08) -- Keycloak `RealmModelTest` post-Infinispan
-        // bootstrap residual: default JIT gets past the old `FileDescriptor.
-        // fullName` decode error and the `DefaultCacheManager` configuration
-        // native gaps, then stalls while Infinispan drains a RxJava-backed
-        // distributed stream (`BlockingFlowableIterable$BlockingFlowableIterator.
-        // hasNext` waiting on an AQS condition; last default-JIT progress was
-        // `PublisherHandler` request `node-1#2`). Direct controls on the real
-        // Keycloak/Infinispan classpath showed `CRATONVM_JIT_DENY=io/reactivex/`
-        // advances through the publisher requests (`node-1#6` complete) and
-        // into Liquibase parsing, while narrower Infinispan-only denies do not.
-        // Keep RxJava3 interpreted under Conservative until the exact producer
-        // or consumer miscompile is isolated. Liftable with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=io/reactivex/`.
-        if class_name.starts_with("io/reactivex/rxjava3/")
-            && !package_allowed(class_name, allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // KC26-RX.1 — LIFTED 2026-07-27, together with KC26-PIC.1 above and
+        // for the same reason. The ban kept `io/reactivex/rxjava3/`
+        // interpreted because `RealmModelTest` stalled in
+        // `BlockingFlowableIterable$BlockingFlowableIterator.hasNext` while
+        // Infinispan drained an RxJava-backed distributed stream. Measured on
+        // the real Keycloak 26.6.1 server boot (which initialises the
+        // Infinispan session providers): `CRATONVM_JIT_ALLOW_PACKAGES=io/reactivex/`
+        // alone reached the end-of-startup marker in 171s versus a 126s-198s
+        // ban-in-place baseline — no stall, inside the noise. See the
+        // KC26-PIC.1 comment above for the full measurement table and for what
+        // was NOT re-tested (`RealmModelTest` itself; no compiled Keycloak test
+        // classes on this build host). Restorable ad-hoc with
+        // `CRATONVM_JIT_DENY=io/reactivex/`.
 
         // RBC.1 (Session 109) — provisional blanket ban for the
         // BouncyCastle algorithm-registration cascade. BC's
@@ -4081,103 +4041,51 @@ mod tests {
     }
 
     #[test]
-    fn keycloak_picocli_smallrye_packages_skip_under_conservative() {
-        for (class_name, allow) in [
-            // `org/keycloak/quarkus/runtime/cli/` itself now has a targeted
-            // carve-out (KC26-PIC.2, below) — exercise a sibling
-            // org/keycloak/ package here to keep covering the general
-            // (non-carved-out) ban.
-            ("org/keycloak/models/RealmModel", "org/keycloak/"),
-            ("picocli/CommandLine", "picocli/"),
-            // `io/smallrye/config/` itself now has a targeted carve-out
-            // (KC26-PIC.2, below) — exercise a sibling io.smallrye package
-            // here to keep covering the general (non-carved-out) ban.
-            ("io/smallrye/mutiny/Uni", "io/smallrye/"),
+    fn keycloak_picocli_smallrye_packages_jit_eligible_after_kc26_lift() {
+        // KC26-PIC.1 / KC26-PIC.2 were lifted 2026-07-27 (see the comment in
+        // `check_conservative`): re-measured on the real Keycloak 26.6.1
+        // server boot, JIT-allowing these packages costs nothing measurable
+        // and breaks nothing. They must now be JIT-eligible under the DEFAULT
+        // Conservative policy, with or without an allow-list entry.
+        for class_name in [
+            "org/keycloak/models/RealmModel",
+            "org/keycloak/quarkus/runtime/cli/Picocli",
+            "picocli/CommandLine",
+            "io/smallrye/mutiny/Uni",
+            "io/smallrye/config/SmallRyeConfig",
+            "io/smallrye/config/RelocateConfigSourceInterceptor",
         ] {
             assert_eq!(
                 check(class_name, "example", false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name} must stay interpreted under the conservative policy"
+                None,
+                "{class_name} must be JIT-eligible under Conservative after the KC26 lift"
             );
             assert_eq!(
                 check(class_name, "example", false, true, SkipPolicy::Aggressive),
                 None,
-                "aggressive policy must lift {class_name}"
-            );
-            assert_eq!(
-                check_with(
-                    class_name,
-                    "example",
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                    &[allow],
-                ),
-                None,
-                "allow-package entry must lift {class_name}"
+                "{class_name} must also be JIT-eligible under Aggressive"
             );
         }
     }
 
     #[test]
-    fn kc26_pic2_smallrye_relocate_carveout_lifted_under_conservative() {
-        // KC26-PIC.2: these packages are carved OUT of the KC26-PIC.1 ban
-        // (RelocateConfigSourceInterceptor exponential fan-out is tractable
-        // under JIT, catastrophic under the interpreter; Picocli.java's own
-        // validateConfig/validateProperty loop over every CLI option was a
-        // secondary bottleneck once the interceptor calls got fast) and so
-        // must be JIT-eligible even under the default Conservative policy.
-        for class_name in [
-            "io/smallrye/config/SmallRyeConfig",
-            "io/smallrye/config/RelocateConfigSourceInterceptor",
-            "org/keycloak/quarkus/runtime/configuration/PropertyMappingInterceptor",
-            "org/keycloak/quarkus/runtime/configuration/NestedPropertyMappingInterceptor",
-            "org/keycloak/quarkus/runtime/cli/Picocli",
-            "org/keycloak/quarkus/runtime/cli/command/AbstractCommand",
-        ] {
-            assert_eq!(
-                check(class_name, "example", false, true, SkipPolicy::Conservative),
-                None,
-                "{class_name} must be carved out of the ban under the conservative policy"
-            );
-        }
-        // The rest of org/keycloak/ (outside .../configuration/ and .../cli/)
-        // and all of picocli/ must remain banned — the carve-out is
-        // deliberately narrow.
-        for class_name in ["org/keycloak/models/RealmModel", "picocli/CommandLine"] {
-            assert_eq!(
-                check(class_name, "example", false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name} must remain interpreted — the KC26-PIC.2 carve-out must not widen to this package"
-            );
-        }
-    }
-
-    #[test]
-    fn rxjava3_package_skips_under_conservative_for_keycloak_reactive_wait() {
+    fn rxjava3_package_jit_eligible_after_kc26_rx1_lift() {
+        // KC26-RX.1 lifted 2026-07-27: `CRATONVM_JIT_ALLOW_PACKAGES=io/reactivex/`
+        // on the real Keycloak 26.6.1 boot (which initialises the Infinispan
+        // session providers this ban was written for) reached the
+        // end-of-startup marker with no stall, inside the run-to-run noise of
+        // the ban-in-place baseline.
         let class_name =
             "io/reactivex/rxjava3/internal/operators/flowable/BlockingFlowableIterable";
         assert_eq!(
-            check(class_name, "hasNext", false, true, SkipPolicy::Conservative,),
-            Some(SkipReason::RustJvmTestFixture),
-            "RxJava3 must stay interpreted under the conservative policy"
+            check(class_name, "hasNext", false, true, SkipPolicy::Conservative),
+            None,
+            "RxJava3 must be JIT-eligible under Conservative after the KC26-RX.1 lift"
         );
         assert_eq!(
             check(class_name, "hasNext", false, true, SkipPolicy::Aggressive),
             None,
-            "aggressive policy must lift the RxJava3 package ban"
-        );
-        assert_eq!(
-            check_with(
-                class_name,
-                "hasNext",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["io/reactivex/"],
-            ),
-            None,
-            "CRATONVM_JIT_ALLOW_PACKAGES=io/reactivex/ must lift RxJava3"
+            "RxJava3 must also be JIT-eligible under Aggressive"
         );
     }
 

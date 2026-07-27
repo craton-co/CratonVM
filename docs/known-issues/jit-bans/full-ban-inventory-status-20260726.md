@@ -74,6 +74,7 @@ checkouts onto the host or finding an equivalent real app.
   regardless (kept by design, not blocked).
 - **HIB-ANTLR.1** (ordinary, non-shaded ANTLR4 runtime used directly by
   Hibernate) — not yet investigated this multi-session effort.
+- **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`.
 - **KC26-PIC.1, KC26-RX.1** (Keycloak/picocli/RxJava3) — needs a real
   Keycloac 26.2.4 checkout; not present on this host.
 - **HIB-TEMPORAL.1** (`org/hibernate/`, temporal/DDL type descriptor
@@ -153,6 +154,7 @@ they were built for rather than the technology itself, so the earlier
   real regression (`FloatFieldBlockLoaderTests`: 38→41 failures under
   JIT); the true failure surface across the full suite is likely larger,
   not yet fully characterized.
+- **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`.
 - **KC26-PIC.1 / KC26-RX.1** (Keycloak) — found a full real Keycloak
   26.6.1 Maven repo + bootable quarkus-dist server at
   `/home/victor/.m2/repository/org/keycloak/`. Still blocked, but for a

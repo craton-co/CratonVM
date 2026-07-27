@@ -463,6 +463,19 @@ pub trait NativeClassAccess {
     /// `.class` bytes). Used to branch native helpers that must mirror JDK
     /// behaviour without registering natives that would override real JDK
     /// bytecode once the stub upgrades.
+    /// Would a name-based load of `name` be answered with a *fabricated
+    /// synthetic stub* (a class with no `Code` on any method, minted only so
+    /// enterprise bytecode can link) rather than a real class?
+    ///
+    /// Non-destructive: unlike [`Self::is_class_synthetic_stub`] it does not
+    /// load anything, so it can be used to decide whether to consult a real
+    /// `ClassLoader` *before* the stub is minted and registered globally.
+    /// Default `false` for contexts with no class manager.
+    fn would_fabricate_synthetic_stub(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
         false
     }
@@ -1627,6 +1640,39 @@ pub trait NativeInvokeAccess: NativeClassAccess {
         args: &[Value],
     ) -> MethodCallResult {
         self.invoke(class_name, method_name, descriptor, args)
+    }
+
+    /// [`Self::invoke_special`] for a caller that ALREADY holds the declaring
+    /// class's resolved `ClassId`.
+    ///
+    /// Same rationale as [`Self::invoke_by_class_id`] (see its doc comment for
+    /// the full argument), applied to the invokespecial dispatch contract.
+    /// `invoke_special` resolves `class_name` through the loader-blind global
+    /// lookup, which collapses to ONE copy per binary name - so a caller that
+    /// knows the exact declaring class must not throw that identity away.
+    ///
+    /// The concrete bug this exists for: `Method.invoke` routes a *private* or
+    /// *cross-package package-private* instance method through
+    /// `invoke_special` (both must bypass virtual dispatch - JLS 8.4.8.1).
+    /// The `Method` mirror's own `clazz` slot already names the exact declaring
+    /// class, but the name-based re-resolution picked the APPLICATION-loader
+    /// copy whenever an isolating loader (Spring Boot's
+    /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
+    /// own copy of that class. See docs/internal/fixed-suite-bugs/springboot/
+    /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
+    ///
+    /// Default implementation falls back to the name-based
+    /// [`Self::invoke_special`] for contexts with no ClassId fast path.
+    fn invoke_special_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let _ = class_id;
+        self.invoke_special(class_name, method_name, descriptor, args)
     }
 
     /// Like [`Self::invoke_special`] but for a native that IS ITSELF the

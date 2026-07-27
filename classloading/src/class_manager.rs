@@ -311,6 +311,15 @@ pub fn loader_aware_resolution() -> bool {
 /// (or, if the gap breaks a superinterface/superclass resolution, a bare
 /// `NoClassDefFoundError` with no further detail). Off by default to avoid
 /// spamming normal runs.
+/// Cached `CRATONVM_DBG_STUB_BT` filter (see the synthetic-stub fallback in
+/// [`ClassManager::load_class`]).
+fn dbg_stub_bt_filter() -> Option<&'static str> {
+    static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FILTER
+        .get_or_init(|| std::env::var("CRATONVM_DBG_STUB_BT").ok())
+        .as_deref()
+}
+
 fn trace_stub_fallback() -> bool {
     loader_flags().trace_unimplemented
 }
@@ -3041,6 +3050,43 @@ impl ClassManager {
         None
     }
 
+    /// Would [`Self::load_class`] answer `name` with a *fabricated synthetic
+    /// stub* rather than a real class?
+    ///
+    /// A synthetic stub has no `Code` on any method: it exists only so that
+    /// WildFly/Quarkus-style bytecode can LINK against enterprise classes that
+    /// are genuinely absent. Answering with one when the class merely lives
+    /// behind a custom `ClassLoader` (invisible to this process's own `-cp`)
+    /// is a silent mis-resolution -- and a destructive one, because the stub is
+    /// registered globally under `Application`, so the real loader can never
+    /// define its own copy afterwards.
+    ///
+    /// Callers that DO have a loader context (see
+    /// `NativeContextImpl::load_class`) use this to consult that loader
+    /// *before* the fabrication happens. Mirrors `load_class`'s own fallback
+    /// branches exactly, so a `true` answer is precise, not a guess.
+    pub fn would_fabricate_synthetic_stub(&self, name: &str) -> bool {
+        if name.starts_with('[') {
+            return false;
+        }
+        if !is_jdk_class(name) {
+            return false;
+        }
+        if name.contains("$$") || is_jboss_logging_locale_lookup(name) {
+            return false;
+        }
+        if is_standard_jdk_namespace(name)
+            && self.has_real_boot_classes()
+            && !is_native_backed_jdk_stub(name)
+        {
+            return false;
+        }
+        if self.resolve_fast_path_class_id(name).is_some() {
+            return false;
+        }
+        self.find_class_bytes_delegated(name).is_err()
+    }
+
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
         if loader_flags().dbg_loadclass && name.contains("GroupsMetadata") {
             let bt = std::backtrace::Backtrace::force_capture();
@@ -3221,6 +3267,18 @@ impl ClassManager {
                     eprintln!(
                         "[cratonvm] stub fallback: {name} — not found on any classpath entry (enterprise-prefix stub; add the missing jar)"
                     );
+                }
+                // `CRATONVM_DBG_STUB_BT=<substring>` -- Rust backtrace at the
+                // point a synthetic stub is fabricated for a matching name.
+                // The stub itself is silent until something tries to *run* it
+                // (`VerifyError: ... must have Code attribute`), by which
+                // point the resolver that asked for it is long gone from the
+                // stack -- this names it.
+                if let Some(want) = dbg_stub_bt_filter() {
+                    if !want.is_empty() && name.contains(want) {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        eprintln!("[DBG_STUB_BT] synthetic stub for {name}\n{bt}");
+                    }
                 }
                 self.create_synthetic_stub(name)
             }
