@@ -130,8 +130,8 @@ rather than assuming closed or re-investigating from scratch.
 > plain jar's own manifest `Class-Path:` attribute. **FIXED** — see
 > [`../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md).
 > `PathRequestTests` now passes outright; the other 3 narrowed to two distinct
-> residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
-> (still OPEN) and `securityfilterautoconfig-capturedoutput-password-not-observed.md`
+> residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md)
+> (now FIXED, see the 2026-07-27 closure update below) and `securityfilterautoconfig-capturedoutput-password-not-observed.md`
 > (was here, now **FIXED** — see below).
 
 > Closure update (2026-07-26): `SecurityFilterAutoConfigurationEarlyInitializationTests`
@@ -145,6 +145,21 @@ rather than assuming closed or re-investigating from scratch.
 > `ManagementWebSecurityAutoConfigurationTests` 3/3 clean; the reactive variant
 > shows a separate, likely-unrelated intermittent timeout — see the FIXED doc
 > above for details).
+
+> Closure update (2026-07-27): `onbeancondition-mergedannotations-intermittent-identity-mismatch.md`
+> is now closed too. The doc's own claimed symptom never reproduced (23 clean
+> runs total, JIT on/off) — resolved as a side effect of unrelated `dev`
+> drift, same pattern as the entries above. The reactive variant's "separate,
+> likely-unrelated intermittent timeout" flagged in the closure update just
+> above turned out to be real and root-caused: a `reactor/core/scheduler/
+> NonBlocking` classloader double-define race (a background Reactor
+> scheduler thread's recursive interface resolution racing, unsynchronized,
+> against the main thread's own top-level `Class.forName` on the same
+> isolated loader) — fixed in both `classloading::ClassManager::
+> resolve_supertype` and `native-builtins`'s `ucl_try_define_local_class`.
+> Verified 0/40 clean (was 10-23% failure rate) plus 16 more clean runs
+> across both classes with JIT on/off. Moved to
+> [`../../internal/fixed-suite-bugs/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md).
 
 > Investigation (2026-07-24): `module/spring-boot-micrometer-tracing-opentelemetry`'s
 > 2-class residual from this rerun (`OpenTelemetryBaggagePropagationIntegrationTests`,

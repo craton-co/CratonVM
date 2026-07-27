@@ -135,7 +135,7 @@ pathing jar — not cross-referencing another worktree).
   bootstrap-appended-visibility fix, confirmed gone after) is also gone; both
   now fail on a separate, real `OnBeanCondition`/`MergedAnnotations`
   intermittent identity bug — see
-  [`../../known-issues/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](../../known-issues/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch.md).
+  [`onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md) (now FIXED).
 - `cargo test -p cratonvm-classloading --release class_path`: 89 passed / 0
   failed / 3 ignored (no regressions from the `ClassPath::new` refactor).
 - `cargo test -p cratonvm-native-builtins --release classloader`: 105
