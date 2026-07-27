@@ -3890,6 +3890,83 @@ fn notify_generated_class_handler(
     );
 }
 
+/// `SpringNamingPolicy.getClassName(prefix, source, key, names)` — real cglib's
+/// name chooser, wrapped so it also avoids names THIS VM already defined.
+///
+/// Real cglib guarantees uniqueness with `AbstractClassGenerator$ClassLoaderData
+/// .reservedClassNames`: every generator it runs reserves the name it took, so
+/// the next one picks the following counter value. `cce_enhance` bypasses cglib
+/// entirely, so its `<Config>$$SpringCGLIB$$0` is invisible to that set — and
+/// the next real-cglib generation for the SAME prefix in the same loader picks
+/// `$$0` too. `CglibAopProxy` is exactly that case: it strips the
+/// `$$SpringCGLIB$$` suffix (`ClassUtils.getUserClass`) and proxies the raw
+/// `@Configuration` class, so its prefix is identical to the enhancer's.
+///
+/// The second definition then took over the name, and every symbolic
+/// field/method ref naming that class resolved to the AOP proxy instead of the
+/// enhanced config class:
+/// `NoSuchFieldError: ...$Config$$SpringCGLIB$$0.$$beanFactory` out of the
+/// enhanced class's own `setBeanFactory`
+/// (`BeanMethodPolymorphismTests.beanMethodDetectedOnSuperClass` and
+/// `NestedConfigurationClassTests.twoLevelsDeepWithInheritanceAndScopedProxy`,
+/// both of which pass in isolation and fail only after a test that AOP-proxies
+/// a `@Configuration` bean has run).
+///
+/// The real method's prefix massaging (`_java.util.…` escaping, the
+/// `org.springframework.cglib.empty.Object` default, the `$$FastClass$$` tag)
+/// is intricate and covered by `SpringNamingPolicyTests`, so delegate to the
+/// real bytecode for the candidate and only advance past names that are
+/// already taken. Names cglib itself reserved are already skipped by its own
+/// predicate, so this loop is a no-op unless a native generator got there
+/// first.
+fn native_spring_naming_policy_get_class_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let candidate = ctx.invoke_virtual_bytecode_only(
+        this,
+        "getClassName",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Lorg/springframework/cglib/core/Predicate;)Ljava/lang/String;",
+        &args[1..],
+    )?;
+    let Some(Value::Object(Some(name_ref))) = candidate else {
+        return Ok(candidate);
+    };
+    let Some(name) = ctx.read_string(name_ref) else {
+        return Ok(candidate);
+    };
+    // Split `<base><n>` where `<n>` is the trailing decimal counter cglib
+    // appends. Anything else (no trailing digits) is left alone.
+    let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return Ok(candidate);
+    }
+    let (base, num) = name.split_at(name.len() - digits);
+    let Ok(mut counter) = num.parse::<u64>() else {
+        return Ok(candidate);
+    };
+    let mut chosen = name.clone();
+    // Bounded: a runaway here would be worse than a collision.
+    for _ in 0..1024 {
+        if ctx.class_id_by_name(&chosen.replace('.', "/")).is_none() {
+            break;
+        }
+        counter += 1;
+        chosen = format!("{base}{counter}");
+    }
+    if chosen == name {
+        return Ok(candidate);
+    }
+    if crate::nbflags().dbg_ccecache {
+        eprintln!("[CCECACHE-DBG] naming policy: {name} already defined -> {chosen}");
+    }
+    let out = ctx.create_string(&chosen);
+    Ok(Some(Value::Object(Some(out))))
+}
+
 fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = receiver, args[1] = config Class, args[2] = ClassLoader.
     //
@@ -4667,6 +4744,15 @@ pub fn register_cglib_enhancer(registry: &mut NativeMethodRegistry) {
         "enhance",
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
         cce_enhance,
+    );
+    // See `native_spring_naming_policy_get_class_name`: keeps real cglib's
+    // generated names from colliding with the ones `cce_enhance` mints outside
+    // cglib's own reserved-name bookkeeping.
+    registry.register(
+        "org/springframework/cglib/core/SpringNamingPolicy",
+        "getClassName",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Lorg/springframework/cglib/core/Predicate;)Ljava/lang/String;",
+        native_spring_naming_policy_get_class_name,
     );
     // FactoryBean-enhancement (SPR-6602/11202/15275) — see the module doc
     // comment above `fb_subclass_cache`. `enhanceFactoryBeanReference` is
