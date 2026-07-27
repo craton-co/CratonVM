@@ -30371,6 +30371,7 @@ mod tests {
             false,
             false,
             false,
+            Vec::new(),
         );
 
         assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));
