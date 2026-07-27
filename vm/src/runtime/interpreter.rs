@@ -1485,7 +1485,19 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
     // so `note_gc_productivity` can compute how much this forced GC actually
     // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
-    let before_live = shared.mem.heap.allocated_bytes();
+    //
+    // Use the free-list-aware live estimate, NOT `allocated_bytes`: the default
+    // (non-moving) young sweep reclaims dead objects into the from-space free
+    // list without retreating the bump cursor, so `allocated_bytes` reads a
+    // perfectly-productive sweep as "freed 0" and latches the overhead limit
+    // after `GC_OVERHEAD_LIMIT_CYCLES` young fills — a spurious
+    // `OutOfMemoryError` on a heap that is almost entirely garbage. Restores
+    // part 3 of a9c580aff, which d8092acba ("fix-tests-real-jdk-contracts")
+    // reverted in this file while leaving both accessors in place and
+    // caller-less; see docs/internal/fixed-suite-bugs/tomcat/
+    // 24-stringcache-oom-under-load.md.
+    let before_live = shared.mem.heap.live_bytes_estimate();
+    let before_promoted = shared.mem.heap.bytes_promoted_total();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -1514,7 +1526,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .mem
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        note_gc_productivity(shared, before_live);
+        note_gc_productivity(shared, before_live, before_promoted);
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1578,7 +1590,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                 .mem
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            note_gc_productivity(shared, before_live);
+            note_gc_productivity(shared, before_live, before_promoted);
         } else {
             safepoint_check(shared, thread);
         }
@@ -1602,17 +1614,37 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// generational heap: in a retained-allocation death-spiral the young semi-space
 /// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
 /// never looks exhausted), yet the GC frees ~nothing net because every survivor
-/// is promoted into an already-full old generation. `before - after` captures
-/// exactly that — promotion is not freeing, so it does not reset the streak.
+/// is promoted into an already-full old generation. Promoted bytes DO count
+/// toward productivity (they re-enable young allocation, which is the point of
+/// the collection) — but the 2%-of-capacity threshold still catches the
+/// death-spiral: a wedged, ~full old generation cannot absorb 2% of total heap
+/// capacity per cycle, so its sliver-promotions stay "unproductive" and the
+/// streak still trips the overhead limit. A healthy young→old drain moves far
+/// more than 2% and resets it.
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
-fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
+fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: u64) {
     let cap = shared.mem.heap.heap_capacity();
     if cap == 0 {
         return;
     }
-    let after_live = shared.mem.heap.allocated_bytes();
-    let freed = before_live.saturating_sub(after_live);
+    // Free-list-aware live metric (see the capture site in `maybe_gc_forced`):
+    // the non-moving sweep reclaims into the young free list without moving
+    // the bump cursor, so `allocated_bytes` would read a fully-productive
+    // sweep as "freed 0" and falsely latch the overhead limit.
+    let after_live = shared.mem.heap.live_bytes_estimate();
+    // A promotion-only cycle conserves live bytes but still did useful
+    // allocation-enabling work (it drained young), so credit promoted bytes.
+    // The 2%-of-capacity threshold below still catches the genuine
+    // everything-survives-into-a-full-old-gen death spiral.
+    let promoted = shared
+        .mem
+        .heap
+        .bytes_promoted_total()
+        .saturating_sub(before_promoted) as usize;
+    let freed = before_live
+        .saturating_sub(after_live)
+        .saturating_add(promoted);
     // unproductive: freed < 2% of capacity
     // Cast: numeric/representation conversion
     let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
@@ -1631,7 +1663,7 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
     };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
-            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
         );
     }
 }
@@ -34057,6 +34089,15 @@ fn compile_osr_artifact(
             }
 
             // Eagerly compile invokestatic callees (class_manager lock released)
+            //
+            // Every baked direct-call target must stay mapped until this caller
+            // is published, because publication is what roots them
+            // (`JitCache::prepare_for_publication` -> `_direct_callee_roots`).
+            // Dropping the callee `Arc` here would let a concurrent tier-up
+            // `put` unmap a body whose address is already baked into the
+            // machine code being emitted.
+            let mut baked_callee_pins: Vec<std::sync::Arc<cratonvm_jit::CompiledMethod>> =
+                Vec::new();
             for (ipc, callee_class, callee_method, callee_desc, param_count) in
                 pending_callee_compiles
             {
@@ -34069,7 +34110,8 @@ fn compile_osr_artifact(
                         &callee_desc,
                         true,
                     );
-                if let Some((entry, needs_ctx)) = compiled_callee {
+                if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
+                    baked_callee_pins.push(callee_pin);
                     if !crate::jit::jit_direct_call_requires_dispatch(
                         &callee_class,
                         &callee_method,
@@ -36583,13 +36625,26 @@ fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str)
 /// already-published body regardless of `optimize`, so a method is compiled at
 /// whatever tier reaches it *first* — there is no C1→C2 re-compile/supersede yet
 /// (that needs safe code-cache replacement; tracked as a follow-up).
+///
+/// # Why this returns the artifact and not just its entry address
+///
+/// [`JitCache::put`] REPLACES the body stored under a key. The superseded
+/// artifact's last `Arc` therefore drops, and `ExecutableBuffer::drop` unmaps
+/// its code. A caller holding only `entry_ptr()` is racing exactly that: every
+/// caller here either CALLs the address, publishes it into an inline cache, or
+/// bakes it into generated code, and all three keep using it long after this
+/// function returns. Handing back the `Arc` makes the address valid for as long
+/// as the caller keeps the binding alive — and, because
+/// `resolve_jit_entry_owner` can only succeed while the artifact lives, it is
+/// also what lets the inline-cache publications inside that window take their
+/// own keep-alive.
 pub fn try_jit_compile_callee(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     optimize: bool,
-) -> Option<(usize, bool)> {
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     use std::sync::atomic::Ordering;
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
@@ -36631,8 +36686,9 @@ pub fn try_jit_compile_callee(
         let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
             // Cast: object/code pointer to integer address
-            return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
-            // Cast: JIT entry point to address
+            let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
+            let needs_ctx = compiled.needs_context();
+            return Some((compiled, entry, needs_ctx));
         }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
@@ -36702,6 +36758,7 @@ pub fn try_jit_compile_callee(
 /// No two of {class_manager, flight_recorder, jit_cache} are ever held at once.
 /// GC itself takes none of these during STW (it scans deposited root snapshots),
 /// so the worker's transient holds only matter via the mutator-stall path above.
+#[allow(clippy::type_complexity)]
 fn try_jit_compile_callee_slow(
     shared: &SharedVm,
     class_name: &str,
@@ -36712,7 +36769,7 @@ fn try_jit_compile_callee_slow(
     // backend. Threaded into `jit::try_compile`'s trailing flag.
     optimize: bool,
     cache_negative: &mut bool,
-) -> Option<(usize, bool)> {
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     // RFJP.1 — never JIT a method whose declaring class transitively extends
     // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
     // miscompiles under deep recursion (returns 0 from depth ~10), and the
@@ -37200,8 +37257,6 @@ fn try_jit_compile_callee_slow(
         compiled.entry_ptr(),
         compiled.code_bytes(),
     );
-    let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
-    let needs_ctx = compiled.needs_context();
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -37283,18 +37338,29 @@ fn try_jit_compile_callee_slow(
         &method_desc_key,
         &mut compiled,
     );
-    {
-        let mut jit_cache = shared.jit.jit_cache.write();
+    let published = {
+        let jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(
-            receiver_key,
-            method_name_key,
-            method_desc_key,
+            receiver_key.clone(),
+            method_name_key.clone(),
+            method_desc_key.clone(),
             callee_class_id,
             compiled,
         );
-    }
-
-    Some((entry, needs_ctx))
+        // Read back a STRONG reference to what is now published under this key
+        // rather than returning the address we held before the `put`. If a
+        // concurrent publish won the race, this is its artifact — the live one
+        // — instead of one whose buffer is already being unmapped.
+        jit_cache.get(
+            &receiver_key,
+            &method_name_key,
+            &method_desc_key,
+            callee_class_id,
+        )
+    }?;
+    let entry = published.entry_ptr() as usize; // Cast: JIT entry point to address
+    let needs_ctx = published.needs_context();
+    Some((published, entry, needs_ctx))
 }
 
 /// wire-tiered-manager increment 2 — the REAL off-thread compile callback.

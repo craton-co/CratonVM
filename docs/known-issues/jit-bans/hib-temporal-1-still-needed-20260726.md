@@ -42,9 +42,11 @@ Re-ran with **only** `org/antlr/v4/runtime/` allowed (`org/hibernate/`
 still banned): all three test classes passed clean, 0 failures, matching
 baseline exactly. This isolates the `StrategySelectionException`
 corruption to `org/hibernate/` alone — see
-`docs/known-issues/hib-antlr-1-removed-shadowed-20260726.md` (or the
-in-line removal comment for HIB-ANTLR.1 in `skip_list.rs`) for that
-separate finding.
+`docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` for that separate
+finding, which was closed on 2026-07-27: `org/antlr/v4/runtime/` is no
+longer banned as a package at all (HIB-LONGTAIL.1's second prefix was
+dropped after a 57-class HQL A/B). HIB-TEMPORAL.1 is unaffected by that
+— it is a different package and still needed.
 
 ## Disposition
 

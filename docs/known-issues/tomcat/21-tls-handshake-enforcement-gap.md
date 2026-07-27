@@ -6,7 +6,7 @@ enforces a rejection condition too loosely (accepts a handshake HotSpot
 correctly refuses) or throws the wrong exception type for one.
 
 Reproduced consistently across two independent runs on the local Windows
-harness (`apps/tomcat`, `apps/tomcat-suite-runner`), `dev` tips ~60a710ad8
+harness (`../../../apps/tomcat`, `../../../apps/tomcat-suite-runner`), `dev` tips ~60a710ad8
 and ~12c79a0ee (250+ commits apart) — same symptoms both times, so this is
 not a transient/contention artifact.
 
@@ -72,6 +72,6 @@ automatically by `run-tomcat-suite.ps1` for `-Vm craton`). Compare against
 A concurrent session already fixed two unrelated `TestSsl` bugs this week
 (missing `SSLSocket.addHandshakeCompletedListener` native registration;
 `rustls_stream_read` not tolerating a peer closing without `close_notify`)
-— see `docs/internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md`.
+— see `../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md`.
 Neither explains `testSni`'s `400`-vs-`200` symptom above, which is a
 separate, still-open issue in the same class.

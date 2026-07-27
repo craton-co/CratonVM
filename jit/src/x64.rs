@@ -5460,10 +5460,40 @@ fn plan_scalar_replacement(
 /// passing the header would have the same defect. That is a pre-existing
 /// limitation of the pre-header placement contract, not one this predicate
 /// widens.
+/// Exception-handler edges (`exception_ranges`, as
+/// `(start_pc, end_pc, handler_pc)`) are not bytecode branches, so the edge
+/// decoding below cannot see them: the real edge is "any throwing instruction
+/// in `[start_pc, end_pc)` -> `handler_pc`", materialised by the runtime's
+/// exception dispatch. A handler landing inside a loop body is an entry into
+/// that loop and bypasses its pre-header exactly as a `goto` into the header
+/// does — but only when it can be reached from OUTSIDE the loop, which is why
+/// the predicate also requires the protected range to escape `[header,
+/// loop_end)`. A range lying wholly inside the loop is sound and keeps its
+/// hoist (the throw can only have happened after the header was entered, so
+/// the pre-header already ran) — that is the shape javac emits for the common
+/// `while (…) { try { … } catch { … } }`.
+///
+/// **This handler clause is currently unreachable and is pre-emptive.** A
+/// method with a non-empty exception table is not admitted to this backend at
+/// all, so `exception_ranges` is empty in every production compile today and
+/// the codegen is byte-identical. Measured on dev `d134f7104` with
+/// `CRATONVM_DBG_DUMP_JIT=LIST`: `LicmEntryProbe.shapeA/shapeB` (no handlers)
+/// are listed as compiled; `TryCatchHot.f` (try/catch in a hot loop, 200 000
+/// calls) and `HandlerLoopProbe.shape` (400 000 calls) are not. It is written
+/// now because that admission gate has already been relaxed once (RBC.6
+/// admitted explicit `athrow`) and the hazard is silent when it goes live — a
+/// wrong loop bound, or a speculative-BCE guard elided but never run.
+/// `docs/known-issues/repros/jit-licm-handler-edge/` holds the dormant
+/// witness: an ASM generator for a shape javac cannot express (handler inside
+/// the loop, protected range entirely before it, normal path falling *through*
+/// into the header so no branch edge exists for the rule above to catch), plus
+/// a driver that alternates both entries. Run it first if that gate is ever
+/// relaxed.
 fn find_bypassable_loop_headers(
     code: &[u8],
     code_len: usize,
     loops: &[(usize, usize)],
+    exception_ranges: &[(usize, usize, usize)],
 ) -> FxHashSet<usize> {
     let mut bypassable: FxHashSet<usize> = FxHashSet::default();
     if loops.is_empty() {
@@ -5597,6 +5627,30 @@ fn find_bypassable_loop_headers(
             let target_inside = target >= header && target < loop_end;
             let src_inside = src >= header && src < loop_end;
             if target_inside && !src_inside {
+                bypassable.insert(header);
+                break;
+            }
+        }
+        // Exception-handler edges are NOT bytecode branches, so the decoding
+        // above cannot see them: the real edge is "any throwing instruction in
+        // `[start_pc, end_pc)` -> `handler_pc`", materialised by the runtime's
+        // exception dispatch. A handler that lands inside this loop's body is
+        // therefore an entry into the loop, and it bypasses the pre-header for
+        // exactly the same reason a `goto` into the header does.
+        //
+        // The predicate is the same one used for branch edges — an entry whose
+        // SOURCE is outside the loop — with the throwing site standing in for
+        // the branch source. A protected range lying wholly inside the loop is
+        // sound and keeps its hoist: the throw can only have happened after
+        // the header was entered, so the pre-header had already run. That is
+        // precisely the shape javac emits for the common
+        // `while (…) { try { … } catch { … } }`, so this costs nothing there.
+        // A range reaching before the header (or past the loop) can deliver
+        // control into the body from code the pre-header never covered.
+        for &(start_pc, end_pc, handler_pc) in exception_ranges {
+            let handler_inside = handler_pc >= header && handler_pc < loop_end;
+            let range_escapes = start_pc < header || end_pc > loop_end;
+            if handler_inside && range_escapes {
                 bypassable.insert(header);
                 break;
             }
@@ -28553,6 +28607,15 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static PENDING_VERIFIED_MAX_STACK: std::cell::RefCell<Option<usize>> =
         const { std::cell::RefCell::new(None) };
+    /// `(start_pc, end_pc, handler_pc)` of this method's exception table,
+    /// staged for the next `compile_with_param_slots` on this thread and
+    /// consumed (taken) at its entry, so a compile that bails out cannot leak
+    /// them into the next method compiled on this worker. Empty for every
+    /// caller that does not stage them (tests, AOT, the legacy `compile`
+    /// wrapper, OSR artifacts) and for every handler-free method — byte
+    /// identical codegen there. See `find_bypassable_loop_headers`.
+    static PENDING_EXCEPTION_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Stage the compact-field-info for the next [`compile`] call on this thread.
@@ -28565,6 +28628,15 @@ pub fn set_pending_compact_field_info(info: Vec<(usize, u32, bool)>) {
 /// Synthetic callers that do not stage it keep using the local estimator.
 pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
     PENDING_VERIFIED_MAX_STACK.with(|c| *c.borrow_mut() = Some(max_stack));
+}
+
+/// Stage this method's exception table as `(start_pc, end_pc, handler_pc)` for
+/// the next x64 compile on this thread. Call immediately before
+/// `compile_with_param_slots`; it takes (clears) them. Consumed only by
+/// `find_bypassable_loop_headers`, to treat a handler that can be entered from
+/// outside a loop as an external entry into that loop's header.
+pub(crate) fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
+    PENDING_EXCEPTION_RANGES.with(|c| *c.borrow_mut() = ranges);
 }
 
 /// Compile a JVM bytecode method to x86-64 machine code.
@@ -28722,6 +28794,11 @@ pub fn compile_with_param_slots(
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
+    // One-shot like every other staged request below: take it here so an early
+    // bail cannot leak this method's handler ranges into an unrelated later
+    // compile on this worker thread.
+    let exception_ranges: Vec<(usize, usize, usize)> =
+        PENDING_EXCEPTION_RANGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
     // Consume the pure-kernel GPR local-homes request FIRST so an early bail
     // below can never leak it into an unrelated later compile on this thread.
     let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
@@ -28805,7 +28882,8 @@ pub fn compile_with_param_slots(
     // every speculating transform for such headers — see
     // `find_bypassable_loop_headers` for the full derivation and the
     // `AttributesImpl.ensureCapacity` witness.
-    let bypassable_headers = find_bypassable_loop_headers(code, code_len, &loops);
+    let bypassable_headers =
+        find_bypassable_loop_headers(code, code_len, &loops, &exception_ranges);
     let hoist_info =
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
             Vec::new()
@@ -36547,7 +36625,7 @@ mod tests {
         ];
         let loops = detect_loops(code, code.len());
         assert_eq!(loops, vec![(2, 10)], "expected one loop with header 2");
-        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops);
+        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops, &[]);
         assert!(
             bypassable.is_empty(),
             "a fall-through-only loop header must keep its pre-header, got {bypassable:?}"
@@ -36571,6 +36649,75 @@ mod tests {
     ///                     15: iconst_5      24: goto 13
     ///                     16: imul          27: iload_2 / 28: ireturn
     /// ```
+    #[test]
+    fn handler_reachable_from_outside_a_hoisted_loop_is_bypassable() {
+        // A plain counted loop whose only non-back-edge predecessor is the
+        // fall-through, so it is NOT bypassable on branch edges alone — every
+        // difference below comes from the exception table.
+        //
+        //  0: iconst_0
+        //  1: istore_2
+        //  2: iload_2            <-- loop header
+        //  3: iload_1
+        //  4: if_icmpge +13 -> 17
+        //  7: iload_0
+        //  8: iconst_3
+        //  9: imul
+        // 10: istore_3           (loop-invariant run, the hoist candidate)
+        // 11: iinc 2, 1
+        // 14: goto -12 -> 2      <-- back edge; loop body is [2, 17)
+        // 17: iload_2
+        // 18: ireturn
+        let code: &[u8] = &[
+            0x03, 0x3D, // iconst_0; istore_2
+            0x1C, 0x1B, 0xA2, 0x00, 0x0D, // iload_2; iload_1; if_icmpge -> 17
+            0x1A, 0x06, 0x68, 0x3E, // iload_0; iconst_3; imul; istore_3
+            0x84, 0x02, 0x01, // iinc 2,1
+            0xA7, 0xFF, 0xF4, // goto -> 2
+            0x1C, 0xAC, // iload_2; ireturn
+        ];
+        let loops = detect_loops(code, code.len());
+        assert_eq!(
+            loops,
+            vec![(2, 14)],
+            "expected exactly one natural loop with header 2"
+        );
+
+        // No exception table: single-entry header keeps its pre-header.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[]).is_empty(),
+            "a single-entry counted loop must not be reported bypassable"
+        );
+
+        // try/catch wholly INSIDE the loop body — the common javac shape for
+        // `while (…) { try { … } catch { … } }`. The throw can only happen
+        // after the header was entered, so the pre-header already ran: sound,
+        // and the hoist must be KEPT (this is the no-regression half).
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(7, 11, 10)]).is_empty(),
+            "a protected range wholly inside the loop must keep its hoist"
+        );
+
+        // Protected range starts BEFORE the header: a throw from pre-loop code
+        // delivers control into the body without the pre-header having run.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(0, 11, 7)]).contains(&2),
+            "a handler reachable from before the loop bypasses the pre-header"
+        );
+
+        // Protected range extends PAST the loop: same hazard from the far side.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(7, 19, 7)]).contains(&2),
+            "a handler reachable from after the loop bypasses the pre-header"
+        );
+
+        // Handler outside the loop entirely — irrelevant, keep the hoist.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(0, 19, 17)]).is_empty(),
+            "a handler outside the loop must not drop the hoist"
+        );
+    }
+
     #[test]
     fn forward_goto_into_loop_header_is_bypassable() {
         let code: &[u8] = &[
@@ -36602,7 +36749,7 @@ mod tests {
             !find_arith_loop_hoists(code, code.len(), &loops).is_empty(),
             "expected arith-LICM to match the `n * 5` run at this header"
         );
-        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops);
+        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops, &[]);
         assert!(
             bypassable.contains(&13),
             "header 13 is entered by the forward `goto` at pc 7 and must be \
