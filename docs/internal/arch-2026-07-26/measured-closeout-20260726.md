@@ -138,22 +138,26 @@ denies deprecated APIs, the all-feature check passes, and the release warning
 count is zero. Verification and rationale are in
 `docs/internal/loader-blind-class-lookup-fixed-20260726.md`.
 
-### P0: collapse the two interpreter semantic implementations
+### P0: collapse the package-selected interpreter implementations — fixed
 
-`interpreter.rs` contains two dispatch paths and routes many Spring/JDK classes
-to the slower one by class-name policy. Quickening is no longer the issue:
+The audited `interpreter.rs` routed many Spring/JDK classes to the decoded
+fallback by class-name policy. Quickening was not the issue:
 `QuickenedCode::resolve` uses an instruction-start bitmap, per-block cumulative
 counts, and popcount for O(1) PC mapping.
 
-The paired probe makes the remaining design visible: identical bytecode becomes
-substantially slower in CratonVM merely by moving it under
-`org.springframework.*`; HotSpot does not exhibit that class-name distinction.
+Resolved on `codex/complete-architecture-remediation-20260726`: package names
+no longer select execution policy, the `Frame::is_jdk_class` field and prefix
+classifier are removed, and every verified class uses the raw-byte handlers
+with unsupported/guarded cases falling through to the decoded handler.
 
-Create one authoritative opcode semantic layer. Generate direct-threaded,
-checked/debug, and specialized/superinstruction forms from those handlers.
-Move compatibility workarounds to explicit method capabilities or a narrow
-denylist with a reason, owner, and expiry test. Package names must never select
-the VM's fundamental execution engine.
+The migration also closed semantic drift found during the change: both paths
+now use heap-validated reference coercion and identical `aastore` recovery,
+and raw-byte returns emit the JVMTI `MethodExit` event that only decoded
+returns emitted before. A verifier-on/raw versus `--noverify`/decoded
+differential probe has identical output. The original two-million-iteration
+paired probe changed from 0.59s default / 1.47s Spring to 0.55s / 0.56s with
+the same checksum. Details are in
+`docs/internal/interpreter-package-routing-fixed-20260727.md`.
 
 ### P0: make roots an owned subsystem before moving objects by default
 

@@ -15,6 +15,16 @@ The Java runner measures:
 - preallocated exception throw/catch, uncontended monitor, and native-call
   boundary costs.
 
+`check-interpreter-equivalence-20260727.sh` additionally runs an opcode-rich
+kernel through the verified raw-byte path and the `--noverify` decoded
+fallback and requires byte-identical output:
+
+```bash
+tools/architecture-probe-20260726/check-interpreter-equivalence-20260727.sh \
+  /data/data/bin/cratonvm-complete-remediation-20260726-r3 \
+  /home/victor/jdk25
+```
+
 Every case runs in a fresh process, pins one CPU, alternates HotSpot and
 CratonVM within each repetition, and records the checksum. Runs are invalid if
 deterministic checksums differ.

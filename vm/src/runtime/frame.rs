@@ -233,7 +233,7 @@ impl std::fmt::Debug for FrameInner {
 /// fits in the first ~128 bytes (~2 cache lines on x86-64) and cold metadata
 /// trails after them. Per-opcode hot reads/writes hit `class_id`, `pc`,
 /// `last_instr_pc`, `locals`, `stack`, `code`, `max_stack`, `max_locals`,
-/// `is_jdk_class`, and `backward_count`. Cold-only state (the
+/// and `backward_count`. Cold-only state (the
 /// `FrameInner` metadata enum, the OSR backoff vector, the synchronized
 /// monitor-on-exit slot) is placed *after* the hot region so the dispatch
 /// loop's frame load doesn't drag those bytes into L1.
@@ -291,12 +291,6 @@ pub struct Frame {
     /// Incremented on each backward branch; triggers JIT when exceeding threshold.
     /// Hot — bumped on every back-edge of every loop in the interpreter.
     pub backward_count: u32,
-
-    /// T14: Set to true for methods from real JDK classes (java/*, jdk/*, sun/*).
-    /// Used to skip the fast-path interpreter which uses pop_unchecked and may
-    /// panic on bytecode patterns not handled by the fast path.
-    /// Hot — checked once per `execute_frame` entry.
-    pub is_jdk_class: bool,
 
     /// Per-frame-instance unique id, used ONLY by the opt-in root-snapshot
     /// cache (`CRATONVM_ROOTSNAP_CACHE`). A frame still present at index `k`
@@ -796,97 +790,6 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
     }
 }
 
-/// T14 — The interpreter's raw-bytecode super-instruction loop is tuned for
-/// synthetic classfiles and uses `pop_unchecked` / `set_local_unchecked` at
-/// sites that assume verifier-narrow stack shapes. Real JDK packages and
-/// Spring Framework (`org.springframework.*`) routinely mix reference returns
-/// from `invokevirtual` with `astore`/`checkcast` sequences where the fast
-/// path can diverge from the spec-correct slow path (Letsgo no-JIT AV
-/// immediately after `ConfigurationClassEnhancer.enhance` returns at
-/// `ConfigurationClassPostProcessor.enhanceConfigurationClasses` + `astore`).
-///
-/// When this returns `true`, `execute_frame` skips the fast path and uses
-/// full `Instruction::decode` dispatch (`is_jdk_class` on [`Frame`]).
-///
-/// The whitelist below re-admits two well-trodden sub-trees —
-/// `java/util/*` collection classes and the pure-math `java/lang/Math` /
-/// `StrictMath` — which were stress-tested against the super-instruction
-/// loop without regressions during round-4-wave-2 perf work. Everything
-/// else in the JDK / Spring prefixes stays on the slow path.
-///
-/// ## Why this is still a prefix check (2026-07-25 audit)
-///
-/// An earlier TODO here proposed replacing the prefix test with a
-/// per-method `unsafe_for_fast_path` flag computed at install/verification
-/// time, on the theory that the gate exists to protect the fast path's
-/// `pop_unchecked` / `set_local_unchecked` / `push_*_unchecked` sites from
-/// stack shapes the verifier would have ruled out. **That theory does not
-/// survive an audit of those helpers**, so the flag cannot replace this
-/// check:
-///
-/// * Their preconditions are exactly `stack.len >= 1` (pop), `stack.len <
-///   max_size` (push), and `index < locals.len()` (locals). None of them
-///   use `get_unchecked`; every one indexes a `Vec`, so a violation is a
-///   bounds panic caught by the `catch_unwind` in `execute_frame_impl`,
-///   never a memory-safety hazard.
-/// * All three preconditions are *already implied* by successful
-///   type-checking verification — the verifier proves the operand-stack
-///   depth and every local index at every pc, and the runtime stack is
-///   strictly shallower than `max_stack` because a category-2 value
-///   occupies one runtime slot where the verifier models two. So a
-///   verification-derived flag would be `false` for essentially every JDK
-///   and Spring method, i.e. it would re-enable the fast path everywhere
-///   the deny list currently blocks it.
-///
-/// What actually keeps the JDK / Spring prefixes off the fast path is that
-/// the fast path and `execute_instruction` are two independently-maintained
-/// implementations that **differ per opcode**, and the differences are not
-/// a property any verifier can certify. Concrete live examples:
-///
-/// * `astore_<n>`: the slow path applies `coerce_value_for_return(v, b'L')`
-///   unconditionally; the fast path applies the *different*
-///   `coerce_value_for_return_validated` and only when the popped slot is
-///   `CompactTag::Long`, storing the raw `CompactValue` otherwise.
-/// * the array-load family (`iaload`..`saload`): the slow path has
-///   per-opcode element typing and JEP-358 helpful-NPE message
-///   construction; the fast path handles all eight opcodes with one
-///   untyped `get_array_element` and re-pushes to fall through when the
-///   shape does not match.
-///
-/// Closing this properly means proving per-opcode equivalence between the
-/// two implementations (or collapsing them into one), not computing a
-/// stack-shape flag. Until then the prefix check stays, and it stays as a
-/// *fallback* for the classes that skip verification entirely
-/// (`-Xverify:none`, per-class `DefineClassOptions::skip_verification`),
-/// where even the unchecked-helper preconditions are unproven.
-#[inline]
-pub(crate) fn class_disables_interp_fast_path(class_name: &str) -> bool {
-    // Whitelist sub-trees that have been validated as fast-path-safe.
-    // These are checked before the broader exclusion so the negation
-    // wins for the well-trodden collection / math hot paths.
-    if class_name.starts_with("java/util/")
-        // Math + StrictMath: pure arithmetic, no invoke-bridge calls.
-        || class_name == "java/lang/Math"
-        || class_name == "java/lang/StrictMath"
-        || class_name.starts_with("java/lang/Math$")
-        || class_name.starts_with("java/lang/StrictMath$")
-    {
-        return false;
-    }
-    class_name.starts_with("java/")
-        || class_name.starts_with("jdk/")
-        || class_name.starts_with("sun/")
-        || class_name.starts_with("com/sun/")
-        // round-7 HIGH: `contains("springframework")` was O(name-len) per
-        // Frame::new (every method call). Real Spring class names are always
-        // rooted at `org/springframework/...` (or `org/springframework$Cglib...`
-        // proxy variants — both share the package prefix), so a prefix test
-        // is O(20) regardless of class-name length and matches the same set
-        // in practice.
-        || class_name.starts_with("org/springframework/")
-        || class_name.starts_with("org/springframework$")
-}
-
 /// CRIT-PERF cap: after this many failed OSR attempts for a single entry
 /// PC we stop retrying — the loop is presumably uncompilable.  Matches the
 /// effective behaviour of the round-4 wave-1 permanent-ban Vec for hot
@@ -962,7 +865,6 @@ impl Frame {
     ) -> Self {
         let (locals, local_kinds, eff_max_locals) =
             init_locals_from_parts(max_locals, args, tls_pop_locals());
-        let is_jdk = class_disables_interp_fast_path(&*class_name);
         let code = padded_bytecode_for_method(class_id, &method_name, &method_descriptor, &code);
         Self {
             class_id,
@@ -987,7 +889,6 @@ impl Frame {
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
-            is_jdk_class: is_jdk,
             seq: next_frame_seq(),
             exec_epoch: 0,
         }
@@ -1039,7 +940,6 @@ impl Frame {
         );
         let (locals, local_kinds, eff_max_locals) =
             init_locals_from_parts(max_locals, args, tls_pop_locals());
-        let is_jdk = class_disables_interp_fast_path(&*class_name);
         Self {
             class_id,
             pc: 0,
@@ -1062,7 +962,6 @@ impl Frame {
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
-            is_jdk_class: is_jdk,
             seq: next_frame_seq(),
             exec_epoch: 0,
         }
@@ -1092,7 +991,6 @@ impl Frame {
         } else {
             ValueStack::new(padded_max)
         };
-        let is_jdk = class_disables_interp_fast_path(&*class_name);
         Self {
             class_id,
             pc: 0,
@@ -1115,7 +1013,6 @@ impl Frame {
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
-            is_jdk_class: is_jdk,
             seq: next_frame_seq(),
             exec_epoch: 0,
         }
@@ -1141,7 +1038,6 @@ impl Frame {
         let class_id = cached.declaring_class_id;
         let code = cached.code.clone();
         let max_stack = cached.max_stack;
-        let is_jdk = class_disables_interp_fast_path(cached.class_name.as_ref());
         Self {
             class_id,
             pc: 0,
@@ -1163,7 +1059,6 @@ impl Frame {
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
-            is_jdk_class: is_jdk,
             seq: next_frame_seq(),
             exec_epoch: 0,
         }
@@ -1193,8 +1088,6 @@ impl Frame {
         self.max_stack = max_stack;
         let eff_max_locals = effective_max_locals(max_locals, args);
         self.max_locals = eff_max_locals;
-        // Update is_jdk_class for correct fast/slow path dispatch
-        self.is_jdk_class = class_disables_interp_fast_path(class_name.as_ref());
         // Update inner metadata so class_name(), method_name(), exception_table() are correct
         self.inner = FrameInner::Owned {
             class_name,
@@ -1790,7 +1683,6 @@ impl Frame {
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
-            is_jdk_class: false,
             seq: next_frame_seq(),
             exec_epoch: 0,
         }

@@ -7333,16 +7333,16 @@ pub fn execute(
     //
     // NOTE(round-4-wave-3): the per-method `catch_unwind` here is load-bearing
     // and intentionally retained. The interpreter's super-instruction fast
-    // path uses `pop_unchecked` / `set_local_unchecked` (see `frame.rs`
-    // `class_disables_interp_fast_path`) which panic on stack-shape mismatches
-    // that some JDK / Spring bytecode legitimately produces. Without this
+    // path uses `pop_unchecked` / `set_local_unchecked`, which can panic if a
+    // malformed or bridge-corrupted frame violates verified stack shapes.
+    // Without this
     // catch_unwind, those panics would propagate past the JIT entry frame and
     // abort the process under the Windows SEH / signal-handler interop in
     // `runtime/signals.rs` (the signal handler converts SIGSEGV / SIGFPE via
     // `catch_unwind`, but a Rust panic crossing the JIT-call boundary is not
-    // catchable by the OS unwinder). The narrowed fast-path gate in
-    // `class_disables_interp_fast_path` shrinks the panic-prone surface; the
-    // `catch_unwind` here is the final guard. The ~10 ns setup cost is
+    // catchable by the OS unwinder). Global `-Xverify:none` disables the raw
+    // handlers; this `catch_unwind` remains the final guard for trusted
+    // per-class verification bypasses and corrupted bridge state. The ~10 ns setup cost is
     // amortized over the entire `execute_frame` invocation — hundreds to
     // thousands of bytecodes — not per-bytecode.
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -8185,11 +8185,13 @@ fn execute_frame_from_index(
         // Pre-read opcode + 2 operand bytes to avoid borrow conflicts with frame.
         // Bytecode is padded with 2 trailing zero bytes, so pc+1 and pc+2 are always
         // safe to read when pc is within the original (unpadded) code region.
-        // T14: Skip the fast path for real JDK classes. The fast path was tuned
-        // for synthetic bytecode and uses pop_unchecked which panics on
-        // unexpected stack states. Real JDK bytecode can produce patterns
-        // (e.g. long/double on stack where int expected) that the fast path
-        // doesn't handle. The slow path uses pop() with proper error handling.
+        // The raw-bytecode handlers are the common interpreter path for every
+        // verified class. Package names are not execution-policy inputs: the
+        // old java/jdk/sun/Spring deny-list made identical bytecode select a
+        // second implementation with different semantics and ~2.7x lower
+        // throughput. Unsupported opcodes and guarded edge cases still fall
+        // through to the shared decoded handler below.
+        //
         // H7: the fast-path local-access handlers (lload/dload, istore/fstore,
         // astore, lstore/dstore — and the `_unchecked` get/set helpers used by
         // the iload/iadd/etc. fusions) index `frame.locals` with the raw
@@ -8205,8 +8207,7 @@ fn execute_frame_from_index(
         // load — no per-instruction RwLock acquire.
         // SAFETY (every `hot_fp` deref below): see the hoist note above —
         // reads only, no push, no `&mut` reborrow of the stack in between.
-        let is_jdk_class = unsafe { (*hot_fp).is_jdk_class };
-        let use_fast_path = !is_jdk_class && !shared.config.skip_verification;
+        let use_fast_path = !shared.config.skip_verification;
         // Explicit `&` on the place expression: calling `.len()` directly on
         // `(*hot_fp).code` autorefs through the raw pointer, which the
         // `dangerous_implicit_autorefs` lint denies. The borrow is confined to
@@ -8946,7 +8947,7 @@ fn execute_frame_from_index(
                     // collision-shaped long return keeps its high bits.
                     let value = if opcode == 0xb0 {
                         let ret = crate::jit::return_type(frame.method_descriptor());
-                        coerce_value_for_return(cv.to_value(), ret)
+                        coerce_value_for_return_validated(shared, cv.to_value(), ret)
                     } else {
                         decode_arg_kind_aware(cv, is_long, desc_byte)
                     };
@@ -9028,6 +9029,17 @@ fn execute_frame_from_index(
                             eprintln!("[SBF-RET] {}.{} -> {:?}{}", cn, mn, value, extra);
                         }
                     }
+                    // Keep the raw-byte and decoded return handlers
+                    // observationally identical for JVMTI. The package gate
+                    // previously hid this missing MethodExit event for most
+                    // JDK/Spring frames.
+                    let return_value = Some(value);
+                    let _ = frame;
+                    fire_jvmti_method_exit_normal(
+                        thread,
+                        &thread.frames[frame_idx],
+                        &return_value,
+                    );
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent.
                         pop_and_recycle_frame(shared, thread);
@@ -9062,6 +9074,8 @@ fn execute_frame_from_index(
                 }
                 // return (void)
                 0xb1 => {
+                    let _ = frame;
+                    fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &None);
                     if frame_idx > initial_frame_idx {
                         pop_and_recycle_frame(shared, thread);
                         frame_idx -= 1;
@@ -10058,14 +10072,18 @@ fn execute_frame_from_index(
                 }
                 // aastore (0x53) — needs SATB pre-barrier + write barrier
                 0x53 => {
-                    let raw_value = coerce_value_for_return(frame.stack.pop_unchecked(), b'L');
+                    let raw_value = coerce_value_for_return_validated(
+                        shared,
+                        frame.stack.pop_unchecked(),
+                        b'L',
+                    );
                     // A valid `aastore` always receives a reference.  A few
                     // native/reflection bridges can nevertheless surface a raw
                     // primitive at this boundary (notably serialization's
                     // primitive field path).  Do the Java boxing here, while
                     // the executing thread is still available, instead of
                     // letting the GC manufacture an untyped AUTOBOX sentinel.
-                    let value = box_aastore_value_fast(shared, raw_value);
+                    let value = normalize_aastore_value(shared, raw_value);
                     // Round-3: typed int pop for the array index.
                     let index = frame.stack.pop_int_unchecked();
                     let arr_val = frame.stack.pop_unchecked();
@@ -13989,7 +14007,11 @@ fn execute_instruction(
             // keep raw bits and the next `if_acmpeq` / `invokevirtual` can AV
             // (Letsgo after `ConfigurationClassEnhancer.enhance` in
             // `ConfigurationClassPostProcessor.enhanceConfigurationClasses`).
-            let v = coerce_value_for_return(thread.frames[frame_idx].get_local(*idx), b'L');
+            let v = coerce_value_for_return_validated(
+                shared,
+                thread.frames[frame_idx].get_local(*idx),
+                b'L',
+            );
             thread.frames[frame_idx].stack.push(v)?;
         }
 
@@ -14077,7 +14099,7 @@ fn execute_instruction(
         // fast path `astore_*` / `0x3a` already use `coerce_value_for_return`).
         Instruction::Astore(idx) => {
             let v = thread.frames[frame_idx].stack.pop()?;
-            let coerced = coerce_value_for_return(v, b'L');
+            let coerced = coerce_value_for_return_validated(shared, v, b'L');
             thread.frames[frame_idx].set_local(*idx, coerced);
         }
         Instruction::Lstore(idx) => {
@@ -14101,9 +14123,14 @@ fn execute_instruction(
         Instruction::Aastore => {
             // Reference array store — needs write barrier for generational GC
             // Mirror fast-path 0x53: JNI / invoke bridges may leave jobject bits as
-            // `Value::Long` on the stack; Spring (`is_jdk_class`) uses this slow path.
-            let raw_value = coerce_value_for_return(thread.frames[frame_idx].stack.pop()?, b'L');
-            let value = box_aastore_value(shared, thread, raw_value)?;
+            // `Value::Long` on the stack; both decoded and raw handlers now use
+            // the same validated normalization.
+            let raw_value = coerce_value_for_return_validated(
+                shared,
+                thread.frames[frame_idx].stack.pop()?,
+                b'L',
+            );
+            let value = normalize_aastore_value(shared, raw_value);
             let index = thread.frames[frame_idx].stack.pop_int()?;
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
@@ -14983,7 +15010,7 @@ fn execute_instruction(
         Instruction::Areturn => {
             let v = thread.frames[frame_idx].stack.pop()?;
             let ret = crate::jit::return_type(thread.frames[frame_idx].method_descriptor());
-            let v = coerce_value_for_return(v, ret);
+            let v = coerce_value_for_return_validated(shared, v, ret);
             let rv = Some(v);
             fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &rv);
             return Ok(InstructionResult::Return(rv));
@@ -16065,14 +16092,9 @@ fn execute_instruction(
 
         // -- Method invocation (slow path) --
         //
-        // PERF FIX (2026-07-15, RequestMappingMessageConversionIntegrationTests
-        // pathological slowness): this `Instruction::decode`-driven path is what
-        // ALL bytecode from `is_jdk_class` frames runs through, because the
-        // raw-byte-peek fast dispatch loop at the top of `execute_frame` is
-        // gated off for JDK-internal classes (`use_fast_path =
-        // !is_jdk_class && ...`, T14 comment above) — that gate exists because
-        // some of the fast loop's opcode fusions (iload/istore/iadd etc.) use
-        // truly-unchecked stack pops tuned for synthetic bytecode shapes.
+        // Decoded fallback for opcodes and guarded edge cases not handled by
+        // the common raw-byte loop. This is no longer selected by class-name
+        // prefix: identical bytecode executes through identical handlers.
         // The monomorphic `InvokeCache` consulted by `execute_invokevirtual_cached`
         // does NOT share that risk: its arg decode already goes through
         // `pop_arg_for_descriptor_checked` (descriptor-aware, checked), and a
@@ -22660,32 +22682,11 @@ fn widen_unboxed_primitive(target: char, value: Value) -> Value {
 ///
 /// The verifier guarantees an object reference at this opcode, but native and
 /// reflective bridges can expose an unboxed primitive despite an `Object`
-/// return descriptor.  Reference-array storage must materialize a real Java
-/// wrapper in that case: the GC's compact-reference-array fallback is an
-/// internal sentinel, not a Java object that reflection or serialization may
-/// inspect with `getClass()`.
-fn box_aastore_value(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-    value: Value,
-) -> Result<Value, MethodCallFailed> {
-    match value {
-        Value::Object(_) | Value::Uninitialized | Value::ReturnAddress(_) => Ok(value),
-        Value::Int(_) => box_primitive(shared, thread, 'I', value),
-        Value::Long(_) => box_primitive(shared, thread, 'J', value),
-        Value::Float(_) => box_primitive(shared, thread, 'F', value),
-        Value::Double(_) => box_primitive(shared, thread, 'D', value),
-    }
-}
-
-/// Fast-interpreter counterpart of [`box_aastore_value`].
-///
-/// The bytecode dispatch loop holds a mutable borrow of its current frame, so
-/// it cannot recursively invoke `valueOf`.  Allocate the same real wrapper
-/// layout directly instead.  This is deliberately only the recovery path for
-/// a value that was already invalid at the verifier boundary; ordinary Java
-/// boxing continues through `valueOf` and retains its cache semantics.
-fn box_aastore_value_fast(shared: &SharedVm, value: Value) -> Value {
+/// return descriptor. The common fast and decoded handlers both use this
+/// allocation-only recovery helper, so package selection cannot change
+/// wrapper identity or layout. Ordinary Java boxing still goes through
+/// `valueOf` and retains its cache semantics.
+fn normalize_aastore_value(shared: &SharedVm, value: Value) -> Value {
     let (class_name, payload) = match value {
         Value::Int(_) => ("java/lang/Integer", value),
         Value::Long(_) => ("java/lang/Long", value),
@@ -42838,8 +42839,8 @@ mod wave1_adoption_tests {
         )
     }
 
-    /// The preamble and dispatch hoists read `pc`, `last_instr_pc`,
-    /// `is_jdk_class` and `code` through a raw `*mut Frame` instead of
+    /// The preamble and dispatch hoists read `pc`, `last_instr_pc` and `code`
+    /// through a raw `*mut Frame` instead of
     /// re-indexing. Pin the two properties that makes sound: the pointer
     /// addresses the same frame indexing would, and a region that performs no
     /// push cannot relocate it (`reloc_epoch` unchanged).
@@ -42857,7 +42858,6 @@ mod wave1_adoption_tests {
         // Everything the hoisted region reads must match indexing.
         unsafe {
             assert_eq!((*fp).pc, frames[frame_idx].pc);
-            assert_eq!((*fp).is_jdk_class, frames[frame_idx].is_jdk_class);
             // Explicit `&` — see the note at the `padded_code_len` read: an
             // implicit autoref through a raw pointer is denied by
             // `dangerous_implicit_autorefs`.
