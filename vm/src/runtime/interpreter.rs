@@ -1124,6 +1124,32 @@ pub(crate) fn nret_find(addr: usize) -> Vec<(usize, usize, String)> {
     })
 }
 
+/// Finalizable roots every collection must seed, whichever path runs it.
+///
+/// Two disjoint sets, both of which the collector would otherwise miss:
+///
+///   * `ref_processor.finalizer_referent_addresses()` — registered
+///     finalizables not yet claimed. Only the `System.gc` path used to pass
+///     these; the ordinary allocation-driven collections below passed `&[]`.
+///   * `finalizer_thread.pending_addresses()` — objects already claimed and
+///     queued, waiting for `finalize()` to actually run. `mark_finalizer_enqueued`
+///     deliberately drops these from the first list, so nothing else roots
+///     them, yet the queue keeps only a raw address. `run_finalizers` also
+///     bails out early whenever a JIT borrow is live, which routinely leaves
+///     entries queued across several collections — a wide window in which a
+///     non-moving young sweep frees the object and leaves the queue pointing
+///     at reclaimed memory (SEGV in `run_finalizers`' `class_id_of`).
+fn finalizable_roots(shared: &SharedVm) -> Vec<usize> {
+    let mut addrs = {
+        let rp = shared.mem.ref_processor.lock();
+        rp.finalizer_referent_addresses()
+    };
+    addrs.extend(shared.mem.finalizer_thread.pending_addresses());
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
 pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
@@ -1186,11 +1212,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result =
-                shared
-                    .mem
-                    .heap
-                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let fin_roots = finalizable_roots(shared);
+            let result = shared
+                .mem
+                .heap
+                .collect_garbage_with_finalizers(
+                    &stw,
+                    &mut roots,
+                    &fin_roots,
+                    &shared.threads.monitors,
+                )
+                .0;
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
@@ -1388,11 +1420,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
                 weakref_null_referents_pre_gc(shared);
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-                let result =
-                    shared
-                        .mem
-                        .heap
-                        .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+                let fin_roots = finalizable_roots(shared);
+                let result = shared
+                    .mem
+                    .heap
+                    .collect_garbage_with_finalizers(
+                        &stw,
+                        &mut roots,
+                        &fin_roots,
+                        &shared.threads.monitors,
+                    )
+                    .0;
                 process_references_after_gc(shared, &result.pointer_map);
 
                 // Update shared VM state (statics, string pool, etc.)
@@ -1514,10 +1552,17 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+        let fin_roots = finalizable_roots(shared);
         let result = shared
             .mem
             .heap
-            .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            .collect_garbage_with_finalizers(
+                &stw,
+                &mut roots,
+                &fin_roots,
+                &shared.threads.monitors,
+            )
+            .0;
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(&result.pointer_map);
@@ -1566,11 +1611,17 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                                     // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result =
-                shared
-                    .mem
-                    .heap
-                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let fin_roots = finalizable_roots(shared);
+            let result = shared
+                .mem
+                .heap
+                .collect_garbage_with_finalizers(
+                    &stw,
+                    &mut roots,
+                    &fin_roots,
+                    &shared.threads.monitors,
+                )
+                .0;
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: remap the ec_watch corruption-watch table across this
@@ -1719,10 +1770,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     mtroots_dump_initiator(shared, thread, 1);
 
     // Snapshot finalizable object addresses so the GC can resurrect dead ones
-    let fin_addrs: Vec<usize> = {
-        let rp = shared.mem.ref_processor.lock();
-        rp.finalizer_referent_addresses()
-    };
+    let fin_addrs: Vec<usize> = finalizable_roots(shared);
 
     let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
