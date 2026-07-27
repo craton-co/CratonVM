@@ -35,11 +35,11 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [25](25-charchunk-tostring-null-vs-empty.md) | `CharChunk.toString()` returns `""` not `null` when empty/recycled | TestCharChunk | FAIL | 🔴 **OPEN** (small, well-isolated) |
 | [26](26-defaultinstancemanager-classunload-offbyone.md) | Class-unload count off-by-one (9 vs 8) | TestDefaultInstanceManager | FAIL | 🔴 **OPEN** |
 | [27](27-xxxendpoint-unix-domain-socket-init-failure.md) | Unix domain socket connector init fails | TestXxxEndpoint | FAIL | 🔴 **OPEN** |
-| [28](28-http2-largeupload-byte-mismatch.md) | HTTP/2 large POST truncated to ~1/5 expected bytes (flow-control suspect) | TestLargeUpload | FAIL | 🔴 **OPEN** |
+| [28](28-http2-largeupload-byte-mismatch-FIXED.md) | HTTP/2 large POST truncated to one DATA frame — native `SSLEngine.unwrap` stopped scattering at the first FULL dst buffer (NOT flow control) | TestLargeUpload | FAIL | ✅ **FIXED** |
 | [29](29-throughput-wall-recurrence-and-unconfirmed.md) | Throughput-wall recurrence (HostConfig/Http2Section_8_2), relative-perf-assertion family, 2 contention-suspected, 1 Windows-only fixture gap | ~11 classes | mixed | see doc (not new bugs) |
 | [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md) | Hot path fully interpreted: the loop method is OSR-denied by the RBC.7 `invokedynamic` ban (its trailing `println("…" + n)` string-concats), and `StringCache.toString` is refused by the RBC.6 handler-safety gate (its `synchronized` block's monitor handler) | TestMethodPerformance | perf | 🔴 **OPEN** (residual of 24) |
 
-10 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14/22); the open set is
+11 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14/22/28); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
 FAILs (05, 16).
 
