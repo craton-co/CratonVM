@@ -1,7 +1,13 @@
 # `TestCharsetCachePerformance` — the cached paths lose to the uncached one
 
-**Status:** OPEN. Root-caused (2026-07-27) and partially fixed; the headline
-defect is understood but its fix is a JIT project, not a charset one.
+**Status:** OPEN, **half fixed** (2026-07-27). The `timeFull < timeNone`
+assertion now PASSES; `timeLazy < timeNone` still fails.
+
+The RBC.6 admission gate described below as "why this was not fixed here" WAS
+subsequently fixed — see *Update* at the end — which is what flipped the first
+assertion. `CharsetCache.getCharset` now compiles, yet the `LazyCsCache` arm is
+still ~835s, so compilation admission was necessary but not sufficient and
+something further remains in that arm.
 
 Confirmed CratonVM-only — passes on HotSpot in the same fixture.
 
@@ -153,7 +159,64 @@ even when the class times out.
 ## Not this bug
 
 Distinct from the general interpreter/JIT throughput ceiling in
-`29-throughput-wall-recurrence-and-unconfirmed.md` and
+`../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md` and
 `04-embedded-server-throughput-wall-OPEN.md`.
 Those are roughly-uniform overhead versus HotSpot. This is a specific method
 being refused compilation outright, plus a set of now-fixed hot-path defects.
+
+## Update 2026-07-27 — RBC.6 gate removed; first assertion now passes
+
+The "why this was not fixed here" reservation above has been resolved. The
+`0xb6 | 0xb7 | 0xb9` codegen arm was audited: all four of its exits are safe
+(two emit no call at all; the inline path is already unreachable because
+`try_compile_inner` clears `inline_sites` under `precise_exception_frames`; and
+the direct-call and MIC/`jit_invoke_dispatch` paths both end in
+`emit_post_invoke_exception_check`). The only lowering that could not honour
+the contract was the **sibling tail-call**, which tears the frame down before
+the callee runs — a latent hole for `invokestatic`, which the whitelist had
+always admitted, not something the new opcodes introduced. It is now suppressed
+inside protected ranges (`x64::Compiler::pc_is_protected`, fed by a one-shot
+thread-local carrying the exception table's `[start_pc, end_pc)` ranges).
+
+`precise_exception_frame_sites_supported` now admits 0xb6/0xb7/0xb8/0xb9 plus
+the monitor ops. `invokedynamic` (0xba) is still excluded — it lowers to an
+unconditional deopt trap, not a frame-publishing call site.
+
+Result on the real class:
+
+| arm | before | after |
+|---|---|---|
+| `NoCsCache` (control) | 60.5s | 60.8s |
+| `FullCsCache` | 89.9s | **36.7s** |
+| `LazyCsCache` | 909s | 835s |
+
+`assertTrue(timeFull < timeNone)` — **PASSES** (full/none 1.49 → 0.60).
+`assertTrue(timeLazy < timeNone)` — still fails (13.7).
+
+`CharsetCache.getCharset` is confirmed compiled now
+(`hot_but_stuck_in_interpreter` 1 → 0, `c1=1`).
+
+### The remaining `LazyCsCache` gap is NOT admission
+
+With `getCharset` compiled, the same binary gives wildly different per-op costs
+depending only on the *driver* shape:
+
+* `LazyDiag` (single thread, direct `CharsetCache` local, loop in `main`):
+  **1961 ns/op**
+* `WarmCmp` (single thread, call through a one-method interface):
+  **12152 ns/op**
+
+Both compile `getCharset`. Call-site polymorphism was ruled out — running the
+lazy probe *first*, while its call site is still monomorphic, measures the same
+~12000 ns/op. So the residual is a third factor, not yet identified, and it is
+what the surviving assertion is measuring. That is the next thing to chase for
+this doc; the admission gate is no longer in the way.
+
+Validation for the gate change: `jit_local_exception_handler_tests` 8/8 (the
+suite guarding this exact property, including the
+`AthrowCountBisect.twoThrowsSequential` silent-wrong-checksum regression the
+params-only rule was added for), plus a `HandlerLocals` conformance probe
+(handler reads a local assigned before the try / inside the try / across
+sequential and nested try blocks / behind a `synchronized` block / reassigned
+after the call, with the throwing call reached through each invoke opcode
+including one in tail position) — byte-identical on CratonVM and HotSpot.
