@@ -5270,7 +5270,25 @@ fn deferred_jit_owners() -> &'static parking_lot::Mutex<Vec<Arc<CompiledMethod>>
     DEFERRED_JIT_OWNERS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
+/// DIAG (2026-07-27): `CRATONVM_JIT_LEAK_CODE=1` makes retired JIT code
+/// immortal. Used to test whether a SIGSEGV is a jump into a freed code page:
+/// if the crash vanishes with this set, the fault is a use-after-free of
+/// compiled code rather than a miscompile. Leaks by construction — diagnosis
+/// only, never a shipping mode.
+fn jit_leak_code_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_LEAK_CODE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 fn drain_deferred_jit_owners_if_quiescent() {
+    if jit_leak_code_enabled() {
+        return;
+    }
     if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) != 0 {
         return;
     }
@@ -5282,6 +5300,10 @@ fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
     let Some(owner) = owner else {
         return;
     };
+    if jit_leak_code_enabled() {
+        deferred_jit_owners().lock().push(owner);
+        return;
+    }
     if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) == 0 {
         drop(owner);
         return;
@@ -5308,7 +5330,47 @@ pub fn jit_execution_leave() {
 
 /// Pin a raw compiled entry while an external dispatch cache can publish it.
 pub fn pin_jit_entry(entry: usize) -> Option<Arc<CompiledMethod>> {
-    resolve_jit_entry_owner(entry)
+    let pinned = resolve_jit_entry_owner(entry);
+    if pinned.is_none() {
+        // DIAG (2026-07-27): a caller is about to cache this RAW entry with no
+        // keep-alive, so nothing stops the body being munmapped under it. Count
+        // and report under `CRATONVM_DBG_JIT_PIN=1`.
+        UNPINNED_JIT_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dbg_jit_pin_enabled() {
+            eprintln!("[jit-pin-miss] entry=0x{entry:x} cached with NO owner keep-alive");
+        }
+    }
+    pinned
+}
+
+/// Count of `pin_jit_entry` calls that could not find a live owner.
+pub static UNPINNED_JIT_ENTRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Count of baked direct-call targets that could not be pinned at publication.
+pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
+/// baked direct-call targets cannot all be kept alive.
+fn strict_callee_roots_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_STRICT_CALLEE_ROOTS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+fn dbg_jit_pin_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_PIN")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
 }
 
 /// Monotonic publication/invalidation generation for external entry caches.
@@ -5434,12 +5496,33 @@ impl JitCache {
         }
     }
 
-    fn prepare_for_publication(compiled: &mut CompiledMethod) {
+    /// Returns `false` when a baked direct-call target could not be pinned, in
+    /// which case this body must NOT be published — its emitted code contains a
+    /// `call` to an address nothing keeps alive.
+    fn prepare_for_publication(compiled: &mut CompiledMethod) -> bool {
+        let wanted = compiled._direct_callee_entries.len();
         compiled._direct_callee_roots = compiled
             ._direct_callee_entries
             .iter()
             .filter_map(|&entry| resolve_jit_entry_owner(entry))
             .collect();
+        let got = compiled._direct_callee_roots.len();
+        if got == wanted {
+            return true;
+        }
+        // A baked callee entry no longer resolves to a live owner. This is the
+        // use-after-free window: the callee was replaced (tier-up) or otherwise
+        // retired between the compile driver baking its address and this
+        // publication, so its `jit_entry_owners` Weak no longer upgrades.
+        UNROOTED_DIRECT_CALLEES.fetch_add(wanted - got, std::sync::atomic::Ordering::Relaxed);
+        if dbg_jit_pin_enabled() {
+            eprintln!(
+                "[jit-unrooted-callee] {}/{} baked direct-call targets could not be pinned",
+                wanted - got,
+                wanted,
+            );
+        }
+        !strict_callee_roots_enabled()
     }
 
     pub fn put(
@@ -5470,7 +5553,12 @@ impl JitCache {
                 key.class_name, key.method_name, key.descriptor
             );
         }
-        Self::prepare_for_publication(&mut compiled);
+        if !Self::prepare_for_publication(&mut compiled) {
+            // Unsafe to publish — see `prepare_for_publication`. Dropping the
+            // artifact leaves the method interpreted; it is recompiled on a
+            // later invocation, by which time the callee has a live body.
+            return;
+        }
         let arc = Arc::new(compiled);
         cratonvm_types::jit_activation::register_executable_owner(
             arc.entry_ptr() as usize,
@@ -5544,7 +5632,12 @@ impl JitCache {
                 key.class_name, key.method_name, key.descriptor
             );
         }
-        Self::prepare_for_publication(&mut compiled);
+        if !Self::prepare_for_publication(&mut compiled) {
+            // Unsafe to publish — see `prepare_for_publication`. Dropping the
+            // artifact leaves the method interpreted; it is recompiled on a
+            // later invocation, by which time the callee has a live body.
+            return;
+        }
         let arc = Arc::new(compiled);
         cratonvm_types::jit_activation::register_executable_owner(
             arc.entry_ptr() as usize,
