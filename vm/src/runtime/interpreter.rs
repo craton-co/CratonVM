@@ -7925,12 +7925,19 @@ pub(crate) fn try_osr_with_backoff(
                 f.class_id,
             )
         };
-        let reusable = {
+        // Three-way classification, not two. `reusable` is the enter-now case;
+        // `published_but_unenterable` is a PUBLISHED OSR artifact that cannot be
+        // entered at THIS pc, which is a permanent property, not a
+        // still-compiling one (see the rejection arm below).
+        let (reusable, published_but_unenterable) = {
             let jc = shared.jit.jit_cache.read();
-            matches!(
-                jc.get_osr(&cn, &mn, &md, frame_class_id),
-                Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
-            )
+            match jc.get_osr(&cn, &mn, &md, frame_class_id) {
+                Some(c) if c.compiled_via_osr => {
+                    let ok = c.can_osr_enter(entry_pc);
+                    (ok, !ok)
+                }
+                _ => (false, false),
+            }
         };
         if !reusable {
             // Not compiled yet: ensure the worker is running, request an OSR
@@ -7938,7 +7945,32 @@ pub(crate) fn try_osr_with_backoff(
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            if crate::jit::tiered::is_osr_denied(&key) {
+            // An artifact this same path already published, which reports
+            // `can_osr_enter(entry_pc) == false`, will report that forever:
+            // `osr_pc_to_native[entry_pc]` is a pure function of the bytecode
+            // and the entry pc (the codegen writes `-1` for a pc strictly
+            // inside a LICM-hoisted loop body, whose pre-header an OSR entry
+            // would skip). Recompiling reproduces it byte for byte — the OSR
+            // path passes empty branch/unroll hint maps, so nothing profile-
+            // dependent can change the outcome; a class redefinition, the one
+            // thing that would, replaces the cached artifact and re-evaluates
+            // this check naturally.
+            //
+            // Treating it as "background compile pending" instead —
+            // `record_osr_background_pending()` resets `backward_count` without
+            // consuming the bounded per-pc rejection budget — made the loop
+            // re-request a compile every `osr_threshold` back-edges forever.
+            // Measured on the `CallRate.allocPutOld` probe: 200 full C2
+            // pipelines for 200 000 iterations (one per 1 000), 199 of them
+            // producing the identical un-enterable artifact, with the loop
+            // interpreted throughout. Route it to the existing bounded
+            // exponential-backoff schedule instead, which is already keyed
+            // per-pc, so other loop headers in the same method keep their OSR
+            // eligibility (unlike `mark_osr_denied`, which is method-wide).
+            //
+            // Strictly a waste-elimination change: it removes compiles, never
+            // adds compiled execution. The loop runs interpreted either way.
+            if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
                 thread.frames[*frame_idx].record_osr_rejection(entry_pc);
                 return OsrBackoffOutcome::Skip;
             }
@@ -33582,6 +33614,22 @@ fn compile_osr_artifact(
     // reuse kicks in.
     let osr_reused =
         matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
+    // DBG: name WHY a cached artifact was not reused. A cached
+    // `compiled_via_osr` artifact that cannot enter at `entry_pc` means the
+    // recompile below is guaranteed to produce the same un-enterable result
+    // (same bytecode, same entry pc), i.e. a pure-waste recompile loop —
+    // distinguishing that from "no artifact yet" or "artifact came from the
+    // invocation path" is the whole diagnosis.
+    if !osr_reused && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        let why = match &cached_osr {
+            None => "no-cached-artifact",
+            Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
+            Some(_) => "cached-cannot-enter-at-pc",
+        };
+        eprintln!(
+            "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+        );
+    }
     let compiled = if osr_reused {
         cached_osr
     } else {
