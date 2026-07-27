@@ -119,6 +119,6 @@ disabled (interpreter-only).
 
 - Crate-specific module docs: every `native-io/src/*.rs` file opens with a
   `//!` block describing its registry shape and platform backing.
-- Embedding guide: [`docs/embedding.md`](embedding.md).
+- Embedding guide: [`docs/EMBEDDING.md`](EMBEDDING.md).
 - GC tuning: [`docs/gc-tuning.md`](gc-tuning.md).
 - Top-level configuration: [`docs/CONFIG.md`](CONFIG.md).

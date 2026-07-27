@@ -128,9 +128,15 @@ first version of this doc gave (systemic metadata corruption — fixed). Keep it
 because 9 classes still regress, four of them with concrete, individually
 actionable signatures.
 
-The `org/antlr/v4/runtime/` half of the ban is still untested in isolation: the
-H2 suite does not exercise it, and it was lifted together with `org/h2/` in both
-arms above. It needs a Hibernate-HQL run to say anything about.
+The `org/antlr/v4/runtime/` half of the ban **is gone as of 2026-07-27.** It was
+untested in isolation when this doc was written — the H2 suite does not exercise
+it, and it was lifted together with `org/h2/` in both arms above — so a later
+session ran the Hibernate-HQL isolation this asked for: all 57
+`org.hibernate.orm.test.hql.*Test` classes, one VM per class, baseline vs
+ban-removed, `org/hibernate/` banned in both arms. 55/57 byte-identical, the
+other two explained by an unrelated load-dependent OOM flake. HIB-LONGTAIL.1 is
+`org/h2/`-only now; the ANTLR prefix carried none of this ban's evidence. See
+`docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`.
 
 ## Reproduction
 

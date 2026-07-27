@@ -3,8 +3,8 @@
 Runs Java programs on **both** CratonVM and a real JDK and **diffs observable
 behavior** — stdout, stderr, thrown exception type + message, and process exit
 code — automatically. This industrializes the manual "run it on HotSpot and
-eyeball the diff" loop that produced nearly every bug in `docs/internal/*` and
-`MEMORY.md`.
+eyeball the diff" loop that produced nearly every bug found and fixed during
+this project's manual bug-hunt history.
 
 Full design: [`docs/feature-designs/differential-fuzzer.md`](../docs/feature-designs/differential-fuzzer.md).
 

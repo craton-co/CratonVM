@@ -12,7 +12,7 @@ implemented and unit-tested, but it is **not yet consumed by the heap sizer**.
 The ergonomic default heap is driven by *physical RAM*, not the cgroup limit.
 
 Cross-links: [CONFIG.md](CONFIG.md) (full flag reference, "Heap and GC"),
-[internal GC tuning notes](internal/gaps/gc-tuning.md).
+[GC tuning notes](gc-tuning.md).
 
 ---
 

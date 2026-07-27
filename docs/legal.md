@@ -72,7 +72,7 @@ implementations:
   pre-defined in the JSON schema.
 - **Differential testing:** The `vm/tests/differential.rs` harness runs
   methods under both CratonVM and HotSpot to detect behavioral divergences.
-  Known divergences are tracked in `docs/internal/divergence-log.md`.
+  Known divergences are tracked in `docs/known-gaps/divergence-log.md`.
 
 ## Current Status
 
@@ -86,7 +86,7 @@ implementations:
 | Test harness          | Yes (`vm/tests/jck_harness.rs`) |
 | Failure capture       | Yes (`bench/jck-failures.json`) |
 | Differential testing  | Yes (`vm/tests/differential.rs`) |
-| Divergence log        | Yes (`docs/internal/divergence-log.md`) |
+| Divergence log        | Yes (`docs/known-gaps/divergence-log.md`) |
 
 The JCK license application has not yet been submitted. All CI and harness
 infrastructure is in place and will activate automatically once `JCK_HOME` is

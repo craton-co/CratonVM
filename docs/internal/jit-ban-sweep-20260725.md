@@ -189,7 +189,10 @@ JIT-specific, not an environment/harness artifact.** Ban lifted + `--nojit`
 added boots cleanly (`WFLYSRV0025 ... started in 24042ms`, matches baseline);
 only ban-lifted + JIT-on fails. **Verdict: KEEP `org/jboss/as/` (SPB.8b) —
 it is protecting against a currently-live miscompile, not a stale one.**
-Full writeup + repro: `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`
+Full writeup + repro: `docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md`
+(RETIRED 2026-07-27: root-caused to a dropped `Runtime.addShutdownHook`
+root plus a collection-layout null-hole bug — not a JIT miscompile; the
+`org/jboss/as/` ban is lifted.)
 (committed). This is the sweep's first concrete "new bug found" per the
 goal's own framing — a real, JIT-only `ModelTypeValidator`/`validTypes`
 null-field bug with a fast (~10-20s) deterministic repro, not yet root-caused

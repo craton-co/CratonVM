@@ -16,8 +16,9 @@ it, or extend the feature, read on.
 > tested, including integer/long reductions. See
 > [`../../README.md`](../../README.md)'s "GPU offload benchmarks"
 > section and [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md)
-> for numbers. The completed hardware-validation follow-ups are recorded in
-> [`../internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md).
+> for numbers. The hardware-validation follow-ups this status reflects are
+> now complete; the durable technical documentation they produced is the
+> feature-doc set in the table below.
 
 ## Document map
 
@@ -46,7 +47,6 @@ it, or extend the feature, read on.
 | [`hardware-ci.md`](hardware-ci.md) | Self-hosted GPU CI scaffolding and enrollment status. |
 | [`../book/src/gpu/overview.md`](../book/src/gpu/overview.md) | User-facing book chapter: what can be offloaded, build modes, CLI flags. |
 | [`../book/src/gpu/benchmarks.md`](../book/src/gpu/benchmarks.md) | The 2026-07-11 RTX 2060 benchmark writeup (methodology + tables). |
-| [`../internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md) | Dated, itemized completed GPU follow-up record. |
 
 ## At a glance
 
@@ -485,8 +485,8 @@ and a GC stress program (`GcStress`).
 
 ## Known follow-ups
 
-See [`../internal/gpu-offload-followups-20260711.md`](../internal/gpu-offload-followups-20260711.md)
-for the itemized, dated completed record. Summary as of 2026-07-12:
+All hardware-validation follow-ups from the first real-hardware pass are
+closed. Summary as of 2026-07-12:
 
 - **DONE**: reduction dispatch (int/long only — see "What the analyzer
   accepts"), the JIT-caller admission gate, the launch-config thread-
@@ -574,7 +574,6 @@ bench-gpu/, bench-tornado/           Benchmark sources + TornadoVM twins; result
 
 docs/gpu/                            This directory.
 docs/book/src/gpu/                   User-facing book chapter + benchmarks page.
-docs/internal/gpu-offload-followups-20260711.md       Itemized completed-work record.
 
 Cargo.toml                           cuda-bridge and jit-cuda as workspace members
 Cargo.lock                           Locked cudarc + bytemuck transitives

@@ -83,3 +83,24 @@ ensuring JUnit5's own outer-instance-construction path (`TestInstancesProvider`
 → `NestedClassTestDescriptor.instantiateTestClass`) resolves the outer
 instance's `Class` through the *same* defining loader as the nested class
 rather than through a global/cached path.
+
+## Regression — confirmed still failing 2026-07-23 (craton-rerun-20260723), identical symptom
+
+Re-broken on `dev` as of the 2026-07-23 rerun — `SBRUNNER_RESULT tests=12
+failed=1`, and the failure is **the exact same** `IllegalArgumentException:
+argument type mismatch` at `ReflectionUtils.newInstance` →
+`ConstructorInvocation.proceed` → `NestedClassTestDescriptor.instantiateTestClass`
+described above (verified by reading the fresh log directly, not assumed).
+Log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard4/logs/module_spring-boot-jms.org.springframework.boot.jms.ConnectionFactoryUnwrapperTests.out.log`.
+This doc's stated root cause (a `@Nested` class's synthetic outer-instance
+constructor parameter resolving to a different `Class` object than the
+actual outer instance, under an isolated `ModifiedClassPathClassLoader`)
+was never independently confirmed even when originally fixed — it "resolved
+as a side effect of the drift merge, exact fixing commit not identified" —
+so this regression is consistent with that same underlying gap never having
+been directly fixed, just transiently masked by whatever unrelated commit(s)
+landed between 2026-07-18 and 2026-07-19. Not re-investigated further this
+session (out of scope — see the sibling discovery-failure cluster affecting
+7 other classes from the same `ModifiedClassPathExtension` family,
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md),
+found the same session).
