@@ -849,18 +849,14 @@ pub fn update_all_roots(
             .update_after_gc(pointer_map);
     }
 
+    // 9a and 15-22. Paired post-move half of the VM/native root inventory.
+    // The historical notes below document the individual registered sources.
+    crate::memory::native_roots::remap_all_roots(shared, pointer_map);
+
     // 9a. Native upcall table — rewrite each live slot's callback `target` to its
     //     post-relocation address so the legacy `pe_upcall_invoke` dispatch path
     //     does not read a stale pointer after a moving collection (root scan in
     //     roots.rs section 9a).
-    {
-        shared
-            .natives
-            .upcall_table
-            .lock()
-            .update_after_gc(pointer_map);
-    }
-
     // 9b. NIO selector side-table — the `sun.nio.ch.SelectionKeyImpl` registry
     // (nio_selector `sk_table` + per-selector key state) stores raw channel /
     // selector / attachment / key ObjectRefs. Without remapping them after a
@@ -869,10 +865,6 @@ pub fn update_all_roots(
     // a moved-away object → `monitorenter ... null` on its `closeLock` and the
     // reactor worker dies (ES testManyAsyncRequests under burst load). The helper
     // early-returns when nothing moved (non-moving GC).
-    cratonvm_native_io::nio_selector::sk_table_update_after_gc(pointer_map);
-    cratonvm_native_io::socket_channel::channel_fields_update_after_gc(pointer_map);
-    cratonvm_native_io::socket_channel::ss_back_ref_update_after_gc(pointer_map);
-    cratonvm_native_api::server_socket_ports::gc_update_after_gc(pointer_map);
 
     // 10. Thread-local ObjectRefs — java_thread_obj, pending_async_exception
     if let Some(ref mut obj_ref) = thread.java_thread_obj {
@@ -942,33 +934,25 @@ pub fn update_all_roots(
     //     under a moving collector their addresses change and we must
     //     remap them here, otherwise the next cache lookup returns a
     //     stale pointer.
-    cratonvm_native_builtins::lang_math::gc_update_value_of_cache_refs(
-        shared.vm_identity,
-        pointer_map,
-    );
 
     // 15a. Unsafe / Class$Atomic synthetic-offset side stores (scanned in
     //      `roots.rs` step 15a). A moving collection relocates the stored refs
     //      and selective promotion may tenure them; repoint them here so the
     //      next side-store load/CAS sees the live address instead of a dangling
     //      one. See `gc_scan_unsafe_side_store_roots`.
-    cratonvm_native_builtins::gc_update_unsafe_side_store_refs(pointer_map);
 
     // 16. Round-9 perf + GC fix: re-point the process-global LambdaMetafactory
     //     CallSite cache living in `native-builtins/src/lang_invoke.rs`.
     //     Same scan/update contract as the Integer.valueOf cache.
-    cratonvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(pointer_map);
 
     // 16a. Re-point the zero-capture lambda proxy singleton cache
     //      (scanned in `roots.rs` step 16a). Same scan/update contract as
     //      the Integer.valueOf cache.
-    crate::runtime::invokedynamic::gc_update_lambda_singleton_refs(shared.vm_identity, pointer_map);
 
     // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
     //     TreeSet) keep their backing arrays + nodes in process-global Rust
     //     side-tables. Their roots are scanned in `roots.rs` step 17; repoint
     //     the stored ObjectRefs to their relocated addresses here.
-    cratonvm_native_collections::gc_update_collection_overlay_refs(pointer_map);
 
     // 18. Singleton built-in class loaders (app / platform) cached in
     //     process-global mutexes in `native-builtins/src/classloader.rs`.
@@ -976,27 +960,22 @@ pub fn update_all_roots(
     //     to their relocated addresses here so `getClassLoader()` keeps
     //     returning the live loader after a moving GC (fixes the intermittent
     //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
-    cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
-    cratonvm_native_builtins::jmx::gc_update_platform_mbean_server_ref(pointer_map);
 
     // 18a. Process-global `System.getenv()` / `System.getProperties()`
     //      singletons (companion to roots.rs step 18a). Repoint the cached
     //      Map/Properties ObjectRefs to their relocated addresses so the next
     //      `getenv()`/`getProperties()` returns the live object after a move.
-    cratonvm_native_builtins::lang_system::gc_update_system_singleton_refs(pointer_map);
 
     // 18b. Process-global Locale caches (companion to roots.rs step 18b).
     //      Repoint the cached default Locale + synthetic Locale side-table keys
     //      to their relocated addresses so `Locale.getDefault()` keeps returning
     //      the live object after a moving GC (fixes the intermittent stale
     //      Locale → SIGSEGV).
-    cratonvm_native_builtins::gc_update_locale_refs(pointer_map);
 
     // 18c. `java.lang.ClassValue` memoization cache (companion to roots.rs
     //      step 18c). Repoint cached `computeValue(Class)` results to their
     //      relocated addresses so `ClassValue.get()` keeps returning the live
     //      object after a moving GC.
-    cratonvm_native_builtins::phases_late::gc_update_classvalue_cache_refs(pointer_map);
 
     // 19. JBoss MSC container-held service objects (the `Service` instance,
     //     synthetic `ServiceController` mirror, child `ServiceTarget`, in-flight
@@ -1005,20 +984,17 @@ pub fn update_all_roots(
     //     step 19; repoint the stored ObjectRefs to their relocated addresses
     //     here so the container can safely invoke `start()`/`stop()` on the held
     //     service after a moving GC.
-    cratonvm_native_builtins::jboss_msc::gc_update_msc_service_refs(pointer_map);
 
     // 19b. logmanager.rs cached LogManager / Logger / LogContext singletons and
     //      the attachments table (Round-4 B4) — repoint the stored addresses to
     //      their relocated locations after a moving GC. Scanned as roots in
     //      `roots.rs` step 19b.
-    cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(pointer_map);
 
     // 19c. Class-level annotation-proxy identity cache in
     //      `native-builtins/src/lang_class.rs` (per-class `getAnnotation` /
     //      `getDeclaredAnnotations` proxies). Scanned as roots in `roots.rs`
     //      step 20; repoint the stored ObjectRefs to their relocated addresses
     //      after a moving GC so cached annotation instances stay live.
-    cratonvm_native_builtins::lang_class::gc_update_annotation_proxy_refs(pointer_map);
 
     // 19d. Synthetic `com.sun.net.httpserver` server registry handler refs
     //      (`native-builtins/src/net_phase_e.rs`). Scanned as roots in `roots.rs`;
@@ -1026,39 +1002,30 @@ pub fn update_all_roots(
     //      addresses after a moving GC so the per-request dispatcher invokes the
     //      live handler instead of a vacated from-space slot (else
     //      `NoSuchMethodError: java/lang/Object.handle` storm under GC pressure).
-    cratonvm_native_builtins::net_phase_e::gc_update_re10_handler_refs(pointer_map);
 
     // Process-global InetAddress side table (companion to roots.rs, right
     // after the re10 handler scan). Repoint the mirror's (hostName,
     // ipAddress) entry to its relocated key after a moving GC so
     // getHostAddress()/getAddress()/toString() keep resolving the real
     // address instead of falling back to "0.0.0.0".
-    cratonvm_native_builtins::net_phase_e::gc_update_inet_addr_refs(pointer_map);
 
     //      ScheduledThreadPoolExecutor pending runnables + XNIO IoFuture
     //      notifier/attachment/result refs: relocate the stored ObjectRefs after
     //      a moving GC so the pump / future-settle invokes the live object, not a
     //      vacated from-space slot. Root-scan companions in `roots.rs`; the NIO
     //      sk_table remap is wired separately above (`sk_table_update_after_gc`).
-    cratonvm_native_builtins::scheduled_pump::gc_update_scheduled_refs(pointer_map);
-    cratonvm_native_builtins::xnio_async::gc_update_xnio_future_refs(pointer_map);
     // FFM/Panama upcall targets (Step 5 GAP C) — rewrite the leaked upcall
     // userdata's `target` in place so the trampoline dispatches to the moved
     // object; scan companion `panama::gc_scan_upcall_target_roots` in `roots.rs`.
-    cratonvm_native_builtins::panama::gc_update_upcall_target_refs(pointer_map);
     // TLS SSLContext TrustManager[] objects; scan companion
     // `t27_tls::gc_scan_tls_ctx_trust_manager_roots` in `roots.rs`.
-    cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_trust_manager_refs(pointer_map);
     // TLS SSLContext KeyManager[] objects (client-cert resolver); scan
     // companion `t27_tls::gc_scan_tls_ctx_key_manager_roots` in `roots.rs`.
-    cratonvm_native_builtins::t27_tls::gc_update_tls_ctx_key_manager_refs(pointer_map);
     // Process-wide default SSLContext; scan companion
     // `t27_tls::gc_scan_default_ssl_context_root` in `roots.rs`.
-    cratonvm_native_builtins::t27_tls::gc_update_default_ssl_context_ref(pointer_map);
 
     // ForkJoinTask done/result side-table; scan companion
     // `phases_early::gc_scan_forkjoin_roots` in `roots.rs`.
-    cratonvm_native_builtins::phases_early::gc_update_forkjoin_refs(pointer_map);
 
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
@@ -1093,7 +1060,6 @@ pub fn update_all_roots(
     //     remap self-guards the empty (non-moving) map; the whole fan-out is a
     //     no-op until a subsystem registers, so behaviour is byte-identical to
     //     baseline on the default path.
-    crate::memory::native_roots::remap_all_native_roots(pointer_map);
 
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);

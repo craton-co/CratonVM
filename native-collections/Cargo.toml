@@ -20,6 +20,7 @@ synthetic-jdk = []
 [dependencies]
 cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-gc = { path = "../gc", version = "0.3.0" }
 parking_lot.workspace = true
 rustc-hash.workspace = true
 

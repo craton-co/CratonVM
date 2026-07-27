@@ -5599,7 +5599,7 @@ impl GenerationalHeap {
             // alive (instance->loader). No-op for the common
             // no-custom-loader case.
             loader_pin_on: cratonvm_types::loader_pin::loader_pinning_enabled(),
-            overlay_owners: cratonvm_native_collections::gc_overlay_owner_addrs(),
+            overlay_owners: crate::external_roots::external_owner_addrs(),
             metadata_pins: cratonvm_types::metadata_pin::snapshot(),
         };
         // mark_if_young: mark a candidate young pointer and enqueue it.
@@ -5924,7 +5924,7 @@ impl GenerationalHeap {
         // card scan does. The major marker below applies the precise
         // owner-reachable rule before it compacts old space.
         for overlay_ref in
-            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+            crate::external_roots::external_roots_for_matching_owners(&|owner_addr| {
                 old_gen.contains(owner_addr as *mut u8)
             })
         {
@@ -8086,7 +8086,7 @@ impl GenerationalHeap {
         // young from-space is conservatively retained for this major cycle,
         // matching the ordinary cross-generation seed's contract.
         for overlay_ref in
-            cratonvm_native_collections::gc_overlay_roots_for_matching_owners(|owner_addr| {
+            crate::external_roots::external_roots_for_matching_owners(&|owner_addr| {
                 young_from.contains(owner_addr as *mut u8)
             })
         {
@@ -8114,7 +8114,7 @@ impl GenerationalHeap {
             // can reclaim an unreachable old collection and its side-table
             // graph together instead of treating every entry as a global root.
             for overlay_ref in
-                cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
+                crate::external_roots::external_roots_for_owner(obj_ptr as usize)
             {
                 let overlay_ptr = overlay_ref.as_ptr();
                 if old_gen.contains(overlay_ptr) {
@@ -10338,7 +10338,7 @@ fn scan_young_object(
         .as_ref()
         .is_some_and(|owners| owners.contains(&obj_addr))
     {
-        for overlay_ref in cratonvm_native_collections::gc_overlay_roots_for_collection(obj_addr) {
+        for overlay_ref in crate::external_roots::external_roots_for_owner(obj_addr) {
             mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
         }
     }

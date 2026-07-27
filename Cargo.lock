@@ -536,7 +536,6 @@ name = "cratonvm-gc"
 version = "0.3.0"
 dependencies = [
  "cratonvm-jit",
- "cratonvm-native-collections",
  "cratonvm-types",
  "loom",
  "parking_lot",
@@ -689,6 +688,7 @@ dependencies = [
 name = "cratonvm-native-collections"
 version = "0.3.0"
 dependencies = [
+ "cratonvm-gc",
  "cratonvm-native-api",
  "cratonvm-types",
  "parking_lot",

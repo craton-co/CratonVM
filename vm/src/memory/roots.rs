@@ -487,10 +487,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     a still-registered upcall (the Panama closure registry remaps its own
     //     copy, but this table's copy was previously neither scanned nor remapped
     //     — see gc.rs section 9a counterpart).
-    {
-        shared.natives.upcall_table.lock().collect_roots(&mut roots);
-    }
-
     // 9b. JNI LOCAL references (vm-jni-roots #1).
     //
     //     Previously only global refs (section 9) were rooted. The per-thread
@@ -717,6 +713,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         });
     }
 
+    // 15-21. VM/native side tables. The registry owns every built-in scan and
+    // its matching relocation callback as one entry. The historical notes
+    // below document why each registered source is a root.
+    crate::memory::native_roots::scan_all_roots(shared, &mut roots);
+
     // 15. Round-9 CRIT GC-correctness fix: process-global Integer.valueOf
     //     (-128..=127) and Boolean.TRUE/FALSE caches. These live in
     //     `native-builtins/src/lang_math.rs` and previously used
@@ -725,11 +726,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     invisible to the GC root scanner — under a moving collector the
     //     cached ObjectRefs would point at relocated or reclaimed memory
     //     after the first compaction.
-    cratonvm_native_builtins::lang_math::gc_scan_value_of_cache_roots(
-        shared.vm_identity,
-        &mut roots,
-    );
-
     // 15a. Unsafe / Class$Atomic synthetic-offset side stores. These hold live
     //      `ObjectRef`s that exist in NO heap slot (the synthetic-offset scheme
     //      services load/CAS/store from a Rust-side map when the field's real
@@ -741,19 +737,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      start/stop corruption flood, first victim always a
     //      `java/lang/ref/SoftReference`). Remap companion in `gc.rs`
     //      (`gc_update_unsafe_side_store_refs`).
-    cratonvm_native_builtins::gc_scan_unsafe_side_store_roots(&mut roots);
 
     // 16. Round-9 perf + GC fix: process-global LambdaMetafactory CallSite
     //     cache. Cached CallSites and their bootstrap-arg ObjectRef keys
     //     must stay live across collections; the matching post-compaction
     //     remap lives in `gc.rs` (`gc_update_lambda_callsite_cache_refs`).
-    cratonvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(&mut roots);
 
     // 16a. Zero-capture lambda proxy singleton cache (companion to the
     //      LambdaMetafactory CallSite cache in step 16 above, but for the
     //      cached proxy INSTANCE of a non-capturing lambda rather than the
     //      CallSite metadata). Lives in `vm/src/runtime/invokedynamic.rs`.
-    crate::runtime::invokedynamic::gc_scan_lambda_singleton_roots(shared.vm_identity, &mut roots);
 
     // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
     //     TreeSet). These keep backing arrays + nodes in Rust side-tables,
@@ -764,14 +757,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     (gen_heap.rs). An explicit System.gc() also selects that non-moving
     //     full-GC path so it can reclaim an otherwise-dead overlay owner rather
     //     than globally rooting its transient compiler graph.
-    let conditional_overlay_marking = shared.config.gc_algorithm
-        == crate::config::GcAlgorithm::Generational
-        && (cratonvm_gc::gc_quiescence::is_active()
-            || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
-            || cratonvm_gc::gc_quiescence::major_gc_requested());
-    if !conditional_overlay_marking {
-        cratonvm_native_collections::gc_scan_collection_overlay_roots(&mut roots);
-    }
 
     // 18. Singleton built-in class loaders (app / platform). These synthetic
     //     `ClassLoader` objects live ONLY in process-global mutexes in
@@ -782,8 +767,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     as a String OID ("Not able to load any cryptoProvider", intermittent
     //     / heap-size dependent). Remap companion in `gc.rs`
     //     (`gc_update_loader_singleton_refs`).
-    cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(&mut roots);
-    cratonvm_native_builtins::jmx::gc_scan_platform_mbean_server_root(&mut roots);
 
     // 18a. Process-global `System.getenv()` / `System.getProperties()`
     //      singletons cached in `native-builtins/src/lang_system.rs`. Like the
@@ -792,7 +775,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      moving young GC reclaims/relocates the cached Map/Properties and the
     //      next `getenv()`/`getProperties()` returns a stale `ObjectRef`. Remap
     //      companion in `gc.rs` (`gc_update_system_singleton_refs`).
-    cratonvm_native_builtins::lang_system::gc_scan_system_singleton_roots(&mut roots);
 
     // 18b. Process-global Locale caches (cached default Locale + synthetic
     //      Locale side-tables) in native-builtins. Same stale-pointer hazard as
@@ -801,7 +783,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      handing back the stale ObjectRef → "Stale pointer … java/util/Locale"
     //      → SIGSEGV (TestServerInfo / TestSwallowAbortedUploads). Remap
     //      companion in `gc.rs` (`gc_update_locale_refs`).
-    cratonvm_native_builtins::gc_scan_locale_roots(&mut roots);
 
     // 18c. `java.lang.ClassValue` memoization cache (BUG-W) — cached
     //      `computeValue(Class)` results live only in a process-global
@@ -810,9 +791,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      reclaim/relocate a cached value while a later `ClassValue.get()`
     //      keeps handing back the stale `ObjectRef`. Remap companion in
     //      `gc.rs` (`gc_update_classvalue_cache_refs`).
-    cratonvm_native_builtins::phases_late::gc_scan_classvalue_cache_roots(&mut roots, &|addr| {
-        shared.mem.heap.metadata_pin_deferrable(addr)
-    });
 
     // 19. JBoss MSC container-held service objects. The `ServiceContainer` Rust
     //     state machine references Java objects (the `Service` instance whose
@@ -824,7 +802,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     and the next `invoke_virtual(service, "start", ...)` is a
     //     use-after-free. Remap companion in `gc.rs`
     //     (`gc_update_msc_service_refs`).
-    cratonvm_native_builtins::jboss_msc::gc_scan_msc_service_roots(&mut roots);
 
     // 19b. Round-4 B4: java.util.logging / JBoss LogManager mirrors — the
     //     LogManager / Logger / LogContext singletons and the attachments
@@ -833,7 +810,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     so a moving GC cannot reclaim/relocate a cached logger out from under
     //     a later native lookup (use-after-free). Remap companion in `gc.rs`
     //     (`gc_update_logmanager_refs`).
-    cratonvm_native_builtins::logmanager::gc_scan_logmanager_roots(&mut roots);
 
     // 20. Class-level annotation-proxy identity cache. The per-class
     //     `getAnnotation(X)` / `getDeclaredAnnotations()` proxies are cached in
@@ -843,7 +819,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     so a moving young GC cannot reclaim/relocate a cached proxy out from
     //     under a later `getAnnotation` read (use-after-free). Remap companion
     //     in `gc.rs` (`gc_update_annotation_proxy_refs`).
-    cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(&mut roots);
 
     //     Synthetic `com.sun.net.httpserver` server registry: each registered
     //     `HttpHandler` ObjectRef lives only in a native map (no Java-heap edge
@@ -851,7 +826,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     would otherwise reclaim/relocate it and the per-request dispatcher
     //     would invoke a stale receiver (NoSuchMethodError java/lang/Object.handle).
     //     Remap companion in `gc.rs` (`gc_update_re10_handler_refs`).
-    cratonvm_native_builtins::net_phase_e::gc_scan_re10_handler_roots(&mut roots);
 
     //     Process-global InetAddress side table (`net_phase_e.rs`): each
     //     synthetic InetAddress mirror's (hostName, ipAddress) pair lives only
@@ -861,51 +835,39 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     back to reporting "0.0.0.0" (ES
     //     InetAddressRandomBinaryDocValuesRangeQueryTests CONTAINS-query false
     //     negative). Remap companion in `gc.rs` (`gc_update_inet_addr_refs`).
-    cratonvm_native_builtins::net_phase_e::gc_scan_inet_addr_roots(&mut roots);
 
     //     NIO SelectionKey table: channel/selector/attachment/key_obj ObjectRefs
     //     live only in `sk_table`; remap was already wired (gc.rs
     //     `sk_table_update_after_gc`) but the root SCAN was missing, so a key
     //     reachable only through sk_table could be swept before the remap ran.
-    cratonvm_native_io::nio_selector::gc_scan_selector_roots(&mut roots);
-    cratonvm_native_io::socket_channel::gc_scan_channel_roots(&mut roots);
-    cratonvm_native_io::socket_channel::gc_scan_ss_back_ref_roots(&mut roots);
-    cratonvm_native_api::server_socket_ports::gc_scan_roots(&mut roots);
     //     ScheduledThreadPoolExecutor pending runnables (stored as relocatable
     //     addresses; remap companion `scheduled_pump::gc_update_scheduled_refs`).
-    cratonvm_native_builtins::scheduled_pump::gc_scan_scheduled_roots(&mut roots);
     //     XNIO IoFuture notifier/attachment/result refs held across allocations
     //     until the future settles (remap companion
     //     `xnio_async::gc_update_xnio_future_refs`).
-    cratonvm_native_builtins::xnio_async::gc_scan_xnio_future_roots(&mut roots);
     //     FFM/Panama upcall targets: the Java MethodHandle/lambda a libffi
     //     trampoline dispatches to, reachable only through the leaked upcall
     //     userdata (Step 5 GAP C; remap companion in `gc.rs`).
-    cratonvm_native_builtins::panama::gc_scan_upcall_target_roots(&mut roots);
     //     TLS SSLContext TrustManager[] objects (t27_tls::ctx_trust_managers_table),
     //     held so the post-handshake trust check (OCSP/CRL revocation checkers,
     //     custom X509TrustManagers) can still call them long after
     //     SSLContext.init returned (remap companion
     //     `t27_tls::gc_update_tls_ctx_trust_manager_refs` in `gc.rs`).
-    cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_trust_manager_roots(&mut roots);
     //     TLS SSLContext KeyManager[] objects (t27_tls::ctx_key_managers_table),
     //     held so `JavaKeyManagerResolver::resolve` can synchronously consult
     //     the real `KeyManager.chooseClientAlias` mid-handshake, long after
     //     SSLContext.init returned (remap companion
     //     `t27_tls::gc_update_tls_ctx_key_manager_refs` in `gc.rs`).
-    cratonvm_native_builtins::t27_tls::gc_scan_tls_ctx_key_manager_roots(&mut roots);
     //     The process-wide default SSLContext (t27_tls::default_ssl_context_slot),
     //     installed by SSLContext.setDefault(ctx) and returned by later
     //     SSLContext.getDefault() calls -- held long after setDefault
     //     returned (remap companion `t27_tls::gc_update_default_ssl_context_ref`
     //     in `gc.rs`).
-    cratonvm_native_builtins::t27_tls::gc_scan_default_ssl_context_root(&mut roots);
 
     //     ForkJoinTask done/result side-table. Real-JDK ForkJoin overrides cache
     //     task results in Rust state keyed by task identity; cached Object
     //     results live in no heap slot, so a GC between `submit` and `get` must
     //     root them here. Remap companion in `gc.rs`.
-    cratonvm_native_builtins::phases_early::gc_scan_forkjoin_roots(&mut roots);
 
     // 21. Uniform native-root registry. Any native subsystem holding ObjectRefs
     //     in a process-global side-table can register a scan callback here
@@ -914,8 +876,6 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     a no-op (byte-identical to baseline) until a subsystem registers, so
     //     it is safe to land ahead of any adopter. The matching post-move remap
     //     is `native_roots::remap_all_native_roots` in `gc.rs`.
-    shared.classes.osc_cache.scan_roots(&mut roots);
-    crate::memory::native_roots::scan_all_native_roots(&mut roots);
 
     if let Some(w) = crate::memory::gc::watch_addr() {
         let rooted = roots.iter().any(|o| o.as_ptr() as usize == w);

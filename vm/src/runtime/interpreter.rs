@@ -2079,7 +2079,7 @@ fn process_references_after_gc(
         // above already relies on — so pruning here with pre-remap addresses
         // is correct; the later `gc_update_collection_overlay_refs` remap
         // pass in `update_all_roots` only touches whatever prune left behind.
-        cratonvm_native_collections::gc_prune_dead_collection_overlays(&is_marked);
+        cratonvm_gc::external_roots::prune_external_roots(&is_marked);
         // Companion reconciliation for the class-mirror cache — see
         // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6. Same
         // "before the no_refproc short-circuit" rationale: the cache must

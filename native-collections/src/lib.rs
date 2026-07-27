@@ -1331,6 +1331,7 @@ fn native_unsorted_set_comparator(
 
 /// Register all collection native methods.
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
+    register_gc_root_provider();
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_arraylist_natives(registry);
@@ -31468,6 +31469,26 @@ pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
     for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
+/// Publish the collection-overlay root contract to the collector abstraction.
+///
+/// Registration is deliberately performed from native initialization rather
+/// than from the GC crate: this keeps the collector independent of collection
+/// implementations and guarantees the provider exists before an overlay can be
+/// created through a registered native.
+fn register_gc_root_provider() {
+    cratonvm_gc::external_roots::register_external_root_provider(
+        cratonvm_gc::external_roots::ExternalRootProvider {
+            name: "native-collection-overlays",
+            scan: gc_scan_collection_overlay_roots,
+            owner_addrs: gc_overlay_owner_addrs,
+            roots_for_owner: gc_overlay_roots_for_collection,
+            roots_for_matching_owners: gc_overlay_roots_for_matching_owners,
+            remap: gc_update_collection_overlay_refs,
+            prune: gc_prune_dead_collection_overlays,
+        },
+    );
+}
+
 /// Owner addresses that have at least one overlay key registered.
 ///
 /// `gc_overlay_roots_for_collection` locks the owner index on every call and
@@ -31596,7 +31617,7 @@ pub fn gc_overlay_roots_for_collection(owner_addr: usize) -> Vec<ObjectRef> {
 /// retain them for the minor collection, then let the major marker apply the
 /// precise per-owner rule before old-space compaction.
 pub fn gc_overlay_roots_for_matching_owners(
-    owner_matches: impl Fn(usize) -> bool,
+    owner_matches: &dyn Fn(usize) -> bool,
 ) -> Vec<ObjectRef> {
     let owners: Vec<usize> = {
         let index = overlay_owner_keys()

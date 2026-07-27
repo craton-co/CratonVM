@@ -16,6 +16,13 @@ default JIT: 16805363457397911308
 The mismatch is unchanged between r2 and r3, so it predates and is independent
 of the package-routing removal.
 
+Additional deterministic coverage from the moving-root remediation:
+`NativeRootRegistryGc` succeeds for all 240 rounds with `--nojit`, including
+TreeSet cardinality checks, but the default JIT path reports
+`size mismatch at round 29: list=30, linked=30, tree=30, set=29`. This gives the
+JIT slice a smaller collection operation to minimize in addition to the
+checksum probe.
+
 ## Required fix
 
 Bisect the kernel by opcode/operation, identify the compiled method and
