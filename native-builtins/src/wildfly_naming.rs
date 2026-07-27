@@ -794,6 +794,20 @@ fn native_initial_context_get_environment(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real JDK: `getEnvironment()` is `getDefaultInitCtx().getEnvironment()`,
+    // so an installed `InitialContextFactoryBuilder` answers it. Same omission
+    // the lookup/bind/rebind/unbind natives already fixed — see
+    // `builder_initial_context`. Spring's
+    // `JndiLocatorDelegate.isDefaultJndiEnvironmentAvailable()` is exactly
+    // `new InitialContext().getEnvironment()` inside a try/catch, so throwing
+    // here told Spring that JNDI is unavailable even right after
+    // `SimpleNamingContextBuilder.emptyActivatedContextBuilder()` — and
+    // `StandardServletEnvironment` then skipped its `jndiProperties` source
+    // entirely (`web.context.support.StandardServletEnvironmentTests
+    // .propertySourceOrder`).
+    if let Some(delegate) = builder_initial_context(ctx, this)? {
+        return ctx.invoke_virtual(delegate, "getEnvironment", "()Ljava/util/Hashtable;", &[]);
+    }
     let incoming = initial_context_env(ctx, this);
     if matches!(incoming, Value::Object(Some(_))) {
         return Ok(Some(incoming));

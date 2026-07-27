@@ -3890,6 +3890,83 @@ fn notify_generated_class_handler(
     );
 }
 
+/// `SpringNamingPolicy.getClassName(prefix, source, key, names)` — real cglib's
+/// name chooser, wrapped so it also avoids names THIS VM already defined.
+///
+/// Real cglib guarantees uniqueness with `AbstractClassGenerator$ClassLoaderData
+/// .reservedClassNames`: every generator it runs reserves the name it took, so
+/// the next one picks the following counter value. `cce_enhance` bypasses cglib
+/// entirely, so its `<Config>$$SpringCGLIB$$0` is invisible to that set — and
+/// the next real-cglib generation for the SAME prefix in the same loader picks
+/// `$$0` too. `CglibAopProxy` is exactly that case: it strips the
+/// `$$SpringCGLIB$$` suffix (`ClassUtils.getUserClass`) and proxies the raw
+/// `@Configuration` class, so its prefix is identical to the enhancer's.
+///
+/// The second definition then took over the name, and every symbolic
+/// field/method ref naming that class resolved to the AOP proxy instead of the
+/// enhanced config class:
+/// `NoSuchFieldError: ...$Config$$SpringCGLIB$$0.$$beanFactory` out of the
+/// enhanced class's own `setBeanFactory`
+/// (`BeanMethodPolymorphismTests.beanMethodDetectedOnSuperClass` and
+/// `NestedConfigurationClassTests.twoLevelsDeepWithInheritanceAndScopedProxy`,
+/// both of which pass in isolation and fail only after a test that AOP-proxies
+/// a `@Configuration` bean has run).
+///
+/// The real method's prefix massaging (`_java.util.…` escaping, the
+/// `org.springframework.cglib.empty.Object` default, the `$$FastClass$$` tag)
+/// is intricate and covered by `SpringNamingPolicyTests`, so delegate to the
+/// real bytecode for the candidate and only advance past names that are
+/// already taken. Names cglib itself reserved are already skipped by its own
+/// predicate, so this loop is a no-op unless a native generator got there
+/// first.
+fn native_spring_naming_policy_get_class_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let candidate = ctx.invoke_virtual_bytecode_only(
+        this,
+        "getClassName",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Lorg/springframework/cglib/core/Predicate;)Ljava/lang/String;",
+        &args[1..],
+    )?;
+    let Some(Value::Object(Some(name_ref))) = candidate else {
+        return Ok(candidate);
+    };
+    let Some(name) = ctx.read_string(name_ref) else {
+        return Ok(candidate);
+    };
+    // Split `<base><n>` where `<n>` is the trailing decimal counter cglib
+    // appends. Anything else (no trailing digits) is left alone.
+    let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return Ok(candidate);
+    }
+    let (base, num) = name.split_at(name.len() - digits);
+    let Ok(mut counter) = num.parse::<u64>() else {
+        return Ok(candidate);
+    };
+    let mut chosen = name.clone();
+    // Bounded: a runaway here would be worse than a collision.
+    for _ in 0..1024 {
+        if ctx.class_id_by_name(&chosen.replace('.', "/")).is_none() {
+            break;
+        }
+        counter += 1;
+        chosen = format!("{base}{counter}");
+    }
+    if chosen == name {
+        return Ok(candidate);
+    }
+    if crate::nbflags().dbg_ccecache {
+        eprintln!("[CCECACHE-DBG] naming policy: {name} already defined -> {chosen}");
+    }
+    let out = ctx.create_string(&chosen);
+    Ok(Some(Value::Object(Some(out))))
+}
+
 fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0] = receiver, args[1] = config Class, args[2] = ClassLoader.
     //
@@ -4668,6 +4745,15 @@ pub fn register_cglib_enhancer(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
         cce_enhance,
     );
+    // See `native_spring_naming_policy_get_class_name`: keeps real cglib's
+    // generated names from colliding with the ones `cce_enhance` mints outside
+    // cglib's own reserved-name bookkeeping.
+    registry.register(
+        "org/springframework/cglib/core/SpringNamingPolicy",
+        "getClassName",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Object;Lorg/springframework/cglib/core/Predicate;)Ljava/lang/String;",
+        native_spring_naming_policy_get_class_name,
+    );
     // FactoryBean-enhancement (SPR-6602/11202/15275) — see the module doc
     // comment above `fb_subclass_cache`. `enhanceFactoryBeanReference` is
     // the invokestatic target `emit_bean_override` splices into a
@@ -4701,11 +4787,19 @@ mod fb_ref_bytecode_tests {
     /// byte-splice: build one FactoryBean-typed and one plain `@Bean`
     /// method on the same enhancer class, parse the result with the real
     /// class-file reader (`cratonvm-reader`, no VM/NativeContext needed —
-    /// this is pure byte-emission logic), and check the FactoryBean
-    /// method's Code attribute is exactly 8 bytes longer, its
-    /// exception-table absolute values are shifted by exactly +8, and its
-    /// `max_stack` is one deeper — while the plain method's layout stays
-    /// byte-identical to `emit_bean_override`'s pre-`fb_ref` shape.
+    /// this is pure byte-emission logic), and check the FactoryBean method's
+    /// Code attribute is exactly 8 bytes longer, its `max_stack` one deeper,
+    /// and each of its two exception-table entries shifted by exactly the
+    /// amount the splice implies: the inner NoSuchBeanDefinitionException
+    /// handler wholesale (+8 on all three PCs, it lives after the splice
+    /// point), the outer SPR-8080 `finally` only on its end/handler PCs (its
+    /// TRY_START precedes the splice).
+    ///
+    /// Everything is asserted as a DELTA against the plain method. Absolute
+    /// offsets were pinned here once and broke the moment an unrelated change
+    /// to `emit_bean_override`'s body moved them (the mismatch block added
+    /// 120 bytes and a second handler) — while the splice itself, which is all
+    /// this test exists to guard, was still correct.
     #[test]
     fn fb_ref_splice_shifts_exception_table_by_exactly_8_bytes() {
         let bean_methods = vec![
@@ -4745,33 +4839,59 @@ mod fb_ref_bytecode_tests {
         let plain_code = plain.code().expect("plainBean has a Code attribute");
         let factory_code = factory.code().expect("factoryBean has a Code attribute");
 
-        assert_eq!(plain_code.max_stack, 3);
+        // Everything asserted here is RELATIVE to the plain method. The
+        // absolute byte offsets this test used to pin (code length 161,
+        // exception-table PCs 94/109/142) describe `emit_bean_override`'s body
+        // at the time the splice landed, so any later, unrelated edit to that
+        // body breaks them while the splice itself is still correct — which is
+        // exactly what happened. The splice contract is a delta, so test the
+        // delta.
         assert_eq!(
-            factory_code.max_stack, 4,
+            factory_code.max_stack,
+            plain_code.max_stack + 1,
             "fb_ref splice briefly needs one more stack slot"
         );
         assert_eq!(plain_code.max_locals, factory_code.max_locals);
 
-        assert_eq!(plain_code.code.len(), 161);
         assert_eq!(
             factory_code.code.len(),
-            161 + 8,
+            plain_code.code.len() + 8,
             "fb_ref splice must add exactly 8 bytes"
         );
 
-        assert_eq!(plain_code.exception_table.len(), 1);
-        assert_eq!(factory_code.exception_table.len(), 1);
-        let pe = &plain_code.exception_table[0];
-        let fe = &factory_code.exception_table[0];
-        assert_eq!(pe.start_pc, 94);
-        assert_eq!(pe.end_pc, 109);
-        assert_eq!(pe.handler_pc, 142);
+        // `emit_bean_override` emits TWO handlers, and the splice moves them
+        // differently — assert each against its plain-method counterpart.
+        assert_eq!(plain_code.exception_table.len(), 2);
+        assert_eq!(factory_code.exception_table.len(), 2);
+
+        // Entry 0 — the inner NoSuchBeanDefinitionException handler around the
+        // mismatch block. The whole block sits AFTER the splice point, so all
+        // three of its PCs move by the full +8.
+        let pe0 = &plain_code.exception_table[0];
+        let fe0 = &factory_code.exception_table[0];
         assert_eq!(
-            fe.start_pc, 94,
+            fe0.start_pc,
+            pe0.start_pc + 8,
+            "inner try2 starts after the splice point — shifts wholesale"
+        );
+        assert_eq!(fe0.end_pc, pe0.end_pc + 8);
+        assert_eq!(fe0.handler_pc, pe0.handler_pc + 8);
+        assert_eq!(fe0.catch_type, pe0.catch_type);
+
+        // Entry 1 — the outer SPR-8080 any-Throwable `finally`. Its TRY_START
+        // is before the splice point, so only its end/handler move.
+        let pe1 = &plain_code.exception_table[1];
+        let fe1 = &factory_code.exception_table[1];
+        assert_eq!(
+            fe1.start_pc, pe1.start_pc,
             "TRY_START is before the splice point — unaffected"
         );
-        assert_eq!(fe.end_pc, 109 + 8);
-        assert_eq!(fe.handler_pc, 142 + 8);
+        assert_eq!(fe1.end_pc, pe1.end_pc + 8);
+        assert_eq!(fe1.handler_pc, pe1.handler_pc + 8);
+        assert_eq!(
+            fe1.catch_type, 0,
+            "outer handler keeps `finally` (catch_type 0) semantics"
+        );
     }
 
     /// Regression guard for the real-cglib-bookkeeping fields

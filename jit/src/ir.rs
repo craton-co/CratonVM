@@ -1837,17 +1837,10 @@ impl IrBuilder {
                 }
                 // new — allocate an object as an `Op::New`. Emitted so escape
                 // analysis can scalar-replace it when it does not escape (no
-                // heap allocation, fields become SSA values). The lowerer has
-                // no allocation path, so an `Op::New` that SURVIVES escape
-                // analysis (escaping) makes the whole compile bail to
-                // single-pass — enforced by the caller after `optimize`.
+                // heap allocation, fields become SSA values). An escaping
+                // allocation survives optimization and is emitted through the
+                // shared compact-layout/TLAB-aware runtime lowering stub.
                 0xbb => {
-                    // Compact layout sizes objects from the packed body, not
-                    // `num_fields * SLOT_SIZE`; bail to the compact-aware
-                    // single-pass `jit_new_object` helper path.
-                    if cratonvm_types::compact_ref_fields_enabled() {
-                        return None;
-                    }
                     let (class_id, num_fields) = match self.new_info.get(&pc) {
                         Some(&ci) => ci,
                         None => return None,

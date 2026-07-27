@@ -2474,6 +2474,15 @@ pub(crate) fn register_mockito_debugging_intrinsics(registry: &mut NativeMethodR
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;)Z",
         native_mockito_mock_method_advice_is_overridden,
     );
+    // The two *selector* overrides below forced Mockito onto its fallback
+    // `Location` / `MemberAccessor` implementations on every run — a silent
+    // divergence from HotSpot (which picks `LocationImpl` and
+    // `InstrumentationMemberAccessor`) that cost every Mockito diagnostic its
+    // call site. They are off by default now; see
+    // `cratonvm_types::flags::mockito_legacy_selectors`.
+    if !cratonvm_types::flags::mockito_legacy_selectors() {
+        return;
+    }
     registry.register(
         MOCKITO_LOCATION_FACTORY,
         "create",
@@ -4419,7 +4428,17 @@ fn assertj_objects_equal(
 ) -> Result<bool, MethodCallFailed> {
     let (left, right) = match (left, right) {
         (None, None) => return Ok(true),
-        (None, Some(_)) | (Some(_), None) => return Ok(false),
+        (None, Some(_)) => return Ok(false),
+        // Real `StandardComparisonStrategy.areEqual` only short-circuits on a
+        // null ACTUAL; every array branch is guarded by `other != null` and the
+        // method ends in `return actual.equals(other)`. So a non-null actual
+        // with a null other still gets `equals(null)` dispatched — which is how
+        // `assertThat(springNullBean).isEqualTo(null)` passes on HotSpot
+        // (`NullBean.equals` is `this == obj || obj == null`).
+        (Some(left), None) => {
+            let r = ctx.invoke_virtual(left, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(None)])?;
+            return Ok(matches!(r, Some(Value::Int(v)) if v != 0));
+        }
         (Some(left), Some(right)) if left == right => return Ok(true),
         (Some(left), Some(right)) => (left, right),
     };

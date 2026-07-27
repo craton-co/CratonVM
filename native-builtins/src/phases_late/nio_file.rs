@@ -10119,13 +10119,37 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // mangled "file:\C:\..." Files emptied Gradle's ClasspathUtil walk
         // and with it every ProjectBuilder module classpath).
         let raw = crate::net_phase_e::uri_raw_string(ctx, uri);
-        let mut path = match ctx.get_field_by_name(uri, "path") {
-            Value::Object(Some(s)) => ctx
+        // Real `File(URI)` is `String p = uri.getPath();` — and `getPath()`
+        // returns the DECODED path, while the `path` FIELD holds the raw,
+        // still-percent-encoded one (`getRawPath()`'s value). Reading the field
+        // therefore produced `/tmp/dir/resource%23test1.txt` for a file
+        // genuinely named `resource#test1.txt`, so `exists()` was false for any
+        // path containing a character `File.toURI()` had escaped. Spring's
+        // `PathMatchingResourcePatternResolver` round-trips through
+        // `new File(url.toURI())` while walking a directory, so a single `#` in
+        // a resource name made the whole wildcard scan return nothing
+        // (`core.io.support.PathMatchingResourcePatternResolverTests
+        // .encodedHashtagInPath`).
+        //
+        // Ask the URI itself, so the decoding rules stay the JDK's. The field
+        // read remains as the fallback for the synthetic 7-slot URIs described
+        // below, whose `getPath()` may not be wired.
+        let mut path = match ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx
                 .read_string(s)
                 .filter(|v| !v.is_empty() && *v != raw)
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        if path.is_empty() {
+            path = match ctx.get_field_by_name(uri, "path") {
+                Value::Object(Some(s)) => ctx
+                    .read_string(s)
+                    .filter(|v| !v.is_empty() && *v != raw)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+        }
         if path.is_empty() {
             // Parse from the full URI text:
             //   scheme:[//authority]path[?query][#fragment]
