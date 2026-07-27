@@ -6,8 +6,7 @@ which flipped `direct_virtual_compiled_callee_entry_enabled()` to default-ON on
 2026-07-27. Workaround:
 `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`.
 
-Found while retiring the json-smart JIT ban
-(`docs/internal/jsonsmart-parser-jit-retired-20260727.md`); the ban itself
+Found while retiring the json-smart JIT ban; the ban itself
 stays retired — the corruption is in the JIT's virtual-dispatch inline cache,
 not in `net/minidev/json/parser/`.
 

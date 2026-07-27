@@ -147,7 +147,7 @@ real; don't trust a single noisy run either way.
 ## Already resolved / no action needed (confirmed this session or by prior commits already on dev)
 
 - `org/bouncycastle/` (BC-JIT family) — **MUST STAY, permanently.**
-  Thoroughly root-caused in `docs/internal/gaps/bc-jit-miscompile-handoff.md`:
+  Thoroughly root-caused:
   the one real miscompile (OSR loop-overrun AIOOBE via an `ldc`
   bytecode-length bug) is fixed on dev; the remaining blocker is a genuine
   throughput wall (SPHINCS-256 needs near-HotSpot crypto throughput the JIT
@@ -168,8 +168,7 @@ High-value (wide blast radius or already well-isolated in comments):
 - **SPB.2/.4/.4b/.4c/.5/.6/.7/.8/.8b/.8c/.9/.9b/.9c/.9d, RBC.1, CGL.1,
   PIC.1, W2-CHM, EXEC.1** — ~19 remaining Spring-Boot-era blanket package
   bans (SPB.1 itself, `org/springframework/util/`, was REMOVED 2026-07-26 —
-  see the "UPDATE" note above and
-  `docs/internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`;
+  see the "UPDATE" note above;
   its "allocate-then-putfield" crash turned out to be a GC-root-scanning gap,
   not a JIT miscompile), all explicitly cross-referenced in their own
   comments as "the same allocate-then-putfield archetype" (a hypothesized JIT
@@ -195,7 +194,7 @@ High-value (wide blast radius or already well-isolated in comments):
   7 specific ATN config-context methods but keeps a package-level ban as
   the "surgical per-method ban of those 7 is the future minimal fix."
   Doing that narrowing is concrete, scoped work.
-- ~~**KC26-PIC.1/.2, KC26-RX.1**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`.
+- ~~**KC26-PIC.1/.2, KC26-RX.1**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`).
   (**KC26-CFG.1** is a separate entry and is not affected by that lift.)
 - **JUNIT.1** — generic `JUnitCore.main` ban; if liftable, improves JIT
   coverage across every suite's test-running machinery, not just one
@@ -220,8 +219,7 @@ still real correctness bugs worth closing):
   native-shadowed `java/util/HashMap.<init>()V`, so JIT-created maps got a
   32-bucket table and iterated in a different order than interpreter-created
   ones — fixed, with `vm/tests/jit_collection_ctor_identity.rs` as the
-  regression net. Full writeup:
-  `docs/internal/jsonsmart-parser-jit-retired-20260727.md`. The 2026-07-26
+  regression net. The 2026-07-26
   verdict below is kept for history.**
 
   ~~DONE 2026-07-26 03:12 UTC: CONFIRMED still needed, ban KEPT.~~ Standalone stress repro (`docs/known-issues/repros/jsonsmart/JsonSmartProbe.java`,
@@ -235,9 +233,8 @@ still real correctness bugs worth closing):
   input document across consecutive iterations (`"tab" at position 6` →
   `"tab":"a\tb at position 12` → `character (a) at position 5`, all for the
   same doc) — a live-state-dependent miscompile signature, not a
-  deterministic parser bug. Full writeup:
-  `docs/internal/jsonsmart-parser-jit-retired-20260727.md` (that doc was
-  renamed and rewritten when this verdict was superseded). Fourth-for-four
+  deterministic parser bug (this verdict was later superseded — see above).
+  Fourth-for-four
   real-app/faithful-repro confirmation this session that this ban family
   (`org/jboss/as/`, `org/h2/`, `com/unboundid/`, now this) is still fully
   live — nothing in it has been found safe to remove yet.
@@ -266,8 +263,7 @@ still real correctness bugs worth closing):
   single-cluster, not yet re-examined.
 - AQS/RRWL family (`is_known_miscompile_aqs_family`), CLQ family
   (`is_known_miscompile_clq_family`) — large, well-tested, tied into the
-  separate H2 testConcurrent perf investigation (see
-  `docs/internal/gaps/h2-*testconcurrent*` and memory
+  separate H2 testConcurrent perf investigation (see memory
   `h2-suite-fail-triage`/`h2-testfilesystem-testconcurrent`). Not
   re-verified this session; do not touch without reading that context
   first, these interact with a live perf investigation.
@@ -277,8 +273,8 @@ still real correctness bugs worth closing):
 **Status (this session, branch `fix/jit-ban-sweep-20260725`):**
 - Item 1 — **DONE, REFUTED 2026-07-26 02:30 UTC** (see consolidation-hypothesis section above).
 - Item 2 (SPB.1 bisection) — **SKIPPED, owned by the other concurrent
-  session** (`fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, see
-  `docs/internal/jit-ban-sweep-20260725.md` — already actively testing the
+  session** (`fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726` —
+  already actively testing the
   SPB/CGL/PIC/WildFly family). Do not duplicate.
 - PROXY-JITCALL.1 — REMOVED (see above, merged dev@07427a14e).
 
@@ -317,8 +313,7 @@ still real correctness bugs worth closing):
   cache. Verified 50/50 clean with the ban kept and 47/47 clean with it
   lifted — no distinct JIT-specific symptom survives the fix, so
   `org/springframework/util/`'s blanket ban is removed rather than left
-  liftable. Full writeup:
-  `docs/internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`.
+  liftable.
 
 1. Verify (or refute) the TYPES-ERASURE.1 consolidation hypothesis — highest
    expected value, cheapest to test (no-rebuild env-var bisection already
@@ -360,8 +355,7 @@ still real correctness bugs worth closing):
    dependencies to chase down which exact artifact has it. **Pivoting to
    TOMCAT-JNDIREALM-RDN.1/JIT.2 (`com/unboundid/`) instead** — real,
    working Tomcat Linux fixture already confirmed on this host (see
-   `[[tomcat-linux-suite-fixture-location]]` memory /
-   `docs/internal/jit-ban-sweep-20260725.md`), and the ban comment names
+   `[[tomcat-linux-suite-fixture-location]]` memory), and the ban comment names
    an exact real repro (`TestJNDIRealmIntegration`, 76-case matrix).
    Leaving this ANTLR.1 item open/unclaimed for whoever has a Groovy
    fixture available, or is willing to fetch the right module.
@@ -419,9 +413,6 @@ Two process lessons for the rest of this sweep:
 2. **Build a same-commit control before crediting a fix.** A control build at
    dev `e4e4053bb` still fails 4/5 in the identical harness, which is what
    makes "clean on current dev" mean something.
-
-Full writeup:
-`docs/internal/fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md`.
 
 ## JASPER-JDT.2 / JASPER-JDT.3 — CLAIMED 2026-07-26 02:54 UTC
 
@@ -487,7 +478,7 @@ no crash. Merged dev@9ba6ab5de.
 ## Session update 2026-07-26 (continuation, `fix/jit-ban-remaining-20260726`)
 
 Worked the remaining unclaimed candidates from the "Not investigated this
-session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-20260726.md`.
+session" list above.
 
 - **REMOVED (7, real-jar/real-checkout-verified, baseline/lifted/aggressive-threshold all clean):**
   SPR-AOT-TESTNG-MAPS.1, REACTOR-ADDCAP.1, REACTOR-FLUXCREATE.1, JETTY-WSIO.1,
@@ -508,7 +499,7 @@ session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-202607
   2026-06-11 (predates this session).
 - **NEW BUG FOUND:** `java.io.Writer.write(char[])` silently drops output
   under JIT once hot — a general VM defect, not app-specific, unrelated to
-  the JAXB ban it was found under. Not yet root-caused/fixed. See
-  `docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md` (CLOSED 2026-07-27).
+  the JAXB ban it was found under. Not yet root-caused/fixed at the time
+  (CLOSED 2026-07-27).
 
 Reproducers committed under `docs/known-issues/repros/jitban-remaining-20260726/`.

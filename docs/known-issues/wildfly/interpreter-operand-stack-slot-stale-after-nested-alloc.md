@@ -19,8 +19,7 @@ interpreter frame walk. A full forensic campaign (worktree
 that: frames are scanned and remapped correctly in every captured event. The family's true members:
 
 1. **Producer #11 — `Properties.load` re-entrant natives (FIXED, commit `8e1162cfa`).** The fatal
-   `MechanismDatabase.<init>` Reader NSME — see
-   `docs/internal/fixed-suite-bugs/wildfly-boot-stale-reader-nsme-mechanismdatabase-FIXED.md`.
+   `MechanismDatabase.<init>` Reader NSME, since fixed and archived.
    0/320 boots post-fix (was the only fatal member).
 2. **Frozen-in-JIT peer interpreter-frame coverage (HARDENED, commit `ec883f519`).** A peer frozen
    mid-JIT by the cross-thread STW takeover was covered only by its last root-snapshot deposit +
@@ -191,8 +190,8 @@ A fresh 320-boot campaign (`out/results.tsv`, waves 1-80) came back with 3 `STAL
   `WFLYCTL0043: An attribute named 'hornetq-store-enable-async-io' is already registered at
   location '/subsystem=transactions'` — a genuine DUPLICATE attribute registration, i.e. some
   extension-initialization code path ran twice. This smells like a class/loader-identity duplication
-  bug (the same family as `docs/internal/aot-beanoverride-double-context-refresh-rootcaused-*`'s
-  fork-loader ClassId instability) rather than a stale-pointer read. **Not yet root-caused; not
+  bug (the same family as the AOT bean-override double-context-refresh fork-loader ClassId
+  instability) rather than a stale-pointer read. **Not yet root-caused; not
   confirmed related to this doc's family** — flagged here only because it was in the same
   1.2%-tail sample as the other three.
 

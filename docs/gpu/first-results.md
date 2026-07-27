@@ -10,8 +10,8 @@ The living results now belong to:
 - **`bench-gpu/results/`** — dated benchmark tables (cold 4-way comparison,
   warm-loop comparison, div-chain "GPU vs best CPU" concept-prover).
 - **Repo `README.md` → "GPU offload"** — the headline table.
-- **`docs/internal/gpu-offload-followups-20260711.md`** — the completed
-  follow-up record, including intentional CPU fallbacks and their rationale.
+- **[`docs/gpu/reductions.md`](reductions.md)** — intentional CPU fallbacks
+  (float reductions) and their rationale.
 
 Acceptance criteria from the original plan, as measured (warm, full
 H2D + kernel + D2H per call, `GpuWarm.heavy` n = 2²⁴): correctness ✓

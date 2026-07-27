@@ -579,5 +579,5 @@ shadowing) is fixed and merged.
   race windows, but they are different defects in different code paths.
 
 ## Related
-- `docs/internal/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md` — the fix that first let `TestLob` run far enough to reach this.
-- `docs/internal/h2-suite-bugs/bug-h2-mvstore-insert-loop-perf-hang.md` — a different, already-tracked MVStore issue in this same suite; checked in this session and confirmed NOT the same root cause (see above).
+- A cross-class-dispatch `NoSuchMethodError` fix (since archived) is what first let `TestLob` run far enough to reach this.
+- A separate, already-tracked MVStore issue in this same suite — pure per-operation interpreter throughput (`TransactionMap`/`MVMap.operate` overhead, ~90x vs HotSpot) — was checked in this session and confirmed NOT the same root cause (see above).

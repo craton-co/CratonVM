@@ -5249,8 +5249,20 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         loader_id: u32,
     ) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let mut cm = self.shared.classes.class_manager_write();
-        match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
+        match cm.define_class(name, bytes, cl_id) {
             Ok(cid) => {
                 drop(cm);
                 let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
@@ -5277,14 +5289,38 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let cm = self.shared.classes.class_manager.read();
-        cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
+        cm.find_class_by_name_in_loader(name, cl_id)
     }
 
     fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let cm = self.shared.classes.class_manager.read();
-        cm.class_defined_by_loader_exact(name, ClassLoaderId::UserDefined(loader_id))
+        cm.class_defined_by_loader_exact(name, cl_id)
     }
 
     fn define_class_full(
@@ -5299,10 +5335,34 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2).
         use cratonvm_classloading::{CodeSource, DefineClassOptions};
         use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
+        // Must be the exact inverse of `loader_id_of_class`'s encoding
+        // (Bootstrap=0, Extension=1, Application=2, UserDefined(id)=id).
+        // This used to only special-case `0` (as Application, the
+        // pre-existing default-sentinel convention some callers rely on)
+        // and fell through everything else -- including `2` -- to
+        // `UserDefined(loader_id)`. A caller that round-trips a REAL
+        // loader id via `loader_id_of_class` (e.g. the CGLIB
+        // `@Configuration` enhancer fetching its superclass's own loader
+        // so the generated subclass is defined by the SAME loader) got
+        // `UserDefined(2)` back for the Application loader instead of
+        // `Application` -- a different `ClassLoaderId` that
+        // `same_runtime_package`'s `loader_id` equality check correctly
+        // treats as a DIFFERENT runtime package from the superclass's
+        // `Application` tag. That silently defeated package-private
+        // method-override detection for the whole generated class: every
+        // package-private `@Bean` override was treated as an unrelated,
+        // independent method in a fresh vtable slot rather than a true
+        // override of the inherited slot, so virtual dispatch to it from
+        // ordinary (non-invokespecial) call sites kept resolving to the
+        // superclass's original method body forever, breaking `@Bean`
+        // inter-method singleton-sharing (calling one `@Bean` method from
+        // another on `this` re-ran the real factory body instead of
+        // returning the container's cached instance).
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Application,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
         };
         let code_source =
             if opts.code_source_url.is_none() && opts.code_source_certificates.is_empty() {
@@ -5383,10 +5443,17 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn list_initiated_class_ids(&self, loader_id: u32) -> Vec<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
         };
         let cm = self.shared.classes.class_manager.read();
         cm.class_store
