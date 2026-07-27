@@ -2333,7 +2333,26 @@ impl<'a> NativeContextImpl<'a> {
     /// `ValueStack::scan_object_refs` still treats pointer-shaped `Long` bits as
     /// roots without heap validation (its file is restricted from edits), and
     /// the resulting bogus addresses crash the GC at the next mark/move.
-    pub(crate) fn deposit_root_snapshot(&self) {
+    pub(crate) fn deposit_root_snapshot(&mut self) {
+        // A thread that is about to PARK cannot consult its per-thread JIT memo
+        // caches, but this deposit publishes them as GC roots — so any entry
+        // left in them pins its `map`/`node` (and everything those reference)
+        // for the entire, unbounded blocked window. For a pooled worker that is
+        // effectively forever: an idle Tomcat `http-nio-*-exec-N` kept a
+        // (HashMap, Node) pair from a JSP compilation alive, and through it the
+        // JDT compiler graph -> JspCompilationContext -> JasperLoader -> the
+        // JSP's `Class` mirror, so `WeakReference<Class>` never cleared and
+        // Tomcat's annotation cache never shrank
+        // (`TestDefaultInstanceManager.testClassUnloading`, doc 26).
+        //
+        // Both caches are PURE MEMOS: every lookup re-validates (`modCount` +
+        // key equality for the HashMap node cache, source identity for the
+        // case cache) and a miss simply recomputes. Dropping them here is
+        // therefore always semantically safe, and it must happen BEFORE the
+        // snapshot is built so the entries are neither published as roots nor
+        // left behind as stale addresses to be read after the park.
+        self.thread.jit_hashmap_string_node_cache.clear();
+        self.thread.string_case_cache.clear();
         self.deposit_root_snapshot_inner(true);
     }
 
