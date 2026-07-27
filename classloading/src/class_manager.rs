@@ -4367,7 +4367,7 @@ impl ClassManager {
                 .access_flags
                 .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::ABSTRACT);
             let is_native = method.is_native();
-            let num_params_u16 = cratonvm_jit::count_param_slots(&method.descriptor) as u16;
+            let num_params_u16 = cratonvm_jit_api::count_param_slots(&method.descriptor) as u16;
             let dispatch: Option<VtableMethodSnapshot> = if is_abstract {
                 None
             } else if let Some(code_attr) = method.code() {

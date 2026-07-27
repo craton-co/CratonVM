@@ -1223,7 +1223,7 @@ impl fmt::Debug for RedefineGate {
 /// Fully-resolved invoke target. Eliminates all intermediate string lookups,
 /// class loading, and superclass walks on subsequent calls.
 #[derive(Clone)]
-pub enum CachedInvokeTarget {
+pub enum CachedInvokeTarget<JitMethod = ()> {
     /// Bytecode method: all data needed for Frame creation (invokestatic/invokespecial).
     Bytecode {
         cached: Arc<CachedBytecodeMethod>,
@@ -1258,7 +1258,9 @@ pub enum CachedInvokeTarget {
     },
     /// JIT-compiled method: call native code directly, no frame push needed.
     Jit {
-        compiled: Arc<cratonvm_jit::CompiledMethod>,
+        /// Backend-owned compiled artifact. Generic by design: class loading
+        /// owns invoke-cache semantics, not a concrete compiler backend.
+        compiled: JitMethod,
         num_params: u16,
         return_type: u8, // b'I', b'J', b'V'
         needs_heap: bool,
@@ -1315,7 +1317,7 @@ pub enum CachedInvokeTarget {
     },
 }
 
-impl CachedInvokeTarget {
+impl<JitMethod> CachedInvokeTarget<JitMethod> {
     /// WP2.4-F1 — fast O(1) staleness check. Returns `true` when the bound
     /// class's redefine generation has advanced since this entry was
     /// populated. The caller is expected to evict the entry and fall
@@ -1371,8 +1373,8 @@ const POLY_CACHE_CAP_PER_SITE: usize = 8;
 
 /// Cache that maps invoke sites to fully-resolved invoke targets.
 /// On cache hit, no locks, string allocations, or method resolution needed.
-pub struct InvokeCache {
-    entries: FxHashMap<InvokeCacheKey, CachedInvokeTarget>,
+pub struct InvokeCache<JitMethod = ()> {
+    entries: FxHashMap<InvokeCacheKey, CachedInvokeTarget<JitMethod>>,
     /// Small overflow cache for call sites that see MORE than one distinct
     /// receiver class. `entries` above is monomorphic: a second receiver
     /// class simply overwrites the first, so an alternating/megamorphic call
@@ -1387,10 +1389,10 @@ pub struct InvokeCache {
     /// call site that only ever sees one receiver class never populates this
     /// map at all (see `put_poly`'s callers, which are the SAME call sites
     /// that already populate `entries`).
-    poly_entries: FxHashMap<InvokeCacheKey, Vec<(ClassId, CachedInvokeTarget)>>,
+    poly_entries: FxHashMap<InvokeCacheKey, Vec<(ClassId, CachedInvokeTarget<JitMethod>)>>,
 }
 
-impl InvokeCache {
+impl<JitMethod: Clone> InvokeCache<JitMethod> {
     pub fn new() -> Self {
         Self {
             entries: fx_hashmap_with_capacity(64),
@@ -1409,7 +1411,7 @@ impl InvokeCache {
         caller_class: ClassId,
         cp_index: u16,
         is_special: bool,
-    ) -> Option<&CachedInvokeTarget> {
+    ) -> Option<&CachedInvokeTarget<JitMethod>> {
         let key = (caller_class, cp_index, is_special);
         // WP2.4-F1: O(1) generation check on hit. If the entry is stale,
         // remove it and pretend we never had it; the caller will repopulate.
@@ -1430,7 +1432,7 @@ impl InvokeCache {
         caller_class: ClassId,
         cp_index: u16,
         is_special: bool,
-        target: CachedInvokeTarget,
+        target: CachedInvokeTarget<JitMethod>,
     ) {
         self.entries
             .insert((caller_class, cp_index, is_special), target);
@@ -1449,7 +1451,7 @@ impl InvokeCache {
         cp_index: u16,
         is_special: bool,
         receiver_class: ClassId,
-    ) -> Option<CachedInvokeTarget> {
+    ) -> Option<CachedInvokeTarget<JitMethod>> {
         let key = (caller_class, cp_index, is_special);
         let entries = self.poly_entries.get_mut(&key)?;
         let idx = entries.iter().position(|(cid, _)| *cid == receiver_class)?;
@@ -1475,7 +1477,7 @@ impl InvokeCache {
         cp_index: u16,
         is_special: bool,
         receiver_class: ClassId,
-        target: CachedInvokeTarget,
+        target: CachedInvokeTarget<JitMethod>,
     ) {
         let key = (caller_class, cp_index, is_special);
         let entries = self.poly_entries.entry(key).or_default();
@@ -1511,19 +1513,19 @@ impl InvokeCache {
     }
 }
 
-impl Default for InvokeCache {
+impl<JitMethod: Clone> Default for InvokeCache<JitMethod> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl fmt::Debug for InvokeCache {
+impl<JitMethod> fmt::Debug for InvokeCache<JitMethod> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "InvokeCache({} entries)", self.entries.len())
     }
 }
 
-impl fmt::Debug for CachedInvokeTarget {
+impl<JitMethod> fmt::Debug for CachedInvokeTarget<JitMethod> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             CachedInvokeTarget::Bytecode { cached: m, .. } => {
@@ -1715,7 +1717,7 @@ mod tests {
     #[test]
     fn invoke_cache_distinguishes_special_vs_virtual() {
         use std::sync::Arc;
-        let mut cache = InvokeCache::new();
+        let mut cache = InvokeCache::<()>::new();
         let caller = ClassId::new(7);
         let cp_index = 666u16;
 
@@ -1788,7 +1790,7 @@ mod tests {
     fn invoke_cache_evicts_stale_entry_after_redefine_bump() {
         use std::sync::atomic::Ordering;
         use std::sync::Arc;
-        let mut cache = InvokeCache::new();
+        let mut cache = InvokeCache::<()>::new();
         let caller = ClassId::new(7);
         let cp_index = 11u16;
 

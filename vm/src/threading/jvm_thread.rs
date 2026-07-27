@@ -463,7 +463,7 @@ pub struct JvmThread {
 
     /// Thread-local invoke cache — maps (caller_class, cp_index) to resolved targets.
     /// No locking needed since each thread owns its cache.
-    pub invoke_cache: InvokeCache,
+    pub invoke_cache: InvokeCache<Arc<crate::jit::CompiledMethod>>,
 
     /// Thread-local cache for the vtable-fast native-shadow guard.
     ///

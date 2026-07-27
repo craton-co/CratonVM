@@ -48,8 +48,8 @@ use cratonvm_reader::instruction::Instruction;
 use tracing::trace;
 
 use crate::classloading::resolution::{
-    CachedBytecodeMethod, CachedInvokeTarget, MethodHandleKind, RedefineGate, ResolvedField,
-    ResolvedMethod,
+    CachedBytecodeMethod, CachedInvokeTarget as GenericCachedInvokeTarget, MethodHandleKind,
+    RedefineGate, ResolvedField, ResolvedMethod,
 };
 use crate::classloading::{find_field_recursive, ClassId};
 use crate::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeError, VmError};
@@ -67,6 +67,8 @@ use crate::vm::{
     get_or_create_class_mirror, get_static_shared, invoke_on_class_shared, invoke_or_native,
     invoke_shared, read_java_string, set_static_shared, SharedVm,
 };
+
+type CachedInvokeTarget = GenericCachedInvokeTarget<Arc<crate::jit::CompiledMethod>>;
 
 // ---------------------------------------------------------------------------
 // GC trigger helper

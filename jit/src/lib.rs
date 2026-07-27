@@ -183,7 +183,7 @@ pub fn validate_code_ptr(ptr: *const u8) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub use cratonvm_jit_api::{CachedBytecodeMethod, JitRuntimeHelpers};
+pub use cratonvm_jit_api::{count_param_slots, CachedBytecodeMethod, JitRuntimeHelpers};
 #[allow(unused_imports)]
 use cratonvm_types::{
     ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE, REF_ELEMENT_SIZE, SLOT_SIZE,
@@ -9178,55 +9178,6 @@ fn is_category2_opcode(op: u8) -> bool {
         | 0x94 | 0x97 | 0x98   // lcmp, dcmpl, dcmpg
         | 0xad | 0xaf          // lreturn, dreturn
     )
-}
-
-pub fn count_param_slots(descriptor: &str) -> usize {
-    let bytes = descriptor.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'(' {
-        return 0;
-    }
-    let mut i = 1;
-    let mut slots = 0;
-    while i < bytes.len() && bytes[i] != b')' {
-        match bytes[i] {
-            b'I' | b'F' | b'B' | b'C' | b'S' | b'Z' => {
-                slots += 1;
-                i += 1;
-            }
-            b'J' | b'D' => {
-                slots += 1;
-                i += 1;
-            }
-            b'L' => {
-                while i < bytes.len() && bytes[i] != b';' {
-                    i += 1;
-                }
-                i += 1;
-                slots += 1;
-            }
-            b'[' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] == b'[' {
-                    i += 1;
-                }
-                if i < bytes.len() {
-                    if bytes[i] == b'L' {
-                        while i < bytes.len() && bytes[i] != b';' {
-                            i += 1;
-                        }
-                        i += 1;
-                    } else {
-                        i += 1;
-                    }
-                }
-                slots += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    slots
 }
 
 /// Per-argument JVM type tag, one entry per COMPACT stack slot (mirrors

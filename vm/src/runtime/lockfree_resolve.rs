@@ -178,9 +178,11 @@ use parking_lot::RwLock;
 
 #[allow(unused_imports)]
 use super::fx_collections::{fx_hashmap, FxBuildHasher, FxHashMap, FxHasher};
-use crate::classloading::resolution::CachedInvokeTarget;
+use crate::classloading::resolution::CachedInvokeTarget as GenericCachedInvokeTarget;
 use crate::classloading::ClassId;
 use std::hash::{Hash, Hasher};
+
+type CachedInvokeTarget = GenericCachedInvokeTarget<Arc<crate::jit::CompiledMethod>>;
 
 // ---------------------------------------------------------------------------
 // ResolutionKey
