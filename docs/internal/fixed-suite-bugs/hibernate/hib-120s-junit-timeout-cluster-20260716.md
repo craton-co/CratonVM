@@ -549,3 +549,68 @@ There were zero `TimeoutException`, stale-pointer, `AbstractMethodError`, or
 unexpected test-failure records. The historical cross-VM throughput ratio for
 the code-diverse insert-ordering workload remains an architectural benchmark
 topic, but it is no longer an open Hibernate timeout or correctness issue.
+
+## Recurrence check (2026-07-27): `DynamicBatchFetchTest` and `ScannerTest` re-trip the 120s timeout in a fresh 282-class rerun -- same load-sensitive margin, not a new/reopened bug
+
+A 282-class rerun on `dev` merged through `13055f75c` (the `MappingXsdSupport`
+compact-ref-fields JIT-regression fix; worktree `CratonVM-hib-local-0712`,
+run `run-20260726-235842-passed`) hit both classes again as standalone
+`TimeoutException` failures, running as two of four `passed`-category shards
+in parallel:
+
+| Class | Suite-run result (4-way parallel shard) | HotSpot solo |
+|---|---|---|
+| `DynamicBatchFetchTest` | `found=2 started=2 ok=1 failed=1 ms=175672` -- `testMultiLoad` tripped the 120s internal guard | `ms=9673` |
+| `ScannerTest` | `found=2 started=2 ok=1 failed=1 ms=160019` -- `testCustomScanner` tripped the 120s internal guard | `ms=11952` |
+
+Both were re-run solo (`-Dcraton.batch=1`, `-Djunit.jupiter.execution.timeout.default=400s`
+override, same `dev`-tip binary) to see the actual completion time past the
+internal 120s guard:
+
+| Class | Solo result | Elapsed vs HotSpot |
+|---|---|---|
+| `DynamicBatchFetchTest` | `found=2 started=2 ok=2 failed=0 ms=182854` -- clean pass | ~18.9x |
+| `ScannerTest` | `found=2 started=2 ok=2 failed=0 ms=135938` -- clean pass | ~11.4x |
+
+Both solo logs are completely clean: zero `Stale pointer detected`,
+`AbstractMethodError`, `out-of-bounds field read`, or any other
+corruption-family warning anywhere in either log -- these are genuine "test
+completes correctly but too slowly" results, exactly this cluster's own
+working hypothesis, not a resurgence of the reflection/GC-corruption family
+this doc's earlier sections ruled these two classes back into once (see the
+2026-07-16 "was never a throughput/timeout member" section above).
+
+Both readings sit comfortably inside variance already on record in this same
+doc for these same classes: `DynamicBatchFetchTest` previously ranged from
+98430ms (quiet-host combined acceptance run) to 783098ms (contended-host solo
+run) -- an ~8x spread -- and `ScannerTest` previously ranged from 27928ms
+(quiet-host combined acceptance run) up to today's 135938-160019ms, a ~5x
+spread. `git log` on both test source files
+(`DynamicBatchFetchTest.java`, `ScannerTest.java`) shows no local
+modifications, so nothing about the tests themselves changed between the
+quiet-host and contended-host readings.
+
+Host contention was directly confirmed during this recheck: `Get-CimInstance
+Win32_Processor`'s `LoadPercentage` read 62% with **six concurrent
+`cratonvm.exe`/`cratonvm-*.exe` processes** running (other sessions'
+worktrees actively exercising their own CratonVM workloads on this shared
+Windows box), then dropped to 9% shortly after -- the same shared-host
+multitenant confound already documented as a false-hang mechanism in
+[`hib-delayedcdisupporttest-weld-bootstrap-hang-NOT-A-BUG.md`](hib-delayedcdisupporttest-weld-bootstrap-hang-NOT-A-BUG.md).
+`ScannerTest`'s ~11.4x ratio in particular is at or below the suite's own
+documented "typical" 10-40x CratonVM/HotSpot interpreter overhead
+(`apps/hib-suite-runner/HOTSPOT-BASELINE.md` §2) -- it isn't running unusually
+slowly, it's just that `testCustomScanner`'s absolute HotSpot cost (four
+`EntityManagerFactory` bootstraps against a `.par`/jandex scan, ~12s) leaves
+very little headroom before Hibernate's fixed 120s per-test guard, so even
+ordinary overhead plus ordinary host contention is enough to tip it over.
+
+**Conclusion: neither class is reopened as a discrete bug.** Both are
+confirmed recurrences of this doc's own already-characterized systemic
+throughput margin -- CratonVM-specific (HotSpot passes both easily) but not
+independently fixable without the broader interpreter/JIT throughput work
+already tracked elsewhere (`bt-throughput-levers-handoff.md`). No known-issues
+doc was opened for either; this update is the record. Whether either
+individually re-trips the 120s guard on any given suite run is expected to
+keep depending on this shared host's instantaneous contention level, same as
+every other class in this cluster.

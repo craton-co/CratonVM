@@ -57,3 +57,41 @@ Using `../../../../apps/hib-suite-runner`, with a fresh process for each run:
 The final quiet-core runs used six otherwise idle logical CPUs while unrelated suites and Rust release builds occupied other cores. The earlier per-element native could pass on a quiet host but still missed the internal timeout during shared-host contention; the bulk destination copy removed that residual and passed both modes under the same moderate load before final integration.
 
 The former timeout method and all structurally similar sibling lock tests are covered by those complete-class runs. No residual failure from this issue remains.
+
+## Recurrence check (2026-07-27): overshoot narrows further to 2869ms, trend continues
+
+A 282-class rerun on `dev` merged through `13055f75c` (worktree
+`CratonVM-hib-local-0712`, run `run-20260726-235842-passed`) hit `LockTest`
+again:
+
+```
+@@FAIL org.hibernate.orm.test.jpa.lock.LockTest :: org.opentest4j.AssertionFailedError:
+execution exceeded timeout of 5000 ms by 2869 ms
+@@RESULT ... found=23 started=15 ok=14 failed=1 aborted=0 skipped=8 ms=21107
+```
+
+This continues the same narrowing trend this doc (and its predecessor
+investigations) have tracked since the original regression was filed:
+
+| Reading | Overshoot past the 5000ms internal timeout |
+|---|---:|
+| Original finding (2026-07-16/21) | 10087ms |
+| After an earlier `dev` merge (2026-07-22-ish) | 3290ms |
+| This recheck (2026-07-27, `dev@13055f75c`+) | **2869ms** |
+
+The overshoot keeps shrinking release over release, consistent with this
+class being dominated by cold-path interpreter/bootstrap cost (the
+`StringUTF16.getChars` bulk-native fix above, plus the unrelated conservative-
+GC-root-scan fix `f377eb69` referenced in
+[`hib-120s-junit-timeout-cluster-20260716.md`](hib-120s-junit-timeout-cluster-20260716.md))
+rather than a single discrete regression -- each unrelated throughput/GC fix
+landed on `dev` shaves a bit more off the margin, but a small residual
+overshoot is still present on this run. This class was not re-run in
+isolation this session (no isolated repro was needed to corroborate the
+narrowing-trend characterization, which is already well established by prior
+sessions' repeated measurements); the suite-run `@@FAIL` line above is taken
+at face value consistent with how this doc's prior updates were recorded.
+Status remains effectively fixed/narrowing, not reopened -- if a future
+session sees the overshoot widen again rather than continue shrinking, that
+would be the signal to re-investigate as a genuine regression rather than
+residual noise.

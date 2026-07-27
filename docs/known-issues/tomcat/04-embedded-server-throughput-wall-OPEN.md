@@ -154,7 +154,7 @@
 > serving at all — it **reset every request** before reading it.
 >
 > Root cause (FIXED, dev — `fix/tomcat-suite-bugs-09-10`,
-> `native-io/src/socket_channel.rs`): `NioEndpoint.setSocketOptions` calls
+> `../../../native-io/src/socket_channel.rs`): `NioEndpoint.setSocketOptions` calls
 > `SocketChannel.setOption(SocketOption, Object)` on every accepted connection.
 > The `sc_set_option` native was registered only with the `NetworkChannel`
 > return-type descriptor, but `SocketChannel.setOption` **covariantly** returns
@@ -188,7 +188,7 @@
 >    (`begin_blocking_region` around `perform` did not help). Likely fix: **drop
 >    the native `HttpURLConnection` bridge so the real `sun.net.www` bytecode runs
 >    over the now-working socket layer** (the raw-`Socket` path already works
->    in-process). See [bug 10](10-pagecontext-npe-contains-null-FAIL.md).
+>    in-process). See [bug 10](../../internal/fixed-suite-bugs/tomcat/10-pagecontext-npe-contains-null-FAIL.md).
 > 3. **Interpreter throughput** (the original wall below) — still real for the
 >    cold deploy (jar/TLD/annotation scanning, classloading).
 >

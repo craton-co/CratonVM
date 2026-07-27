@@ -65,7 +65,7 @@ is a 3x slowdown of the supposedly-faster path — a real defect, not just
   run, but HANG at 1500s in the second (post-merge) run, never reaching that
   same test method. Given the Hashtable-size-doubling fix that landed on
   `dev` between the two runs is known to have broken Jasper/ECJ JSP
-  compilation entirely (see `19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md`),
+  compilation entirely (see `../../internal/fixed-suite-bugs/tomcat/19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md`),
   `testBug56581`'s NPE may already be fixed — the class just didn't get far
   enough to prove it in the post-merge run (many sequential embedded-server
   test methods ahead of it, same throughput-multiplication pattern as the
@@ -93,7 +93,7 @@ is a 3x slowdown of the supposedly-faster path — a real defect, not just
   been fixed on THIS host's `apps\tomcat-suite-runner\.suite\cp.txt` yet.
   The actual `%20`-decoding CratonVM bug this class also exercises
   (`bug58086a`) IS already fixed on `dev` per
-  `20-fixture-completion-regressions-closure-FIXED.md` — this class simply
+  `../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md` — this class simply
   never gets far enough to prove it on Windows because of the classpath
   gap. **Fix:** add `ant.jar`/`ant-launcher.jar` to this Windows harness's
   classpath the same way the Linux one was fixed, then rerun.
