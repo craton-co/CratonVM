@@ -156,6 +156,31 @@ declaration and the `NativeContextImpl` impl) while keeping its caller in
 every session. Restored verbatim in commit `fd29d3cd2` and pushed to dev
 immediately.
 
+### (c) Real-Tomcat regression check for both fixes
+
+Same runner (`apps/tomcat-suite-runner/run-tomcat-suite.sh craton`), same
+fixture, one frozen binary each:
+
+| Class | baseline `cratonvm-jbi-base-20260727` | with both fixes |
+|---|---|---|
+| `org.apache.jasper.compiler.TestCompiler` | rc=124 **HANG** at the 301s cap, log ending in a flood of `try_patch_i32: offset out of bounds` warnings | **completes**: `Tests run: 12, Failures: 1` in 897s |
+| `org.apache.tomcat.util.buf.TestByteChunk` | PASS | PASS |
+| `org.apache.tomcat.util.buf.TestMessageBytes` | PASS | PASS |
+| `org.apache.tomcat.util.buf.TestMessageBytesConversion` | PASS | PASS |
+| `org.apache.tomcat.util.collections.TestSynchronizedStack` | PASS | PASS |
+| `org.apache.tomcat.util.http.TestCookieProcessorGeneration` | PASS | PASS |
+
+`TestCompiler` is jasper → Eclipse-JDT, i.e. exactly the ecj family this
+change lifts, and it reaches the same `ExecutableBuffer` overflow path the
+Groovy probe did. Its one remaining failure is a separate, pre-existing issue,
+and the host was heavily loaded by other sessions throughout (load average
+30-85 on 16 cores), so the wall times are not comparable across runs — the
+transition from "never finishes" to "runs all 12 tests" is the signal.
+
+Unit tests on the final tree: `cargo test --release -p cratonvm-vm skip_list`
+68 passed / 0 failed; `cargo test --release -p cratonvm-jit ir_lower` 31 passed
+/ 0 failed.
+
 ## 4. Pre-existing VM gaps surfaced by the probes (NOT JIT, NOT fixed here)
 
 Each of these behaves **identically** with the JIT on, with
