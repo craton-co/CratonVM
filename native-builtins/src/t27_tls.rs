@@ -8134,11 +8134,10 @@ fn do_unwrap(
             if idx >= pending.len() {
                 break;
             }
-            let n = bb_write_from(ctx, *d, &pending[idx..]);
-            idx += n;
-            if n == 0 {
-                break;
-            }
+            // NOTE: a dst that accepts 0 bytes is FULL, not a stop signal —
+            // keep scattering into the remaining buffers. See the identical
+            // note on the Step-3 scatter below.
+            idx += bb_write_from(ctx, *d, &pending[idx..]);
         }
         let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
         let status = if idx < pending.len() {
@@ -8385,6 +8384,17 @@ fn do_unwrap(
     bb_set_pos(ctx, src, src_view.layout, offset);
 
     // Step 3: write plaintext into dsts (may span multiple buffers).
+    //
+    // A dst that accepts 0 bytes is simply FULL — it must NOT stop the scatter,
+    // because `unwrap(src, dsts, off, len)` is a scattering operation and later
+    // buffers may still have room. Tomcat's HTTP/2 async parser reads every
+    // frame into `[frameHeader(9), framePayload(maxFrameSize)]`; once the 9-byte
+    // header is filled by the first unwrap, EVERY subsequent unwrap sees dst[0]
+    // full. Breaking there produced `produced=0` while the record had already
+    // been consumed, so the whole record went to `plaintext_pending`, which the
+    // caller cannot see. The connection then wedged in a BUFFER_OVERFLOW loop
+    // and the request body was truncated after the first DATA frame
+    // (`TestLargeUpload`: 13107 of 65535 bytes read by the servlet).
     let mut produced_total = 0usize;
     let mut idx = 0usize;
     for dst in &dsts {
@@ -8394,9 +8404,6 @@ fn do_unwrap(
         let n = bb_write_from(ctx, *dst, &plaintext[idx..]);
         produced_total += n;
         idx += n;
-        if n == 0 {
-            break;
-        }
     }
     // If we have plaintext left over, signal BUFFER_OVERFLOW and stash the
     // remainder back in rustls' reader by re-injecting via writer? We can't —
