@@ -4787,11 +4787,19 @@ mod fb_ref_bytecode_tests {
     /// byte-splice: build one FactoryBean-typed and one plain `@Bean`
     /// method on the same enhancer class, parse the result with the real
     /// class-file reader (`cratonvm-reader`, no VM/NativeContext needed —
-    /// this is pure byte-emission logic), and check the FactoryBean
-    /// method's Code attribute is exactly 8 bytes longer, its
-    /// exception-table absolute values are shifted by exactly +8, and its
-    /// `max_stack` is one deeper — while the plain method's layout stays
-    /// byte-identical to `emit_bean_override`'s pre-`fb_ref` shape.
+    /// this is pure byte-emission logic), and check the FactoryBean method's
+    /// Code attribute is exactly 8 bytes longer, its `max_stack` one deeper,
+    /// and each of its two exception-table entries shifted by exactly the
+    /// amount the splice implies: the inner NoSuchBeanDefinitionException
+    /// handler wholesale (+8 on all three PCs, it lives after the splice
+    /// point), the outer SPR-8080 `finally` only on its end/handler PCs (its
+    /// TRY_START precedes the splice).
+    ///
+    /// Everything is asserted as a DELTA against the plain method. Absolute
+    /// offsets were pinned here once and broke the moment an unrelated change
+    /// to `emit_bean_override`'s body moved them (the mismatch block added
+    /// 120 bytes and a second handler) — while the splice itself, which is all
+    /// this test exists to guard, was still correct.
     #[test]
     fn fb_ref_splice_shifts_exception_table_by_exactly_8_bytes() {
         let bean_methods = vec![
@@ -4831,33 +4839,59 @@ mod fb_ref_bytecode_tests {
         let plain_code = plain.code().expect("plainBean has a Code attribute");
         let factory_code = factory.code().expect("factoryBean has a Code attribute");
 
-        assert_eq!(plain_code.max_stack, 3);
+        // Everything asserted here is RELATIVE to the plain method. The
+        // absolute byte offsets this test used to pin (code length 161,
+        // exception-table PCs 94/109/142) describe `emit_bean_override`'s body
+        // at the time the splice landed, so any later, unrelated edit to that
+        // body breaks them while the splice itself is still correct — which is
+        // exactly what happened. The splice contract is a delta, so test the
+        // delta.
         assert_eq!(
-            factory_code.max_stack, 4,
+            factory_code.max_stack,
+            plain_code.max_stack + 1,
             "fb_ref splice briefly needs one more stack slot"
         );
         assert_eq!(plain_code.max_locals, factory_code.max_locals);
 
-        assert_eq!(plain_code.code.len(), 161);
         assert_eq!(
             factory_code.code.len(),
-            161 + 8,
+            plain_code.code.len() + 8,
             "fb_ref splice must add exactly 8 bytes"
         );
 
-        assert_eq!(plain_code.exception_table.len(), 1);
-        assert_eq!(factory_code.exception_table.len(), 1);
-        let pe = &plain_code.exception_table[0];
-        let fe = &factory_code.exception_table[0];
-        assert_eq!(pe.start_pc, 94);
-        assert_eq!(pe.end_pc, 109);
-        assert_eq!(pe.handler_pc, 142);
+        // `emit_bean_override` emits TWO handlers, and the splice moves them
+        // differently — assert each against its plain-method counterpart.
+        assert_eq!(plain_code.exception_table.len(), 2);
+        assert_eq!(factory_code.exception_table.len(), 2);
+
+        // Entry 0 — the inner NoSuchBeanDefinitionException handler around the
+        // mismatch block. The whole block sits AFTER the splice point, so all
+        // three of its PCs move by the full +8.
+        let pe0 = &plain_code.exception_table[0];
+        let fe0 = &factory_code.exception_table[0];
         assert_eq!(
-            fe.start_pc, 94,
+            fe0.start_pc,
+            pe0.start_pc + 8,
+            "inner try2 starts after the splice point — shifts wholesale"
+        );
+        assert_eq!(fe0.end_pc, pe0.end_pc + 8);
+        assert_eq!(fe0.handler_pc, pe0.handler_pc + 8);
+        assert_eq!(fe0.catch_type, pe0.catch_type);
+
+        // Entry 1 — the outer SPR-8080 any-Throwable `finally`. Its TRY_START
+        // is before the splice point, so only its end/handler move.
+        let pe1 = &plain_code.exception_table[1];
+        let fe1 = &factory_code.exception_table[1];
+        assert_eq!(
+            fe1.start_pc, pe1.start_pc,
             "TRY_START is before the splice point — unaffected"
         );
-        assert_eq!(fe.end_pc, 109 + 8);
-        assert_eq!(fe.handler_pc, 142 + 8);
+        assert_eq!(fe1.end_pc, pe1.end_pc + 8);
+        assert_eq!(fe1.handler_pc, pe1.handler_pc + 8);
+        assert_eq!(
+            fe1.catch_type, 0,
+            "outer handler keeps `finally` (catch_type 0) semantics"
+        );
     }
 
     /// Regression guard for the real-cglib-bookkeeping fields
