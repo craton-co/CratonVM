@@ -282,6 +282,9 @@ struct Lowerer<'a> {
     /// caches. 6 args: `(vm_ptr, info_ptr, args_ptr, num_args, mic, pic)`.
     /// 0 ⇒ no IC site may be planned (the planner checks the same field).
     invoke_virtual_mic: usize,
+    /// Shared post-call frame publication used by direct and hashed dispatch
+    /// stubs. Zero when precise frame tracking is unavailable.
+    frame_record: usize,
     /// wire-tiered-manager Step 4 (PGO handoff C1 → C2): per-bytecode-PC branch
     /// bias, keyed by the conditional-branch instruction's bytecode PC (the same
     /// key the IR builder stamps on each `Op::If` via `Node::bytecode_pc`). Value
@@ -413,6 +416,7 @@ impl<'a> Lowerer<'a> {
             direct_calls,
             ic_slots,
             invoke_virtual_mic: helpers.invoke_virtual_mic,
+            frame_record: helpers.frame_record,
             branch_hints,
             sr_map,
         }
@@ -1167,12 +1171,7 @@ impl<'a> Lowerer<'a> {
     /// context-free artifacts receive Java arg0 there. Inline caches retain the
     /// callee's ABI bit, so both shapes can use the cache instead of forcing
     /// context-free methods back through the resolving helper.
-    fn emit_ic_abi_marshal(
-        &mut self,
-        inputs: &[NodeId],
-        num_args: usize,
-        needs_context: bool,
-    ) {
+    fn emit_ic_abi_marshal(&mut self, inputs: &[NodeId], num_args: usize, needs_context: bool) {
         let base = if needs_context {
             self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
             1
@@ -1382,11 +1381,20 @@ impl<'a> Lowerer<'a> {
         }
         debug_assert!(next_entry.is_none());
 
-        // ── Slow path: the resolving + cache-populating helper ──────
-        // .slow:
+        // ── Shared compact hashed/vtable stub ─────────────────────────────
         for p in slow_patches {
             self.patch_rel32_to_here(p);
         }
+        let arg_offsets: Vec<i32> = (0..num_args).map(|i| self.slot_of(inputs[2 + i])).collect();
+        done_patches.extend(crate::runtime_lowering::emit_hashed_vtable_stub(
+            &mut self.buf,
+            pic,
+            self.context_slot_off,
+            &arg_offsets,
+            self.frame_record,
+        ));
+
+        // ── Slow path: the resolving + cache-populating helper ────────────
         // Args 1..4 use the same ABI as `jit_invoke_dispatch`, so the staging
         // marshalling is identical to the generic path below.
         for i in 0..num_args {
@@ -2134,9 +2142,7 @@ impl<'a> Lowerer<'a> {
                 // stack-argument path — so an over-wide site falls through to
                 // the unchanged helper dispatch below. `lower_data_node` has no
                 // post-`match` code, so an early `return` fully handles the node.
-                if let Some(&(mic, pic)) =
-                    node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc))
-                {
+                if let Some(&(mic, pic)) = node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc)) {
                     if mic != 0
                         && pic != 0
                         && self.invoke_virtual_mic != 0
@@ -3346,7 +3352,7 @@ mod tests {
             num_jit_args: 2, // receiver + one int
             return_type: b'I',
             invoke_kind: 0, // virtual
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let info_ptr = info as *const JitInvokeInfo as usize;
 
@@ -3415,11 +3421,11 @@ mod tests {
             contains_seq(&code, &PIC.to_le_bytes()),
             "the PIC slot address must be baked into the cascade"
         );
-        // One MIC entry + three PIC entries = four `CALL R11` cached-entry calls.
+        // MIC + four PIC entries + two hashed ways all call via R11.
         assert_eq!(
             count_seq(&code, &[0x41, 0xFF, 0xD3]),
-            1 + crate::JIT_PIC_ENTRIES,
-            "one cached-entry CALL R11 per inline-cache entry (MIC + 4-way PIC)"
+            1 + crate::JIT_PIC_ENTRIES + crate::JIT_MEGA_WAYS,
+            "one cached-entry CALL R11 per MIC/PIC entry plus the two hashed ways"
         );
         // The miss path resolves AND populates via `jit_invoke_virtual_mic`.
         assert!(
@@ -3492,7 +3498,13 @@ mod tests {
             assert!(
                 contains_seq(
                     &code,
-                    &[0x41, 0x80, 0x7A, JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8, 0x00]
+                    &[
+                        0x41,
+                        0x80,
+                        0x7A,
+                        JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8,
+                        0x00
+                    ]
                 ),
                 "PIC entry {i} needs-context gate must be emitted"
             );
