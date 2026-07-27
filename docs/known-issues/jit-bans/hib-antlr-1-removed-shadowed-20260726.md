@@ -29,8 +29,8 @@ test methods.
 HIB-LONGTAIL.1 (`vm/src/jit/skip_list.rs`, same prefix,
 `if (class_name.starts_with("org/h2/") ...) || (class_name.starts_with("org/antlr/v4/runtime/") ...)`),
 which is independently confirmed still-needed via a real 218-class H2
-suite run that found a `Schema not found` DB-reconnect corruption (see
-`docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`). That
+suite run that found a `Schema not found` DB-reconnect corruption (root-caused
+and fixed). That
 bug is triggered by a different, more specific scenario (closing and
 reopening a database connection, replaying metadata) that this HQL-parsing
 test batch does not exercise.
@@ -39,22 +39,20 @@ test batch does not exercise.
 default after this removal, exactly as before — HIB-LONGTAIL.1 alone is
 sufficient. This removal only deletes a redundant, now-unnecessary second
 check; it does not change any observable JIT-eligibility outcome. Matches
-the same pattern found earlier this session for SPRINGBOOT-WITHOUT-JACKSON.2
-(see `docs/internal/jit-ban-remaining-sweep-20260726.md`).
+the same pattern found earlier this session for SPRINGBOOT-WITHOUT-JACKSON.2.
 
 ## Related
 
 - `docs/known-issues/hib-temporal-1-still-needed-20260726.md` — the
   HIB-TEMPORAL.1 (`org/hibernate/`) finding from the same investigation
   session, which IS a confirmed-still-live, non-shadowed bug.
-- `docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md` —
-  HIB-LONGTAIL.1's own confirming evidence (a prior session).
+- HIB-LONGTAIL.1's own confirming evidence (a prior session) — the H2
+  `Schema not found` reconnect bug, root-caused and fixed.
 
 ## Cross-session update (2026-07-26, same day)
 
 A concurrent session rewrote HIB-LONGTAIL.1's own doc
-(`docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`,
-commit `670983c71`) with fresh 218-class H2 suite evidence: the ORIGINAL
+(commit `670983c71`) with fresh 218-class H2 suite evidence: the ORIGINAL
 `Schema  not found` corruption this ban was written for is now fixed and
 extinct (0/218 classes), but the ban stays because lifting it causes 9
 OTHER, unrelated regressions in the H2 suite (`TestObjectDataType`,
@@ -64,8 +62,7 @@ That session's own doc explicitly says: **The `org/antlr/v4/runtime/`
 ## Cross-session update (2026-07-26, same day)
 
 A concurrent session rewrote HIB-LONGTAIL.1's own doc
-(`docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`,
-commit `670983c71`) with fresh 218-class H2 suite evidence: the ORIGINAL
+(commit `670983c71`) with fresh 218-class H2 suite evidence: the ORIGINAL
 `Schema  not found` corruption this ban was written for is now fixed and
 extinct (0/218 classes), but the ban stays because lifting it causes 9
 OTHER, unrelated regressions in the H2 suite (`TestObjectDataType`,

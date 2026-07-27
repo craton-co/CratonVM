@@ -131,6 +131,6 @@ Two honest caveats fall out of the tables above:
 
 `--gpu-min-work` (default `4096`, see [CLI flags](overview.md#cli-flags-only-under---features-gpu))
 exists specifically to skip offload below a work-size threshold for this
-reason, though the current estimate it uses is a fixed placeholder rather than
-the true runtime array length — see item 4 in
-[`docs/internal/gpu-offload-followups-20260711.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/internal/gpu-offload-followups-20260711.md).
+reason. The dispatcher sizes the launch from the true runtime array length
+rather than a fixed placeholder — see
+[`docs/gpu/launch-work-sizing.md`](https://github.com/craton-co/cratonvm/blob/dev/docs/gpu/launch-work-sizing.md).

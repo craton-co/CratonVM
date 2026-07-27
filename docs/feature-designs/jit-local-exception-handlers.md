@@ -354,9 +354,8 @@ side effect (the real, once-confirmed Liquibase `Scope` corruption this
 gate was written to fix, `752796a0a`, 2026-07-07).
 
 Git archaeology showed this premise died the same day it was born: a
-**concurrent** fix on a different branch, merged the same day
-(`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`),
-closed four separate bugs in the reason-8 (`UnreachedCode`) trap's
+**concurrent** fix on a different branch, merged the same day, closed four
+separate bugs in the reason-8 (`UnreachedCode`) trap's
 UNCONDITIONAL precise-resume machinery (`emit_osr_exit_map_at_reason`,
 `emit_deopt_stubs`'s reason-8 routing — not gated behind
 `deopt_real_enabled()`) — including, as its own "FOURTH bug", the *exact*

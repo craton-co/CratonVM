@@ -15,10 +15,9 @@ to HEADER(40)+2×8 = **56 B** (~22 %). The win compounds across every
 reference-heavy workload (linked structures, HashMap.Node, AST nodes, …) as less
 memory allocated, written, swept, and cache-resident per object.
 
-This is the recommended first slice from
-[`docs/internal/feature-designs/bt-throughput-levers-handoff.md`](../internal/feature-designs/bt-throughput-levers-handoff.md)
-and lever #4 in
-[`docs/internal/gaps/gap-bintrees18-gc-throughput.md`](../internal/gaps/gap-bintrees18-gc-throughput.md).
+This was the recommended first slice identified during the binary-trees
+throughput investigation (bt18 vs. HotSpot), where it was tracked as
+architectural lever #4.
 
 ---
 

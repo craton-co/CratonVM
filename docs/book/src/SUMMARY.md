@@ -36,8 +36,15 @@
 # Performance
 
 - [Benchmarks](performance/benchmarks.md)
+- [Performance Tuning](performance/tuning.md)
 - [How the JIT Got Fast](performance/jit-internals.md)
 - [Profiling](performance/profiling.md)
+
+# Operations
+
+- [Deployment and Operations](operations/deployment.md)
+- [Observability](operations/observability.md)
+- [Incident Response](operations/incident-response.md)
 
 # GPU Offload
 
@@ -53,6 +60,8 @@
 # Architecture & Internals
 
 - [Architecture Overview](internals/architecture.md)
+- [Runtime Lifecycle](internals/runtime-lifecycle.md)
+- [Runtime Contracts](internals/runtime-contracts.md)
 - [The Interpreter](internals/interpreter.md)
 - [The JIT Compiler](internals/jit.md)
 - [The Garbage Collector](internals/garbage-collector.md)
@@ -65,11 +74,13 @@
 - [Building from Source](contributing/building.md)
 - [Testing](contributing/testing.md)
 - [Contributing Guide](contributing/contributing.md)
+- [Documentation Guide](contributing/documentation.md)
 - [Roadmap](contributing/roadmap.md)
 
 # Reference
 
 - [Environment Variables](reference/environment-variables.md)
 - [Platform Support Matrix](reference/platform-support.md)
+- [Compatibility and Support Policy](reference/compatibility-policy.md)
 - [FAQ](reference/faq.md)
 - [Glossary](reference/glossary.md)
