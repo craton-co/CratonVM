@@ -44,9 +44,16 @@
 //!
 //! ## SAFETY INVARIANT: GC must conservatively re-sweep every JIT frame
 //!
-//! The JIT register allocator's callee-saved GPR local homes are default-off
-//! (`CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` opts back into the legacy
-//! path for diagnostics). When that legacy path is enabled, a Java local
+//! The JIT register allocator's callee-saved GPR local homes are default-**ON**
+//! whenever precise JIT maps (or moving-young) are active, which is the default
+//! — see `x64::callee_saved_gpr_local_homes_enabled`, whose env override
+//! `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=0` is now the *opt-out*. (This
+//! paragraph said "default-off" until 2026-07-27; the default flipped back with
+//! `precise_jit_maps_enabled` on 2026-07-07 and the prose was not updated.
+//! `skip_list.rs` carried a second, private copy of this switch that kept its
+//! own default of `false`, which is how a ~950-line ban list ended up inert for
+//! weeks — see docs/internal/is-known-miscompile-block-retired-20260727.md.)
+//! With that allocator active, a Java local
 //! (including an object reference) may live **exclusively in a callee-saved GPR**
 //! between bytecode aload/astore opcodes — the value need not be present in the
 //! frame's local slot at any given native PC. The precise oop map (`OopMapEntry`)
@@ -3796,6 +3803,21 @@ pub fn set_integer_int_value_direct_fn(addr: usize) {
     INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Direct thin-lock monitor helpers registered by the VM at bootstrap.
+///
+/// They stay outside `JitRuntimeHelpers` to avoid expanding that stable
+/// cross-crate ABI for process-lifetime addresses. Generated code reaches
+/// them through `runtime_lowering::emit_monitor_stub`.
+pub static MONITOR_ENTER_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static MONITOR_EXIT_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_monitor_direct_fns(enter: usize, exit: usize) {
+    MONITOR_ENTER_DIRECT_FN.store(enter, std::sync::atomic::Ordering::Release);
+    MONITOR_EXIT_DIRECT_FN.store(exit, std::sync::atomic::Ordering::Release);
+}
+
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
 ///
 /// Returns `Some((entry, num_params, return_type))` where `entry` is the
@@ -5436,6 +5458,18 @@ impl JitCache {
             descriptor,
             declaring_class_id,
         };
+        // CRATONVM_DBG_JIT_COMPILED: one line per successfully published
+        // compilation. The cheapest way to answer "is this method actually
+        // running compiled?" -- an A/B whose only visible difference is
+        // throughput can otherwise cost a whole session to attribute (the
+        // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
+        // stopped being compiled once org/h2/ became JIT-eligible).
+        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+            eprintln!(
+                "CRATONVM_DBG_JIT_COMPILED: put {}.{}{}",
+                key.class_name, key.method_name, key.descriptor
+            );
+        }
         Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
         cratonvm_types::jit_activation::register_executable_owner(
@@ -5498,6 +5532,18 @@ impl JitCache {
             descriptor,
             declaring_class_id,
         };
+        // CRATONVM_DBG_JIT_COMPILED: one line per successfully published
+        // compilation. The cheapest way to answer "is this method actually
+        // running compiled?" -- an A/B whose only visible difference is
+        // throughput can otherwise cost a whole session to attribute (the
+        // 2026-07-26 H2 TestFreeSpace residual: java/util/BitSet silently
+        // stopped being compiled once org/h2/ became JIT-eligible).
+        if std::env::var_os("CRATONVM_DBG_JIT_COMPILED").is_some() {
+            eprintln!(
+                "CRATONVM_DBG_JIT_COMPILED: osr {}.{}{}",
+                key.class_name, key.method_name, key.descriptor
+            );
+        }
         Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
         cratonvm_types::jit_activation::register_executable_owner(
@@ -6808,10 +6854,15 @@ pub fn try_compile_with_invokespecial_resolver(
         }
     }
 
-    // The `org/glassfish/jaxb/` mirror of the VM skip-list guard was removed
-    // 2026-07-27 together with it -- see the removal comment in
-    // `vm/src/jit/skip_list.rs` (`should_skip_jit_internal`) for the bisected
-    // root cause and the re-verification evidence.
+    // The `org/glassfish/jaxb/` final-admission mirror of the VM skip-list
+    // guard was removed 2026-07-27. It is the SECOND of the two gates that
+    // enforced that ban, and deleting `jaxb_mapping_residual_skip_prefix` from
+    // `vm/src/jit/skip_list.rs` alone does not lift it: `try_compile` returns
+    // `None` here before any JAXB method can be compiled, so a "ban removed"
+    // run that does not also pass `CRATONVM_JIT_ALLOW_PACKAGES` measures an
+    // uncompiled package. See `docs/internal/jaxb-jit-ban-removed-20260727.md`
+    // ("Completing the removal") for the JIT-entry counts that show the
+    // difference, and for the bisected root cause (`82b78bca5`).
 
     // Keep the final admission gate aligned with the VM-side Xerces parser
     // guard. Background compilation bypasses the VM skip-list, and JITting
@@ -7069,6 +7120,58 @@ fn local_handler_reads_unsafe_local(
     false
 }
 
+/// Whether every potentially throwing bytecode covered by this method's
+/// exception table already exits through an x64 runtime call site that can
+/// publish a precise reason-9 exceptional frame.
+///
+/// This deliberately recognises only `invokestatic` and monitor operations.
+/// It is enough for javac's ordinary synchronized-loop shape (the synthetic
+/// catch-all protects arithmetic/control-flow plus `monitorexit`) while
+/// keeping array, field, allocation, cast, divide, `athrow`, and ldc failure
+/// paths behind the existing params-only safety gate until each of those
+/// lowerings publishes the same snapshot.
+#[cfg(target_arch = "x86_64")]
+fn precise_exception_frame_sites_supported(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> bool {
+    let covered = |pc: usize| {
+        exception_table
+            .iter()
+            .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
+    };
+    let may_throw_without_precise_frame = |op: u8| {
+        matches!(
+            op,
+            0x12..=0x14 // ldc family (String/class resolution can allocate)
+                | 0x2e..=0x35 // array loads
+                | 0x4f..=0x56 // array stores
+                | 0x6c | 0x6d | 0x70 | 0x71 // integer divide/remainder
+                | 0xb2..=0xba // fields, invokes, and invokedynamic
+                | 0xbb..=0xc1 // allocations, arraylength, athrow, and casts
+                | 0xc5 // multianewarray
+        )
+    };
+
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        if covered(pc)
+            && may_throw_without_precise_frame(op)
+            && !matches!(op, 0xb8 | 0xc2 | 0xc3)
+        {
+            return false;
+        }
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return false;
+        }
+        pc += len;
+    }
+    true
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
@@ -7220,6 +7323,26 @@ fn try_compile_inner(
         return None;
     }
 
+    // Diagnostic for the "hot method never compiles" shape: every constant-pool
+    // resolver below can come back `None`, and each such miss silently bails the
+    // whole compile with `backend_attempted = false` (a *transient* bail, retried
+    // until `MAX_TIER_FAIL_RETRIES`, after which the method interprets forever).
+    // `CRATONVM_DBG_JITC=1` previously reported only that the bail happened;
+    // naming the resolver is what turns that into an actionable report.
+    macro_rules! jitc_bail {
+        ($site:expr) => {
+            return {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] resolver-bail site={} {}.{}{}",
+                        $site, cached.class_name, cached.method_name, cached.method_descriptor
+                    );
+                }
+                None
+            }
+        };
+    }
+
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
@@ -7316,6 +7439,7 @@ fn try_compile_inner(
     // same method). See `local_handler_reads_unsafe_local`'s own doc
     // comment, and `regalloc::handler_has_unsafe_local_read`'s, for the
     // full algorithm and soundness argument.
+    let mut precise_exception_frames = false;
     if !cached.exception_table.is_empty() {
         let unsafe_local = local_handler_reads_unsafe_local(
             code,
@@ -7331,12 +7455,26 @@ fn try_compile_inner(
             );
         }
         if unsafe_local {
-            // The current exception router can restore only incoming
-            // parameters. A handler that reads a later local must remain
-            // interpreted until the precise exceptional-frame handoff covers
-            // every compiled-call sink. Compiling it is unsound: a propagated
-            // exception reaches the handler with that local reset to null/zero.
-            return None;
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !precise_exception_frame_sites_supported(
+                    code,
+                    code_len,
+                    &cached.exception_table,
+                ) {
+                    // A handler that reads a later local remains interpreted
+                    // unless every throwing site in its protected ranges can
+                    // publish that local through the precise exceptional-frame
+                    // handoff. Compiling any broader shape would reset the
+                    // handler local to null/zero on an exception.
+                    return None;
+                }
+                precise_exception_frames = true;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                return None;
+            }
         }
     }
 
@@ -7968,16 +8106,15 @@ fn try_compile_inner(
                     }
                 }
 
-                // An `Op::New` that SURVIVED escape analysis (it escaped, so it
-                // was not scalar-replaced) has no IR lowering — `ir_lower` has
-                // no allocation path and would emit nothing for it, leaving a
-                // garbage object reference. Bail to single-pass rather than
-                // miscompile. (Scalar-replaced News are already `Op::Dead`.)
-                let has_live_new = graph
+                // Arrays still use the baseline tier's specialized allocation
+                // lowering. Escaping object allocations are supported directly
+                // by the optimizing tier through the shared allocation stub;
+                // scalar-replaced objects are already `Op::Dead`.
+                let has_live_new_array = graph
                     .nodes
                     .iter()
-                    .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
-                if !has_live_new {
+                    .any(|n| matches!(n.op, ir::Op::NewArray { .. }));
+                if !has_live_new_array {
                     let schedule = ir_schedule::schedule(&graph);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
                     // optimizing IR (C2) lowerer the profiled branch bias so it can
@@ -8090,9 +8227,13 @@ fn try_compile_inner(
     // Resolve multianewarray entries
     let mut mna_info = Vec::new();
     if !scan.multianewarray_ops.is_empty() {
-        let resolver = cp_class_name_resolver?;
+        let Some(resolver) = cp_class_name_resolver else {
+            jitc_bail!("cp_class_name_resolver(multianewarray)")
+        };
         for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-            let class_name = resolver(cp_idx)?;
+            let Some(class_name) = resolver(cp_idx) else {
+                jitc_bail!("multianewarray_class")
+            };
             let leaf = class_name.trim_start_matches('[');
             let leaf_et = match leaf.as_bytes().first() {
                 Some(b'I') => 10u8,
@@ -8117,9 +8258,13 @@ fn try_compile_inner(
     let mut compact_field_info: Vec<(usize, u32, bool)> = Vec::new();
     let compact_fields = cratonvm_types::compact_ref_fields_enabled();
     if !scan.field_ops.is_empty() {
-        let resolver = cp_field_resolver?;
+        let Some(resolver) = cp_field_resolver else {
+            jitc_bail!("cp_field_resolver")
+        };
         for &(pc, cp_idx) in &scan.field_ops {
-            let (field_index, type_tag, compact_slot) = resolver(cp_idx)?;
+            let Some((field_index, type_tag, compact_slot)) = resolver(cp_idx) else {
+                jitc_bail!("field_resolve")
+            };
             field_info.push((pc, field_index, type_tag));
             // Only a genuinely-resolved compact slot may enter the inline
             // emitter's compact-offset map. `None` (no registered layout, or
@@ -8143,9 +8288,13 @@ fn try_compile_inner(
     let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
     let mut owned_strings: Vec<Box<str>> = Vec::new();
     if !scan.typecheck_ops.is_empty() {
-        let resolver = cp_class_name_resolver.as_ref()?;
+        let Some(resolver) = cp_class_name_resolver.as_ref() else {
+            jitc_bail!("cp_class_name_resolver(typecheck)")
+        };
         for &(pc, cp_idx) in &scan.typecheck_ops {
-            let class_name = resolver(cp_idx)?;
+            let Some(class_name) = resolver(cp_idx) else {
+                jitc_bail!("typecheck_class")
+            };
             let boxed: Box<str> = class_name.into_boxed_str();
             let ptr = boxed.as_ptr();
             let len = boxed.len();
@@ -8156,9 +8305,14 @@ fn try_compile_inner(
 
     let mut static_field_info: Vec<(usize, u32, usize, u8, bool)> = Vec::new();
     if !scan.static_field_ops.is_empty() {
-        let resolver = cp_static_field_resolver?;
+        let Some(resolver) = cp_static_field_resolver else {
+            jitc_bail!("cp_static_field_resolver")
+        };
         for &(pc, cp_idx) in &scan.static_field_ops {
-            let (class_id_raw, field_index, type_tag, is_volatile) = resolver(cp_idx)?;
+            let Some((class_id_raw, field_index, type_tag, is_volatile)) = resolver(cp_idx)
+            else {
+                jitc_bail!("static_field_resolve")
+            };
             static_field_info.push((pc, class_id_raw, field_index, type_tag, is_volatile));
         }
     }
@@ -8179,13 +8333,20 @@ fn try_compile_inner(
     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
     if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() {
-        let resolver = cp_new_resolver?;
+        let Some(resolver) = cp_new_resolver else {
+            jitc_bail!("cp_new_resolver")
+        };
         for &(pc, cp_idx) in &scan.new_ops {
-            let (class_id_raw, num_fields, has_prim_init, has_finalizer) = resolver(cp_idx)?;
+            let Some((class_id_raw, num_fields, has_prim_init, has_finalizer)) = resolver(cp_idx)
+            else {
+                jitc_bail!("new_resolve")
+            };
             new_info.push((pc, class_id_raw, num_fields, has_prim_init, has_finalizer));
         }
         for &(pc, cp_idx) in &scan.anewarray_ops {
-            let (class_id_raw, ..) = resolver(cp_idx)?;
+            let Some((class_id_raw, ..)) = resolver(cp_idx) else {
+                jitc_bail!("anewarray_resolve")
+            };
             anewarray_info.push((pc, class_id_raw));
         }
     }
@@ -8239,7 +8400,9 @@ fn try_compile_inner(
     // `is_double` flag and keeps just the bits.
     let mut ldc2w_info: Vec<(usize, i64)> = Vec::new();
     if !scan.ldc2w_ops.is_empty() {
-        let resolver = cp_ldc2w_resolver?;
+        let Some(resolver) = cp_ldc2w_resolver else {
+            jitc_bail!("cp_ldc2w_resolver")
+        };
         for &(pc, cp_idx) in &scan.ldc2w_ops {
             let (val, _is_double) = match resolver(cp_idx) {
                 Some(v) => v,
@@ -8306,9 +8469,13 @@ fn try_compile_inner(
     let resolved_string_layout: Option<StringFieldLayout> =
         string_layout_resolver.and_then(|r| r());
     if !scan.invoke_ops.is_empty() {
-        let resolver = cp_invoke_resolver?;
+        let Some(resolver) = cp_invoke_resolver else {
+            jitc_bail!("cp_invoke_resolver")
+        };
         for &(pc, cp_idx, opcode) in &scan.invoke_ops {
-            let (class_name, method_name, descriptor) = resolver(cp_idx)?;
+            let Some((class_name, method_name, descriptor)) = resolver(cp_idx) else {
+                jitc_bail!("invoke_resolve")
+            };
             let invoke_kind = match opcode {
                 0xb6 => 0u8,
                 0xb7 => 1,
@@ -8919,9 +9086,13 @@ fn try_compile_inner(
     // invokedynamic's stack effect.
     let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
     if !scan.indy_ops.is_empty() {
-        let resolver = cp_invokedynamic_descriptor_resolver?;
+        let Some(resolver) = cp_invokedynamic_descriptor_resolver else {
+            jitc_bail!("cp_invokedynamic_descriptor_resolver")
+        };
         for &(pc, cp_idx) in &scan.indy_ops {
-            let descriptor = resolver(cp_idx)?;
+            let Some(descriptor) = resolver(cp_idx) else {
+                jitc_bail!("indy_descriptor_resolve")
+            };
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
             let arg_type_tags = indy_arg_type_tags(&descriptor);
@@ -8969,6 +9140,14 @@ fn try_compile_inner(
     // normal dispatch". Resolved here (cheap, once) so neither the
     // intrinsic matcher nor `x64::compile` needs the VM class registry.
     let string_layout: Option<StringFieldLayout> = string_layout_resolver.and_then(|r| r());
+
+    // A protected invokestatic in the narrow precise-handler shape must retain
+    // its explicit post-call reason-9 guard. Inlining would move the callee's
+    // throwing operations into this body without independently snapshotting
+    // each one, invalidating `precise_exception_frame_sites_supported`.
+    if precise_exception_frames {
+        inline_sites.clear();
+    }
 
     // round-7 fix (bug 1): from this point on, any `None` return is a
     // permanent backend bail — the resolver pre-checks all completed
@@ -9023,6 +9202,11 @@ fn try_compile_inner(
     );
 
     x64::set_pending_verified_max_stack(cached.max_stack as usize);
+    // The request is one-shot and consumed at x64 compiler entry. Set it only
+    // after every resolver/admission early return above so a failed front-end
+    // attempt cannot leak the request into the next method compiled on this
+    // thread.
+    x64::set_precise_exception_frame_request(precise_exception_frames);
     // Pure-kernel GPR local homes: this is the METHOD-ENTRY compile path
     // (OSR artifacts go through the interpreter's `compile_osr_artifact`,
     // which never sets this), so request the kernel register homes. The
@@ -13998,7 +14182,8 @@ mod tests {
 
     /// RG.6 — JIT scanner accepts `monitorenter` (0xc2) and `monitorexit`
     /// (0xc3) so synchronized blocks are JIT-eligible. The compiler then
-    /// either elides the lock (escape-analysis proves thread-local) or bails.
+    /// either elides the exact lock site (escape analysis proves its receiver
+    /// thread-local) or lowers it through the direct thin-lock runtime stub.
     #[test]
     fn rg6_jit_accepts_monitor_enter_exit() {
         // aconst_null, dup (0x59), monitorenter, monitorexit, pop (0x57), ireturn
@@ -14007,6 +14192,88 @@ mod tests {
             is_jit_compatible(&code, code.len(), "()I"),
             "monitorenter/exit must be accepted so synchronized methods can JIT"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn synchronized_cleanup_has_precise_exception_site_coverage() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // javac-style synchronized cleanup: save the lock in local 1, execute
+        // a non-throwing body, release it, and use a catch-all handler to
+        // release + rethrow. The handler reads the non-parameter lock local,
+        // while every potentially throwing protected instruction is a monitor
+        // runtime call that publishes a reason-9 snapshot.
+        let code = vec![
+            0x2a, // 0: aload_0
+            0x59, // 1: dup
+            0x4c, // 2: astore_1
+            0xc2, // 3: monitorenter
+            0x03, // 4: iconst_0
+            0x3d, // 5: istore_2
+            0x84, 0x02, 0x01, // 6: iinc 2, 1
+            0x2b, // 9: aload_1
+            0xc3, // 10: monitorexit
+            0xb1, // 11: return
+            0x4e, // 12: astore_3
+            0x2b, // 13: aload_1
+            0xc3, // 14: monitorexit
+            0x2d, // 15: aload_3
+            0xbf, // 16: athrow
+        ];
+        let table = vec![
+            ExceptionTableEntry {
+                start_pc: 4,
+                end_pc: 11,
+                handler_pc: 12,
+                catch_type: 0,
+            },
+            ExceptionTableEntry {
+                start_pc: 12,
+                end_pc: 15,
+                handler_pc: 12,
+                catch_type: 0,
+            },
+        ];
+        assert!(local_handler_reads_unsafe_local(
+            &code,
+            code.len(),
+            &table,
+            "(Ljava/lang/Object;)V",
+            true,
+        ));
+        assert!(precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table,
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn protected_field_access_keeps_unsafe_handler_interpreted() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        let code = vec![
+            0x2a, // 0: aload_0
+            0xb4, 0x00, 0x01, // 1: getfield #1
+            0x57, // 4: pop
+            0xb1, // 5: return
+            0x4c, // 6: astore_1
+            0x2b, // 7: aload_1
+            0xbf, // 8: athrow
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 5,
+            handler_pc: 6,
+            catch_type: 0,
+        }];
+        assert!(!precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table,
+        ));
     }
 
     /// RG.7 — `System.arraycopy` is routed through the native registry as an

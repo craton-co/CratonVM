@@ -195,10 +195,8 @@ High-value (wide blast radius or already well-isolated in comments):
   7 specific ATN config-context methods but keeps a package-level ban as
   the "surgical per-method ban of those 7 is the future minimal fix."
   Doing that narrowing is concrete, scoped work.
-- **KC26-PIC.1/.2, KC26-CFG.1, KC26-RX.1** — Keycloak/picocli/smallrye/
-  RxJava3 hangs, already narrowed once (picocli itself un-banned, a
-  specific interceptor fan-out class stays banned). Testable via the
-  Keycloak suite (`apps/keycloak`).
+- ~~**KC26-PIC.1/.2, KC26-RX.1**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`.
+  (**KC26-CFG.1** is a separate entry and is not affected by that lift.)
 - **JUNIT.1** — generic `JUnitCore.main` ban; if liftable, improves JIT
   coverage across every suite's test-running machinery, not just one
   class. Comment notes a `DBG bypass` already exists to force-compile it
@@ -211,13 +209,22 @@ still real correctness bugs worth closing):
 - HIB-TEMPORAL.1, HIB-LONGTAIL.1/2/3, HIB-BIGINTEGER-AIOOBE.1,
   HIB-STOREDPROC-JIT.1 (candidate for TYPES-ERASURE.1 consolidation, see
   above)
-- ~~JAXB (`jaxb_mapping_residual_skip_prefix`)~~ — REMOVED 2026-07-27, see
-  `docs/internal/jaxb-jit-ban-lifted-20260727.md`. Xerces
+- JAXB (`jaxb_mapping_residual_skip_prefix`), Xerces
   (`xerces_schema_jit_deny_prefix`), SnakeYAML emitter
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
-- JSONSMART-PARSER.1 — **DONE 2026-07-26 03:12 UTC: CONFIRMED still needed,
-  ban KEPT.** Standalone stress repro (`docs/known-issues/repros/jsonsmart/JsonSmartProbe.java`,
+- JSONSMART-PARSER.1 — **SUPERSEDED. Re-tested 2026-07-27: ban RETIRED, stays
+  removed from `skip_list.rs`; the package JIT-compiles and 3,000,000
+  round-trip parse operations produce 0 errors. The one real defect found was
+  VM-wide, not json-smart's: the trivial-constructor elision dropped the
+  native-shadowed `java/util/HashMap.<init>()V`, so JIT-created maps got a
+  32-bucket table and iterated in a different order than interpreter-created
+  ones — fixed, with `vm/tests/jit_collection_ctor_identity.rs` as the
+  regression net. Full writeup:
+  `docs/internal/jsonsmart-parser-jit-retired-20260727.md`. The 2026-07-26
+  verdict below is kept for history.**
+
+  ~~DONE 2026-07-26 03:12 UTC: CONFIRMED still needed, ban KEPT.~~ Standalone stress repro (`docs/known-issues/repros/jsonsmart/JsonSmartProbe.java`,
   10 varied JSON docs × 300k iterations, round-trip parse/serialize/re-parse
   check) against `json-smart-2.6.0.jar`. Baseline (ban in place): 0 errors
   in whatever it completed within a 200s budget (interpreted parsing is
@@ -229,7 +236,8 @@ still real correctness bugs worth closing):
   `"tab":"a\tb at position 12` → `character (a) at position 5`, all for the
   same doc) — a live-state-dependent miscompile signature, not a
   deterministic parser bug. Full writeup:
-  `docs/known-issues/jsonsmart-parser-still-needed.md`. Fourth-for-four
+  `docs/internal/jsonsmart-parser-jit-retired-20260727.md` (that doc was
+  renamed and rewritten when this verdict was superseded). Fourth-for-four
   real-app/faithful-repro confirmation this session that this ban family
   (`org/jboss/as/`, `org/h2/`, `com/unboundid/`, now this) is still fully
   live — nothing in it has been found safe to remove yet.
@@ -487,13 +495,9 @@ session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-202607
   `org/springframework/boot/` blanket ban under Conservative — safe no-op for
   default behavior, see the doc for the nuance), ES-HAMCREST.1, SnakeYAML
   emitter (ES-JIT-DEOPT-GC.1).
-- **~~KEPT, confirmed still live~~ — REMOVED 2026-07-27:** JAXB
-  (`org/glassfish/jaxb/`). The corruption reproduced here was real, but it
-  was not JAXB's and not the `java.io.Writer` bug either — both faces are
-  the JIT's `java/lang/String` compact-layout field intrinsic reading a
-  primitive field four bytes high, fixed by `82b78bca5`. Bisected against
-  this ban's own reproducer; see
-  `docs/internal/jaxb-jit-ban-lifted-20260727.md`.
+- **KEPT, confirmed still live:** JAXB (`org/glassfish/jaxb/`) — real
+  corruption reproduced once a newly-found, unrelated `java.io.Writer`
+  bug (below) was worked around.
 - **KEPT, no fixture to test:** ES fragile cluster / whole `org/elasticsearch/`
   prefix — no Elasticsearch checkout survives on this host; see
   `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`.
@@ -502,11 +506,9 @@ session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-202607
   (defaults `false`) — dead in any default run already. NETTY.1's only
   matching entry was the historical `Arrays.fill` bug, already lifted
   2026-06-11 (predates this session).
-- **NEW BUG FOUND — FIXED, same root cause as the JAXB ban:**
-  `java.io.Writer.write(char[])` silently drops output under JIT once hot.
-  Root-caused 2026-07-27 to the JIT's `java/lang/String` compact-layout
-  field intrinsic (`82b78bca5`), not to `Writer` — the dropped content was
-  always the *name* strings, already decoded empty before the write. See
-  `docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
+- **NEW BUG FOUND:** `java.io.Writer.write(char[])` silently drops output
+  under JIT once hot — a general VM defect, not app-specific, unrelated to
+  the JAXB ban it was found under. Not yet root-caused/fixed. See
+  `docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md` (CLOSED 2026-07-27).
 
 Reproducers committed under `docs/known-issues/repros/jitban-remaining-20260726/`.

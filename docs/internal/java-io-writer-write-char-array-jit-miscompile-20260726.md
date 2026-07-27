@@ -1,154 +1,113 @@
-# `java.io.Writer.write(char[])` JIT miscompile — silently drops written characters
+# `java.io.Writer.write(...)` JIT miscompile — silently drops written characters — CLOSED 2026-07-27
 
-**Status: FIXED 2026-07-26 by `82b78bca5` ("fix(jit): String field intrinsics
-read compact primitive fields 4 bytes high"); verified and retired
-2026-07-27.**
+**Status: ✅ CLOSED.** Filed 2026-07-26 while re-testing the
+`org/glassfish/jaxb/` JIT ban (`jaxb_mapping_residual_skip_prefix`) during the
+JIT-ban-removal sweep that followed the 2026-07-26 JIT rework. It no longer
+reproduces on dev, and the probe it blocked now runs clean with the JAXB ban
+removed entirely.
 
-The diagnosis in the original report below ("the whole `write(char[])` call
-no-ops") was the wrong layer. `Writer.write(char[])` was never miscompiled.
-What was miscompiled was the JIT's `java/lang/String` field intrinsic on a
-compact-layout `String`: it read the primitive `coder`/`hash` field four bytes
-above its real offset, so the *name* strings JAXB's marshaller writes decoded
-as empty. The output therefore lost exactly the element and attribute names
-(`</widget>` -> `</>`, `<widget id="w27">` -> `< ="w27">`) while every other
-write in the same document was intact — which is why the bisection below
-pinned it to `Writer.write` (that is simply where the already-empty string was
-handed over) rather than to the String intrinsic that produced it. It also
-explains why `CRATONVM_JIT_BISECT_ONLY=java/io/Writer` still reproduced: the
-String intrinsic fires inside `Writer`'s own compiled body.
+Two things in the original writeup turned out to be wrong; both are corrected
+below, because the same reasoning is easy to repeat.
 
-The same defect is the root cause of the `org/glassfish/jaxb/` JIT ban, now
-also lifted — see `jaxb-jit-ban-lifted-20260727.md` in this directory for the
-full bisection table and the re-verification evidence.
+## Original symptom (2026-07-26)
 
-**Verification:** the reproducer described below (`JaxbQNameProbe`, real
-`jakarta.xml.bind`/`org.glassfish.jaxb` 4.0.7) fails deterministically at
-iteration 27 on dev `95e4d9929` (2026-07-26 12:15Z) and is clean on
-`82b78bca5` and every later tree, including 20000-iteration runs on current
-dev with the JAXB package JIT-eligible.
-
----
-
-## Original report (2026-07-26), retained for history
-
-## Symptom
-
-A `StringWriter`-backed writer silently drops a whole `write(char[])` call's
-content partway through a run. Standalone repro: marshal a small
-`@XmlRootElement`-annotated class via a real `jakarta.xml.bind`/
-`org.glassfish.jaxb` `Marshaller` into a `StringWriter`, in a loop, with a
-fresh `Marshaller`/`StringWriter` each iteration. From iteration 26 onward
-(deterministic, every run), the produced XML has an **empty closing tag**:
+Marshalling a small `@XmlRootElement` class through a real
+`jakarta.xml.bind` / `org.glassfish.jaxb` 4.0.7 `Marshaller` into a fresh
+`StringWriter` per iteration produced, from iteration 26 onward, XML with an
+**empty closing tag**:
 
 ```
-<?xml version="1.0" encoding="UTF-8" standalone="yes"?><widget id="w26"><type>type4_26</type><refs>ref26-0</refs><refs>ref26-1</refs><refs>ref26-2</refs></>
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?><widget id="w26">…</>
 ```
 
-Expected `</widget>`; got `</>` — the root element name (6 ASCII characters,
-"widget") vanished from between `</` and `>`. Every other write in the same
-document (opening tags, attribute values, nested element text) is correct;
-only this one write call, always at the same iteration, is affected in a
-20-run/20-run reproduction.
+Expected `</widget>`; the six characters of the root element name vanished, as
+if the write had been turned into a zero-length write. `--nojit` was clean;
+`CRATONVM_JIT_BISECT_SKIP=java/io/Writer.write` was clean;
+`CRATONVM_JIT_BISECT_ONLY=java/io/Writer` still failed.
 
-## Root cause (bisected, not yet fixed)
+## Status on 2026-07-27: does not reproduce
 
-Confirmed **completely unrelated to JAXB or the existing `org/glassfish/jaxb/`
-ban**: reproduces identically whether that ban is active or lifted via
-`CRATONVM_JIT_ALLOW_PACKAGES=org/glassfish/jaxb/`. Bisected with
-`CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_SKIP` / `CRATONVM_JIT_BISECT_ONLY`
-(no rebuild needed once a diagnostic binary exists):
-
-- `CRATONVM_JIT_DENY=java/` (force all JDK classes to interpret) → clean.
-- `CRATONVM_JIT_DENY=java/io/` → clean. `CRATONVM_JIT_DENY=java/io/Writer` (a
-  substring match, so it also covers `java/io/Writer` itself but NOT
-  `java/io/StringWriter`, a different string) → **still fails** — see below,
-  this pins it to `Writer` itself, not `StringWriter`.
-- `CRATONVM_JIT_DENY=java/lang/`, `java/util/`, `java/lang/reflect/` → each
-  individually **still fails** (i.e. not those packages).
-- `CRATONVM_JIT_BISECT_SKIP=java/io/Writer.write` → clean.
-  `CRATONVM_JIT_BISECT_SKIP=java/io/Writer.append` / `.close` / `.flush` →
-  each **still fails**. Pins the defect to one of `Writer`'s `write(...)`
-  overloads specifically (bisect-skip matches by method name, not exact
-  overload, so this narrows to the `write` family, not a specific arity yet).
-- `CRATONVM_JIT_BISECT_ONLY=java/io/Writer` (ONLY this class JIT-eligible,
-  everything else forced to interpret) → **still fails**, deterministically
-  at the same iteration 26. This is the cleanest isolation: the defect is
-  fully self-contained within `java.io.Writer`'s own bytecode, not an
-  interaction with any other hot class.
-- `--nojit` (interpreter only) → clean, 100/100 and 1000/1000 in separate
-  runs. Confirms JIT-specific, not a general JAXB/reflection bug.
-
-`java.io.Writer.write(char[] cbuf)` (real JDK 25, no CratonVM native stub) is
-a one-line forwarding method:
-```java
-public void write(char[] cbuf) throws IOException {
-    write(cbuf, 0, cbuf.length);
-}
-```
-`StringWriter` does not override this particular zero-argument-array overload
-(it overrides `write(int)`, `write(char[], int, int)`, `write(String)`,
-`write(String, int, int)`, and the `append(...)` family), so any caller that
-invokes `Writer.write(char[])` on a `StringWriter` receiver executes this
-exact inherited one-liner. The most likely failure mode given the symptom
-(the whole write silently no-ops — no exception, no partial content, just
-zero characters appended) is that the virtual dispatch or the `cbuf.length`
-read in the trivial forwarding call is getting corrupted to `0` under JIT,
-turning `write(cbuf, 0, cbuf.length)` into `write(cbuf, 0, 0)`. This has not
-been confirmed at the disassembly level — no fix has been attempted.
-
-## Reproducer
-
-`JaxbQNameProbe.java` (marshal/unmarshal loop over a `QName`-bearing
-`@XmlRootElement` class using a real `jakarta.xml.bind`/`org.glassfish.jaxb`
-4.0.7 runtime + a plain `java.io.StringWriter`), run under default JIT:
-fails deterministically at iteration 26 of any run ≥27 iterations. Under
-`--nojit`, or with `CRATONVM_JIT_BISECT_SKIP=java/io/Writer.write`, or with
-`CRATONVM_JIT_DENY=java/io/Writer`: clean.
-
-```bash
-CP=<jaxb-runtime,jaxb-core,txw2,jakarta.xml.bind-api,istack-commons-runtime,jakarta.activation-api jars>:<probe classes dir>
-<cratonvm-binary> --java-home <jdk25> -cp "$CP" JaxbQNameProbe 100
-# fails at i=26 with a malformed "</>" closing tag, then an UnmarshalException
-# parsing that malformed XML back.
-
-<cratonvm-binary> --java-home <jdk25> --nojit -cp "$CP" JaxbQNameProbe 100
-# clean, 100/100.
-```
-
-## Blast radius
-
-Any real application that writes through `Writer.write(char[])` on a
-receiver that doesn't override that specific overload — not limited to
-`StringWriter`; any `Writer` subclass that overrides only the `(char[], int,
-int)` / `String` / `append` family and relies on the inherited `write(char[])`
-forwarder is equally exposed once that call site gets hot enough to compile.
-This is likely a **wider-reaching bug than the JAXB ban it was found under**;
-worth checking whether other already-catalogued "mysterious partial/dropped
-output" bugs in this codebase's history are actually this same root cause.
-
-## Relationship to the JAXB ban
-
-**Does not explain and does not subsume** `jaxb_mapping_residual_skip_prefix`
-(`org/glassfish/jaxb/`). That ban is confirmed independently still necessary:
-with this `Writer` bug worked around (`CRATONVM_JIT_DENY=java/io/Writer`) and
-the `org/glassfish/jaxb/` ban ALSO lifted, the same probe hits a **different**
-JIT-only corruption at iteration 81 — an `UnmarshalException: unexpected
-element (uri:"", local:"widget")` where the parsed/expected `QName` values
-print as textually identical but compare unequal (matching the ban's own
-documented "QName-heavy runtime graph" / self-cast corruption symptom). With
-the `org/glassfish/jaxb/` ban kept active (default) and only the `Writer` bug
-worked around, the same 4000-iteration probe is clean. See test log summary:
+Re-run on dev at `c042e794f` with the documented reproducer
+(`docs/known-issues/repros/jitban-remaining-20260726/JaxbQNameProbe.java`, real
+JAXB 4.0.7 jars, real JDK 25 via `--java-home`):
 
 | Config | Result |
 |---|---|
-| Default (jaxb ban active, Writer bug NOT worked around) | Fails at i=26 — this `Writer` bug |
-| Jaxb ban active + `CRATONVM_JIT_DENY=java/io/Writer` | Clean, 4000/4000 |
-| Jaxb ban LIFTED + `CRATONVM_JIT_DENY=java/io/Writer` | Fails at i=81 — separate QName corruption, confirms jaxb ban still needed |
-| Jaxb ban LIFTED + `--nojit` | Clean, 1000/1000 |
+| Default (JAXB ban active), 100 iterations | clean |
+| Default (JAXB ban active), 4000 iterations | clean, 0 failures |
+| JAXB ban lifted + `CRATONVM_JIT_DENY=java/io/Writer` (the 2026-07-26 config), 4000 iterations | clean, 0 failures |
+| JAXB ban **removed from the skip list**, 4000 iterations × 6 | clean, 0 failures |
 
-**Action for whoever picks this up:** root-cause `Writer.write(char[])`'s
-codegen (start with `CRATONVM_JIT_BISECT_ONLY=java/io/Writer` +
-`CRATONVM_FRAME_TRACE=1`/disassembly on the compiled method — no rebuild
-needed to reproduce). Once fixed, re-run this exact probe to confirm, and
-separately leave `jaxb_mapping_residual_skip_prefix` alone (it guards a
-different, still-live bug).
+Closed by general JIT correctness work merged into dev between 2026-07-26 and
+2026-07-27 — not by a targeted fix, and not by this session's change. The
+`Writer` family was never a JIT ban (it has no skip-list entry), so there is
+nothing to lift; this doc is retired to `docs/internal/` per the
+`docs/known-issues` convention (that directory holds only *unfixed* bugs).
+
+## Correction 1 — the overload was `write(String)`, not `write(char[])`
+
+The original writeup pinned the defect on `Writer.write(char[] cbuf)` on the
+strength of `BISECT_SKIP=java/io/Writer.write` clearing it, and reasoned about
+`write(cbuf, 0, cbuf.length)`'s `arraylength`. But `CRATONVM_JIT_BISECT_SKIP`
+matches by **method name**, so it covered every `write` overload at once.
+
+`CRATONVM_DBG_DUMP_JIT=LIST` over the same probe on 2026-07-27 shows the JAXB
+path compiles exactly one `java/io/Writer` method:
+
+```
+[JIT_COMPILED] java/io/Writer.write(Ljava/lang/String;)V
+```
+
+`Writer.write(char[])` is never compiled in this workload. The two bodies have
+the same shape (`write(x, 0, <length of x>)`), so the symptom description still
+fits — but any future search keyed on `arraylength` would have been looking in
+the wrong place. **Lesson: `BISECT_SKIP` narrows to a method *name*; confirm the
+actual compiled overload with `CRATONVM_DBG_DUMP_JIT=LIST` before writing the
+root cause down.**
+
+## Correction 2 — it does not subsume, and is not subsumed by, the LICM bug
+
+While closing this doc, the same probe at 4000 iterations exposed a *different*,
+still-live general VM bug — the LICM / speculative pre-header bypass, whose
+`org.xml.sax.helpers.AttributesImpl.ensureCapacity` face killed the run with
+`OutOfMemoryError … anewarray … length 1677721600` about one run in three. That
+one is real, root-caused, and fixed:
+`docs/internal/jit-licm-preheader-bypass-20260727.md`. It is **not** the bug
+described here: it has no loop in any `Writer` method to hoist out of, and the
+`Writer` symptom predates it and reproduced under `BISECT_ONLY=java/io/Writer`
+where `AttributesImpl` cannot compile at all.
+
+## Related
+
+- `docs/internal/jit-licm-preheader-bypass-20260727.md` — the real bug this
+  probe was hiding at higher iteration counts.
+- `docs/internal/jaxb-jit-ban-removed-20260727.md` — the ban this was found
+  under; now removed.
+- `docs/known-issues/repros/jitban-remaining-20260726/JaxbQNameProbe.java` —
+  the reproducer, kept as the regression witness for all three.
+
+---
+
+## Fixing commit (added 2026-07-27 by a second session)
+
+"Does not reproduce on dev" above now has an exact attribution:
+**`82b78bca5` — "fix(jit): String field intrinsics read compact primitive
+fields 4 bytes high"** (2026-07-26 13:14 UTC).
+
+Bisected with this doc's own reproducer (`JaxbQNameProbe`, real
+`jakarta.xml.bind` / `org.glassfish.jaxb` 4.0.7, JDK 25): dev `95e4d9929`
+(07-26 12:15Z) fails deterministically at iteration 27 with the documented
+shape — `< ="w27"><>type5_27</>…</>` — and dev `82b78bca5` and every later
+tree is clean.
+
+This confirms the correction stated above: `Writer.write(char[])` was never
+miscompiled. The JIT's `java/lang/String` field intrinsic read the primitive
+`coder`/`hash` field four bytes above its real offset on a compact-layout
+`String`, so the *name* strings were already empty by the time they reached
+the write. That is also why `CRATONVM_JIT_BISECT_ONLY=java/io/Writer` still
+reproduced — the intrinsic fires inside `Writer`'s own compiled body — and why
+`BISECT_SKIP=java/io/Writer.write` cleared it without the defect being in
+`write`.
+
+The same commit is the root cause of the `org/glassfish/jaxb/` JIT ban; see
+`jaxb-jit-ban-removed-20260727.md` in this directory.

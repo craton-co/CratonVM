@@ -559,6 +559,9 @@ pub(crate) struct MockNativeContext {
     /// Per-native-call roots for tests that simulate a moving GC during
     /// `invoke_virtual` callbacks.
     native_pin_roots: UnsafeCell<Vec<ObjectRef>>,
+    /// Open `NativeHandleScope` depths, as marks into `native_pin_roots`.
+    /// See this type's `handle_scope_push`/`handle_scope_pop`.
+    handle_scope_marks: UnsafeCell<Vec<usize>>,
     /// Process-global-style roots used by natives that need object handles
     /// across callbacks. The mock does not move objects, but implementing the
     /// API keeps tests on the same path as the real VM.
@@ -761,6 +764,7 @@ impl MockNativeContext {
             invoke_virtual_result: UnsafeCell::new(None),
             invoke_virtual_hook: UnsafeCell::new(None),
             native_pin_roots: UnsafeCell::new(Vec::new()),
+            handle_scope_marks: UnsafeCell::new(Vec::new()),
             global_roots: UnsafeCell::new(HashMap::new()),
             next_global_root: UnsafeCell::new(1),
             hidden_classes: UnsafeCell::new(std::collections::HashSet::new()),
@@ -1998,6 +2002,34 @@ impl cratonvm_native_api::NativeHeapAccess for MockNativeContext {
         let idx = roots.len();
         roots.push(obj);
         idx
+    }
+
+    // --- Handle scopes -----------------------------------------------------
+    //
+    // `NativeContext`'s DEFAULT `handle_root` pins (it delegates to
+    // `pin_native_root`) while the default `handle_scope_push`/`pop` are
+    // no-ops. That pairing is asymmetric: every native written against
+    // `NativeHandleScope` would appear to leak a pin per rooted object for the
+    // whole life of the mock, so a test asserting "this native releases its
+    // roots" could never pass. The VM overrides all four; the mock now does
+    // too, mapping scopes onto its existing pin stack so the balance is real.
+
+    fn handle_scope_push(&mut self) {
+        let depth = unsafe { (&*self.native_pin_roots.get()).len() };
+        unsafe { (&mut *self.handle_scope_marks.get()).push(depth) };
+    }
+
+    fn handle_scope_pop(&mut self) {
+        if let Some(base) = unsafe { (&mut *self.handle_scope_marks.get()).pop() } {
+            self.unpin_native_roots(base);
+        }
+    }
+
+    fn handle_get(&self, slot: u32) -> Option<ObjectRef> {
+        // The mock never moves objects, so the pinned reference IS the
+        // current address. `None` past the end lets `NativeHandle::get` fall
+        // back, matching the trait's contract for a popped scope.
+        unsafe { (&*self.native_pin_roots.get()).get(slot as usize).copied() }
     }
 
     fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
