@@ -38,51 +38,59 @@ aliasing/relocation failure, which the evidence below now supports directly.
 
 ## What it needs, measured
 
-All rows on the 2026-07-27 build that already carries the NodeConnections
-callee-artifact pin fix, so none of this is the stale-entry bug.
+All rows below are on builds that already carry the NodeConnections
+callee-artifact pin fix, so none of this is the stale-entry bug. The rate is
+about **1.3 errors per 1,000,000 parse operations**, so a single 1,500,000-op run
+is worth ~2 expected errors and observing 0 in one run means almost nothing
+(p ≈ 0.13). **Budget 4.5M–6M operations per configuration**; the earlier
+"1 per 500k" figure came from a higher-rate build and over-promised.
 
 | config | ops | errors |
 |---|---|---|
-| default (`-Xmx1g`) | 1,500,000 | 2 |
-| default (`-Xmx1g`), second run | 1,500,000 | 1 |
-| **`-Xmx8g`** | 1,500,000 | **0** |
-| **`-Xmx8g`**, second run | 1,500,000 | **0** |
-| **`CRATONVM_MOVING_YOUNG=0`** (`-Xmx1g`) | 1,500,000 | **0** |
+| default (`-Xmx1g`), 2026-07-27 branch build | 6,000,000 | 8 |
+| default (`-Xmx1g`), same day's `dev` tip | 6,000,000 | 2 |
+| **`CRATONVM_MOVING_YOUNG=0`** (`-Xmx1g`) | **4,500,000** | **0** |
+| `-Xmx8g` | 3,000,000 | 0 |
 | `-Xmx256m` | 600,000 | 0 |
 | `CRATONVM_JIT_POISON_FREE=1` | 1,500,000 | 3, **no SIGSEGV** |
 | `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` | 1,500,000 | 1 |
+| `CRATONVM_NO_PRECISE_JIT_MAPS=1` | 1,500,000 | 0 — *underpowered, inconclusive* |
+| `CRATONVM_NO_PRECISE_JIT_MAPS=1 CRATONVM_XT_JIT_ROOT_SCAN=0` | 1,500,000 | 0 — *underpowered, inconclusive* |
 | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0` (earlier build) | 3,000,000 | 0 |
 | `CRATONVM_JIT_DENY=net/minidev/json/parser/` (earlier build) | 1,500,000 | 0 |
 
 Reading those together:
 
-* **It needs a moving young generation.** 3 errors per 3M ops at `-Xmx1g`
-  versus 0 per 3M at `-Xmx8g` and 0 per 1.5M with `CRATONVM_MOVING_YOUNG=0` at
-  the *same* 1 GiB heap. The `MOVING_YOUNG=0` row is the load-bearing one: at an
-  unchanged heap it isolates *relocation* rather than *collection*. The rate is
-  NOT monotonic in collection frequency — `-Xmx256m`, which collects far more
-  often, is also clean over 600,000 ops — so the trigger is a particular
-  young-gen regime (big enough to evacuate rather than fall back), not simply
-  "more collections". Whatever narrows that regime is also the cheapest
-  amplifier available.
+* **It needs a moving young generation.** `CRATONVM_MOVING_YOUNG=0` is clean
+  over 4,500,000 operations on the *same binary and the same 1 GiB heap* whose
+  control rate predicts ~6 errors (Poisson p ≈ 0.003). That row, not the
+  heap-size rows, is the load-bearing one: it isolates *relocation* rather than
+  *collection*. The rate is not monotonic in collection frequency either —
+  `-Xmx256m` collects far more often and is clean — so the trigger is a
+  particular young-gen regime (large enough to evacuate rather than fall back),
+  which is also the cheapest amplifier available for further work.
 * **It is not the inline machine-code MIC/PIC cascade.**
   `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` stops that cascade from being emitted at
-  all and the corruption survives. What remains on that path is the *dispatch
+  all and the corruption survives. What remains on the path is the *dispatch
   helper* calling a compiled callee directly via
   `try_call_compiled_entry_reentrant`.
 * **It is not a stale or recycled code buffer.** See the refutation below.
+* The two root-scan rows are listed only so nobody re-runs them at the same
+  size and mistakes the result for a signal — at 1.5M ops each they cannot
+  distinguish "fixed" from "unchanged".
 
 So the shape is: a compiled caller → `jit_invoke_virtual_mic` →
 `try_call_compiled_entry_reentrant` → compiled callee, with a young-gen
-relocation somewhere inside the callee, after which the caller (or the helper)
-uses a reference that was not updated.
+relocation somewhere inside the callee, after which a reference that was not
+updated is used. Returning one of the document's own keys instead of the parsed
+map is what an aliased-after-evacuation reference looks like.
 
 `try_call_compiled_entry_reentrant` already registers a
 `JitEntryGuard::enter_with_compiled` for the nested call — but only when
 `lookup_jit_code_range(entry)` resolves, i.e. only when the code-range registry
 is populated (`precise_jit_maps_enabled() || xt_jit_root_scan_enabled()`, both
-default-on today). Whether that guard actually publishes the *helper's own*
-Rust-frame references, and what the collector does with the caller frame
+default-on today). Whether that guard publishes the *helper's own* Rust-frame
+references, and what the collector does with the compiled caller's frame
 underneath it, is the first thing to audit.
 
 ## Refuted — do not re-litigate without new evidence
@@ -115,10 +123,10 @@ suspect) — same evidence as above.
    helper's live references (`class_name`, the decoded receiver, `args_slice`)
    while the nested callee runs, and whether the caller's spill slots are
    remapped when the callee triggers a young collection.
-2. Amplify: the probe reproduces at ~1 per 750,000 operations at `-Xmx1g`.
-   A smaller heap (or `CRATONVM_DBG_FORCE_MOVING`) should raise the rate enough
-   to make single-run A/Bs meaningful; budget at least 1,500,000 operations per
-   configuration otherwise.
+2. Amplify before anything else. At ~1.3 per 1,000,000 operations every A/B
+   here costs half an hour to reach even marginal significance. `-Xmx256m` is
+   *not* the amplifier (it is clean); find the young-gen sizing that maximises
+   moving evacuations at a 1 GiB heap, or use `CRATONVM_DBG_FORCE_MOVING`.
 3. Until then, `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0` remains the
    correctness-first setting for interface-heavy workloads, and
    `CRATONVM_MOVING_YOUNG=0` is an equally effective (and more targeted)
