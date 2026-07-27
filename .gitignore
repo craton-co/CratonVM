@@ -88,3 +88,10 @@ docs/internal/**/cld*.out
 # Compiled/build output under spring-suite; sources (e.g. MRun.java) stay
 # tracked, but .class/.out/.err build products should not be.
 spring-suite/build/
+
+# Personal / machine-specific dev build scripts (hardcoded usernames, dated
+# worktree paths, one-off investigation output names). scripts/README.md has
+# documented this as gitignored policy since before this rule actually
+# existed in .gitignore; scripts/internal/ had been tracked in the meantime.
+#scripts/internal/
+#scripts/smoke/
