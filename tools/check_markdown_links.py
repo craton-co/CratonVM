@@ -31,7 +31,11 @@ def links_in(path: Path) -> list[tuple[int, str]]:
     links: list[tuple[int, str]] = []
     in_fence = False
     marker = ""
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    # The internal archive contains a few pre-migration Windows-1252 bytes.
+    # Replacement decoding keeps --all useful for link auditing without making
+    # archived encoding cleanup a prerequisite for checking maintained docs.
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for number, line in enumerate(text.splitlines(), 1):
         fence = FENCE_RE.match(line)
         if fence:
             current = fence.group(1)
