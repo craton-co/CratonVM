@@ -822,11 +822,11 @@ fn resolve_class_mirror_slots(
 /// Whether the `CRATONVM_DBG_TOARRAY` diagnostic is enabled.
 ///
 /// Resolved once from the environment and cached for the process lifetime,
-/// so the class-mirror hot path does not pay a per-call `std::env::var`
+/// so the class-mirror hot path does not pay a per-call `cratonvm_types::flags::runtime_var`
 /// (String allocation + global env-mutex acquisition) on every lookup.
 fn dbg_toarray_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CRATONVM_DBG_TOARRAY").is_ok())
+    *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok())
 }
 
 /// Get or create a java.lang.Class mirror object for the given ClassId.
@@ -849,7 +849,7 @@ fn dbg_toarray_enabled() -> bool {
 /// Java-visible fields.
 pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> ObjectRef {
     // PERF: read the CRATONVM_DBG_TOARRAY flag once, not on every mirror
-    // lookup. `std::env::var` allocates a String and touches a global env
+    // lookup. `cratonvm_types::flags::runtime_var` allocates a String and touches a global env
     // mutex on every call; this runs on the class-mirror hot path. Cache the
     // resolved bool in a process-wide OnceLock (the env var is fixed for the
     // process lifetime).
@@ -1022,7 +1022,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     if let Some(loader) =
         cratonvm_native_builtins::classloader::defining_loader_for(class_id.as_u32())
     {
-        if std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
             let name = shared
                 .classes
                 .class_manager

@@ -355,7 +355,7 @@ pub fn shadow_stack_enabled() -> bool {
     // moving young gen relies on the complete precise map the shadow stack now
     // publishes (see `moving_young_enabled`).
     *ENABLED.get_or_init(|| {
-        std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled()
     })
 }
 
@@ -371,7 +371,7 @@ pub fn shadow_stack_enabled() -> bool {
 ///
 /// # This is an INTERLOCK, not an independent policy decision (arch-2026-07-26)
 ///
-/// This used to be its own `std::env::var_os("CRATONVM_MOVING_YOUNG")` read —
+/// This used to be its own `cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG")` read —
 /// the second of **three** copies of the same predicate, alongside
 /// `cratonvm_jit::x64::moving_young_enabled` (codegen) and
 /// `cratonvm_gc::gc_quiescence::moving_young_enabled` (collector). Three
@@ -440,8 +440,8 @@ pub fn moving_young_osr_shadow_fallback_needed() -> bool {
     if !moving_young_enabled() {
         return false;
     }
-    let debug_shadow_disabled = std::env::var_os("CRATONVM_SHADOW_NOPUSH").is_some()
-        || std::env::var_os("CRATONVM_SHADOW_NORELOAD").is_some();
+    let debug_shadow_disabled = cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NOPUSH").is_some()
+        || cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NORELOAD").is_some();
     JIT_ENTRY_CHAIN.with(|c| {
         let mut chain = c.borrow_mut();
         flush_top_rbp_cache_to_chain(chain.as_mut_slice());
@@ -480,7 +480,7 @@ fn moving_young_osr_method_needs_fallback(
 pub fn shadow_pin_roots() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_PIN").is_some())
+    *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_PIN").is_some())
 }
 
 /// Capture the current native stack pointer.
@@ -952,9 +952,9 @@ fn jit_scan_cache_enabled() -> bool {
         // cache stays enabled for its perf benefit; `collection_count` keying
         // (see `JitScanCache`) keeps it from republishing freed addresses across
         // a GC. `CRATONVM_NO_JIT_SCAN_CACHE` force-disables it for bisection.
-        std::env::var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
-            && std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_none()
-            && std::env::var_os("CRATONVM_SHADOW_STACK").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FORCE_MOVING").is_none()
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_STACK").is_none()
     })
 }
 
@@ -964,7 +964,7 @@ fn jit_scan_cache_enabled() -> bool {
 /// call — a kernel transition on the hottest dispatch path. Cached once.
 fn dbg_no_prune() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_PRUNE").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_PRUNE").is_some())
 }
 
 /// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
@@ -972,7 +972,7 @@ fn dbg_no_prune() -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn dbg_fullstack_scan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some())
 }
 
 /// A5 fix — scan this thread's native stack band `[lo, hi)` for any word that is
@@ -1083,7 +1083,7 @@ fn native_stack_has_jit_frame(lo: usize, hi: usize) -> bool {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn jit_range_scan_legacy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_RANGE_SCAN_LEGACY").is_some())
 }
 
 /// Read the safepoint id a live compiled frame published into
@@ -1367,7 +1367,7 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
 /// guessed at. Latched once; the scan runs on every collection.
 fn band_dbg() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_BAND_DBG").is_some())
 }
 
 fn report_unpublished_band_words(
@@ -1410,7 +1410,7 @@ fn report_unpublished_band_words(
 /// is no. Not a supported configuration.
 fn band_verify_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some())
+    *OFF.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY").is_some())
 }
 
 /// Scan one compiled frame's band `[rbp - frame_size, rbp)` for a word that
@@ -1525,7 +1525,7 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
     if !moving_young_enabled() {
         return true;
     }
-    let dbg = std::env::var_os("CRATONVM_MOVING_YOUNG_COVERAGE_DBG").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_MOVING_YOUNG_COVERAGE_DBG").is_some();
     let scanner_sp = current_stack_pointer();
     if !dbg_no_prune() {
         let _ = prune_returned_jit_entries(scanner_sp);
@@ -1819,7 +1819,7 @@ pub static CROSS_THREAD_JIT_GAP_HITS: AtomicUsize = AtomicUsize::new(0);
 /// the detector runs on the per-native-call hot path.
 fn strict_jit_roots() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_STRICT_JIT_ROOTS").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_STRICT_JIT_ROOTS").is_some())
 }
 
 /// Detect — and loudly report — the unsupported *multi-thread-in-JIT* condition
@@ -2299,7 +2299,7 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
     // Stage 5 diagnostic (CRATONVM_DBG_PRECISE): count frames walked / slots
     // rewritten / chain entries so we can see whether the RBP-chain walk
     // actually engages. Printed once per remap call (grep-friendly).
-    let dbg = std::env::var_os("CRATONVM_DBG_PRECISE").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PRECISE").is_some();
     let mut dbg_entries = 0usize;
     let mut dbg_precise = 0usize;
     let mut dbg_frames = 0usize;
@@ -2503,7 +2503,7 @@ fn remap_one_jit_frame(
 fn verify_oop_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some())
+    *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_OOP_MAPS").is_some())
 }
 
 /// `CRATONVM_PRECISE_COVERAGE_PIN` — when set, surface
@@ -2517,7 +2517,7 @@ fn verify_oop_maps_enabled() -> bool {
 fn coverage_pin_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some())
+    *E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_PRECISE_COVERAGE_PIN").is_some())
 }
 
 /// Count of precise frames observed NOT `fully_oop_covered` during GC scans

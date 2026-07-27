@@ -50,7 +50,7 @@ use super::SharedVm;
 fn lenient_clinit() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_LENIENT_CLINIT") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_LENIENT_CLINIT") {
         Ok(v) => v == "1",
         Err(_) => false,
     })
@@ -1509,7 +1509,7 @@ fn initialize_class_shared(
                         // swallowed clinit in a class `Catalina` depends on
                         // leaves a static field null and surfaces later as the
                         // bare NPE that aborts `Catalina.<clinit>`.
-                        if std::env::var("CRATONVM_DBG_CATALINA").is_ok()
+                        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_CATALINA").is_ok()
                             && (class_name_for_jfr.starts_with("org/apache/catalina/")
                                 || class_name_for_jfr.starts_with("org/apache/tomcat/")
                                 || class_name_for_jfr.starts_with("org/apache/coyote/")
@@ -4353,7 +4353,7 @@ mod tests {
     #[test]
     fn lenient_clinit_defaults_off() {
         // Guard against a polluted CI env explicitly setting the opt-in.
-        if std::env::var("CRATONVM_LENIENT_CLINIT").as_deref() == Ok("1") {
+        if cratonvm_types::flags::runtime_var("CRATONVM_LENIENT_CLINIT").as_deref() == Ok("1") {
             // Opt-in is honored — gate reads true. Nothing else to assert.
             assert!(lenient_clinit());
         } else {

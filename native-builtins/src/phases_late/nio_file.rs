@@ -7973,7 +7973,7 @@ pub(crate) mod jrtfs_javac_listing_tests {
 
     fn test_java_home() -> Option<PathBuf> {
         for key in ["CRATONVM_TEST_JDK", "CRATONVM_JAVA_HOME", "JAVA_HOME"] {
-            if let Some(home) = std::env::var_os(key).map(PathBuf::from) {
+            if let Some(home) = cratonvm_types::flags::runtime_var_os(key).map(PathBuf::from) {
                 if home.join("lib/modules").is_file() {
                     return Some(home);
                 }

@@ -695,7 +695,7 @@ fn should_skip_jit_internal(
         use std::sync::OnceLock;
         static BISECT: OnceLock<Vec<(String, String)>> = OnceLock::new();
         let list = BISECT.get_or_init(|| {
-            std::env::var("CRATONVM_JIT_BISECT_SKIP")
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_BISECT_SKIP")
                 .ok()
                 .map(|s| {
                     s.split(',')
@@ -725,7 +725,7 @@ fn should_skip_jit_internal(
         use std::sync::OnceLock;
         static ONLY: OnceLock<Option<Vec<String>>> = OnceLock::new();
         let only = ONLY.get_or_init(|| {
-            std::env::var("CRATONVM_JIT_BISECT_ONLY").ok().map(|s| {
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_BISECT_ONLY").ok().map(|s| {
                 s.split(',')
                     .map(|e| e.trim().to_string())
                     .filter(|e| !e.is_empty())
@@ -3369,12 +3369,12 @@ fn callee_saved_gpr_local_homes_enabled() -> bool {
     // interpreted method invocation VM-wide -- unlike its four sibling
     // env-var checks in this file (CRATONVM_JIT_BISECT_SKIP/ONLY,
     // CRATONVM_JIT_ALLOW_PACKAGES), which all cache via `OnceLock`, this one
-    // called `std::env::var()` fresh on every call. Under a two-real-thread,
+    // called `cratonvm_types::flags::runtime_var()` fresh on every call. Under a two-real-thread,
     // JIT-heavy, high-invocation-count workload (H2's
     // TestFileSystem.testConcurrent against the `async:` filesystem) this
     // manifested as an apparent 300s+ hang: live gdb attaches during the
     // "hang" showed both threads actively burning CPU (not parked), one
-    // repeatedly stuck inside `std::env::var` -> libc `getenv`, with no
+    // repeatedly stuck inside `cratonvm_types::flags::runtime_var` -> libc `getenv`, with no
     // forward progress visible in the test's own log for minutes at a time.
     // Cache the decision once, matching the established pattern below.
     #[cfg(target_arch = "x86_64")]
@@ -3382,7 +3382,7 @@ fn callee_saved_gpr_local_homes_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
                 .ok()
                 .map(|v| {
                     matches!(
@@ -3467,7 +3467,7 @@ pub fn allow_packages_from_env() -> &'static [&'static str] {
     static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            std::env::var("CRATONVM_JIT_ALLOW_PACKAGES")
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ALLOW_PACKAGES")
                 .ok()
                 .map(|s| {
                     // Leak each entry so the borrow lives for 'static. The

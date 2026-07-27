@@ -810,7 +810,7 @@ fn aio_dispatcher_main() {
 /// attach (cold path; attach is rare).
 fn foreign_attach_enabled() -> bool {
     !matches!(
-        std::env::var("CRATONVM_FOREIGN_ATTACH").as_deref(),
+        cratonvm_types::flags::runtime_var("CRATONVM_FOREIGN_ATTACH").as_deref(),
         Ok("0") | Ok("false") | Ok("FALSE")
     )
 }

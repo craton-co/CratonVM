@@ -75,7 +75,7 @@ pub fn optimize(graph: &mut Graph) {
 pub fn licm_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("CRATONVM_JIT_LICM").map_or(true, |v| v != "0"))
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_LICM").map_or(true, |v| v != "0"))
 }
 
 /// `true` when `CRATONVM_JIT_REASSOC` is set (cached). Enables the affine
@@ -83,7 +83,7 @@ pub fn licm_enabled() -> bool {
 pub fn reassoc_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_REASSOC").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_REASSOC").is_some())
 }
 
 /// `true` (default) when pure, call-free *branchy* integer methods may take the
@@ -95,7 +95,7 @@ pub fn reassoc_enabled() -> bool {
 pub fn ir_branchy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_NO_IR_BRANCHY").is_none())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_IR_BRANCHY").is_none())
 }
 
 // ── Affine strength reduction (reassociation) ────────────────────────
@@ -1251,7 +1251,7 @@ fn licm(graph: &mut Graph) -> bool {
     // Non-vacuity diagnostic (mirrors `CRATONVM_DBG_UNROLL`): count the loads
     // this pass actually hoists, so a live soak can confirm LICM fired rather
     // than silently bailing every loop.
-    let dbg = std::env::var_os("CRATONVM_DBG_LICM").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LICM").is_some();
     let mut hoisted = 0usize;
     if dbg {
         eprintln!("[DBG_LICM] {} candidate loop header(s)", headers.len());
@@ -1902,7 +1902,7 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
 pub fn unroll_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("CRATONVM_JIT_UNROLL").map_or(true, |v| v != "0"))
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_JIT_UNROLL").map_or(true, |v| v != "0"))
 }
 
 /// Only fully unroll loops whose constant trip count is at most this (bounds
@@ -1970,7 +1970,7 @@ fn build_users(graph: &Graph) -> Vec<Vec<NodeId>> {
 /// (non-constant init/stride/bound, induction tested against a non-constant,
 /// multiple header tests, …).
 fn analyze_counted_loop(graph: &Graph, region: NodeId, back_ctrl: NodeId) -> Option<CountedLoop> {
-    let dbg = std::env::var_os("CRATONVM_DBG_UNROLL").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
     let n = graph.nodes.len();
     // Induction phi: Phi anchored at `region`, inputs [region, init(Const), next],
     // next = Add(self, Const) or Add(Const, self).
@@ -2165,7 +2165,7 @@ fn forward_control_closure(
 /// each carried phi to its final value and straight-line the control. Anything
 /// not matching this shape is left untouched.
 fn unroll(graph: &mut Graph) -> bool {
-    let dbg = std::env::var_os("CRATONVM_DBG_UNROLL").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some();
     // Normalize away the single-input Merge wrappers the builder puts around
     // branch projections, so loop headers/back-edges sit next to their If/Proj.
     collapse_trivial_merges(graph);
@@ -2496,7 +2496,7 @@ fn unroll(graph: &mut Graph) -> bool {
         for &d in &to_clone {
             graph.kill(d);
         }
-        if std::env::var_os("CRATONVM_DBG_UNROLL").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNROLL").is_some() {
             eprintln!(
                 "[DBG_UNROLL] fully unrolled counted loop (region {region}, trip {}, {} cloned nodes/iter)",
                 info.trip,

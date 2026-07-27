@@ -2128,7 +2128,7 @@ fn ccpp_process_config_bean_definitions(
 #[inline]
 fn ccpp_dbg_enabled() -> bool {
     static DBG: OnceLock<bool> = OnceLock::new();
-    *DBG.get_or_init(|| std::env::var_os("CCPP_DBG").is_some())
+    *DBG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CCPP_DBG").is_some())
 }
 
 #[cfg(test)]
@@ -2138,14 +2138,14 @@ mod ccpp_dbg_flag_tests {
         // The `@Import` walker used to call `env::var` (which also allocates a
         // `String`) on every missing-class branch. The latched helper must
         // agree with the environment at first use and stay stable.
-        let expected = std::env::var_os("CCPP_DBG").is_some();
+        let expected = cratonvm_types::flags::runtime_var_os("CCPP_DBG").is_some();
         assert_eq!(super::ccpp_dbg_enabled(), expected);
         assert_eq!(super::ccpp_dbg_enabled(), expected);
     }
 
     #[test]
     fn ccpp_dbg_flag_is_off_in_a_clean_environment() {
-        if std::env::var_os("CCPP_DBG").is_none() {
+        if cratonvm_types::flags::runtime_var_os("CCPP_DBG").is_none() {
             assert!(!super::ccpp_dbg_enabled());
         }
     }

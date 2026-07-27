@@ -79,7 +79,7 @@ const DEFAULT_SHARED_CACHE_CAP: usize = 65_536;
 /// exercise the parsing rules without depending on which test happened to run
 /// first (the public entry point memoizes for process lifetime).
 fn read_shared_cache_cap() -> usize {
-    match std::env::var("CRATONVM_RESOLVE_CACHE_CAP") {
+    match cratonvm_types::flags::runtime_var("CRATONVM_RESOLVE_CACHE_CAP") {
         Ok(s) => match s.trim().parse::<usize>() {
             Ok(n) if n >= 1 => n,
             _ => DEFAULT_SHARED_CACHE_CAP,
@@ -94,7 +94,7 @@ fn read_shared_cache_cap() -> usize {
 /// back to [`DEFAULT_SHARED_CACHE_CAP`]; the cap can never be set below 1 so a
 /// freshly-inserted entry always survives.
 ///
-/// PERF (2026-07-26 arch pass). This used to call `std::env::var` — which
+/// PERF (2026-07-26 arch pass). This used to call `cratonvm_types::flags::runtime_var` — which
 /// allocates a `String` and, on Windows, is a `GetEnvironmentVariableW`
 /// syscall — on **every first promotion of a call site**, and did so *while
 /// holding the `promoted_invokes` write guard*, so every thread promoting a
@@ -1443,7 +1443,7 @@ mod tests {
         // on every exit path.
         let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
         const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
-        let prev = std::env::var(VAR).ok();
+        let prev = cratonvm_types::flags::runtime_var(VAR).ok();
 
         std::env::set_var(VAR, "10");
         assert_eq!(read_shared_cache_cap(), 10);
@@ -1472,7 +1472,7 @@ mod tests {
         // afterwards must NOT retroactively change the live cap.
         let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
         const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
-        let prev = std::env::var(VAR).ok();
+        let prev = cratonvm_types::flags::runtime_var(VAR).ok();
 
         let first = shared_cache_cap();
         std::env::set_var(VAR, "3");

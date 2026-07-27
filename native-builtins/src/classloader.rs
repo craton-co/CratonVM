@@ -996,7 +996,7 @@ pub(crate) fn is_loader_aware_resolution_eligible(
     loader_obj: ObjectRef,
 ) -> bool {
     // Loader-identity consolidation: this used to inline its own
-    // `std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION")` parse -- a FOURTH
+    // `cratonvm_types::flags::runtime_var("CRATONVM_LOADER_AWARE_RESOLUTION")` parse -- a FOURTH
     // copy of the same gate living right next to the crate's own
     // `loader_aware_resolution()` below. Route through that single
     // in-crate copy (which itself now delegates to
@@ -6009,7 +6009,7 @@ pub(crate) fn ucl_try_define_local_class(
     loader: ObjectRef,
     internal_name: &str,
 ) -> Option<MethodCallResult> {
-    if std::env::var("CRATONVM_DBG_UCLTRACE").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_UCLTRACE").is_ok() {
         let loader_cid = ctx.class_id_of_object(loader);
         let loader_class = ctx.class_name_of_id(loader_cid).unwrap_or_default();
         let paths = loader_constructor_url_paths(ctx, loader);

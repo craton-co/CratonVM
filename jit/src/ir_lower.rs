@@ -456,7 +456,7 @@ impl<'a> Lowerer<'a> {
         let s = self.node_slot[id as usize];
         if s == 0 {
             self.unallocated_slot_use.set(true);
-            if std::env::var_os("CRATONVM_DBG_IRSLOT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IRSLOT").is_some() {
                 let n = &self.graph.nodes[id as usize];
                 eprintln!(
                     "[irslot] UNALLOCATED node={} op={:?} ty={:?} inputs={:?} pc={:?}",
@@ -615,7 +615,7 @@ impl<'a> Lowerer<'a> {
     /// back-edges. The lowerer keeps all live values in frame slots, so the
     /// no-argument slow path may be called directly.
     fn emit_safepoint_poll(&mut self) {
-        let enabled = std::env::var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
+        let enabled = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
             .and_then(|v| v.into_string().ok())
             .is_none_or(|v| v != "0");
         if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
@@ -2751,7 +2751,7 @@ impl<'a> Lowerer<'a> {
         // exactly the historical `frame_value_for` mapping (byte-identical).
         if let Some(sr) = self.sr_map {
             let deopt_block = self.deopt_block_for_bci(sp.bci);
-            if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
                 let matches: Vec<NodeId> = sp
                     .locals
                     .iter()
@@ -2854,7 +2854,7 @@ impl<'a> Lowerer<'a> {
         sr: &ScalarReplacementMap,
         emitted: &mut std::collections::HashSet<NodeId>,
     ) -> FrameValue {
-        let dbg = std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
+        let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some();
         let info = match sr.objects.get(&new_id) {
             Some(i) => i,
             None => return FrameValue::Undefined,
@@ -2931,7 +2931,7 @@ impl<'a> Lowerer<'a> {
             field_values.push(fv);
         }
         emitted.insert(new_id);
-        if std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
             eprintln!(
                 "[DBG_SCALAR_DEOPT] emit VirtualObject (new {new_id}, class_id {}, {} field(s)) at deopt block {db}",
                 info.class_id, info.num_fields

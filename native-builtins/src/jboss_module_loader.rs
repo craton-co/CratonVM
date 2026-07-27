@@ -206,7 +206,7 @@ fn remember_maven_repo_root(root: Option<String>) {
 ///
 /// Returns `None` if neither source is present.
 fn find_mp_argument() -> Option<String> {
-    if let Ok(root) = std::env::var("CRATONVM_JBOSS_MP_ROOT") {
+    if let Ok(root) = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT") {
         if !root.is_empty() {
             return Some(root);
         }
@@ -299,19 +299,19 @@ fn maven_repo_candidates() -> Vec<PathBuf> {
         roots.push(cached);
     }
     for key in ["CRATONVM_MAVEN_REPO_LOCAL", "MAVEN_REPO_LOCAL", "M2_REPO"] {
-        if let Ok(raw) = std::env::var(key) {
+        if let Ok(raw) = cratonvm_types::flags::runtime_var(key) {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 roots.push(PathBuf::from(trimmed));
             }
         }
     }
-    if let Ok(userprofile) = std::env::var("USERPROFILE") {
+    if let Ok(userprofile) = cratonvm_types::flags::runtime_var("USERPROFILE") {
         if !userprofile.trim().is_empty() {
             roots.push(PathBuf::from(userprofile).join(".m2").join("repository"));
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
+    if let Ok(home) = cratonvm_types::flags::runtime_var("HOME") {
         if !home.trim().is_empty() {
             roots.push(PathBuf::from(home).join(".m2").join("repository"));
         }
@@ -3875,7 +3875,7 @@ mod tests {
     fn wp8_10_find_mp_argument_honours_env_var() {
         let _g = TEST_LOCK.lock();
         // Start from a clean slate.
-        let prev = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let prev = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::set_var("CRATONVM_JBOSS_MP_ROOT", "/tmp/wp8_10_fixture_mp");
         let v = find_mp_argument();
         assert_eq!(v.as_deref(), Some("/tmp/wp8_10_fixture_mp"));
@@ -3892,7 +3892,7 @@ mod tests {
     #[test]
     fn wp8_10_find_mp_argument_ignores_empty_env_var() {
         let _g = TEST_LOCK.lock();
-        let prev = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let prev = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::set_var("CRATONVM_JBOSS_MP_ROOT", "");
         let v = find_mp_argument();
         // With an empty env var and the cargo test harness's argv (which
@@ -4029,7 +4029,7 @@ mod tests {
         let jar = repo.join("com/acme/tool/1.0/tool-1.0.jar");
         write(&jar, "PK");
 
-        let prev = std::env::var("CRATONVM_MAVEN_REPO_LOCAL").ok();
+        let prev = cratonvm_types::flags::runtime_var("CRATONVM_MAVEN_REPO_LOCAL").ok();
         std::env::set_var("CRATONVM_MAVEN_REPO_LOCAL", &repo);
         let r = resolve_module(&root, "com.example.foo").unwrap();
         match prev {

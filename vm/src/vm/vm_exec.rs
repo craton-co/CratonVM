@@ -136,7 +136,7 @@ fn debug_log_thread_mirror_identity(shared: &SharedVm, thread_id: u64, obj: Obje
 fn thread_start_handoff_grace() -> std::time::Duration {
     static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *GRACE.get_or_init(|| {
-        let millis = std::env::var("CRATONVM_THREAD_START_GRACE_MS")
+        let millis = cratonvm_types::flags::runtime_var("CRATONVM_THREAD_START_GRACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
@@ -624,12 +624,12 @@ fn recover_stale_lambda_receiver_from_native_pins(
 fn youngscan_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNGSCAN").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNGSCAN").is_some())
 }
 
 /// Cached `CRATONVM_DBG_BLOCKGC` gate — blocked-GC/pin canaries on the
 /// native-call funnel and the pin/unpin paths. PERF (perf/halfgap-20260717):
-/// the uncached `std::env::var_os` probes of this flag ran on EVERY native
+/// the uncached `cratonvm_types::flags::runtime_var_os` probes of this flag ran on EVERY native
 /// call (the PIN-UNDERFLOW guard) and on pin-table operations; `getenv`
 /// linear-scans `environ`, and the probes measured ~7% of a HashMapOnly-4M
 /// run. Same read-once semantics every other debug flag in this codebase
@@ -639,7 +639,7 @@ fn youngscan_enabled() -> bool {
 fn blockgc_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some())
 }
 
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
@@ -656,7 +656,7 @@ thread_local! {
 fn youngscan_straystack_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STRAYSTACK").is_some())
 }
 
 /// Throttle stride for the whole-young scan (every Nth native). Default 1.
@@ -665,7 +665,7 @@ fn youngscan_stride() -> u64 {
     use std::sync::OnceLock;
     static S: OnceLock<u64> = OnceLock::new();
     *S.get_or_init(|| {
-        std::env::var("CRATONVM_YOUNGSCAN_STRIDE")
+        cratonvm_types::flags::runtime_var("CRATONVM_YOUNGSCAN_STRIDE")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&v| v > 0)
@@ -1966,7 +1966,7 @@ fn cold_log_overlay_corruption(
         // map then runs real bytecode and works. Flagging these drowns the
         // genuinely-broken overlays. Set CRATONVM_DBG_OVERLAY_ALL=1 to see
         // them too.
-        if std::env::var_os("CRATONVM_DBG_OVERLAY_ALL").is_none() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_ALL").is_none() {
             if let Some(map_id) = cm.get_loaded_class_id("java/util/Map") {
                 if cm.is_subclass_of(class_id, map_id) {
                     return;
@@ -2280,7 +2280,7 @@ impl<'a> NativeContextImpl<'a> {
         let trace =
             crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
         drop(cm);
-        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STTRACE").is_some() {
             eprintln!(
                 "STTRACE_DBG_CAP frames={} depth={}",
                 self.thread.frames.len(),
@@ -2722,7 +2722,7 @@ impl<'a> NativeContextImpl<'a> {
         );
         if !fixup.is_empty() {
             // BUG-03 trace (gated): record that the blocked-wake remap ran for main.
-            if self.thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+            if self.thread.thread_id.0 == 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
                 let jto = self
                     .thread
                     .java_thread_obj
@@ -3547,7 +3547,7 @@ thread_local! {
 
 fn unpin_ring_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_UNPIN_RING").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNPIN_RING").is_some())
 }
 
 struct VmNativeThreadBlocker {
@@ -4918,7 +4918,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
         let r = self.shared.throwable_stack_trace(throwable_hash);
-        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STTRACE").is_some() {
             eprintln!(
                 "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={}",
                 r.is_some(),
@@ -5163,7 +5163,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // routed here with a heap dst). Catch it with the live Java stack so
         // the offending call site is pinned. is_heap_addr is region-membership
         // only (no header read) so it is safe on an arbitrary address.
-        if std::env::var_os("CRATONVM_DBG_HEAPCOPY").is_some()
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some()
             && self.shared.mem.heap.is_heap_addr(addr as usize).is_some()
         {
             let n = data.len().min(16);
@@ -5970,7 +5970,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // per-allocation stack dump still fires every time.
             let dbg = {
                 static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *DBG.get_or_init(|| std::env::var("CRATONVM_DBG_ANONALLOC").is_ok())
+                *DBG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANONALLOC").is_ok())
             };
             if !dbg && num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
                 let cached = self.shared.classes.anon_class_cache[num_fields]
@@ -6993,7 +6993,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `-Xss` CLI flag will gate the *Java* stack-depth limit
         // (`max_stack_depth` in `JvmConfig`) independently of this native
         // budget.
-        let child_stack_size = std::env::var("RUST_MIN_STACK")
+        let child_stack_size = cratonvm_types::flags::runtime_var("RUST_MIN_STACK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(8 * 1024 * 1024);
@@ -7182,7 +7182,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Gated diagnostic (CRATONVM_DBG_THREADSTART): log each spawned
             // thread's run-class on entry and its result on exit — surfaces
             // threads that never start their target or block inside run().
-            let dbg_ts = std::env::var("CRATONVM_DBG_THREADSTART").is_ok();
+            let dbg_ts = cratonvm_types::flags::runtime_var("CRATONVM_DBG_THREADSTART").is_ok();
             if dbg_ts {
                 let cn = shared_arc
                     .classes.class_manager
@@ -7290,7 +7290,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let pin_base = jvm_thread.native_pin_roots.len();
                     jvm_thread.native_pin_roots.push(exc);
                     let exc_ref = jvm_thread.native_pin_roots[pin_base];
-                    if std::env::var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
                         let cid = shared_arc.mem.heap.class_id_of(exc_ref);
                         let cname = shared_arc
                             .classes.class_manager
@@ -8839,7 +8839,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // list to see whether this thread's park() call landed before
             // or after the pause was requested, and whether pre_stw-gated
             // arrival actually fires.
-            if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
                 eprintln!(
                     "[stw-park] tid={} pre_stw={}",
                     self.thread.thread_id.0, blk.pre_stw
@@ -9393,7 +9393,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         &method_descriptor,
                         &full_args,
                     ) {
-                        if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
                             eprintln!(
                                 "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
                                 class_name, method_name, method_descriptor
@@ -9648,7 +9648,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .read()
                         .get_loaded_class_id(&class_name)
                         != Some(receiver_class_id));
-            if std::env::var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
                 && method_name == "aotContributedInitializerStartsManagementContext"
             {
                 let global_id = self
@@ -14673,7 +14673,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
-    if std::env::var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() && method_name == "value" {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() && method_name == "value" {
         let type_desc = match shared.mem.heap.get_field(proxy, 0) {
             Value::Object(Some(s)) => {
                 super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
@@ -19052,7 +19052,7 @@ fn invoke_on_class_shared_inner(
                 if let Some(result) =
                     object_serialization_hook_neutral_result(method_name, descriptor, args)
                 {
-                    if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
                         eprintln!(
                             "[rf-ser] neutral missing serialization hook {}.{}{} caller={}",
                             class_name,

@@ -371,7 +371,7 @@ fn reset_container_state() {
 /// or not the feature has been added to the manifest.
 fn synthetic_arc_opted_in() -> bool {
     cfg!(feature = "synthetic-quarkus-arc")
-        || std::env::var("CRATONVM_SYNTHETIC_QUARKUS_ARC").as_deref() == Ok("1")
+        || cratonvm_types::flags::runtime_var("CRATONVM_SYNTHETIC_QUARKUS_ARC").as_deref() == Ok("1")
 }
 
 /// Register every `io.quarkus.arc.*` native we implement. Called from
@@ -1324,7 +1324,7 @@ mod tests {
         // Serialize on the shared guard: this test mutates a process-wide
         // env var that other tests would otherwise observe.
         let _g = state_guard().lock();
-        let prev = std::env::var("CRATONVM_SYNTHETIC_QUARKUS_ARC").ok();
+        let prev = cratonvm_types::flags::runtime_var("CRATONVM_SYNTHETIC_QUARKUS_ARC").ok();
 
         // Default (no opt-in, feature not declared): registers nothing.
         std::env::remove_var("CRATONVM_SYNTHETIC_QUARKUS_ARC");

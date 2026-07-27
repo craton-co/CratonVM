@@ -97,7 +97,7 @@ type CachedInvokeTarget = GenericCachedInvokeTarget<Arc<crate::jit::CompiledMeth
 fn straystack_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STRAYSTACK").is_some())
 }
 
 /// Cached `CRATONVM_DBG_ARRSTORE` gate (bc math-ec 0x4 smear hunt): validate
@@ -106,7 +106,7 @@ fn straystack_enabled() -> bool {
 fn arrstore_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ARRSTORE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ARRSTORE").is_some())
 }
 
 /// Cached `CRATONVM_DBG_CCE_BT` gate (WildFly `parallel-extension-add` CCE
@@ -120,7 +120,7 @@ fn arrstore_enabled() -> bool {
 pub fn dbg_cce_bt_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CCE_BT").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CCE_BT").is_some())
 }
 
 /// Cached `CRATONVM_DBG_NO_REFPROC` gate (bc math-ec 0x4): skip ALL post-GC
@@ -129,7 +129,7 @@ pub fn dbg_cce_bt_enabled() -> bool {
 fn no_refproc() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_REFPROC").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_REFPROC").is_some())
 }
 
 /// HIB-CV-24 (Manifestation B) — end-to-end Weak/Phantom reference *clearing*.
@@ -147,7 +147,7 @@ fn weakref_clear_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        std::env::var("CRATONVM_WEAKREF_CLEAR")
+        cratonvm_types::flags::runtime_var("CRATONVM_WEAKREF_CLEAR")
             .map(|v| v != "0")
             .unwrap_or(true)
     })
@@ -157,7 +157,7 @@ fn weakref_clear_enabled() -> bool {
 fn dbg_weakref() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_WEAKREF").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_WEAKREF").is_some())
 }
 
 /// HIB-CV-24 — pre-collection pass: null the `referent` slot of every active
@@ -268,19 +268,19 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
 fn no_cleaners() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_CLEANERS").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NO_CLEANERS").is_some())
 }
 
 /// Cached `CRATONVM_DBG_AIOOBE` gate (perf P1, audit `vm-runtime.md`): the
 /// array load/store AIOOBE diagnostic. The previous call sites invoked
-/// `std::env::var("CRATONVM_DBG_AIOOBE")` (which locks the process env and
+/// `cratonvm_types::flags::runtime_var("CRATONVM_DBG_AIOOBE")` (which locks the process env and
 /// allocates a `String`) on the array-bounds error path; cache it once like
 /// the sibling gates above.
 #[inline]
 fn aioobe_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AIOOBE").is_some())
 }
 
 /// Cached `CRATONVM_DBG_AIOOBE2` gate (perf P1): secondary array-bounds
@@ -289,7 +289,7 @@ fn aioobe_dbg() -> bool {
 fn aioobe2_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE2").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AIOOBE2").is_some())
 }
 
 /// Validate a primitive-array-store receiver header; dump receiver + Java
@@ -385,7 +385,7 @@ fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool 
 fn mtroots_on() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_MTROOTS").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MTROOTS").is_some())
 }
 
 #[inline]
@@ -682,8 +682,8 @@ fn stw_take_over_and_wait(
                     shared.threads.thread_registry.debug_thread_census()
                 );
             }
-            if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some()
-                || std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_CENSUS").is_some()
+                || cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some()
             {
                 eprintln!(
                     "[stw-census] rounds={rounds} pending={pending} taken={} blocked={} alive={}{}",
@@ -692,7 +692,7 @@ fn stw_take_over_and_wait(
                     shared.threads.thread_registry.alive_count(),
                     shared.threads.thread_registry.debug_thread_census()
                 );
-                if std::env::var_os("CRATONVM_DBG_STW_NATIVE_RING").is_some() {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_NATIVE_RING").is_some() {
                     cratonvm_native_api::native_ring::dump_to_stderr();
                 }
             }
@@ -767,7 +767,7 @@ fn stw_take_over_and_wait(
                 xt_roots.push(r);
             }
         }
-        if std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some() {
             eprintln!(
                 "[xt-frame-scan] frozen_peers={} contributed_roots={}",
                 taken.count(),
@@ -887,7 +887,7 @@ fn pin_frozen_peer_roots_for_g1(
 pub(crate) fn remap_trace_on() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_REMAP_TRACE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REMAP_TRACE").is_some())
 }
 
 thread_local! {
@@ -1229,7 +1229,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // gen (frequent GC) this fires close to the JIT corruptor — the
             // interpreted frame on top is the BC method that called the
             // JIT-compiled corruptor.
-            if std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some()
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some()
                 && cratonvm_gc::gen_heap::SWEEP_CORRUPTION_HITS
                     .load(std::sync::atomic::Ordering::Relaxed)
                     > 0
@@ -1332,7 +1332,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         // the instant this pause is requested, to disambiguate
                         // whether a thread later seen parked was already
                         // excluded at request time or genuinely raced in.
-                        if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
                             let expected_ids: Vec<u64> = shared
                                 .threads
                                 .thread_registry
@@ -1614,7 +1614,7 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         0
     };
-    if std::env::var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
             "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
         );
@@ -1631,12 +1631,12 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
 /// `CRATONVM_GC_OVERHEAD_LIMIT=0`.
 pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
     // PERF: this runs on the per-allocation slow path (`jit_new_object` and
-    // the interpreter allocation sites). An uncached `std::env::var` here was
+    // the interpreter allocation sites). An uncached `cratonvm_types::flags::runtime_var` here was
     // ~6% of binarytrees-18 wall time (getenv does a linear environ scan) —
     // read the knob once. `Some(0)` = explicitly disabled.
     use std::sync::OnceLock;
     static LIMIT: OnceLock<u32> = OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| match std::env::var("CRATONVM_GC_OVERHEAD_LIMIT") {
+    let limit = *LIMIT.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_GC_OVERHEAD_LIMIT") {
         Ok(v) => v.trim().parse::<u32>().unwrap_or(GC_OVERHEAD_LIMIT_CYCLES),
         Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
     });
@@ -2585,7 +2585,7 @@ fn dbg_invoke_stats_record(index: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_INVOKESTATS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INVOKESTATS").is_some()) {
         return;
     }
     static COUNTS: [AtomicU64; 4] = [
@@ -2613,7 +2613,7 @@ fn dbg_refill_fail_state(shared: &SharedVm, requested: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some()) {
         return;
     }
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2636,7 +2636,7 @@ fn dbg_refill_fail(stage: usize, requested: usize) {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some()) {
         return;
     }
     static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2709,7 +2709,7 @@ fn tlab_gc_trigger_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        std::env::var("CRATONVM_TLAB_GC_TRIGGER")
+        cratonvm_types::flags::runtime_var("CRATONVM_TLAB_GC_TRIGGER")
             .map(|v| {
                 let v = v.trim();
                 !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
@@ -3176,7 +3176,7 @@ fn gc_alloc_array(
 fn rootsnap_dbg_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_ROOTSNAP").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ROOTSNAP").is_some())
 }
 static ROOTSNAP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ROOTSNAP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3225,7 +3225,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 .any(|so| so.cur != so.orig);
         if pending {
             let n = crate::vm::vm_exec::apply_pending_blocked_fixups(shared, thread);
-            if n > 0 && std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if n > 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
                 eprintln!(
                     "[blockgc] SAFEPOINT-HEAL tid={} applied {} pending fixups (leaked blocked-region exit upstream)",
                     thread.thread_id.0, n,
@@ -3248,7 +3248,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 thread.thread_id,
                 &thread.gc_block_state.in_blocked_region,
             );
-            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
                 eprintln!(
                     "[blockgc] SAFEPOINT-FLAG-CLEAR tid={} - in_blocked_region was raised on a running thread",
                     thread.thread_id.0,
@@ -3261,7 +3261,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // address at the safepoint publish. A hit here bounds the miss window to
     // "since the previous safepoint" on a RUNNING thread, which none of the
     // DEPOSIT/WAKE/ARRIVE verifiers can see.
-    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
         thread_local! {
             static LAST_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
         }
@@ -3835,7 +3835,7 @@ pub(crate) fn apply_pointer_map_to_thread(
     // thread, so this is the only place that can reach these handles.
     crate::native::jni::update_local_refs_after_gc(pointer_map);
     // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
-    if thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+    if thread.thread_id.0 == 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
         let jto = thread
             .java_thread_obj
             .map(|o| o.as_ptr() as usize)
@@ -3877,7 +3877,7 @@ pub(crate) fn apply_pointer_map_to_thread(
     }
     // DIAGNOSTIC-ONLY (cceres3): mirror of the wake-time WAKE-STALE verifier;
     // catches a frame slot left stale right after a safepoint-arrival remap.
-    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
         for (fi, fr) in thread.frames.iter().enumerate() {
             for li in 0..fr.locals_len() {
                 if let Value::Object(Some(o)) = fr.get_local(li as u16) {
@@ -4022,7 +4022,7 @@ pub(crate) fn apply_pointer_map_to_thread(
     fn gc_verify_stale_enabled() -> bool {
         use std::sync::OnceLock;
         static E: OnceLock<bool> = OnceLock::new();
-        *E.get_or_init(|| std::env::var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1"))
+        *E.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1"))
     }
     if gc_verify_stale_enabled() {
         use cratonvm_types::ObjectHeader;
@@ -4694,7 +4694,7 @@ fn g1_remark_process_references(
     // distinguishes clears that happened HERE (against the mark bitmap)
     // from clears the evacuation-pause path produced, which black-box
     // probes cannot tell apart.
-    if std::env::var_os("CRATONVM_DBG_REFPROC_REMARK").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFPROC_REMARK").is_some() {
         eprintln!(
             "[refproc-remark] soft_cleared={} weak_cleared={} enqueued={} finalize={} \
              cleaner_actions={} resurrect={}",
@@ -4844,7 +4844,7 @@ fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
     // through `execute` by forcing an early *catchable* StackOverflowError (whose
     // Java stack trace reveals the cycle), and (b) cap deep frames whose real
     // per-level native-stack cost exceeds NATIVE_STACK_BYTES_PER_EXEC_LEVEL.
-    if let Ok(v) = std::env::var("CRATONVM_EXEC_DEPTH_CEILING") {
+    if let Ok(v) = cratonvm_types::flags::runtime_var("CRATONVM_EXEC_DEPTH_CEILING") {
         if let Ok(n) = v.trim().parse::<u32>() {
             return n.max(1);
         }
@@ -4971,7 +4971,7 @@ pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
 /// uncached-invocation path). Default-OFF → behaviour is byte-for-byte unchanged.
 fn c2_first_call_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_C2_FIRST_CALL").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_FIRST_CALL").is_some())
 }
 
 /// Execute a method on the given class.
@@ -6196,7 +6196,7 @@ pub fn execute(
                     // so eliding it — or dispatching `Object.<init>` on the
                     // freshly zeroed object if the elision somehow did not fire —
                     // is identical to running `C.<init>`.)
-                    let dbg_ctor = std::env::var_os("CRATONVM_DBG_CTOR_FIX").is_some();
+                    let dbg_ctor = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CTOR_FIX").is_some();
                     for (pc, tclass, pcount) in pending_ctor_sites {
                         let elidable = shared
                             .load_class_concurrent(&tclass)
@@ -10604,7 +10604,7 @@ fn execute_frame_from_index(
         ))) = &exec_result
         {
             if message == "operand stack underflow"
-                && std::env::var("CRATONVM_DBG_UNDERFLOW").is_ok()
+                && cratonvm_types::flags::runtime_var("CRATONVM_DBG_UNDERFLOW").is_ok()
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static FIRED: AtomicBool = AtomicBool::new(false);
@@ -10641,7 +10641,7 @@ fn execute_frame_from_index(
         ))) = &exec_result
         {
             if feature.starts_with("expected int on stack, got")
-                && std::env::var("CRATONVM_DBG_POPINT").is_ok()
+                && cratonvm_types::flags::runtime_var("CRATONVM_DBG_POPINT").is_ok()
             {
                 use std::sync::atomic::{AtomicBool, Ordering};
                 static FIRED_POPINT: AtomicBool = AtomicBool::new(false);
@@ -11778,7 +11778,7 @@ fn route_jit_exception_through_method(
 fn ir_deopt_resume_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_IR_DEOPT_RESUME").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_IR_DEOPT_RESUME").is_some())
 }
 
 /// Map ONE reconstructed `FrameValue` (already resolved in-stub against the
@@ -11879,7 +11879,7 @@ fn resume_from_ir_deopt(
     // FALLBACK re-run, with the reason) so the type source can be validated
     // live — e.g. an instance method's `this` resolving to `Value::Object(..)`
     // rather than a truncated `Value::Int`. Cheap (only when the var is set).
-    let trace = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
+    let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
     let bail = |why: &str| -> Option<CachedCallResult> {
         if trace {
             eprintln!(
@@ -12162,7 +12162,7 @@ pub(crate) fn build_deopt_frame_inner(
             FrameValue::VirtualObject(_) | FrameValue::VirtualObjectRef(_)
         )
     });
-    if has_virtual && std::env::var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+    if has_virtual && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
         eprintln!(
             "[DBG_SCALAR_DEOPT] build_deopt_frame_inner: materializing virtual object(s) at bci={}",
             rframe.bci
@@ -12420,7 +12420,7 @@ fn transfer_osr_exit_into_live_frame(
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
 ) -> Option<()> {
     use cratonvm_jit::deopt::FrameValue;
-    let trace = std::env::var_os("CRATONVM_DBG_DEOPT").is_some();
+    let trace = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some();
     let bail = |why: &str| -> Option<()> {
         if trace {
             eprintln!(
@@ -12711,7 +12711,7 @@ fn real_frame_deopt_resume_and_despeculate(
         &cached.method_name,
         &cached.method_descriptor,
     ) {
-        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
             eprintln!(
                 "[cratonvm-deopt] stashed frame identity mismatch: frame={} bci={} \
                  vs sink method {}.{}:{} — despeculating frame owner, safe re-run",
@@ -12746,7 +12746,7 @@ fn real_frame_deopt_resume_and_despeculate(
     let resumed = if fresh {
         resume_real_ir_deopt(shared, thread, cached, rframe)
     } else {
-        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
             eprintln!(
                 "[cratonvm-deopt] skip resume — artifact epoch {} < live {} for {} (superseded)",
                 compiled.compilation_epoch, live, method_key
@@ -12795,7 +12795,7 @@ fn real_frame_deopt_resume_and_despeculate(
             .deopt_count_at_bci(&method_key, rframe.bci);
         if bci_deopts >= PER_BCI_DESPEC_LIMIT {
             cratonvm_jit::deopt::despec_insert(&method_key, rframe.bci);
-            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] per-bci de-spec: {} bci={} ({} deopts ≥ {}) — \
                      speculation suppressed on next compile (method stays compilable)",
@@ -15285,7 +15285,7 @@ fn execute_instruction(
             );
             if crate::runtime::env_cache::any_field_diag()
                 && obj_ref.is_err()
-                && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NULLTHIS").is_some()
             {
                 let field_name = resolve_field_name(shared, current_class_id, *index);
                 let fr0 = &thread.frames[frame_idx];
@@ -15762,7 +15762,7 @@ fn execute_instruction(
             // var check still selects exactly this block — semantics unchanged.
             if crate::runtime::env_cache::any_field_diag()
                 && obj_ref.is_err()
-                && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NULLTHIS").is_some()
             {
                 let field_name = resolve_field_name(shared, current_class_id, *index);
                 let fr0 = &thread.frames[frame_idx];
@@ -16623,7 +16623,7 @@ fn execute_instruction(
                     // directly: firstReader identity, the cached hold
                     // counter, and the current thread's readHolds
                     // ThreadLocalMap entry.
-                    if std::env::var_os("CRATONVM_DBG_IMSE").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IMSE").is_some() {
                         dump_imse_holdcount_state(shared, thread, obj_ref);
                     }
                     // S111r19+: trace IAE thrown from Java bytecode (ATHROW opcode)
@@ -18558,7 +18558,7 @@ fn execute_ldc(
                         })
                     })?
                     .to_string();
-                if std::env::var_os("CRATONVM_LDC_CLASSREF_TRACE").is_some()
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_LDC_CLASSREF_TRACE").is_some()
                     && (name.contains("ManagementContextAutoConfiguration")
                         || name.contains("ManagementPortType")
                         || name.contains("WebEndpointAutoConfiguration"))
@@ -19811,7 +19811,7 @@ fn resolve_field_in_class(
                     )?;
 
                     let is_ref = f.descriptor.starts_with('L') || f.descriptor.starts_with('[');
-                    if std::env::var("CRATON_FIELD_TRACE").is_ok()
+                    if cratonvm_types::flags::runtime_var("CRATON_FIELD_TRACE").is_ok()
                         && !is_static
                         && index >= class.num_total_fields
                     {
@@ -19887,7 +19887,7 @@ fn resolve_field_in_class(
         is_reference: is_ref,
         desc_byte,
     };
-    if std::env::var("CRATON_FIELD_TRACE").is_ok() && !is_static {
+    if cratonvm_types::flags::runtime_var("CRATON_FIELD_TRACE").is_ok() && !is_static {
         let cm = shared.classes.class_manager.read();
         let decl = cm.get_class(declaring_id);
         let ntf = decl.map(|c| c.num_total_fields).unwrap_or(0);
@@ -21335,7 +21335,7 @@ fn execute_invoke_kind(
                             // remapped mirror — pinpoints whether the staleness is in
                             // the operand-stack copy, the per-thread field, or the
                             // registry (the moving-GC concurrent-spawn reclamation).
-                            if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
                                 let field = thread
                                     .java_thread_obj
                                     .map(|o| o.as_ptr() as usize)
@@ -21489,7 +21489,7 @@ fn execute_invoke_kind(
                             // stack and the per-frame locals/operand slots that
                             // reference this stale address so we can see HOW
                             // the bad pointer arrived in the receiver slot.
-                            if std::env::var_os("CRATONVM_DBG_STALE_RECV").is_some() {
+                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STALE_RECV").is_some() {
                                 // Cast: object/code pointer to integer address
                                 let stale_addr = obj_ref.as_ptr() as usize;
                                 // Extend CRATONVM_DBG_STALE_RECV with the A2
@@ -21507,7 +21507,7 @@ fn execute_invoke_kind(
                                 // reference surviving a legitimate
                                 // relocation -- see
                                 // initialize_real_thread_pool_executor).
-                                if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A2").is_some() {
                                     let hist = cratonvm_gc::a2dbg::history_at(stale_addr, 16);
                                     if hist.is_empty() {
                                         eprintln!(
@@ -21966,7 +21966,7 @@ fn execute_invoke_kind(
                             );
                         }
                     }
-                    if std::env::var_os("CRATONVM_DBG_NPE_STACK").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_NPE_STACK").is_some() {
                         let cm = shared.classes.class_manager.read();
                         eprintln!(
                             "[CRATONVM_DBG_NPE_STACK] NPE invoke {}.{}{} — stack:",
@@ -22403,7 +22403,7 @@ fn execute_invoke_kind(
         None
     };
 
-    if std::env::var_os("CRATONVM_DBG_INVSPECIAL").is_some() && is_special {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INVSPECIAL").is_some() && is_special {
         let cm = shared.classes.class_manager.read();
         let cur_loader = cm.get_loader_id(current_class_id);
         if matches!(cur_loader, Some(cratonvm_types::ClassLoaderId::UserDefined(_))) {
@@ -23538,7 +23538,7 @@ fn try_lambda_default_method_dispatch(
         }
     };
 
-    if std::env::var_os("CRATONVM_DBG_LAMBDA_DISPATCH").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LAMBDA_DISPATCH").is_some() {
         eprintln!(
             "[DBG_LAMBDA] default-dispatch proxy={:?} method={}{} hint={:?}",
             obj_class_id, method_name, method_descriptor, interface_id_hint
@@ -24964,7 +24964,7 @@ fn invoke_cached_native_callback_prevalidated(
 /// Throwable stack capture keeps only a handful of frames, which hides which
 /// methods actually recurse (e.g. the H2 GROUP BY StackOverflowError).
 fn dump_stack_on_soe(thread: &JvmThread) {
-    if std::env::var_os("CRATONVM_DBG_SOE").is_none() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SOE").is_none() {
         return;
     }
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -25122,7 +25122,7 @@ pub(crate) fn is_classvalue_native_override(
             ("get", "(Ljava/lang/Class;)Ljava/lang/Object;") | ("remove", "(Ljava/lang/Class;)V")
         );
     if class_name == "java/lang/ClassValue"
-        && std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_TRACE_CLASSVALUE").is_some()
     {
         eprintln!(
             "[classvalue-gate] is_classvalue_native_override({class_name}, {method_name}, {descriptor}) -> {result}"
@@ -31013,7 +31013,7 @@ fn try_stackless_invoke(
         );
     }
     if method_name == "<init>"
-        && std::env::var_os("CRATONVM_DBG_STTRACE").is_some()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STTRACE").is_some()
         && (class_name.contains("Exception")
             || class_name.contains("Throwable")
             || class_name.contains("Error"))
@@ -31706,7 +31706,7 @@ fn execute_invokestatic(
     // dispatcher (visible in the bt18 regression profile's getenv storm).
     fn invokestatic_loader_trace() -> bool {
         static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *G.get_or_init(|| std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some())
+        *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some())
     }
     if invokestatic_loader_trace()
         && (method_class_name.contains("SpringFactoriesLoader")
@@ -34255,7 +34255,7 @@ fn try_osr(
     for i in 0..num_locals {
         jit_locals.push(frame.get_local_raw(i) as i64); // Cast: JIT ABI -- i64 register convention
     }
-    if std::env::var_os("CRATONVM_DBG_OSR").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
         eprintln!(
             "[cratonvm-osr] enter {}.{}{} entry_pc={} num_locals={} locals={:?}",
             &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, num_locals, jit_locals
@@ -34288,7 +34288,7 @@ fn try_osr(
         // back to _qd0 + 1. Anything higher leaked.
         {
             let now = cratonvm_gc::gc_quiescence::depth();
-            if now > _qd0 + 1 && std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
+            if now > _qd0 + 1 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
                 eprintln!(
                     "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
                     _qd0,
@@ -34339,7 +34339,7 @@ fn try_osr(
     // OSR→interpreter handoff without expanding the OSR signature
     // (`Option<Option<Value>>`, no error channel).
     if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
-        if std::env::var_os("CRATONVM_DBG_OSR").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR").is_some() {
             let cid = shared.mem.heap.class_id_of(exc);
             let cname = shared
                 .classes
@@ -34512,7 +34512,7 @@ fn try_osr(
                 deopt_frame_matches_method(&rframe, &class_name, &method_name, &method_descriptor);
             if !identity_ok {
                 despeculate_stashed_frame_method(shared, &rframe);
-                if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                     eprintln!(
                         "[cratonvm-deopt] OSR-exit stash identity mismatch (frame={} bci={}) \
                          for {}.{}{} — safe reject",
@@ -34539,7 +34539,7 @@ fn try_osr(
             if compiled.can_osr_exit
                 && transfer_osr_exit_into_live_frame(shared, thread, frame_idx, &rframe).is_some()
             {
-                if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                     eprintln!(
                         "[cratonvm-deopt] OSR-exit TRANSFER {}.{}{} entry_pc={} resume_bci={}",
                         &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, rframe.bci
@@ -34549,7 +34549,7 @@ fn try_osr(
             }
             // Safe reject: gate off, method not OSR-exit-capable, or an
             // out-of-scope/unmappable reconstructed frame.
-            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (continue interpreting) {}.{}{} entry_pc={}",
                     &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
@@ -34588,7 +34588,7 @@ fn try_osr(
         // case above, so the interpreter resumes THIS frame from where it
         // was instead of reinterpreting the `i64::MIN` sentinel as a value.
         if deopt_signaled {
-            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] OSR-exit bail rejected (uncommon trap, no frame) {}.{}{} entry_pc={}",
                     &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc

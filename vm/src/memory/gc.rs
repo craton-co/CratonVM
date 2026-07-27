@@ -216,7 +216,7 @@ pub fn unload_dead_class_metadata(
 /// `CRATONVM_LOADER_UNLOAD=0`): every entry is still rooted in that mode, so
 /// `is_marked` is always true and nothing is pruned.
 pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(usize) -> bool) {
-    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
     let mut mirrors = shared.classes.class_mirrors.write();
     if dbg {
         let cm = shared.classes.class_manager.read();
@@ -275,14 +275,14 @@ pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<u
 pub(crate) fn altrace_enabled_vm() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some())
 }
 
 pub(crate) fn watch_addr() -> Option<usize> {
     use std::sync::OnceLock;
     static W: OnceLock<Option<usize>> = OnceLock::new();
     *W.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_WATCHADDR")
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_WATCHADDR")
             .ok()
             .and_then(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
     })
@@ -296,7 +296,7 @@ pub(crate) fn watch_addr() -> Option<usize> {
 pub(crate) fn gcpart_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCPART").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GCPART").is_some())
 }
 
 #[allow(clippy::type_complexity)]
@@ -366,7 +366,7 @@ pub fn update_all_roots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &HashMap<usize, usize>,
 ) {
-    if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PRECISE").is_some() {
         eprintln!(
             "[PRECISE] update_all_roots called, pointer_map.len()={}",
             pointer_map.len()
@@ -389,7 +389,7 @@ pub fn update_all_roots(
     // object handle in sync with a move and prune traces for collected
     // throwables before any early return for a non-relocating sweep.
     shared.remap_and_sweep_throwable_stack_traces(pointer_map);
-    if std::env::var_os("CRATONVM_DBG_ALTRACE").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some() {
         eprintln!(
             "[altrace GC] count={} moved={} tid={}",
             shared.mem.heap.collection_count(),
@@ -430,7 +430,7 @@ pub fn update_all_roots(
     // who the initiator is + main's blocked state — to find the GC where the mirror
     // moves but main's frames are not remapped (the concurrent-spawn stale-`parent`
     // root cause). Read the mirror's CURRENT (pre-step-21) registry address.
-    if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
         let epoch = shared.mem.heap.collection_count();
         let main_old = shared
             .threads
@@ -545,7 +545,7 @@ pub fn update_all_roots(
 
     // DIAGNOSTIC-ONLY (cceres3): initiator-side counterpart of the
     // ARRIVE-STALE / WAKE-STALE frame verifiers.
-    if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
         for (fi, fr) in thread.frames.iter().enumerate() {
             for li in 0..fr.locals_len() {
                 if let crate::types::Value::Object(Some(o)) = fr.get_local(li as u16) {
@@ -589,7 +589,7 @@ pub fn update_all_roots(
     // registers. This is what makes the moving collector correct under JIT.
     if crate::jit::conservative_roots::shadow_stack_enabled() {
         let _rewritten = thread.shadow_stack.remap(pointer_map);
-        if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() && _rewritten > 0 {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() && _rewritten > 0 {
             eprintln!(
                 "[SHADOW] remap: depth={} rewritten={}",
                 thread.shadow_stack.depth(),
@@ -1080,7 +1080,7 @@ pub fn update_all_roots(
 pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
     use cratonvm_types::{ObjectHeader, ObjectKind};
 
-    if std::env::var_os("CRATONVM_DBG_VALIDATE_NEW").is_none() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VALIDATE_NEW").is_none() {
         return;
     }
     let heap = &shared.mem.heap;
@@ -1164,7 +1164,7 @@ pub fn verify_heap_object_fields(
         ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE,
     };
 
-    if std::env::var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
         return;
     }
     let heap = &shared.mem.heap;
@@ -1296,7 +1296,7 @@ fn verify_no_stale_refs(
     // for a zeroed header (class_id=0 && identity_hash_code=0 && num_slots=0).
     // Such a slot is the in-memory signature of the heavy-trees bug: a
     // pointer at an address inside the just-reset young-from semispace.
-    let heavy = std::env::var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1");
+    let heavy = cratonvm_types::flags::runtime_var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1");
 
     // Build the set of "stale destination addresses" — addresses that appear
     // as VALUES in pointer_map but ALSO as KEYS. These are intermediate

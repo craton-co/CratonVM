@@ -1708,7 +1708,7 @@ pub(crate) fn native_system_getenv(
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_str = ctx.read_string(key_ref).unwrap_or_default();
-    match std::env::var(&key_str) {
+    match cratonvm_types::flags::runtime_var(&key_str) {
         Ok(val) => {
             let str_obj = ctx.create_string(&val);
             Ok(Some(Value::Object(Some(str_obj))))

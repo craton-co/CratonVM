@@ -455,7 +455,7 @@ fn next_frame_seq() -> u64 {
 fn stalelong_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STALELONG").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STALELONG").is_some())
 }
 
 /// Kind mark for a `Value` about to be written into a local slot. Only the
@@ -1878,7 +1878,7 @@ impl Frame {
             // BUG-03 diag (gated): for any slot whose address is in this GC's
             // pointer_map, log the kind/tag/decision — captures the exact slot
             // (Thread.<init> local[7] = `parent`) that the remap skips.
-            if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
                 let cv = self.locals[i];
                 let obj = cv.as_object_ptr().map(|p| p as usize);
                 let raw = cv.raw_bits() as usize;

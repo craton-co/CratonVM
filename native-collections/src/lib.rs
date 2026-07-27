@@ -1231,7 +1231,7 @@ pub fn jit_overlay_hashmap_put(
 // Cached debug-flag probes.
 //
 // These flags are read from the OS environment on every native call in the
-// original code (`std::env::var`/`var_os`), which is a syscall-backed lookup
+// original code (`cratonvm_types::flags::runtime_var`/`var_os`), which is a syscall-backed lookup
 // on the hot path. The values never change for the lifetime of the process,
 // so we resolve each exactly once into a `OnceLock<bool>` and reference the
 // cached boolean thereafter. Behaviour is identical — the flag is still
@@ -1241,19 +1241,19 @@ pub fn jit_overlay_hashmap_put(
 /// `true` iff `CRATONVM_HM_TRACE` is set (HashMap equals/contract tracing).
 fn dbg_hm_trace() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HM_TRACE").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_HM_TRACE").is_some())
 }
 
 /// `true` iff `CRATONVM_HS_ITR_DBG` is set (HashSet iterator tracing).
 fn dbg_hs_itr() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_HS_ITR_DBG").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_HS_ITR_DBG").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_SBLOAD` is set (synthetic-build-load tracing).
 fn dbg_sbload() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_SBLOAD").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SBLOAD").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_KCBOOL` is set — traces enum-keyed map lookups,
@@ -1265,14 +1265,14 @@ fn dbg_sbload() -> bool {
 /// constant object exists (same `(class_id, ordinal)`, different pointer).
 fn dbg_kcbool() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_KCBOOL").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_KCBOOL").is_some())
 }
 
 /// `true` iff `CRATONVM_DBG_HMPUT` is set (HashMap put node-walk tracing).
 /// Cached to avoid a syscall-backed env probe per node on the hot put path.
 fn dbg_hmput() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_HMPUT").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HMPUT").is_some())
 }
 
 /// Diagnostic: on an enum-keyed `Map.get` miss, dump the lookup key's enum
@@ -2908,7 +2908,7 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn altrace_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ALTRACE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_ALTRACE").is_some())
 }
 
 // ALTRACE helper: resolve a Value to "ptr cls=... [str=...]" so a trace line
@@ -3282,7 +3282,7 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs={}",
             args.len()
@@ -3382,7 +3382,7 @@ pub fn native_al_to_array_typed(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let elems = al_or_collection_elements(ctx, this);
     let size = elems.len();
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
             "[DBG_TOARRAY] native_al_to_array_typed HIT nargs={} size={} template_some={}",
             args.len(),
@@ -11110,7 +11110,7 @@ fn implements_comparable(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 /// branch when unset.
 fn dbg_cce_backtrace(site: &str, ctx: &dyn NativeContext, ao: ObjectRef, bo: Option<ObjectRef>) {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*E.get_or_init(|| std::env::var_os("CRATONVM_DBG_CCE_BT").is_some()) {
+    if !*E.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CCE_BT").is_some()) {
         return;
     }
     let a_name = object_class_name(ctx, ao);
@@ -13766,10 +13766,10 @@ const LAZY_OP_FLAT_MAP: i32 = 5;
 fn lazy_streams_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| {
-        if std::env::var_os("CRATONVM_LAZY_STREAMS").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_LAZY_STREAMS").is_some() {
             return true; // explicit force-on wins
         }
-        std::env::var_os("CRATONVM_EAGER_STREAMS").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_EAGER_STREAMS").is_none()
     })
 }
 
@@ -24408,7 +24408,7 @@ fn native_random_next_int_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         // CRATONVM_DBG_NEXTINT=1 — dump the Java caller chain. See the twin
         // diagnostic in native-builtins securerandom.rs for rationale (locating
         // the empty-collection divergence in ES/Lucene test-framework setup).
-        if std::env::var("CRATONVM_DBG_NEXTINT").is_ok() {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DBG_NEXTINT").is_ok() {
             eprintln!("NEXTINT-BAD(coll) bound={bound} caller-chain (inner→outer):");
             let frames = ctx.capture_stack_trace(0);
             for f in frames.iter().rev().take(20) {
@@ -27205,7 +27205,7 @@ fn native_lhm_put_evict(
     // `ExplicitQueryStatsMaxSizeTest` (query-plan stats trimmed at 100 entries).
     let (this_cid, this_class_name, is_plain_lhm, invoke_remove_eldest) =
         lhm_remove_eldest_hook_decision(ctx, this);
-    if std::env::var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LHM_EVICT").is_some() {
         eprintln!(
             "[dbg-lhm-evict] this_cid={:?} class_name={:?} is_plain_lhm={} invoke_remove_eldest={} evict={}",
             this_cid,
@@ -31719,7 +31719,7 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
 /// this crate's scope and is flagged in the change report rather than edited
 /// here.
 pub fn gc_prune_dead_collection_overlays(is_live: &dyn Fn(usize) -> bool) {
-    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIRRORPIN").is_some();
     if dbg {
         let total_slots: usize = obj_key_shards()
             .iter()
@@ -46103,7 +46103,7 @@ fn native_tp_is_terminated(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// native-builtins helper of the same shape (kept separate to avoid a crate
 /// dependency cycle).
 fn interrupt_tpe_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
-    let dbg = std::env::var_os("CRATONVM_DBG_EXEC").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXEC").is_some();
     let tpe = match ctx.get_field_by_name(exec, "e") {
         Value::Object(Some(inner)) => inner,
         _ => exec,
@@ -46354,7 +46354,7 @@ mod tests {
         // The cached helper must report exactly "env var is set" — identical
         // truthiness to the original `env::var(...).is_ok()` check.
         use super::dbg_hmput;
-        let expected = std::env::var_os("CRATONVM_DBG_HMPUT").is_some();
+        let expected = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HMPUT").is_some();
         assert_eq!(dbg_hmput(), expected);
         // Cached: second call returns the same value.
         assert_eq!(dbg_hmput(), expected);

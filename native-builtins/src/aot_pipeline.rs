@@ -96,12 +96,12 @@ impl AotPipelineConfig {
 /// because it is not already a workspace dependency; the environment-variable
 /// fallback matches `dirs`' behaviour on Unix and Windows.
 fn dirs_home() -> PathBuf {
-    if let Ok(h) = std::env::var("HOME") {
+    if let Ok(h) = cratonvm_types::flags::runtime_var("HOME") {
         if !h.is_empty() {
             return PathBuf::from(h);
         }
     }
-    if let Ok(u) = std::env::var("USERPROFILE") {
+    if let Ok(u) = cratonvm_types::flags::runtime_var("USERPROFILE") {
         if !u.is_empty() {
             return PathBuf::from(u);
         }
@@ -642,7 +642,7 @@ pub fn startup_load(config: AotPipelineConfig) -> StartupStats {
         let java_home = config
             .java_home_override
             .clone()
-            .unwrap_or_else(|| PathBuf::from(std::env::var("JAVA_HOME").unwrap_or_default()));
+            .unwrap_or_else(|| PathBuf::from(cratonvm_types::flags::runtime_var("JAVA_HOME").unwrap_or_default()));
         let expected = read_jdk_build_id(&java_home);
         if let Some((_, classes)) =
             CdsArchiveWithBuildIdV2::try_load(&path.to_string_lossy(), &expected)
@@ -709,7 +709,7 @@ pub fn shutdown_flush() -> ShutdownStats {
         let java_home = config
             .java_home_override
             .clone()
-            .unwrap_or_else(|| PathBuf::from(std::env::var("JAVA_HOME").unwrap_or_default()));
+            .unwrap_or_else(|| PathBuf::from(cratonvm_types::flags::runtime_var("JAVA_HOME").unwrap_or_default()));
         let build_id = read_jdk_build_id(&java_home);
 
         let mut archive =

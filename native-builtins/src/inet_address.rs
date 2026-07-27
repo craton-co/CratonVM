@@ -354,17 +354,17 @@ fn local_host_name() -> String {
         );
         if rc != 0 {
             // Winsock not initialised — fall back to env-driven discovery.
-            return std::env::var("COMPUTERNAME")
+            return cratonvm_types::flags::runtime_var("COMPUTERNAME")
                 .ok()
-                .or_else(|| std::env::var("HOSTNAME").ok())
+                .or_else(|| cratonvm_types::flags::runtime_var("HOSTNAME").ok())
                 .unwrap_or_else(|| "localhost".to_string());
         }
         let cstr = std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::os::raw::c_char);
         let s = cstr.to_string_lossy().into_owned();
         if s.is_empty() {
-            std::env::var("COMPUTERNAME")
+            cratonvm_types::flags::runtime_var("COMPUTERNAME")
                 .ok()
-                .or_else(|| std::env::var("HOSTNAME").ok())
+                .or_else(|| cratonvm_types::flags::runtime_var("HOSTNAME").ok())
                 .unwrap_or_else(|| "localhost".to_string())
         } else {
             s

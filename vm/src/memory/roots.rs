@@ -32,8 +32,8 @@ pub(crate) fn conservative_locals_enabled() -> bool {
     // risk). Opt out even under the gate with `CRATONVM_NO_CONSERVATIVE_LOCALS`.
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let base = *ENABLED.get_or_init(|| {
-        std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_some()
-            && std::env::var_os("CRATONVM_NO_CONSERVATIVE_LOCALS").is_none()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_some()
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_NO_CONSERVATIVE_LOCALS").is_none()
     });
     base && cratonvm_gc::gc_quiescence::is_active()
 }
@@ -688,7 +688,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         // GC. A monotonically growing depth across collections means the JIT
         // `top` is DRIFTING (a push without a paired reload) — which makes the
         // pop-only reload read above the real data and corrupt a home register.
-        if std::env::var_os("CRATONVM_DBG_SHADOW_DEPTH").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW_DEPTH").is_some() {
             let d = thread.shadow_stack.depth();
             if d > 0 {
                 eprintln!(

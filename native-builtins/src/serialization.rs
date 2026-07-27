@@ -4343,9 +4343,9 @@ fn process_serial_filter() -> &'static Mutex<Option<SerialFilter>> {
         // Honour the `jdk.serialFilter` system property if present at
         // first access. The real JDK also reads `conf/security/java.security`
         // — out of scope here.
-        let default = std::env::var("jdk.serialFilter")
+        let default = cratonvm_types::flags::runtime_var("jdk.serialFilter")
             .ok()
-            .or_else(|| std::env::var("JDK_SERIAL_FILTER").ok())
+            .or_else(|| cratonvm_types::flags::runtime_var("JDK_SERIAL_FILTER").ok())
             .filter(|s| !s.is_empty())
             .map(|s| SerialFilter::parse(&s));
         Mutex::new(default)

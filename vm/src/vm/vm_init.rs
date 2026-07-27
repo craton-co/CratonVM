@@ -177,7 +177,7 @@ fn canonical_os_version() -> String {
 #[cfg(target_os = "windows")]
 fn windows_build_number() -> Option<u32> {
     // Tests can override via env to validate the threshold logic.
-    if let Ok(override_str) = std::env::var("CRATONVM_FORCE_WIN_BUILD") {
+    if let Ok(override_str) = cratonvm_types::flags::runtime_var("CRATONVM_FORCE_WIN_BUILD") {
         if let Ok(n) = override_str.parse::<u32>() {
             return Some(n);
         }
@@ -198,8 +198,8 @@ fn windows_build_number() -> Option<u32> {
 /// `en_US.UTF-8`.  Windows has no direct env equivalent; we default to
 /// `en`/`US` if the env-var approach fails.
 fn derive_locale() -> (String, String) {
-    let raw = std::env::var("LC_ALL")
-        .or_else(|_| std::env::var("LANG"))
+    let raw = cratonvm_types::flags::runtime_var("LC_ALL")
+        .or_else(|_| cratonvm_types::flags::runtime_var("LANG"))
         .unwrap_or_default();
     // Strip `.<encoding>` suffix and any `@<variant>`.
     let base = raw
@@ -925,7 +925,7 @@ impl SharedVm {
         // narrow slots; G1/ZGC keep full 64-bit references.
         let want_compressed_oops = config.use_compressed_oops
             || matches!(
-                std::env::var("CRATONVM_COMPRESSED_OOPS").as_deref(),
+                cratonvm_types::flags::runtime_var("CRATONVM_COMPRESSED_OOPS").as_deref(),
                 Ok("1") | Ok("true")
             );
         if want_compressed_oops {
@@ -2258,7 +2258,7 @@ impl SharedVm {
         // one-flag opt-in for real concurrent CDI. Otherwise (synthetic pool,
         // the default) seed NONE so Weld deploys single-threaded instead of
         // hanging on `ForkJoinPool.commonPool().invokeAll`.
-        if std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_none() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_none() {
             sys_props.insert(
                 "org.jboss.weld.executor.threadPoolType".to_string(),
                 "NONE".to_string(),
@@ -2297,8 +2297,8 @@ impl SharedVm {
         } else {
             sys_props.insert("user.dir".to_string(), ".".to_string());
         }
-        let user_home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
+        let user_home = cratonvm_types::flags::runtime_var("HOME")
+            .or_else(|_| cratonvm_types::flags::runtime_var("USERPROFILE"))
             .unwrap_or_else(|_| {
                 if cfg!(windows) {
                     "C:\\".to_string()
@@ -2309,8 +2309,8 @@ impl SharedVm {
         sys_props.insert("user.home".to_string(), user_home);
         sys_props.insert(
             "user.name".to_string(),
-            std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
+            cratonvm_types::flags::runtime_var("USER")
+                .or_else(|_| cratonvm_types::flags::runtime_var("USERNAME"))
                 .unwrap_or_else(|_| "unknown".to_string()),
         );
         sys_props.insert(
@@ -2328,7 +2328,7 @@ impl SharedVm {
         // the key is at least present.
         sys_props.insert(
             "user.timezone".to_string(),
-            std::env::var("TZ").unwrap_or_default(),
+            cratonvm_types::flags::runtime_var("TZ").unwrap_or_default(),
         );
 
         // ---- Tier 3: env/config-derived keys ----
@@ -2366,7 +2366,7 @@ impl SharedVm {
             // default classpath (notably H2's dynamic CREATE ALIAS compiler).
             crate::classloading::ClassPath::expand_classpath_entries(&config.classpath).join(sep)
         } else {
-            std::env::var("CLASSPATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("CLASSPATH").unwrap_or_default()
         };
         sys_props.insert("java.class.path".to_string(), class_path_val);
 
@@ -2374,11 +2374,11 @@ impl SharedVm {
         // $LD_LIBRARY_PATH on Linux, $DYLD_LIBRARY_PATH on macOS. Always
         // prefix with <java.home>/lib so native-lib lookup still works.
         let lib_path_env = if cfg!(windows) {
-            std::env::var("PATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("PATH").unwrap_or_default()
         } else if cfg!(target_os = "macos") {
-            std::env::var("DYLD_LIBRARY_PATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("DYLD_LIBRARY_PATH").unwrap_or_default()
         } else {
-            std::env::var("LD_LIBRARY_PATH").unwrap_or_default()
+            cratonvm_types::flags::runtime_var("LD_LIBRARY_PATH").unwrap_or_default()
         };
         let sep = if cfg!(windows) { ";" } else { ":" };
         let lib_path_val = if lib_path_env.is_empty() {

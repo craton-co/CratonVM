@@ -616,7 +616,7 @@ static JIT_CODE_CACHE_CAP_LOGGED: std::sync::atomic::AtomicBool =
 /// read so the env lookup happens at most once.
 pub fn jit_code_cache_cap_bytes() -> usize {
     static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_CODE_CACHE_MAX_MB") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CODE_CACHE_MAX_MB") {
         Ok(s) => match s.trim().parse::<usize>() {
             // `0` is an explicit "disable the cap" sentinel (treated as
             // `usize::MAX` so the at-capacity check is always false).
@@ -888,7 +888,7 @@ pub fn xt_jit_root_scan_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
         !matches!(
-            std::env::var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
+            cratonvm_types::flags::runtime_var("CRATONVM_XT_JIT_ROOT_SCAN").as_deref(),
             Ok("0") | Ok("false") | Ok("off")
         )
     })
@@ -956,7 +956,7 @@ fn jit_name_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, String)>> {
 /// Whether to record JIT method-name ranges (`CRATONVM_DBG_JIT_NAMES`). Cached.
 pub fn jit_names_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_JIT_NAMES").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_NAMES").is_some())
 }
 
 /// deopt-osr: master gate for *real* deopt-exit / OSR-exit resume
@@ -976,7 +976,7 @@ pub fn jit_names_enabled() -> bool {
 /// so OSR-exit uses the safe reject path.
 pub fn deopt_real_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_DEOPT_REAL") {
+    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_DEOPT_REAL") {
         // Explicit opt-out values disable; any other value (and unset) → ON.
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
@@ -996,7 +996,7 @@ pub fn deopt_real_enabled() -> bool {
 /// passed `sr_map = None` ⇒ byte-identical to the prior producer.
 pub fn scalar_deopt_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SCALAR_DEOPT").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SCALAR_DEOPT").is_some())
 }
 
 /// deopt-osr: CI/test gate for the eager-deopt differential verifier
@@ -1006,7 +1006,7 @@ pub fn scalar_deopt_enabled() -> bool {
 /// mandatory check before any guard/loop family is flipped onto `deopt_real`.
 pub fn deopt_verify_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_VERIFY").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DEOPT_VERIFY").is_some())
 }
 
 /// deopt-osr: the through-JIT BCE-deopt differential trigger (`CRATONVM_DEOPT_EAGER`,
@@ -1022,7 +1022,7 @@ pub fn deopt_verify_enabled() -> bool {
 /// byte-identical production code.
 pub fn deopt_eager_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DEOPT_EAGER").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DEOPT_EAGER").is_some())
 }
 
 /// Phase B (real-frame-deopt x64 backport) e2e trigger: `CRATONVM_DEOPT_EAGER_BCI=<n>`
@@ -1036,7 +1036,7 @@ pub fn deopt_eager_enabled() -> bool {
 pub fn deopt_eager_bci_override() -> Option<usize> {
     static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("CRATONVM_DEOPT_EAGER_BCI")
+        cratonvm_types::flags::runtime_var("CRATONVM_DEOPT_EAGER_BCI")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
     })
@@ -1051,7 +1051,7 @@ pub fn deopt_eager_bci_override() -> Option<usize> {
 /// emitted ⇒ byte-identical code (the production path).
 pub fn osr_exit_test_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_OSR_EXIT_TEST").is_some())
+    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_OSR_EXIT_TEST").is_some())
 }
 
 /// deopt-osr Step 8 follow-up (P4): `CRATONVM_OSR_EXIT_AFTER=N` (default-OFF,
@@ -1071,7 +1071,7 @@ pub fn osr_exit_test_enabled() -> bool {
 pub fn osr_exit_after() -> Option<usize> {
     static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
-        std::env::var("CRATONVM_OSR_EXIT_AFTER")
+        cratonvm_types::flags::runtime_var("CRATONVM_OSR_EXIT_AFTER")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -3886,7 +3886,7 @@ pub fn try_resolve_intrinsic(
     //   * Long.reverse is intentionally NOT registered: it has no single-
     //     instruction lowering and the multi-mask SWAR sequence is omitted in
     //     favour of safe fallback to normal dispatch (roadmap §3.4).
-    if class == "java/lang/Long" && std::env::var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_none() {
+    if class == "java/lang/Long" && cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_none() {
         let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("bitCount", "(J)I") if x64::has_popcnt() => {
                 Some((JitIntrinsic::LongBitCount, 1, b'I'))
@@ -6131,7 +6131,7 @@ fn jit_deny_filter() -> Option<&'static Vec<String>> {
     static CACHE: OnceLock<Option<Vec<String>>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let v = std::env::var("CRATONVM_JIT_DENY").ok()?;
+            let v = cratonvm_types::flags::runtime_var("CRATONVM_JIT_DENY").ok()?;
             if v.is_empty() {
                 return None;
             }
@@ -6144,7 +6144,7 @@ fn jit_allow_packages_filter() -> &'static Vec<String> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Vec<String>> = OnceLock::new();
     CACHE.get_or_init(|| {
-        std::env::var("CRATONVM_JIT_ALLOW_PACKAGES")
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_ALLOW_PACKAGES")
             .ok()
             .map(|s| {
                 s.split(',')
@@ -6436,14 +6436,14 @@ pub fn ir_direct_calls_enabled() -> bool {
     if !direct_jit_callee_calls_enabled() {
         return false;
     }
-    match std::env::var("CRATONVM_JIT_IR_DIRECT_CALL") {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_DIRECT_CALL") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     }
 }
 
 pub fn direct_jit_callee_calls_enabled() -> bool {
-    match std::env::var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
     }
@@ -6867,7 +6867,7 @@ pub fn try_compile_with_invokespecial_resolver(
             &cached.method_descriptor,
         );
     }
-    if result.is_none() && std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+    if result.is_none() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
             "[cratonvm-jitc] compile-bail {}.{}{} backend_attempted={}",
             cached.class_name, cached.method_name, cached.method_descriptor, backend_attempted
@@ -6876,7 +6876,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // DBG (env-gated): dump the emitted machine code for a specific method so
     // its prologue/epilogue + body can be disassembled offline. Set
     // CRATONVM_DBG_DUMP_JIT="Class.method" (slash-separated class) to target.
-    if let Ok(target) = std::env::var("CRATONVM_DBG_DUMP_JIT") {
+    if let Ok(target) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_DUMP_JIT") {
         if let Some(ref cm) = result {
             let sig = format!("{}.{}", cached.class_name, cached.method_name);
             // LIST mode: print every compiled method's sig (reveals exact
@@ -6912,7 +6912,7 @@ pub fn try_compile_with_invokespecial_resolver(
     // crashing dup_x1 method (NO_DUP_X1 removes the Groovy SIGSEGV) can be pinned
     // and dumped. Proper opcode walk via scev::bytecode_len so operand bytes that
     // happen to equal 0x5A are not mistaken for the opcode.
-    if result.is_some() && std::env::var_os("CRATONVM_DBG_DUPX_METHODS").is_some() {
+    if result.is_some() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPX_METHODS").is_some() {
         let code: &[u8] = &cached.code;
         let n = code.len();
         let mut pc = 0usize;
@@ -7002,7 +7002,7 @@ fn local_handler_reads_unsafe_local(
     } else {
         (1u64 << param_slot_count) - 1
     };
-    let dbg = std::env::var_os("CRATONVM_DBG_RBC6").is_some();
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some();
     for entry in exception_table {
         let handler_pc = entry.handler_pc as usize;
         let unsafe_found =
@@ -7174,7 +7174,7 @@ fn try_compile_inner(
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
-            if std::env::var_os("CRATONVM_DBG_RBC6").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some() {
                 eprintln!(
                     "[rbc6-dbg] try_compile_inner: jit_scan returned None for {}.{}{}",
                     cached.class_name, cached.method_name, cached.method_descriptor
@@ -7275,7 +7275,7 @@ fn try_compile_inner(
             &cached.method_descriptor,
             cached.is_static,
         );
-        if std::env::var_os("CRATONVM_DBG_RBC6").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some() {
             eprintln!(
                 "[rbc6-dbg] try_compile_inner: local_handler_reads_unsafe_local={} for {}.{}{}",
                 unsafe_local, cached.class_name, cached.method_name, cached.method_descriptor
@@ -7765,7 +7765,7 @@ fn try_compile_inner(
                         info_map.insert(pc, (info_ptr, num_args, ret));
                     }
                     if all_emittable && !info_map.is_empty() {
-                        if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
                             eprintln!(
                                 "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s), {} bound as DIRECT calls",
                                 cached.class_name,
@@ -7808,7 +7808,7 @@ fn try_compile_inner(
         // `tiered::MAX_C2_COMPILE_TIME_MS`, which catches whatever slips past.
         let built = match built {
             Some(g) if g.nodes.len() > ir::IR_MAX_GRAPH_NODES => {
-                if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_CALL").is_some() {
                     eprintln!(
                         "[cratonvm-ircall] {}.{}{}: IR graph {} nodes > IR_MAX_GRAPH_NODES {} — single-pass",
                         cached.class_name,
@@ -7829,7 +7829,7 @@ fn try_compile_inner(
         // silently disabled scalar-new on ALL real javac allocations, surfaced).
         if built.is_none()
             && !scan.new_ops.is_empty()
-            && std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some()
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some()
         {
             eprintln!(
                 "[cratonvm-scalarnew] IR builder bailed (single-pass) for allocation method {}.{}{}",
@@ -7884,7 +7884,7 @@ fn try_compile_inner(
                     // `scalar_replaceable < ir_news` means some `new` escaped and
                     // the method will bail to single-pass via the surviving-New
                     // gate below.
-                    if std::env::var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_NEW").is_some() {
                         let ir_news = graph
                             .nodes
                             .iter()
@@ -8022,7 +8022,7 @@ fn try_compile_inner(
                         // took the IR path at runtime (single-pass also compiles
                         // longs, so a live "== HotSpot" probe alone is vacuous).
                         if ir_emit_long
-                            && std::env::var_os("CRATONVM_DBG_IR_LONG").is_some()
+                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LONG").is_some()
                             && method_uses_category2(code, code_len, &cached.method_descriptor)
                         {
                             eprintln!(
@@ -9027,7 +9027,7 @@ fn try_compile_inner(
     compiled._direct_callee_entries = direct_callee_entries;
     compiled.inlined_methods = inlined_methods;
 
-    if let Ok(want) = std::env::var("CRATONVM_DBG_JIT_CODE") {
+    if let Ok(want) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_CODE") {
         let full = format!(
             "{}.{}{}",
             cached.class_name, cached.method_name, cached.method_descriptor
@@ -9596,7 +9596,7 @@ fn selfrec_direct_enabled() -> bool {
     if let Some(v) = SELFREC_DIRECT_TEST_OVERRIDE.with(|c| c.get()) {
         return v;
     }
-    match std::env::var("CRATONVM_JIT_IR_SELFREC_DIRECT") {
+    match cratonvm_types::flags::runtime_var("CRATONVM_JIT_IR_SELFREC_DIRECT") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off"

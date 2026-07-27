@@ -12579,7 +12579,7 @@ fn compute_field_layout(
 }
 
 fn field_trace_enabled() -> bool {
-    std::env::var("CRATON_FIELD_TRACE").is_ok()
+    cratonvm_types::flags::runtime_var("CRATON_FIELD_TRACE").is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -13801,7 +13801,7 @@ mod tests {
     fn find_jmods_dir() -> Option<std::path::PathBuf> {
         use std::path::PathBuf;
         // JAVA_HOME
-        if let Ok(val) = std::env::var("JAVA_HOME") {
+        if let Ok(val) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
             let p = PathBuf::from(&val).join("jmods");
             if p.is_dir() {
                 return Some(p);

@@ -144,8 +144,8 @@ fn read_settings(ctx: &dyn NativeContext) -> ProxySettings {
     // duplicate `or_else` arms halves the `getenv` traffic. Semantics are
     // unchanged: same keys, same lowercase-wins precedence.
     let env_get = |lower: &'static str, upper: &'static str| -> Option<String> {
-        std::env::var(lower)
-            .or_else(|_| std::env::var(upper))
+        cratonvm_types::flags::runtime_var(lower)
+            .or_else(|_| cratonvm_types::flags::runtime_var(upper))
             .ok()
             .filter(|s| !s.is_empty())
     };
@@ -736,7 +736,7 @@ mod tests {
         ];
         let _guard = env_test_lock();
         let saved: Vec<(&str, Option<String>)> =
-            KEYS.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            KEYS.iter().map(|k| (*k, cratonvm_types::flags::runtime_var(k).ok())).collect();
         for key in KEYS {
             std::env::remove_var(key);
         }

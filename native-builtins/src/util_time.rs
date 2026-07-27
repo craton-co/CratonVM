@@ -5098,7 +5098,7 @@ fn os_default_zone_id() -> String {
     // `TZ` env var is the POSIX convention — the user can override
     // the platform default with it, and if it's present we honor it
     // verbatim. Empty values are ignored.
-    if let Ok(tz) = std::env::var("TZ") {
+    if let Ok(tz) = cratonvm_types::flags::runtime_var("TZ") {
         if !tz.is_empty() {
             return tz;
         }

@@ -55,8 +55,8 @@
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -124,6 +124,16 @@ impl MapSource {
         for (name, value) in std::env::vars_os() {
             if let Ok(name) = name.into_string() {
                 map.entry(name).or_insert(value);
+            }
+        }
+        Self(map)
+    }
+
+    fn declared_snapshot(src: &dyn FlagSource) -> Self {
+        let mut map = HashMap::new();
+        for &name in declared_flag_names() {
+            if let Some(value) = src.get(name) {
+                map.insert(name.to_string(), value);
             }
         }
         Self(map)
@@ -1674,6 +1684,10 @@ pub struct VmFlags {
     pub io: IoFlags,
     /// Flags read only by `native-builtins`.
     pub natives: NativeFlags,
+    /// Resolved legacy values retained for configuration consumers that have
+    /// not yet been converted to a typed field. Private so new code cannot
+    /// widen the public configuration surface.
+    legacy_values: MapSource,
 }
 
 impl VmFlags {
@@ -1687,7 +1701,12 @@ impl VmFlags {
             loader: LoaderFlags::from_source(src),
             io: IoFlags::from_source(src),
             natives: NativeFlags::from_source(src),
+            legacy_values: MapSource::declared_snapshot(src),
         }
+    }
+
+    fn legacy_var_os(&self, name: &str) -> Option<OsString> {
+        self.legacy_values.get(name)
     }
 
     /// Build from the process environment.
@@ -1707,6 +1726,29 @@ impl VmFlags {
 
 static FLAGS: OnceLock<VmFlags> = OnceLock::new();
 
+fn declared_flag_names() -> &'static HashSet<&'static str> {
+    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = HashSet::new();
+        for entry in crate::flag_groups::INVENTORY {
+            if let Some(name) = entry.on_key {
+                names.insert(name);
+            }
+            if let Some(name) = entry.off_key {
+                names.insert(name);
+            }
+        }
+        names.extend(crate::flag_groups::SCALARS.iter().copied());
+        names.extend(
+            crate::flag_groups::Group::ALL
+                .iter()
+                .copied()
+                .map(crate::flag_groups::Group::var),
+        );
+        names
+    })
+}
+
 /// The process-wide configuration.
 ///
 /// Initialised from the environment on first call. See the module docs for the
@@ -1714,6 +1756,37 @@ static FLAGS: OnceLock<VmFlags> = OnceLock::new();
 #[inline]
 pub fn flags() -> &'static VmFlags {
     FLAGS.get_or_init(VmFlags::from_env)
+}
+
+/// Read an environment value through the runtime configuration boundary.
+///
+/// Declared CratonVM flags come from the one immutable [`VmFlags`] snapshot.
+/// Ordinary process variables (`HOME`, `TZ`, application `System.getenv`
+/// names, and so on) retain `std::env`'s live-read semantics.
+#[inline]
+pub fn runtime_var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError> {
+    let key = key.as_ref();
+    if let Some(name) = key.to_str() {
+        if declared_flag_names().contains(name) {
+            return match flags().legacy_var_os(name) {
+                Some(value) => value.into_string().map_err(std::env::VarError::NotUnicode),
+                None => Err(std::env::VarError::NotPresent),
+            };
+        }
+    }
+    std::env::var(key)
+}
+
+/// OS-native sibling of [`runtime_var`].
+#[inline]
+pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
+    let key = key.as_ref();
+    if let Some(name) = key.to_str() {
+        if declared_flag_names().contains(name) {
+            return flags().legacy_var_os(name);
+        }
+    }
+    std::env::var_os(key)
 }
 
 /// Publish an explicitly-built configuration.
@@ -1737,6 +1810,23 @@ mod tests {
 
     fn src(pairs: &[(&str, &str)]) -> MapSource {
         MapSource::new(pairs.iter().copied())
+    }
+
+    #[test]
+    fn vm_flags_retain_resolved_legacy_values_for_boundary_reads() {
+        let f = VmFlags::from_source(&src(&[("CRATONVM_DBG_DEOPT", "enabled")]));
+        assert_eq!(
+            f.legacy_var_os("CRATONVM_DBG_DEOPT"),
+            Some(OsString::from("enabled"))
+        );
+        assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
+    }
+
+    #[test]
+    fn undeclared_process_values_keep_live_standard_environment_semantics() {
+        let key = if cfg!(windows) { "PATH" } else { "HOME" };
+        assert_eq!(runtime_var_os(key), std::env::var_os(key));
+        assert_eq!(runtime_var(key), std::env::var(key));
     }
 
     #[test]

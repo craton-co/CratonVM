@@ -1419,8 +1419,8 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
     let loc = "java/util/Locale";
     r.register(loc, "getDefault", "()Ljava/util/Locale;", |ctx, _args| {
         // Read LANG or LC_ALL from environment
-        let lang_env = std::env::var("LANG")
-            .or_else(|_| std::env::var("LC_ALL"))
+        let lang_env = cratonvm_types::flags::runtime_var("LANG")
+            .or_else(|_| cratonvm_types::flags::runtime_var("LC_ALL"))
             .unwrap_or_else(|_| "en_US.UTF-8".to_string());
         // Parse: "en_US.UTF-8" -> language=en, country=US
         let base = lang_env.split('.').next().unwrap_or("en_US");

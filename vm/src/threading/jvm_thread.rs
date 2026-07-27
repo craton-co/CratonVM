@@ -168,7 +168,7 @@ pub struct ParkState {
 fn parklat_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_PARKLAT").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_PARKLAT").is_some())
 }
 
 /// Monotonic nanos for the PARKLAT diagnostic (process-relative).
@@ -614,7 +614,7 @@ impl JvmThread {
     #[inline]
     pub fn vm_state_diagnostics_enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_VM_STATE").is_some())
+        *ENABLED.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VM_STATE").is_some())
     }
 
     /// Publish a short diagnostic state for STW census. No-op unless enabled.

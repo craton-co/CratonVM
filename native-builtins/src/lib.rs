@@ -63,12 +63,12 @@ fn jboss_home_from_class_path(class_path: &str) -> Option<String> {
 }
 
 fn jboss_home_dir_fallback() -> Option<String> {
-    if let Ok(home) = std::env::var("JBOSS_HOME") {
+    if let Ok(home) = cratonvm_types::flags::runtime_var("JBOSS_HOME") {
         if !home.is_empty() {
             return Some(home);
         }
     }
-    std::env::var("CRATONVM_JBOSS_MP_ROOT")
+    cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT")
         .ok()
         .and_then(|mp_root| jboss_home_from_modules_dir(std::path::Path::new(&mp_root)))
         .or_else(|| {
@@ -2377,8 +2377,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_jboss_home_env() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::set_var("JBOSS_HOME", "/opt/wildfly");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
 
@@ -2400,8 +2400,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_module_path_property() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::remove_var("JBOSS_HOME");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
 
@@ -2425,8 +2425,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_java_class_path_property() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         std::env::remove_var("JBOSS_HOME");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
 
@@ -2450,8 +2450,8 @@ mod bootstrap_property_fallback_tests {
     #[test]
     fn jboss_home_dir_falls_back_to_wildfly_current_dir() {
         let _guard = env_lock();
-        let old_home = std::env::var("JBOSS_HOME").ok();
-        let old_mp = std::env::var("CRATONVM_JBOSS_MP_ROOT").ok();
+        let old_home = cratonvm_types::flags::runtime_var("JBOSS_HOME").ok();
+        let old_mp = cratonvm_types::flags::runtime_var("CRATONVM_JBOSS_MP_ROOT").ok();
         let old_cwd = std::env::current_dir().unwrap();
         std::env::remove_var("JBOSS_HOME");
         std::env::remove_var("CRATONVM_JBOSS_MP_ROOT");
@@ -10573,7 +10573,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // System.getenv — needed in both synthetic and real-JDK modes because
     // the real JDK bytecode for getenv() calls ProcessEnvironment which
     // requires native interop we don't support. Our native override
-    // delegates directly to std::env::var.
+    // delegates directly to cratonvm_types::flags::runtime_var.
     registry.register(
         "java/lang/System",
         "getenv",
@@ -22940,7 +22940,7 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 /// Cached `CRATONVM_DBG_VDISP` check for `native_object_hash_code` --
 /// `Object.hashCode()`'s native is one of the hottest paths in the entire
 /// VM (every `HashMap`/`HashSet` operation on a default-hashCode key calls
-/// it), so a raw `std::env::var_os(...)` here -- a global-lock-guarded
+/// it), so a raw `cratonvm_types::flags::runtime_var_os(...)` here -- a global-lock-guarded
 /// syscall -- on every single call is a severe, silently-pervasive
 /// performance bug: any hashCode()-heavy workload (Hibernate Validator's
 /// reflective constraint-metadata caching was the one that surfaced it,
@@ -31574,13 +31574,13 @@ pub(crate) fn resolve_real_hostname() -> String {
 /// The uncached probe behind [`resolve_real_hostname`]. Split out so the
 /// resolution order stays directly testable without the `OnceLock` latch.
 pub(crate) fn resolve_real_hostname_uncached() -> String {
-    if let Ok(name) = std::env::var("HOSTNAME") {
+    if let Ok(name) = cratonvm_types::flags::runtime_var("HOSTNAME") {
         let trimmed = name.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
     }
-    if let Ok(name) = std::env::var("COMPUTERNAME") {
+    if let Ok(name) = cratonvm_types::flags::runtime_var("COMPUTERNAME") {
         let trimmed = name.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
@@ -38776,7 +38776,7 @@ pub(crate) fn vmflags() -> &'static cratonvm_types::flags::VmFlags {
 
 /// The `native-builtins`-only slice of the typed configuration.
 ///
-/// Replaces ~360 direct `std::env::var`/`var_os` probes. A field read here is
+/// Replaces ~360 direct `cratonvm_types::flags::runtime_var`/`var_os` probes. A field read here is
 /// one relaxed-acquire load of an already-initialised `OnceLock` plus a load
 /// from a static — cheaper than the per-flag `OnceLock<bool>` helpers it
 /// subsumes, and *far* cheaper than `getenv`, which takes the process environ

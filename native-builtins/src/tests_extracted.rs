@@ -5318,7 +5318,7 @@ fn register_s4_misc(r: &mut NativeMethodRegistry) {
 #[inline]
 fn baos_dbg_enabled() -> bool {
     static DBG: OnceLock<bool> = OnceLock::new();
-    *DBG.get_or_init(|| std::env::var_os("CRATON_BAOS_DBG").is_some())
+    *DBG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATON_BAOS_DBG").is_some())
 }
 
 #[cfg(test)]
@@ -5328,7 +5328,7 @@ mod baos_dbg_flag_tests {
         // `ByteArrayOutputStream.write(int)` used to probe `env::var_os` per
         // byte. The latched helper must (a) agree with the environment as it
         // stood at first use and (b) never change answer afterwards.
-        let expected = std::env::var_os("CRATON_BAOS_DBG").is_some();
+        let expected = cratonvm_types::flags::runtime_var_os("CRATON_BAOS_DBG").is_some();
         assert_eq!(super::baos_dbg_enabled(), expected);
         assert_eq!(super::baos_dbg_enabled(), expected, "flag must be stable");
     }
@@ -5337,7 +5337,7 @@ mod baos_dbg_flag_tests {
     fn baos_dbg_flag_is_off_in_a_clean_environment() {
         // Guards against the debug `eprintln!` ever becoming default-on: with
         // the switch unset the write path must take the quiet branch.
-        if std::env::var_os("CRATON_BAOS_DBG").is_none() {
+        if cratonvm_types::flags::runtime_var_os("CRATON_BAOS_DBG").is_none() {
             assert!(!super::baos_dbg_enabled());
         }
     }

@@ -24,7 +24,7 @@ use crate::native_id::{NativeMethodId, NativeMethodKey};
 fn real_net_sockets_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
 }
 
 /// REAL-FORKJOINPOOL (opt-in `CRATONVM_REAL_FORKJOINPOOL`): when set, the
@@ -53,7 +53,7 @@ fn real_net_sockets_enabled() -> bool {
 fn real_forkjoinpool_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
 }
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -4024,7 +4024,7 @@ impl NativeMethodRegistry {
             // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
             // value) enables strict mode: synthetic-stub registrations are
             // dropped so calls hit real bytecode or a clear error.
-            drop_synthetic_stubs: std::env::var_os("CRATONVM_NO_STUBS")
+            drop_synthetic_stubs: cratonvm_types::flags::runtime_var_os("CRATONVM_NO_STUBS")
                 .is_some_and(|v| !v.is_empty()),
             drop_real_layout_synthetic: false,
             // PERF: deferred native-ring name index. Sized like the other boot
@@ -4126,7 +4126,7 @@ impl NativeMethodRegistry {
             // category at one of its call sites — this made the drop visible
             // in seconds instead of a multi-round bisection. Cheap/no-op when
             // unset; kept as a permanent diagnostic for the next occurrence.
-            if std::env::var_os("CRATONVM_DBG_DROPPED_STUBS").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DROPPED_STUBS").is_some() {
                 eprintln!("[DROPPED-STUB] {class_name}.{method_name}{descriptor}");
             }
             return;

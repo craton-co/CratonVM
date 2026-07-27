@@ -604,7 +604,7 @@ impl Default for VmConfig {
             // carrier) — those ceilings remain the actual backstop on smaller
             // stacks and will trip first there, so raising this default adds
             // no new crash risk.
-            max_stack_depth: std::env::var("RJ_MAX_STACK_DEPTH")
+            max_stack_depth: cratonvm_types::flags::runtime_var("RJ_MAX_STACK_DEPTH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .filter(|n| *n >= 64 && *n <= 65536)
@@ -1149,7 +1149,7 @@ pub fn detect_real_jdk_from(explicit: Option<&str>) -> Option<PathBuf> {
 /// so the operator can see *why* the probe failed rather than guessing.
 pub fn describe_jdk_search(explicit: Option<&str>) -> String {
     fn env_line(key: &str) -> String {
-        match std::env::var(key) {
+        match cratonvm_types::flags::runtime_var(key) {
             Ok(v) if !v.trim().is_empty() => {
                 let p = Path::new(v.trim());
                 if p.is_dir() {
@@ -1286,7 +1286,7 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
 
     // 2. CRATONVM_JAVA_HOME — used when JAVA_HOME points at a cratonvm shim
     // tree (Maven, Gradle) but boot modules must come from a real JDK.
-    if let Ok(val) = std::env::var("CRATONVM_JAVA_HOME") {
+    if let Ok(val) = cratonvm_types::flags::runtime_var("CRATONVM_JAVA_HOME") {
         let p = PathBuf::from(val.trim());
         if p.is_dir() {
             return Some(p);
@@ -1294,7 +1294,7 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
     }
 
     // 3. JAVA_HOME env var
-    if let Ok(val) = std::env::var("JAVA_HOME") {
+    if let Ok(val) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
         let p = PathBuf::from(&val);
         if p.is_dir() {
             return Some(p);
@@ -1316,7 +1316,7 @@ fn resolve_java_home(explicit: Option<&str>) -> Option<PathBuf> {
 ///   - JDK 25+: `-XshowSettings:properties` (plural)
 ///   - Fallback: `-XshowSettings:all`
 fn first_java_executable_on_path() -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
+    let path_var = cratonvm_types::flags::runtime_var_os("PATH")?;
     let exe = if cfg!(windows) { "java.exe" } else { "java" };
     for dir in std::env::split_paths(&path_var) {
         let candidate = Path::new(&dir).join(exe);
@@ -1866,7 +1866,7 @@ mod tests {
     /// Helper: find a real JDK installation on this machine, or return None.
     fn find_local_jdk() -> Option<PathBuf> {
         // Check JAVA_HOME first
-        if let Ok(val) = std::env::var("JAVA_HOME") {
+        if let Ok(val) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
             let p = PathBuf::from(&val);
             if p.join("jmods").is_dir() {
                 return Some(p);
@@ -2025,7 +2025,7 @@ mod tests {
     /// them. We isolate by stashing/restoring and serialising via a
     /// static mutex below.
     fn with_env<R>(key: &str, value: Option<&str>, f: impl FnOnce() -> R) -> R {
-        let prev = std::env::var_os(key);
+        let prev = cratonvm_types::flags::runtime_var_os(key);
         match value {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),

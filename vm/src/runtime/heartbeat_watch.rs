@@ -25,7 +25,7 @@ use std::io::Write;
 use std::time::Duration;
 
 pub fn arm_from_env() {
-    let Ok(v) = std::env::var("CRATONVM_DBG_HEARTBEAT") else {
+    let Ok(v) = cratonvm_types::flags::runtime_var("CRATONVM_DBG_HEARTBEAT") else {
         return;
     };
     let ms = v.trim().parse::<u64>().ok().filter(|m| *m > 0).unwrap_or(100);

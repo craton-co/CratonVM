@@ -69,7 +69,7 @@ use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot
 fn direct_static_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(
-        || match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         },
@@ -85,7 +85,7 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(
-        || match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY") {
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY") {
             Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
             Err(_) => true,
         },
@@ -117,7 +117,7 @@ pub mod mic_prof {
 
     pub fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_MIC_PROF").is_some())
+        *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MIC_PROF").is_some())
     }
 
     #[inline]
@@ -479,7 +479,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
         // abnormal JIT exit (exception/deopt skipping a method epilogue) left
         // unbalanced. Captured after `ensure_allocated` so `top` is valid.
         saved_shadow_top = Some(thread.shadow_stack.top);
-        if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SHADOW").is_some() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
             if !ONCE.swap(true, Ordering::Relaxed) {
@@ -1340,7 +1340,7 @@ struct VirtualDispatchTarget {
 /// the hot dispatch path pays two slice compares + one bool load.
 pub(crate) fn cv_trace_enabled() -> bool {
     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
 }
 
 /// Residual-6 diagnosis: does this invoke-info describe the
@@ -1773,7 +1773,7 @@ unsafe fn try_resume_trapped_callee(
         }
     };
 
-    if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
         eprintln!("[cratonvm-deopt] helper precise-resume of trapped callee {key} at bci={bci}");
     }
 
@@ -2346,14 +2346,14 @@ pub unsafe extern "C" fn jit_post_tlab_init(
 }
 
 /// Cached `CRATONVM_DBG_JIT_ALLOC` class-id filter (`None` = unset or
-/// unparseable). PERF: the previous per-call `std::env::var` in the two
+/// unparseable). PERF: the previous per-call `cratonvm_types::flags::runtime_var` in the two
 /// allocation helpers was ~13% of binarytrees-18 wall time — getenv does a
 /// linear scan of `environ` on every call.
 fn dbg_jit_alloc_filter() -> Option<u32> {
     use std::sync::OnceLock;
     static F: OnceLock<Option<u32>> = OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_JIT_ALLOC")
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_ALLOC")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
     })
@@ -2372,7 +2372,7 @@ fn dbg_tlabmiss(reason: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some()) {
         return;
     }
     static COUNTS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
@@ -4751,7 +4751,7 @@ forwarding_ptr={fwd_ptr:#x}"
 fn aioobe3_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE3").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_AIOOBE3").is_some())
 }
 
 /// RBC.6 — trace exception routing through `route_implicit_exc_through_callee`
@@ -4761,7 +4761,7 @@ fn aioobe3_dbg() -> bool {
 pub(crate) fn rbc6_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_RBC6").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_RBC6").is_some())
 }
 
 /// Direct-throw for `ArithmeticException` ("/ by zero") — the div-by-zero
@@ -8224,7 +8224,7 @@ impl DeoptimizationController {
         };
         let action = vm.record_deoptimization(&method_key, event, &tiered_key);
 
-        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
             eprintln!(
                 "[cratonvm-deopt] {} reason={:?} bci={} action={:?}",
                 method_key, reason, bci, action
@@ -8338,7 +8338,7 @@ impl DeoptimizationController {
                     enqueue_time_ms: now_ms,
                     osr_bci: None,
                 });
-            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] eager re-queue (RecompileAndReinterpret) {}",
                     method_key
@@ -10110,7 +10110,7 @@ pub unsafe extern "C" fn jit_safepoint_slow_path() {
     };
     if let Some((thread, _guard)) = jit_thread_mut() {
         let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if hit <= 16 && std::env::var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some() {
+        if hit <= 16 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some() {
             eprintln!(
                 "[jit-safepoint] cooperative slow-path hit={} thread_id={}",
                 hit, thread.thread_id.0

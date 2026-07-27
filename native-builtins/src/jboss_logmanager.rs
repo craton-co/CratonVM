@@ -100,7 +100,7 @@ fn open_boot_log_path() -> Option<std::fs::File> {
     let path = crate::nbflags()
         .jboss_boot_log_file
         .clone()
-        .or_else(|| std::env::var("org.jboss.boot.log.file").ok());
+        .or_else(|| cratonvm_types::flags::runtime_var("org.jboss.boot.log.file").ok());
     let path = match path {
         Some(p) if !p.is_empty() => p,
         _ => return None,
@@ -122,7 +122,7 @@ fn boot_log_path_from_ctx(ctx: &dyn NativeContext) -> Option<String> {
             return Some(p);
         }
     }
-    if let Ok(p) = std::env::var("org.jboss.boot.log.file") {
+    if let Ok(p) = cratonvm_types::flags::runtime_var("org.jboss.boot.log.file") {
         if !p.is_empty() {
             return Some(p);
         }

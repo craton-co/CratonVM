@@ -268,7 +268,7 @@ impl AotCache {
     /// variable is unset or empty (callers then fall back to a bare SHA-256
     /// content digest).
     fn integrity_key() -> Option<Vec<u8>> {
-        match std::env::var(Self::INTEGRITY_KEY_ENV) {
+        match cratonvm_types::flags::runtime_var(Self::INTEGRITY_KEY_ENV) {
             Ok(k) if !k.is_empty() => Some(k.into_bytes()),
             _ => None,
         }
