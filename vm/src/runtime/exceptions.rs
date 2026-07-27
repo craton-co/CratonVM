@@ -1787,6 +1787,14 @@ pub fn raise_no_class_def_found(
     thread: &mut JvmThread,
     class_name: &str,
 ) -> MethodCallFailed {
+    // `CRATONVM_DBG_LINKAGE_BT=1` -- same hook `linkage_throwable` carries, for
+    // the OTHER way a `NoClassDefFoundError` reaches Java. The Java stack stops
+    // at whatever bytecode triggered resolution; only the Rust backtrace names
+    // the resolver that decided the class was missing.
+    if dbg_linkage_bt() {
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[DBG_LINKAGE_BT] NoClassDefFoundError {class_name}\n{bt}");
+    }
     match create_exception_object(
         shared,
         thread,

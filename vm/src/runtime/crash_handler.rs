@@ -1493,6 +1493,14 @@ pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
 pub fn install_hardware_fault_handler() {
     #[cfg(windows)]
     windows_fault::install();
+    // The Unix equivalent of the Windows vectored exception handler is the
+    // SIGSEGV/SIGBUS/SIGILL `sigaction` set below. It used to be reachable
+    // only from `install_crash_handler`, which `vm-cli` never calls (it
+    // installs its own panic hook) — so on Linux a hardware fault produced no
+    // stderr banner and no `hs_err_pid<pid>.log` at all. Installing signals
+    // here does NOT touch the panic hook, so it composes with that caller.
+    #[cfg(unix)]
+    install_signal_handlers();
 }
 
 /// Install the crash handler (Rust panic hook + platform signal handlers).
@@ -1797,6 +1805,32 @@ pub fn prime_signal_tls() {}
 fn install_signal_handlers() {
     use std::ffi::c_int;
 
+    // Both `install_crash_handler` and `install_hardware_fault_handler` reach
+    // here; installing twice would be harmless but would also re-arm the
+    // handler after a deliberate override, so latch it.
+    static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    // Sampled here, never inside the handler: naming the faulting JIT method
+    // goes through `lookup_jit_method_name`, which allocates a `String`. That
+    // is not async-signal-safe, so it is opt-in via the same env var that
+    // populates the table in the first place.
+    static NAME_JIT_FRAMES: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    // Readability probe for the register dump below: `write(2)` to /dev/null
+    // returns EFAULT for an unmapped buffer instead of faulting.
+    static NULL_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    NULL_FD.store(
+        unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY) },
+        Ordering::SeqCst,
+    );
+    NAME_JIT_FRAMES.store(
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_NAMES").is_some(),
+        Ordering::SeqCst,
+    );
+
     // Signals that indicate a crash.
     const CRASH_SIGNALS: &[c_int] = &[
         libc::SIGSEGV,
@@ -1810,7 +1844,9 @@ fn install_signal_handlers() {
     // as `&'static [u8]` means no allocation is needed to reference them.
     const HDR: &[u8] =
         b"\n#\n# A fatal error has been detected by the CratonVM Runtime Environment:\n#  ";
-    const AT_PC: &[u8] = b" at pc=0x0, pid=";
+    const AT_PC: &[u8] = b" at pc=0x";
+    const ADDR_LBL: &[u8] = b", addr=0x";
+    const PID_LBL: &[u8] = b", pid=";
     const TID_LBL: &[u8] = b", tid=";
     const NL_REPORT: &[u8] = b"\n#  Error report saved to: ";
     const FOOTER: &[u8] = b"\n#\n";
@@ -1837,7 +1873,11 @@ fn install_signal_handlers() {
     // for the rules. Roughly: only libc syscalls, atomics, and stack-local
     // arithmetic are allowed. No allocations, no locks, no formatting
     // machinery, no `std::fs`, no `Backtrace::capture`.
-    extern "C" fn crash_signal_handler(sig: std::ffi::c_int) {
+    extern "C" fn crash_signal_handler(
+        sig: std::ffi::c_int,
+        info: *mut libc::siginfo_t,
+        ucontext: *mut std::ffi::c_void,
+    ) {
         // Re-entry guard. `compare_exchange` on an `AtomicBool` is lock-free
         // and async-signal-safe on every architecture we target.
         if CRASH_IN_PROGRESS
@@ -1855,6 +1895,23 @@ fn install_signal_handlers() {
         let mut pid_buf = [0u8; 20];
         let mut tid_buf = [0u8; 20];
         let mut filename = [0u8; 64];
+        let mut pc_buf = [0u8; 16];
+        let mut addr_buf = [0u8; 16];
+
+        // Faulting PC and address. Both come from the kernel-supplied
+        // `siginfo_t` / `ucontext_t`, so reading them is async-signal-safe
+        // (plain loads from the signal frame). The PC is the single most
+        // useful fact in a JIT crash: an `rip` equal to `si_addr` means an
+        // indirect call jumped to an unmapped/non-executable target, which is
+        // what a stale inline-cache entry looks like.
+        let fault_addr = if info.is_null() {
+            0u64
+        } else {
+            unsafe { (*info).si_addr() as usize as u64 }
+        };
+        let fault_pc = fault_pc_from_ucontext(ucontext);
+        let pc_len = hex_into_buf(&mut pc_buf, fault_pc);
+        let addr_len = hex_into_buf(&mut addr_buf, fault_addr);
 
         let pid = async_signal_safe::CACHED_PID.load(Ordering::Relaxed) as u64;
         let pid_len = itoa_into_buf(&mut pid_buf, pid);
@@ -1885,6 +1942,10 @@ fn install_signal_handlers() {
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, HDR);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, sig_name);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, AT_PC);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &pc_buf[..pc_len]);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, ADDR_LBL);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &addr_buf[..addr_len]);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, PID_LBL);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &pid_buf[..pid_len]);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, TID_LBL);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &tid_buf[..tid_len]);
@@ -1894,6 +1955,60 @@ fn install_signal_handlers() {
         // Write filename without the trailing NUL.
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &filename[..fpos]);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, FOOTER);
+
+        // Indirect-call registers. The JIT's inline MIC/PIC cascade and the
+        // hashed megamorphic stub all fault as `MOV R11,[R10+disp]; CALL R11`,
+        // so R10 names the cache slot and R11 the entry it produced.
+        {
+            let r10 = greg_from_ucontext(ucontext, GREG_R10);
+            let r11 = greg_from_ucontext(ucontext, GREG_R11);
+            let mut rbuf = [0u8; 16];
+            let n = hex_into_buf(&mut rbuf, r10);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  r10=0x");
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            let n = hex_into_buf(&mut rbuf, r11);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" r11=0x");
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+
+            // Dump the first 8 qwords of the slot R10 points at, when readable.
+            let fd = NULL_FD.load(Ordering::Relaxed);
+            if fd >= 0 && r10 != 0 {
+                let ptr = r10 as usize as *const u8;
+                let readable = unsafe {
+                    libc::write(fd, ptr as *const libc::c_void, 64) == 64
+                };
+                if readable {
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  slot[r10]:");
+                    for i in 0..8usize {
+                        let word = unsafe { std::ptr::read_unaligned((ptr as *const u64).add(i)) };
+                        let n = hex_into_buf(&mut rbuf, word);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" 0x");
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                    }
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                } else {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#  slot[r10]: UNREADABLE (the cache slot itself is gone)\n",
+                    );
+                }
+            }
+        }
+
+        // Which compiled body does the faulting PC (and, for an indirect call
+        // that jumped to an unmapped target, the faulting ADDRESS) belong to?
+        // For a stale inline-cache entry those are the same value, and the name
+        // is the callee whose body was retired underneath the cache.
+        if NAME_JIT_FRAMES.load(Ordering::Relaxed) {
+            for (label, addr) in [(b"#  jit pc  : ".as_slice(), fault_pc), (b"#  jit addr: ".as_slice(), fault_addr)] {
+                if let Some(name) = cratonvm_jit::lookup_jit_method_name(addr as usize) {
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, name.as_bytes());
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                }
+            }
+        }
 
         // ── Write a minimal hs_err_pid file via raw open/write/close ──────
         //
@@ -1910,6 +2025,10 @@ fn install_signal_handlers() {
             async_signal_safe::write_all(fd, &pid_buf[..pid_len]);
             async_signal_safe::write_all(fd, b"\n# tid=");
             async_signal_safe::write_all(fd, &tid_buf[..tid_len]);
+            async_signal_safe::write_all(fd, b"\n# pc=0x");
+            async_signal_safe::write_all(fd, &pc_buf[..pc_len]);
+            async_signal_safe::write_all(fd, b"\n# addr=0x");
+            async_signal_safe::write_all(fd, &addr_buf[..addr_len]);
             async_signal_safe::write_all(fd, b"\n# jdk mode: ");
             async_signal_safe::write_all(fd, jdk_mode_bytes());
             async_signal_safe::write_all(
@@ -1927,11 +2046,104 @@ fn install_signal_handlers() {
         }
     }
 
+    // `sigaction` (not `signal`) so the handler receives `siginfo_t` +
+    // `ucontext_t` and can report the faulting address and PC. `SA_ONSTACK`
+    // keeps us usable on the sigaltstack Rust installs per thread, so a
+    // stack-overflow SIGSEGV still reaches the handler instead of double
+    // faulting.
     for &sig in CRASH_SIGNALS {
         unsafe {
-            libc::signal(sig, crash_signal_handler as libc::sighandler_t);
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = crash_signal_handler as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
         }
     }
+}
+
+/// `ucontext_t::uc_mcontext.gregs` indices used by the register dump. Only
+/// meaningful on Linux/x86-64; other platforms report 0.
+#[cfg(unix)]
+const GREG_R10: usize = 0;
+#[cfg(unix)]
+const GREG_R11: usize = 1;
+
+/// One general-purpose register out of the signal frame, selected by the
+/// pseudo-indices above. Plain loads only — async-signal-safe.
+#[cfg(unix)]
+fn greg_from_ucontext(ucontext: *mut std::ffi::c_void, which: usize) -> u64 {
+    if ucontext.is_null() {
+        return 0;
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe {
+        let uc = ucontext as *const libc::ucontext_t;
+        let idx = if which == GREG_R10 {
+            libc::REG_R10
+        } else {
+            libc::REG_R11
+        };
+        (*uc).uc_mcontext.gregs[idx as usize] as u64
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    {
+        let _ = (ucontext, which);
+        0
+    }
+}
+
+/// Faulting instruction pointer out of the signal frame, or 0 where the
+/// platform layout is not known. Plain loads only — async-signal-safe.
+#[cfg(unix)]
+fn fault_pc_from_ucontext(ucontext: *mut std::ffi::c_void) -> u64 {
+    if ucontext.is_null() {
+        return 0;
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe {
+        let uc = ucontext as *const libc::ucontext_t;
+        (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as u64
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    unsafe {
+        let uc = ucontext as *const libc::ucontext_t;
+        (*uc).uc_mcontext.pc
+    }
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    {
+        let _ = ucontext;
+        0
+    }
+}
+
+/// Lower-case hex of `n` into `buf` (no `0x` prefix, no leading zeros).
+/// Allocation-free and branch-simple — safe to call from a signal handler.
+pub fn hex_into_buf(buf: &mut [u8], n: u64) -> usize {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    if buf.is_empty() {
+        return 0;
+    }
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut scratch = [0u8; 16];
+    let mut len = 0usize;
+    let mut v = n;
+    while v > 0 && len < scratch.len() {
+        scratch[len] = DIGITS[(v & 0xf) as usize];
+        v >>= 4;
+        len += 1;
+    }
+    let out_len = core::cmp::min(len, buf.len());
+    for i in 0..out_len {
+        buf[i] = scratch[len - 1 - i];
+    }
+    out_len
 }
 
 // ── Platform helpers ───────────────────────────────────────────────────────
