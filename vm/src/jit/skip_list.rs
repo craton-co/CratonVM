@@ -1321,11 +1321,10 @@ fn should_skip_jit_internal(
         // aggressive-compilation pass: 0 mismatches in every configuration.
         // No longer reproduces on current dev (the original bug's own
         // `System$1.findNative` FFM bridge fix + subsequent JIT correctness
-        // work appears to have already closed it). Note: the broader
-        // `org/elasticsearch/` blanket ban immediately above this one
-        // (`is_elasticsearch_suite_jit_fragile_cluster`) was NOT re-tested --
-        // no Elasticsearch checkout/fixture is available on this host, see
-        // `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`.
+        // work appears to have already closed it). The broader
+        // `org/elasticsearch/` blanket ban that used to sit immediately above
+        // this one was removed 2026-07-27 against the real ES 9.6.0-SNAPSHOT
+        // fixture; see `docs/internal/es-fragile-cluster-confirmed-needed-20260726.md`.
         // `HamcrestProbe.java` is the regression witness for this entry only.
 
         // WILDFLY-CONTROLLER-JIT.1 (2026-07-13): the optimized
