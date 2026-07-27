@@ -36819,6 +36819,86 @@ fn chm_seg_get(
     Ok(None)
 }
 
+/// Allocation-free String-key fast path for `ConcurrentHashMap.get`, the direct
+/// analogue of [`native_hashmap_get_string_fast`] on the HashMap side.
+///
+/// String hashing and equality are *final, pure* operations: they run no Java
+/// code and therefore cannot trigger a collection. That removes the reason for
+/// nearly everything the general [`chm_seg_get`] path pays per lookup — the
+/// receiver/key pinning, a second `map_hash_key`, and above all the
+/// snapshot-the-entire-chain-into-two-heap-allocated-`Vec`s dance, which exists
+/// only so a *user-defined* `equals` cannot observe a half-relinked chain or
+/// re-enter a resize and self-deadlock on the stripe lock. With no user code in
+/// play the chain can simply be walked in place under the read lock, exactly
+/// like a JDK lock-free `get`.
+///
+/// `native_chm_get` measured 6920 cycles/call without this path — 6x the
+/// equivalent HashMap lookup — which is what made `CharsetCache.getCharset` (a
+/// `ConcurrentMap<String,Charset>` probe) lose to the *uncached*
+/// `Charset.forName` baseline in `TestCharsetCachePerformance`.
+///
+/// Returns `None` — meaning "fall through to the general path, unchanged" —
+/// whenever anything is not a plain `java.lang.String`: a non-String lookup
+/// key, or a chain containing any non-String key. Mixed-key maps and every
+/// exotic key type (enums, Thread mirrors, user-defined `equals`) therefore run
+/// exactly the code they ran before.
+fn native_chm_get_string_fast(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: ObjectRef,
+) -> Option<Value> {
+    let raw_hash = ctx.java_string_hash_code(key)?;
+    // Same spreading `map_hash_key` applies — this must agree with whatever
+    // bucket `put` chose.
+    let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
+    let seg = chm_segment_for(ctx, this, hash)?;
+    // The same stripe read lock the general path takes, for the same reason:
+    // serialize against `map_resize_concurrent`'s in-place NEXT relinking.
+    let seg_id = ctx.identity_hash_code(seg);
+    let _read_guard = chm_seg_lock_for(seg_id).read();
+    let buckets = match ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS) {
+        Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
+        _ => return Some(Value::Object(None)),
+    };
+    let cap = ctx.array_length(buckets) as i32;
+    if cap <= 0 {
+        return Some(Value::Object(None));
+    }
+    let mut node_value = ctx.get_array_element(buckets, map_bucket_index(hash, cap));
+    const CHAIN_WALK_LIMIT: usize = 4096;
+    for _ in 0..CHAIN_WALK_LIMIT {
+        let Value::Object(Some(node)) = node_value else {
+            return Some(Value::Object(None));
+        };
+        let Value::Object(Some(node_key)) = get_node_key(ctx, node) else {
+            // CHM rejects null keys, so this is an unexpected node shape —
+            // defer to the general path rather than guessing.
+            return None;
+        };
+        match ctx.java_strings_equal(node_key, key) {
+            Some(true) => {
+                let value = get_node_value(ctx, node);
+                // An in-flight `computeIfAbsent` parks the segment object
+                // itself in the value slot as a reservation marker; lock-free
+                // readers must read that as absent, exactly as `chm_seg_get`
+                // does (CHM-mapper-deadlock fix, 2026-07-21).
+                if let Value::Object(Some(v)) = value {
+                    if std::ptr::eq(v.as_ptr(), seg.as_ptr()) {
+                        return Some(Value::Object(None));
+                    }
+                }
+                return Some(value);
+            }
+            Some(false) => {}
+            // A non-String key on the chain — hand the whole lookup back so
+            // the general path's full equality ladder decides.
+            None => return None,
+        }
+        node_value = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
+    }
+    None
+}
+
 pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -36826,6 +36906,11 @@ pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     chm_reject_null_key(&key)?;
+    if let Value::Object(Some(key_object)) = key {
+        if let Some(value) = native_chm_get_string_fast(ctx, this, key_object) {
+            return Ok(Some(value));
+        }
+    }
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let key = read_pinned_elem(ctx, key_pin, key);
