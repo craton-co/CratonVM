@@ -3295,6 +3295,15 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Object(None))),
     };
     let mut elems = al_or_collection_elements(ctx, this);
+    if heuristic_snapshot_is_suspect(ctx, this, &elems) {
+        // Null holes from a foreign non-List backing array (see
+        // `heuristic_snapshot_is_suspect`). `toArray` is not on the iterator
+        // native's path, so the real `iterator()` is safe to drive here.
+        let real = collect_via_real_iterator_once(ctx, this);
+        if !real.is_empty() {
+            elems = real;
+        }
+    }
     if elems.is_empty() {
         // `collect_collection_elements` only knows fixed collection layouts and
         // returns empty for any other Collection — but this native is also
@@ -3358,6 +3367,64 @@ fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Ve
         }
     }
     out
+}
+
+/// Recursion-safe wrapper around [`collect_via_real_iterator`].
+///
+/// The real `iterator()` of a foreign collection can land back in a
+/// collection native that itself wants a fallback snapshot. One level is all
+/// any caller needs, so a re-entrant request yields an empty Vec (and the
+/// caller keeps whatever it already had) instead of recursing.
+fn collect_via_real_iterator_once(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+    use std::cell::Cell;
+    thread_local! {
+        static IN_REAL_ITER: Cell<bool> = const { Cell::new(false) };
+    }
+    if IN_REAL_ITER.with(Cell::get) {
+        return Vec::new();
+    }
+    IN_REAL_ITER.with(|g| g.set(true));
+    let out = collect_via_real_iterator(ctx, coll);
+    IN_REAL_ITER.with(|g| g.set(false));
+    out
+}
+
+/// True iff a heuristic element snapshot of `coll` must not be trusted.
+///
+/// The layout probes in [`collect_collection_elements`] assume the backing
+/// array is a dense `arr[0..size)` prefix. That is a *list* invariant. A
+/// foreign open-addressed collection keeps NULL holes for empty buckets in
+/// exactly those slots, so the probe returns the right element *count* made up
+/// of mostly nulls and looks entirely plausible — the failure only shows up
+/// when the caller dereferences one. Known members of that shape: MSC's
+/// `org.jboss.msc.service.IdentityHashSet`, Kafka's
+/// `ImplicitLinkedHashCollection`, Jetty's `BlockingArrayQueue`; the latter two
+/// carry hand-written special cases in `collect_collection_elements` precisely
+/// because of this, which is what this general guard replaces the need for.
+///
+/// Concretely closed here: `new HashSet<>().addAll(mscIdentityHashSet)` turned
+/// a 3-element set into `{null}`, so WildFly's `ContainerStateMonitor`
+/// iterated a null `ServiceController` and every boot that reported a failed
+/// service died on `NullPointerException: ... "controller" is null` instead of
+/// logging the report.
+///
+/// A `List` may legitimately hold nulls at any index, so nulls are only
+/// suspicious in a non-`List` receiver. Note this deliberately does NOT consult
+/// `is_synthetic_backed_collection`: its `al_is_list_layout` arm matches on the
+/// very `(Object[], int)` shape an open-addressed foreign set has, so it
+/// reported MSC's `IdentityHashSet` as synthetic-backed and suppressed the
+/// guard. Callers only *adopt* the real-iterator answer when it is non-empty,
+/// and CratonVM's own synthetic sets/maps resolve `iterator()` to their own
+/// (correct) natives, so re-deriving is at worst equivalent for them.
+fn heuristic_snapshot_is_suspect(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+    elems: &[Value],
+) -> bool {
+    if !elems.iter().any(|v| matches!(v, Value::Object(None))) {
+        return false;
+    }
+    !obj_is_instance_of(ctx, coll, "java/util/List")
 }
 
 /// Read elements for the `toArray` / `forEach` natives. These are registered on
@@ -29381,6 +29448,17 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
     let elems = collect_collection_elements(ctx, coll);
     if !elems.is_empty() {
+        if heuristic_snapshot_is_suspect(ctx, coll, &elems) {
+            // A plausible-looking but null-holed snapshot of a foreign
+            // non-List collection — see `heuristic_snapshot_is_suspect`. Every
+            // caller of this helper (addAll / removeAll / retainAll /
+            // containsAll / hashCode / copy ctors) is off the iterator
+            // native's path, so driving the real `iterator()` is safe.
+            let real = collect_via_real_iterator_once(ctx, coll);
+            if !real.is_empty() {
+                return real;
+            }
+        }
         return elems;
     }
     let real_size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
