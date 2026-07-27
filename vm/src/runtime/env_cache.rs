@@ -728,6 +728,13 @@ cached_is_ok!(dbg_arrlen, "CRATONVM_DBG_ARRLEN");
 /// the call sites; they are equivalent here (the flag is never set to
 /// non-UTF-8), so one predicate serves both.
 cached_is_ok!(dbg_loader_trace, "CRATONVM_DBG_LOADER_TRACE");
+/// `CRATONVM_DBG_ISOLATED_CNF` — narrow trace for the isolated-URLClassLoader
+/// "class not found" hard-fail in [`resolve_class_loader_aware`]: prints the
+/// name, the referencing class, and the Java frames whenever an isolating
+/// loader's own `loadClass` declined a name and the VM therefore refuses to
+/// fall back to the global store. Fires at most a handful of times per run,
+/// unlike `dbg_loader_trace`.
+cached_is_ok!(dbg_isolated_cnf, "CRATONVM_DBG_ISOLATED_CNF");
 cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");

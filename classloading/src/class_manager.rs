@@ -2988,18 +2988,45 @@ impl ClassManager {
     /// genuinely failing to find real bytes for `name` -- i.e. only when no
     /// better, classpath-backed answer could possibly exist.
     pub fn resolve_fast_path_class_id(&self, name: &str) -> Option<ClassId> {
+        let dbg = loader_flags().dbg_dupclass
+            && loader_flags()
+                .dbg_dupclass_filter
+                .as_deref()
+                .is_none_or(|f| name.contains(f));
         if let Some(id) = self.get_loaded_class_id_for_requester(name, ClassLoaderId::Application) {
+            if dbg {
+                eprintln!(
+                    "[DBG_DUPCLASS] builtin-chain hit {:?} (loader={:?}) for {:?}",
+                    id,
+                    self.class_store.get(id).map(|c| c.loader_id),
+                    name,
+                );
+            }
             return Some(id);
         }
-        let candidate = self.get_loaded_class_id(name)?;
+        let Some(candidate) = self.get_loaded_class_id(name) else {
+            if dbg {
+                eprintln!("[DBG_DUPCLASS] no loaded candidate at all for {name:?}");
+            }
+            return None;
+        };
         let is_user_loader_answer = matches!(
             self.class_store.get(candidate).map(|c| c.loader_id),
             Some(ClassLoaderId::UserDefined(_))
         );
+        if dbg {
+            eprintln!(
+                "[DBG_DUPCLASS] fallback candidate {:?} (loader={:?}, is_user={is_user_loader_answer}) for {:?}; delegated_bytes_found={}",
+                candidate,
+                self.class_store.get(candidate).map(|c| c.loader_id),
+                name,
+                self.find_class_bytes_delegated(name).is_ok(),
+            );
+        }
         if is_user_loader_answer && self.find_class_bytes_delegated(name).is_err() {
             return Some(candidate);
         }
-        if loader_flags().dbg_dupclass {
+        if dbg {
             eprintln!(
                 "[DBG_DUPCLASS] rejecting existing UserDefined-loader candidate {:?} (loader={:?}) for {:?} -- delegation chain also has it, so a SEPARATE ClassId will be created under Application",
                 candidate,
@@ -5886,6 +5913,21 @@ impl ClassManager {
                     continue;
                 }
                 if let Some(id) = found {
+                    if loader_flags().dbg_dupclass
+                        && loader_flags()
+                            .dbg_dupclass_filter
+                            .as_deref()
+                            .is_none_or(|f| name.contains(f))
+                    {
+                        eprintln!(
+                            "[BLINDPICK] find_class_by_name({name:?}) -> {id:?} (loader={:?}) via user-loader scan",
+                            self.class_store.get(id).map(|c| c.loader_id),
+                        );
+                        if loader_flags().dbg_dupclass_bt {
+                            let bt = std::backtrace::Backtrace::force_capture();
+                            eprintln!("[BLINDPICK-BT] {name}\n{bt}");
+                        }
+                    }
                     return Some(id);
                 }
             }

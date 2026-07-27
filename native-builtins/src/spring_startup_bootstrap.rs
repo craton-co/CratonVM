@@ -3482,7 +3482,30 @@ fn resolve_class_id_with_nested_retry(
     if let Some(c) = resolve_class_id_via_tccl(ctx, internal) {
         return Some(c);
     }
-    if let Some(c) = ctx.class_id_by_name(internal) {
+    // Loader identity (2026-07-26, WebSocketMessagingAutoConfigurationTests
+    // #shouldUseJackson2WhenPreferred): this used to be the loader-BLIND
+    // `ctx.class_id_by_name`, whose user-defined-loader scan returns an
+    // isolating loader's private copy whenever that loader happened to load
+    // the name FIRST. Two of that class's 13 methods carry
+    // `@ClassPathExclusions`, so `ModifiedClassPathClassLoader` defines its
+    // own `WebSocketMessagingAutoConfiguration$Jackson2WebSocketMessage`
+    // `ConverterConfiguration` early in the run; every LATER, non-isolated
+    // method then resolved its bean definition's class name to that isolated
+    // copy (the TCCL branch above correctly declines -- their TCCL is the
+    // plain application loader). Spring then instantiated a bean class whose
+    // declared `ObjectMapper` constructor parameter is the isolated loader's
+    // `ObjectMapper`, against the application loader's `ObjectMapper` bean --
+    // `IllegalArgumentException: argument type mismatch`, surfacing as
+    // `BeanInstantiationException: Illegal arguments for constructor`.
+    //
+    // `class_id_by_name_delegated` is the parent-delegation answer: it still
+    // returns a user-defined loader's copy when that is the only possible
+    // answer (no ordinary-classpath bytes for the name -- in-memory
+    // `Proxy`/generated classes), but refuses to substitute one for a class
+    // that genuinely exists on the classpath, letting the
+    // `ensure_class_initialized` fallback below define the correct
+    // application-loader copy instead.
+    if let Some(c) = ctx.class_id_by_name_delegated(internal) {
         return Some(c);
     }
     if let Ok(c) = ctx.ensure_class_initialized(internal) {
@@ -3495,7 +3518,7 @@ fn resolve_class_id_with_nested_retry(
         return None;
     }
     let nested_internal = format!("{}${}", &internal[..last_dot], &internal[last_dot + 1..]);
-    if let Some(c) = ctx.class_id_by_name(&nested_internal) {
+    if let Some(c) = ctx.class_id_by_name_delegated(&nested_internal) {
         return Some(c);
     }
     ctx.ensure_class_initialized(&nested_internal).ok()

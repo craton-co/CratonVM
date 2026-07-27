@@ -26,15 +26,18 @@
 // ---------------------------------------------------------------------------
 // KNOWN FIDELITY GAPS
 // ---------------------------------------------------------------------------
-//  * The dump is NOT taken at a safepoint. `dump_heap` walks
-//    `mem.heap.walk_objects()` while other Java threads keep running and
-//    allocating. A dump taken under mutator activity can therefore contain
-//    torn field values or reference IDs for objects that a concurrent
-//    collection has since moved/freed. This is tolerable for the OOM path
-//    (the VM is about to die) but must be fixed before wiring an on-demand
-//    trigger. An older comment in `write_heap_segments` claimed the dump was
-//    "serialized against concurrent GC via the SharedVm's gc_barrier" — that
-//    is not true of any code on this path and the claim has been removed.
+//  * obsaudit D11 (2026-07-26), FIXED: the dump used to run with no
+//    safepoint at all — `dump_heap` walked `mem.heap.walk_objects()` while
+//    other Java threads kept running and allocating, which could produce
+//    torn field values or reference IDs for objects a concurrent collection
+//    had since moved/freed. `dump_heap` now requests the same stop-the-world
+//    barrier real GC cycles use before walking (see `DumpSafepoint`) and
+//    releases it (with an empty, no-op pointer map — nothing here moves any
+//    object) once the walk finishes, including on an early error or panic.
+//    A request can still be declined if another pause is already in
+//    flight, in which case this falls back to the old unpaused behaviour —
+//    see `DumpSafepoint`'s doc comment for why that fallback, rather than
+//    joining the other pause, was the right scope for this fix.
 //  * Object IDs are raw heap addresses. Under a relocating collector two
 //    dumps of the same logical object will not agree, and an address recycled
 //    after a collection can alias.
@@ -48,6 +51,7 @@ use std::sync::Arc;
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef};
 
 use crate::runtime::serviceability::HprofWriter;
+use crate::threading::jvm_thread::ThreadId;
 use crate::vm::SharedVm;
 
 // ---- HPROF heap-dump sub-record tags ------------------------------------
@@ -96,9 +100,24 @@ const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 /// Dump the heap of `vm` into an HPROF binary file at `path`.
 /// Returns the number of bytes written, or an error string.
-pub fn dump_heap(vm: &Arc<SharedVm>, path: &str) -> Result<u64, String> {
+///
+/// `initiator` is the calling thread's id, used to request a stop-the-world
+/// pause for the duration of the walk — see [`DumpSafepoint`] (obsaudit D11).
+pub fn dump_heap(vm: &Arc<SharedVm>, path: &str, initiator: ThreadId) -> Result<u64, String> {
     let file = std::fs::File::create(path).map_err(|e| format!("cannot create {}: {}", path, e))?;
     let mut w = BufWriter::new(file);
+
+    // obsaudit D11 (2026-07-26): the walk below used to run with no
+    // safepoint at all — see the KNOWN FIDELITY GAPS block at the top of
+    // this file for the failure mode (torn field reads / use of an object
+    // a concurrent GC has since moved or freed). `DumpSafepoint` requests
+    // the same stop-the-world barrier real GC cycles use
+    // (`SharedVm::mem::gc_barrier`); its `Drop` releases the barrier with an
+    // empty pointer map (nothing here moves any object) even if the walk
+    // below panics or returns early, so a dump can never leak the VM in a
+    // permanently-paused state.
+    let _safepoint = DumpSafepoint::request(vm, initiator);
+
     let mut dumper = HprofDumper::new(vm);
     dumper
         .write_all(&mut w)
@@ -111,6 +130,62 @@ pub fn dump_heap(vm: &Arc<SharedVm>, path: &str) -> Result<u64, String> {
         .map_err(|e| format!("metadata error: {}", e))?
         .len();
     Ok(size)
+}
+
+/// RAII stop-the-world pause for an HPROF dump (obsaudit D11).
+///
+/// Requests the barrier via [`crate::threading::gc_barrier::GcBarrier::request_stw_counted_with_live_blocked`]
+/// — the same entry point `runtime::interpreter`'s real GC-triggering path
+/// uses — then waits for every counted mutator to arrive. Deliberately does
+/// *not* use the interpreter's `stw_take_over_and_wait` forcible-freeze path
+/// for in-JIT peers (that machinery exists to let a *moving* collector
+/// relocate objects safely under a frozen peer; an HPROF walk moves
+/// nothing, so `wait_for_all`'s cooperative safepoint poll — the same one
+/// JIT-compiled backward branches hit — is sufficient here and keeps this
+/// diagnostic path from depending on the more experimental takeover code).
+///
+/// `request_stw_counted_with_live_blocked` can decline (returns `false`) if
+/// another stop-the-world pause is already in flight — e.g. a real GC cycle
+/// racing the OOM path that triggered this dump. Rather than block trying to
+/// join someone else's pause (real GC's own coordination protocol is
+/// considerably more involved than this diagnostic needs), a declined
+/// request falls back to the pre-D11 behaviour: dump without a pause. That
+/// preserves this path's original best-effort characteristic — a torn dump
+/// on a benign race is still strictly better than the OOM handler itself
+/// blocking or erroring.
+struct DumpSafepoint<'a> {
+    vm: &'a SharedVm,
+    acquired: bool,
+}
+
+impl<'a> DumpSafepoint<'a> {
+    fn request(vm: &'a SharedVm, initiator: ThreadId) -> Self {
+        let acquired = vm.mem.gc_barrier.request_stw_counted_with_live_blocked(initiator, || {
+            let (alive, blocked, _os_tids, blocked_tids) =
+                vm.threads.thread_registry.alive_count_blocked_and_os_tids();
+            (
+                u32::try_from(alive).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
+        if acquired {
+            vm.mem.gc_barrier.wait_for_all();
+        }
+        Self { vm, acquired }
+    }
+}
+
+impl Drop for DumpSafepoint<'_> {
+    fn drop(&mut self) {
+        if self.acquired {
+            // No object moved, so the empty map is not a shortcut — it is
+            // the exact and complete answer for a non-moving pause. See
+            // `vm/src/native/jni.rs`'s `gc_barrier.complete_gc(HashMap::new())`
+            // test usage for the same pattern.
+            self.vm.mem.gc_barrier.complete_gc(HashMap::new());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,17 +366,12 @@ impl<'a> HprofDumper<'a> {
             // walkable-arena. Each pointer was validated against
             // the allocator's live set before being returned.
             //
-            // Observability audit (2026-07-26): an earlier version of this
-            // comment claimed "the heap is not collected while the HPROF
-            // dump is in progress — dump is serialized against concurrent
-            // GC via the SharedVm's gc_barrier". That is NOT true: neither
-            // `dump_heap` nor `maybe_dump_heap_on_oom` requests a safepoint
-            // or touches any GC barrier. The claim has been removed rather
-            // than relied upon. The single production caller runs on the
-            // OOM path where the process is about to die, so a torn dump is
-            // still better than none — but the missing safepoint MUST be
-            // fixed before any on-demand (jcmd / attach) trigger is wired.
-            // See the LIVENESS block at the top of this file.
+            // obsaudit D11, FIXED: `dump_heap` now requests a real
+            // stop-the-world pause before this walk begins (see
+            // `DumpSafepoint`) — an earlier version of this comment
+            // retracted a false claim that such a pause already existed;
+            // now it genuinely does. See the KNOWN FIDELITY GAPS block at
+            // the top of this file.
             let obj = unsafe { ObjectRef::from_raw(*ptr) };
             let header = self.vm.mem.heap.get_header(obj);
 
@@ -1409,7 +1479,8 @@ mod tests {
 
         let tmp = std::env::temp_dir().join("cratonvm_s42_test.hprof");
         let path = tmp.to_str().unwrap();
-        let size = dump_heap(&vm, path).expect("dump_heap should succeed");
+        let size =
+            dump_heap(&vm, path, ThreadId(0)).expect("dump_heap should succeed");
         assert!(size > 0, "Dump file should be non-empty");
 
         // Verify the file starts with HPROF magic

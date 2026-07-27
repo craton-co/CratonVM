@@ -225,6 +225,37 @@ pub const EMBEDDED_DEFAULT_JDK_MODE: JdkMode = JdkMode::Synthetic;
 /// call [`require_synthetic_jdk`]) before honouring a synthetic request.
 pub const SYNTHETIC_JDK_COMPILED_IN: bool = cfg!(feature = "synthetic-jdk");
 
+/// obsaudit D12 (2026-07-26) — settings for `-XX:StartFlightRecording`.
+/// Parsed by `vm-cli/src/main.rs`, consumed by `Vm::new`
+/// (`vm/src/vm/vm_init.rs`) to start a real JFR recording at boot.
+///
+/// Deliberately narrower than HotSpot's `StartFlightRecording:` option set:
+/// no `disk=` (recordings stay memory-only — see the `RecordingSettings`
+/// doc comment in `jfr/src/recording.rs` for why), and `maxevents` names
+/// what `jfr::RecordingSettings::max_size` actually bounds (an event
+/// count) rather than reusing HotSpot's `maxsize` name, which means bytes
+/// in real JFR — a CratonVM `maxsize=` would silently mean something
+/// different from HotSpot's, which is worse than not offering the name.
+#[derive(Debug, Clone, Default)]
+pub struct JfrStartRecordingConfig {
+    /// `filename=<path>`. `None` defaults to `./cratonvm-recording-<pid>.jfr`
+    /// (chosen at dump time, once the pid is known).
+    pub filename: Option<String>,
+    /// `duration=<secs>`. `None` means the recording runs until the VM
+    /// exits (or is stopped by some future explicit control surface).
+    pub duration: Option<std::time::Duration>,
+    /// `maxage=<secs>`. `None` means no age-based eviction — see
+    /// `jfr::repository::EventRepository::with_max_age`.
+    pub max_age: Option<std::time::Duration>,
+    /// `maxevents=<n>`. `None` keeps the default 100_000-event ring.
+    pub max_events: Option<usize>,
+    /// `dumponexit=true|false`, default `true` (matches HotSpot's default
+    /// for `-XX:StartFlightRecording`). When true, the VM dumps this
+    /// recording to `filename` from the pre-exit hook — see
+    /// `vm-cli/src/main.rs`'s `set_pre_exit_hook` installer.
+    pub dump_on_exit: bool,
+}
+
 /// Configuration for the JVM instance.
 ///
 /// Mirrors common JVM `-X` flags and provides defaults suitable for development.
@@ -438,6 +469,13 @@ pub struct VmConfig {
     /// `./java_pid<pid>.hprof` in the current working directory.
     pub heap_dump_path: Option<String>,
 
+    /// obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording[:opts]`.
+    /// `Some` means the VM starts a JFR recording during boot with these
+    /// settings; `None` (the default) means JFR stays off, exactly as
+    /// before this flag existed. See `JfrStartRecordingConfig` and
+    /// `vm-cli/src/main.rs`'s parser for the accepted `opts`.
+    pub jfr_start_recording: Option<JfrStartRecordingConfig>,
+
     /// Enable container/cgroup support (`-XX:+UseContainerSupport`).
     /// When `true` (default), the JVM reads cgroup v1/v2 limits to
     /// auto-size heap and thread pools inside Docker/Kubernetes.
@@ -648,6 +686,7 @@ impl Default for VmConfig {
             jit_aggressive_compilation: false,
             heap_dump_on_oom: false,
             heap_dump_path: None,
+            jfr_start_recording: None,
             use_container_support: true,
             container_effective_processors: None,
             // JEP 358: default ON to match HotSpot (messages verified

@@ -578,6 +578,18 @@ pub trait NativeClassAccess {
         self.class_id_by_name(name)
     }
 
+    /// Resolve `name` the way a requester-less parent-delegation loader
+    /// would: bootstrap, then extension, then application. Do not collapse
+    /// onto an unrelated user-defined loader's private same-named class unless
+    /// it is the only possible answer.
+    ///
+    /// Use this for lookups performed on behalf of ordinary application code
+    /// when no precise requesting class is available. Prefer
+    /// [`Self::class_id_by_name_near`] whenever a requester is known.
+    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
+        self.class_id_by_name(name)
+    }
+
     /// Resolve `name` to a `ClassId`, LOADING it through
     /// `referencing_class_id`'s own defining classloader if it isn't loaded
     /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/

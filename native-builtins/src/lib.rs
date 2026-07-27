@@ -36564,9 +36564,21 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "isRecord", "()Z", native_class_is_record);
     registry.register(c, "isSealed", "()Z", native_class_is_sealed);
     registry.register(c, "isSynthetic", "()Z", native_return_false);
-    registry.register(c, "isAnonymousClass", "()Z", native_return_false);
-    registry.register(c, "isLocalClass", "()Z", native_return_false);
-    registry.register(c, "isMemberClass", "()Z", native_return_false);
+    // The nesting predicates are derived from the class's own `InnerClasses`
+    // entry (see `lang_class::class_nesting_kind`). They were `native_return_false`,
+    // so under `synthetic-jdk` every nested class reported itself top-level —
+    // `isMemberClass()` in particular is false for NO nested class on HotSpot.
+    // Real-JDK mode never reaches here: it runs `java.lang.Class`'s own
+    // bytecode, which was already correct on all 19 shapes of the
+    // nesting/enclosing differential probe.
+    registry.register(
+        c,
+        "isAnonymousClass",
+        "()Z",
+        native_class_is_anonymous_class,
+    );
+    registry.register(c, "isLocalClass", "()Z", native_class_is_local_class);
+    registry.register(c, "isMemberClass", "()Z", native_class_is_member_class);
     // NEW-8: Class.isHidden real impl — was native_return_false which
     // shadowed the registration at lib.rs:~325. Both now consult the
     // class's hidden flag through NativeContext::is_class_hidden.

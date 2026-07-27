@@ -1491,11 +1491,45 @@ pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
 /// classes happen to be present, because last-writer-wins on the native
 /// registry just leaves the real bytecode dispatch in place.)
 pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
+    // FIX (log4j2loggingsystemtests-correlationid-mdc-binder-shadowed): same
+    // bug class as `micrometer-metrics-logbackcondition-wrong-binder-20260724`
+    // below (`StaticLoggerBinder`), just never applied here too — these three
+    // natives used to apply UNCONDITIONALLY, shadowing a REAL
+    // `org/slf4j/impl/StaticMDCBinder` class whenever one is genuinely on the
+    // classpath (e.g. `@ConfigureClasspathToPreferLog4j2`'s `ClassPathOverrides`
+    // pulling in `log4j-slf4j-impl` on a `ModifiedClassPathClassLoader`, whose
+    // real `getMDCA()` returns a real `Log4jMDCAdapter` bridging straight into
+    // `org.apache.logging.log4j.ThreadContext`). With the stub always winning,
+    // `org.slf4j.MDC.put`/`setContextMap` never reached `ThreadContext` at all,
+    // so Log4j2's `%correlationId` pattern converter never saw the MDC values
+    // an app set via the SLF4J facade
+    // (`Log4J2LoggingSystemTests.correlationLoggingTo*WhenExpectCorrelationIdTrueAndMdcContent`/
+    // `WhenHasCorrelationPattern`, all real-JDK-A/B-confirmed CratonVM-only).
+    // Same fix shape as `StaticLoggerBinder` below: prefer the real
+    // bytecode via the `*_bytecode_only` primitives when a genuine
+    // (non-bridge) declaration is present; only fabricate the synthetic
+    // `BasicMDCAdapter` placeholder when no real implementation exists.
     registry.register(
         "org/slf4j/impl/StaticMDCBinder",
         "getSingleton",
         "()Lorg/slf4j/impl/StaticMDCBinder;",
         |ctx, _| {
+            if let Some(cid) = ctx.class_id_by_name("org/slf4j/impl/StaticMDCBinder") {
+                if ctx.class_declares_method(
+                    cid,
+                    "getSingleton",
+                    "()Lorg/slf4j/impl/StaticMDCBinder;",
+                ) {
+                    if let Ok(Some(real)) = ctx.invoke_special_bytecode_only(
+                        "org/slf4j/impl/StaticMDCBinder",
+                        "getSingleton",
+                        "()Lorg/slf4j/impl/StaticMDCBinder;",
+                        &[],
+                    ) {
+                        return Ok(Some(real));
+                    }
+                }
+            }
             let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticMDCBinder", 1);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -1504,7 +1538,20 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/impl/StaticMDCBinder",
         "getMDCA",
         "()Lorg/slf4j/spi/MDCAdapter;",
-        |ctx, _| {
+        |ctx, args| {
+            if let Ok(this) = obj_arg(args, 0) {
+                let cid = ctx.class_id_of_object(this);
+                if ctx.class_declares_method(cid, "getMDCA", "()Lorg/slf4j/spi/MDCAdapter;") {
+                    if let Ok(Some(real)) = ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "getMDCA",
+                        "()Lorg/slf4j/spi/MDCAdapter;",
+                        &[],
+                    ) {
+                        return Ok(Some(real));
+                    }
+                }
+            }
             let a = alloc_concurrent_synthetic(ctx, "org/slf4j/helpers/BasicMDCAdapter", 0);
             Ok(Some(Value::Object(Some(a))))
         },
@@ -1513,7 +1560,21 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/impl/StaticMDCBinder",
         "getMDCAdapterClassStr",
         "()Ljava/lang/String;",
-        |ctx, _| {
+        |ctx, args| {
+            if let Ok(this) = obj_arg(args, 0) {
+                let cid = ctx.class_id_of_object(this);
+                if ctx.class_declares_method(cid, "getMDCAdapterClassStr", "()Ljava/lang/String;")
+                {
+                    if let Ok(Some(real)) = ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "getMDCAdapterClassStr",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        return Ok(Some(real));
+                    }
+                }
+            }
             let s = ctx.create_string("org.slf4j.helpers.BasicMDCAdapter");
             Ok(Some(Value::Object(Some(s))))
         },
@@ -1940,10 +2001,26 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string("default")))))
     });
     registry.register(lb_ctx, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
-    registry.register(lb_ctx, "start", "()V", |_, _| Ok(None));
-    registry.register(lb_ctx, "stop", "()V", |_, _| Ok(None));
-    registry.register(lb_ctx, "reset", "()V", |_, _| Ok(None));
-    registry.register(lb_ctx, "isStarted", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    // FIX (loggingapplicationlistenertests-logbacklogsystemtests-reset-noop):
+    // `start`/`stop`/`reset`/`isStarted` were STILL natively stubbed here
+    // from the same pre-fix era the `getLogger` comment above documents —
+    // `reset()`'s no-op meant `LoggerContext.reset()` (called by
+    // `LogbackLoggingSystem.stopAndReset` between every test-method-scoped
+    // re-`initialize()`) never ran `Logger.recursiveReset()` /
+    // `detachAndStopAllAppenders()`, so EVERY previously-configured
+    // ConsoleAppender (including Logback's own auto-bootstrap default one)
+    // stayed permanently attached to the root logger — each subsequent test
+    // method's log calls fired through every prior test's appenders too
+    // (duplicate/leaked output across `@Test` methods in the same class,
+    // e.g. `LoggingApplicationListenerTests`, `LogbackLoggingSystemTests`,
+    // `SpringBootJoranConfiguratorTests`). Confirmed via a minimal direct
+    // Logback repro (`ctx.reset()` leaving `root.iteratorForAppenders()`
+    // non-empty) and real-JDK A/B. `ContextBase`'s real `start`/`stop`/
+    // `reset`/`isStarted` are simple, safe real bytecode (a boolean field
+    // flip, a few real method calls) — the field-layout risk this stub
+    // family originally guarded against was `<init>`-shaped, and `<init>`
+    // has been real bytecode since the `getLogger` fix above (guarded by
+    // `logback_context_construction_and_state_are_not_native_overridden`).
 
     // `ch/qos/logback/classic/Logger` (getLogger, addAppender, info/warn/
     // error/etc., filterAndLog_*) is intentionally NOT natively overridden
@@ -2743,6 +2820,16 @@ mod logback_construction_registration_tests {
                 "getTurboFilterList",
                 "()Lch/qos/logback/classic/spi/TurboFilterList;",
             ),
+            // FIXED 2026-07-26 (loggingapplicationlistenertests-logbacklogsystemtests-reset-noop):
+            // `reset()` (and `start`/`stop`/`isStarted`) were stale no-ops
+            // that silently skipped `Logger.recursiveReset()` /
+            // `detachAndStopAllAppenders()`, leaking every previously
+            // attached ConsoleAppender across `@Test` methods. Guard
+            // against reintroducing any of these.
+            ("ch/qos/logback/classic/LoggerContext", "reset", "()V"),
+            ("ch/qos/logback/classic/LoggerContext", "stop", "()V"),
+            ("ch/qos/logback/classic/LoggerContext", "start", "()V"),
+            ("ch/qos/logback/classic/LoggerContext", "isStarted", "()Z"),
             // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
             // LoggerContext.getLogger used to fabricate a throwaway synthetic
             // Logger, and every Logger/Log instance method below was a

@@ -100,12 +100,30 @@ public class RCollections {
         // AbstractSet.equals across the type boundary must be symmetric+correct.
         check(!hs.equals(foreignPartial) && !foreignPartial.equals(hs), "equals foreign partial");
         check(hs.equals(foreignSubset) && foreignSubset.equals(hs), "equals foreign subset");
+        // Set.hashCode contract across the type boundary: a foreign Set's
+        // inherited AbstractSet.hashCode() is the SUM of its element
+        // hashCodes, so it must equal an equal HashSet's. CratonVM routes
+        // AbstractSet.hashCode through its HashSet native, which saw a
+        // foreign (non-backing-map) layout as empty and returned 0 — equal
+        // sets that hash differently are unfindable in any HashMap, which is
+        // what the "set-key true hit" check below then hit as a null return.
+        check(new TinySet("a", "x").hashCode() == "a".hashCode() + "x".hashCode(),
+                "foreign Set hashCode is element-hash sum");
+        check(foreignSubset.hashCode() == hs.hashCode(), "foreign/HashSet hashCode agree");
+        check(new TinySet("a", "b").hashCode() == new HashSet<>(Arrays.asList("a", "b")).hashCode(),
+                "foreign/HashSet hashCode agree (fresh)");
         // Set-of-set keyed map: a HashSet lookup must not collide with a foreign
-        // set key that merely shares one element (the getSharedSet failure).
+        // set key that merely shares one element (the getSharedSet failure) —
+        // and must HIT when the sets are equal, in both key directions.
         Map<Set<String>, String> byKey = new HashMap<>();
         byKey.put(new TinySet("a", "x"), "AX");
         check(byKey.get(new HashSet<>(Arrays.asList("a", "y"))) == null, "set-key no false hit");
-        check(byKey.get(new HashSet<>(Arrays.asList("a", "x"))).equals("AX"), "set-key true hit");
+        check("AX".equals(byKey.get(new HashSet<>(Arrays.asList("a", "x")))), "set-key true hit");
+        // Reverse: HashSet key, foreign-Set probe.
+        Map<Set<String>, String> byKeyRev = new HashMap<>();
+        byKeyRev.put(new HashSet<>(Arrays.asList("a", "x")), "AX");
+        check("AX".equals(byKeyRev.get(new TinySet("a", "x"))), "set-key true hit (reverse)");
+        check(byKeyRev.get(new TinySet("a", "y")) == null, "set-key no false hit (reverse)");
         // retainAll against a foreign arg must keep the shared element, not empty.
         Set<String> retain = new HashSet<>(Arrays.asList("a", "b"));
         retain.retainAll(new TinySet("a", "z"));

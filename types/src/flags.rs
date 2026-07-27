@@ -848,6 +848,9 @@ pub struct LoaderFlags {
     pub dbg_dupclass: bool,
     /// `CRATONVM_DBG_DUPCLASS_BT`
     pub dbg_dupclass_bt: bool,
+    /// `CRATONVM_DBG_DUPCLASS_FILTER` -- [`parse::utf8`]. Restricts the
+    /// `CRATONVM_DBG_DUPCLASS` trace to class names containing this substring.
+    pub dbg_dupclass_filter: Option<String>,
     /// `CRATONVM_DBG_FBCGLIB`
     pub dbg_fbcglib: bool,
     /// `CRATONVM_DBG_GETRESOURCES` — [`parse::non_empty_non_zero`].
@@ -892,6 +895,7 @@ impl LoaderFlags {
             dbg_define: present_utf8(src, "CRATONVM_DBG_DEFINE"),
             dbg_dupclass: present_utf8(src, "CRATONVM_DBG_DUPCLASS"),
             dbg_dupclass_bt: present(src, "CRATONVM_DBG_DUPCLASS_BT"),
+            dbg_dupclass_filter: utf8(src, "CRATONVM_DBG_DUPCLASS_FILTER"),
             dbg_fbcglib: present(src, "CRATONVM_DBG_FBCGLIB"),
             dbg_getresources: non_empty_non_zero(src, "CRATONVM_DBG_GETRESOURCES"),
             dbg_layout: present(src, "CRATONVM_DBG_LAYOUT"),

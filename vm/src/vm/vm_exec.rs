@@ -4062,6 +4062,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .find_class_by_name_for_class(name, near)
     }
 
+    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .resolve_fast_path_class_id(name)
+    }
+
     fn class_id_by_name_via_referencing_class(
         &mut self,
         referencing_class_id: ClassId,
@@ -5526,12 +5534,16 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                 num_captures,
             )?;
 
-            // Loader-faithful impl owner (gated): dispatch a lambda whose
-            // enclosing class was defined by a child / bytecode-enhancing loader
-            // on that loader's copy of the impl class, not the global one (see
-            // `lambda_impl_dispatch_override`).
-            let impl_override =
-                crate::runtime::interpreter::lambda_impl_dispatch_override(self.shared, &lcs);
+            // Drive loader-faithful resolution here because this native
+            // callback can be the first reference to the implementation owner
+            // (for example a constructor method reference reached through a
+            // native Stream pipeline). A passive cache-only lookup can miss and
+            // incorrectly fall back to the application-loader copy.
+            let impl_override = crate::runtime::interpreter::lambda_impl_dispatch_override_driven(
+                self.shared,
+                self.thread,
+                &lcs,
+            );
             // Dispatch by method handle kind.
             let raw_result = match lcs.impl_handle.kind {
                 MethodHandleKind::InvokeStatic => {
