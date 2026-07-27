@@ -93,4 +93,5 @@ spring-suite/build/
 # worktree paths, one-off investigation output names). scripts/README.md has
 # documented this as gitignored policy since before this rule actually
 # existed in .gitignore; scripts/internal/ had been tracked in the meantime.
-scripts/internal/
+#scripts/internal/
+#scripts/smoke/
