@@ -1,65 +1,118 @@
-# TestGroupChannelSenderConnections — intermittent SIGSEGV in NioSender.keepalive
+# TestGroupChannelSenderConnections — intermittent SIGSEGV
 
-**Status:** OPEN. Pre-existing on `dev`; found while closing
-[22-tribes-realnetwork-membership-bug](../../internal/fixed-suite-bugs/tomcat/22-tribes-realnetwork-membership-bug-FIXED.md)
-and deliberately **not** fixed there — different subsystem (TCP replication
-sender), different root cause.
+**Status:** OPEN, re-diagnosed 2026-07-28. It has **two** causes; one is now
+FIXED, the other is not, so the class still crashes at roughly its original
+rate. The original title blamed `NioSender.keepalive` — see "It is NOT a JIT
+bug in the Tribes sender" below for why that reading was wrong.
+
+Found while closing
+[22-tribes-realnetwork-membership-bug](../../internal/fixed-suite-bugs/tomcat/22-tribes-realnetwork-membership-bug-FIXED.md).
+Neither cause is Tribes-specific — this class is just a cheap reproducer.
 
 ## Symptom
 
 `org.apache.catalina.tribes.group.TestGroupChannelSenderConnections` crashes the
-VM part-way through `testConnectionLinger`, roughly 1 run in 6:
+VM part-way through `testConnectionLinger`, roughly 1 run in 6. That is the test
+which sends its 3 messages back-to-back with **zero delay** (the other two space
+them 1–2 s apart), so the pooled sender is returned and reused rapidly.
 
-```
-#  EXCEPTION_ACCESS_VIOLATION (SIGSEGV) (0xC0000005) at pc=0x00007FF736980850
-#  Faulting access: read at address 0x000002B624B75B84
-#  thread: "main-vm"
-#  gc collector: generational   young-gen policy: non-moving (STW mark-sweep young)
-#  jit: faulting pc not attributed to a compiled method
-#  Java frames:
-#    ... TestGroupChannelSenderConnections.testConnectionLinger
-#    ... GroupChannel.send -> ChannelCoordinator.sendMessage
-#    ... ReplicationTransmitter.sendMessage -> PooledParallelSender.sendMessage
-#    at org/apache/catalina/tribes/transport/PooledSender.returnSender
-#    at org/apache/catalina/tribes/transport/nio/ParallelNioSender.keepalive
-#    at org/apache/catalina/tribes/transport/nio/NioSender.read
-Native frames: exe+0x1263562, external/jit, external/jit, external/jit, exe+0xF60850
-```
+The class also fails non-fatally at a similar rate with an assertion failure or
+`GroupChannel.messageReceived Unable to deserialize message:[ClusterData…]`.
+Both are consistent with the same use-after-free, but neither has been pinned.
 
-Three of the five native frames are `external/jit`, so the fault is reached
-from JIT-compiled code. The class also fails non-fatally in two other ways at a
-similar rate — an assertion failure, and
-`GroupChannel.messageReceived Unable to deserialize message:[ClusterData…]` —
-which may or may not share the root cause.
+## It is NOT a JIT bug in the Tribes sender
 
-Purely TCP: `ParallelNioSender` / `NioSender`. No datagram code is involved, so
-this is unrelated to the multicast membership work in doc 22.
+The original filing read the `NioSender.read` / `ParallelNioSender.keepalive`
+Java frames plus three `external/jit` native frames as "the fault is reached
+from JIT-compiled code in the TCP sender". Both halves were wrong:
 
-## Evidence that it predates the doc-22 fixes
+* The Java frame list is explicitly *"published at the last blocking/safepoint
+  deposit — may lag the faulting instruction"*. It names where the mutator last
+  parked, not where it faulted.
+* The three `external/jit` frames sit at byte-identical addresses in **every**
+  crash, including ones whose faulting PC is completely different. They are the
+  Windows exception-dispatch path above the handler, not compiled Java.
 
-Interleaved A/B on the same host, alternating binaries run-by-run so host load
-is shared, 12 runs each:
+Symbolize the real frames with `CRATONVM_SYMBOLIZE`, run **from the build tree**
+so the 97 MB PDB next to the binary is found — a copied-out `.exe` symbolizes
+every address to `<unresolved>`.
 
-| binary | PASS | CRASH | other FAIL |
-|---|---|---|---|
-| clean `origin/dev` @ `fa1b0ade0` | 9 | **2** | 1 |
-| `origin/dev` + doc-22 fixes | 8 | **2** | 2 |
+## Cause 1 — finalizable objects were not GC roots ✅ FIXED
 
-Identical crash rate. (An earlier non-interleaved sample read 3/16 vs 6/16, but
-that comparison was confounded by concurrent host load — the interleaved run is
-the one to trust.)
+Dominant baseline site: `interpreter.rs::run_finalizers`, faulting in
+`heap.class_id_of` on an address returned by `finalizer_thread.dequeue()`.
 
-The class PASSes on HotSpot in the same fixture, and has PASSed on CratonVM in
-several prior full-suite runs, so it is intermittent rather than always-broken.
+`ReferenceProcessor::mark_finalizer_enqueued` flags an entry so
+`finalizer_referent_addresses` stops reporting it (that flag stops the
+resurrection channel re-enqueuing the same object every cycle). From then on the
+only thing referring to the object is the pending finalization queue — a raw
+address no marker can see. `update_after_gc` covered a moving collection; a
+non-moving young mark-sweep simply freed the object. `run_finalizers` also
+returns early whenever a JIT borrow is live, so entries routinely sit queued
+across several collections, widening the window.
+
+Separately, only the `System.gc` path passed finalizable roots at all; the four
+allocation-driven `collect_garbage` sites passed `&[]` — silently falsifying the
+invariant `process_references_after_gc` already documents ("Finalizable objects
+are rooted via `finalizer_addrs`, so a LIVE one is always in the pointer map").
+
+Fixed by seeding one `finalizable_roots` set (registered + pending, deduped) at
+all five sites. Effect over 24 runs each: **baseline 3 of 4 crashes at
+`run_finalizers`; after the fix 0 of 6.** The site is gone.
+
+## Cause 2 — JIT-dependent missing root on an interpreter operand stack 🔴 OPEN
+
+With cause 1 fixed the crash just moves. Sites across 6 crashes in 24 runs:
+
+| faulting frame | count |
+|---|---|
+| `VmHeap::load_and_forward` ← `execute_instruction` (`Getfield`) | 3 |
+| `vm_exec::object_num_fields` ← `native_map_put_evict` | 2 |
+| `vm_exec::invoke_on_class_shared_inner` | 1 |
+
+All three read a *reclaimed* object header. The `Getfield` one is the clearest:
+the receiver is popped off the operand stack into a bare Rust local, and the
+barrier added there (`load_and_forward`, "GCBARRIER-CDLWAIT-FIX") heals a
+receiver that **moved** but faults outright on one that was **freed**. So the
+reference was already dangling on the interpreter operand stack — a missing
+root, not staleness after a move.
+
+**The JIT is required.** `--nojit`: **16 runs, 0 crashes.** Every crash report
+carries `jit: guarded compiled frames live process-wide: YES` together with
+`gc young-gen policy: non-moving (STW mark-sweep young)` — a young sweep running
+while JIT frames are live and conservatively scanned (the BUG-03
+forcibly-stopped-peer path). Something an interpreter frame owns is missing from
+that root set.
+
+This is most likely the long-running "JIT corruptor" family rather than a new
+bug; compare `reference_osr_main_corruptor` (many apparent JIT corruptors are
+really the non-moving young sweep) and the fork6 GC-stress corruption notes.
+
+### Where to pick it up
+
+`CRATONVM_DBG_HEAP_STALE=1` — which flags a live object whose *field* points at
+reclaimed memory — stays **silent** across these crashes. That is itself a
+result: it places the dangling reference in a frame/operand stack rather than in
+the heap graph, where that verifier cannot see it. The useful next probes are
+`CRATONVM_DBG_STRAYSTACK=1` and `CRATONVM_DBG_CORRUPT_FRAMES=1`, plus forcing a
+moving young collection to confirm the non-moving sweep is required.
 
 ## Reproduction
+
+This class starts its channels with `SND_RX_SEQ|SND_TX_SEQ` only — no membership
+service, so no multicast group is joined and the receiver ports auto-bind.
+Unlike the membership tests it is therefore safe to run several copies
+concurrently, which is what makes a ~1-in-6 crash cheap to hunt:
 
 ```powershell
 $env:CRATONVM_REAL_NET_SOCKETS='1'; $env:CRATONVM_REAL_AQS='1'
 <cratonvm.exe> -Xmx2g -Djava.net.preferIPv4Stack=true -cp <tomcat suite cp> org.junit.runner.JUnitCore org.apache.catalina.tribes.group.TestGroupChannelSenderConnections
 ```
 
-Run it ~10 times; expect 1–2 access violations. Re-run with
-`CRATONVM_DBG_JIT_NAMES=1` to attribute the faulting pc to a compiled method,
-and consider `CRATONVM_DISABLE_JIT=1` to confirm the JIT dependency before
-digging further.
+Run ~24 copies 4-way parallel; expect 4–6 access violations.
+
+## Evidence it predates the doc-22 membership fixes
+
+Interleaved A/B, alternating binaries run-by-run so host load is shared, 12 runs
+each: clean `origin/dev` 2 crashes, `origin/dev` + doc-22 fixes 2 crashes —
+unchanged. The class passes on HotSpot in the same fixture.
