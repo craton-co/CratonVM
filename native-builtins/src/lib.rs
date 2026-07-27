@@ -28984,7 +28984,14 @@ pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
         Some(e) => &bytes[body_start..body_start + e],
         None => &bytes[body_start..],
     };
-    match b64_decode(body, B64_VARIANT_BASIC) {
+    // MIME, not BASIC: a PEM body is line-wrapped by definition (RFC 7468
+    // caps it at 64 chars per line), and even a one-line body carries the
+    // newline that precedes `-----END`. The BASIC decoder rejects EVERY
+    // non-alphabet byte including whitespace (see `b64_decode`), so with it
+    // this function could never decode any real PEM — it always fell through
+    // to the "hand the original bytes back" arm and returned the armored text
+    // as if it were DER. MIME is exactly the whitespace-skipping variant.
+    match b64_decode(body, B64_VARIANT_MIME) {
         Ok(der) if !der.is_empty() => der,
         // Not valid base64 (or empty) — hand the original bytes back so the
         // caller's existing DER path / mirror fallback runs exactly as before.
