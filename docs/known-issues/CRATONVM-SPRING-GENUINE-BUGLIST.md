@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **21 residual classes**, down from the 57 captured on 2026-07-27 (see the "second session" entry below for the six VM fixes and two harness fixes that closed the other 36, and for the per-class state of what is left). The older "127 non-passed of 2925" figure is superseded: 73 of those 74 `EMPTY` classes were `Abstract*Tests`/annotation-interface entries the runner should never have indexed, and the runner no longer does. |
+| **Status** | OPEN — **19 residual classes**, down from the 57 captured on 2026-07-27 (see the "second session" entry below for the eight VM fixes and two harness fixes that closed the other 38, and for the per-class state of what is left). The older "127 non-passed of 2925" figure is superseded: 73 of those 74 `EMPTY` classes were `Abstract*Tests`/annotation-interface entries the runner should never have indexed, and the runner no longer does. |
 | **Captured** | 2026-07-27 (second session), branch `fix/spring-buglist-close-20260727` merged forward to `origin/dev` `ffc7f90d4`, Azure host `20.83.144.174`, real JDK 25. The baseline it improves on is the 2026-07-27 full 8-shard run recorded immediately below. **The shared host ran at load 70–100 throughout, so batch runs emit spurious FAIL/TIMEOUT rows — re-check any residual in isolation before believing it.** |
 
 ## 2026-07-27 suite-wide reconfirmation: current numbers, named remaining clusters
@@ -205,7 +205,7 @@ the next person doesn't have to re-run the full suite just to get this
 list again.
 
 
-## 2026-07-27 (second session) — six VM bugs + two harness gaps; 57 residual classes → 21
+## 2026-07-27 (second session) — eight VM bugs + two harness gaps; 57 residual classes → 19
 
 Worktree `/data/data/wt-sprbuglist-20260727` (branch
 `fix/spring-buglist-close-20260727`, from `origin/dev` `60a710ad8`, merged
@@ -326,6 +326,27 @@ availability with exactly `new InitialContext().getEnvironment()` in a
 try/catch, so `StandardServletEnvironment` silently omitted its
 `jndiProperties` source.
 
+### Fix 7 — `new File(URI)` used the raw path, so percent-escapes survived
+
+Real `File(URI)` is `String p = uri.getPath();`, and `getPath()` returns the
+DECODED path — the `path` FIELD the native read holds the raw one (what
+`getRawPath()` returns). A file genuinely named `resource#test1.txt` therefore
+came back as `resource%23test1.txt`, and `exists()` was false for any path
+containing a character `File.toURI()` had escaped. `URI` itself was already
+correct on both VMs. `probes/HashProbe.java`.
+
+### Fix 8 — `InitialContext.getEnvironment()` (see Fix 6 above)
+
+### Harness gap 0 — the last `EMPTY` class was `@Disabled`
+
+`test.context.async.AsyncMethodsSpringTestContextIntegrationTests` carries
+`@Disabled("Only meant to be executed manually")`; **HotSpot reports `found=0`
+for it too.** It was never a `@RepeatedTest` discovery gap — a standalone
+`@RepeatedTest(3)` probe discovers and runs correctly on both VMs.
+`is_concrete.py` now also parses the class-level `RuntimeVisibleAnnotations`
+and drops `@Disabled` classes, which takes the index to 2847 and **empties the
+`EMPTY` cluster entirely**.
+
 ### Harness gap 1 — `discover()` indexed classes that cannot be run
 
 `run-suite.sh discover` finds candidates by *filename* (`*Tests.class`), which
@@ -361,15 +382,14 @@ it**.
 
 | class | state | note |
 |---|---|---|
-| `beans.PropertyDescriptorUtilsPropertyResolutionTests` | LOADERR | `OutOfMemoryError` during discovery of a JUnit `@ParameterizedClass` + `@FieldSource` class; reproduces in isolation at 2GB **and** 8GB heap, so it is a real allocation blow-up, not host contention |
+| `beans.PropertyDescriptorUtilsPropertyResolutionTests` | LOADERR | `OutOfMemoryError` after ~90s during discovery of a JUnit `@ParameterizedClass` + `@FieldSource` class. Reproduces in isolation at 2GB **and** 8GB heap, so it is a real allocation blow-up, not the host contention the section below guessed at |
 | `aot.nativex.FileNativeConfigurationWriterTests` | 2/7 | JSONAssert `Unexpected: comment` — the writer emits a `comment` key the expected JSON does not have |
 | `context.annotation.ConfigurationClassEnhancerTests` | 3/5 | `cce_enhance` ignores the `classLoader` argument and defines into the config class's own loader. Real Spring/CGLIB picks the defining loader per `ReflectUtils.defineClass`'s contextClass/SmartClassLoader rules, which the two failing methods assert case by case |
 | `core.annotation.MergedAnnotationsTests` | 177/178 | `equalsForSynthesizedAnnotations` — a synthesized annotation and a real one are not `equals()`; their `toString()`s show one is a real JDK annotation proxy and the other CratonVM's synthetic |
 | `core.io.ModuleResourceTests` | 2/3 | `ModuleResource(Introspector.class.getModule(), "java/beans/Introspector.class").exists()` is false |
-| `core.io.support.PathMatchingResourcePatternResolverTests` | 19/22 | `encodedHashtagInPath`, plus two `javaDashJarFinds*ClassPathManifestEntries` (`NoSuchElementException: No value present`) |
+| `core.io.support.PathMatchingResourcePatternResolverTests` | 19/22 | HotSpot is 22/22 in the same checkout, so all three are genuine. `encodedHashtagInPath` is root-caused: `URLClassLoader.getResource`/`getResources` return the resource URL with the base URL's percent-escapes **decoded** (`file:/…/custom#root/scanned/` where HotSpot keeps `custom%23root`), and a raw `#` in a URL is a fragment delimiter, so everything after it is lost downstream. `probes/UclProbe.java` is a 5-line repro. `classloader.rs::file_url_spec` already encodes correctly but is only used by `getURLs()`/manifest entries — the `getResource` return path builds its URL somewhere else. The two `javaDashJarFinds*ClassPathManifestEntries` are separate (`NoSuchElementException: No value present`) |
 | `orm.jpa.support.PersistenceInjectionTests` | 26/27 | unchanged from the older section below |
 | `scripting.groovy.GroovyScriptFactoryTests` | 27/38 | `NoClassDefFoundError` for classes GroovyClassLoader compiles from `.groovy` sources (`GroovyCalculator`, `TestFactoryBean`, `GroovyMessenger2`, `TestCustomizer`) |
-| `test.context.async.AsyncMethodsSpringTestContextIntegrationTests` | EMPTY | `@RepeatedTest(200)` discovery gap |
 | `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | 0/2 | JUnit parallel execution × `ApplicationEvents` |
 | `test.web.servlet.assertj.MockMvcTesterIntegrationTests` | 72/74 | `MockMvcTester.debug()` output-stream capture |
 | `util.SerializationUtilsTests` | 8/9 | `ObjectInputStream.readObject` on a stream naming an undefined class throws `InvalidClassException` where the JDK throws `ClassNotFoundException`; `Class.forName` itself is correct, so the swallow is inside the deserializer |
