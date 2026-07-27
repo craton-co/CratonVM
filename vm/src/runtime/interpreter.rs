@@ -6248,7 +6248,7 @@ pub fn execute(
                             .ok()
                             .map(|tid| {
                                 let cm2 = shared.classes.class_manager.read();
-                                is_elidable_construction(&cm2, tid)
+                                is_elidable_construction(shared, &cm2, tid)
                             })
                             .unwrap_or(false);
                         if dbg_ctor {
@@ -33954,7 +33954,7 @@ fn compile_osr_artifact(
                     .ok()
                     .map(|tid| {
                         let cm2 = shared.classes.class_manager.read();
-                        is_elidable_construction(&cm2, tid)
+                        is_elidable_construction(shared, &cm2, tid)
                     })
                     .unwrap_or(false);
                 let info_class: &str = if elidable {
@@ -34781,10 +34781,39 @@ fn resolve_jit_new_site(
 /// which admits arbitrary calls (e.g. `register(this)`) that escape the receiver
 /// — unsound to elide. (A future refinement may recurse the super chain to admit
 /// non-`Object` supers whose `<init>` is itself elidable.)
-fn is_elidable_construction(cm: &crate::classloading::ClassManager, class_id: ClassId) -> bool {
+fn is_elidable_construction(
+    shared: &SharedVm,
+    cm: &crate::classloading::ClassManager,
+    class_id: ClassId,
+) -> bool {
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
+    // A REGISTERED NATIVE SHADOWS THE BYTECODE CONSTRUCTOR. `invokespecial`
+    // always prefers a registered native over bytecode, so a trivial-looking
+    // `<init>()V` body says nothing about what actually runs — and eliding the
+    // call skips the native's side effects entirely.
+    //
+    // `java/util/HashMap.<init>()V` is exactly this shape: an empty bytecode
+    // constructor plus `native_map_init`, which allocates the 16-bucket table
+    // and initialises size/threshold. With the call elided, a JIT-compiled
+    // `new HashMap<>()` left `table` null; the first `put` then materialised
+    // the table through `map_resize`, which DOUBLED the assumed default to 32
+    // buckets. Every JIT-created HashMap therefore iterated its keys in a
+    // different order than an interpreter-created one holding the same keys —
+    // found as a json-smart parse/serialize/re-parse round-trip mismatch at the
+    // exact iteration `JSONParserBase.readObject` tiered up
+    // (docs/internal/jsonsmart-parser-jit-retired-20260727.md). The companion
+    // `map_resize` fix makes the fallback capacity correct; this one keeps the
+    // native constructor running in the first place.
+    if shared
+        .natives
+        .native_methods
+        .find(&class.name, "<init>", "()V")
+        .is_some()
+    {
+        return false;
+    }
     let Some(init) = class.find_method("<init>", "()V") else {
         return false;
     };
@@ -35046,7 +35075,7 @@ fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: ClassId, cp_
     };
     // 3. Check elidability (brief `cm` read).
     let cm = shared.classes.class_manager.read();
-    let elidable = is_elidable_construction(&cm, target_id);
+    let elidable = is_elidable_construction(shared, &cm, target_id);
     // DBG (CRATONVM_DBG_CTOR_FIX): when this resolves an elidable ctor whose
     // target `find_class_by_name` could NOT see, it is the app-class gap being
     // closed (the old resolver would have returned false here).
@@ -37722,7 +37751,7 @@ fn resolve_inline_site(
         }
         let elidable = target_class == "java/lang/Object" || {
             match cm.find_class_by_name_for_class(target_class, declaring_id) {
-                Some(tid) => is_elidable_construction(&cm, tid),
+                Some(tid) => is_elidable_construction(shared, &cm, tid),
                 None => false,
             }
         };

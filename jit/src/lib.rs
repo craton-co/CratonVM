@@ -7246,6 +7246,26 @@ fn try_compile_inner(
         return None;
     }
 
+    // Diagnostic for the "hot method never compiles" shape: every constant-pool
+    // resolver below can come back `None`, and each such miss silently bails the
+    // whole compile with `backend_attempted = false` (a *transient* bail, retried
+    // until `MAX_TIER_FAIL_RETRIES`, after which the method interprets forever).
+    // `CRATONVM_DBG_JITC=1` previously reported only that the bail happened;
+    // naming the resolver is what turns that into an actionable report.
+    macro_rules! jitc_bail {
+        ($site:expr) => {
+            return {
+                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!(
+                        "[cratonvm-jitc] resolver-bail site={} {}.{}{}",
+                        $site, cached.class_name, cached.method_name, cached.method_descriptor
+                    );
+                }
+                None
+            }
+        };
+    }
+
     let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
         Some(s) => s,
         None => {
@@ -8115,9 +8135,13 @@ fn try_compile_inner(
     // Resolve multianewarray entries
     let mut mna_info = Vec::new();
     if !scan.multianewarray_ops.is_empty() {
-        let resolver = cp_class_name_resolver?;
+        let Some(resolver) = cp_class_name_resolver else {
+            jitc_bail!("cp_class_name_resolver(multianewarray)")
+        };
         for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
-            let class_name = resolver(cp_idx)?;
+            let Some(class_name) = resolver(cp_idx) else {
+                jitc_bail!("multianewarray_class")
+            };
             let leaf = class_name.trim_start_matches('[');
             let leaf_et = match leaf.as_bytes().first() {
                 Some(b'I') => 10u8,
@@ -8142,9 +8166,13 @@ fn try_compile_inner(
     let mut compact_field_info: Vec<(usize, u32, bool)> = Vec::new();
     let compact_fields = cratonvm_types::compact_ref_fields_enabled();
     if !scan.field_ops.is_empty() {
-        let resolver = cp_field_resolver?;
+        let Some(resolver) = cp_field_resolver else {
+            jitc_bail!("cp_field_resolver")
+        };
         for &(pc, cp_idx) in &scan.field_ops {
-            let (field_index, type_tag, compact_slot) = resolver(cp_idx)?;
+            let Some((field_index, type_tag, compact_slot)) = resolver(cp_idx) else {
+                jitc_bail!("field_resolve")
+            };
             field_info.push((pc, field_index, type_tag));
             // Only a genuinely-resolved compact slot may enter the inline
             // emitter's compact-offset map. `None` (no registered layout, or
@@ -8168,9 +8196,13 @@ fn try_compile_inner(
     let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
     let mut owned_strings: Vec<Box<str>> = Vec::new();
     if !scan.typecheck_ops.is_empty() {
-        let resolver = cp_class_name_resolver.as_ref()?;
+        let Some(resolver) = cp_class_name_resolver.as_ref() else {
+            jitc_bail!("cp_class_name_resolver(typecheck)")
+        };
         for &(pc, cp_idx) in &scan.typecheck_ops {
-            let class_name = resolver(cp_idx)?;
+            let Some(class_name) = resolver(cp_idx) else {
+                jitc_bail!("typecheck_class")
+            };
             let boxed: Box<str> = class_name.into_boxed_str();
             let ptr = boxed.as_ptr();
             let len = boxed.len();
@@ -8181,9 +8213,14 @@ fn try_compile_inner(
 
     let mut static_field_info: Vec<(usize, u32, usize, u8, bool)> = Vec::new();
     if !scan.static_field_ops.is_empty() {
-        let resolver = cp_static_field_resolver?;
+        let Some(resolver) = cp_static_field_resolver else {
+            jitc_bail!("cp_static_field_resolver")
+        };
         for &(pc, cp_idx) in &scan.static_field_ops {
-            let (class_id_raw, field_index, type_tag, is_volatile) = resolver(cp_idx)?;
+            let Some((class_id_raw, field_index, type_tag, is_volatile)) = resolver(cp_idx)
+            else {
+                jitc_bail!("static_field_resolve")
+            };
             static_field_info.push((pc, class_id_raw, field_index, type_tag, is_volatile));
         }
     }
@@ -8204,13 +8241,20 @@ fn try_compile_inner(
     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
     if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() {
-        let resolver = cp_new_resolver?;
+        let Some(resolver) = cp_new_resolver else {
+            jitc_bail!("cp_new_resolver")
+        };
         for &(pc, cp_idx) in &scan.new_ops {
-            let (class_id_raw, num_fields, has_prim_init, has_finalizer) = resolver(cp_idx)?;
+            let Some((class_id_raw, num_fields, has_prim_init, has_finalizer)) = resolver(cp_idx)
+            else {
+                jitc_bail!("new_resolve")
+            };
             new_info.push((pc, class_id_raw, num_fields, has_prim_init, has_finalizer));
         }
         for &(pc, cp_idx) in &scan.anewarray_ops {
-            let (class_id_raw, ..) = resolver(cp_idx)?;
+            let Some((class_id_raw, ..)) = resolver(cp_idx) else {
+                jitc_bail!("anewarray_resolve")
+            };
             anewarray_info.push((pc, class_id_raw));
         }
     }
@@ -8264,7 +8308,9 @@ fn try_compile_inner(
     // `is_double` flag and keeps just the bits.
     let mut ldc2w_info: Vec<(usize, i64)> = Vec::new();
     if !scan.ldc2w_ops.is_empty() {
-        let resolver = cp_ldc2w_resolver?;
+        let Some(resolver) = cp_ldc2w_resolver else {
+            jitc_bail!("cp_ldc2w_resolver")
+        };
         for &(pc, cp_idx) in &scan.ldc2w_ops {
             let (val, _is_double) = match resolver(cp_idx) {
                 Some(v) => v,
@@ -8331,9 +8377,13 @@ fn try_compile_inner(
     let resolved_string_layout: Option<StringFieldLayout> =
         string_layout_resolver.and_then(|r| r());
     if !scan.invoke_ops.is_empty() {
-        let resolver = cp_invoke_resolver?;
+        let Some(resolver) = cp_invoke_resolver else {
+            jitc_bail!("cp_invoke_resolver")
+        };
         for &(pc, cp_idx, opcode) in &scan.invoke_ops {
-            let (class_name, method_name, descriptor) = resolver(cp_idx)?;
+            let Some((class_name, method_name, descriptor)) = resolver(cp_idx) else {
+                jitc_bail!("invoke_resolve")
+            };
             let invoke_kind = match opcode {
                 0xb6 => 0u8,
                 0xb7 => 1,
@@ -8944,9 +8994,13 @@ fn try_compile_inner(
     // invokedynamic's stack effect.
     let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
     if !scan.indy_ops.is_empty() {
-        let resolver = cp_invokedynamic_descriptor_resolver?;
+        let Some(resolver) = cp_invokedynamic_descriptor_resolver else {
+            jitc_bail!("cp_invokedynamic_descriptor_resolver")
+        };
         for &(pc, cp_idx) in &scan.indy_ops {
-            let descriptor = resolver(cp_idx)?;
+            let Some(descriptor) = resolver(cp_idx) else {
+                jitc_bail!("indy_descriptor_resolve")
+            };
             let arg_slots = count_param_slots(&descriptor);
             let ret_type = return_type(&descriptor);
             let arg_type_tags = indy_arg_type_tags(&descriptor);

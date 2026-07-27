@@ -1189,6 +1189,20 @@ fn should_skip_jit_internal(
         // `CRATONVM_JIT_THRESHOLD=1` aggressive-compilation pass -- 0
         // failures in every configuration. No longer reproduces on current
         // dev. `JsonSmartProbe.java` is the regression witness.
+        //
+        // Re-confirmed 2026-07-27 against the stronger case that removal did
+        // not cover: real json-smart-2.6.0 (not 2.3), 10 varied documents,
+        // 300000 iterations = 3,000,000 parse/serialize/re-parse operations,
+        // with `JSONParserString.read`/`readS`/`JSONParserBase.skipSpace`
+        // verified JIT-compiled (CRATONVM_DBG_DUMP_JIT=LIST) -- 0 errors, and
+        // 0 again under CRATONVM_JIT_THRESHOLD=1. The residual that re-testing
+        // DID surface was VM-wide rather than json-smart's: the
+        // trivial-constructor elision dropped the native-shadowed
+        // `java/util/HashMap.<init>()V`, so a JIT-created HashMap got a
+        // 32-bucket table where the interpreter gives 16 (fixed in
+        // `is_elidable_construction`; regression net
+        // vm/tests/jit_collection_ctor_identity.rs). Full writeup:
+        // docs/internal/jsonsmart-parser-jit-retired-20260727.md.
         // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
         // The `InstantTests` failure cluster was not a Hibernate data bug: with
         // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`

@@ -5221,11 +5221,25 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
         None
     };
 
-    let (_old_buckets0, size, old_cap) = map_state(ctx, this);
+    let (old_buckets0, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
         return; // cannot grow further
     }
-    let new_cap = std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY);
+    // `native_map_put` also routes here to MATERIALISE a table for a map that
+    // has none (a JDK-bytecode constructor that leaves `table` null, or any
+    // path that skipped the synthetic `<init>` native). That is not a growth
+    // step: HotSpot's `resize()` on a null table allocates
+    // DEFAULT_INITIAL_CAPACITY buckets, it does not double. Doubling gave
+    // every lazily-initialised map a 32-bucket table where HotSpot has 16,
+    // which shifts every key's bucket index and makes iteration order diverge
+    // from HotSpot for the identical set of keys (found via a json-smart
+    // parse -> serialize -> re-parse round trip, where one map came from the
+    // interpreter and the other from JIT-compiled code).
+    let new_cap = if old_buckets0.is_none() {
+        std::cmp::max(old_cap, MAP_DEFAULT_CAPACITY as i32)
+    } else {
+        std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY)
+    };
     // gcstress residual face-1 fix — `alloc_ref_array` can trigger a moving
     // young GC (deterministic under CRATONVM_DBG_GC_STRESS) that relocates
     // `this` and its bucket array. Both were captured as bare Rust locals

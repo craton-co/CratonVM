@@ -215,8 +215,18 @@ still real correctness bugs worth closing):
   (`xerces_schema_jit_deny_prefix`), SnakeYAML emitter
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
-- JSONSMART-PARSER.1 — **DONE 2026-07-26 03:12 UTC: CONFIRMED still needed,
-  ban KEPT.** Standalone stress repro (`docs/known-issues/repros/jsonsmart/JsonSmartProbe.java`,
+- JSONSMART-PARSER.1 — **SUPERSEDED. Re-tested 2026-07-27: ban RETIRED, stays
+  removed from `skip_list.rs`; the package JIT-compiles and 3,000,000
+  round-trip parse operations produce 0 errors. The one real defect found was
+  VM-wide, not json-smart's: the trivial-constructor elision dropped the
+  native-shadowed `java/util/HashMap.<init>()V`, so JIT-created maps got a
+  32-bucket table and iterated in a different order than interpreter-created
+  ones — fixed, with `vm/tests/jit_collection_ctor_identity.rs` as the
+  regression net. Full writeup:
+  `docs/internal/jsonsmart-parser-jit-retired-20260727.md`. The 2026-07-26
+  verdict below is kept for history.**
+
+  ~~DONE 2026-07-26 03:12 UTC: CONFIRMED still needed, ban KEPT.~~ Standalone stress repro (`docs/known-issues/repros/jsonsmart/JsonSmartProbe.java`,
   10 varied JSON docs × 300k iterations, round-trip parse/serialize/re-parse
   check) against `json-smart-2.6.0.jar`. Baseline (ban in place): 0 errors
   in whatever it completed within a 200s budget (interpreted parsing is
@@ -228,7 +238,8 @@ still real correctness bugs worth closing):
   `"tab":"a\tb at position 12` → `character (a) at position 5`, all for the
   same doc) — a live-state-dependent miscompile signature, not a
   deterministic parser bug. Full writeup:
-  `docs/known-issues/jsonsmart-parser-still-needed.md`. Fourth-for-four
+  `docs/internal/jsonsmart-parser-jit-retired-20260727.md` (that doc was
+  renamed and rewritten when this verdict was superseded). Fourth-for-four
   real-app/faithful-repro confirmation this session that this ban family
   (`org/jboss/as/`, `org/h2/`, `com/unboundid/`, now this) is still fully
   live — nothing in it has been found safe to remove yet.

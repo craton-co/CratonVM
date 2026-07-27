@@ -23,7 +23,7 @@ retain full evidence/repro details; this file is the summary.
 | HIB-LONGTAIL.3 | `GenerationTargetToScript.<init>` | shadowing analysis |
 | HIB-ANTLR.1 | `org/antlr/v4/runtime/` | shadowed no-op (see below) |
 | TOMCAT-DOHEAD-JUNIT-ITERATOR.1 | `TestClass.collectAnnotatedMethodValues` | real junit-4.13.2, blanket-ban-lifted-too |
-| JSONSMART-PARSER.1 | `net/minidev/json/parser/` | real json-smart-2.3.jar |
+| JSONSMART-PARSER.1 | `net/minidev/json/parser/` | real json-smart-2.3.jar; re-confirmed 2026-07-27 against json-smart-2.6.0 (3M round-trip ops, 0 errors) — `docs/internal/jsonsmart-parser-jit-retired-20260727.md` |
 | SPB.9 | `org/slf4j/`,`ch/qos/logback/`,`org/apache/commons/logging/` | real jcl-over-slf4j+logback |
 | JASPER-JDT.2 | `org/eclipse/jdt/internal/compiler/parser/` | real Tomcat TestCompiler, 2x2 repeated runs |
 | JASPER-JDT.3 | `org/eclipse/jdt/internal/compiler/ast/` | real Tomcat TestFormAuthenticatorA, 2x2 repeated runs |

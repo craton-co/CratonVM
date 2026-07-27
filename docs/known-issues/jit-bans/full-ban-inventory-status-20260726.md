@@ -22,11 +22,20 @@ HIB-BIGINTEGER-AIOOBE.1/.2 staying active). NETTY.1's Arrays.fill entry
 was independently already-lifted before this multi-session effort even
 started.
 
+## Superseded by later re-testing
+
+- JSONSMART-PARSER.1 (`net/minidev/json/parser/`) — was listed here as
+  "confirmed still needed". **RETIRED 2026-07-27**: the ban is gone from
+  `skip_list.rs`, the package JIT-compiles, and 3,000,000 round-trip parse
+  operations produce 0 errors. The one real defect found on re-test was a
+  VM-wide JIT bug (a native-shadowed `HashMap.<init>()V` being elided by the
+  trivial-constructor optimisation), now fixed. See
+  `docs/internal/jsonsmart-parser-jit-retired-20260727.md`.
+
 ## CONFIRMED still needed, KEPT, each with a dedicated writeup
 
 - JAXB (`org/glassfish/jaxb/`) — `docs/known-issues/jaxb-still-needed-20260726.md`
 - ES fragile cluster (`org/elasticsearch/`) — no fixture, `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`
-- JSONSMART-PARSER.1 (`net/minidev/json/parser/`) — `docs/known-issues/jsonsmart-parser-still-needed.md`
 - SPB.1 (`org/springframework/util/`) — inconclusive real-app-less repro, `docs/known-issues/spb1-springframework-util-investigation.md`
 - TOMCAT-JNDIREALM-RDN.1 / JIT.2 (`com/unboundid/`) — real Tomcat suite, SIGSEGV confirmed, see `docs/known-issues/jit-skip-list-open-bans-20260725.md`
 - `org/jboss/as/` (WildFly boot, part of the SPB.8b/8c family) — real WildFly boot, `ModelTypeValidator.validTypes` NPE, `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`; WILDFLY-CONTROLLER-JIT.1 transitively confirmed via the same finding
