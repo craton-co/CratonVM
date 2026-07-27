@@ -189,6 +189,89 @@ bootstrap the override was written to avoid is supported now.
 `org.springframework.boot.tomcat.servlet.TomcatServletWebServerServletContextListenerTests`
 — 2/2 tests PASS on the fixed binary.
 
-### 5. Regression sweep
+### 5. Regression sweep — 583 classes, single-binary A/B, zero differences
 
-See the "Regression sweep" section appended below.
+`core/spring-boot` + `core/spring-boot-test` + `core/spring-boot-autoconfigure`
++ `module/spring-boot-tomcat` + `module/spring-boot-jetty` +
+`module/spring-boot-web-server` — the same 583-class list the parent
+investigation used (`broad-regress.tsv`), on the merged binary at
+`ed93c79a8`.
+
+Both arms are the **same binary**; the control arm only sets
+`CRATONVM_COMPAT=mockito-legacy-selectors`, which re-enables exactly the two
+native overrides this change turns off. That isolates the change itself from
+everything else moving on `dev`.
+
+| Arm | PASS | FAIL | CRASH | HANG | EMPTY |
+|---|---:|---:|---:|---:|---:|
+| fix (default) | 484 | 77 | 11 | 1 | 10 |
+| legacy (control) | 484 | 77 | 10 | 2 | 10 |
+
+A per-class diff of *(status, failed-test count)* across all **583/583** finds
+exactly **one** row differing, and it is not a behavioural difference:
+
+```
+org.springframework.boot.tomcat.autoconfigure.TomcatWebServerFactoryCustomizerTests
+    legacy = HANG  383.9s→420.1s  tests=0  panicked at jit\src\ir_lower.rs:2781
+    fix    = CRASH 383.9s         tests=0  panicked at jit\src\ir_lower.rs:2781
+```
+
+Same panic site, same zero tests run, in both arms — the class dies either way
+and only lands on opposite sides of the 420 s timeout cutoff. Raw results kept
+at `C:\craton\mockfallback-20260727\sweep-{fix,legacy}-results.tsv`.
+
+`EMPTY` is a harness artifact (abstract base test classes declaring no runnable
+tests of their own), unchanged between arms.
+
+## Not caused by this change: a large concurrent `dev` regression
+
+The 484/77/11 above is much worse than the 559 PASS / 12 FAIL / 2 HANG the
+parent investigation measured on the same 583 classes hours earlier. That gap
+is **upstream**, not from this change — the A/B above is the primary evidence
+(both arms are equally bad), and two independent checks agree:
+
+* `ConditionalOnPropertyTests` runs **38/38 PASS** on the pre-merge build of
+  this branch (`dev` at `60a710ad8` + this fix) and **38 FAIL** on the merged
+  build, failing with
+  `ClassCastException: class org.springframework.core.ResolvableType cannot be
+  cast to class org.springframework.core.ResolvableType` — same name, two
+  ClassIds, i.e. a duplicate-class-copy / loader-identity fault with no
+  connection to Mockito.
+* All 14 of the parent investigation's known non-passing classes are still
+  non-passing; roughly 75 classes are *newly* broken.
+
+Leading suspects in the 26-commit range, **not bisected**:
+
+* `a50ce9348 fix(classloading): eliminate loader-blind VM lookups` — migrated
+  47 production call sites across invocation, reflection, exception, proxy and
+  array paths from `find_class_by_name` to loader-aware variants and added
+  `#![deny(deprecated)]`. Its own doc records the verification as a `git grep`
+  returning no output plus 3 unit tests; no suite run. That is exactly the
+  shape that produces `X cannot be cast to X`.
+* `c1269e77c jit: share hashed megamorphic lowering across tiers` (and the
+  `099334deb` / `1b3662777` lowering merges) — every CRASH/HANG in the sweep
+  carries a JIT lowering panic: 4× `jit\src\ir_lower.rs:2781`, 2× `:2412`,
+  1× `:645`.
+
+`TomcatServletWebServerServletContextListenerTests`, the class the original
+known-issue doc cites, is part of this upstream regression: 2/2 PASS on the
+pre-merge build, 1/2 with `MissingWebServerFactoryBeanException` after the
+merge, and identically 1/2 with this change disabled via the legacy flag.
+
+## Harness notes (cost real time here; worth knowing)
+
+* `run-spring-boot-suite.ps1` sets `$ErrorActionPreference = 'Stop'`, so a
+  single transient `Add-Content` lock on `results.tsv` aborts the **whole**
+  run — while still printing its normal completion line. It happened twice
+  (at class 251 and 321). A sweep can report "done" having covered 43% of its
+  list; count rows, don't trust the exit. Worked around with
+  `C:\craton\mockfallback-20260727\sweep-resume.ps1`, which re-invokes until
+  the row count reaches the class count (the runner resumes correctly from
+  `results.tsv`).
+* Those aborts orphan the runner's child VM processes, which then keep running
+  forever with no parent to time them out — and were themselves the likely
+  source of the recurring `results.tsv` lock.
+* The 420 s per-class timeout does **not** reliably fire:
+  `ConfigurationPropertySourcesTests` ran **1530 s** (25 min) and PASSED in
+  both arms. So `HANG` classification is unreliable for long-running classes,
+  which is precisely what the single diffing row above turned out to be.
