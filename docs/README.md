@@ -72,6 +72,25 @@ Forward-looking proposals live under
 [`feature-designs/`](feature-designs/README.md); a proposal is not evidence that
 the feature is implemented.
 
+Current deep dives include:
+
+- [Compact object and field layout](architecture/compact-object-and-field-layout.md)
+- [Class-loader unloading](architecture/class-loader-unloading.md)
+- [Inline allocation and reference publication](architecture/inline-allocation-and-reference-publication.md)
+- [Continuation-backed virtual threads](architecture/continuation-backed-virtual-threads.md)
+- [JIT safepoint polls](architecture/jit-safepoint-polls.md)
+- [JIT cache sharding and code reclamation](architecture/jit-cache-sharding-and-code-reclamation.md)
+- [Register allocation, recursion, and inlining](architecture/register-allocation-recursion-and-inlining.md)
+- [Shared verified-code IR](architecture/shared-verified-code-ir.md)
+- [Native target-method metadata](architecture/native-target-method-metadata.md)
+- [Mapped JAR and shared class bytes](architecture/mapped-jar-shared-class-bytes.md)
+
+The canonical in-source lock hierarchy is
+[`../vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs). The
+[no-synthetic-stubs policy](contributing/no-synthetic-stubs.md) and
+[stub ratchet](contributing/stub-ratchet.md) govern application-visible JDK
+compatibility work.
+
 ## Compatibility and platform status
 
 - [Compatibility and Support Policy](book/src/reference/compatibility-policy.md)

@@ -5221,11 +5221,25 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
         None
     };
 
-    let (_old_buckets0, size, old_cap) = map_state(ctx, this);
+    let (old_buckets0, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
         return; // cannot grow further
     }
-    let new_cap = std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY);
+    // `native_map_put` also routes here to MATERIALISE a table for a map that
+    // has none (a JDK-bytecode constructor that leaves `table` null, or any
+    // path that skipped the synthetic `<init>` native). That is not a growth
+    // step: HotSpot's `resize()` on a null table allocates
+    // DEFAULT_INITIAL_CAPACITY buckets, it does not double. Doubling gave
+    // every lazily-initialised map a 32-bucket table where HotSpot has 16,
+    // which shifts every key's bucket index and makes iteration order diverge
+    // from HotSpot for the identical set of keys (found via a json-smart
+    // parse -> serialize -> re-parse round trip, where one map came from the
+    // interpreter and the other from JIT-compiled code).
+    let new_cap = if old_buckets0.is_none() {
+        std::cmp::max(old_cap, MAP_DEFAULT_CAPACITY as i32)
+    } else {
+        std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY)
+    };
     // gcstress residual face-1 fix — `alloc_ref_array` can trigger a moving
     // young GC (deterministic under CRATONVM_DBG_GC_STRESS) that relocates
     // `this` and its bucket array. Both were captured as bare Rust locals
@@ -9546,6 +9560,28 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let old = native_map_put(ctx, &put_args)?;
     let was_new = matches!(old, Some(Value::Object(None)));
     Ok(Some(Value::Int(if was_new { 1 } else { 0 })))
+}
+
+/// `HashSet.remove(Object)` against this VM's native backing map, for callers
+/// that registered their own override on a `HashSet` subclass and need the
+/// ordinary behaviour as a fallback.
+///
+/// Returns `None` when `this` has no native backing map, so the caller can
+/// still fall through to real bytecode. Falling through UNCONDITIONALLY is not
+/// safe: real `HashSet.remove` is `return map.remove(o) == PRESENT;`, and the
+/// synthetic backing map stores an `Int(1)` sentinel rather than JDK
+/// `HashSet.PRESENT` — so that identity comparison is always false and
+/// `remove()` deletes the element while reporting `false`.
+pub fn try_native_hashset_remove(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    hs_backing_map(ctx, this)?;
+    Some(native_hs_remove(ctx, args))
 }
 
 fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

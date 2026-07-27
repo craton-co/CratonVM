@@ -463,6 +463,19 @@ pub trait NativeClassAccess {
     /// `.class` bytes). Used to branch native helpers that must mirror JDK
     /// behaviour without registering natives that would override real JDK
     /// bytecode once the stub upgrades.
+    /// Would a name-based load of `name` be answered with a *fabricated
+    /// synthetic stub* (a class with no `Code` on any method, minted only so
+    /// enterprise bytecode can link) rather than a real class?
+    ///
+    /// Non-destructive: unlike [`Self::is_class_synthetic_stub`] it does not
+    /// load anything, so it can be used to decide whether to consult a real
+    /// `ClassLoader` *before* the stub is minted and registered globally.
+    /// Default `false` for contexts with no class manager.
+    fn would_fabricate_synthetic_stub(&self, name: &str) -> bool {
+        let _ = name;
+        false
+    }
+
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
         false
     }
@@ -1630,28 +1643,6 @@ pub trait NativeInvokeAccess: NativeClassAccess {
         self.invoke(class_name, method_name, descriptor, args)
     }
 
-    /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
-    /// native registered for `(class_name, method_name, descriptor)` and
-    /// must run that class's own real bytecode body directly.
-    ///
-    /// [`Self::invoke_special`] re-finds ANY registered native FIRST (see its
-    /// own contract) -- calling it from inside that same native re-enters it
-    /// (unbounded Rust-stack recursion). This variant skips that check
-    /// entirely and resolves straight to `class_name`'s own bytecode, still
-    /// with true invokespecial semantics: static binding on `class_name`'s
-    /// hierarchy, never virtual dispatch to a receiver's overriding
-    /// subclass. That distinction is the whole point -- the bug this exists
-    /// to fix was a native registered on `ThreadPoolExecutor.shutdown()`,
-    /// reached via `ScheduledThreadPoolExecutor.shutdown()`'s
-    /// `super.shutdown()`, which used `invoke_virtual_bytecode_only` (dynamic
-    /// receiver class) and so re-dispatched straight back into the STPE
-    /// override that called it -- `StackOverflowError` from infinite
-    /// self-recursion.
-    ///
-    /// `args[0]` MUST be the receiver, same contract as [`Self::invoke_special`].
-    ///
-    /// Default implementation falls back to [`Self::invoke_special`] -- safe
-    /// for any context with no such native-reentrancy hazard (mocks, tests).
     /// [`Self::invoke_special`] for a caller that ALREADY holds the declaring
     /// class's resolved `ClassId`.
     ///
@@ -1684,6 +1675,29 @@ pub trait NativeInvokeAccess: NativeClassAccess {
         let _ = class_id;
         self.invoke_special(class_name, method_name, descriptor, args)
     }
+
+    /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
+    /// native registered for `(class_name, method_name, descriptor)` and
+    /// must run that class's own real bytecode body directly.
+    ///
+    /// [`Self::invoke_special`] re-finds ANY registered native FIRST (see its
+    /// own contract) -- calling it from inside that same native re-enters it
+    /// (unbounded Rust-stack recursion). This variant skips that check
+    /// entirely and resolves straight to `class_name`'s own bytecode, still
+    /// with true invokespecial semantics: static binding on `class_name`'s
+    /// hierarchy, never virtual dispatch to a receiver's overriding
+    /// subclass. That distinction is the whole point -- the bug this exists
+    /// to fix was a native registered on `ThreadPoolExecutor.shutdown()`,
+    /// reached via `ScheduledThreadPoolExecutor.shutdown()`'s
+    /// `super.shutdown()`, which used `invoke_virtual_bytecode_only` (dynamic
+    /// receiver class) and so re-dispatched straight back into the STPE
+    /// override that called it -- `StackOverflowError` from infinite
+    /// self-recursion.
+    ///
+    /// `args[0]` MUST be the receiver, same contract as [`Self::invoke_special`].
+    ///
+    /// Default implementation falls back to [`Self::invoke_special`] -- safe
+    /// for any context with no such native-reentrancy hazard (mocks, tests).
 
     fn invoke_special_bytecode_only(
         &mut self,
@@ -4613,6 +4627,31 @@ impl NativeMethodRegistry {
                 class_name,
                 "java/lang/ref/Cleaner" | "java/lang/ref/Cleaner$Cleanable"
             )
+        {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `java/lang/ref/ReferenceQueue`
+        // CONSTRUCTOR so the real one runs. The synthetic ctor only writes the
+        // two-slot (head, size) shape this file's natives use; a real JDK 25
+        // `ReferenceQueue` additionally declares `private final Lock lock`,
+        // which the real `enqueue`/`poll`/`remove` bytecode synchronizes on.
+        // Leaving it null made every real `ReferenceQueue.enqueue()` throw
+        // `NullPointerException: Cannot enter synchronized block because
+        // "this.lock" is null` — reached from `Reference.enqueue()`, whose
+        // native already (correctly) delegates to the real `enqueue` bytecode
+        // for a real-layout Reference. Symptom: Spring's
+        // `ConcurrentReferenceHashMap` failing to purge stale entries, which
+        // aborts `AbstractApplicationContext.resetCommonCaches()` and hence
+        // any context refresh that has to be cancelled
+        // (`scripting.{bsh,config,groovy}.*` in the Spring suite).
+        //
+        // Only the constructor is dropped. `poll`/`remove` stay native: the
+        // GC's reference processor enqueues by writing the queue's head slot
+        // directly (`vm/src/runtime/interpreter.rs`) and never notifies the
+        // real `lock`, so real blocking `remove()` bytecode would wait forever.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/lang/ref/ReferenceQueue"
+            && method_name == "<init>"
         {
             return;
         }

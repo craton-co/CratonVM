@@ -43,3 +43,25 @@ Runner result roots:
 
 - `apps/spring-boot-suite-runner/.suite-zipkin-realsocket-20260718-019f768f/results/zipkin-final2-jit-019f768f/zipkin-final2-jit`
 - `apps/spring-boot-suite-runner/.suite-zipkin-realsocket-20260718-019f768f/results/zipkin-final2-nojit-019f768f/zipkin-final2-nojit`
+
+## Update 2026-07-23 — `ZipkinHttpClientSenderTests` regressed to 6/7 (`sendShouldCompressData` fails again)
+
+`craton-rerun-20260723` (`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard7/logs/module_spring-boot-zipkin.org.springframework.boot.zipkin.autoconfigure.ZipkinHttpClientSenderTests.out.log`)
+shows `sendShouldCompressData()` failing again with
+`org.assertj.core.error.AssertJMultipleFailuresError` — but the harness's
+`TestExecutionSummary.printFailuresTo` captured **no message body and no
+stack trace** past the 3-line call chain down to
+`ZipkinHttpClientSenderTests.java:168` (`assertThat(request).satisfies(assertions)`,
+line 148's lambda checking method/`Content-Type`/`Content-Encoding`/gzip body
+bytes). Which of the 4 `requestAssertions` sub-checks actually failed is
+**not determinable from this log alone** — not re-run to get a fuller capture
+(out of this triage pass's scope, log-reading only). Given this doc's fix was
+specifically about byte-exact DEFLATE/gzip output (`Deflater`/`GZIPOutputStream`
+routed through bundled stock zlib to match HotSpot's exact compressed bytes),
+the gzip-body assertion (`request.getBody().readByteArray()).isEqualTo(compressed)`)
+is the most likely candidate to have regressed, but this is **not confirmed**
+— could equally be one of the three simpler header/method assertions. Other
+6/7 tests in the class still pass. Flagged as a real residual needing a fresh
+run with fuller failure capture (e.g. `-Dassertj.printAssertionsMessages` or
+just re-running just this method in isolation) before it can be root-caused
+further.

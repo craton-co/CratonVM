@@ -2288,12 +2288,15 @@ fn process_references_after_gc(
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
         let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.mem.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
-        let size = match shared.mem.heap.get_field(q_obj, 1) {
-            // RQ_FIELD_SIZE
-            Value::Int(v) => v,
-            _ => 0,
+        // RQ_FIELD_SIZE. Slot 1 is `size` in the synthetic two-slot shape but
+        // `queueLength` — a `long` — on a real JDK ReferenceQueue, whose own
+        // `enqueue0`/`poll0` bytecode reads it back. Preserve the stored width.
+        let new_size = match shared.mem.heap.get_field(q_obj, 1) {
+            Value::Long(v) => Value::Long(v + 1),
+            Value::Int(v) => Value::Int(v + 1),
+            _ => Value::Int(1),
         };
-        shared.mem.heap.set_field(q_obj, 1, Value::Int(size + 1));
+        shared.mem.heap.set_field(q_obj, 1, new_size);
         // Mark as enqueued — sentinel Int(1) distinguishes from "never had queue"
         shared.mem.heap.set_field(ref_obj, 1, Value::Int(1)); // REF_FIELD_QUEUE = enqueued sentinel
     }
@@ -6248,7 +6251,7 @@ pub fn execute(
                             .ok()
                             .map(|tid| {
                                 let cm2 = shared.classes.class_manager.read();
-                                is_elidable_construction(&cm2, tid)
+                                is_elidable_construction(shared, &cm2, tid)
                             })
                             .unwrap_or(false);
                         if dbg_ctor {
@@ -19508,6 +19511,32 @@ pub(crate) fn resolve_class_loader_aware(
     // additive — only fires on what would already be a resolution failure, so
     // it never changes a previously-successful (or differently-failing)
     // resolution.
+    // A name the global path can only answer with a *fabricated synthetic
+    // stub* must be offered to the referencing class's own loader FIRST.
+    // `load_class_concurrent` would otherwise register that stub globally
+    // under `Application`, after which the real loader can never define its
+    // own copy -- and a stub has no `Code` and implements no interfaces, so
+    // the first real use fails (`VerifyError`, or a `ClassCastException` on
+    // an interface the real class does implement). Quarkus's fast-jar
+    // `RunnerClassLoader` serving `lib/quarkus/generated-bytecode.jar` is the
+    // case this was written for: `new ValueRegistry_..._Synthetic_Bean()` from
+    // generated Arc bytecode resolved to a stub, which then could not be cast
+    // to `io.quarkus.arc.InjectableBean`. Strictly additive -- it only
+    // pre-empts an answer that was going to be fake.
+    if cratonvm_native_builtins::classloader::any_defining_loader_registered()
+        && shared
+            .classes
+            .class_manager
+            .read()
+            .would_fabricate_synthetic_stub(name)
+    {
+        if let Some(id) = drive_defining_loader_load(shared, thread, referencing_class_id, name) {
+            if dbg_trace {
+                eprintln!("[LOADER-TRACE] name={name} resolved via would-stub loader drive {id:?}");
+            }
+            return Ok(id);
+        }
+    }
     match shared.load_class_concurrent(name) {
         Ok(id) => {
             if dbg_trace {
@@ -19536,7 +19565,7 @@ pub(crate) fn resolve_class_loader_aware(
 /// loader's `loadClass` does not produce a class — in every such case the caller
 /// falls back to global resolution, so this can only ever resolve MORE classes,
 /// never fail one that global resolution would have answered.
-fn drive_defining_loader_load(
+pub(crate) fn drive_defining_loader_load(
     shared: &SharedVm,
     thread: &mut JvmThread,
     referencing_class_id: ClassId,
@@ -34028,7 +34057,7 @@ fn compile_osr_artifact(
                     .ok()
                     .map(|tid| {
                         let cm2 = shared.classes.class_manager.read();
-                        is_elidable_construction(&cm2, tid)
+                        is_elidable_construction(shared, &cm2, tid)
                     })
                     .unwrap_or(false);
                 let info_class: &str = if elidable {
@@ -34855,10 +34884,39 @@ fn resolve_jit_new_site(
 /// which admits arbitrary calls (e.g. `register(this)`) that escape the receiver
 /// — unsound to elide. (A future refinement may recurse the super chain to admit
 /// non-`Object` supers whose `<init>` is itself elidable.)
-fn is_elidable_construction(cm: &crate::classloading::ClassManager, class_id: ClassId) -> bool {
+fn is_elidable_construction(
+    shared: &SharedVm,
+    cm: &crate::classloading::ClassManager,
+    class_id: ClassId,
+) -> bool {
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
+    // A REGISTERED NATIVE SHADOWS THE BYTECODE CONSTRUCTOR. `invokespecial`
+    // always prefers a registered native over bytecode, so a trivial-looking
+    // `<init>()V` body says nothing about what actually runs — and eliding the
+    // call skips the native's side effects entirely.
+    //
+    // `java/util/HashMap.<init>()V` is exactly this shape: an empty bytecode
+    // constructor plus `native_map_init`, which allocates the 16-bucket table
+    // and initialises size/threshold. With the call elided, a JIT-compiled
+    // `new HashMap<>()` left `table` null; the first `put` then materialised
+    // the table through `map_resize`, which DOUBLED the assumed default to 32
+    // buckets. Every JIT-created HashMap therefore iterated its keys in a
+    // different order than an interpreter-created one holding the same keys —
+    // found as a json-smart parse/serialize/re-parse round-trip mismatch at the
+    // exact iteration `JSONParserBase.readObject` tiered up
+    // (docs/internal/jsonsmart-parser-jit-retired-20260727.md). The companion
+    // `map_resize` fix makes the fallback capacity correct; this one keeps the
+    // native constructor running in the first place.
+    if shared
+        .natives
+        .native_methods
+        .find(&class.name, "<init>", "()V")
+        .is_some()
+    {
+        return false;
+    }
     let Some(init) = class.find_method("<init>", "()V") else {
         return false;
     };
@@ -35120,7 +35178,7 @@ fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: ClassId, cp_
     };
     // 3. Check elidability (brief `cm` read).
     let cm = shared.classes.class_manager.read();
-    let elidable = is_elidable_construction(&cm, target_id);
+    let elidable = is_elidable_construction(shared, &cm, target_id);
     // DBG (CRATONVM_DBG_CTOR_FIX): when this resolves an elidable ctor whose
     // target `find_class_by_name` could NOT see, it is the app-class gap being
     // closed (the old resolver would have returned false here).
@@ -37796,7 +37854,7 @@ fn resolve_inline_site(
         }
         let elidable = target_class == "java/lang/Object" || {
             match cm.find_class_by_name_for_class(target_class, declaring_id) {
-                Some(tid) => is_elidable_construction(&cm, tid),
+                Some(tid) => is_elidable_construction(shared, &cm, tid),
                 None => false,
             }
         };

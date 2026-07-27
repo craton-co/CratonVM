@@ -2,6 +2,19 @@
 
 **Status: FIXED — verified 2026-07-19**
 
+> **Regression note (2026-07-23):** Cluster B's `http_parse_url` fix (the
+> `'/' | '?' | '#'` authority/path split below) is **no longer present** in
+> the code — confirmed absent at both this worktree's HEAD and `origin/dev`'s
+> tip as of 2026-07-27. `BasicErrorControllerIntegrationTests` reproduces the
+> exact same 5/26 "bad port" failures again in the `craton-rerun-20260723`
+> results. Root-caused to a silent merge: `b0dd2e726` (2026-07-07, merged into
+> `dev` after this fix landed) carried its own rewrite of `http_parse_url`
+> based on the pre-fix version, silently dropping the `?`/`#` handling while
+> adding unrelated `userinfo`-authority parsing. See
+> [`../../known-issues/springboot/http-parse-url-query-only-authority-split-regression-20260723.md`](../../known-issues/springboot/http-parse-url-query-only-authority-split-regression-20260723.md)
+> for the full analysis and re-fix direction. Cluster A (`MappingMatch`
+> `<clinit>`) and the timeout-override config change are unaffected by this.
+
 ## Cluster A — `RemappedErrorViewIntegrationTests#forwardToErrorPage`: root mapping never invoked under a context path — FIXED
 
 ### Root cause

@@ -515,15 +515,10 @@ fn t7_clipboard_operations() {
 
 #[test]
 fn t7_4_1_javafx_documented_as_out_of_tree() {
-    // The status doc was relocated under docs/internal/gaps/ by the
-    // known-issues triage convention; follow it to its current home.
-    let doc_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../docs/internal/gaps/javafx-status.md"
-    );
+    let doc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/javafx-status.md");
     assert!(
         std::path::Path::new(doc_path).exists(),
-        "docs/internal/gaps/javafx-status.md should exist documenting JavaFX as out-of-tree"
+        "docs/javafx-status.md should exist documenting JavaFX as out-of-tree"
     );
     let content = std::fs::read_to_string(doc_path).unwrap();
     assert!(
