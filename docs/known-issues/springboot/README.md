@@ -45,7 +45,7 @@ smaller/individual differences not yet clustered.
 > `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`,
 > `DataRedisHealthContributorAutoConfigurationTests` — see
 > `RESULTS-20260723.md`'s residual table) is fixed — see
-> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
+> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](../../internal/fixed-suite-bugs/springboot/data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
 > Root cause: `URLClassLoader.findClass`/`findResource` rebuilt the whole
 > classpath scan from scratch on every call (no caching), and `JarFile`
 > entry lookups eagerly decompressed every entry in a jar just to answer an
@@ -138,8 +138,14 @@ rather than assuming closed or re-investigating from scratch.
 > constructed via `Assertions.assertThat(String)`, not via direct
 > construction — reduced to a 100% reproducing ~15-line standalone repro, not
 > yet root-caused to file:line, likely masking real failure messages broadly
-> across the suite since `assertThat(someString)` is ubiquitous). OPEN — see
-> [`micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md`](micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md).
+> across the suite since `assertThat(someString)` is ubiquitous). **CLOSED
+> 2026-07-26** — moved to
+> [`../../internal/fixed-suite-bugs/springboot/micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals-FIXED.md`](../../internal/fixed-suite-bugs/springboot/micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals-FIXED.md).
+> The NPE was CratonVM's own `native_assertj_lightweight_comparable_assert`
+> shim building `AbstractAssert` without running its constructor (fixed by
+> `fdc852f558`, bisect-confirmed); the two real failures it had been masking
+> were a single loader-blind lambda-impl resolution in the native-callback
+> dispatcher (`vm/src/vm/vm_exec.rs`). The module is now 9/9 classes PASS.
 
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 

@@ -19213,7 +19213,9 @@ pub(crate) fn resolve_class_loader_aware(
             || name.contains("DefaultCacheAwareContextLoaderDelegate")
             || name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
             || name.contains("PathRequestTests")
-            || name.contains("ManagementWebSecurityAutoConfigurationTests"));
+            || name.contains("ManagementWebSecurityAutoConfigurationTests")
+            || name.contains("WebSocketMessaging")
+            || name.contains("Jackson2WebSocketMessageConverterConfiguration"));
     if dbg_trace {
         let cm = shared.classes.class_manager.read();
         let ref_name = cm
@@ -19313,6 +19315,34 @@ pub(crate) fn resolve_class_loader_aware(
             return Ok(id);
         }
         if isolated_url_definition {
+            if crate::runtime::env_cache::dbg_isolated_cnf() {
+                let (ref_name, ref_loader) = {
+                    let cm = shared.classes.class_manager.read();
+                    (
+                        cm.get_class(referencing_class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default(),
+                        cm.get_loader_id(referencing_class_id),
+                    )
+                };
+                let global = shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .find_class_by_name(name);
+                eprintln!(
+                    "[ISOLATED-CNF] name={name} referencing={referencing_class_id:?}/{ref_name} (loader={ref_loader:?}) global_would_be={global:?}"
+                );
+                for (i, f) in thread.frames.iter().enumerate().rev().take(14) {
+                    eprintln!(
+                        "[ISOLATED-CNF]   [{i}] {}.{}{} pc={}",
+                        f.class_name(),
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.pc
+                    );
+                }
+            }
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         let fallback = shared.load_class_concurrent(name);
@@ -19397,6 +19427,9 @@ fn drive_defining_loader_load(
     }
     let key = referencing_class_id.as_u32();
     if IN_FLIGHT.with(|s| s.borrow().iter().any(|(c, n)| *c == key && n == name)) {
+        if crate::runtime::env_cache::dbg_isolated_cnf() {
+            eprintln!("[ISOLATED-CNF] drive declined: IN_FLIGHT re-entry name={name} cid={key}");
+        }
         return None;
     }
     let cache_loader = shared
@@ -19467,6 +19500,27 @@ fn drive_defining_loader_load(
             }
             return Some(id);
         }
+        if crate::runtime::env_cache::dbg_isolated_cnf() {
+            eprintln!("[ISOLATED-CNF] drive declined: mirror had no ClassId name={name}");
+        }
+        return None;
+    }
+    if crate::runtime::env_cache::dbg_isolated_cnf() {
+        let shape = match &result {
+            Ok(Some(Value::Object(None))) => "Ok(null)".to_string(),
+            Ok(None) => "Ok(void)".to_string(),
+            Ok(Some(v)) => format!("Ok(non-object {v:?})"),
+            Err(MethodCallFailed::ExceptionThrown(exc)) => {
+                let cm = shared.classes.class_manager.read();
+                let cid = Some(shared.mem.heap.class_id_of(*exc));
+                let cname = cid
+                    .and_then(|c| cm.get_class(c).map(|k| k.name.to_string()))
+                    .unwrap_or_default();
+                format!("Err(thrown {cname})")
+            }
+            Err(e) => format!("Err({e:?})"),
+        };
+        eprintln!("[ISOLATED-CNF] drive declined: loadClass -> {shape} name={name}");
     }
     None
 }
