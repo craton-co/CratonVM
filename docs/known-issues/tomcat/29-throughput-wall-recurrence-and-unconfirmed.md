@@ -58,6 +58,20 @@ Distinct in kind from `23-charsetcache-pathological-slowdown.md` (that one
 is a 3x slowdown of the supposedly-faster path — a real defect, not just
 "not yet as fast as HotSpot").
 
+> **Update 2026-07-27 — one member of this family is now root-caused, and it
+> is NOT a diffuse interpreter ceiling.**
+> `org.apache.tomcat.util.http.TestMethodPerformance` was chased down to two
+> *named* JIT-admission gates that leave its entire hot path interpreted: the
+> loop method is permanently OSR-denied by the RBC.7 `invokedynamic` ban
+> (triggered by its trailing `println("…" + duration + "ns")` string-concats),
+> and `StringCache.toString` is refused outright by the RBC.6
+> exception-handler-safety gate (triggered by its `synchronized` block's
+> javac-generated monitor handler). Full analysis, probe table, and fix
+> directions: [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md).
+> Worth checking whether the other relative-performance-assertion classes
+> above fail the same way — `CRATONVM_DBG_JITC=1 CRATONVM_DBG_RBC6=1` names
+> the gate in one run.
+
 ## Unconfirmed / contention-suspected — do not treat as new regressions without a clean rerun
 
 - **`org.apache.jasper.compiler.TestGenerator`** — FAILed with a clean NPE

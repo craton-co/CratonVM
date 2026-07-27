@@ -21,22 +21,23 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [08](08-importhandler-standard-packages-npe-FAIL.md) | ModuleFinder.ofSystem/jimage ModuleReader.list | jakarta.el.TestImportHandlerStandardPackages | FAIL | ✅ **FIXED** (peer) |
 | [09](09-objectstreamclass-recordsupport-missing.md) | ObjectStreamClass$RecordSupport (record serialization) | catalina.realm.TestGenericPrincipal | NOSUMMARY | ✅ **FIXED** (peer) — TestJNDIRealm residual now FIXED in [13](13-hashtable-clone-cce-jndirealm-FIXED.md) |
 | [13](13-hashtable-clone-cce-jndirealm-FIXED.md) | `Hashtable.clone()` casts synthetic native entry → CCE | catalina.realm.TestJNDIRealm | FAIL | ✅ **FIXED** |
-| [04](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md) | Embedded-server deployment throughput wall | (most catalina/coyote) | perf | 🔴 **OPEN** (dominant — most HANGs) |
+| [04](04-embedded-server-throughput-wall-OPEN.md) | Embedded-server deployment throughput wall | (most catalina/coyote) | perf | 🔴 **OPEN** (dominant — most HANGs) |
 | [06](06-openssl-ffm-clinit-segv-CRASH.md) | `Method.invoke` GC stale-ref under load (mis-blamed on OpenSSL FFM) | catalina.util.TestServerInfo | CRASH | ✅ **FIXED** — NOT an FFM bug (see note) |
 | [10](10-pagecontext-npe-contains-null-FAIL.md) | Embedded-server serving wall (null response body; re-diagnosed → group 04, NOT a JSP/EL bug) | jakarta.servlet.jsp.TestPageContext | FAIL | 🔴 **OPEN** (→ 04) |
 | [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 | [14](14-classpath-url-protocol-not-registered-FIXED.md) | `classpath:` URL scheme unresolvable (`VM.isBooted` false → factory bypassed; pre-clinit factory publish; synthetic `URI.toURL` allowlist; webapp-TCCL resource scoping; `file:`-dir listing) | TestClasspathUrlStreamHandler, TestConfigFileLoader, TestPropertiesRoleMappingListener | FAIL | ✅ **FIXED** |
 | [16](16-full-suite-6shard-rerun-20260721.md) | Full 646-class Linux 6-shard run + HotSpot control diff (corrected 2026-07-24 for a harness CWD bug) | **91 classes** (was miscounted as 23) | FAIL/HANG/CRASH | 🔴 **OPEN** (individually undiagnosed, like 05) |
 | [18](18-fixture-environment-gaps-20260724.md) | True Linux fixture gaps (httpd/OCSP/LargeHeap/missing conf-Catalina-localhost/missing ant.jar), categorized by root cause | 35 classes | FAIL/HANG/CRASH | 🔴 **OPEN** (not CratonVM bugs — fixture completion work); its category J (9 classes, HANG-classification) turned out NOT to be a fixture gap at all — ✅ **FIXED**, see [hang-classification-unconfirmed-host-contention-FIXED.md](hang-classification-unconfirmed-host-contention-FIXED.md) |
-| [21](../../../known-issues/tomcat/21-tls-handshake-enforcement-gap.md) | TLS handshake enforcement too loose/too strict (SNI, cipher/protocol allow-lists, client-cert) | 8 classes (TestSsl, TestSSLHostConfig{Compat,Cipher,Protocol}, TestSslHandshakeFailure, TestClientCert, TestCustomSslTrustManager, TestResolverSSL) | FAIL | 🔴 **OPEN** |
-| [22](../../../known-issues/tomcat/22-tribes-realnetwork-membership-bug.md) | Tribes real-socket group-membership undercounting | TestTcpFailureDetector, TestNonBlockingCoordinator | FAIL | 🔴 **OPEN** |
-| [23](../../../known-issues/tomcat/23-charsetcache-pathological-slowdown.md) | `CharsetCache`'s "cached" path is 3x SLOWER than uncached | TestCharsetCachePerformance | FAIL/perf | 🔴 **OPEN** |
-| [24](../../../known-issues/tomcat/24-stringcache-oom-under-load.md) | `StringCache.toString()` OOMs under sustained load at a heap HotSpot handles fine | TestMethodPerformance | FAIL | 🔴 **OPEN** |
-| [25](../../../known-issues/tomcat/25-charchunk-tostring-null-vs-empty.md) | `CharChunk.toString()` returns `""` not `null` when empty/recycled | TestCharChunk | FAIL | 🔴 **OPEN** (small, well-isolated) |
-| [26](../../../known-issues/tomcat/26-defaultinstancemanager-classunload-offbyone.md) | Class-unload count off-by-one (9 vs 8) | TestDefaultInstanceManager | FAIL | 🔴 **OPEN** |
-| [27](../../../known-issues/tomcat/27-xxxendpoint-unix-domain-socket-init-failure.md) | Unix domain socket connector init fails | TestXxxEndpoint | FAIL | 🔴 **OPEN** |
-| [28](../../../known-issues/tomcat/28-http2-largeupload-byte-mismatch.md) | HTTP/2 large POST truncated to ~1/5 expected bytes (flow-control suspect) | TestLargeUpload | FAIL | 🔴 **OPEN** |
-| [29](../../../known-issues/tomcat/29-throughput-wall-recurrence-and-unconfirmed.md) | Throughput-wall recurrence (HostConfig/Http2Section_8_2), relative-perf-assertion family, 2 contention-suspected, 1 Windows-only fixture gap | ~11 classes | mixed | see doc (not new bugs) |
+| [21](21-tls-handshake-enforcement-gap.md) | TLS handshake enforcement too loose/too strict (SNI, cipher/protocol allow-lists, client-cert) | 8 classes (TestSsl, TestSSLHostConfig{Compat,Cipher,Protocol}, TestSslHandshakeFailure, TestClientCert, TestCustomSslTrustManager, TestResolverSSL) | FAIL | 🔴 **OPEN** |
+| [22](22-tribes-realnetwork-membership-bug.md) | Tribes real-socket group-membership undercounting | TestTcpFailureDetector, TestNonBlockingCoordinator | FAIL | 🔴 **OPEN** |
+| [23](23-charsetcache-pathological-slowdown.md) | `CharsetCache`'s "cached" path is 3x SLOWER than uncached | TestCharsetCachePerformance | FAIL/perf | 🔴 **OPEN** |
+| [24](24-stringcache-oom-under-load.md) | `StringCache.toString()` OOMs under sustained load at a heap HotSpot handles fine — NOT a StringCache bug: the GC-overhead limit scored every non-moving young sweep as "freed 0" (silently-reverted `a9c580aff` metric) | TestMethodPerformance | FAIL | ✅ **FIXED** — throughput residual tracked in [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md) |
+| [25](25-charchunk-tostring-null-vs-empty.md) | `CharChunk.toString()` returns `""` not `null` when empty/recycled | TestCharChunk | FAIL | 🔴 **OPEN** (small, well-isolated) |
+| [26](26-defaultinstancemanager-classunload-offbyone.md) | Class-unload count off-by-one (9 vs 8) | TestDefaultInstanceManager | FAIL | 🔴 **OPEN** |
+| [27](27-xxxendpoint-unix-domain-socket-init-failure.md) | Unix domain socket connector init fails | TestXxxEndpoint | FAIL | 🔴 **OPEN** |
+| [28](28-http2-largeupload-byte-mismatch.md) | HTTP/2 large POST truncated to ~1/5 expected bytes (flow-control suspect) | TestLargeUpload | FAIL | 🔴 **OPEN** |
+| [29](29-throughput-wall-recurrence-and-unconfirmed.md) | Throughput-wall recurrence (HostConfig/Http2Section_8_2), relative-perf-assertion family, 2 contention-suspected, 1 Windows-only fixture gap | ~11 classes | mixed | see doc (not new bugs) |
+| [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md) | Hot path fully interpreted: the loop method is OSR-denied by the RBC.7 `invokedynamic` ban (its trailing `println("…" + n)` string-concats), and `StringCache.toString` is refused by the RBC.6 handler-safety gate (its `synchronized` block's monitor handler) | TestMethodPerformance | perf | 🔴 **OPEN** (residual of 24) |
 
 9 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
@@ -141,5 +142,5 @@ well-isolated CratonVM-only bugs** confirmed reproducing identically across
 both binaries, written up individually: groups 21-28. Everything else
 (throughput-wall recurrence, relative-performance-assertion family, 2
 contention-suspected findings, 1 Windows-only fixture gap) is in
-[29](../../../known-issues/tomcat/29-throughput-wall-recurrence-and-unconfirmed.md), not treated as new
+[29](29-throughput-wall-recurrence-and-unconfirmed.md), not treated as new
 bugs.

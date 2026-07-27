@@ -84,7 +84,7 @@ started.
   WILDFLY-CONTROLLER-JIT.1 was only *transitively* implicated by that same
   finding and is therefore no longer backed by it either — it is kept in place
   pending its own re-test.
-- `org/h2/` + `org/antlr/v4/runtime/` (HIB-LONGTAIL.1) — real 218-class H2 suite, `Schema not found` reconnect bug (root-caused and fixed)
+- `org/h2/` (HIB-LONGTAIL.1) — real 218-class H2 suite, `Schema not found` reconnect bug (root-caused and fixed). **The `org/antlr/v4/runtime/` half was removed 2026-07-27** — the H2 evidence never covered it (H2 loads no ANTLR class at all) and a 57-class Hibernate HQL A/B came back equivalent; see `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`
 - HIB-BIGINTEGER-AIOOBE.1/.2 (`java/math/{BigInteger,MutableBigInteger}`) — deterministic repro, no escape hatch by design; now cross-referenced with SUNEC-INTPOLY above
 - TYPES-ERASURE.1 (`com/sun/tools/javac/code/Types.erasure`) — 40/40 repro; consolidation-with-the-other-6-javac-bans hypothesis explicitly REFUTED (see `docs/known-issues/jit-skip-list-open-bans-20260725.md`), so it stays as its own entry alongside SPRING-TESTCOMPILER.1-4/HIB-STOREDPROC-JIT.1 below
 
@@ -133,8 +133,10 @@ checkouts onto the host or finding an equivalent real app.
   3.0.21/3.0.8/4.0.22 directly). ANTLR-COLDPATH.1's narrower correctness
   guard inside this package is independently confirmed and stays
   regardless (kept by design, not blocked).
-- **HIB-ANTLR.1** (ordinary, non-shaded ANTLR4 runtime used directly by
-  Hibernate) — not yet investigated this multi-session effort.
+- ~~**HIB-ANTLR.1**~~ (ordinary, non-shaded ANTLR4 runtime used directly by
+  Hibernate) — DONE. Its own check went 2026-07-26, and the HIB-LONGTAIL.1
+  prefix that was still shadowing it went 2026-07-27; `org/antlr/v4/runtime/`
+  is now genuinely JIT-eligible. See `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`.
 - **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`).
 - **KC26-PIC.1, KC26-RX.1** (Keycloak/picocli/RxJava3) — needs a real
   Keycloac 26.2.4 checkout; not present on this host.
@@ -202,8 +204,9 @@ they were built for rather than the technology itself, so the earlier
   `org/hibernate/`) — found a full real Hibernate ORM 8.0 test harness at
   `apps/hibernate-orm-harness/` (compiled `hibernate-core` test classes +
   full runtime classpath + a JUnit5 Platform Launcher driver). HIB-ANTLR.1
-  **REMOVED** (own claim doesn't reproduce, though shadowed by
-  HIB-LONGTAIL.1 regardless). HIB-TEMPORAL.1 **CONFIRMED STILL NEEDED** —
+  **REMOVED** (own claim doesn't reproduce; it was shadowed by
+  HIB-LONGTAIL.1 at the time, and that shadow was itself removed
+  2026-07-27 — the package is JIT-eligible now). HIB-TEMPORAL.1 **CONFIRMED STILL NEEDED** —
   and MORE severe than documented: lifting it causes a full
   `StrategySelectionException` Hibernate bootstrap failure, not just a
   narrow DDL-descriptor NPE.
