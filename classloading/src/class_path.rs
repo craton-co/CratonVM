@@ -21,6 +21,25 @@ use std::sync::{Arc, OnceLock};
 use tracing::debug;
 use zip::ZipArchive;
 
+/// Percent-encode a filesystem path for embedding in a `file:`/`jar:file:` URL,
+/// the way `File.toURI()` (`sun.net.www.ParseUtil.encodePath`) does.
+///
+/// Without this a directory literally named `custom#root` came back from
+/// `ClassLoader.getResource` as `file:/.../custom#root/scanned/`, where the raw
+/// `#` is a URL *fragment* delimiter — every consumer that re-parses the URL
+/// silently drops everything after it (HotSpot keeps `custom%23root`; see
+/// `core.io.support.PathMatchingResourcePatternResolverTests.encodedHashtagInPath`).
+/// `%` is escaped first so the escapes added here are not double-encoded.
+/// Mirrors `native-builtins::classloader::file_url_spec`, which already did
+/// this for the `URLClassLoader.getURLs()` / manifest side only.
+pub(crate) fn encode_path_for_url(p: &str) -> String {
+    p.replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F")
+}
+
+
 /// Immutable backing for an archive. On-disk archives are mapped once and all
 /// `ZipArchive` cursors plus stored class entries share that mapping. Nested
 /// archives and test fixtures retain an owned reference-counted buffer.
@@ -1225,9 +1244,9 @@ impl ClassPath {
         let p = p.strip_prefix("//?/").unwrap_or(&p);
         let p = p.trim_start_matches('/');
         if canon_path.is_dir() && !p.ends_with('/') {
-            format!("file:/{p}/")
+            format!("file:/{}/", encode_path_for_url(p))
         } else {
-            format!("file:/{p}")
+            format!("file:/{}", encode_path_for_url(p))
         }
     }
 
@@ -2560,7 +2579,7 @@ impl ClassPath {
                         let p = abs.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p).to_string();
                         let p = p.trim_start_matches('/').trim_end_matches('/').to_string();
-                        return Some((format!("file:/{p}/"), Vec::new()));
+                        return Some((format!("file:/{}/", encode_path_for_url(&p)), Vec::new()));
                     }
                 }
                 ClassPathEntry::JarFile {
@@ -2610,7 +2629,7 @@ impl ClassPath {
                         };
                         let certs =
                             Self::certs_for_signed_class(info, archive, &relative_path, mr_cache);
-                        return Some((format!("file:/{p}"), certs));
+                        return Some((format!("file:/{}", encode_path_for_url(&p)), certs));
                     }
                 }
                 ClassPathEntry::NestedDirectory {
@@ -2621,7 +2640,7 @@ impl ClassPath {
                     if entries_cache.contains_key(&relative_path) {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/').to_string();
-                        return Some((format!("file:/{p}"), Vec::new()));
+                        return Some((format!("file:/{}", encode_path_for_url(&p)), Vec::new()));
                     }
                 }
                 ClassPathEntry::NestedJar {
@@ -2645,7 +2664,13 @@ impl ClassPath {
                         // not searched multi-release here, so pass `None`.
                         let certs =
                             Self::certs_for_signed_class(info, archive, &relative_path, None);
-                        return Some((format!("jar:file:/{outer}!/{nested_path}"), certs));
+                        return Some((
+                            format!(
+                                "jar:file:/{}!/{nested_path}",
+                                encode_path_for_url(&outer)
+                            ),
+                            certs,
+                        ));
                     }
                 }
                 ClassPathEntry::JmodFile { .. } | ClassPathEntry::JImageFile { .. } => {
@@ -3754,9 +3779,9 @@ impl ClassPath {
                         // must be conditional since this function also serves
                         // plain (non-directory) resource lookups.
                         if canon_path.is_dir() && !p.ends_with('/') {
-                            urls.push(format!("file:/{p}/"));
+                            urls.push(format!("file:/{}/", encode_path_for_url(&p)));
                         } else {
-                            urls.push(format!("file:/{p}"));
+                            urls.push(format!("file:/{}", encode_path_for_url(&p)));
                         }
                     }
                 }
@@ -3801,7 +3826,7 @@ impl ClassPath {
                             let p = p.strip_prefix("//?/").unwrap_or(&p);
                             let p = p.trim_start_matches('/');
                             for candidate in candidates {
-                                urls.push(format!("jar:file:/{p}!/{candidate}"));
+                                urls.push(format!("jar:file:/{}!/{candidate}", encode_path_for_url(&p)));
                             }
                         }
                         continue;
@@ -3851,7 +3876,7 @@ impl ClassPath {
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
                         let p = p.trim_start_matches('/');
                         let suffix = selected_entry.expect("resource hit has an entry name");
-                        urls.push(format!("jar:file:/{p}!/{suffix}"));
+                        urls.push(format!("jar:file:/{}!/{suffix}", encode_path_for_url(&p)));
                     }
                 }
                 ClassPathEntry::NestedDirectory {
@@ -3915,7 +3940,7 @@ impl ClassPath {
                         for candidate in
                             Self::matching_resource_entry_names(class_entry_index.iter(), name)
                         {
-                            urls.push(format!("jar:file:/{p}!/{candidate}"));
+                            urls.push(format!("jar:file:/{}!/{candidate}", encode_path_for_url(&p)));
                         }
                         continue;
                     }
@@ -3929,7 +3954,7 @@ impl ClassPath {
                     if found {
                         let p = path.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{p}!/{name}"));
+                        urls.push(format!("jar:file:/{}!/{name}", encode_path_for_url(&p)));
                     }
                 }
                 ClassPathEntry::JImageFile {

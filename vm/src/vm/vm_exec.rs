@@ -12236,9 +12236,43 @@ pub fn invoke_or_native(
     // already be loaded. Class-init state is monotonic, so this call is
     // cheap (a single atomic load) once initialized and can never
     // regress an already-initialized class back to needing the check.
+    // Resolving the dispatch class by NAME is ambiguous whenever more than one
+    // loader has defined that name -- `get_loaded_class_id` / `invoke_shared`
+    // then answer `None` / `ClassNotFound` and the call surfaces as a
+    // `NoClassDefFoundError` for a class that is very much loaded. Groovy is
+    // the everyday case: `GroovyScriptFactory` compiles the same script class
+    // through a FRESH `GroovyClassLoader` per application context, so by the
+    // second context `org/springframework/scripting/groovy/TestFactoryBean`
+    // names two distinct classes (`scripting.groovy.GroovyScriptFactoryTests`,
+    // 11 of 38 methods, JIT-only because the interpreter's own dispatch is
+    // ClassId-based and never re-resolves the name).
+    //
+    // A virtual call's receiver IS the authoritative answer: when its runtime
+    // class carries exactly this name, dispatch on that ClassId instead of
+    // asking the (ambiguous) global name table.
+    let receiver_class_id = match args.first() {
+        Some(Value::Object(Some(receiver))) => {
+            let cid = shared.mem.heap.class_id_of(*receiver);
+            let same_name = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(cid)
+                .map(|c| c.name.as_ref() == effective_class)
+                .unwrap_or(false);
+            if same_name {
+                Some(cid)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
     {
         let cm = shared.classes.class_manager.read();
-        if let Some(class_id) = cm.get_loaded_class_id(effective_class) {
+        if let Some(class_id) =
+            receiver_class_id.or_else(|| cm.get_loaded_class_id(effective_class))
+        {
             if let Some(class) = cm.class_store.get(class_id) {
                 if !class.is_synthetic_stub {
                     drop(cm);
@@ -12953,7 +12987,7 @@ pub(super) fn proxy_invoke_handler(
         return proxy_unbox_primitive_return(
             ctx.shared,
             descriptor,
-            proxy_annotation_handler_invoke(ctx.shared, handler_ref, method_name, args),
+            proxy_annotation_handler_invoke(ctx.shared, ctx.thread, handler_ref, method_name, args),
         );
     }
 
@@ -13292,7 +13326,21 @@ fn annotation_proxy_invoke(
     method_name: &str,
     args: &[Value],
 ) -> MethodCallResult {
-    annotation_proxy_dispatch_impl(ctx.shared, proxy, method_name, args)
+    // Route through the SHARED entry point, not `annotation_proxy_dispatch_impl`
+    // directly: only the shared one carries the `asMap` handler and the
+    // cross-type `equals` delegation (an `AnnotationProxy` compared against a
+    // FOREIGN annotation proxy of the same type -- e.g. Spring's
+    // `MergedAnnotation.synthesize()` JDK proxy -- must delegate to that
+    // proxy's own `equals`, or equality is asymmetric).
+    //
+    // This is the path a native takes via `NativeContext::invoke_virtual`,
+    // which is how AssertJ's natively-shimmed
+    // `StandardComparisonStrategy.areEqual` performs its final
+    // `actual.equals(other)`. Bypassing the delegation made
+    // `assertThat(realAnnotation).isEqualTo(synthesizedAnnotation)` fail while
+    // the identical call written in Java passed
+    // (`core.annotation.MergedAnnotationsTests.equalsForSynthesizedAnnotations`).
+    annotation_proxy_invoke_shared(ctx.shared, ctx.thread, proxy, method_name, args)
 }
 
 /// Shared-interpreter version of `proxy_invoke_handler` вЂ” callable from the
@@ -13346,6 +13394,7 @@ fn proxy_unbox_primitive_return(
 /// annotation equality compares its members rather than proxy identity.
 fn proxy_annotation_handler_invoke(
     shared: &SharedVm,
+    thread: &mut JvmThread,
     handler_ref: ObjectRef,
     method_name: &str,
     args: &[Value],
@@ -13369,7 +13418,15 @@ fn proxy_annotation_handler_invoke(
             }
         }
     }
-    annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args)
+    // Fall through to the SHARED entry point, not `annotation_proxy_dispatch_impl`:
+    // only the shared one delegates `equals` to a FOREIGN annotation proxy of
+    // the same type (e.g. Spring's `MergedAnnotation.synthesize()` proxy, whose
+    // handler is Spring's own, not an `AnnotationProxy`). Without it
+    // `realAnnotation.equals(synthesized)` answered false while
+    // `synthesized.equals(realAnnotation)` answered true -- asymmetric equality,
+    // surfacing as `core.annotation.MergedAnnotationsTests
+    // .equalsForSynthesizedAnnotations`.
+    annotation_proxy_invoke_shared(shared, thread, handler_ref, method_name, args)
 }
 
 pub(crate) fn proxy_invoke_handler_shared(
@@ -13399,7 +13456,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         return proxy_unbox_primitive_return(
             shared,
             descriptor,
-            proxy_annotation_handler_invoke(shared, handler_ref, method_name, args),
+            proxy_annotation_handler_invoke(shared, thread, handler_ref, method_name, args),
         );
     }
 
