@@ -1,6 +1,8 @@
 # JSONSMART-PARSER.1 (`net/minidev/json/parser/`) — RETIRED 2026-07-27: ban gone, package JIT-compiles clean, one real residual found and fixed
 
-**Status:** ✅ CLOSED. The ban is removed from `vm/src/jit/skip_list.rs` (it was
+**Status:** ✅ CLOSED for the ban itself; see the post-merge addendum below for
+a separate, newly-landed JIT dispatch-cache bug that this probe now catches.
+The ban is removed from `vm/src/jit/skip_list.rs` (it was
 removed on 2026-07-26 by a concurrent session and is still removed), the parser
 package JIT-compiles, and 3,000,000 parse/serialize/re-parse operations under
 JIT produce **0 errors**. The one real defect this re-investigation turned up
@@ -124,6 +126,32 @@ orders for `HashMap()`, `HashMap(16)`, `LinkedHashMap()`, `HashSet()`,
 `ArrayList()`, plus a round-trip order check. Verified to FAIL on the
 pre-fix binary (`hashMapNoArg` order differs, `roundTripEqualOrder=false`) and
 pass after.
+
+## Post-merge addendum (dev `a80673ad0`): a NEW corruption, from the JIT dispatch cache
+
+Everything above was measured on this branch before merging the day's dev
+(`a7a5d6ff5` + the elidable-ctor fix: 1,500,000 operations, 0 errors). After
+merging dev `a80673ad0`, the same probe fails again — 3 errors in 1,500,000
+operations, and 2 in a second run:
+
+```
+ROUNDTRIP MISMATCH at iter=47981
+  doc={"a":1,"b":2.5,"c":"hello","d":true,"e":null,"f":[1,2,3]}
+  rt1={"a":1,"b":2.5,"c":"hello","d":true,"e":null,"f":[1,2,3]}
+  rt2="d"          <-- the re-parse returned one of the KEYS, not the map
+```
+
+This is NOT the ban's bug returning, and not the HashMap-capacity bug fixed
+here (`MiniJsonProbe`, its deterministic repro, stays clean). It arrived with
+`4f280090f`, which flipped the JIT's compiled-callee direct entry to
+default-ON: with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0` the same
+merged binary runs 1,500,000 operations twice with 0 errors. Written up, with
+the full evidence table and the suspected mechanism, in
+`docs/known-issues/jit-virtual-direct-entry-json-corruption-20260727.md`.
+
+Disposition is unchanged: the corruption is in the JIT's virtual-dispatch
+inline cache, which every interface-heavy workload uses — re-banning
+`net/minidev/json/parser/` would hide one victim of it, not fix it.
 
 ## Known, unrelated coverage gap seen in the same runs
 
