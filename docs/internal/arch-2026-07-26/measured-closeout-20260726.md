@@ -212,6 +212,14 @@ verified on both controlled shutdown paths; see
 
 ### P1: pack instance fields and then shrink the header
 
+Current-status correction (2026-07-27): descriptor-backed instance fields are
+already packed at natural 1/2/4/8-byte widths in the production allocators,
+interpreter, JIT helpers, and collectors. The remaining 16-byte-cell path is
+the required fallback for descriptor-less/padded synthetic slots. The last
+allocation hot-path registry lookup was removed by
+`../packed-object-fields-performance-20260727.md`; this section is retained as
+the recommendation that led to that verification, not as current-state truth.
+
 The 16-byte universal heap field slot dominates ordinary object size. Use
 class-computed byte offsets with 1/2/4/8-byte primitive storage, 8-byte
 references initially, and alignment-aware field ordering. Keep `Value` as an

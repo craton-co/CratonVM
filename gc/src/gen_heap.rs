@@ -49,7 +49,7 @@ use crate::old_gen::OldGen;
 // instance fields are stored as 8-byte pointers per the per-class oop-map.
 use crate::gc_flags;
 use crate::satb::SatbQueue;
-use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
+use crate::{compact_ref_fields_enabled, is_compact_object, object_body_size};
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size, write_ref_slot};
 use cratonvm_types::GC_FLAG_COMPACT;
 use cratonvm_types::{ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value};
@@ -10745,22 +10745,22 @@ fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
 #[inline]
 fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32, u8)> {
     if compact_ref_fields_enabled() {
-        if let Some(layout) = class_layout(class_id.as_u32()) {
-            if layout.field_count() == num_fields {
-                let total = HEADER_SIZE.checked_add(layout.body_size as usize)?;
-                return Some((total, layout.body_size, GC_FLAG_COMPACT));
-            } else if gc_flags().dbg_compact_legacy {
-                let name = crate::gc::resolve_class_info(class_id.as_u32())
-                    .map(|(n, _)| n)
-                    .unwrap_or_else(|| "<unresolved>".to_string());
-                eprintln!(
-                    "[compact-legacy] class={} id={} alloc num_fields={} != layout.field_count={} -> LEGACY object",
-                    name,
-                    class_id.as_u32(),
-                    num_fields,
-                    layout.field_count(),
-                );
-            }
+        if let Some(body_size) =
+            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields)
+        {
+            let total = HEADER_SIZE.checked_add(body_size)?;
+            let body_size = u32::try_from(body_size).ok()?;
+            return Some((total, body_size, GC_FLAG_COMPACT));
+        } else if gc_flags().dbg_compact_legacy {
+            let name = crate::gc::resolve_class_info(class_id.as_u32())
+                .map(|(n, _)| n)
+                .unwrap_or_else(|| "<unresolved>".to_string());
+            eprintln!(
+                "[compact-legacy] class={} id={} alloc num_fields={} has no matching current compact layout -> LEGACY object",
+                name,
+                class_id.as_u32(),
+                num_fields,
+            );
         }
     }
     let body = num_fields.checked_mul(SLOT_SIZE)?;
