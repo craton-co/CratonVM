@@ -6383,6 +6383,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .find_class_by_name(name)
     }
 
+    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .resolve_fast_path_class_id(name)
+    }
+
     fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
         let cm = self.shared.classes.class_manager.read();
         if let Some(loader) = cm.get_loader_id(near) {
