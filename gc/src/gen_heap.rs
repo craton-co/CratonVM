@@ -3557,6 +3557,20 @@ impl GenerationalHeap {
         monitors: &dyn MonitorCleanup,
     ) -> (GcResult, Vec<usize>) {
         let mut result = self.sweep_young_non_moving(roots, finalizer_addrs);
+        // Selective promotion commits young -> old relocations inside
+        // `sweep_young_non_moving`. Registered external-root providers can own
+        // the only reference to a promoted object (collection overlay backing
+        // arrays are the canonical case), and the System.gc path below may run
+        // an old-space sweep in this SAME collector call. Waiting for the VM's
+        // ordinary post-GC remap is therefore too late: the old marker would
+        // consult a provider that still points at the forwarded young source,
+        // fail to seed the promoted destination, and immediately reclaim it.
+        //
+        // Publish provider relocation at the young-phase commit boundary,
+        // before any same-cycle old marking. The VM-level remap after this
+        // function returns remains intentionally idempotent and still covers
+        // every non-provider root owner.
+        crate::external_roots::remap_external_roots(&result.0.pointer_map);
         // OOM-INVESTIGATE (dohead-oom, 2026-07-19): track young-arena usage
         // across cycles to find where reclaimed bytes stop coming back as
         // usable free space. Gated so normal runs pay nothing.

@@ -14,6 +14,11 @@ public final class ArchitectureInterpreterSemantics20260727 {
         public int apply(int value) {
             return value + delta;
         }
+
+        @Override
+        public int hashCode() {
+            return 0x5a17 + delta;
+        }
     }
 
     private static int staticMix(int a, int b) {

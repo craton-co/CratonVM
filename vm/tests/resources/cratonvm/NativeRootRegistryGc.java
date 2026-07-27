@@ -20,7 +20,9 @@ public final class NativeRootRegistryGc {
             list.add(value);
             insertionOrder.put(round, value);
             sorted.put(round, value);
-            set.add(round);
+            if (!set.add(round)) {
+                throw new AssertionError("TreeSet rejected fresh value at round " + round);
+            }
 
             if (round >= 32) {
                 int expired = round - 32;

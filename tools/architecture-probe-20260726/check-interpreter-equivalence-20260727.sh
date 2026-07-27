@@ -12,21 +12,34 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 classes="$(mktemp -d)"
 trap 'rm -rf "$classes"' EXIT
 
-"$java_home/bin/javac" -d "$classes" \
+javac_bin="$java_home/bin/javac"
+if [ ! -x "$javac_bin" ]; then
+    javac_bin="$(command -v javac)"
+fi
+
+"$javac_bin" -d "$classes" \
     "$script_dir/ArchitectureInterpreterSemantics20260727.java"
 
-run_probe() {
-    timeout 180 "$exe" --nojit --java-home "$java_home" "$@" \
+run_craton() {
+    timeout 180 "$exe" --java-home "$java_home" "$@" \
         -cp "$classes" ArchitectureInterpreterSemantics20260727 20000 |
         tail -1
 }
 
-verified="$(run_probe)"
-decoded="$(run_probe --noverify)"
+verified="$(run_craton --nojit)"
+decoded="$(run_craton --nojit --noverify)"
+jitted="$(run_craton)"
+hotspot="$(timeout 180 "$java_home/bin/java" \
+    -cp "$classes" ArchitectureInterpreterSemantics20260727 20000)"
 
 if [ "$verified" != "$decoded" ]; then
     echo "interpreter mismatch: verified=$verified decoded=$decoded" >&2
     exit 1
 fi
 
-echo "verified raw-byte path == forced decoded fallback: $verified"
+if [ "$verified" != "$jitted" ] || [ "$verified" != "$hotspot" ]; then
+    echo "execution mismatch: interpreter=$verified jit=$jitted hotspot=$hotspot" >&2
+    exit 1
+fi
+
+echo "verified interpreter == decoded fallback == JIT == HotSpot: $verified"
