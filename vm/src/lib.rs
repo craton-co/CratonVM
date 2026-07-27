@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+#![deny(deprecated)]
+
 //! CratonVM — A Java Virtual Machine implemented in Rust.
 //!
 //! This crate provides the core VM implementation including:

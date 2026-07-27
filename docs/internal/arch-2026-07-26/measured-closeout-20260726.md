@@ -122,20 +122,21 @@ compiled code; they do not isolate the nanosecond cost of one PIC hit.
 
 ## Findings and changes recommended
 
-### P0: remove loader-blind class lookup from production paths
+### P0: remove loader-blind class lookup from production paths — fixed
 
-The release build emits 47 deprecation warnings for
+The audited release build emitted 47 deprecation warnings for
 `ClassManager::find_class_by_name`, spread through interpreter, VM execution,
 utility, reflection, native, and invocation paths. The API explicitly says it
 is loader-blind. This is correctness debt in a VM supporting multiple class
 loaders, and it also prevents negative/positive lookup caches from having an
 unambiguous key.
 
-Replace each call with an operation that takes the initiating/defining loader
-or an already-resolved `ClassId`. Do not add a global fallback to make the
-warnings disappear. Turn this deprecation into a deny lint for production code
-after the migration. The open defect is tracked separately in
-`docs/known-issues/loader-blind-class-lookup-deprecation-debt-20260726.md`.
+Resolved on `codex/complete-architecture-remediation-20260726`: all 47 calls
+now take an initiating/defining class or loader, require bootstrap identity, or
+fail closed when a legacy metadata path genuinely has no context. The VM crate
+denies deprecated APIs, the all-feature check passes, and the release warning
+count is zero. Verification and rationale are in
+`docs/internal/loader-blind-class-lookup-fixed-20260726.md`.
 
 ### P0: collapse the two interpreter semantic implementations
 
@@ -287,8 +288,9 @@ Track at least:
 
 ## Prioritized execution plan
 
-1. **Correctness gate:** migrate the 47 loader-blind calls; add a dual-loader
-   conformance corpus and deny the deprecated API in production.
+1. **Correctness gate — complete:** the 47 loader-blind calls are migrated,
+   dual-loader namespace tests pass, and the deprecated API is denied in
+   production.
 2. **Interpreter convergence:** one semantic handler set, generated variants,
    package routing removed; preserve checksum and exception tests.
 3. **Root ownership:** stable native handles, provider registration, exact JIT

@@ -1434,7 +1434,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// Self-call identity proof for the raw direct self-recursive CALL routing
 /// (see `cratonvm_jit::set_self_call_identity_stable`): true iff `class_id`
 /// was defined by a BUILTIN loader (bootstrap/extension/application) AND the
-/// loader-blind global name lookup maps the class's name back to this exact
+/// loader-qualified exact-name lookup maps the class's name back to this exact
 /// `ClassId`. Builtin loader registries hold one class per name and resolve a
 /// self-reference to the already-defined class, so a same-named shadow can
 /// never rebind the target; `UserDefined` loaders (enhancement/duplicating
@@ -1447,7 +1447,7 @@ fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) -> bool {
     !matches!(
         class.loader_id,
         cratonvm_types::ClassLoaderId::UserDefined(_)
-    ) && cm.find_class_by_name(&class.name) == Some(class_id)
+    ) && cm.class_defined_by_loader_exact(&class.name, class.loader_id) == Some(class_id)
 }
 
 pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
@@ -1989,7 +1989,7 @@ fn gc_reference_next_slot(shared: &SharedVm, ref_obj: ObjectRef) -> usize {
         return 0; // legacy synthetic 2-field shape: referent, queue only
     }
     let cm = shared.classes.class_manager.read();
-    cm.find_class_by_name("java/lang/ref/Reference")
+    cm.find_bootstrap_class_by_name("java/lang/ref/Reference")
         .and_then(|reference_cid| {
             crate::vm::vm_exec::resolve_field_index_in_hierarchy(
                 reference_cid,
@@ -5645,7 +5645,8 @@ pub fn execute(
             // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
             // under deep recursion and must run in the interpreter pending a
             // proper regalloc fix.
-            let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str);
+            let fjp_skip =
+                is_fjp_subclass_blocklisted(shared, &class_name_str, Some(class_id));
             // S111r15 - refuse to JIT a method directly backed by a Rust native at
             // this FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
             // bypassed the native override and corrupted Spring property-name parsing.
@@ -11397,7 +11398,8 @@ fn find_exception_handler_pc_unknown(
         // loader-identity-blind fallback match (see
         // `Class::is_subclass_of_by_name`).
         let catch_class_name_owned = catch_class_name.to_string();
-        let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
+        let catch_class_id =
+            match cm_guard.find_class_by_name_for_class(catch_class_name, frame.class_id) {
             Some(id) => id,
             None => {
                 let owned = catch_class_name.to_string();
@@ -11475,7 +11477,8 @@ fn find_exception_handler_impl(
 
         // Try to find the catch type class on the held lock — `&str`,
         // no allocation.
-        let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
+        let catch_class_id =
+            match cm_guard.find_class_by_name_for_class(catch_class_name, frame.class_id) {
             Some(id) => id,
             None => {
                 // Lazy load: must drop the read lock since
@@ -11608,7 +11611,9 @@ fn route_jit_exception_through_method(
         // current borrow so it stays valid across the lock drop/reacquire
         // in the lazy-load branch just below.
         let catch_class_name_owned = catch_class_name.to_string();
-        let catch_class_id = match cm_guard.find_class_by_name(catch_class_name) {
+        let catch_class_id = match cm_guard
+            .find_class_by_name_for_class(catch_class_name, cached.declaring_class_id)
+        {
             Some(id) => id,
             None => {
                 let owned = catch_class_name.to_string();
@@ -17975,7 +17980,11 @@ fn array_is_assignable_to_impl(
         // holds its own read guard, self-deadlocking against a non-reentrant
         // `parking_lot::RwLock`. Bind the read result to a `let` first so the
         // guard drops before any write-lock attempt.
-        let found = shared.classes.class_manager.read().find_class_by_name(name);
+        let found = shared
+            .classes
+            .class_manager
+            .read()
+            .find_unique_class_by_name(name);
         found.or_else(|| shared.load_class_concurrent(name).ok())
     };
     let src_id = match resolve_component(&src_comp) {
@@ -18085,7 +18094,7 @@ pub(crate) fn aastore_element_assignable(
             .classes
             .class_manager
             .read()
-            .find_class_by_name(comp_name)
+            .find_class_by_name_for_class(comp_name, array_component_class_id)
     })
     .unwrap_or_else(
         || match shared.classes.class_manager_write().load_class(comp_name) {
@@ -33008,7 +33017,7 @@ fn execute_invokestatic_cached(
 /// mandatory `value` / `hash` fields. Cheap enough to call once per compilation.
 fn resolve_string_field_layout(shared: &SharedVm) -> Option<cratonvm_jit::StringFieldLayout> {
     let cm = shared.classes.class_manager.read();
-    let string_id = cm.find_class_by_name("java/lang/String")?;
+    let string_id = cm.find_bootstrap_class_by_name("java/lang/String")?;
     let class = cm.get_class(string_id)?;
     let (value_idx, _) = class.find_own_field("value")?;
     let (hash_idx, _) = class.find_own_field("hash")?;
@@ -34552,7 +34561,7 @@ fn resolve_jit_new_site(
 ) -> Option<(u32, usize, bool, bool)> {
     let class = cm.get_class(holder_cid)?;
     let class_name = class.constant_pool.get_class_name(cp_idx)?;
-    let target_id = cm.find_class_by_name(class_name)?;
+    let target_id = cm.find_class_by_name_for_class(class_name, holder_cid)?;
     let Some(target) = cm.get_class(target_id) else {
         return Some((target_id.as_u32(), 0, true, true));
     };
@@ -34708,7 +34717,9 @@ fn jit_invoke_targets_native_shadow(
         };
         let method_name = method_name.to_string();
         let descriptor = descriptor.to_string();
-        let declaring_class = if let Some(target_id) = cm.find_class_by_name(&target_class) {
+        let declaring_class =
+            if let Some(target_id) = cm.find_class_by_name_for_class(&target_class, caller_class_id)
+            {
             let store = cm.class_store();
             crate::classloading::find_method_recursive(target_id, &method_name, &descriptor, store)
                 .and_then(|(_, declaring_id)| {
@@ -34716,9 +34727,9 @@ fn jit_invoke_targets_native_shadow(
                         .get(declaring_id)
                         .map(|declaring| declaring.name.to_string())
                 })
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         (
             target_class,
             method_name,
@@ -34860,7 +34871,9 @@ fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: ClassId, cp_
     // target `find_class_by_name` could NOT see, it is the app-class gap being
     // closed (the old resolver would have returned false here).
     if elidable && crate::runtime::env_cache::ctor_fix_dbg() {
-        let via_find = cm.find_class_by_name(&target_name).is_some();
+        let via_find = cm
+            .find_class_by_name_for_class(&target_name, holder_cid)
+            .is_some();
         eprintln!(
             "[ctor-fix] elidable-resolver: {} elidable=true find_class_by_name={}{}",
             target_name,
@@ -35228,7 +35241,7 @@ fn try_jit_upgrade_with_gate(
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
         let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-        let cp_class_id = cm.find_class_by_name(target_class)?;
+        let cp_class_id = cm.find_class_by_name_for_class(target_class, class_id)?;
         let store = cm.class_store();
         let start = crate::classloading::invokespecial_selection_start(
             class_id,
@@ -35285,7 +35298,10 @@ fn try_jit_upgrade_with_gate(
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
-        Some(cm.find_class_by_name(target_class)?.as_u32())
+        Some(
+            cm.find_class_by_name_for_class(target_class, class_id)?
+                .as_u32(),
+        )
     };
 
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
@@ -35347,7 +35363,11 @@ fn try_jit_upgrade_with_gate(
         |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
             // RFJP.1 — never JIT a callee on a class transitively extending
             // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
-            if is_fjp_subclass_blocklisted(shared, callee_class) {
+            if is_fjp_subclass_blocklisted(
+                shared,
+                callee_class,
+                Some(cached.declaring_class_id),
+            ) {
                 return None;
             }
             // S111r15 — refuse to compile a callee that has a Rust native
@@ -35382,7 +35402,9 @@ fn try_jit_upgrade_with_gate(
             // call (no perf change on the bench/gauntlet hot paths).
             {
                 let cm = shared.classes.class_manager.read();
-                if let Some(callee_cid) = cm.find_class_by_name(callee_class) {
+                if let Some(callee_cid) =
+                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
+                {
                     let store = cm.class_store();
                     if let Some((method, _decl)) = crate::classloading::find_method_recursive(
                         callee_cid,
@@ -35408,7 +35430,7 @@ fn try_jit_upgrade_with_gate(
                     .classes
                     .class_manager
                     .read()
-                    .find_class_by_name(callee_class)
+                    .find_class_by_name_for_class(callee_class, cached.declaring_class_id)
                     .unwrap_or(ClassId::new(0));
                 let jit_cache = shared.jit.jit_cache.read();
                 if let Some(compiled) = jit_cache.get(
@@ -35436,7 +35458,8 @@ fn try_jit_upgrade_with_gate(
 
             // Look up the callee class and method
             let cm = shared.classes.class_manager.read();
-            let callee_class_id = cm.find_class_by_name(callee_class)?;
+            let callee_class_id =
+                cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)?;
             let store = cm.class_store();
             let (method, declaring_id) = crate::classloading::find_method_recursive(
                 callee_class_id,
@@ -35679,7 +35702,7 @@ fn try_jit_upgrade_with_gate(
                 };
                 let target_class = class.constant_pool.get_class_name(class_idx)?;
                 let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-                let cp_class_id = cm.find_class_by_name(target_class)?;
+                let cp_class_id = cm.find_class_by_name_for_class(target_class, callee_cid)?;
                 let store = cm.class_store();
                 let start = crate::classloading::invokespecial_selection_start(
                     callee_cid,
@@ -35735,7 +35758,10 @@ fn try_jit_upgrade_with_gate(
                     _ => return None,
                 };
                 let target_class = class.constant_pool.get_class_name(class_idx)?;
-                Some(cm.find_class_by_name(target_class)?.as_u32())
+                Some(
+                    cm.find_class_by_name_for_class(target_class, callee_cid)?
+                        .as_u32(),
+                )
             };
 
             let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
@@ -35921,7 +35947,13 @@ fn try_jit_upgrade_with_gate(
                            callee_method: &str,
                            callee_desc: &str|
      -> Option<cratonvm_jit::InlineSite> {
-        resolve_inline_site(shared, callee_class, callee_method, callee_desc)
+        resolve_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+        )
     };
     // Main-path small-method inlining is GATED default-OFF behind
     // `CRATONVM_JIT_MAIN_INLINE=1`. Enabling it inlines tiny arith/getter/field
@@ -36059,7 +36091,11 @@ fn try_jit_upgrade_with_gate(
 /// Returns `true` if the named class transitively extends
 /// `java/util/concurrent/ForkJoinTask` and therefore must not be JIT-compiled
 /// pending the regalloc fix.
-pub fn is_fjp_subclass_blocklisted(shared: &SharedVm, class_name: &str) -> bool {
+pub fn is_fjp_subclass_blocklisted(
+    shared: &SharedVm,
+    class_name: &str,
+    requesting_class_id: Option<ClassId>,
+) -> bool {
     // Cheap exact-name fast path — the JDK classes themselves are always
     // affected by the same regalloc shape if they ever get to JIT.
     if class_name == "java/util/concurrent/ForkJoinTask"
@@ -36070,7 +36106,10 @@ pub fn is_fjp_subclass_blocklisted(shared: &SharedVm, class_name: &str) -> bool 
         return true;
     }
     let cm = shared.classes.class_manager.read();
-    let Some(start_cid) = cm.find_class_by_name(class_name) else {
+    let start_cid = requesting_class_id
+        .and_then(|requester| cm.find_class_by_name_for_class(class_name, requester))
+        .or_else(|| cm.find_unique_class_by_name(class_name));
+    let Some(start_cid) = start_cid else {
         return false;
     };
     let mut cid = start_cid;
@@ -36288,7 +36327,7 @@ fn try_jit_compile_callee_slow(
     // miscompiles under deep recursion (returns 0 from depth ~10), and the
     // proper regalloc fix is out of scope here. Returning `None` here forces
     // the interpreter for both direct and dispatcher-cached callee paths.
-    if is_fjp_subclass_blocklisted(shared, class_name) {
+    if is_fjp_subclass_blocklisted(shared, class_name, None) {
         return None;
     }
     // FJP fix (CORRECTED): refuse to compile a method only when the method that
@@ -36321,7 +36360,7 @@ fn try_jit_compile_callee_slow(
     }
     // Look up the method bytecode
     let cm = shared.classes.class_manager.read();
-    let callee_class_id = match cm.find_class_by_name(class_name) {
+    let callee_class_id = match cm.find_unique_class_by_name(class_name) {
         Some(id) => id,
         None => {
             // The receiver's class may simply not be loaded yet — a later
@@ -36574,7 +36613,7 @@ fn try_jit_compile_callee_slow(
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
         let (method_name, _descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
-        let cp_class_id = cm.find_class_by_name(target_class)?;
+        let cp_class_id = cm.find_class_by_name_for_class(target_class, cid)?;
         let store = cm.class_store();
         let start = crate::classloading::invokespecial_selection_start(
             cid,
@@ -36624,7 +36663,10 @@ fn try_jit_compile_callee_slow(
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
-        Some(cm.find_class_by_name(target_class)?.as_u32())
+        Some(
+            cm.find_class_by_name_for_class(target_class, cid)?
+                .as_u32(),
+        )
     };
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.classes.class_manager.read();
@@ -36687,7 +36729,13 @@ fn try_jit_compile_callee_slow(
                            callee_method: &str,
                            callee_desc: &str|
      -> Option<cratonvm_jit::InlineSite> {
-        resolve_inline_site(shared, callee_class, callee_method, callee_desc)
+        resolve_inline_site(
+            shared,
+            cached.declaring_class_id,
+            callee_class,
+            callee_method,
+            callee_desc,
+        )
     };
 
     // Resolve java/lang/String's field layout for the JIT String call-site
@@ -37306,6 +37354,7 @@ pub fn jit_panic_to_exception(
 /// - No unsupported bytecodes (new, checkcast, instanceof, invoke*, etc.)
 fn resolve_inline_site(
     shared: &SharedVm,
+    requesting_class_id: ClassId,
     callee_class: &str,
     callee_method: &str,
     callee_desc: &str,
@@ -37313,7 +37362,8 @@ fn resolve_inline_site(
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
     let cm = shared.classes.class_manager.read();
-    let callee_class_id = cm.find_class_by_name(callee_class)?;
+    let callee_class_id =
+        cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
     let store = cm.class_store();
     let (method, declaring_id) = crate::classloading::find_method_recursive(
         callee_class_id,
@@ -37489,7 +37539,7 @@ fn resolve_inline_site(
             return None;
         }
         let elidable = target_class == "java/lang/Object" || {
-            match cm.find_class_by_name(target_class) {
+            match cm.find_class_by_name_for_class(target_class, declaring_id) {
                 Some(tid) => is_elidable_construction(&cm, tid),
                 None => false,
             }
@@ -42022,7 +42072,9 @@ fn invokespecial_owner_class_name(
         class.constant_pool.get(cp_index),
         Some(ConstantPoolEntry::InterfaceMethodReference { .. })
     );
-    let Some(cp_class_id) = cm.find_class_by_name(method_class_name) else {
+    let Some(cp_class_id) =
+        cm.find_class_by_name_for_class(method_class_name, current_class_id)
+    else {
         return Arc::clone(method_class_name);
     };
     let store = cm.class_store();

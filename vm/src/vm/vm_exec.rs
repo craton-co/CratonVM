@@ -545,7 +545,7 @@ fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
         .classes
         .class_manager
         .read()
-        .find_class_by_name("java/lang/Object")?;
+        .find_bootstrap_class_by_name("java/lang/Object")?;
     let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
     Some(resolved)
 }
@@ -6380,17 +6380,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .classes
             .class_manager
             .read()
-            .find_class_by_name(name)
+            .find_unique_class_by_name(name)
     }
 
     fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
-        let cm = self.shared.classes.class_manager.read();
-        if let Some(loader) = cm.get_loader_id(near) {
-            if let Some(id) = cm.find_class_by_name_in_loader(name, loader) {
-                return Some(id);
-            }
-        }
-        cm.find_class_by_name(name)
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_class_by_name_for_class(name, near)
     }
 
     fn class_id_by_name_via_referencing_class(
@@ -6513,7 +6511,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 && !ic.inner_name.is_empty()
             {
                 // Resolve outer class name to ClassId
-                return cm.find_class_by_name(&ic.outer_class);
+                return cm.find_class_by_name_for_class(&ic.outer_class, class_id);
             }
         }
         None
@@ -14767,7 +14765,7 @@ fn annotation_member_declared_default(
         .classes
         .class_manager
         .read()
-        .find_class_by_name(&class_name)?;
+        .find_unique_class_by_name(&class_name)?;
     let cm = shared.classes.class_manager.read();
     let class = cm.get_class(cid)?;
     for m in &class.methods {
@@ -15440,7 +15438,7 @@ fn invoke_on_class_shared_inner(
             let recv_cid = shared.mem.heap.class_id_of(recv);
             let is_path = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name("java/nio/file/Path")
+                cm.find_bootstrap_class_by_name("java/nio/file/Path")
                     .map(|path_cid| cm.is_subclass_of(recv_cid, path_cid))
                     .unwrap_or(false)
             };

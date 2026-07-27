@@ -5320,7 +5320,7 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
     // Resolve the class name and remove all registered natives for it.
     // Since JNI_NATIVE_METHODS is keyed by hash, we need the class name
     // to reconstruct the keys. If we can't resolve the class, best-effort no-op.
-    let class_name = with_shared_vm(|shared| {
+    let class_info = with_shared_vm(|shared| {
         let oref = jobject_to_obj(clazz)?;
         let class_id = shared.mem.heap.class_id_of(oref);
         shared
@@ -5328,23 +5328,21 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
             .class_manager
             .read()
             .get_class(class_id)
-            .map(|c| c.name.clone())
+            .map(|c| (class_id, c.name.clone()))
     })
     .flatten();
 
-    if let Some(class_name) = class_name {
+    if let Some((class_id, class_name)) = class_info {
         // Get all methods for this class and remove their native registrations
         let methods_to_remove: Vec<u64> = with_shared_vm(|shared| {
             let cm = shared.classes.class_manager.read();
             let mut keys = Vec::new();
-            // Find the class and iterate its methods
-            if let Some(class_id) = cm.find_class_by_name(&class_name) {
-                if let Some(class) = cm.get_class(class_id) {
-                    for method in &class.methods {
-                        if method.is_native() {
-                            let key = jni_native_key(&class_name, &method.name, &method.descriptor);
-                            keys.push(key);
-                        }
+            // `clazz` already supplied the exact loader-qualified ClassId.
+            if let Some(class) = cm.get_class(class_id) {
+                for method in &class.methods {
+                    if method.is_native() {
+                        let key = jni_native_key(&class_name, &method.name, &method.descriptor);
+                        keys.push(key);
                     }
                 }
             }

@@ -24238,7 +24238,7 @@ mod tests {
             .classes
             .class_manager
             .read()
-            .find_class_by_name("test/NotAnAnnotation")
+            .find_unique_class_by_name("test/NotAnAnnotation")
             .unwrap();
         let mirror = {
             let mut ctx = NativeContextImpl {
@@ -24272,7 +24272,7 @@ mod tests {
             .classes
             .class_manager
             .read()
-            .find_class_by_name("test/MyAnnotation")
+            .find_unique_class_by_name("test/MyAnnotation")
             .unwrap();
         let mirror = {
             let mut ctx = NativeContextImpl {
@@ -46509,7 +46509,7 @@ mod tests {
         }
         let string_id = {
             let cm = shared.classes.class_manager.read();
-            cm.find_class_by_name("java/lang/String")
+            cm.find_bootstrap_class_by_name("java/lang/String")
         };
 
         if let Some(sid) = string_id {

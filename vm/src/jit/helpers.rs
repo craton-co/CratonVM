@@ -1433,7 +1433,15 @@ unsafe fn virtual_dispatch_class(
 /// `JitInvokeInfo` whose name fields are live `&str`s.
 unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> bool {
     let cm = vm.classes.class_manager.read();
-    let Some(class_id) = cm.find_class_by_name(info.class_name) else {
+    let class_id = if info.declaring_class_id == 0 {
+        cm.find_bootstrap_class_by_name(info.class_name)
+    } else {
+        cm.find_class_by_name_for_class(
+            info.class_name,
+            ClassId::new(info.declaring_class_id),
+        )
+    };
+    let Some(class_id) = class_id else {
         return false;
     };
     let store = cm.class_store();
@@ -1697,7 +1705,14 @@ unsafe fn try_resume_trapped_callee(
     // key) — mirrors the `callee_compiler` resolution recipe.
     let cached = {
         let cm = vm.classes.class_manager.read();
-        let class_id = cm.find_class_by_name(key_class)?;
+        let class_id = if info.declaring_class_id == 0 {
+            cm.find_bootstrap_class_by_name(key_class)?
+        } else {
+            cm.find_class_by_name_for_class(
+                key_class,
+                ClassId::new(info.declaring_class_id),
+            )?
+        };
         let store = cm.class_store();
         let (method, declaring_id) =
             crate::classloading::find_method_recursive(class_id, key_method, key_desc, store)?;
@@ -4270,7 +4285,7 @@ unsafe fn jit_typecheck_resolve(
             .classes
             .class_manager
             .read()
-            .find_class_by_name(class_name);
+            .find_unique_class_by_name(class_name);
         if let Some(target) = resolved {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
                 cache.set(Some((
@@ -4536,7 +4551,7 @@ pub unsafe extern "C" fn jit_checkcast(
                 .get_class(obj_class_id)
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "<none>".into());
-            let target_cid = cm.find_class_by_name(class_name);
+            let target_cid = cm.find_unique_class_by_name(class_name);
             eprintln!(
                 "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
                 obj_ptr,
