@@ -1,8 +1,10 @@
 # TLS handshake enforcement/validation gap — 8 classes — FIXED
 
-**Status:** FIXED (2026-07-27), with two precisely-characterised residuals
-listed at the bottom. Measured on the local Windows harness (`apps/tomcat`,
-`apps/tomcat-suite-runner`), real JDK 25 boot, real sockets.
+**Status:** FIXED (2026-07-27). Seven of the eight classes are fully green;
+`TestClientCert` retains one by-design residual (A) that cannot be reproduced
+without TLS renegotiation. Measured after merging current `dev`, on the local
+Windows harness (`apps/tomcat`, `apps/tomcat-suite-runner`), real JDK 25 boot,
+real sockets.
 
 The doc this replaces framed the failures as "CratonVM enforces a rejection
 condition too loosely, or throws the wrong exception type", and guessed at a
@@ -30,7 +32,7 @@ had ever completed through this SSLEngine** (#4).
 | `org.apache.catalina.valves.rewrite.TestResolverSSL` | 1 / 3 fail | **OK 3/3** |
 | `org.apache.tomcat.util.net.TestSsl` (`testSni`) | fail | **passes** |
 | `org.apache.tomcat.util.net.TestClientCert` | 5 / 18 fail | 1 / 18 (residual A) |
-| `org.apache.tomcat.util.net.TestSSLHostConfigCompat` | 4 / 78 fail | 1 / 78 (residual B) |
+| `org.apache.tomcat.util.net.TestSSLHostConfigCompat` | 4 / 78 fail | **OK 78/78** |
 
 `TestSsl` as a whole is no longer a TLS failure but remains slow — see §8.
 
@@ -246,31 +248,27 @@ parameterisations are the same story and not a separate bug:
 `testSimpleSsl[OpenSSL]` runs in **1.9 s** in isolation, so those gaps are
 cumulative heap/GC state after `testPost`, not anything the OpenSSL path does.
 
-## Residual B — `TestSSLHostConfigCompat.testHostECwithRSAandECClient`, OPEN
+## Residual B — `TestSSLHostConfigCompat.testHostECwithRSAandECClient` — RESOLVED by the merge
 
-1 of 78, and **only in a full-class run**: executed on its own it passes in
-13 s. In-class it stalls for exactly 300 s and then fails with
-`SocketTimeoutException: Read timed out`. Reproduced twice.
+Worth recording because it briefly looked like a regression caused by this
+work. Before merging current `dev`, that one test (1 of 78) stalled for
+exactly 300 s in a full-class run and failed with
+`SocketTimeoutException: Read timed out`, while passing in 13 s standalone.
+Reproduced twice.
 
-It appeared the moment the client-restriction probe started working (root
-cause #1 above) — before that the client was silently unrestricted, so this
-test succeeded without exercising the path at all. With the restriction
-applied the client offers exactly `{ECDHE_RSA_AES256 (aliased from DHE_RSA),
-ECDHE_ECDSA_AES256}` to an EC-certificate server, which must select the ECDSA
-suite. Its near-twin `testHostECwithECClient` (client offers ONLY the ECDSA
-suite) passes, as does this test standalone, so the suite selection itself is
-not obviously wrong — the in-class-only, exactly-300 s shape points at state
-left behind by the two preceding tests that deliberately fail their handshakes
-(`testHostECwithRSAClient`, `testHostRSAwithECClient`) rather than at this
-test's own configuration.
+It surfaced the moment the client-restriction probe started working (root
+cause #1): until then the client was silently unrestricted and never exercised
+the path. With the restriction applied the client offers exactly
+`{ECDHE_RSA_AES256 (aliased from DHE_RSA), ECDHE_ECDSA_AES256}` to an
+EC-certificate server, and the server produced no response at all.
 
-Not chased further here: it is a strict improvement on the baseline (that
-class went 4 failures → 1), and the alternative — leaving the probe dead —
-costs `TestSSLHostConfigProtocol` a test AND leaves the general mechanism
-inert. Next step for whoever picks it up: run the class with
-`--stack-dump-on-timeout=90` (a standalone dump is useless, it does not
-reproduce) and look for a leaked rustls stream or an exhausted connector
-thread pool from the two preceding failed handshakes.
+Merging `origin/dev` fixed it — the class is **78/78 in ~38 s**, confirmed on
+two consecutive runs. The credible cause is `89787de3e`
+("fix(tls): scatter unwrap plaintext past FULL dst buffers"), which lands on
+exactly this path: a server that stops scattering plaintext at the first full
+destination buffer delivers nothing and the client waits out its read timeout.
+Two independent defects on the same code path, each invisible until the other
+moved.
 
 ## Files touched
 
