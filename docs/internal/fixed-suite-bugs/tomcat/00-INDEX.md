@@ -36,7 +36,7 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [26](26-defaultinstancemanager-classunload-offbyone.md) | Class-unload count off-by-one (9 vs 8) | TestDefaultInstanceManager | FAIL | 🔴 **OPEN** |
 | [27](27-xxxendpoint-unix-domain-socket-init-failure.md) | Unix domain socket connector init fails | TestXxxEndpoint | FAIL | 🔴 **OPEN** |
 | [28](28-http2-largeupload-byte-mismatch.md) | HTTP/2 large POST truncated to ~1/5 expected bytes (flow-control suspect) | TestLargeUpload | FAIL | 🔴 **OPEN** |
-| [29](29-throughput-wall-recurrence-and-unconfirmed.md) | Throughput-wall recurrence (HostConfig/Http2Section_8_2), relative-perf-assertion family, 2 contention-suspected, 1 Windows-only fixture gap | ~11 classes | mixed | see doc (not new bugs) |
+| [29](29-throughput-wall-recurrence-and-unconfirmed.md) | Throughput-wall recurrence (HostConfig/Http2Section_8_2), relative-perf-assertion family, 2 contention-suspected, 1 Windows-only fixture gap | ~11 classes | mixed | ✅ **CLOSED** (2026-07-27) — it was NOT all throughput. Four real defects fell out of it, all FIXED: `File.setLastModified` returning `false` for directories; jar/war byte caches keyed on path only, so a redeployed archive served stale content; a truncated HTTP response body discarded instead of delivered; `file:`-URL leading-slash decided before percent-decoding. Ant classpath gap fixed on the Windows harness. The genuine throughput residue moved into [04](04-embedded-server-throughput-wall-OPEN.md) |
 
 9 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed

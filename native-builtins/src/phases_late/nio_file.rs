@@ -6371,9 +6371,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             fs_cls,
             "setLastModifiedTime",
             "(Ljava/io/File;J)Z",
-            |_ctx, _args| {
-                // Stub — not critical for bootstrap
-                Ok(Some(Value::Int(1)))
+            |ctx, args| {
+                // Real-JDK `File.setLastModified(long)` bytecode delegates here.
+                // This used to be a stub that claimed success without touching
+                // the file, so any caller that reached the bytecode path (rather
+                // than the direct `java/io/File.setLastModified` native below)
+                // got `true` and an unchanged timestamp. Share the same helper
+                // so both entry points behave identically for files AND
+                // directories.
+                let file_ref = obj_arg(args, 1)?;
+                // Same `path`-field read as the sibling `getLastModifiedTime` /
+                // `getLength` / `delete0` handlers in this loop.
+                let path = match ctx.get_field(file_ref, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let millis = match args.get(2) {
+                    Some(Value::Long(v)) => *v,
+                    _ => 0,
+                };
+                Ok(Some(Value::Int(if set_file_mtime_millis(&path, millis) {
+                    1
+                } else {
+                    0
+                })))
             },
         );
 
@@ -7383,17 +7404,27 @@ pub(crate) fn jrtfs_decode(p: &str) -> Option<(String, String)> {
 /// multi-MB) pathologically slow. Classpath/mounted jars are read-only for the
 /// VM lifetime, so memoise the bytes (re-parsing the in-memory zip is cheap
 /// relative to re-reading multi-MB files from disk hundreds of times).
+///
+/// Keyed on (path, [`crate::net_phase_e::archive_stamp`]) rather than the path
+/// alone: an application server replaces a war/jar in place and redeploys, so a
+/// path-only key serves the OLD archive forever (see `archive_stamp`'s doc for
+/// the Tomcat `TestHostConfigAutomaticDeployment*` failure this caused).
 pub(crate) fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<u8>>>>>> =
-        OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<(String, u64, u64), Option<Arc<Vec<u8>>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
+    let key = (jar.to_string(), mtime, len);
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(jar) {
+    if let Some(cached) = guard.get(&key) {
         return cached.clone();
     }
     let bytes = std::fs::read(jar).ok().map(Arc::new);
-    guard.insert(jar.to_string(), bytes.clone());
+    guard.retain(|(p, _, _), _| p != jar);
+    guard.insert(key, bytes.clone());
     bytes
 }
 
@@ -7416,13 +7447,20 @@ pub(crate) struct JarFsIndex {
     children: std::collections::HashMap<String, Vec<(String, bool)>>,
 }
 
+/// Keyed on (path, [`crate::net_phase_e::archive_stamp`]) — see
+/// `jar_bytes_cached` for why a path-only key is wrong for a redeployable
+/// archive.
 pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<JarFsIndex>>>>> =
-        OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<(String, u64, u64), Option<Arc<JarFsIndex>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
+    let key = (jar.to_string(), mtime, len);
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(jar) {
+    if let Some(cached) = guard.get(&key) {
         return cached.clone();
     }
     let built = (|| {
@@ -7479,7 +7517,8 @@ pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
             children,
         }))
     })();
-    guard.insert(jar.to_string(), built.clone());
+    guard.retain(|(p, _, _), _| p != jar);
+    guard.insert(key, built.clone());
     built
 }
 
@@ -9448,6 +9487,30 @@ pub(crate) fn encode_file_uri_path(path: &str) -> String {
     out
 }
 
+/// Set a path's last-modified time, in milliseconds since the epoch, the way
+/// `java.io.File.setLastModified(long)` must: it has to work for
+/// **directories** as well as regular files, and report failure (`false`) when
+/// the path does not exist.
+///
+/// The obvious `OpenOptions::new().write(true).open(path)` + `File::set_modified`
+/// spelling silently gets this wrong for directories on every platform — on
+/// Windows `CreateFileW` refuses a directory handle without
+/// `FILE_FLAG_BACKUP_SEMANTICS`, and on Unix `open(2)` with `O_WRONLY` returns
+/// `EISDIR` — so it returned `false` for every directory. Tomcat's
+/// `TestHostConfigAutomaticDeploymentUpdateWarOffline` calls
+/// `dir.setLastModified(...)` on the expanded webapp directory to age it and
+/// asserts the return value, so it failed all four of its tests on CratonVM
+/// while passing on HotSpot. `filetime::set_file_mtime` opens with the right
+/// flags on both platforms.
+pub(crate) fn set_file_mtime_millis(path: &str, millis: i64) -> bool {
+    // Split into whole seconds + non-negative nanosecond remainder, which is
+    // what `FileTime::from_unix_time` expects (its nanos argument must be in
+    // `0..1_000_000_000` even for pre-epoch timestamps).
+    let secs = millis.div_euclid(1000);
+    let nanos = (millis.rem_euclid(1000) * 1_000_000) as u32;
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, nanos)).is_ok()
+}
+
 pub(crate) fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     // Prefer the real-JDK `getPath()` implementation when Available (correct
     // `prefixLength` + internal path for `java.io.File` loaded from modules).
@@ -10477,17 +10540,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        // Use std::fs::File + set_modified (Rust 1.75+)
-        let ok = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .and_then(|f| {
-                let time =
-                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis.max(0) as u64);
-                f.set_modified(time)
-            })
-            .is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        Ok(Some(Value::Int(if set_file_mtime_millis(&path, millis) {
+            1
+        } else {
+            0
+        })))
     });
     r.register(file, "setReadable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;

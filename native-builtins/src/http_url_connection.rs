@@ -27,7 +27,7 @@
 //! No stubs: every code path performs real I/O against the network or rejects
 //! the call with a typed `IOException`. We never fabricate canned 200s.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -50,6 +50,39 @@ thread_local! {
     /// (post-redirect-follow) response by the time `huc_real_perform` reads
     /// it back out into `RealResult::reason`.
     static LAST_REASON_PHRASE: RefCell<String> = RefCell::new(String::new());
+
+    /// Whether the response body most recently read on this thread was
+    /// TRUNCATED — the peer closed the connection part-way through a chunked
+    /// body/chunk header, or short of the advertised `Content-Length`.
+    ///
+    /// This used to be reported as a hard `Err` from `read_chunked`, which
+    /// **discarded every byte already received**. Real JDK semantics are the
+    /// opposite: `getResponseCode()` succeeds (the head arrived intact),
+    /// `getInputStream()` hands out the bytes that DID arrive, and only the
+    /// read that runs past the truncation point throws `IOException`
+    /// ("Premature EOF"). Tomcat's `TestGenerator.testBug56581` depends on
+    /// exactly that: `bug56581.jsp` writes 1000 lines, commits the response,
+    /// then throws, so `ErrorReportValve` aborts the connection mid-body — the
+    /// test asserts on the 1000 lines the client did receive AND on the
+    /// resulting `IOException`. Discarding the body made `ByteChunk.toString()`
+    /// return `null` and the assertion NPE.
+    ///
+    /// Same rationale as `LAST_REASON_PHRASE` above for why this is a
+    /// thread-local side channel rather than a 4th tuple element: every
+    /// blocking HTTP call is performed serially on the calling Java thread, so
+    /// "most recently read on this thread" is exactly "the response this
+    /// thread just read".
+    static LAST_RESPONSE_TRUNCATED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Mark the response currently being read on this thread as truncated.
+fn mark_response_truncated() {
+    LAST_RESPONSE_TRUNCATED.with(|t| t.set(true));
+}
+
+/// Read and clear the truncation flag for the response just read.
+fn take_response_truncated() -> bool {
+    LAST_RESPONSE_TRUNCATED.with(|t| t.replace(false))
 }
 
 use rustls::pki_types::ServerName;
@@ -94,6 +127,9 @@ struct ConnState {
     /// Once `getInputStream` has been called and the bytes drained, we keep
     /// the body here so subsequent `read()` calls return the same data.
     body_consumed: bool,
+    /// The peer aborted before the body was complete — see
+    /// `LAST_RESPONSE_TRUNCATED` and `make_response_input_stream`.
+    truncated: bool,
 }
 
 struct ConnRegistry {
@@ -157,6 +193,10 @@ struct RealResult {
     /// Empty for the synthetic timeout-sentinel result, in which case
     /// `huc_get_response_message` falls back to the hardcoded table.
     reason: String,
+    /// The peer aborted before the body was complete (see
+    /// `LAST_RESPONSE_TRUNCATED`). `body` holds the bytes that DID arrive;
+    /// the stream handed to Java replays them and then throws `IOException`.
+    truncated: bool,
 }
 
 fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
@@ -592,6 +632,7 @@ fn huc_real_perform(
                             headers,
                             body,
                             reason,
+                            truncated: take_response_truncated(),
                         },
                     );
                 }
@@ -606,6 +647,7 @@ fn huc_real_perform(
                             headers: Vec::new(),
                             body: Vec::new(),
                             reason: String::new(),
+                            truncated: false,
                         },
                     );
                 }
@@ -703,6 +745,7 @@ fn huc_real_perform(
                         headers,
                         body,
                         reason,
+                        truncated: take_response_truncated(),
                     },
                 );
             }
@@ -721,6 +764,7 @@ fn huc_real_perform(
                         headers: Vec::new(),
                         body: Vec::new(),
                         reason: String::new(),
+                        truncated: false,
                     },
                 );
             }
@@ -758,6 +802,75 @@ fn huc_real_body(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
         .ok()
         .and_then(|t| t.get(&key).map(|r| r.body.clone()))
         .unwrap_or_default()
+}
+
+/// Whether the cached response for a real-JDK connection was truncated by the
+/// peer (see `LAST_RESPONSE_TRUNCATED`).
+fn huc_real_truncated(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    real_results()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| r.truncated))
+        .unwrap_or(false)
+}
+
+/// Build the `InputStream` handed to Java for a response body.
+///
+/// For a complete response this is just a `ByteArrayInputStream` over `body`.
+/// For a TRUNCATED response (peer aborted mid-body) it is a
+/// `SequenceInputStream(ByteArrayInputStream(body), <a stream whose first read
+/// throws IOException>)`, so a Java reader sees exactly what HotSpot shows it:
+/// the bytes that arrived, followed by an `IOException` at the point the data
+/// stopped — rather than an empty body (what discarding the partial body gave)
+/// or a silent clean EOF (what returning it without the error would give).
+///
+/// The trailing "always throws" stream is an **unconnected**
+/// `java.io.PipedInputStream`: a real JDK class, constructed with no side
+/// effects, whose every `read` overload immediately throws
+/// `IOException("Pipe not connected")`. Using a real `InputStream` subclass
+/// (rather than a CratonVM synthetic) matters because callers wrap the result
+/// in `BufferedInputStream`/`InputStreamReader`, which are typed against
+/// `java.io.InputStream`.
+fn make_response_input_stream(
+    ctx: &mut dyn NativeContext,
+    body: &[u8],
+    truncated: bool,
+) -> MethodCallResult {
+    let head = make_byte_array_input_stream(ctx, body);
+    if !truncated {
+        return Ok(Some(head));
+    }
+    let Value::Object(Some(head_ref)) = head else {
+        return Ok(Some(head));
+    };
+    // `head` must survive the two constructor up-calls below, both of which can
+    // allocate and therefore relocate it under the moving collector — pin it and
+    // read the forwarded reference back afterwards.
+    let pin = ctx.pin_native_root(head_ref);
+    let tail = ctx.new_object_initialized("java/io/PipedInputStream", "()V", &[]);
+    let out = match tail {
+        Ok(Some(Value::Object(Some(tail_ref)))) => {
+            // BOTH operands have to survive the `SequenceInputStream`
+            // allocation, so pin the tail too before re-reading either.
+            let tail_pin = ctx.pin_native_root(tail_ref);
+            let head_now = Value::Object(Some(ctx.read_native_pin(pin, head_ref)));
+            let tail_now = Value::Object(Some(ctx.read_native_pin(tail_pin, tail_ref)));
+            match ctx.new_object_initialized(
+                "java/io/SequenceInputStream",
+                "(Ljava/io/InputStream;Ljava/io/InputStream;)V",
+                &[head_now, tail_now],
+            ) {
+                Ok(Some(seq @ Value::Object(Some(_)))) => Ok(Some(seq)),
+                // Could not wrap — hand back the partial body on its own rather
+                // than losing it.
+                _ => Ok(Some(Value::Object(Some(ctx.read_native_pin(pin, head_ref))))),
+            }
+        }
+        _ => Ok(Some(Value::Object(Some(ctx.read_native_pin(pin, head_ref))))),
+    };
+    ctx.unpin_native_roots(pin);
+    out
 }
 
 /// Cached response headers for a real-JDK connection (empty if not performed).
@@ -1224,6 +1337,9 @@ fn read_response_with_prefix<S: Read>(
     head: bool,
     prefix: Vec<u8>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    // Fresh response: clear any truncation flag left by an earlier one on this
+    // thread (e.g. the first leg of a redirect chain).
+    LAST_RESPONSE_TRUNCATED.with(|t| t.set(false));
     let mut buf = prefix;
     let mut tmp = [0u8; 8192];
     let head_end = match find_subslice(&buf, b"\r\n\r\n") {
@@ -1308,6 +1424,10 @@ fn read_response_with_prefix<S: Read>(
         while body_buf.len() < target {
             let n = read_eof_tolerant(stream, &mut tmp).map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
+                // Peer closed before delivering the advertised Content-Length.
+                // Keep what arrived; the caller surfaces the shortfall as an
+                // IOException at the END of the stream, as HotSpot does.
+                mark_response_truncated();
                 break;
             }
             body_buf.extend_from_slice(&tmp[..n]);
@@ -1341,7 +1461,12 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             let n =
                 read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("chunked size", e))?;
             if n == 0 {
-                return Err("chunked: socket closed mid-header".into());
+                // Connection aborted between chunks. Return the chunks that
+                // DID arrive (see `LAST_RESPONSE_TRUNCATED`) instead of
+                // discarding the whole body — the caller replays them to the
+                // Java reader and then throws, matching HotSpot.
+                mark_response_truncated();
+                return Ok(out);
             }
             prefix.extend_from_slice(&tmp[..n]);
         };
@@ -1359,7 +1484,11 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             let n =
                 read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("chunked body", e))?;
             if n == 0 {
-                return Err("chunked: socket closed mid-body".into());
+                // Aborted part-way through a chunk: keep the complete chunks
+                // already decoded plus whatever of this one arrived.
+                mark_response_truncated();
+                out.extend_from_slice(&prefix[..prefix.len().min(size)]);
+                return Ok(out);
             }
             prefix.extend_from_slice(&tmp[..n]);
         }
@@ -2490,6 +2619,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
             response_body: body_bytes,
             response_headers: headers,
             body_consumed: false,
+            truncated: take_response_truncated(),
         });
     ctx.set_field(this, HUC_CONN_ID, Value::Int(id));
     ctx.set_field(this, HUC_CONNECTED, Value::Int(1));
@@ -2679,7 +2809,8 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             if full.starts_with("http://") || full.starts_with("https://") {
                 huc_real_perform(ctx, this, &full)?;
                 let body = huc_real_body(ctx, this);
-                return Ok(Some(make_byte_array_input_stream(ctx, &body)));
+                let truncated = huc_real_truncated(ctx, this);
+                return make_response_input_stream(ctx, &body, truncated);
             }
             return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
         }
@@ -2701,14 +2832,8 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
 
     ensure_connected(ctx, this)?;
-    let body_bytes = with_state(ctx, this, |s| s.response_body.clone()).unwrap_or_default();
-    let body_arr = new_byte_array(ctx, &body_bytes);
-    let len = body_bytes.len() as i32;
-    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-    ctx.set_field(stream, 0, Value::Object(Some(body_arr)));
-    ctx.set_field(stream, 1, Value::Int(0));
-    ctx.set_field(stream, 2, Value::Int(0));
-    ctx.set_field(stream, 3, Value::Int(len));
+    let (body_bytes, truncated) = with_state(ctx, this, |s| (s.response_body.clone(), s.truncated))
+        .unwrap_or_default();
     // Mark consumed so a follow-up read doesn't double-pull.
     if let Value::Int(id) = ctx.get_field(this, HUC_CONN_ID) {
         if let Ok(mut reg) = registry().lock() {
@@ -2717,7 +2842,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         }
     }
-    Ok(Some(Value::Object(Some(stream))))
+    make_response_input_stream(ctx, &body_bytes, truncated)
 }
 
 fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2730,7 +2855,8 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 return Ok(Some(Value::Object(None)));
             }
             let body = huc_real_body(ctx, this);
-            return Ok(Some(make_byte_array_input_stream(ctx, &body)));
+            let truncated = huc_real_truncated(ctx, this);
+            return make_response_input_stream(ctx, &body, truncated);
         }
     }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
