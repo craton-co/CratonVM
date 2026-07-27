@@ -1,8 +1,8 @@
 # OPEN — Keycloak boots but Arc registers no beans, so no HTTP listener starts
 
 **Status: OPEN, found 2026-07-27** as a follow-on to the (now closed) Keycloak
-boot blockers in
-`docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`. Not a
+boot blockers (classloader synthetic-stub fabrication pre-empting a custom
+`ClassLoader`, root-caused and fixed). Not a
 regression — this surface was simply unreachable before, because the boot died
 earlier.
 
@@ -51,8 +51,8 @@ empty or key-mismatched.
 
 `BeanContainerImpl.instance(Class, Annotation...)` looks beans up by `Class`
 identity, which is the shape CratonVM has repeatedly got wrong before (a
-`Class`-keyed map missing an entry its name-keyed sibling finds) — see
-`docs/internal/fixed-suite-bugs/springboot/` for the Spring analogues, and
+`Class`-keyed map missing an entry its name-keyed sibling finds) — see the
+Spring analogues in memory
 `spring-bean-class-identity-check-native-shims-first`. That is the first thing
 to check, not the last: whether the `Class` object the generated
 `ComponentsProvider` registered under and the one `BeanContainerImpl` looks up

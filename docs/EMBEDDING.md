@@ -320,7 +320,7 @@ that means per embedding path:
   undocumented-but-possible path.
 
 For the state of the offload path itself (independent of this embedding-surface gap), see
-[`docs/internal/gpu-offload-followups-20260711.md`](internal/gpu-offload-followups-20260711.md).
+[`docs/gpu/README.md`](gpu/README.md) and the feature docs it links to.
 
 ## See also
 

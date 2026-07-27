@@ -245,18 +245,15 @@ when reading allocation-path or GC-pause code.
 Correctness is no longer what blocks the flip. `CRATONVM_MOVING_YOUNG=1` with
 the JIT enabled produces the right answer and runs real moving cycles as of
 2026-07-26 — the heap corruption that blocked it was five codegen sites pushing
-an untagged object reference onto the JIT's simulated operand stack
-([`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`](docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md)).
+an untagged object reference onto the JIT's simulated operand stack.
 What blocks the flip now is throughput, and by less than it was: on
 Binary-Trees-18 the moving path measures **2.1×** the default sweep (six
 interleaved rounds, min 2905 ms vs 1363 ms), down from 5.0× before the
 pre-cycle object-start walk stopped building a hash set of every object in
-from-space
-([`docs/internal/moving-young-throughput-20260726.md`](docs/internal/moving-young-throughput-20260726.md)).
+from-space.
 bt18 is the worst case for a copying collector, and it is also the workload
 where the default build cannot run at `-Xmx512m` at all while the compacting
-collector completes. Remaining precise-root work is tracked in
-[`docs/internal/arch-2026-07-26/moving-young-precise-roots.md`](docs/internal/arch-2026-07-26/moving-young-precise-roots.md).
+collector completes.
 
 **Object layout:**
 ```
@@ -450,9 +447,9 @@ pointer.
    `--real-jdk` and `--synthetic-jdk` are symmetric and mutually exclusive.
    `VmConfig::default()` remains synthetic for hermetic embedding/tests, while
    the launcher default is the named `LAUNCHER_DEFAULT_JDK_MODE`. Version and
-   fatal-error output identify the selected mode. The change and its
-   compatibility alias are recorded in
-   `docs/internal/arch-2026-07-26/jdk-mode-determinism.md`.
+   fatal-error output identify the selected mode. `VmConfig::with_host_jdk_default()`
+   is kept only as a compatibility alias for `VmConfig::for_launcher()` — see
+   the doc comment on either in [`vm/src/config.rs`](vm/src/config.rs).
 
    Practical consequence for anyone diagnosing a failure: **establish which
    library the run used before anything else.** A missing real-JDK native and a
@@ -512,9 +509,8 @@ This repository has a chronic and well-evidenced failure mode: a capability
 lands behind a `CRATONVM_*` environment variable, the variable defaults to
 **off**, the work is recorded as "implemented", and the code never executes on
 the default path. The docs then describe a VM that nobody is running. Several
-of the corrections in the 2026-07-26 truth pass were instances of this; the
-pass itself is recorded in
-[`docs/internal/arch-2026-07-26/docs-truth-pass.md`](docs/internal/arch-2026-07-26/docs-truth-pass.md).
+of the corrections in the 2026-07-26 truth pass over this document were
+instances of this.
 
 **Confirmed instances** (all verifiable in the tree today):
 

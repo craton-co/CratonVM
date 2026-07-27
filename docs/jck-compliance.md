@@ -14,9 +14,8 @@
 > * **Pass %** — ratio of in-repo tests (`cargo test --workspace` +
 >   `cratonvm-vm` integration tests + Phase-I smoke runners) that
 >   exercise the section's API surface, weighted by rough surface area.
-> * **Open bugs** — count of unresolved items in
->   `docs/internal/roadmap-any-java-app.md` + `docs/internal/roadmap.md`
->   that affect that section.
+> * **Open bugs** — count of unresolved items in the internal per-app-area
+>   and per-milestone task trackers that affect that section.
 >
 > When the real JCK bundle lands, this table is regenerated from
 > `runtests/report/junit-report.xml` via `scripts/jck-matrix.sh`.
