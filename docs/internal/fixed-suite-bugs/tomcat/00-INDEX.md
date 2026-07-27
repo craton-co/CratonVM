@@ -86,6 +86,14 @@ in the remaining 11. Also flagged: two remaining-11 classes
 this directory claiming they're already fixed, but both still fail/hang on
 current `dev` — not reconciled yet. See group 16's addendum for full detail.
 
+> **`TestJNDIRealmIntegration` reconciled 2026-07-26.** The class is 76/76 with
+> the JIT fully enabled on `com/unboundid/`, and its real producer
+> (TOMCAT-JNDIREALM-JIT.3 — `string_case_cache` published only to the GC
+> initiator, so any peer-initiated sweep reclaimed the cached case-conversion
+> Strings) is fixed, with both JIT guards removed. See
+> [jndirealmintegration-unboundid-jit-corruption-FIXED.md](jndirealmintegration-unboundid-jit-corruption-FIXED.md).
+> `TestMapperPerformance` remains unreconciled.
+
 > ⚠️ **The 172-fixture-gap figure above (both 2026-07-21 and 2026-07-23) is
 > WRONG — corrected 2026-07-24.** `run-tomcat-suite.sh` never `cd`'d into the
 > Tomcat checkout root before launching each test, so relative-path resource

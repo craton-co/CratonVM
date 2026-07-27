@@ -55,6 +55,22 @@ cargo test --release -p cratonvm-vm unboundid_rdn_name_value_pairs --lib
 # 2 passed; 0 failed
 ```
 
+> **Superseded 2026-07-26 — the guard is gone; the real producer was found.**
+> The `RDN.getNameValuePairs` guard described in this section
+> (TOMCAT-JNDIREALM-RDN.1) was containment, not a fix, and has been **removed**
+> along with the wider `com/unboundid/` guard that later superseded it
+> (TOMCAT-JNDIREALM-JIT.2). The code-generation defect speculated about above —
+> "the JIT's array-backed `SortedSet` return path" — did not exist. The producer
+> was a GC root gap: `JvmThread::string_case_cache` was published only to the GC
+> *initiator*, so a collection initiated by any other thread reclaimed the
+> cached case-conversion Strings that `StaticUtils.toLowerCase` returns. The two
+> unit tests named above are replaced by
+> `unboundid_is_jit_eligible_after_jndirealm_ban_removal`. The "Diagnostic
+> follow-up (2026-07-16)" note below is superseded too: those bounded GC
+> "corrupt header" messages were this same defect, not benign interior
+> conservative-root candidates. Full writeup, evidence and validation:
+> [jndirealmintegration-unboundid-jit-corruption-FIXED.md](jndirealmintegration-unboundid-jit-corruption-FIXED.md).
+
 This closes both the special-character credential group and the escaped-OU
 residual group. The earlier connection-level JNDI LDAP fix remains documented
 in [jndirealmintegration-ldap-connection-npe-FIXED.md](jndirealmintegration-ldap-connection-npe-FIXED.md).

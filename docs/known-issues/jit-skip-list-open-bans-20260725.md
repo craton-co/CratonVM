@@ -236,10 +236,9 @@ still real correctness bugs worth closing):
   `AbstractOperationContext.<init>`/`controllerOperations` null report —
   very likely the same underlying bug family, possibly the same bug. No
   separate test needed; KEEP.
-- TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2 — **CLAIMED by
-  `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, 2026-07-26
-  ~02:35 UTC** (pivoted here from the blocked ANTLR.1 item above; real
-  Tomcat Linux fixture + named repro test available on this host).
+- TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2 — **BOTH REMOVED
+  2026-07-26, root-caused and fixed** (TOMCAT-JNDIREALM-JIT.3, the
+  `string_case_cache` cross-thread root gap — see the section below).
   PROXY-JITCALL.1, SPR-AOT-TESTNG-MAPS.1
 - REACTOR-ADDCAP.1, REACTOR-FLUXCREATE.1, JETTY-WSIO.1, NETTY.1 — all
   Reactor/Jetty/Netty websocket demand-accounting bugs, share a "JIT
@@ -346,7 +345,7 @@ Testable via Tomcat's 76-case `TestJNDIRealmIntegration` matrix on this
 host's Tomcat fixture (`/data/data/apps/tomcat`). Starting with the
 narrow RDN.getNameValuePairs guard first.
 
-**Result: DONE, ban stays (re-confirmed real) — 2026-07-26 02:43 UTC.**
+**Result (2026-07-26 02:43 UTC): ban stays, re-confirmed real.**
 Ran Tomcat's real 76-case `TestJNDIRealmIntegration` suite against this
 host's fixture (`org.junit.runner.JUnitCore`, real UnboundID in-memory
 LDAP server, no mocks): baseline (ban in place) 76/76 pass in ~35s. With
@@ -359,9 +358,36 @@ followed by `ClassCastException(java.lang.Object cannot be cast to
 java.lang.String)` during LDAP DN/RDN matching, and the run eventually
 hangs (STW cross-thread JIT takeover waiting on cooperative mutators,
 timeout at 120s). Confirmed JIT-specific: identical lifted config with
-`--nojit` added is 76/76 clean in ~34s. **No action needed — both guards
-are current and correct, not stale. Do not attempt to lift without a real
-fix for the stale-pointer/zero-header receiver bug.**
+`--nojit` added is 76/76 clean in ~34s. "Do not attempt to lift without a
+real fix for the stale-pointer/zero-header receiver bug."
+
+**SUPERSEDED — BOTH BANS REMOVED 2026-07-26, root cause found and fixed
+(`fix/tomcat-jndirealm-unboundid-jit-20260726`).** The real fix the entry
+above asked for: **TOMCAT-JNDIREALM-JIT.3** — `JvmThread::string_case_cache`
+(the ASCII case-conversion cache, three raw `ObjectRef`s per entry) was wired
+into `roots.rs`/`gc.rs` only, i.e. the **initiator-only** pair, and into
+neither published root snapshot nor the frozen-peer walk. Since the in-memory
+LDAP server is thread-per-connection, the GC initiator is almost never the
+cache's owner, so the non-moving young sweep reclaimed the cached Strings and
+the owner's next `get_ascii_case_string_cached` returned the freed address.
+Method bisection pinned the trigger to the single method
+`com/unboundid/util/StaticUtils.toLowerCase` (whose whole body is the case
+conversion): `CRATONVM_JIT_BISECT_SKIP` on it alone took the reclaimed-live
+count from 3-4/run to 0 with everything else still compiled.
+
+Two process lessons for the rest of this sweep:
+
+1. **A passing run is not a clean run.** The 02:43 UTC "baseline 76/76 pass"
+   and 38 later lifted runs that also passed were all emitting 3-4
+   `Stale pointer` warnings each — the interpreter's CP-class fallback usually
+   recovers. Grep stderr for `Stale pointer` and count it; that metric was
+   near-deterministic where the assertion failure was ~40% flaky.
+2. **Build a same-commit control before crediting a fix.** A control build at
+   dev `e4e4053bb` still fails 4/5 in the identical harness, which is what
+   makes "clean on current dev" mean something.
+
+Full writeup:
+`docs/internal/fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md`.
 
 ## JASPER-JDT.2 / JASPER-JDT.3 — CLAIMED 2026-07-26 02:54 UTC
 
