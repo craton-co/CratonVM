@@ -1296,11 +1296,21 @@ fn should_skip_jit_internal(
             }
         }
 
-        if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
-            && !package_allowed(class_name, allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // ES-FRAGILE-CLUSTER.1 (blanket `org/elasticsearch/`) -- REMOVED
+        // 2026-07-27. The ban's last re-verification
+        // (`docs/internal/es-fragile-cluster-confirmed-needed-20260726.md`)
+        // kept it on the strength of a single class,
+        // `index.mapper.blockloader.FloatFieldBlockLoaderTests`, which gained
+        // 3 failures with the package allowed (38/120 -> 41/120) while the
+        // other 17 classes in that spread sample were byte-identical. That
+        // regression, and the `cluster.NodeConnectionsServiceTests` SIGSEGV
+        // investigated in the same window, were both the ownerless
+        // inline-cache entry fixed in `vm/src/jit/helpers.rs` (see
+        // `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`):
+        // a MIC slot published a raw compiled entry with no
+        // `Arc<CompiledMethod>` keep-alive, so generated code kept calling a
+        // body the next tier-up `put` unmapped. Re-measured with that fix in
+        // place -- see the doc for the class-by-class tallies.
 
         // ES-HAMCREST.1 -- REMOVED 2026-07-26. Re-verified with a
         // standalone probe (`HamcrestProbe.java`, real hamcrest-core +
@@ -1311,11 +1321,10 @@ fn should_skip_jit_internal(
         // aggressive-compilation pass: 0 mismatches in every configuration.
         // No longer reproduces on current dev (the original bug's own
         // `System$1.findNative` FFM bridge fix + subsequent JIT correctness
-        // work appears to have already closed it). Note: the broader
-        // `org/elasticsearch/` blanket ban immediately above this one
-        // (`is_elasticsearch_suite_jit_fragile_cluster`) was NOT re-tested --
-        // no Elasticsearch checkout/fixture is available on this host, see
-        // `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`.
+        // work appears to have already closed it). The broader
+        // `org/elasticsearch/` blanket ban that used to sit immediately above
+        // this one was removed 2026-07-27 against the real ES 9.6.0-SNAPSHOT
+        // fixture; see `docs/internal/es-fragile-cluster-confirmed-needed-20260726.md`.
         // `HamcrestProbe.java` is the regression witness for this entry only.
 
         // WILDFLY-CONTROLLER-JIT.1 (2026-07-13): the optimized
@@ -2377,19 +2386,6 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
             | ("java/util/Objects", "hashCode")
             | ("java/util/Objects", "equals")
     )
-}
-
-// Elasticsearch suite classes are kept interpreted under the conservative
-// policy until the package can be safely re-bisected. The July 2026 vector and
-// DiskBBQ hang residuals are covered by this same containment: the affected
-// test classes and their Elasticsearch vector-codec bodies sit under
-// `org/elasticsearch/`. Lucene bytecode is no longer skip-listed: the
-// LUCENE-POSTINGS.1 blanket `org/apache/lucene/` ban was retired by
-// `117d2d906` ("admit Lucene after synchronized-method gate") once the
-// interpreter started gating ACC_SYNCHRONIZED methods out of JIT/OSR itself,
-// which closed the IndexWriter monitor repro that had kept the ban alive.
-fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
-    class_name.starts_with("org/elasticsearch/")
 }
 
 fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
