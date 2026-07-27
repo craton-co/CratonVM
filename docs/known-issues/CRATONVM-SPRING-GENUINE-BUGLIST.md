@@ -144,11 +144,23 @@ Two more that were on the list are **not** CratonVM bugs and need no further wor
 - `aot.nativex.FileNativeConfigurationWriterTests` — fixture artifact, see the
   archived history.
 
-Not re-run this session because the previous session closed them and nothing
-here touches their area: `beans.factory.aot.BeanRegistrationsAotContributionTests`
-(the separately tracked ~227×-vs-HotSpot interpreter throughput defect, which
-also SIGSEGVs under batch load) and
-`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`.
+The last two were re-measured after the table above was first written, so they
+belong in it — the count of 8 already includes them:
+
+- `beans.factory.aot.BeanRegistrationsAotContributionTests` — TIMEOUT, no
+  `RESULT` line at a 1500 s ceiling. This is the separately tracked
+  ~227×-vs-HotSpot interpreter throughput defect; it SIGSEGV'd under batch load
+  earlier the same day, so treat a crash there as a symptom of the same
+  slowness, not a second bug.
+- `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`
+  — LOADERR after 948 s: `NoClassDefFoundError:
+  org/junit/platform/commons/util/ExceptionUtils`, a core JUnit-Platform class
+  that is unconditionally on the classpath. The archived history guessed
+  memory pressure; that is now unlikely — this is the third
+  "`NoClassDefFoundError` for a class that is demonstrably loaded" of the
+  session, after the two loader-ambiguity bugs fixed above, and it survives
+  those fixes. `CRATONVM_DBG_LINKAGE_BT=1` names the raise site in one run;
+  start there.
 
 ## Reproducing
 
