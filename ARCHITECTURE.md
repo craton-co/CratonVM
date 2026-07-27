@@ -5,15 +5,21 @@ If you want to contribute, this is the place to start.
 
 ## Crate Layout
 
-The workspace has 20 member crates (the `fuzz` harness is a separate,
+The workspace has 22 member crates (the `fuzz` harness is a separate,
 standalone workspace, not a member):
 
 ```
 cratonvm/
   reader/              cratonvm-reader              .class file parser
   types/               cratonvm-types               Shared types (Value, ClassId, ObjectRef)
-  native-api/          cratonvm-native-api          NativeContext trait & FD table
-  native-builtins/     cratonvm-native-builtins     java.lang.* native methods
+  native-api/          cratonvm-native-api          Native capability facade & FD table
+  native-builtins/     cratonvm-native-builtins     java.lang.*, registration & marshalling
+  native-builtins-crypto/
+                       cratonvm-native-builtins-crypto
+                                                    Crypto compatibility kernels
+  native-builtins-security/
+                       cratonvm-native-builtins-security
+                                                    JDK security & SunEC native pack
   native-collections/  cratonvm-native-collections  java.util.* native methods
   native-io/           cratonvm-native-io           java.io/nio native methods
   native-awt/          cratonvm-native-awt          AWT/Swing/Java2D native peers
@@ -41,6 +47,8 @@ vm-cli -> vm -> {classloading, gc, jit, native-builtins, native-collections,
                  -> {reader, types, native-api, jit-api}
                  -> (gpu-offload feature only) {jit-cuda, cuda-bridge}
                      -> also forwards gc/gpu-offload, native-builtins/gpu-offload
+
+native-builtins -> {native-builtins-crypto, native-builtins-security}
 
 libcratonvm  -> vm   (C-ABI / JNI Invocation API embedding shim)
 cratonvm-embed -> vm (curated, semver-stable Rust embedding facade)
@@ -74,8 +82,8 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~1,290,000 LoC across the 20 workspace
-member crates as of 2026-07-25, plus the separate `fuzz` harness workspace).
+The VM is the core of the project (~1,348,000 Rust LoC across the 22 workspace
+member crates as of 2026-07-27, plus the separate `fuzz` harness workspace).
 It contains six major subsystems (several now extracted into their own
 crates).
 
@@ -84,26 +92,26 @@ actually is:
 
 | Crate | LoC | Crate | LoC |
 |-------|----:|-------|----:|
-| `native-builtins` | 565,000 | `native-awt` | 17,000 |
-| `vm` | 319,000 | `native-api` | 15,000 |
-| `jit` | 97,000 | `jfr` | 14,000 |
-| `gc` | 58,000 | `reader` | 13,000 |
-| `native-collections` | 53,000 | `jit-cuda` | 10,000 |
-| `native-io` | 50,000 | `types` | 9,500 |
-| `classloading` | 50,000 | remaining 6 | < 6,000 each |
+| `native-builtins` | 571,000 | `native-awt` | 17,000 |
+| `vm` | 334,000 | `types` | 17,000 |
+| `jit` | 105,000 | `native-api` | 17,000 |
+| `gc` | 64,000 | `reader` | 14,000 |
+| `classloading` | 56,000 | `jfr` | 14,000 |
+| `native-collections` | 54,000 | `jit-cuda` | 10,000 |
+| `native-io` | 52,000 | remaining 10 | < 7,000 each |
 
 Several individual files are far larger than is comfortable. The two largest
-*production* files are `vm/src/runtime/interpreter.rs` (~46,800 lines) and
-`jit/src/x64.rs` (~41,000).
+*production* files are `vm/src/runtime/interpreter.rs` (~47,900 lines) and
+`jit/src/x64.rs` (~42,600).
 
-`vm/src/vm.rs` appears to dwarf both at 74,043 lines, but that number is
+`vm/src/vm.rs` appears to dwarf both at ~74,200 lines, but that number is
 misleading and this is **not** the file to start reading. Everything from
 line 62 onward is a single `#[cfg(all(test, feature = "synthetic-jdk"))]
 mod tests` — a test module the default build does not even compile, because
 `synthetic-jdk` is deliberately not a default Cargo feature (`vm/Cargo.toml`).
 The orchestrator itself is the ~61-line module header above it, which declares
-and re-exports `vm/src/vm/`: `vm_exec.rs` (~21,200 lines), `vm_init.rs`
-(~11,900), `vm_util.rs` (~4,300), `vm_object.rs` (~2,100), and `realms/`.
+and re-exports `vm/src/vm/`: `vm_exec.rs` (~21,900 lines), `vm_init.rs`
+(~12,300), `vm_util.rs` (~4,600), `vm_object.rs` (~2,100), and `realms/`.
 Those are the files to open.
 
 Two `native-builtins` files were worse and were split on 2026-07-25:
@@ -124,9 +132,12 @@ noise. The payoff of splitting is **merge-conflict surface and reviewability**
 (the two worst files are 57% and 89% smaller, and edits now land in 31 separate
 files instead of colliding in two), not build time.
 
-An actual incremental-build win requires splitting into **separate crates**. The
-module boundaries established by that split are the natural seams for it, and
-that is the tracked follow-up.
+An actual incremental-build win requires **separate crates**. That work has
+started at the heaviest stable seams: cryptographic kernels and JDK
+security/SunEC code now compile as `native-builtins-crypto` and
+`native-builtins-security`. The facade crate retains registration and
+Java-object marshalling; other domain modules remain candidates only when a
+measured rebuild or ownership benefit justifies another crate boundary.
 
 ### Runtime (`vm/src/runtime/`)
 
@@ -136,41 +147,20 @@ The bytecode execution engine.
   operands, manipulates the operand stack and local variables, and advances the
   program counter.
 
-  There are **two dispatch paths**, and which one a frame gets is decided by its
-  class name:
+  There are two cooperating dispatch paths:
 
-  * a *fast path* that reads opcodes straight from the raw bytecode and fuses
-    common sequences (e.g. `iload_X; iload_Y; iadd`) as superinstructions; and
-  * a *slow path* that calls `Instruction::decode` and matches on the decoded
-    `Instruction` enum.
+  * the common *fast path* reads opcodes from verified raw bytecode and fuses
+    common sequences (for example `iload_X; iload_Y; iadd`) as
+    superinstructions; and
+  * unsupported opcodes or guarded edge cases fall through to the shared
+    decoded handler.
 
-  The fast path uses `pop_unchecked` / `set_local_unchecked` at sites that
-  assume verifier-narrow stack shapes, so it is **not** spec-correct for
-  arbitrary bytecode. `class_disables_interp_fast_path`
-  (`vm/src/runtime/frame.rs`) therefore excludes whole package prefixes —
-  `java/`, `jdk/`, `sun/`, `com/sun/`, `org/springframework/` — with
-  `java/util/*` and `Math`/`StrictMath` whitelisted back in. Two consequences
-  worth knowing before you touch this file:
-
-  1. Correctness of the fast path rests on a class-name deny-list, not on a
-     property of the bytecode. The intended fix (recorded in that function's
-     own TODO) is a per-method `unsafe_for_fast_path` flag computed at
-     verification time.
-  2. JDK and Spring bytecode runs on the slow path. The re-decode-on-every-
-     execution cost that used to imply **has been fixed** — do not re-propose
-     it. A one-time quickening pass pre-decodes a method's instruction stream
-     into a `QuickenedCode` (`reader/src/quickened.rs`), and the slow path
-     picks it up through `quickened_for_frame`
-     (`vm/src/runtime/interpreter.rs:7872`), falling back to
-     `Instruction::decode` only for frames with no quickened stream.
-
-     The pc→index lookup is now O(1), including taken branches:
-     `QuickenedCode` stores a bitmap of instruction starts plus a cumulative
-     count per 64-byte block, and `resolve(pc)` maps any valid bytecode pc with
-     two loads and a popcount. The interpreter uses this hint-free combined
-     lookup directly. The remaining architectural problem is the duplicated
-     opcode semantics in the fast and slow dispatch paths, not decoding or
-     pc lookup.
+  Package names are no longer execution-policy inputs: identical verified
+  bytecode takes the same common path whether it belongs to an application,
+  the JDK, or a framework. `--noverify` disables unchecked raw-byte handlers
+  and uses the bounds-checked decoded path. A one-time quickening pass stores
+  a `QuickenedCode` (`reader/src/quickened.rs`), whose bitmap/rank index maps a
+  bytecode PC to a decoded instruction in O(1), including taken branches.
 - **`frame.rs`** — Stack frame: local variables and operand stack use
   8-byte NaN-boxed `CompactValue` slots. A parallel byte array is retained
   for the ambiguous raw `long`/`double` local cases; tags are otherwise inline.
@@ -178,6 +168,28 @@ The bytecode execution engine.
 - **`value_stack.rs`** — Typed operand stack (SoA encoded).
 - **`exceptions.rs`** — Java exception creation and throw handling.
 - **`invokedynamic.rs`** — Lambda/method-ref bootstrap via LambdaMetafactory.
+
+### Typed Bootstrap (`vm/src/vm/vm_init.rs`)
+
+Startup is encoded as consuming typestate transitions:
+
+```text
+BootstrapPhase<Allocated>
+    → BootstrapPhase<ClassesReady>
+    → BootstrapPhase<NativesReady>
+    → BootstrapPhase<RuntimeReady>
+```
+
+Each boundary validates the invariant it owns: a nonempty class universe with
+`java/lang/Object`, a nonempty native registry, and wired runtime hooks.
+Only `RuntimeReady` exposes `finish`. The token is deliberately small; large
+subsystems remain locally owned during `SharedVm::new`, while the token prevents
+accidental reordering and gives tests a precise failure boundary.
+
+The end-to-end process lifecycle and the cross-subsystem safety invariants are
+documented in the manual's
+[Runtime Lifecycle](docs/book/src/internals/runtime-lifecycle.md) and
+[Runtime Contracts](docs/book/src/internals/runtime-contracts.md) chapters.
 
 ### Class Loading (`classloading/` crate)
 
@@ -265,22 +277,22 @@ Field cell width depends on the field's type and on the layout in force
 
 | Field kind | Width | Notes |
 |------------|------:|-------|
-| Reference | 8 B | `REF_FIELD_SIZE` — bare pointer, `0` = null. Default (compact reference-field layout; `CRATONVM_COMPACT_REF_FIELDS=0` opts back out to a 16 B tagged cell). |
-| Primitive | 16 B | `SLOT_SIZE` — the full tagged `Value` enum: 4 B discriminant, then the payload. |
+| Reference | 8 B | Bare pointer, `0` = null; 4 B when compressed oops are explicitly enabled. |
+| `boolean` / `byte` | 1 B | Tagless physical field. |
+| `char` / `short` | 2 B | Tagless physical field. |
+| `int` / `float` | 4 B | Tagless physical field. |
+| `long` / `double` | 8 B | Tagless physical field. |
 
-So an `int` field currently costs 16 bytes for 4 bytes of data. `CompactLayout`
-already computes natural 1/2/4/8-byte offsets and a precise GC oop-map
-(`ref_offsets`) for *all* field kinds, so extending the tagless representation
-from references to primitives is a completion of existing work rather than a
-new subsystem — see the tracked layout work.
+`CompactLayout` computes aligned offsets and the precise GC reference map
+(`ref_offsets`). The interpreter/native `Value` enum is a boundary type, not
+the physical instance-field representation.
 
-The 32-byte header (`ObjectHeader`, `types/src/heap_types.rs`) spends 8 bytes on
-an always-resident `forwarding_ptr` and 4 on an always-resident
-`identity_hash_code`. Folding the forwarding pointer into the mark word would
-take the header to **24 bytes**. Removing the identity hash alone saves nothing
-because alignment restores four bytes of padding. Reaching 16 bytes is a
-separate design project: the kind/element-type/age/flags word also has to move,
-and the current inflated-monitor mark word has no spare bits.
+The 32-byte header (`ObjectHeader`, `types/src/heap_types.rs`) is the current
+compatibility contract. A 24- or 16-byte header would require a separate object
+model: folding forwarding state into the mark word couples collector relocation
+to thin/inflated monitor state, while removing the identity hash alone saves no
+space after alignment. Header compression is therefore an experiment, not an
+unfinished requirement of the compact field layout.
 
 Arrays use compact element sizes (1/2/4/8 bytes per element depending on type;
 `element_byte_size`), with reference elements at `REF_ELEMENT_SIZE` = 8 B.
@@ -298,7 +310,7 @@ active, so `getfield`/`putfield` fall back to the always-correct helpers.
 
 ### JIT Compiler (`jit/` crate)
 
-Custom x86-64 / AArch64 JIT compiler (~97,000 LoC; `x64.rs` alone is ~39,000).
+Custom x86-64 / AArch64 JIT compiler (~105,000 LoC; `x64.rs` alone is ~42,600).
 Extracted into the `cratonvm-jit` crate, with shared API types in
 `cratonvm-jit-api`.
 
@@ -317,19 +329,25 @@ in `ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`), which
 decouples optimization from instruction selection; others fall back to the
 direct single-pass path.
 
-**The IR path is materially wider than the original bring-up path, but the
-two-backend split still leaks capabilities.** `ir_compatible()` now admits up
-to 64 invokes, 64 instance-field operations, 64 static-field operations, and
-16 allocation sites; `ir_compatible_sized` uses an 8,000-byte method cap and a
-20,000-node graph cap. Static calls lower directly and virtual/interface calls
-use the same inline-cache/PIC shape as the single-pass backend, default-on.
+**The two front ends now share one runtime-sensitive lowering library.**
+`jit/src/runtime_lowering.rs` owns the x86-64 contracts for allocation,
+megamorphic dispatch, and live monitor calls. The single-pass emitter and IR
+lowerer may differ in optimization and scheduling, but both emit those
+stateful operations through the same ABI.
 
-Real lowering gaps remain. The IR still declines `athrow`, `invokedynamic`,
-`multianewarray`, and type checks. A surviving allocation cannot be lowered by
-the IR at all: only allocations eliminated by escape analysis stay on the IR
-path; otherwise compilation falls back to single-pass so the inline TLAB bump
-is retained. The design goal is therefore still one shared lowering layer, but
-call dispatch is no longer the blocker described by older audits.
+`ir_compatible()` admits up to 64 invokes, 64 instance-field operations, 64
+static-field operations, and 16 allocation sites; `ir_compatible_sized` uses
+an 8,000-byte method cap and a 20,000-node graph cap. Static calls lower
+directly, virtual/interface calls use the same MIC/four-entry PIC plus compact
+eight-set/two-way hashed tail, and escaping `Op::New` nodes lower through the
+class-initializing, TLAB-aware allocation helper. Live monitor bytecodes call
+the thin-lock runtime path; only an exact per-PC scalar-replacement proof may
+elide a lock.
+
+Coverage gaps such as unsupported `invokedynamic`, `multianewarray`, or
+exception-frame shapes remain fail-closed admission boundaries: the method
+uses another tier or the interpreter rather than receiving different runtime
+semantics.
 
 Key optimizations: register allocation for locals, magic division,
 LICM, bounds check elimination, AVX2 SIMD, on-stack replacement (OSR).
@@ -347,14 +365,21 @@ appears (`CRATONVM_BG_COMPILE=0` restores inline compilation). Two calling
 conventions: **pure** methods (direct call) and **context** methods (receive
 `SharedVm` pointer as hidden first argument).
 
-### Native Methods (`native-builtins/`, `native-collections/`, `native-io/` crates)
+### Native Methods (`native-api/` and `native-*` crates)
 
 A large compatibility surface of native implementations and application
 bridges, split across domain-specific crates. The real-JDK default registers a
 smaller bridge/intrinsic subset; the `synthetic-jdk` feature adds the synthetic
-standard-library surface. The `NativeContext` trait lives in `native-api/`.
+standard-library surface. `native-api/` defines narrow heap, class, invoke,
+thread, exception, system, and related capability traits composed by
+`NativeContext`.
 
-- **`native-builtins/`** — java.lang.* native methods.
+- **`native-builtins/`** — java.lang.*, registration, and Java-object
+  marshalling.
+- **`native-builtins-crypto/`** — separately compiled cryptographic
+  compatibility kernels.
+- **`native-builtins-security/`** — separately compiled JDK security and SunEC
+  implementation pack.
 - **`native-collections/`** — java.util.* native methods.
 - **`native-io/`** — java.io/nio native methods.
 
@@ -362,9 +387,11 @@ These stubs are the **synthetic** standard library — the fallback mode, not th
 default one (see Key Design Decision 1). In the default real-JDK mode the same
 crates register a much smaller essential-native surface underneath real
 `java.base` bytecode, so a method you find implemented here may not be the one
-executing. The `NativeContext` trait (in `native-api/`) provides a VM-agnostic
-interface for native methods to access the heap, class manager, and thread
-state in both modes.
+executing. The `NativeContext` capability facade provides VM-agnostic,
+loader-aware operations in both modes without making native crates depend on
+the concrete VM. Common native argument decoding, forwarding, and pin-index
+buffers retain up to eight slots inline and spill correctly for larger
+descriptors.
 
 ### Threading (`vm/src/threading/`)
 
