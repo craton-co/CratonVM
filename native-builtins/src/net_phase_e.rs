@@ -787,6 +787,24 @@ fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed 
     .into()
 }
 
+/// Classify a UDP `recv` failure the way the JDK does: an expired `SO_TIMEOUT`
+/// (`WSAETIMEDOUT` on Windows, `EAGAIN`/`EWOULDBLOCK` on Unix) is
+/// `java.net.SocketTimeoutException`, everything else a plain IOException.
+/// Polling receivers distinguish the two — see `native-io::net::udp_recv_error`
+/// for the Tribes membership case a bare IOException broke.
+fn udp_recv_ex(e: std::io::Error) -> cratonvm_types::error::MethodCallFailed {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    ) {
+        return RuntimeError::SocketTimeoutException {
+            message: "Receive timed out".into(),
+        }
+        .into();
+    }
+    ioex(format!("UDP recv: {e}"))
+}
+
 /// Throw the concrete `java.net.UnknownHostException` (a subclass of
 /// IOException). Code that catches `UnknownHostException` specifically (e.g.
 /// Tomcat `NetMask`) misses a bare IOException, so host-resolution failures
@@ -10285,7 +10303,7 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(o)) => o,
                 _ => data_arr,
             };
-            let (n, origin) = recv_result.map_err(|e| ioex(format!("UDP recv: {e}")))?;
+            let (n, origin) = recv_result.map_err(udp_recv_ex)?;
             copy_bytes_into_java_array(ctx, data_arr, 0, &buf[..n])?;
             ctx.set_field(pkt, DP_LENGTH, Value::Int(n as i32));
             if let Some((oh, op)) = origin.rsplit_once(':') {
