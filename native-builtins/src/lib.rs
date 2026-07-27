@@ -4050,10 +4050,7 @@ pub mod lang_string;
 // helpers, Executable.getParameters, Method.getDefaultValue, etc.).
 pub mod lang_reflect;
 // WP4.7: Real StampedLock + ReentrantReadWriteLock backends.
-pub(crate) mod bc_aes;
-pub(crate) mod bc_chacha;
-pub(crate) mod bc_newhope;
-pub(crate) mod bc_newhope_tables;
+pub(crate) use cratonvm_native_builtins_crypto::{bc_aes, bc_chacha, bc_newhope};
 pub mod lang_invoke;
 pub mod lang_math;
 pub mod lang_misc;
@@ -4381,10 +4378,10 @@ pub mod atomic_updater;
 pub mod biginteger_intrinsics;
 // Byte-identical native intrinsic for the SunEC P-256 Montgomery field
 // multiply/square (dominant cost of EC keygen/sign/verify).
-pub mod sunec_intpoly;
+pub use cratonvm_native_builtins_security::sunec_intpoly;
 // Gated (default-off) coarse native EC scalar-multiply via the p256 crate,
 // bypassing the one-time generator-table precompute.
-pub mod sunec_point;
+pub use cratonvm_native_builtins_security::sunec_point;
 
 // WP1.4 — `jdk.internal.access.SharedSecrets` bridge: 15 *Access
 // interface singletons + every per-interface method.  Unblocks
@@ -28984,7 +28981,14 @@ pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
         Some(e) => &bytes[body_start..body_start + e],
         None => &bytes[body_start..],
     };
-    match b64_decode(body, B64_VARIANT_BASIC) {
+    // MIME, not BASIC: a PEM body is line-wrapped by definition (RFC 7468
+    // caps it at 64 chars per line), and even a one-line body carries the
+    // newline that precedes `-----END`. The BASIC decoder rejects EVERY
+    // non-alphabet byte including whitespace (see `b64_decode`), so with it
+    // this function could never decode any real PEM — it always fell through
+    // to the "hand the original bytes back" arm and returned the armored text
+    // as if it were DER. MIME is exactly the whitespace-skipping variant.
+    match b64_decode(body, B64_VARIANT_MIME) {
         Ok(der) if !der.is_empty() => der,
         // Not valid base64 (or empty) — hand the original bytes back so the
         // caller's existing DER path / mirror fallback runs exactly as before.

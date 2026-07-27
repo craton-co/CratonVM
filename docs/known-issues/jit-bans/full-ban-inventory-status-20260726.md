@@ -34,18 +34,26 @@ started.
 - HIB-BIGINTEGER-AIOOBE.1/.2 (`java/math/{BigInteger,MutableBigInteger}`) — deterministic repro, no escape hatch by design; now cross-referenced with SUNEC-INTPOLY above
 - TYPES-ERASURE.1 (`com/sun/tools/javac/code/Types.erasure`) — 40/40 repro; consolidation-with-the-other-6-javac-bans hypothesis explicitly REFUTED (see `docs/known-issues/jit-skip-list-open-bans-20260725.md`), so it stays as its own entry alongside SPRING-TESTCOMPILER.1-4/HIB-STOREDPROC-JIT.1 below
 
-## CONSOLIDATED FINDING — no longer individually actionable
+## CONSOLIDATED FINDING — CLOSED 2026-07-27, block deleted
 
-`is_known_miscompile()`'s entire ~950-line `matches!` block is unreachable
-dead code under any default run (gated behind
-`callee_saved_gpr_local_homes_enabled()`, defaults false, no CLI wiring).
-This resolves EXEC.1, W2-CHM, RBC.1, HIB-PROXY, KC26.LR, KC-CRED.LAZY,
-ES-HANG-01's WeakHashMap entries, and the SPB.1/2/8 *individual-method*
-entries (HashMap/LinkedHashMap/String/Provider/Long/Integer) without
-further work needed. Full writeup:
-`docs/known-issues/is-known-miscompile-block-inert-20260726.md`.
-BC-ASN1.1, FELIX.1, and JUNIT.1's duplicate dead copy were the specific
-instances found and confirmed as part of this same discovery.
+`is_known_miscompile()`'s entire ~950-line `matches!` block (189 entries) was
+unreachable dead code under any default run, gated behind a PRIVATE
+`callee_saved_gpr_local_homes_enabled()` copy in `skip_list.rs` that defaulted
+false — while the real allocator switch of that name
+(`jit::x64::callee_saved_gpr_local_homes_enabled()`) has defaulted **true**
+since precise JIT maps went default-on 2026-07-07. The block and that private
+gate were **deleted 2026-07-27**, closing EXEC.1, W2-CHM, RBC.1, HIB-PROXY,
+KC26.LR, KC-CRED.LAZY, ES-HANG-01's WeakHashMap entries, BC-ASN1.1, FELIX.1,
+SB-17, JUNIT.1's duplicate dead copy, the ecj `HashtableOf*.rehash` family and
+the SPB.1/2/8 *individual-method* entries
+(HashMap/LinkedHashMap/String/Provider/Long/Integer).
+
+19 of the 189 entries were additionally verified as genuinely JIT-compiled
+today and correct (`--nojit` vs. JIT vs. `CRATONVM_JIT_THRESHOLD=1`, with
+`CRATONVM_DBG_JITC` proving compilation); the rest cannot be compiled at all
+(Rust natives win over their bytecode), are `<init>`s the constructor gate
+already blocks, or are shadowed by other still-active bans. Full writeup:
+`docs/internal/is-known-miscompile-block-retired-20260727.md`.
 
 ## NOT YET RE-INVESTIGATED this session — real, open work, blocked or unclaimed
 

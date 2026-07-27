@@ -61,6 +61,23 @@ smaller/individual differences not yet clustered.
 > global class store, un-doing `ModifiedClassPathClassLoader`'s
 > `@ClassPathExclusions` filtering.
 
+> Closure update (2026-07-27): `mockito-silently-selects-fallback-location-and-memberaccessor.md`
+> is fixed — moved to
+> [`../../internal/fixed-suite-bugs/springboot/mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md`](../../internal/fixed-suite-bugs/springboot/mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md).
+> Root cause was **not** the branch/dispatch defect that doc hypothesised, and
+> not classloader-related at all (it reproduces with no fork loader at all):
+> CratonVM shipped two deliberate native overrides that replaced Mockito's
+> selector methods wholesale — `LocationFactory.create` returned a
+> `Java8LocationImpl` carrying the hardcoded string `"-> at <<unknown line>>"`
+> instead of walking the stack, and `ModuleMemberAccessor.delegate` always
+> returned `ReflectionMemberAccessor`. Both are now off by default (behind
+> `CRATONVM_MOCKITO_LEGACY_SELECTORS`), so every Mockito failure message names
+> its real call site again. Removing the first override unmasked a second,
+> wider bug also fixed here: CratonVM's synthetic `StackWalker$StackFrame`
+> carrier never registered `toString()`, so it printed
+> `java.lang.StackWalker$StackFrame@a166` instead of `Cls.method(File:line)`
+> for **any** consumer, not just Mockito.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -113,8 +130,8 @@ rather than assuming closed or re-investigating from scratch.
 > plain jar's own manifest `Class-Path:` attribute. **FIXED** — see
 > [`../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md).
 > `PathRequestTests` now passes outright; the other 3 narrowed to two distinct
-> residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
-> (still OPEN) and `securityfilterautoconfig-capturedoutput-password-not-observed.md`
+> residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md)
+> (now FIXED, see the 2026-07-27 closure update below) and `securityfilterautoconfig-capturedoutput-password-not-observed.md`
 > (was here, now **FIXED** — see below).
 
 > Closure update (2026-07-26): `SecurityFilterAutoConfigurationEarlyInitializationTests`
@@ -128,6 +145,21 @@ rather than assuming closed or re-investigating from scratch.
 > `ManagementWebSecurityAutoConfigurationTests` 3/3 clean; the reactive variant
 > shows a separate, likely-unrelated intermittent timeout — see the FIXED doc
 > above for details).
+
+> Closure update (2026-07-27): `onbeancondition-mergedannotations-intermittent-identity-mismatch.md`
+> is now closed too. The doc's own claimed symptom never reproduced (23 clean
+> runs total, JIT on/off) — resolved as a side effect of unrelated `dev`
+> drift, same pattern as the entries above. The reactive variant's "separate,
+> likely-unrelated intermittent timeout" flagged in the closure update just
+> above turned out to be real and root-caused: a `reactor/core/scheduler/
+> NonBlocking` classloader double-define race (a background Reactor
+> scheduler thread's recursive interface resolution racing, unsynchronized,
+> against the main thread's own top-level `Class.forName` on the same
+> isolated loader) — fixed in both `classloading::ClassManager::
+> resolve_supertype` and `native-builtins`'s `ucl_try_define_local_class`.
+> Verified 0/40 clean (was 10-23% failure rate) plus 16 more clean runs
+> across both classes with JIT on/off. Moved to
+> [`../../internal/fixed-suite-bugs/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md).
 
 > Investigation (2026-07-24): `module/spring-boot-micrometer-tracing-opentelemetry`'s
 > 2-class residual from this rerun (`OpenTelemetryBaggagePropagationIntegrationTests`,

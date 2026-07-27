@@ -224,6 +224,9 @@ struct Lowerer<'a> {
     /// instance-field reads route through it so receivers are validated against
     /// the live heap before any object-header dereference.
     getfield: usize,
+    /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
+    /// nodes use the same shared runtime-lowering stub as the baseline tier.
+    new_object: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -332,6 +335,9 @@ impl<'a> Lowerer<'a> {
             if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
                 needs_context = true;
             }
+            if matches!(n.op, Op::New { .. }) {
+                needs_context = true;
+            }
         }
 
         // Frame layout (rbp downward): locals, [context slot], spills, [args
@@ -405,6 +411,7 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
+            new_object: helpers.new_object,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -633,9 +640,9 @@ impl<'a> Lowerer<'a> {
         self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         let rel = self.buf.pos() as i32 - (clear_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(clear_patch, rel)
-            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+        // IR safepoint poll -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, clear_patch, rel);
     }
 
     /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
@@ -1009,9 +1016,9 @@ impl<'a> Lowerer<'a> {
             self.call_exc_patches.push(patch);
         }
         let rel = self.buf.pos() as i32 - (fast_skip_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(fast_skip_patch, rel)
-            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+        // ir_lower self-call stack-sample -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, fast_skip_patch, rel);
 
         // Marshal args into this method's OWN entry ABI — IDENTICAL to the
         // register list `emit_prologue` reads incoming args from: abi[0] = the
@@ -1054,9 +1061,9 @@ impl<'a> Lowerer<'a> {
         // .keep:
         let keep_off = self.buf.pos();
         let rel = keep_off as i32 - (keep_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(keep_patch, rel)
-            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+        // ir_lower self-call sentinel keep -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, keep_patch, rel);
         // Spill the return value.
         self.store_rax(slot);
     }
@@ -1474,9 +1481,9 @@ impl<'a> Lowerer<'a> {
             // .keep: patch the JNE above to land here.
             let keep_off = self.buf.pos();
             let rel = keep_off as i32 - (keep_patch as i32 + 4);
-            self.buf
-                .try_patch_i32(keep_patch, rel)
-                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+            // ir_lower call-sentinel keep -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, keep_patch, rel);
         } else {
             self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
             let patch = self.buf.pos();
@@ -1493,9 +1500,9 @@ impl<'a> Lowerer<'a> {
         for p in patches {
             // rel32 = target - (rel32_field_offset + 4); target = entry = 0.
             let rel = 0i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+            // ir_lower self-call rel32 -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, p, rel);
         }
     }
 
@@ -1675,6 +1682,40 @@ impl<'a> Lowerer<'a> {
                 // MOV RAX, RDX
                 self.buf.emit(&[0x48, 0x89, 0xD0]);
                 self.patch_div_overflow_after(ovf_after);
+                self.store_rax(slot);
+            }
+            Op::New {
+                class_id,
+                num_fields,
+            } => {
+                let slot = self.alloc_slot(id);
+                crate::runtime_lowering::emit_new_object_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    self.new_object,
+                    *class_id,
+                    *num_fields,
+                    self.frame_record,
+                );
+
+                // `jit_new_object` returns null after publishing a pending
+                // initialization/OOM exception. Convert that private sentinel
+                // to the JIT-wide i64::MIN return before entering the shared
+                // exception epilogue, matching the baseline tier.
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+                self.buf.emit(&[0x0F, 0x85]); // JNZ allocated
+                let allocated_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+                let allocated = self.buf.pos();
+                let rel = allocated as i32 - (allocated_patch as i32 + 4);
+                // allocation success -- tolerated on an overflowed buffer; see
+                // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                Self::patch_or_bail(&mut self.buf, allocated_patch, rel);
                 self.store_rax(slot);
             }
             Op::Neg => {
@@ -1921,9 +1962,9 @@ impl<'a> Lowerer<'a> {
                 // continue: patch the JNZ to here (fall-through past the deopt).
                 let cont = self.buf.pos();
                 let rel = cont as i32 - (jnz_patch as i32 + 4);
-                self.buf
-                    .try_patch_i32(jnz_patch, rel)
-                    .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+                // guard JNZ -- tolerated on an overflowed buffer; see
+                // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                Self::patch_or_bail(&mut self.buf, jnz_patch, rel);
             }
             // getfield read — `Op::Load`. The IR builder emits only
             // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
@@ -2366,9 +2407,9 @@ impl<'a> Lowerer<'a> {
                         // around_first: the jumped-to edge. Patch the Jcc here.
                         let around_first = self.buf.pos();
                         let rel = around_first as i32 - (jcc_patch as i32 + 4);
-                        self.buf
-                            .try_patch_i32(jcc_patch, rel)
-                            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+                        // codegen -- tolerated on an overflowed buffer; see
+                        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                        Self::patch_or_bail(&mut self.buf, jcc_patch, rel);
                         self.emit_phi_copies(block_idx, second_block);
                         self.buf.emit_byte(0xE9); // JMP second_block
                         let jmp_second = self.buf.pos();
@@ -2396,9 +2437,9 @@ impl<'a> Lowerer<'a> {
         for &(patch_pos, target_block) in &self.branch_patches {
             let target_offset = self.block_offsets[target_block];
             let rel32 = target_offset as i32 - (patch_pos as i32 + 4);
-            self.buf
-                .try_patch_i32(patch_pos, rel32)
-                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+            // codegen -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, patch_pos, rel32);
         }
     }
 
@@ -2592,9 +2633,9 @@ impl<'a> Lowerer<'a> {
         let do_div = self.buf.pos();
         for p in [jne1, jne2] {
             let rel = do_div as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+            // div-overflow JNE -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, p, rel);
         }
         after_patch
     }
@@ -2605,9 +2646,9 @@ impl<'a> Lowerer<'a> {
     fn patch_div_overflow_after(&mut self, after_patch: usize) {
         let cont = self.buf.pos();
         let rel = cont as i32 - (after_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(after_patch, rel)
-            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+        // div-overflow JMP -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, after_patch, rel);
     }
 
     /// Emit a deopt-on-zero branch, given the caller has already emitted a
@@ -2657,9 +2698,9 @@ impl<'a> Lowerer<'a> {
         // continue:
         let cont = self.buf.pos();
         let rel = cont as i32 - (jcc_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(jcc_patch, rel)
-            .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+        // deopt-unless Jcc -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, jcc_patch, rel);
     }
 
     /// IR FP tier (Slice B) — emit the JVMS null + bounds deopt guards for an
@@ -2711,10 +2752,42 @@ impl<'a> Lowerer<'a> {
         let patches = std::mem::take(&mut self.deopt_stub_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+            if !Self::patch_or_bail(&mut self.buf, p, rel) {
+                break;
+            }
         }
+    }
+
+    /// Patch one stub-relative `rel32`, tolerating an overflowed buffer.
+    ///
+    /// Returns `false` once the patch could not be applied.
+    /// [`ExecutableBuffer::try_patch_i32`] reports that ONLY by marking the
+    /// buffer overflowed, and an overflowed buffer makes `lower_inner`
+    /// discard the whole `CompiledMethod` and fall back to the single-pass
+    /// backend -- so the error is genuinely ignorable here, exactly as
+    /// `try_patch_i32`'s own contract says ("the caller may ignore the `Err`
+    /// and rely on that bail") and as `patch_rel32_to_here` already does.
+    ///
+    /// It must NOT be an `expect`. `emit_deopt_stub` / `emit_call_exc_stub`
+    /// run BEFORE that bail-out, on a VM thread with no unwinding catch, so a
+    /// body that outgrew its estimated buffer aborted the whole process
+    /// instead of falling back. Real repro (2026-07-27): parsing Groovy
+    /// source through `GroovyClassLoader.parseClass` panicked with
+    /// `call-exc JE patch in-bounds: PatchFailed { kind: "i32", offset: 4125 }`
+    /// -- offset == the emitted length, i.e. the branch's own rel32
+    /// placeholder had already been dropped by the sticky-overflow `emit` --
+    /// and took the VM down with `fatal runtime error: failed to initiate
+    /// panic`. The identical run under `--nojit` is clean.
+    fn patch_or_bail(buf: &mut ExecutableBuffer, offset: usize, rel: i32) -> bool {
+        if buf.try_patch_i32(offset, rel).is_err() {
+            debug_assert!(
+                buf.overflowed(),
+                "try_patch_i32 must mark the buffer overflowed when it fails, \
+                 so that lower_inner discards this compile"
+            );
+            return false;
+        }
+        true
     }
 
     /// Gap B: emit the single shared call-exception bail stub (if any `Op::Call`
@@ -2735,9 +2808,9 @@ impl<'a> Lowerer<'a> {
         let patches = std::mem::take(&mut self.call_exc_patches);
         for p in patches {
             let rel = stub_off as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .ok(); // Err => buffer overflowed; lower_inner bails (see patch_rel32_to_here)
+            if !Self::patch_or_bail(&mut self.buf, p, rel) {
+                break;
+            }
         }
     }
 
@@ -3106,6 +3179,17 @@ pub(crate) fn lower_inner(
     // site keeps the historical helper dispatch.
     ic_slots: &HashMap<usize, (usize, usize)>,
 ) -> Option<CompiledMethod> {
+    // A live object allocation is now supported by the common allocation
+    // stub. A zero helper pointer is only possible in synthetic unit-test
+    // tables; reject it instead of emitting a call through address zero.
+    if helpers.new_object == 0
+        && graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, Op::New { .. }))
+    {
+        return None;
+    }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
     // MIC + 4-way-PIC dual-ABI inline-cache site emits ~360 and a direct call
@@ -3298,6 +3382,97 @@ mod tests {
             "patch sites must swallow the error and let `lower_inner`'s \
              `buf.overflowed()` bail fall back to single-pass, not panic \
              (use `.ok()`); offenders: {offenders:?}",
+        );
+    }
+
+    #[test]
+    fn live_new_uses_shared_allocation_stub_and_context_abi() {
+        extern "C" fn allocate(vm: i64, class_id: i64, num_fields: i64) -> i64 {
+            vm + class_id * 100 + num_fields
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let allocation = graph.add(
+            Op::New {
+                class_id: 23,
+                num_fields: 7,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            Some(0),
+        );
+        graph.exit = graph.add(
+            Op::Return,
+            IrType::Void,
+            vec![ctrl, allocation],
+            Some(3),
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.new_object = allocate as *const () as usize;
+        let compiled =
+            lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation must lower");
+        assert!(compiled.needs_context);
+        // SAFETY: the synthetic helper treats the context as an integer and the
+        // generated method has no Java arguments.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(11, &[])
+                .expect("allocation call")
+        };
+        assert_eq!(result, 11 + 23 * 100 + 7);
+    }
+
+    #[test]
+    fn live_new_converts_null_failure_to_jit_exception_sentinel() {
+        extern "C" fn fail(_: i64, _: i64, _: i64) -> i64 {
+            0
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let allocation = graph.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            Some(0),
+        );
+        graph.exit = graph.add(
+            Op::Return,
+            IrType::Void,
+            vec![ctrl, allocation],
+            Some(3),
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.new_object = fail as *const () as usize;
+        let compiled = lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation");
+        // SAFETY: helper ignores the synthetic context.
+        assert_eq!(
+            unsafe { compiled.try_call_with_context(1, &[]) },
+            Ok(i64::MIN)
         );
     }
 

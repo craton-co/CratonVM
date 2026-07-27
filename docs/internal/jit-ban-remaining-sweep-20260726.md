@@ -112,7 +112,10 @@ tests rewritten from "stays interpreted" assertions to
 ## NEW BUG FOUND: `java.io.Writer.write(char[])` JIT miscompile
 
 Found incidentally while re-testing the JAXB ban. Full writeup:
-`docs/known-issues/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
+`docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md`
+(CLOSED 2026-07-27 — does not reproduce; see also
+`docs/internal/jit-licm-preheader-bypass-20260727.md`, the general JIT bug
+that the same probe was really failing on at 4000 iterations).
 Summary: `Writer.write(char[] cbuf)`'s trivial one-line forwarding body
 (`write(cbuf, 0, cbuf.length)`, inherited by `StringWriter` since it doesn't
 override this specific zero-argument-array overload) silently drops the
