@@ -5319,6 +5319,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         )
     }
 
+
     fn invoke_special(
         &mut self,
         class_name: &str,

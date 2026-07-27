@@ -1459,6 +1459,7 @@ pub trait NativeInvokeAccess: NativeClassAccess {
         self.invoke(class_name, method_name, descriptor, args)
     }
 
+
     // -- LinkResolver wiring for Java-side reflection natives -----------
     //
     // Round 9 audit fix (HIGH #7): Java-side reflection

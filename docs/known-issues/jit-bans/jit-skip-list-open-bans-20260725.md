@@ -500,6 +500,6 @@ session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-202607
 - **NEW BUG FOUND:** `java.io.Writer.write(char[])` silently drops output
   under JIT once hot — a general VM defect, not app-specific, unrelated to
   the JAXB ban it was found under. Not yet root-caused/fixed. See
-  `docs/known-issues/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
+  `docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md` (CLOSED 2026-07-27).
 
 Reproducers committed under `docs/known-issues/repros/jitban-remaining-20260726/`.
