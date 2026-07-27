@@ -39,7 +39,11 @@ retain full evidence/repro details; this file is the summary.
 
 ## Kept — confirmed still needed, with real evidence
 
-- **JAXB** (`org/glassfish/jaxb/`) — real QName-compare corruption reproduces. `docs/known-issues/jaxb-still-needed-20260726.md`.
+- ~~**JAXB** (`org/glassfish/jaxb/`)~~ — **superseded: ban REMOVED 2026-07-27.**
+  The QName-compare corruption was real but not JAXB's: it was the JIT's
+  `java/lang/String` compact-layout field intrinsic reading a primitive field
+  four bytes high, fixed by `82b78bca5`. See
+  `docs/internal/jaxb-jit-ban-lifted-20260727.md`.
 - **ES fragile cluster** (`org/elasticsearch/`) — real ES 9.6.0-SNAPSHOT checkout, 18-class sample found a real regression (`FloatFieldBlockLoaderTests`). `docs/known-issues/es-fragile-cluster-confirmed-needed-20260726.md`.
 - **HIB-TEMPORAL.1** (`org/hibernate/`) — real Hibernate ORM 8.0 harness, lifting causes a full `StrategySelectionException` bootstrap cascade. `docs/known-issues/hib-temporal-1-still-needed-20260726.md`.
 

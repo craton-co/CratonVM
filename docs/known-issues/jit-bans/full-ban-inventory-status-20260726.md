@@ -24,7 +24,9 @@ started.
 
 ## CONFIRMED still needed, KEPT, each with a dedicated writeup
 
-- JAXB (`org/glassfish/jaxb/`) — `docs/known-issues/jaxb-still-needed-20260726.md`
+- ~~JAXB (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27**, root-caused to
+  `82b78bca5` (String compact-layout field intrinsic read 4 bytes high), not
+  to JAXB. See `docs/internal/jaxb-jit-ban-lifted-20260727.md`.
 - ES fragile cluster (`org/elasticsearch/`) — no fixture, `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`
 - JSONSMART-PARSER.1 (`net/minidev/json/parser/`) — `docs/known-issues/jsonsmart-parser-still-needed.md`
 - SPB.1 (`org/springframework/util/`) — inconclusive real-app-less repro, `docs/known-issues/spb1-springframework-util-investigation.md`

@@ -211,7 +211,8 @@ still real correctness bugs worth closing):
 - HIB-TEMPORAL.1, HIB-LONGTAIL.1/2/3, HIB-BIGINTEGER-AIOOBE.1,
   HIB-STOREDPROC-JIT.1 (candidate for TYPES-ERASURE.1 consolidation, see
   above)
-- JAXB (`jaxb_mapping_residual_skip_prefix`), Xerces
+- ~~JAXB (`jaxb_mapping_residual_skip_prefix`)~~ — REMOVED 2026-07-27, see
+  `docs/internal/jaxb-jit-ban-lifted-20260727.md`. Xerces
   (`xerces_schema_jit_deny_prefix`), SnakeYAML emitter
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
@@ -486,9 +487,13 @@ session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-202607
   `org/springframework/boot/` blanket ban under Conservative — safe no-op for
   default behavior, see the doc for the nuance), ES-HAMCREST.1, SnakeYAML
   emitter (ES-JIT-DEOPT-GC.1).
-- **KEPT, confirmed still live:** JAXB (`org/glassfish/jaxb/`) — real
-  corruption reproduced once a newly-found, unrelated `java.io.Writer`
-  bug (below) was worked around.
+- **~~KEPT, confirmed still live~~ — REMOVED 2026-07-27:** JAXB
+  (`org/glassfish/jaxb/`). The corruption reproduced here was real, but it
+  was not JAXB's and not the `java.io.Writer` bug either — both faces are
+  the JIT's `java/lang/String` compact-layout field intrinsic reading a
+  primitive field four bytes high, fixed by `82b78bca5`. Bisected against
+  this ban's own reproducer; see
+  `docs/internal/jaxb-jit-ban-lifted-20260727.md`.
 - **KEPT, no fixture to test:** ES fragile cluster / whole `org/elasticsearch/`
   prefix — no Elasticsearch checkout survives on this host; see
   `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`.
@@ -497,9 +502,11 @@ session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-202607
   (defaults `false`) — dead in any default run already. NETTY.1's only
   matching entry was the historical `Arrays.fill` bug, already lifted
   2026-06-11 (predates this session).
-- **NEW BUG FOUND:** `java.io.Writer.write(char[])` silently drops output
-  under JIT once hot — a general VM defect, not app-specific, unrelated to
-  the JAXB ban it was found under. Not yet root-caused/fixed. See
-  `docs/known-issues/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
+- **NEW BUG FOUND — FIXED, same root cause as the JAXB ban:**
+  `java.io.Writer.write(char[])` silently drops output under JIT once hot.
+  Root-caused 2026-07-27 to the JIT's `java/lang/String` compact-layout
+  field intrinsic (`82b78bca5`), not to `Writer` — the dropped content was
+  always the *name* strings, already decoded empty before the write. See
+  `docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
 
 Reproducers committed under `docs/known-issues/repros/jitban-remaining-20260726/`.

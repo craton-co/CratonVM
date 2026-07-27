@@ -1,11 +1,35 @@
-# `java.io.Writer.write(char[])` JIT miscompile — silently drops written characters (NEW, undiscovered)
+# `java.io.Writer.write(char[])` JIT miscompile — silently drops written characters
 
-**Status: OPEN.** Found while re-testing the `org/glassfish/jaxb/` JIT ban
-(`jaxb_mapping_residual_skip_prefix`) as part of the JIT-ban-removal sweep
-following the 2026-07-26 JIT rework. This is a **general VM correctness bug**,
-not specific to JAXB or any app — it can corrupt any write through
-`Writer.write(char[])`'s default one-argument overload once the calling
-method is hot enough to JIT.
+**Status: FIXED 2026-07-26 by `82b78bca5` ("fix(jit): String field intrinsics
+read compact primitive fields 4 bytes high"); verified and retired
+2026-07-27.**
+
+The diagnosis in the original report below ("the whole `write(char[])` call
+no-ops") was the wrong layer. `Writer.write(char[])` was never miscompiled.
+What was miscompiled was the JIT's `java/lang/String` field intrinsic on a
+compact-layout `String`: it read the primitive `coder`/`hash` field four bytes
+above its real offset, so the *name* strings JAXB's marshaller writes decoded
+as empty. The output therefore lost exactly the element and attribute names
+(`</widget>` -> `</>`, `<widget id="w27">` -> `< ="w27">`) while every other
+write in the same document was intact — which is why the bisection below
+pinned it to `Writer.write` (that is simply where the already-empty string was
+handed over) rather than to the String intrinsic that produced it. It also
+explains why `CRATONVM_JIT_BISECT_ONLY=java/io/Writer` still reproduced: the
+String intrinsic fires inside `Writer`'s own compiled body.
+
+The same defect is the root cause of the `org/glassfish/jaxb/` JIT ban, now
+also lifted — see `jaxb-jit-ban-lifted-20260727.md` in this directory for the
+full bisection table and the re-verification evidence.
+
+**Verification:** the reproducer described below (`JaxbQNameProbe`, real
+`jakarta.xml.bind`/`org.glassfish.jaxb` 4.0.7) fails deterministically at
+iteration 27 on dev `95e4d9929` (2026-07-26 12:15Z) and is clean on
+`82b78bca5` and every later tree, including 20000-iteration runs on current
+dev with the JAXB package JIT-eligible.
+
+---
+
+## Original report (2026-07-26), retained for history
 
 ## Symptom
 

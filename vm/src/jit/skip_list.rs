@@ -1215,16 +1215,26 @@ fn should_skip_jit_internal(
             }
         }
 
-        // Hibernate mapping metadata initializes JAXB's QName-heavy runtime
-        // graph.  JITting org.glassfish.jaxb currently corrupts that graph and
-        // produces a self-cast `QName cannot be cast to QName`; interpreting
-        // the package reproduces the no-JIT result.  Keep this scoped guard
-        // liftable for bisection.
-        if let Some(prefix) = jaxb_mapping_residual_skip_prefix(class_name) {
-            if !package_allowed(prefix, allow_packages) {
-                return Some(SkipReason::RustJvmTestFixture);
-            }
-        }
+        // JAXB (`org/glassfish/jaxb/`) -- REMOVED 2026-07-27. The ban existed
+        // because Hibernate mapping metadata initializes JAXB's QName-heavy
+        // runtime graph and JITting `org.glassfish.jaxb` corrupted it into a
+        // self-cast `QName cannot be cast to QName`. Re-confirmed live on
+        // 2026-07-26 (`docs/internal/jaxb-jit-ban-lifted-20260727.md`), then
+        // root-caused: the corruption was never JAXB-specific. It was the
+        // String compact-layout field intrinsic reading a primitive field four
+        // bytes high, fixed by `82b78bca5` ("fix(jit): String field intrinsics
+        // read compact primitive fields 4 bytes high"). Bisected with the
+        // ban's own reproducer
+        // (`docs/known-issues/repros/jitban-remaining-20260726/JaxbQNameProbe.java`,
+        // real jakarta.xml.bind/org.glassfish.jaxb 4.0.7): dev @ `95e4d9929`
+        // fails at iteration 81 with the exact documented
+        // `UnmarshalException: unexpected element (uri:"", local:"widget")`;
+        // dev @ `82b78bca5` and every later tree is clean. The same commit
+        // also fixed the `java.io.Writer.write(char[])` dropped-output bug
+        // filed alongside it. Re-verified on this tree with the package
+        // JIT-eligible: 20000-iteration marshal/unmarshal round trips, 0
+        // failures, plus the real Hibernate ORM 8.0 orm.xml/JAXB binding
+        // suite. No `jaxb_mapping_residual_skip_prefix` helper remains.
 
         // SPRING-HAZELCAST-XERCES-JIT.1 -- REMOVED 2026-07-26. Historically,
         // Hazelcast's schema validation passed the complete server suite
@@ -2189,16 +2199,6 @@ fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &s
 fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
     const SLASH_PREFIX: &str = "org/hibernate/";
     const DOT_PREFIX: &str = "org.hibernate.";
-    if class_name.starts_with(SLASH_PREFIX) {
-        Some(SLASH_PREFIX)
-    } else {
-        class_name.starts_with(DOT_PREFIX).then_some(DOT_PREFIX)
-    }
-}
-
-fn jaxb_mapping_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
-    const SLASH_PREFIX: &str = "org/glassfish/jaxb/";
-    const DOT_PREFIX: &str = "org.glassfish.jaxb.";
     if class_name.starts_with(SLASH_PREFIX) {
         Some(SLASH_PREFIX)
     } else {
@@ -3778,28 +3778,20 @@ mod tests {
     }
 
     #[test]
-    fn jaxb_mapping_package_skipped_conservatively_and_lifts_for_bisection() {
+    fn jaxb_package_is_jit_eligible_after_removal() {
+        // The `org/glassfish/jaxb/` ban was removed 2026-07-27 -- see the
+        // removal comment above `should_skip_jit_internal` for the bisected
+        // root cause (`82b78bca5`) and the re-verification evidence.
         for cls in [
             "org/glassfish/jaxb/runtime/v2/runtime/reflect/Accessor",
-            "org.glassfish.jaxb.runtime.v2.runtime.reflect.Accessor",
+            "org/glassfish/jaxb/runtime/util/AttributesImpl",
         ] {
             assert_eq!(
                 check(cls, "get", false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{cls} should stay interpreted under the JAXB mapping guard"
+                None,
+                "{cls} must be JIT-eligible now that the JAXB ban is removed"
             );
         }
-        assert_eq!(
-            check_with(
-                "org/glassfish/jaxb/runtime/v2/runtime/reflect/Accessor",
-                "get",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["org/glassfish/jaxb/"],
-            ),
-            None
-        );
     }
 
     #[test]
