@@ -242,7 +242,8 @@ still real correctness bugs worth closing):
   WILDFLY-CONTROLLER-JIT.1 (`org/jboss/as/controller/`) — **already
   transitively confirmed still-needed**: it's a strict subset of the
   broader `org/jboss/as/` prefix this session already lifted for the
-  `org/jboss/as/` WildFly-boot test (`docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`)
+  `org/jboss/as/` WildFly-boot test — RESOLVED 2026-07-27, ban lifted
+  (`docs/internal/fixed-suite-bugs/wildfly/modeltypevalidator-validtypes-npe.md`)
   — `package_allowed()` lifts any ban whose prefix starts with an allowed
   entry, so lifting `org/jboss/as/` also lifted `org/jboss/as/controller/`
   in that same run. The crash found (`ModelTypeValidator.validTypes` null)

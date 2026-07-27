@@ -1956,24 +1956,37 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SPB.8b (Session 113 r2) — companion blanket ban for the WildFly
-        // server boot path (`org/jboss/as/`). Once JBoss Modules is
-        // unblocked by SPB.8, the next downstream consumer is the JBoss AS
-        // server bootstrap (`org/jboss/as/server`, `org/jboss/as/controller`,
-        // `org/jboss/as/jmx`, etc.), which exhibits the same
-        // allocate-then-putfield pattern: `ServerLogger_$logger_en_US`
-        // ctors store i18n message slots, `PluggableMBeanServerImpl`
-        // delegates allocate fresh `Subject` / `ClassLoader` references
-        // per invocation, and `ServerEnvironment.<init>` resolves dozens
-        // of `-Djboss.*` properties via `Long.parseLong` /
-        // `Boolean.parseBoolean`. Pre-emptive to avoid a second iteration
-        // if the next gap surfaces in this layer. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/`.
-        if class_name.starts_with("org/jboss/as/")
-            && !package_allowed("org/jboss/as/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.8b — `org/jboss/as/` blanket ban REMOVED 2026-07-27.
+        //
+        // Added Session 113 r2 as a pre-emptive companion to SPB.8 (never
+        // driven by a failure of its own), then re-confirmed on 2026-07-26 by
+        // a real `standalone.sh` boot that died on
+        // `NullPointerException: ... "this.validTypes" is null` in
+        // `ModelTypeValidator` with the ban lifted and JIT on, and booted with
+        // the ban lifted and `--nojit` — a differential that read as a JIT
+        // miscompile. It was not one. The NPE was a *consequence* of the boot
+        // being torn down mid-flight: `Runtime.addShutdownHook` was a no-op
+        // stub, so WildFly's `BootstrapImpl$ShutdownHook` — which holds the MSC
+        // `ServiceContainer` — became unreachable the moment `Main.main`
+        // returned, MSC 1.5's leak-detector `Cleaner` called
+        // `container.shutdown()`, and `AbstractControllerService.stop` reset
+        // `controller` to null under the still-running boot thread. WHEN that
+        // collection happened depended on GC timing, which the JIT changes;
+        // hence the clean-looking `--nojit` differential.
+        //
+        // With that root fixed (plus the `HashSet.addAll(<foreign
+        // open-addressed set>)` null-hole fix that unmasked the boot's own
+        // failure reporting), WildFly 32.0.1.Final boots to `WFLYSRV0026` with
+        // this package JIT-compiled, at the same rate as with the ban in place:
+        // 4/6 vs 5/6 over a 6+6 A/B on the Azure host, and every failure in
+        // BOTH arms is the same pre-existing flaky
+        // `NoSuchMethodError: java/lang/Object.hasNext()Z` from
+        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
+        // The full write-up (root causes, the A/B, and the per-package results
+        // for the four sibling bans, which stay in place) is the retired
+        // `modeltypevalidator-validtypes-npe` doc — archived with the rest of
+        // docs/internal. The residual it hands off to is
+        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
 
         // SPB.8c (Session 113 r2) — companion blanket ban for the WildFly
         // security-manager package (`org/wildfly/`). The

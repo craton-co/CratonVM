@@ -72,7 +72,18 @@ started.
 - ES fragile cluster (`org/elasticsearch/`) — no fixture, `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`
 - SPB.1 (`org/springframework/util/`) — inconclusive real-app-less repro, `docs/known-issues/spb1-springframework-util-investigation.md`
 - TOMCAT-JNDIREALM-RDN.1 / JIT.2 (`com/unboundid/`) — real Tomcat suite, SIGSEGV confirmed, see `docs/known-issues/jit-skip-list-open-bans-20260725.md`
-- `org/jboss/as/` (WildFly boot, part of the SPB.8b/8c family) — real WildFly boot, `ModelTypeValidator.validTypes` NPE, `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`; WILDFLY-CONTROLLER-JIT.1 transitively confirmed via the same finding
+- `org/jboss/as/` (WildFly boot, part of the SPB.8b/8c family) — **BAN LIFTED
+  2026-07-27**. The `ModelTypeValidator.validTypes` NPE that re-confirmed it was
+  not a JIT miscompile: `Runtime.addShutdownHook` was a no-op stub, so MSC's
+  leak-detector `Cleaner` tore the boot down mid-flight once `Main.main`
+  returned. Root-caused and fixed (retired write-up archived under
+  docs/internal); the surviving residual is the flaky
+  `NoSuchMethodError: java/lang/Object.hasNext()Z` in
+  `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`,
+  which reproduces with the ban in place and under `--nojit`.
+  WILDFLY-CONTROLLER-JIT.1 was only *transitively* implicated by that same
+  finding and is therefore no longer backed by it either — it is kept in place
+  pending its own re-test.
 - `org/h2/` + `org/antlr/v4/runtime/` (HIB-LONGTAIL.1) — real 218-class H2 suite, `Schema not found` reconnect bug (root-caused and fixed)
 - HIB-BIGINTEGER-AIOOBE.1/.2 (`java/math/{BigInteger,MutableBigInteger}`) — deterministic repro, no escape hatch by design; now cross-referenced with SUNEC-INTPOLY above
 - TYPES-ERASURE.1 (`com/sun/tools/javac/code/Types.erasure`) — 40/40 repro; consolidation-with-the-other-6-javac-bans hypothesis explicitly REFUTED (see `docs/known-issues/jit-skip-list-open-bans-20260725.md`), so it stays as its own entry alongside SPRING-TESTCOMPILER.1-4/HIB-STOREDPROC-JIT.1 below

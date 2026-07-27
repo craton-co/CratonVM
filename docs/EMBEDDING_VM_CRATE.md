@@ -124,7 +124,7 @@ need to touch it directly.
 | Custom natives | Must be `fn` (not `FnMut`); state goes in `static` / `OnceLock`. |
 
 The full lock hierarchy is documented in
-[`vm/src/runtime/lock_order.rs`](../../vm/src/runtime/lock_order.rs).
+[`vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs).
 
 ## Pitfalls
 
