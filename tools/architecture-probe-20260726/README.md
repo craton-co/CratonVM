@@ -41,6 +41,19 @@ tools/architecture-probe-20260726/check-interface-jit-performance-20260727.sh \
   --iterations 1000000 --reps 3 --cpu 13
 ```
 
+The focused monitor gate exercises a javac synchronized block through
+method-entry JIT compilation. It checks JIT/`--nojit` checksums, forces an
+exception from inside the protected region, verifies catch-all cleanup
+rethrows and releases the lock, and requires both monitor methods to reach the
+compiler:
+
+```bash
+tools/architecture-probe-20260726/check-monitor-jit-path-20260727.sh \
+  -Exe /data/data/bin/cratonvm-architecture-final-convergence-20260727-r1 \
+  --java-home /home/victor/jdk25 \
+  --iterations 500000 --cpu 13
+```
+
 Build CratonVM under a unique name and run:
 
 ```bash
