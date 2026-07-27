@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **19 residual classes**, down from the 57 captured on 2026-07-27 (see the "second session" entry below for the eight VM fixes and two harness fixes that closed the other 38, and for the per-class state of what is left). The older "127 non-passed of 2925" figure is superseded: 73 of those 74 `EMPTY` classes were `Abstract*Tests`/annotation-interface entries the runner should never have indexed, and the runner no longer does. |
+| **Status** | OPEN — **17 residual classes**, down from the 57 captured on 2026-07-27 (see the "second session" entry below for the ten VM fixes and two harness fixes that closed the other 40, and for the per-class state of what is left). The older "127 non-passed of 2925" figure is superseded: 73 of those 74 `EMPTY` classes were `Abstract*Tests`/annotation-interface entries the runner should never have indexed, and the runner no longer does. |
 | **Captured** | 2026-07-27 (second session), branch `fix/spring-buglist-close-20260727` merged forward to `origin/dev` `ffc7f90d4`, Azure host `20.83.144.174`, real JDK 25. The baseline it improves on is the 2026-07-27 full 8-shard run recorded immediately below. **The shared host ran at load 70–100 throughout, so batch runs emit spurious FAIL/TIMEOUT rows — re-check any residual in isolation before believing it.** |
 
 ## 2026-07-27 suite-wide reconfirmation: current numbers, named remaining clusters
@@ -205,7 +205,7 @@ the next person doesn't have to re-run the full suite just to get this
 list again.
 
 
-## 2026-07-27 (second session) — eight VM bugs + two harness gaps; 57 residual classes → 19
+## 2026-07-27 (second session) — ten VM bugs + two harness gaps; 57 residual classes → 17
 
 Worktree `/data/data/wt-sprbuglist-20260727` (branch
 `fix/spring-buglist-close-20260727`, from `origin/dev` `60a710ad8`, merged
@@ -337,6 +337,47 @@ correct on both VMs. `probes/HashProbe.java`.
 
 ### Fix 8 — `InitialContext.getEnvironment()` (see Fix 6 above)
 
+### Fixes 9 and 10 — charset encode/decode ignored direct buffers and the array offset
+
+Both found by `core.io.buffer.DataBufferTests` (294 tests) timing out; the
+watchdog caught the main thread parked at `DirectByteBuffer.<init>` pc=0 in
+every dump, inside `DataBuffer.write(CharSequence, Charset)`.
+
+- A real-JDK **direct** `ByteBuffer` has no backing array, so `charset.rs`'s
+  `buf_state` returned `None` and `CharsetEncoder.encode` answered `OVERFLOW`
+  having written nothing and consumed nothing. That is an infinite loop for any
+  caller that grows its buffer and retries on OVERFLOW — which is what the
+  `encode` contract invites, and what Spring does.
+  `NettyDataBuffer.asByteBuffer()` is direct.
+- `buf_state` also ignored the buffer's **`offset`** field, so every encode and
+  decode read and wrote at the backing array's absolute start rather than the
+  buffer's own window. Non-zero `offset` is not exotic: `wrap(array, off, len)`,
+  `slice()`, `duplicate()` of a positioned buffer, and every pooled Netty
+  `ByteBuf` (a window onto a shared arena) have one — which is why the residual
+  44 failures after the first fix were all on the
+  `PooledByteBufAllocator - preferDirect = false` parameterisation.
+
+`core.io.buffer.DataBufferTests` TIMEOUT → **294/294**. `probes/EncProbe.java`
+and `probes/OffProbe.java` both match HotSpot now.
+
+### Two residuals are NOT CratonVM bugs — check HotSpot in THIS checkout first
+
+`apps/spring-suite-runner/hs.sh <fqcn>` runs one class on HotSpot from its own
+module directory, i.e. exactly the way `one.sh` runs it on CratonVM. Doing that
+for the whole residual set found two that fail identically on HotSpot:
+
+- **`aot.nativex.FileNativeConfigurationWriterTests` (2/7)** — the writer emits
+  `"comment": "Spring Framework 7.1.0-SNAPSHOT"`, and the expected JSON is
+  compared `NON_EXTENSIBLE`. Both VMs emit it: the test only passes when
+  `SpringVersion.getVersion()` returns null, which needs a classpath without
+  the packaged jar. Fixture artifact.
+- **`context.annotation.ConfigurationClassEnhancerTests.withPublicClass`** —
+  fails on HotSpot too, so only `enhanceReloadedClass` is a genuine CratonVM
+  failure in that class.
+
+Everything else in the table below was confirmed green on HotSpot in this same
+checkout.
+
 ### Harness gap 0 — the last `EMPTY` class was `@Disabled`
 
 `test.context.async.AsyncMethodsSpringTestContextIntegrationTests` carries
@@ -413,25 +454,22 @@ it**.
 | class | state | note |
 |---|---|---|
 | `beans.PropertyDescriptorUtilsPropertyResolutionTests` | LOADERR | `OutOfMemoryError` after ~90s during discovery of a JUnit `@ParameterizedClass` + `@FieldSource` class. Reproduces in isolation at 2GB **and** 8GB heap, so it is a real allocation blow-up, not the host contention the section below guessed at |
-| `aot.nativex.FileNativeConfigurationWriterTests` | 2/7 | JSONAssert `Unexpected: comment` — the writer emits a `comment` key the expected JSON does not have |
-| `context.annotation.ConfigurationClassEnhancerTests` | 3/5 | `cce_enhance` ignores the `classLoader` argument and defines into the config class's own loader. Real Spring/CGLIB picks the defining loader per `ReflectUtils.defineClass`'s contextClass/SmartClassLoader rules, which the two failing methods assert case by case |
+| `context.annotation.ConfigurationClassEnhancerTests` | 3/5 (1 genuine) | `withPublicClass` fails on HotSpot too. For `enhanceReloadedClass`, `cce_enhance` ignores the `classLoader` argument and defines into the config class's own loader. Real Spring/CGLIB picks the defining loader per `ReflectUtils.defineClass`'s contextClass/SmartClassLoader rules, which the two failing methods assert case by case |
 | `core.annotation.MergedAnnotationsTests` | 177/178 | `equalsForSynthesizedAnnotations` — a synthesized annotation and a real one are not `equals()`; their `toString()`s show one is a real JDK annotation proxy and the other CratonVM's synthetic |
-| `core.io.ModuleResourceTests` | 2/3 | `ModuleResource(Introspector.class.getModule(), "java/beans/Introspector.class").exists()` is false |
+| `core.io.ModuleResourceTests` | 2/3 | Root-caused: the failing assertion is on the **ClassPathResource**, not the ModuleResource — `isReadable()` is false for `jrt:/java.desktop/java/beans/Introspector.class`. `URL.openConnection()` hands that URL a `sun.net.www.protocol.http.HttpURLConnection` (content length -1), so Spring's `AbstractFileResolvingResource.isReadable` takes its `instanceof HttpURLConnection` branch and sends a HEAD. `openStream()` on the same URL returns the right 23755 bytes, so only the protocol-handler choice is wrong. `probes/JrtProbe.java`. `Module.getResourceAsStream` is fine (`probes/ModProbe.java`) |
 | `core.io.support.PathMatchingResourcePatternResolverTests` | 19/22 | HotSpot is 22/22 in the same checkout, so all three are genuine. `encodedHashtagInPath` is root-caused: `URLClassLoader.getResource`/`getResources` return the resource URL with the base URL's percent-escapes **decoded** (`file:/…/custom#root/scanned/` where HotSpot keeps `custom%23root`), and a raw `#` in a URL is a fragment delimiter, so everything after it is lost downstream. `probes/UclProbe.java` is a 5-line repro. `classloader.rs::file_url_spec` already encodes correctly but is only used by `getURLs()`/manifest entries — the `getResource` return path builds its URL somewhere else. The two `javaDashJarFinds*ClassPathManifestEntries` are separate (`NoSuchElementException: No value present`) |
 | `orm.jpa.support.PersistenceInjectionTests` | 26/27 | unchanged from the older section below |
 | `scripting.groovy.GroovyScriptFactoryTests` | 27/38 | `NoClassDefFoundError` for classes GroovyClassLoader compiles from `.groovy` sources (`GroovyCalculator`, `TestFactoryBean`, `GroovyMessenger2`, `TestCustomizer`) |
 | `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | 0/2 | JUnit parallel execution × `ApplicationEvents` |
 | `test.web.servlet.assertj.MockMvcTesterIntegrationTests` | 72/74 | `MockMvcTester.debug()` output-stream capture |
-| `util.SerializationUtilsTests` | 8/9 | `ObjectInputStream.readObject` on a stream naming an undefined class throws `InvalidClassException` where the JDK throws `ClassNotFoundException`; `Class.forName` itself is correct, so the swallow is inside the deserializer |
+| `util.SerializationUtilsTests` | 8/9 | Narrowed: real `ObjectInputStream` bytecode runs (no native registered for `resolveClass`), and its `Class.forName(name, false, latestUserDefinedLoader())` **returns a fabricated stub class** for a name that does not exist — so `initNonProxy` records a `deserializeEx` and `checkDeserialize` throws `InvalidClassException` instead of the JDK's `ClassNotFoundException`. The identical `Class.forName` call from ordinary user code, with the identical loader, correctly throws (`probes/OisProbe5.java`, `probes/LoaderProbe.java`), so the stub fabrication is caller/dispatch dependent — the `ProbeGuard` in `native_class_for_name` is evidently not in force on whichever path the JDK-internal call takes |
 | `web.reactive.function.client.DefaultWebClientTests` | 24/25 | |
 | `web.reactive.function.client.WebClientIntegrationTests` | 168/170 | |
 | `web.reactive.result.view.FragmentViewResolutionResultHandlerTests` | 5/6 | reactor `Timeout on blocking read` in the SSE path |
 | `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | the separately tracked ~227×-vs-HotSpot interpreter throughput defect |
 | `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | needs re-measuring on a quiet host — it was 40/40 as of follow-up 10 |
-| `core.io.buffer.DataBufferTests` | TIMEOUT | |
 | `test.context.aot.AotIntegrationTests` | TIMEOUT | |
 | `test.context.aot.TestContextAotGeneratorIntegrationTests` | TIMEOUT | follow-up 9c's `Spliterators.spliterator` hang |
-| `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests` | TIMEOUT | |
 | `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | TIMEOUT | |
 
 Also closed on the way, without a dedicated fix (they were downstream of the
