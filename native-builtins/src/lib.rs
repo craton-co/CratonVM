@@ -25814,7 +25814,19 @@ fn objects_values_equal(
 ) -> Result<bool, MethodCallFailed> {
     match (a, b) {
         (Value::Object(None), Value::Object(None)) => Ok(true),
-        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
+        (Value::Object(None), _) => Ok(false),
+        // `Objects.equals` is `(a == b) || (a != null && a.equals(b))` — a
+        // non-null `a` gets `a.equals(null)` dispatched, it is NOT short-
+        // circuited to false. Classes whose `equals` accepts null are rare but
+        // real and load-bearing: Spring's `NullBean` (the placeholder for a
+        // `@Bean` method that returned null) is defined as
+        // `return (this == obj || obj == null)` precisely so that
+        // `getBean(name)` compares equal to null.
+        (Value::Object(Some(ra)), Value::Object(None)) => {
+            let r = ctx.invoke_virtual(*ra, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(None)])?;
+            Ok(matches!(r, Some(Value::Int(v)) if v != 0))
+        }
+        (_, Value::Object(None)) => Ok(false),
         (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
             if ra.as_ptr() == rb.as_ptr() {
                 return Ok(true);

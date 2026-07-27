@@ -4419,7 +4419,17 @@ fn assertj_objects_equal(
 ) -> Result<bool, MethodCallFailed> {
     let (left, right) = match (left, right) {
         (None, None) => return Ok(true),
-        (None, Some(_)) | (Some(_), None) => return Ok(false),
+        (None, Some(_)) => return Ok(false),
+        // Real `StandardComparisonStrategy.areEqual` only short-circuits on a
+        // null ACTUAL; every array branch is guarded by `other != null` and the
+        // method ends in `return actual.equals(other)`. So a non-null actual
+        // with a null other still gets `equals(null)` dispatched — which is how
+        // `assertThat(springNullBean).isEqualTo(null)` passes on HotSpot
+        // (`NullBean.equals` is `this == obj || obj == null`).
+        (Some(left), None) => {
+            let r = ctx.invoke_virtual(left, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(None)])?;
+            return Ok(matches!(r, Some(Value::Int(v)) if v != 0));
+        }
         (Some(left), Some(right)) if left == right => return Ok(true),
         (Some(left), Some(right)) => (left, right),
     };
