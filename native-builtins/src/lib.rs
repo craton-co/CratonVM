@@ -36527,7 +36527,7 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "isEnum", "()Z", native_class_is_enum);
     registry.register(c, "isRecord", "()Z", native_class_is_record);
     registry.register(c, "isSealed", "()Z", native_class_is_sealed);
-    registry.register(c, "isSynthetic", "()Z", native_return_false);
+    registry.register(c, "isSynthetic", "()Z", native_class_is_synthetic);
     // The nesting predicates are derived from the class's own `InnerClasses`
     // entry (see `lang_class::class_nesting_kind`). They were `native_return_false`,
     // so under `synthetic-jdk` every nested class reported itself top-level —

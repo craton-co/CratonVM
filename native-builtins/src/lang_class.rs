@@ -15289,6 +15289,33 @@ pub(crate) fn i2_classloader_check_certs(
     Ok(None)
 }
 
+/// `Class.isSynthetic()` — `(getModifiers() & ACC_SYNTHETIC) != 0`, which is
+/// verbatim how `java.lang.Class` defines it. Was `native_return_false`, so
+/// under `synthetic-jdk` NOTHING was ever synthetic — most visibly a lambda's
+/// hidden class, which Spring's `ClassUtils.isLambdaClass()` gates on.
+///
+/// Delegating to `native_class_get_modifiers` rather than reading
+/// `class_access_flags` directly is deliberate: that native already models
+/// every case HotSpot's `JVM_GetClassModifiers` does — the
+/// `ACC_FINAL|ACC_SYNTHETIC` synthesis for lambda proxy classes (which carry
+/// no class-store access flags of their own), the JVMS §4.7.6 substitution of
+/// the `InnerClasses` entry's flags for a nested class, and the primitive and
+/// array forms — so this cannot drift from it. Note both of those synthesised
+/// forms deliberately exclude ACC_SYNTHETIC for primitives and arrays, which
+/// matches HotSpot: an array of a synthetic class is not itself synthetic.
+pub(crate) fn native_class_is_synthetic(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    const ACC_SYNTHETIC: i32 = 0x1000;
+    match native_class_get_modifiers(ctx, args)? {
+        Some(Value::Int(modifiers)) => Ok(Some(Value::Int(i32::from(
+            (modifiers & ACC_SYNTHETIC) != 0,
+        )))),
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
 /// JVMS nesting kind of a class, read off its own `InnerClasses` entry (see
 /// `own_inner_class_entry`). This is the classification behind
 /// `Class.isAnonymousClass()` / `isLocalClass()` / `isMemberClass()`, which
@@ -18669,6 +18696,79 @@ mod tests {
         assert_eq!(ctx.read_string(obj).unwrap(), "Local");
         let r = native_class_get_canonical_name(&mut ctx, &[Value::Object(Some(mirror))]);
         assert_eq!(r.unwrap(), Some(Value::Object(None)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Class.isSynthetic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn class_is_synthetic_reads_the_access_flag() {
+        const ACC_SYNTHETIC: u16 = 0x1000;
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("P3$SwitchMap").unwrap();
+        // SAFETY: single-threaded test code (same pattern as the enum tests).
+        unsafe {
+            (*ctx.class_flags_override.get()).insert(cid.as_u32(), ACC_SYNTHETIC);
+        }
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "P3$SwitchMap");
+        let r = native_class_is_synthetic(&mut ctx, &[Value::Object(Some(mirror))]);
+        assert_eq!(r.unwrap(), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn class_is_synthetic_false_for_an_ordinary_class() {
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("P3").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "P3");
+        let r = native_class_is_synthetic(&mut ctx, &[Value::Object(Some(mirror))]);
+        assert_eq!(r.unwrap(), Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn class_is_synthetic_prefers_the_inner_classes_flags_for_a_nested_class() {
+        // JVMS 4.7.6 / JVM_GetClassModifiers: a nested class's modifiers come
+        // from its `InnerClasses` entry, not its own ClassFile access_flags.
+        // javac marks the synthetic switch-map holder there.
+        const ACC_SYNTHETIC: u16 = 0x1000;
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("P3$1").unwrap();
+        ctx.set_inner_classes(
+            cid,
+            vec![(
+                "P3$1".to_string(),
+                String::new(),
+                String::new(),
+                ACC_SYNTHETIC,
+            )],
+        );
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "P3$1");
+        let r = native_class_is_synthetic(&mut ctx, &[Value::Object(Some(mirror))]);
+        assert_eq!(r.unwrap(), Some(Value::Int(1)));
+    }
+
+    #[test]
+    fn class_is_synthetic_false_for_primitives_and_arrays() {
+        // JVM_GetClassModifiers synthesises PUBLIC|FINAL|ABSTRACT for a
+        // primitive and <element access>|FINAL|ABSTRACT for an array; neither
+        // carries ACC_SYNTHETIC, so an array of a synthetic class is not
+        // itself synthetic.
+        let mut ctx = mock_ctx();
+        let cid = ctx.ensure_class_initialized("int").unwrap();
+        let mirror = make_class_mirror(&mut ctx, cid.as_u32(), "int");
+        let r = native_class_is_synthetic(&mut ctx, &[Value::Object(Some(mirror))]);
+        assert_eq!(r.unwrap(), Some(Value::Int(0)));
+
+        const ACC_SYNTHETIC: u16 = 0x1000;
+        let elem = ctx.ensure_class_initialized("P3$SynthElem").unwrap();
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*ctx.class_flags_override.get()).insert(elem.as_u32(), ACC_SYNTHETIC);
+        }
+        let arr = ctx.ensure_class_initialized("[LP3$SynthElem;").unwrap();
+        let arr_mirror = make_class_mirror(&mut ctx, arr.as_u32(), "[LP3$SynthElem;");
+        let r = native_class_is_synthetic(&mut ctx, &[Value::Object(Some(arr_mirror))]);
+        assert_eq!(r.unwrap(), Some(Value::Int(0)));
     }
 
     // -----------------------------------------------------------------------
