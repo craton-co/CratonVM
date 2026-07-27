@@ -87,6 +87,7 @@ pub mod pgo;
 pub mod platform;
 pub mod profile;
 pub mod regalloc;
+pub(crate) mod runtime_lowering;
 pub mod scev;
 pub mod tiered;
 pub mod x64;
@@ -616,16 +617,18 @@ static JIT_CODE_CACHE_CAP_LOGGED: std::sync::atomic::AtomicBool =
 /// read so the env lookup happens at most once.
 pub fn jit_code_cache_cap_bytes() -> usize {
     static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CODE_CACHE_MAX_MB") {
-        Ok(s) => match s.trim().parse::<usize>() {
-            // `0` is an explicit "disable the cap" sentinel (treated as
-            // `usize::MAX` so the at-capacity check is always false).
-            Ok(0) => usize::MAX,
-            // Saturate the MiB→bytes multiply so a huge value can't wrap.
-            Ok(mb) => mb.saturating_mul(1024 * 1024),
+    *CACHE.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_JIT_CODE_CACHE_MAX_MB") {
+            Ok(s) => match s.trim().parse::<usize>() {
+                // `0` is an explicit "disable the cap" sentinel (treated as
+                // `usize::MAX` so the at-capacity check is always false).
+                Ok(0) => usize::MAX,
+                // Saturate the MiB→bytes multiply so a huge value can't wrap.
+                Ok(mb) => mb.saturating_mul(1024 * 1024),
+                Err(_) => DEFAULT_JIT_CODE_CACHE_CAP_BYTES,
+            },
             Err(_) => DEFAULT_JIT_CODE_CACHE_CAP_BYTES,
-        },
-        Err(_) => DEFAULT_JIT_CODE_CACHE_CAP_BYTES,
+        }
     })
 }
 
@@ -793,8 +796,7 @@ impl JitCodeRangeRegistry {
     }
 }
 
-static JIT_CODE_RANGES: std::sync::OnceLock<JitCodeRangeRegistry> =
-    std::sync::OnceLock::new();
+static JIT_CODE_RANGES: std::sync::OnceLock<JitCodeRangeRegistry> = std::sync::OnceLock::new();
 
 fn jit_code_ranges() -> &'static JitCodeRangeRegistry {
     JIT_CODE_RANGES.get_or_init(JitCodeRangeRegistry::new)
@@ -976,14 +978,16 @@ pub fn jit_names_enabled() -> bool {
 /// so OSR-exit uses the safe reject path.
 pub fn deopt_real_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_DEOPT_REAL") {
-        // Explicit opt-out values disable; any other value (and unset) → ON.
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    })
+    *CACHE.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_DEOPT_REAL") {
+            // Explicit opt-out values disable; any other value (and unset) → ON.
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
 }
 
 /// activate-ir-optimizer Front 3.2: guard-surviving scalar replacement
@@ -3046,7 +3050,10 @@ mod inline_selection_tests {
         );
         // The hot tier is still bounded — FreqInlineSize is a cap, not a licence.
         assert_eq!(
-            inline_site_expansion_cost_tiered(&site(MAX_INLINE_BYTECODE_SIZE + 1, 0, 0, false), true),
+            inline_site_expansion_cost_tiered(
+                &site(MAX_INLINE_BYTECODE_SIZE + 1, 0, 0, false),
+                true
+            ),
             None
         );
     }
@@ -3113,8 +3120,15 @@ mod inline_selection_tests {
             prof.record_backedge(8);
         }
         let ranges = hot_loop_ranges(&code, code.len(), Some(&prof));
-        assert_eq!(ranges, vec![(0usize, 8usize)], "header recovered from goto -8");
-        assert!(call_site_is_hot(4, &ranges, Some(&prof)), "site inside the loop is hot");
+        assert_eq!(
+            ranges,
+            vec![(0usize, 8usize)],
+            "header recovered from goto -8"
+        );
+        assert!(
+            call_site_is_hot(4, &ranges, Some(&prof)),
+            "site inside the loop is hot"
+        );
         assert!(
             !call_site_is_hot(11, &ranges, Some(&prof)),
             "site after the loop is cold"
@@ -3886,7 +3900,9 @@ pub fn try_resolve_intrinsic(
     //   * Long.reverse is intentionally NOT registered: it has no single-
     //     instruction lowering and the multi-mask SWAR sequence is omitted in
     //     favour of safe fallback to normal dispatch (roadmap §3.4).
-    if class == "java/lang/Long" && cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_none() {
+    if class == "java/lang/Long"
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_LONG_INTRINSICS").is_none()
+    {
         let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
             ("bitCount", "(J)I") if x64::has_popcnt() => {
                 Some((JitIntrinsic::LongBitCount, 1, b'I'))
@@ -4470,6 +4486,11 @@ impl Default for JitMICSlot {
 /// shapes (including the architecture probe's four implementations) without
 /// entering LFU eviction on every cycle.
 pub const JIT_PIC_ENTRIES: usize = 4;
+/// Megamorphic secondary cache: eight hash sets with two immutable-published
+/// ways each. Generated code probes exactly two adjacent entries.
+pub const JIT_MEGA_SETS: usize = 8;
+pub const JIT_MEGA_WAYS: usize = 2;
+pub const JIT_MEGA_ENTRIES: usize = JIT_MEGA_SETS * JIT_MEGA_WAYS;
 
 /// Polymorphic inline cache slot: a 4-way associative cache for
 /// virtual call dispatch targeting a call site that has exhibited
@@ -4529,6 +4550,13 @@ pub struct JitPICSlot {
     pub hits: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
     /// Total cache misses (receiver not in any entry).
     pub misses: std::sync::atomic::AtomicU64,
+    /// Compact hashed/vtable cache used after the four inline PIC guards miss.
+    /// These arrays are part of the generated-code-visible prefix. Entries are
+    /// installed once (entry/ABI first, class id last) and never evicted, so a
+    /// lock-free reader cannot pair an old class guard with a new target.
+    mega_class_ids: [std::sync::atomic::AtomicU32; JIT_MEGA_ENTRIES],
+    mega_entry_ptrs: [std::sync::atomic::AtomicU64; JIT_MEGA_ENTRIES],
+    mega_needs_context: [std::sync::atomic::AtomicBool; JIT_MEGA_ENTRIES],
     /// Cached class names (mutex-protected). Parallel to `class_ids`.
     /// Moved to the tail: `parking_lot::Mutex<Option<String>>` has an
     /// unstable layout we must not expose to JIT codegen.
@@ -4536,22 +4564,9 @@ pub struct JitPICSlot {
     /// Strong owners for compiled `entry_ptrs`; tail-only so hot offsets stay
     /// stable. Native targets leave the corresponding element empty.
     compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_PIC_ENTRIES],
-    /// Bounded secondary cache used after the four generated inline probes
-    /// miss. It keeps megamorphic sites from repeating method resolution and
-    /// compile-cache lookup on every invocation while leaving generated code
-    /// compact and the hot layout above unchanged.
-    megamorphic_entries:
-        parking_lot::RwLock<std::collections::HashMap<u32, JitMegamorphicEntry>>,
+    /// Strong owners for the generated hashed table's raw entry pointers.
+    mega_compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_MEGA_ENTRIES],
 }
-
-struct JitMegamorphicEntry {
-    entry_ptr: u64,
-    needs_context: bool,
-    _class_name: String,
-    owner: Option<Arc<CompiledMethod>>,
-}
-
-const JIT_MEGAMORPHIC_ENTRIES: usize = 64;
 
 /// Miss count on a `JitMICSlot` at which the adaptive recompiler
 /// promotes the site to a `JitPICSlot`.
@@ -4576,6 +4591,21 @@ impl JitPICSlot {
     /// of the struct. JIT codegen reads these to decide whether to
     /// thread the VM context pointer through the inline dispatch.
     pub const NEEDS_CONTEXT_OFFSETS: [usize; JIT_PIC_ENTRIES] = [48, 49, 50, 51];
+    /// Generated-code-visible offsets for the compact hashed table. The
+    /// preceding hot prefix is: ids(16), entries(32), ABI(4), pad(4),
+    /// hits(32), misses(8) = 96 bytes.
+    pub const MEGA_CLASS_IDS_OFFSET: usize = 96;
+    pub const MEGA_ENTRY_PTRS_OFFSET: usize = Self::MEGA_CLASS_IDS_OFFSET + JIT_MEGA_ENTRIES * 4;
+    pub const MEGA_NEEDS_CONTEXT_OFFSET: usize =
+        Self::MEGA_ENTRY_PTRS_OFFSET + JIT_MEGA_ENTRIES * 8;
+    pub const MEGA_HASH_MULTIPLIER: u32 = 0x9E37_79B1;
+    pub const MEGA_SET_SHIFT: u8 = 29;
+
+    #[inline]
+    pub const fn mega_base_index(class_id: u32) -> usize {
+        (((class_id.wrapping_mul(Self::MEGA_HASH_MULTIPLIER)) >> Self::MEGA_SET_SHIFT) as usize)
+            * JIT_MEGA_WAYS
+    }
 
     /// Create an empty PIC slot.
     pub fn new() -> Self {
@@ -4609,6 +4639,9 @@ impl JitPICSlot {
                 std::sync::atomic::AtomicU64::new(0),
             ],
             misses: std::sync::atomic::AtomicU64::new(0),
+            mega_class_ids: std::array::from_fn(|_| std::sync::atomic::AtomicU32::new(0)),
+            mega_entry_ptrs: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            mega_needs_context: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
             class_names: [
                 parking_lot::Mutex::new(None),
                 parking_lot::Mutex::new(None),
@@ -4621,7 +4654,7 @@ impl JitPICSlot {
                 parking_lot::Mutex::new(None),
                 parking_lot::Mutex::new(None),
             ],
-            megamorphic_entries: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            mega_compiled_owners: std::array::from_fn(|_| parking_lot::Mutex::new(None)),
         }
     }
 
@@ -4747,23 +4780,35 @@ impl JitPICSlot {
         entry_ptr: u64,
         needs_context: bool,
     ) {
-        let mut entries = self.megamorphic_entries.write();
-        if entries.len() >= JIT_MEGAMORPHIC_ENTRIES && !entries.contains_key(&class_id) {
-            if let Some(victim) = entries.keys().next().copied() {
-                if let Some(old) = entries.remove(&victim) {
-                    defer_jit_owner(old.owner);
-                }
+        use std::sync::atomic::Ordering;
+        let base = Self::mega_base_index(class_id);
+        for index in base..base + JIT_MEGA_WAYS {
+            let observed = self.mega_class_ids[index].load(Ordering::Acquire);
+            if observed == class_id {
+                return;
+            }
+            if observed == 0
+                && self.mega_class_ids[index]
+                    .compare_exchange(
+                        0,
+                        JitMICSlot::INSTALLING_CLASS_ID,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                *self.mega_compiled_owners[index].lock() =
+                    resolve_jit_entry_owner(entry_ptr as usize);
+                self.mega_entry_ptrs[index].store(entry_ptr, Ordering::Release);
+                self.mega_needs_context[index].store(needs_context, Ordering::Relaxed);
+                self.mega_class_ids[index].store(class_id, Ordering::Release);
+                return;
             }
         }
-        let replacement = JitMegamorphicEntry {
-            entry_ptr,
-            needs_context,
-            _class_name: class_name.to_string(),
-            owner: resolve_jit_entry_owner(entry_ptr as usize),
-        };
-        if let Some(old) = entries.insert(class_id, replacement) {
-            defer_jit_owner(old.owner);
-        }
+        // Both ways are occupied. Do not evict: generated readers are lock-free,
+        // so mutating a live way could pair a stale guard with a new target.
+        // The resolving helper remains the correct overflow path.
+        let _ = class_name;
     }
 
     /// Lookup used by the shared helper after the generated four-entry cascade
@@ -4771,10 +4816,20 @@ impl JitPICSlot {
     /// its compiled owner until invalidation or slot destruction.
     #[inline]
     pub fn lookup_megamorphic(&self, class_id: u32) -> Option<(u64, bool)> {
-        self.megamorphic_entries
-            .read()
-            .get(&class_id)
-            .map(|entry| (entry.entry_ptr, entry.needs_context))
+        use std::sync::atomic::Ordering;
+        let base = Self::mega_base_index(class_id);
+        for index in base..base + JIT_MEGA_WAYS {
+            if self.mega_class_ids[index].load(Ordering::Acquire) == class_id {
+                let entry = self.mega_entry_ptrs[index].load(Ordering::Acquire);
+                if entry != 0 {
+                    return Some((
+                        entry,
+                        self.mega_needs_context[index].load(Ordering::Relaxed),
+                    ));
+                }
+            }
+        }
+        None
     }
 
     /// Core installation sequence. Writes entry_ptr before class_id
@@ -4813,14 +4868,11 @@ impl JitPICSlot {
             *self.class_names[i].lock() = None;
             defer_jit_owner(self.compiled_owners[i].lock().take());
         }
-        let drained: Vec<_> = self
-            .megamorphic_entries
-            .write()
-            .drain()
-            .filter_map(|(_, entry)| entry.owner)
-            .collect();
-        for owner in drained {
-            defer_jit_owner(Some(owner));
+        for index in 0..JIT_MEGA_ENTRIES {
+            self.mega_class_ids[index].store(0, std::sync::atomic::Ordering::Release);
+            self.mega_entry_ptrs[index].store(0, std::sync::atomic::Ordering::Release);
+            self.mega_needs_context[index].store(false, std::sync::atomic::Ordering::Relaxed);
+            defer_jit_owner(self.mega_compiled_owners[index].lock().take());
         }
     }
 
@@ -4834,16 +4886,14 @@ impl JitPICSlot {
                 defer_jit_owner(self.compiled_owners[i].lock().take());
             }
         }
-        let mut entries = self.megamorphic_entries.write();
-        let victims: Vec<u32> = entries
-            .iter()
-            .filter_map(|(&class_id, entry)| {
-                targets.contains(&(entry.entry_ptr as usize)).then_some(class_id)
-            })
-            .collect();
-        for class_id in victims {
-            if let Some(entry) = entries.remove(&class_id) {
-                defer_jit_owner(entry.owner);
+        for index in 0..JIT_MEGA_ENTRIES {
+            let entry =
+                self.mega_entry_ptrs[index].load(std::sync::atomic::Ordering::Acquire) as usize;
+            if entry != 0 && targets.contains(&entry) {
+                self.mega_class_ids[index].store(0, std::sync::atomic::Ordering::Release);
+                self.mega_entry_ptrs[index].store(0, std::sync::atomic::Ordering::Release);
+                self.mega_needs_context[index].store(false, std::sync::atomic::Ordering::Relaxed);
+                defer_jit_owner(self.mega_compiled_owners[index].lock().take());
             }
         }
     }
@@ -5179,13 +5229,11 @@ pub struct JitCache {
 static JIT_ENTRY_OWNERS: std::sync::OnceLock<
     parking_lot::Mutex<FxHashMap<usize, std::sync::Weak<CompiledMethod>>>,
 > = std::sync::OnceLock::new();
-static JIT_CACHE_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+static JIT_CACHE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static ACTIVE_JIT_EXECUTIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-static DEFERRED_JIT_OWNERS: std::sync::OnceLock<
-    parking_lot::Mutex<Vec<Arc<CompiledMethod>>>,
-> = std::sync::OnceLock::new();
+static DEFERRED_JIT_OWNERS: std::sync::OnceLock<parking_lot::Mutex<Vec<Arc<CompiledMethod>>>> =
+    std::sync::OnceLock::new();
 
 fn jit_entry_owners(
 ) -> &'static parking_lot::Mutex<FxHashMap<usize, std::sync::Weak<CompiledMethod>>> {
@@ -5560,10 +5608,7 @@ impl JitCache {
         })
     }
 
-    fn invalidate_matching(
-        &self,
-        predicate: impl Fn(&JitKey, &CompiledMethod) -> bool,
-    ) -> usize {
+    fn invalidate_matching(&self, predicate: impl Fn(&JitKey, &CompiledMethod) -> bool) -> usize {
         let _mutation = self.mutation.lock();
         let mut remove_entries = std::collections::HashSet::new();
         for shard in self.shards.iter() {
@@ -5676,7 +5721,10 @@ impl std::fmt::Debug for JitCache {
         write!(
             f,
             "JitCache({} methods, {} osr methods)",
-            self.shards.iter().map(|s| s.methods.load().len()).sum::<usize>(),
+            self.shards
+                .iter()
+                .map(|s| s.methods.load().len())
+                .sum::<usize>(),
             self.shards
                 .iter()
                 .map(|s| s.osr_methods.load().len())
@@ -6107,7 +6155,12 @@ pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str)
     // elsewhere hit a genuine backend limitation), so a fixed sentinel
     // `ClassId` keeps this hash's shape unchanged rather than threading a
     // real class identity through this negative-cache-only path.
-    let h = compute_jit_key_hash(class_name, method_name, descriptor, cratonvm_types::ClassId::new(0));
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
     jit_bail_list().read().contains(&h)
 }
 
@@ -6115,7 +6168,12 @@ pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str)
 /// `x64::compile` path returns None (typically because of an unsupported
 /// backend pattern that won't change on retry).
 pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
-    let h = compute_jit_key_hash(class_name, method_name, descriptor, cratonvm_types::ClassId::new(0));
+    let h = compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    );
     jit_bail_list().write().insert(h);
 }
 
@@ -6912,7 +6970,9 @@ pub fn try_compile_with_invokespecial_resolver(
     // crashing dup_x1 method (NO_DUP_X1 removes the Groovy SIGSEGV) can be pinned
     // and dumped. Proper opcode walk via scev::bytecode_len so operand bytes that
     // happen to equal 0x5A are not mistaken for the opcode.
-    if result.is_some() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPX_METHODS").is_some() {
+    if result.is_some()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DUPX_METHODS").is_some()
+    {
         let code: &[u8] = &cached.code;
         let n = code.len();
         let mut pc = 0usize;
@@ -8022,7 +8082,8 @@ fn try_compile_inner(
                         // took the IR path at runtime (single-pass also compiles
                         // longs, so a live "== HotSpot" probe alone is vacuous).
                         if ir_emit_long
-                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LONG").is_some()
+                            && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_IR_LONG")
+                                .is_some()
                             && method_uses_category2(code, code_len, &cached.method_descriptor)
                         {
                             eprintln!(
@@ -8379,7 +8440,8 @@ fn try_compile_inner(
                         && invoke_kind == 3
                         && class_name == "java/lang/StringLatin1"
                         && method_name == "toLowerCase"
-                        && descriptor == "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;"
+                        && descriptor
+                            == "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;"
                     {
                         let entry = STRING_LATIN1_LOWER_DIRECT_FN
                             .load(std::sync::atomic::Ordering::Relaxed);
@@ -8424,34 +8486,34 @@ fn try_compile_inner(
                     }
                     if direct_jit_callee_calls_enabled {
                         if let Some(compiler) = callee_compiler.as_ref() {
-                        if let Some((entry, callee_needs_ctx)) =
-                            compiler(&class_name, &method_name, &descriptor)
-                        {
-                            if jit_direct_call_requires_dispatch(
-                                &class_name,
-                                &method_name,
-                                &descriptor,
-                            ) {
-                                needs_heap = true;
-                                mark_current_jit_compile_method_recursive_cycle();
-                            } else {
-                                if callee_needs_ctx {
+                            if let Some((entry, callee_needs_ctx)) =
+                                compiler(&class_name, &method_name, &descriptor)
+                            {
+                                if jit_direct_call_requires_dispatch(
+                                    &class_name,
+                                    &method_name,
+                                    &descriptor,
+                                ) {
                                     needs_heap = true;
+                                    mark_current_jit_compile_method_recursive_cycle();
+                                } else {
+                                    if callee_needs_ctx {
+                                        needs_heap = true;
+                                    }
+                                    direct_callee_entries.push(entry);
+                                    direct_calls.push((
+                                        pc,
+                                        JitDirectCall {
+                                            entry,
+                                            needs_context: callee_needs_ctx,
+                                            num_params,
+                                            return_type: ret_type,
+                                            guard_class_id: 0,
+                                        },
+                                    ));
+                                    continue;
                                 }
-                                direct_callee_entries.push(entry);
-                                direct_calls.push((
-                                    pc,
-                                    JitDirectCall {
-                                        entry,
-                                        needs_context: callee_needs_ctx,
-                                        num_params,
-                                        return_type: ret_type,
-                                        guard_class_id: 0,
-                                    },
-                                ));
-                                continue;
                             }
-                        }
                         }
                     }
                     needs_heap = true;
@@ -8575,14 +8637,20 @@ fn try_compile_inner(
                     && method_name == "get"
                     && descriptor == "(Ljava/lang/Object;)Ljava/lang/Object;"
                 {
-                    let entry = CONCURRENT_HASHMAP_GET_DIRECT_FN
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let entry =
+                        CONCURRENT_HASHMAP_GET_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
                     if entry != 0 {
                         needs_heap = true;
-                        direct_calls.push((pc, JitDirectCall {
-                            entry, needs_context: true, num_params: 1,
-                            return_type: b'L', guard_class_id: 0,
-                        }));
+                        direct_calls.push((
+                            pc,
+                            JitDirectCall {
+                                entry,
+                                needs_context: true,
+                                num_params: 1,
+                                return_type: b'L',
+                                guard_class_id: 0,
+                            },
+                        ));
                         continue;
                     }
                 }
@@ -8593,8 +8661,8 @@ fn try_compile_inner(
                     && method_name == "toLowerCase"
                     && descriptor == "(Ljava/util/Locale;)Ljava/lang/String;"
                 {
-                    let entry = STRING_LOCALE_LOWER_DIRECT_FN
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let entry =
+                        STRING_LOCALE_LOWER_DIRECT_FN.load(std::sync::atomic::Ordering::Relaxed);
                     if entry != 0 {
                         needs_heap = true;
                         direct_calls.push((
@@ -12000,13 +12068,34 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_pic_slot_duplicate_install_overwrites() {
+    fn test_jit_pic_slot_duplicate_install_keeps_published_mega_target() {
         let pic = JitPICSlot::new();
         pic.install(1, "A", 0x1000, false);
         pic.install(1, "A2", 0x2000, true);
         assert_eq!(pic.entries_used(), 1);
         assert_eq!(pic.lookup(1), Some((0x2000, true)));
-        assert_eq!(pic.lookup_megamorphic(1), Some((0x2000, true)));
+        // The generated hashed table is immutable after publication: changing
+        // an entry underneath a lock-free reader could pair the old class
+        // guard with a new target. Redefinition invalidation clears it first.
+        assert_eq!(pic.lookup_megamorphic(1), Some((0x1000, false)));
+    }
+
+    #[test]
+    fn test_jit_mega_offsets_match_generated_stub_contract() {
+        let pic = JitPICSlot::new();
+        let base = &pic as *const JitPICSlot as usize;
+        assert_eq!(
+            &pic.mega_class_ids as *const _ as usize - base,
+            JitPICSlot::MEGA_CLASS_IDS_OFFSET
+        );
+        assert_eq!(
+            &pic.mega_entry_ptrs as *const _ as usize - base,
+            JitPICSlot::MEGA_ENTRY_PTRS_OFFSET
+        );
+        assert_eq!(
+            &pic.mega_needs_context as *const _ as usize - base,
+            JitPICSlot::MEGA_NEEDS_CONTEXT_OFFSET
+        );
     }
 
     #[test]

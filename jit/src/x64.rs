@@ -1097,7 +1097,9 @@ fn dup_x2_codegen_disabled() -> bool {
 /// op is to blame.
 fn dupx_eager_canon() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_DUPX_EAGER_CANON").is_some())
+    *CACHE.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_DUPX_EAGER_CANON").is_some()
+    })
 }
 
 pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitScanResult> {
@@ -1114,40 +1116,40 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut indy_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `invokedynamic` (0xba)
     let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut has_newarray = false; // Primitive array allocation (0xbc)
-    // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
-    // instruction's (bytecode_pc, local_slot). Populated inline in the
-    // existing, already-correct per-opcode arms below (zero new pc-
-    // advancement logic — just recording a side effect), so it can never
-    // diverge from this scanner's own opcode-width decoding. Consumed by
-    // `local_handler_reads_unsafe_local` (jit/src/lib.rs) to conservatively
-    // verify every exception-table handler in a method only ever reads a
-    // local it (or something reachable before it in bytecode order,
-    // starting from the handler's own entry pc) has itself written — see
-    // that function's doc comment for why this check exists.
+                                  // RBC.6 local-handler-safety fix — every `*load`/`*store`/`iinc`
+                                  // instruction's (bytecode_pc, local_slot). Populated inline in the
+                                  // existing, already-correct per-opcode arms below (zero new pc-
+                                  // advancement logic — just recording a side effect), so it can never
+                                  // diverge from this scanner's own opcode-width decoding. Consumed by
+                                  // `local_handler_reads_unsafe_local` (jit/src/lib.rs) to conservatively
+                                  // verify every exception-table handler in a method only ever reads a
+                                  // local it (or something reachable before it in bytecode order,
+                                  // starting from the handler's own entry pc) has itself written — see
+                                  // that function's doc comment for why this check exists.
     let mut local_slot_ops: Vec<(usize, bool, u16)> = Vec::new(); // (pc, is_store, slot)
-                                  // BUG-LQB-SCOPE (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md
-                                  // — documented alongside the RBC.6 relaxation it was found while
-                                  // validating): this scanner used to track the earliest "committing side
-                                  // effect" pc and refuse to compile ANY method where one preceded an
-                                  // `invokedynamic` in raw bytecode-pc order, because at the time
-                                  // (`752796a0a`, 2026-07-07) the trap's fallback was believed to be an
-                                  // imprecise whole-method re-run that could double-execute that side
-                                  // effect (the real, once-confirmed Liquibase `Scope` corruption). That
-                                  // premise is stale: the SAME day, a concurrent fix
-                                  // (`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
-                                  // closed FOUR separate bugs in the reason-8 (`UnreachedCode`) precise-resume
-                                  // machinery this trap already uses UNCONDITIONALLY (`emit_osr_exit_map_at_reason`
-                                  // below, `emit_deopt_stubs`'s reason-8 routing, not gated behind
-                                  // `deopt_real_enabled()`) — including the exact nested-compiled-callee
-                                  // identity-mismatch case this gate was defending against
-                                  // (`try_resume_trapped_callee` + baked `method_key` identity checks,
-                                  // verified via a dedicated repro: 30000/30000 corrupted calls before,
-                                  // 0 after). A live indy trap today precisely resumes at the trapping bci
-                                  // with the correct locals/stack reconstructed — it does not re-run
-                                  // anything before it, so there is nothing left to double-execute. Removed
-                                  // this scan-time gate; the underlying runtime protection it was
-                                  // duplicating (imprecisely, at compile time) already exists and is
-                                  // strictly more precise.
+                                                                  // BUG-LQB-SCOPE (RELAXED, see docs/feature-designs/jit-local-exception-handlers.md
+                                                                  // — documented alongside the RBC.6 relaxation it was found while
+                                                                  // validating): this scanner used to track the earliest "committing side
+                                                                  // effect" pc and refuse to compile ANY method where one preceded an
+                                                                  // `invokedynamic` in raw bytecode-pc order, because at the time
+                                                                  // (`752796a0a`, 2026-07-07) the trap's fallback was believed to be an
+                                                                  // imprecise whole-method re-run that could double-execute that side
+                                                                  // effect (the real, once-confirmed Liquibase `Scope` corruption). That
+                                                                  // premise is stale: the SAME day, a concurrent fix
+                                                                  // (`docs/internal/jit-invokedynamic-uncommon-trap-precise-resume-groovy-regression-FIXED.md`)
+                                                                  // closed FOUR separate bugs in the reason-8 (`UnreachedCode`) precise-resume
+                                                                  // machinery this trap already uses UNCONDITIONALLY (`emit_osr_exit_map_at_reason`
+                                                                  // below, `emit_deopt_stubs`'s reason-8 routing, not gated behind
+                                                                  // `deopt_real_enabled()`) — including the exact nested-compiled-callee
+                                                                  // identity-mismatch case this gate was defending against
+                                                                  // (`try_resume_trapped_callee` + baked `method_key` identity checks,
+                                                                  // verified via a dedicated repro: 30000/30000 corrupted calls before,
+                                                                  // 0 after). A live indy trap today precisely resumes at the trapping bci
+                                                                  // with the correct locals/stack reconstructed — it does not re-run
+                                                                  // anything before it, so there is nothing left to double-execute. Removed
+                                                                  // this scan-time gate; the underlying runtime protection it was
+                                                                  // duplicating (imprecisely, at compile time) already exists and is
+                                                                  // strictly more precise.
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
@@ -2135,7 +2137,9 @@ pub fn narrow_oops_block_inline_fields() -> bool {
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_PUTFIELD").is_none())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_PUTFIELD").is_none()
+    })
 }
 
 /// Inline TLAB `new` — bump allocation emitted directly in compiled code.
@@ -2158,7 +2162,9 @@ pub fn inline_putfield_enabled() -> bool {
 pub fn inline_tlab_new_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_TLAB_NEW").is_none())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_INLINE_TLAB_NEW").is_none()
+    })
 }
 
 fn inline_site_is_fresh_ctor_first_store(
@@ -2169,7 +2175,7 @@ fn inline_site_is_fresh_ctor_first_store(
     site.method_name == "<init>"
         && !site.field_info.iter().any(|(prior_pc, prior_index, _)| {
             *prior_pc < cpc && *prior_index == field_index && site.callee_code[*prior_pc] == 0xb5
-            })
+        })
 }
 
 /// Opt-IN inline `getfield` fast path (`CRATONVM_JIT_INLINE_GETFIELD`).
@@ -2183,7 +2189,9 @@ fn inline_site_is_fresh_ctor_first_store(
 pub fn inline_getfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_INLINE_GETFIELD").is_some()
+    })
 }
 
 /// Default-ON guarded inline `getfield` (perf/throughput-20260710).
@@ -2258,10 +2266,12 @@ pub fn guarded_inline_getfield_enabled() -> bool {
 pub fn inline_self_guard_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_SELF_GUARD") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    })
+    *G.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_INLINE_SELF_GUARD") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 
 /// Let direct self-recursive entries inherit immutable per-thread cache slots
@@ -2271,7 +2281,9 @@ pub fn inline_self_guard_enabled() -> bool {
 fn self_cache_inherit_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SELF_CACHE_INHERIT").is_none())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SELF_CACHE_INHERIT").is_none()
+    })
 }
 
 /// Step 1 of `docs/feature-designs/precise-jit-maps-default.md` — opt-IN
@@ -2297,7 +2309,8 @@ pub fn precise_inline_frame_record_enabled() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         precise_jit_maps_enabled()
-            && cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD").is_none()
+            && cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD")
+                .is_none()
     })
 }
 
@@ -2310,7 +2323,9 @@ pub fn precise_inline_frame_record_enabled() -> bool {
 pub fn verify_inline_frame_record_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD").is_some())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD").is_some()
+    })
 }
 
 /// Step 1 — the GS-relative byte displacement of the Windows TLS slot that
@@ -2609,7 +2624,9 @@ fn shadow_reload_raw() -> bool {
 fn shadow_no_savebase() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_SAVEBASE").is_some())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_SHADOW_NO_SAVEBASE").is_some()
+    })
 }
 
 /// Cooperative JIT safepoint polling — whether the backend emits an inline
@@ -2636,7 +2653,9 @@ fn jit_safepoint_polls_enabled() -> bool {
 fn safepoint_reg_spill_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_REG_SPILL").is_some())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_SAFEPOINT_REG_SPILL").is_some()
+    })
 }
 
 /// SB-CRASH-04 diagnostic — `CRATONVM_JIT_SAFEPOINT_REG_SPILL=nostore` reserves
@@ -2687,7 +2706,9 @@ fn safepoint_reg_spill_all() -> bool {
 fn precise_reg_spill_disabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_REG_SPILL").is_some())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_PRECISE_REG_SPILL").is_some()
+    })
 }
 
 /// Keep the legacy full-register spill at otherwise eligible direct
@@ -2696,7 +2717,9 @@ fn precise_reg_spill_disabled() -> bool {
 fn full_self_call_spill_requested() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FULL_SELF_CALL_SPILL").is_some())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_FULL_SELF_CALL_SPILL").is_some()
+    })
 }
 
 /// The full set of allocatable GPRs spilled at safepoints under the `=all` gate
@@ -2751,7 +2774,9 @@ fn reference_local_in_register(
 fn flush_callee_saved_oops_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none()
+    })
 }
 
 /// Enable graph-coloured callee-saved GPR homes for Java locals.
@@ -2770,15 +2795,16 @@ pub fn callee_saved_gpr_local_homes_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        let requested = cratonvm_types::flags::runtime_var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "on" | "yes"
-                )
-            })
-            .unwrap_or(true);
+        let requested =
+            cratonvm_types::flags::runtime_var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+                .ok()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "yes"
+                    )
+                })
+                .unwrap_or(true);
         requested && (precise_jit_maps_enabled() || moving_young_enabled())
     })
 }
@@ -2914,7 +2940,9 @@ thread_local! {
 fn slot_mirror_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SLOT_MIRROR").is_none())
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_SLOT_MIRROR").is_none()
+    })
 }
 
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
@@ -9511,7 +9539,8 @@ impl Compiler {
                     continue;
                 }
                 if let Some(state) = self.sr_virtual_object_state(new_pc) {
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
+                    {
                         eprintln!(
                             "[DBG_SCALAR_DEOPT] x64 emit VirtualObject local={i} new_pc={new_pc} \
                              class_id={} fields={} at bci={bci}",
@@ -14522,8 +14551,7 @@ impl Compiler {
             }
         };
         self.buf.emit_byte(opcode);
-        self.buf
-            .emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
         self.buf.emit(&disp.to_le_bytes());
     }
 
@@ -14657,8 +14685,7 @@ impl Compiler {
         }
         self.buf.emit_byte(0xC6);
         self.buf.emit_byte(0x04); // mod=00, /0, SIB
-        self.buf
-            .emit_byte(((index & 7) << 3) | (base & 7)); // scale=1
+        self.buf.emit_byte(((index & 7) << 3) | (base & 7)); // scale=1
         self.buf.emit_byte(value);
     }
 
@@ -15118,11 +15145,7 @@ impl Compiler {
         bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null -> helper
 
         // Match the interpreter/helper's silent out-of-bounds drop.
-        self.emit_mov_r32_mem_disp32(
-            RCX,
-            RAX,
-            cratonvm_types::NUM_SLOTS_OFFSET as i32,
-        );
+        self.emit_mov_r32_mem_disp32(RCX, RAX, cratonvm_types::NUM_SLOTS_OFFSET as i32);
         self.emit_mov_imm64(RDX, field_index as i64);
         self.emit_cmp_r32_r32(RDX, RCX);
         let oob = self.emit_jcc_rel32_patch(0x83); // JAE -> drop
@@ -15473,26 +15496,14 @@ impl Compiler {
         // (16..24) and mark_word (24..32, MARK_NEUTRAL == 0) are written
         // explicitly as dword pairs (no qword-imm store emitter; four dwords
         // per `new` is negligible vs. a helper call).
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            cratonvm_types::FORWARDING_PTR_OFFSET as i32,
-            0,
-        );
+        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::FORWARDING_PTR_OFFSET as i32, 0);
         self.emit_mov_dword_mem_disp32_imm32(
             R11,
             cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
             0,
         );
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            cratonvm_types::MARK_WORD_OFFSET as i32,
-            0,
-        );
-        self.emit_mov_dword_mem_disp32_imm32(
-            R11,
-            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
-            0,
-        );
+        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32, 0);
+        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::MARK_WORD_OFFSET as i32 + 4, 0);
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
@@ -19072,8 +19083,8 @@ impl Compiler {
                         let p = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                         self.deopt_stubs.push((p, pc, 2)); // 2 = DEOPT_REASON_BOUNDS_CHECK
-                        // MOV R11D, INT_MAX (41 BB id); SUB R11D, ECX (41 29 CB);
-                        // CMP EDX, R11D (44 39 DA); JG rel32 (0F 8F).
+                                                           // MOV R11D, INT_MAX (41 BB id); SUB R11D, ECX (41 29 CB);
+                                                           // CMP EDX, R11D (44 39 DA); JG rel32 (0F 8F).
                         self.buf.emit(&[0x41, 0xBB]);
                         self.buf.emit(&0x7FFF_FFFFi32.to_le_bytes());
                         self.buf.emit(&[0x41, 0x29, 0xCB]);
@@ -22043,9 +22054,7 @@ impl Compiler {
                         pairs.push((key, target));
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
-                    if def_target <= base_pc
-                        || pairs.iter().any(|&(_, target)| target <= base_pc)
-                    {
+                    if def_target <= base_pc || pairs.iter().any(|&(_, target)| target <= base_pc) {
                         self.emit_safepoint_poll();
                     }
                     self.load_slot_to_reg(RAX, key_slot);
@@ -22355,7 +22364,9 @@ impl Compiler {
                                         && self.helpers.region_bounds_addr != 0))
                         })
                     {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE")
+                            .is_some()
+                        {
                             eprintln!(
                                 "[compact-inline] getfield pc={pc} off={c_off} ref={c_is_ref}"
                             );
@@ -22453,18 +22464,12 @@ impl Compiler {
                                 b'F' => {
                                     self.emit_mov_r32_mem_disp32(RAX, RAX, cell_off);
                                 }
-                                b'Z' => self.emit_movx_r64_mem_disp32(
-                                    RAX, RAX, cell_off, 8, false,
-                                ),
-                                b'B' => self.emit_movx_r64_mem_disp32(
-                                    RAX, RAX, cell_off, 8, true,
-                                ),
-                                b'C' => self.emit_movx_r64_mem_disp32(
-                                    RAX, RAX, cell_off, 16, false,
-                                ),
-                                b'S' => self.emit_movx_r64_mem_disp32(
-                                    RAX, RAX, cell_off, 16, true,
-                                ),
+                                b'Z' => self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 8, false),
+                                b'B' => self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 8, true),
+                                b'C' => {
+                                    self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 16, false)
+                                }
+                                b'S' => self.emit_movx_r64_mem_disp32(RAX, RAX, cell_off, 16, true),
                                 _ => {
                                     self.emit_movsxd_r64_mem_disp32(RAX, RAX, cell_off);
                                 }
@@ -22819,7 +22824,11 @@ impl Compiler {
                                         && self.helpers.region_bounds_addr != 0
                                 })
                             {
-                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
+                                if cratonvm_types::flags::runtime_var_os(
+                                    "CRATONVM_DBG_COMPACT_INLINE",
+                                )
+                                .is_some()
+                                {
                                     eprintln!("[compact-inline] putfield-ref pc={pc} off={c_off}");
                                 }
                                 // COMPACT inline reference putfield: store the
@@ -22884,8 +22893,8 @@ impl Compiler {
                                     self.emit_and_r64_imm8(RCX, 1);
                                     bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
                                 }
-                                                                            // non-null OLD value → helper (SATB). The old ref
-                                                                            // is the 8-byte pointer AT the cell base.
+                                // non-null OLD value → helper (SATB). The old ref
+                                // is the 8-byte pointer AT the cell base.
                                 self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
@@ -22953,8 +22962,8 @@ impl Compiler {
                                     self.emit_and_r64_imm8(RCX, 1);
                                     bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
                                 }
-                                                                            // non-null OLD value → helper (SATB). Read the cell's
-                                                                            // 8-byte payload; a null old value never needs SATB.
+                                // non-null OLD value → helper (SATB). Read the cell's
+                                // 8-byte payload; a null old value never needs SATB.
                                 self.emit_mov_r64_mem_disp32(
                                     RCX,
                                     RAX,
@@ -25395,8 +25404,8 @@ impl Compiler {
                                         RAX,
                                         RAX,
                                         layout.hash_compact_offset,
-                                    false,
-                                    layout.hash_legacy_offset,
+                                        false,
+                                        layout.hash_legacy_offset,
                                     );
                                     // TEST EAX,EAX ; JNZ cached_done
                                     self.buf.emit(&[0x85, 0xC0]);
@@ -25421,7 +25430,7 @@ impl Compiler {
                                         RDX,
                                         RDX,
                                         layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                        layout.value_legacy_offset,
                                     );
                                     // h = 0 (EAX) ; i = 0 (R8D).
                                     self.emit_xor_reg_self(RAX);
@@ -25627,13 +25636,13 @@ impl Compiler {
                                 R8,
                                 RAX,
                                 layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                layout.value_legacy_offset,
                             );
                             self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
                                 layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                layout.value_legacy_offset,
                             );
                             // Null value array on either side → deopt.
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
@@ -25647,8 +25656,8 @@ impl Compiler {
                                 RCX,
                                 RAX,
                                 layout.coder_compact_offset,
-                                    layout.coder_compact_is_byte,
-                                    layout.coder_legacy_offset,
+                                layout.coder_compact_is_byte,
+                                layout.coder_legacy_offset,
                             );
                             // other.coder may come from a legacy-laid-out `other`
                             // independently of `this` -- load it through the
@@ -25659,8 +25668,8 @@ impl Compiler {
                                 R11,
                                 RDX,
                                 layout.coder_compact_offset,
-                                    layout.coder_compact_is_byte,
-                                    layout.coder_legacy_offset,
+                                layout.coder_compact_is_byte,
+                                layout.coder_legacy_offset,
                             );
                             self.emit_alu_r32_r32(0x39, RCX, R11); // CMP ECX,R11D
                             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
@@ -25776,7 +25785,7 @@ impl Compiler {
                                 R8,
                                 RAX,
                                 layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -25784,7 +25793,7 @@ impl Compiler {
                                 R9,
                                 RDX,
                                 layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -25793,15 +25802,15 @@ impl Compiler {
                                 R10,
                                 RAX,
                                 layout.coder_compact_offset,
-                                    layout.coder_compact_is_byte,
-                                    layout.coder_legacy_offset,
+                                layout.coder_compact_is_byte,
+                                layout.coder_legacy_offset,
                             );
                             self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
                                 layout.coder_compact_offset,
-                                    layout.coder_compact_is_byte,
-                                    layout.coder_legacy_offset,
+                                layout.coder_compact_is_byte,
+                                layout.coder_legacy_offset,
                             );
 
                             // --- past every deopt edge: save the callee-
@@ -25915,7 +25924,7 @@ impl Compiler {
                                 R8,
                                 RAX,
                                 layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -25924,8 +25933,8 @@ impl Compiler {
                                 R10,
                                 RAX,
                                 layout.coder_compact_offset,
-                                    layout.coder_compact_is_byte,
-                                    layout.coder_legacy_offset,
+                                layout.coder_compact_is_byte,
+                                layout.coder_legacy_offset,
                             );
                             // R9D = needle = ch & 0xFFFF.
                             self.load_slot_to_reg(R9, ch_slot);
@@ -26016,7 +26025,7 @@ impl Compiler {
                                 R8,
                                 RAX,
                                 layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -26024,7 +26033,7 @@ impl Compiler {
                                 R9,
                                 RDX,
                                 layout.value_compact_offset,
-                                    layout.value_legacy_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -26033,15 +26042,15 @@ impl Compiler {
                                 R10,
                                 RAX,
                                 layout.coder_compact_offset,
-                                    layout.coder_compact_is_byte,
-                                    layout.coder_legacy_offset,
+                                layout.coder_compact_is_byte,
+                                layout.coder_legacy_offset,
                             );
                             self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
                                 layout.coder_compact_offset,
-                                    layout.coder_compact_is_byte,
-                                    layout.coder_legacy_offset,
+                                layout.coder_compact_is_byte,
+                                layout.coder_legacy_offset,
                             );
 
                             // PUSH RBX,RSI,RDI,R12,R13,R14,R15.
@@ -26595,7 +26604,9 @@ impl Compiler {
                             // slot live as a fallback), PIC takes
                             // precedence: it caches a 4-entry superset.
                             let pic_ptr = self.pic_slots_idx.get(&pc).map(|&i| self.pic_slots[i].1);
-                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN")
+                                .is_some()
+                            {
                                 eprintln!(
                                     "[JIT_GEN_INVOKE_VS] pc={} op=0x{:02x} info_kind={} mic_present={} pic_present={} {}.{}{}",
                                     pc, op, info_ref.invoke_kind, mic_ptr.is_some(), pic_ptr.is_some(),
@@ -26772,10 +26783,9 @@ impl Compiler {
                                     .starts_with("java/util/regex/Pattern$GroupHead.match");
                             let inline_virtual_ic_allowed =
                                 crate::direct_jit_callee_calls_enabled()
-                                && !regex_backtracking_frame;
-                            let pic_inline = inline_virtual_ic_allowed
-                                && pic_ptr.is_some()
-                                && args_fit;
+                                    && !regex_backtracking_frame;
+                            let pic_inline =
+                                inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
                             let mic_inline = inline_virtual_ic_allowed
                                 && !pic_inline
                                 && mic_ptr.is_some()
@@ -26836,17 +26846,17 @@ impl Compiler {
                                 self.emit_mov_imm64_full(R10, pic as *const _ as i64); // Cast: function pointer for JIT call target
                                 self.ic_patches
                                     .push((ic_imm64_off, 1, pic as *const _ as usize)); // 1 = PIC
-                                                                         // SECURITY FIX (V1) INVARIANT: R10 holds the
-                                                                         // PIC slot base pointer from here until each
-                                                                         // per-slot `MOV R11,[R10+disp]; CALL R11`
-                                                                         // below. Code emitted in this window (receiver
-                                                                         // load, NPE guard, class_id load, the per-slot
-                                                                         // CMP/JNE cascade) must touch only RAX and R10
-                                                                         // itself — it must NOT route through any helper
-                                                                         // that clobbers R10 (e.g. emit_bounds_check,
-                                                                         // SIMD lowering). The ABI marshalling below
-                                                                         // targets ARG_REGS only (RCX/RDX/RSI/R8/R9/RDI
-                                                                         // — never R10), so R10 stays the trusted base.
+                                                                                        // SECURITY FIX (V1) INVARIANT: R10 holds the
+                                                                                        // PIC slot base pointer from here until each
+                                                                                        // per-slot `MOV R11,[R10+disp]; CALL R11`
+                                                                                        // below. Code emitted in this window (receiver
+                                                                                        // load, NPE guard, class_id load, the per-slot
+                                                                                        // CMP/JNE cascade) must touch only RAX and R10
+                                                                                        // itself — it must NOT route through any helper
+                                                                                        // that clobbers R10 (e.g. emit_bounds_check,
+                                                                                        // SIMD lowering). The ABI marshalling below
+                                                                                        // targets ARG_REGS only (RCX/RDX/RSI/R8/R9/RDI
+                                                                                        // — never R10), so R10 stays the trusted base.
 
                                 // ---- Hoist callee ABI marshalling out of
                                 // the 4-way cascade. Previously each slot
@@ -27039,13 +27049,7 @@ impl Compiler {
                                     // the resolving helper compiles and
                                     // publishes a concrete target.
                                     // CMP QWORD [R10 + ENTRY_PTR_OFFS[i]], 0
-                                    self.buf.emit(&[
-                                        0x49,
-                                        0x83,
-                                        0x7A,
-                                        ENTRY_PTR_OFFS[i],
-                                        0x00,
-                                    ]);
+                                    self.buf.emit(&[0x49, 0x83, 0x7A, ENTRY_PTR_OFFS[i], 0x00]);
                                     // JE rel32 → .miss
                                     self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                                     miss_patches_rel32.push(self.buf.pos() - 4);
@@ -27078,32 +27082,23 @@ impl Compiler {
 
                                     // .noctx: Java args start at ARG_REGS[0].
                                     let noctx_off = self.buf.pos();
-                                    let noctx_rel =
-                                        (noctx_off as i64) - (noctx_patch as i64 + 4);
+                                    let noctx_rel = (noctx_off as i64) - (noctx_patch as i64 + 4);
                                     debug_assert!(
-                                        (i32::MIN as i64..=i32::MAX as i64)
-                                            .contains(&noctx_rel)
+                                        (i32::MIN as i64..=i32::MAX as i64).contains(&noctx_rel)
                                     );
-                                    self.buf
-                                        .try_patch_i32(noctx_patch, noctx_rel as i32)
-                                        .ok();
+                                    self.buf.try_patch_i32(noctx_patch, noctx_rel as i32).ok();
                                     for j in 0..n {
-                                        let spill_off =
-                                            args_base_offset + ((n - 1 - j) as i32) * 8;
+                                        let spill_off = args_base_offset + ((n - 1 - j) as i32) * 8;
                                         self.emit_load_local(ARG_REGS[j], spill_off);
                                     }
 
                                     // .call
                                     let call_off = self.buf.pos();
-                                    let call_rel =
-                                        (call_off as i64) - (ctx_call_patch as i64 + 4);
+                                    let call_rel = (call_off as i64) - (ctx_call_patch as i64 + 4);
                                     debug_assert!(
-                                        (i32::MIN as i64..=i32::MAX as i64)
-                                            .contains(&call_rel)
+                                        (i32::MIN as i64..=i32::MAX as i64).contains(&call_rel)
                                     );
-                                    self.buf
-                                        .try_patch_i32(ctx_call_patch, call_rel as i32)
-                                        .ok();
+                                    self.buf.try_patch_i32(ctx_call_patch, call_rel as i32).ok();
 
                                     // SECURITY FIX (V1): do NOT keep the
                                     // call target live in memory addressed
@@ -27205,15 +27200,15 @@ impl Compiler {
                                 self.emit_mov_imm64_full(R10, mic as *const _ as i64); // Cast: function pointer for JIT call target
                                 self.ic_patches
                                     .push((ic_imm64_off, 0, mic as *const _ as usize)); // 0 = MIC
-                                                                         // SECURITY FIX (V1) INVARIANT: R10 holds the
-                                                                         // MIC slot base pointer from here until the
-                                                                         // `MOV R11,[R10+8]; CALL R11` below. Every
-                                                                         // instruction emitted in this window (receiver
-                                                                         // load into RAX, NPE guard, class_id/needs-ctx
-                                                                         // checks, and the ARG_REGS marshalling loop)
-                                                                         // touches only RAX, R10, and ARG_REGS — never
-                                                                         // R10 as a destination — so the call target
-                                                                         // base cannot be perturbed before the CALL.
+                                                                                        // SECURITY FIX (V1) INVARIANT: R10 holds the
+                                                                                        // MIC slot base pointer from here until the
+                                                                                        // `MOV R11,[R10+8]; CALL R11` below. Every
+                                                                                        // instruction emitted in this window (receiver
+                                                                                        // load into RAX, NPE guard, class_id/needs-ctx
+                                                                                        // checks, and the ARG_REGS marshalling loop)
+                                                                                        // touches only RAX, R10, and ARG_REGS — never
+                                                                                        // R10 as a destination — so the call target
+                                                                                        // base cannot be perturbed before the CALL.
 
                                 // Load receiver pointer into RAX. Receiver is
                                 // arg_slots[0], spilled at the *highest* offset
@@ -27290,9 +27285,7 @@ impl Compiler {
                                 debug_assert!(
                                     (i32::MIN as i64..=i32::MAX as i64).contains(&noctx_rel)
                                 );
-                                self.buf
-                                    .try_patch_i32(noctx_patch, noctx_rel as i32)
-                                    .ok();
+                                self.buf.try_patch_i32(noctx_patch, noctx_rel as i32).ok();
                                 for i in 0..n {
                                     let spill_off = args_base_offset + ((n - 1 - i) as i32) * 8;
                                     self.emit_load_local(ARG_REGS[i], spill_off);
@@ -27304,9 +27297,7 @@ impl Compiler {
                                 debug_assert!(
                                     (i32::MIN as i64..=i32::MAX as i64).contains(&call_rel)
                                 );
-                                self.buf
-                                    .try_patch_i32(ctx_call_patch, call_rel as i32)
-                                    .ok();
+                                self.buf.try_patch_i32(ctx_call_patch, call_rel as i32).ok();
 
                                 // SECURITY FIX (V1): same hardening as the
                                 // PIC arm — never CALL indirectly through a
@@ -27348,10 +27339,33 @@ impl Compiler {
                                         "inline MIC miss branch overflowed rel32 ({} bytes)",
                                         rel
                                     );
-                                    self.buf
-                                        .try_patch_i32(*patch, rel as i32)
-                                        .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
+                                    self.buf.try_patch_i32(*patch, rel as i32).ok();
+                                    // on Err try_patch_byte set buf.overflowed; compile bails
                                 }
+                            }
+
+                            // ---- Shared compact hashed/vtable stub ----
+                            // Both the baseline and optimizing tiers lower
+                            // megamorphic misses through this exact library.
+                            // It reloads arg0, performs two lock-free probes,
+                            // and falls through here only on a real miss.
+                            if let Some(pic) = pic_ptr {
+                                let arg_offsets: Vec<i32> = (0..n)
+                                    .map(|i| args_base_offset + ((n - 1 - i) as i32) * 8)
+                                    .collect();
+                                done_patches32.extend(
+                                    crate::runtime_lowering::emit_hashed_vtable_stub(
+                                        &mut self.buf,
+                                        pic as usize,
+                                        self.heap_local_offset,
+                                        &arg_offsets,
+                                        if self.precise_maps {
+                                            self.helpers.frame_record
+                                        } else {
+                                            0
+                                        },
+                                    ),
+                                );
                             }
 
                             // ---- Slow path: helper ABI setup + call ----
@@ -27408,7 +27422,7 @@ impl Compiler {
                                         0,
                                         mic as *const _ as usize,
                                     ));
-                                                                                      // MOV [RSP + 32], RAX
+                                    // MOV [RSP + 32], RAX
                                     self.rex_w();
                                     self.buf.emit(&[0x89, 0x44, 0x24, 0x20]);
                                     // 6th arg at [RSP + 40]
@@ -27742,10 +27756,15 @@ impl Compiler {
                         // current one completes the header before the cursor
                         // advance, which is what made default-on safe.)
                         let skip_helper = !has_prim_init && !has_finalizer;
-                        let can_inline = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_DISABLE_INLINE_NEW")
-                            .is_none()
+                        let can_inline = cratonvm_types::flags::runtime_var_os(
+                            "CRATONVM_JIT_DISABLE_INLINE_NEW",
+                        )
+                        .is_none()
                             && (skip_helper
-                                || cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some())
+                                || cratonvm_types::flags::runtime_var_os(
+                                    "CRATONVM_JIT_ENABLE_INLINE_NEW",
+                                )
+                                .is_some())
                             && self.helpers.get_current_thread != 0
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
@@ -28569,11 +28588,12 @@ pub fn compile_with_param_slots(
 
     // LICM: detect loops and find invariant aaload sequences to hoist
     let loops = detect_loops(code, code_len);
-    let hoist_info = if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
-        Vec::new()
-    } else {
-        find_loop_hoists(code, code_len, &loops)
-    };
+    let hoist_info =
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
+            Vec::new()
+        } else {
+            find_loop_hoists(code, code_len, &loops)
+        };
     // Per-bci de-spec (same registry the speculative-BCE guards use): the
     // hoisted aaload's null+bounds preheader guard deopts at the loop-header
     // bci; once a header crosses the de-spec threshold, drop its hoists so
@@ -28598,12 +28618,15 @@ pub fn compile_with_param_slots(
     // LICM: find loop-invariant integer-arithmetic runs to hoist into the
     // loop pre-header. These are pure, non-faulting ALU expressions on
     // loop-invariant locals/constants — see `find_arith_loop_hoists`.
-    let arith_hoist_info = if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_ARITH_LICM").is_some() {
-        Vec::new()
-    } else {
-        find_arith_loop_hoists(code, code_len, &loops)
-    };
-    if !arith_hoist_info.is_empty() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some() {
+    let arith_hoist_info =
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_ARITH_LICM").is_some() {
+            Vec::new()
+        } else {
+            find_arith_loop_hoists(code, code_len, &loops)
+        };
+    if !arith_hoist_info.is_empty()
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_GEN").is_some()
+    {
         eprintln!(
             "[JIT_GEN] arith-LICM hoists={} runs={:?}",
             arith_hoist_info.len(),
@@ -28862,7 +28885,9 @@ pub fn compile_with_param_slots(
         }
         analyze_escapes(code, code_len, &invokespecial_shapes)
     };
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some() && !new_info.is_empty() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_SCALAR_DEOPT").is_some()
+        && !new_info.is_empty()
+    {
         eprintln!(
             "[DBG_SCALAR_DEOPT] x64::compile escape re-analysis: new_info={} non_escaping_new={:?} invoke_info={}",
             new_info.len(),
@@ -28875,11 +28900,12 @@ pub fn compile_with_param_slots(
     let num_hoists = hoist_info.len();
     let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
     let empty_non_escaping = std::collections::HashSet::new();
-    let non_escaping_for_sr = if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some() {
-        &empty_non_escaping
-    } else {
-        &non_escaping_new
-    };
+    let non_escaping_for_sr =
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some() {
+            &empty_non_escaping
+        } else {
+            &non_escaping_new
+        };
     let sr_plan = plan_scalar_replacement(
         code,
         code_len,
@@ -28889,7 +28915,8 @@ pub fn compile_with_param_slots(
         scalar_base,
     );
     let num_scalar_slots = sr_plan.total_slots;
-    let force_inline_new = cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some();
+    let force_inline_new =
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ENABLE_INLINE_NEW").is_some();
     let cache_jit_thread_for_inline_new = needs_heap
         && helpers.get_current_thread != 0
         && helpers.tlab_post_init != 0
@@ -29944,9 +29971,7 @@ mod tests {
     // SAFETY: obj_ptr points to a live, properly aligned ObjectHeader (repr(C)); reading the
     // u32 num_slots field at its fixed offset is in-bounds and the object is not freed.
     unsafe fn read_num_slots(obj_ptr: *const u8) -> u32 {
-        std::ptr::read(
-            obj_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
-        )
+        std::ptr::read(obj_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32)
     }
 
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
@@ -30314,7 +30339,9 @@ mod tests {
 
         // int i=3; do { --i; } while (i != 0); return i;
         // The loop has no goto: its only backedge is the conditional ifne.
-        let code = [0x06, 0x3b, 0x84, 0x00, 0xff, 0x1a, 0x9a, 0xff, 0xfc, 0x1a, 0xac];
+        let code = [
+            0x06, 0x3b, 0x84, 0x00, 0xff, 0x1a, 0x9a, 0xff, 0xfc, 0x1a, 0xac,
+        ];
         let compiled = compile(
             &code,
             code.len(),
@@ -36212,7 +36239,7 @@ mod tests {
             num_jit_args: 1, // just receiver
             return_type: b'I',
             invoke_kind: 0, // invokevirtual
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let invoke_info = vec![(1usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -36270,7 +36297,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'I',
             invoke_kind: 2, // invokeinterface
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let invoke_info = vec![(1usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -36328,7 +36355,7 @@ mod tests {
             num_jit_args: 1, // just receiver
             return_type: b'V',
             invoke_kind: 0,
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let invoke_info = vec![(1usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -36388,7 +36415,7 @@ mod tests {
             num_jit_args: 3, // receiver + 2 int args
             return_type: b'I',
             invoke_kind: 0,
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let invoke_info = vec![(3usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -38972,7 +38999,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'V',
             invoke_kind: 0xb7,
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)]; // Cast: address arithmetic
         let scalar_base = 4; // some offset
@@ -39090,7 +39117,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'V',
             invoke_kind: 0xb7,
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)];
         let plan =
@@ -39179,7 +39206,7 @@ mod tests {
             num_jit_args: 2,
             return_type: b'V',
             invoke_kind: 0xb7,
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         }));
         let invoke_info = vec![(5usize, init_info as *const JitInvokeInfo)]; // Cast: address arithmetic
         let plan = plan_scalar_replacement(&code, 9, &non_escaping, &new_info, &invoke_info, 0);
@@ -41267,7 +41294,7 @@ mod tests {
             num_jit_args: 1, // receiver only
             return_type: b'I',
             invoke_kind: 0, // virtual
-        declaring_class_id: 0,
+            declaring_class_id: 0,
         });
         let info_ptr: *const JitInvokeInfo = &*info;
         let invoke_info = vec![(11usize, info_ptr)];
