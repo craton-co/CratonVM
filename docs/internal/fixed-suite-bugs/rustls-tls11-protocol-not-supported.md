@@ -69,3 +69,10 @@ Not pursued further without explicit user sign-off given the security
 tradeoff involved (reviving a deprecated, actively-being-removed protocol
 version); flagged back rather than silently attempted, same posture as the
 CBC and DHE docs.
+
+**Confirmed still failing 2026-07-23** (`RunName=craton-rerun-20260723`):
+`sslEnabledMultipleProtocolsConfiguration` still fails with the identical
+`["TLSv1.2"]` vs `["TLSv1.1", "TLSv1.2"]` mismatch (7/8 other tests in the
+class pass). Expected, given this is a permanent upstream rustls limitation
+rather than a bug to fix. Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard6/logs/module_spring-boot-tomcat.org.springframework.boot.tomcat.SslConnectorCustomizerTests.out.log`.
