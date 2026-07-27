@@ -518,6 +518,62 @@ fn should_skip_jit_internal(
         return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
 
+    // SPRING-CRHM.1 (2026-07-27) — REGRESSION REPAIR, not a new ban.
+    //
+    // `654dfb918` ("retire the inert is_known_miscompile ban block") deleted
+    // ~189 (class, method) entries on the finding that the block's gate had
+    // drifted and the list was therefore inert. That held for most of it, but
+    // NOT for this family: the removed list contained
+    //   ("org/springframework/util/ConcurrentReferenceHashMap",         "get")
+    //   ("org/springframework/util/ConcurrentReferenceHashMap",         "getReference")
+    //   ("org/springframework/util/ConcurrentReferenceHashMap",         "getEntryIfAvailable")
+    //   ("org/springframework/util/ConcurrentReferenceHashMap$Segment", "getReference")
+    //   ("org/springframework/util/ConcurrentReferenceHashMap$Segment", "findInChain")
+    //   ("org/springframework/util/ConcurrentReferenceHashMap$Segment", "restructureIfNecessary")
+    // and dropping them re-enabled a live miscompile.
+    //
+    // Symptom (~75 Spring Boot classes): `ResolvableType.forType` does
+    // `cache.get(key)` on this map then `checkcast ResolvableType`
+    // (bytecode 61 -> 64). The compiled `Segment.getReference` returns an
+    // object of the wrong type, so the cast throws
+    //   `ClassCastException: class org.springframework.core.ResolvableType
+    //    cannot be cast to class org.springframework.core.ResolvableType`
+    // which READS like a class-identity split but is not: the receiver is a
+    // `ResolvableType[]` (`kind=Array`,
+    // `arr_desc="[Lorg/springframework/core/ResolvableType;"`, component cid
+    // == target cid), and `jit_checkcast`'s message renders an array receiver
+    // by its COMPONENT name. The typecheck refusal is correct; the value
+    // reaching it is not.
+    //
+    // Isolation (all on one binary, no rebuilds):
+    //   --nojit                                                      -> 38/38 pass
+    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/core            -> pass
+    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/util            -> pass
+    //   CRATONVM_JIT_BISECT_ONLY=<core>,<util>                       -> FAIL (minimal pair)
+    //   CRATONVM_JIT_BISECT_SKIP=...$Segment.getReference, full JIT  -> 38/38 pass
+    // Not heap/GC dependent (identical at --Xmx 512m and 8g); not the
+    // pointer-keyed typecheck target cache (instrumented: zero stale hits).
+    // Witness: `ConditionalOnPropertyTests` (38 tests, all 38 failed).
+    //
+    // The sibling entries are restored with it because they form one lookup
+    // chain (`get` -> `getReference` -> `Segment.getReference` ->
+    // `findInChain`): skipping `ConcurrentReferenceHashMap.get` or
+    // `ResolvableType.forType` alone does NOT help, because the defective body
+    // arrives by INLINING rather than by call.
+    if class_name == "org/springframework/util/ConcurrentReferenceHashMap"
+        && matches!(method_name, "get" | "getReference" | "getEntryIfAvailable")
+    {
+        return Some(SkipReason::JavaUtilCollection);
+    }
+    if class_name == "org/springframework/util/ConcurrentReferenceHashMap$Segment"
+        && matches!(
+            method_name,
+            "getReference" | "findInChain" | "restructureIfNecessary"
+        )
+    {
+        return Some(SkipReason::JavaUtilCollection);
+    }
+
     // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
     // in-process javac invocation per fixture. Once the real JDK's
     // `JavacTool.getTask` is tier-compiled, its `context.put(JavaFileManager,
