@@ -3573,6 +3573,8 @@ pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod http_url_connection_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

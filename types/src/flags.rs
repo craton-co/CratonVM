@@ -55,8 +55,8 @@
 //! part of this refactor; naming each parser at each field is what makes the
 //! divergence visible enough to retire later, flag by flag, with benchmarks.
 
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -124,6 +124,16 @@ impl MapSource {
         for (name, value) in std::env::vars_os() {
             if let Ok(name) = name.into_string() {
                 map.entry(name).or_insert(value);
+            }
+        }
+        Self(map)
+    }
+
+    fn declared_snapshot(src: &dyn FlagSource) -> Self {
+        let mut map = HashMap::new();
+        for &name in declared_flag_names() {
+            if let Some(value) = src.get(name) {
+                map.insert(name.to_string(), value);
             }
         }
         Self(map)
@@ -774,16 +784,28 @@ impl GcFlags {
 /// crates are here so far; the rest arrive with the `jit` migration.
 #[derive(Debug, Clone, Default)]
 pub struct JitFlags {
+    /// `CRATONVM_DISABLE_JIT` — process-wide interpreter-only kill switch.
+    ///
+    /// This is typed because the launcher must be able to overlay `--nojit`
+    /// before publishing the immutable configuration snapshot.
+    pub disable_jit: bool,
     /// `CRATONVM_SHADOW_STACK` — use the JIT shadow stack for root discovery.
     /// Read from `gc`, `jit` and `vm`, which is why it is in the shared config
     /// rather than a crate-private cache.
     pub shadow_stack: bool,
+    /// `CRATONVM_DBG_JIT_METHOD_STATS=1` — emit the tier/promotion summary
+    /// exactly once during controlled VM shutdown. Kept in the shared snapshot
+    /// so the supported `CRATONVM_DBG=jit-method-stats` spelling and the legacy
+    /// spelling cannot diverge at the launcher.
+    pub method_stats: bool,
 }
 
 impl JitFlags {
     fn from_source(src: &dyn FlagSource) -> Self {
         Self {
+            disable_jit: parse::non_empty_non_zero(src, "CRATONVM_DISABLE_JIT"),
             shadow_stack: parse::present(src, "CRATONVM_SHADOW_STACK"),
+            method_stats: parse::exactly_one(src, "CRATONVM_DBG_JIT_METHOD_STATS"),
         }
     }
 }
@@ -1672,6 +1694,10 @@ pub struct VmFlags {
     pub io: IoFlags,
     /// Flags read only by `native-builtins`.
     pub natives: NativeFlags,
+    /// Resolved legacy values retained for configuration consumers that have
+    /// not yet been converted to a typed field. Private so new code cannot
+    /// widen the public configuration surface.
+    legacy_values: MapSource,
 }
 
 impl VmFlags {
@@ -1685,7 +1711,12 @@ impl VmFlags {
             loader: LoaderFlags::from_source(src),
             io: IoFlags::from_source(src),
             natives: NativeFlags::from_source(src),
+            legacy_values: MapSource::declared_snapshot(src),
         }
+    }
+
+    fn legacy_var_os(&self, name: &str) -> Option<OsString> {
+        self.legacy_values.get(name)
     }
 
     /// Build from the process environment.
@@ -1698,12 +1729,46 @@ impl VmFlags {
     /// every field below. Legacy per-flag names are what the grouped tokens
     /// expand *to*, so setting one directly still works unchanged.
     pub fn from_env() -> Self {
-        let raw = MapSource::from_process_env();
+        Self::from_env_with_overrides(MapSource::empty())
+    }
+
+    /// Build from one process-environment snapshot plus launcher overrides.
+    ///
+    /// Overrides win over inherited variables, then grouped flag expressions
+    /// are resolved across the combined source. Launchers should use this
+    /// instead of mutating `environ` after argument parsing: once any
+    /// CratonVM flag is read, the process configuration is immutable.
+    pub fn from_env_with_overrides(overrides: MapSource) -> Self {
+        let mut raw = MapSource::from_process_env();
+        raw.0.extend(overrides.0);
         Self::from_source(&crate::flag_groups::resolve(&raw))
     }
 }
 
 static FLAGS: OnceLock<VmFlags> = OnceLock::new();
+
+fn declared_flag_names() -> &'static HashSet<&'static str> {
+    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = HashSet::new();
+        for entry in crate::flag_groups::INVENTORY {
+            if let Some(name) = entry.on_key {
+                names.insert(name);
+            }
+            if let Some(name) = entry.off_key {
+                names.insert(name);
+            }
+        }
+        names.extend(crate::flag_groups::SCALARS.iter().copied());
+        names.extend(
+            crate::flag_groups::Group::ALL
+                .iter()
+                .copied()
+                .map(crate::flag_groups::Group::var),
+        );
+        names
+    })
+}
 
 /// The process-wide configuration.
 ///
@@ -1712,6 +1777,37 @@ static FLAGS: OnceLock<VmFlags> = OnceLock::new();
 #[inline]
 pub fn flags() -> &'static VmFlags {
     FLAGS.get_or_init(VmFlags::from_env)
+}
+
+/// Read an environment value through the runtime configuration boundary.
+///
+/// Declared CratonVM flags come from the one immutable [`VmFlags`] snapshot.
+/// Ordinary process variables (`HOME`, `TZ`, application `System.getenv`
+/// names, and so on) retain `std::env`'s live-read semantics.
+#[inline]
+pub fn runtime_var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError> {
+    let key = key.as_ref();
+    if let Some(name) = key.to_str() {
+        if declared_flag_names().contains(name) {
+            return match flags().legacy_var_os(name) {
+                Some(value) => value.into_string().map_err(std::env::VarError::NotUnicode),
+                None => Err(std::env::VarError::NotPresent),
+            };
+        }
+    }
+    std::env::var(key)
+}
+
+/// OS-native sibling of [`runtime_var`].
+#[inline]
+pub fn runtime_var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
+    let key = key.as_ref();
+    if let Some(name) = key.to_str() {
+        if declared_flag_names().contains(name) {
+            return flags().legacy_var_os(name);
+        }
+    }
+    std::env::var_os(key)
 }
 
 /// Publish an explicitly-built configuration.
@@ -1760,6 +1856,23 @@ mod tests {
     }
 
     #[test]
+    fn vm_flags_retain_resolved_legacy_values_for_boundary_reads() {
+        let f = VmFlags::from_source(&src(&[("CRATONVM_DBG_DEOPT", "enabled")]));
+        assert_eq!(
+            f.legacy_var_os("CRATONVM_DBG_DEOPT"),
+            Some(OsString::from("enabled"))
+        );
+        assert_eq!(f.legacy_var_os("CRATONVM_DBG_AIOOBE"), None);
+    }
+
+    #[test]
+    fn undeclared_process_values_keep_live_standard_environment_semantics() {
+        let key = if cfg!(windows) { "PATH" } else { "HOME" };
+        assert_eq!(runtime_var_os(key), std::env::var_os(key));
+        assert_eq!(runtime_var(key), std::env::var(key));
+    }
+
+    #[test]
     fn empty_source_matches_all_documented_defaults() {
         let f = VmFlags::from_source(&MapSource::empty());
         // Every opt-in flag is off…
@@ -1772,6 +1885,7 @@ mod tests {
         assert!(!f.gc.card_table_only);
         assert!(!f.gc.dbg_a2);
         assert!(!f.jit.shadow_stack);
+        assert!(!f.jit.method_stats);
         // …and every default-ON flag is on.
         assert!(f.gc.old_sweep_jit);
         // Value flags fall back.
@@ -1780,6 +1894,35 @@ mod tests {
         assert_eq!(f.gc.dbg_stale_objref_cycles, 1);
         assert_eq!(f.gc.dbg_watch_cell, 0);
         assert_eq!(f.gc.dbg_blocked_access, BlockedAccessMode::Off);
+        assert!(!f.jit.disable_jit);
+    }
+
+    #[test]
+    fn launcher_override_and_grouped_flags_share_one_resolved_snapshot() {
+        let mut raw = src(&[("CRATONVM_DBG", "jit-method-stats")]);
+        raw.0
+            .extend(MapSource::empty().with("CRATONVM_DISABLE_JIT", "1").0);
+        let f = VmFlags::from_source(&crate::flag_groups::resolve(&raw));
+        assert!(f.jit.disable_jit);
+        assert!(f.jit.method_stats);
+    }
+
+    #[test]
+    fn jit_method_stats_uses_the_grouped_and_legacy_spelling_consistently() {
+        let grouped = src(&[("CRATONVM_DBG", "jit-method-stats")]);
+        let grouped = crate::flag_groups::resolve(&grouped);
+        assert!(VmFlags::from_source(&grouped).jit.method_stats);
+
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_JIT_METHOD_STATS", "1")]))
+                .jit
+                .method_stats
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_DBG_JIT_METHOD_STATS", "0")]))
+                .jit
+                .method_stats
+        );
     }
 
     #[test]

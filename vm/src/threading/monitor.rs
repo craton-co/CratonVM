@@ -151,7 +151,7 @@ pub fn signal_stack_dump_to_waiters() {
 /// Read once and cached so the per-enter check is a single relaxed load.
 pub fn mon_enter_dump_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("CRATONVM_DBG_MONENTER").is_ok())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_MONENTER").is_ok())
 }
 
 // REMOVED (ARCH-2026-07-26): `reclaim_dead_monitors_enabled()` /
@@ -1520,7 +1520,7 @@ impl MonitorTable {
     #[cold]
     fn dbg_monexit_forensics(&self, obj_ref: ObjectRef, tid: ThreadId, mark: u64, arm: &str) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_MONEXIT").is_some()) {
+        if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_MONEXIT").is_some()) {
             return;
         }
         let key = obj_ref.as_ptr() as usize;

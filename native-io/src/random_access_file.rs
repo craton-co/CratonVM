@@ -549,6 +549,8 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::fd_table::FileDescriptorTable;
     use std::io::{Read, Write};

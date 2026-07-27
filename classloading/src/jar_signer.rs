@@ -1948,8 +1948,8 @@ impl TrustStore {
         // property; we read it from the env-var spelling the VM emits
         // when materialising sysprops back to native code.  The matching
         // password sysprop is `javax.net.ssl.trustStorePassword`.
-        if let Ok(p) = std::env::var("JAVAX_NET_SSL_TRUSTSTORE") {
-            let pw = std::env::var("JAVAX_NET_SSL_TRUSTSTOREPASSWORD")
+        if let Ok(p) = cratonvm_types::flags::runtime_var("JAVAX_NET_SSL_TRUSTSTORE") {
+            let pw = cratonvm_types::flags::runtime_var("JAVAX_NET_SSL_TRUSTSTOREPASSWORD")
                 .unwrap_or_else(|_| "changeit".to_string());
             ts.try_load_path(&p, "javax.net.ssl.trustStore", &pw);
         }
@@ -1973,13 +1973,13 @@ impl TrustStore {
         // TrustedCertEntry becomes a trust anchor.  Honour
         // `JAVAX_NET_SSL_TRUSTSTOREPASSWORD` if set; otherwise the JDK
         // default "changeit".
-        if let Some(jh) = std::env::var_os("JAVA_HOME") {
+        if let Some(jh) = cratonvm_types::flags::runtime_var_os("JAVA_HOME") {
             let mut path = std::path::PathBuf::from(jh);
             path.push("lib");
             path.push("security");
             path.push("cacerts");
             if path.exists() {
-                let pw = std::env::var("JAVAX_NET_SSL_TRUSTSTOREPASSWORD")
+                let pw = cratonvm_types::flags::runtime_var("JAVAX_NET_SSL_TRUSTSTOREPASSWORD")
                     .unwrap_or_else(|_| "changeit".to_string());
                 ts.try_load_path(&path.to_string_lossy(), "JDK cacerts", &pw);
             }

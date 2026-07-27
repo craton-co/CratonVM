@@ -52,7 +52,7 @@ fn store() -> &'static RwLock<FxHashMap<u32, usize>> {
 pub fn loader_pinning_enabled() -> bool {
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| {
-        std::env::var("CRATONVM_LOADER_UNLOAD")
+        crate::flags::runtime_var("CRATONVM_LOADER_UNLOAD")
             .map(|v| v != "0")
             .unwrap_or(true)
     })

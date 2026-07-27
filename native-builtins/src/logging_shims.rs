@@ -2788,6 +2788,8 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod logback_construction_registration_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 /// this file.
 ///
 /// Why this matters: every one of these was previously an **uncached**
-/// `std::env::var_os` on the `throw_runtime_error` / `convert_class_not_found`
+/// `cratonvm_types::flags::runtime_var_os` on the `throw_runtime_error` / `convert_class_not_found`
 /// / `throw_linkage_error` entry paths. `throw_runtime_error` alone paid three
 /// of them on *every* VM-raised throw (NPE, CCE, AIOOBE, ISE, IOException, …)
 /// — i.e. ~1.5 µs of pure syscall on Windows before a single useful
@@ -38,7 +38,7 @@ macro_rules! cached_env_flag {
         #[inline]
         fn $name() -> bool {
             static CACHE: OnceLock<bool> = OnceLock::new();
-            *CACHE.get_or_init(|| std::env::var_os($env).is_some())
+            *CACHE.get_or_init(|| cratonvm_types::flags::runtime_var_os($env).is_some())
         }
     };
 }
@@ -49,7 +49,7 @@ macro_rules! cached_env_flag {
 #[inline]
 fn iae_trace_enabled() -> bool {
     static IAE_TRACE: OnceLock<bool> = OnceLock::new();
-    *IAE_TRACE.get_or_init(|| std::env::var("CRATONVM_IAE_TRACE").is_ok())
+    *IAE_TRACE.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_IAE_TRACE").is_ok())
 }
 
 cached_env_flag!(dbg_npe_none, "CRATONVM_DBG_NPE_NONE");
@@ -2013,7 +2013,7 @@ mod tests {
     // Cached debug-flag helpers (throw hot path)
     // -----------------------------------------------------------------------
 
-    /// `throw_runtime_error` used to pay three uncached `std::env::var_os`
+    /// `throw_runtime_error` used to pay three uncached `cratonvm_types::flags::runtime_var_os`
     /// lookups on *every* VM-raised throw, plus one each in
     /// `convert_class_not_found` and `throw_linkage_error`. They are now
     /// process-lifetime memoized. The failure mode a memo introduces is a typo'd
@@ -2032,7 +2032,7 @@ mod tests {
             (dbg_verify_error, "CRATONVM_DBG_VERIFY_ERROR"),
         ];
         for (flag, name) in pairs {
-            let expected = std::env::var_os(name).is_some();
+            let expected = cratonvm_types::flags::runtime_var_os(name).is_some();
             assert_eq!(
                 flag(),
                 expected,
@@ -2042,7 +2042,7 @@ mod tests {
         }
         assert_eq!(
             iae_trace_enabled(),
-            std::env::var("CRATONVM_IAE_TRACE").is_ok()
+            cratonvm_types::flags::runtime_var("CRATONVM_IAE_TRACE").is_ok()
         );
     }
 

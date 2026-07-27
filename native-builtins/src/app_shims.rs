@@ -3,13 +3,10 @@
 
 //! Third-party application-shim registration seams.
 //!
-//! `register_essential_natives` installs, on **every** boot including
-//! `HelloWorld`, several thousand natives that only exist to serve one
-//! third-party library each: BouncyCastle, JBoss/WildFly/XNIO, the JCA
-//! connection pools, ANTLR, ByteBuddy/Mockito, Hibernate. The
-//! [reachability audit] proposed extracting them into
-//! `native-appshim-*` crates and described the boundary as a "clean seam,
-//! one call site each".
+//! The built-ins crate contains compatibility overrides for BouncyCastle,
+//! JBoss/WildFly/XNIO, connection pools, ANTLR, ByteBuddy/Mockito, and
+//! Hibernate. Registering all of them on every boot used memory and made
+//! unrelated programs vulnerable to accidental overrides.
 //!
 //! This module is that seam, made explicit: each family's registrars are
 //! collected behind exactly one `pub fn` so that turning the family off —
@@ -18,92 +15,22 @@
 //! site instead of an archaeology exercise across 12 000 lines of
 //! `register_essential_natives`.
 //!
-//! **Nothing here is conditional and nothing is dropped.** These functions
-//! run unconditionally from `register_essential_natives`, in the same order
-//! and under the same ambient [`NativeKind`] as the call sequence they
-//! replaced, so the registered set is bit-identical to before the grouping.
-//! Grouping is the safe half of the change; see below for why the other half
-//! is not landable yet.
+//! VM bootstrap selects these families from indexed application-classpath
+//! witnesses before bytecode executes. The existence-only probe neither
+//! inflates JAR entries nor loads witness classes. Core JDK registrations
+//! formerly mixed into the datasource, naming, and security packs have
+//! dedicated unconditional registrars, so an absent application pack cannot
+//! remove a platform bridge.
 //!
 //! [reachability audit]: ../../docs/internal/arch-2026-07-26/native-builtins-reachability.md
 //!
-//! # Why these are not registered lazily
+//! # Why selection happens at bootstrap
 //!
-//! Two independent blockers, both outside this crate:
-//!
-//! 1. **The registry is immutable after boot.** `NativeMethodRegistry` is
-//!    held *by value* (`vm/src/vm/realms/native_realm.rs:16`, "immutable
-//!    after construction"), built as a local in `SharedVm::new`
-//!    (`vm/src/vm/vm_init.rs:1006`) and moved into the `Arc<SharedVm>` at
-//!    `vm/src/vm/vm_init.rs:2542`. `register` needs `&mut`
-//!    (`native-api/src/registry.rs:4060`) and no `&mut` exists past that
-//!    move. Late registration is not merely unsound today — it is
-//!    unreachable.
-//!
-//! 2. **A miss is memoized as `Bytecode`, permanently.** For a method that
-//!    *has* real bytecode and whose shim is meant to override it — which is
-//!    what almost every registration below is — `populate_invoke_cache`
-//!    probes the registry once and bakes `CachedInvokeTarget::Bytecode`
-//!    into `thread.invoke_cache` (`vm/src/runtime/interpreter.rs:32451`).
-//!    The three dispatch arms (`interpreter.rs:32625`, `:39811`, `:40656`)
-//!    never re-probe, and no invalidation path is keyed on the registry, so
-//!    a shim registered after that call site first ran would be ignored for
-//!    the life of the thread.
-//!
-//!    Note what *is* sound, so the next reader does not re-derive it:
-//!    [`NativeCallSite`](cratonvm_native_api) memoizes negatives against
-//!    `NativeMethodRegistry::generation()` (`native-api/src/registry.rs:4728`)
-//!    and self-heals; an `ACC_NATIVE` method with no registered callback
-//!    caches nothing at all (`interpreter.rs:32414`) and re-probes every
-//!    call; and `ResolvedMethod::native_target`'s `None`
-//!    (`classloading/src/resolution.rs:122`) falls through to a live
-//!    registry probe at `interpreter.rs:32207`, despite the warning comment
-//!    above the field. The gap is specifically the `Bytecode` verdict.
-//!
-//! # What *is* landable, and what stands in its way
-//!
-//! Deciding at **registration time** — still inside `SharedVm::new`, before
-//! any bytecode has executed — has neither problem: nothing has been
-//! memoized yet, so there is nothing to poison. The classpath is fully
-//! parsed and indexed ~900 lines earlier (`ClassManager::new`,
-//! `vm/src/vm/vm_init.rs:612`), and each JAR carries a decompression-free
-//! `entry_index: FxHashSet<String>` (`classloading/src/class_path.rs:338`),
-//! so "is this library present?" costs one hash probe per classpath entry
-//! and never inflates — it does **not** re-enter the O(num_jars x
-//! zip-probes) rescan that caused the JAXB model-building hang
-//! (`class_manager.rs:1319`, `synthetic_upgrade_absent`).
-//!
-//! The obstacle is only plumbing: `register_essential_natives`
-//! (`crate::register_essential_natives`) takes `&mut NativeMethodRegistry`
-//! and nothing else, so a registrar cannot see the classpath. Making a
-//! family conditional needs a signature widening plus a one-line change at
-//! `vm/src/vm/vm_init.rs:1509` — files this seam deliberately does not own.
-//! [`ShimFamily::witness_resources`] carries the exact probe keys that
-//! change would use.
-//!
-//! # …and why two of the four families still could not be gated
-//!
-//! The audit's "clean seam" claim does not survive checking *which classes*
-//! each family registers into, as opposed to which registrars are reachable.
-//! Two of the four families register natives on **JDK-module** classes:
-//!
-//! | Family | JDK classes it also owns |
-//! |---|---|
-//! | `JBossWildFlyXnio` | `java/security/AccessControlContext`, `javax/security/auth/Subject`, `javax/security/auth/login/LoginContext` (`java.base`), `javax/naming/InitialContext` (`java.naming`) |
-//! | `DataSourcePools` | `javax/sql/DataSource` (`java.sql`) |
-//!
-//! Gating those on "is WildFly on the classpath?" would silently remove
-//! JAAS and JNDI natives from every program that is not WildFly — the
-//! `d8092acb` failure mode reached by a different route. It is not
-//! hypothetical: the H2 suite's `LoginContext` fix lives in
-//! `wildfly_security.rs`, and H2 is not WildFly.
-//!
-//! [`ShimFamily::jdk_entanglements`] records those classes and
-//! [`ShimFamily::is_severable`] reports the verdict, both enforced by the
-//! tests below. Splitting the JDK registrations out of
-//! `wildfly_security` / `wildfly_naming` / `wildfly_datasources_tx` is the
-//! prerequisite for gating those two families; `BouncyCastle` and
-//! `AppIntrinsics` need no such work.
+//! The registry becomes immutable after VM construction and interpreter call
+//! sites memoize bytecode/native dispatch. Late registration would require
+//! synchronized registry mutation plus cache invalidation. Bootstrap
+//! selection avoids both: the registry is complete before any dispatch
+//! decision can be cached.
 //!
 //! # Deliberate non-members
 //!
@@ -124,14 +51,38 @@
 
 use cratonvm_native_api::NativeMethodRegistry;
 
-/// A third-party library family whose natives `register_essential_natives`
-/// installs unconditionally on every boot.
+/// Immutable application compatibility-pack selection made during VM boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShimSelection(u8);
+
+impl ShimSelection {
+    pub const NONE: Self = Self(0);
+    pub const ALL: Self = Self((1 << ShimFamily::ALL.len()) - 1);
+
+    /// Build a selection from existence-only resource probes.
+    pub fn from_resource_probe(mut contains: impl FnMut(&str) -> bool) -> Self {
+        let mut bits = 0;
+        for family in ShimFamily::ALL {
+            if family
+                .witness_resources()
+                .iter()
+                .any(|resource| contains(resource))
+            {
+                bits |= 1 << family.index();
+            }
+        }
+        Self(bits)
+    }
+
+    pub fn includes(self, family: ShimFamily) -> bool {
+        self.0 & (1 << family.index()) != 0
+    }
+}
+
+/// A third-party compatibility family selected during VM bootstrap.
 ///
-/// The metadata on this enum is the input a future conditional call site
-/// needs: what to probe for ([`witness_resources`](Self::witness_resources)),
-/// what the family owns ([`owned_prefixes`](Self::owned_prefixes)), and what
-/// it would take away from everyone else if it were skipped
-/// ([`jdk_entanglements`](Self::jdk_entanglements)).
+/// The metadata defines what to probe for and the namespace the selected pack
+/// is allowed to own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ShimFamily {
     /// ANTLR 4 (incl. Groovy's shaded copy), ByteBuddy, Mockito, Hibernate.
@@ -158,6 +109,15 @@ impl ShimFamily {
         ShimFamily::DataSourcePools,
         ShimFamily::JBossWildFlyXnio,
     ];
+
+    const fn index(self) -> u8 {
+        match self {
+            ShimFamily::AppIntrinsics => 0,
+            ShimFamily::BouncyCastle => 1,
+            ShimFamily::DataSourcePools => 2,
+            ShimFamily::JBossWildFlyXnio => 3,
+        }
+    }
 
     /// Classpath resources whose presence means this family's library is
     /// actually in play.
@@ -201,11 +161,9 @@ impl ShimFamily {
 
     /// Internal-name package prefixes this family registers natives into.
     ///
-    /// Every class the family's registrars touch is either under one of
-    /// these or listed in [`jdk_entanglements`](Self::jdk_entanglements) —
-    /// an invariant the tests enforce, so a registrar that grows a new
-    /// out-of-family target fails loudly instead of silently widening the
-    /// blast radius of a future gating change.
+    /// Every class the family's registrars touch is under one of these
+    /// prefixes. Tests enforce that invariant so a new out-of-family target
+    /// cannot silently widen the pack's ownership.
     pub fn owned_prefixes(self) -> &'static [&'static str] {
         match self {
             ShimFamily::AppIntrinsics => &[
@@ -246,42 +204,17 @@ impl ShimFamily {
         }
     }
 
-    /// JDK-module classes this family *also* registers natives on.
+    /// JDK-module classes owned by this application family.
     ///
-    /// Skipping the family would take these away from every program,
-    /// including ones that have never heard of the library. A non-empty
-    /// list therefore means the family cannot be made conditional until
-    /// these registrations are split out into their own registrar.
-    ///
-    /// Kept exact rather than approximate: the tests assert both that no
-    /// unlisted JDK class leaks in *and* that every entry is still really
-    /// registered, so this list cannot rot in either direction.
+    /// This must remain empty. Platform bridges belong to the unconditional
+    /// core registrars, never to a classpath-selected compatibility pack.
     pub fn jdk_entanglements(self) -> &'static [&'static str] {
-        match self {
-            ShimFamily::AppIntrinsics | ShimFamily::BouncyCastle => &[],
-            // `wildfly_datasources_tx.rs` registers the JDBC `DataSource`
-            // surface itself, not merely WildFly's binding of it.
-            ShimFamily::DataSourcePools => &["javax/sql/DataSource"],
-            // JAAS (`wildfly_security.rs`) and JNDI (`wildfly_naming.rs`).
-            // The H2 suite depends on the `LoginContext` natives; see the
-            // module header.
-            ShimFamily::JBossWildFlyXnio => &[
-                "java/security/AccessControlContext",
-                "javax/naming/InitialContext",
-                "javax/security/auth/Subject",
-                "javax/security/auth/login/LoginContext",
-            ],
-        }
+        &[]
     }
 
-    /// Whether this family can be skipped without removing a native that a
-    /// program outside the family might depend on.
-    ///
-    /// `false` is not a permanent verdict — it means "not until the classes
-    /// in [`jdk_entanglements`](Self::jdk_entanglements) move to their own
-    /// registrar".
+    /// Whether this family can be skipped without removing a platform native.
     pub fn is_severable(self) -> bool {
-        self.jdk_entanglements().is_empty()
+        true
     }
 
     /// Run this family's registrars. Equivalent to calling the matching
@@ -456,9 +389,8 @@ pub fn register_datasource_pool_shims(registry: &mut NativeMethodRegistry) {
 /// XNIO layers.
 ///
 /// This is the largest single family (~48 kLoC of module source) and the
-/// one a `HelloWorld` has the least use for — but see
-/// [`ShimFamily::jdk_entanglements`]: it currently also owns the JAAS and
-/// JNDI natives, so it is not severable as-is.
+/// one a `HelloWorld` has the least use for. JAAS and JNDI are registered
+/// separately and are not part of this pack.
 pub fn register_jboss_wildfly_xnio_shims(registry: &mut NativeMethodRegistry) {
     // --- RA.4 / RA.5: JBoss Modules `module.xml` parser + ResourceRootFactory.
     // We bypass the MXParser path (which relies on NIO CharBuffer internals
@@ -545,6 +477,8 @@ pub fn register_jboss_wildfly_xnio_shims(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeKind;
 
@@ -595,6 +529,18 @@ mod tests {
         classes
     }
 
+    fn registered_keys(family: ShimFamily) -> Vec<(String, String, String)> {
+        let mut registry = probe_registry();
+        family.register(&mut registry);
+        registry
+            .dump_registrations()
+            .into_iter()
+            .map(|(class, method, descriptor, _)| {
+                (class.to_string(), method.to_string(), descriptor.to_string())
+            })
+            .collect()
+    }
+
     #[test]
     fn every_family_registers_something() {
         for family in ShimFamily::ALL {
@@ -606,53 +552,30 @@ mod tests {
         }
     }
 
-    /// The invariant that makes the seam meaningful: a family owns its own
-    /// packages and nothing else, apart from the JDK classes it explicitly
-    /// declares. If a registrar grows a new out-of-family target this fails
-    /// with the class name, instead of silently widening what a future
-    /// conditional call site would remove.
+    /// A selected family owns its own packages and nothing else.
     #[test]
-    fn families_register_only_into_owned_prefixes_or_declared_entanglements() {
+    fn families_register_only_into_owned_prefixes() {
         for family in ShimFamily::ALL {
             let owned = family.owned_prefixes();
-            let declared = family.jdk_entanglements();
             for class in registered_classes(family) {
                 let in_family = owned.iter().any(|p| class.starts_with(p));
-                let declared_jdk = declared.contains(&class.as_str());
                 assert!(
-                    in_family || declared_jdk,
-                    "{family:?} registers `{class}`, which is neither under one of \
-                     its owned prefixes {owned:?} nor a declared JDK entanglement. \
-                     Either add the prefix (if the family genuinely grew) or add the \
-                     class to jdk_entanglements() (if it is a JDK bridge that blocks \
-                     conditional registration)."
+                    in_family,
+                    "{family:?} registers `{class}` outside its owned prefixes \
+                     {owned:?}; platform bridges must use a core registrar"
                 );
             }
         }
     }
 
-    /// The list must not rot in the other direction either: a stale
-    /// entanglement entry would make a family look unseverable forever.
     #[test]
-    fn declared_entanglements_are_all_actually_registered() {
+    fn application_families_have_no_jdk_entanglements() {
         for family in ShimFamily::ALL {
-            let classes = registered_classes(family);
-            for declared in family.jdk_entanglements() {
-                assert!(
-                    classes.iter().any(|c| c == declared),
-                    "{family:?} declares `{declared}` as a JDK entanglement but no \
-                     longer registers it — drop it from jdk_entanglements() so the \
-                     family can be gated."
-                );
-            }
+            assert!(family.jdk_entanglements().is_empty(), "{family:?}");
         }
     }
 
-    /// Pins the actual finding: two of the four families are blocked, and
-    /// the reason is JDK-namespace registrations, not the `NativeKind` tag.
-    /// If a later change splits JAAS/JNDI out of `wildfly_security` /
-    /// `wildfly_naming`, this test is the one that says "you may now gate
-    /// this family".
+    /// The declared seam must agree with the classes each pack registers.
     #[test]
     fn severability_matches_measured_jdk_entanglement() {
         for family in ShimFamily::ALL {
@@ -665,8 +588,59 @@ mod tests {
         }
         assert!(ShimFamily::AppIntrinsics.is_severable());
         assert!(ShimFamily::BouncyCastle.is_severable());
-        assert!(!ShimFamily::DataSourcePools.is_severable());
-        assert!(!ShimFamily::JBossWildFlyXnio.is_severable());
+        assert!(ShimFamily::DataSourcePools.is_severable());
+        assert!(ShimFamily::JBossWildFlyXnio.is_severable());
+    }
+
+    #[test]
+    fn witness_selection_is_family_local() {
+        let selected = ShimSelection::from_resource_probe(|resource| {
+            resource == "org/bouncycastle/crypto/engines/AESEngine.class"
+                || resource == "org/xnio/OptionMap.class"
+        });
+        assert!(!selected.includes(ShimFamily::AppIntrinsics));
+        assert!(selected.includes(ShimFamily::BouncyCastle));
+        assert!(!selected.includes(ShimFamily::DataSourcePools));
+        assert!(selected.includes(ShimFamily::JBossWildFlyXnio));
+        assert_eq!(ShimSelection::NONE.0, 0);
+        for family in ShimFamily::ALL {
+            assert!(ShimSelection::ALL.includes(family));
+        }
+    }
+
+    #[test]
+    fn no_application_packs_keeps_jdk_entanglements_registered() {
+        let mut registry = probe_registry();
+        crate::register_essential_natives_with_shims(&mut registry, ShimSelection::NONE);
+        let registrations: std::collections::HashSet<(String, String, String)> = registry
+            .dump_registrations()
+            .into_iter()
+            .map(|(class, method, descriptor, _)| {
+                (class.to_string(), method.to_string(), descriptor.to_string())
+            })
+            .collect();
+
+        for jdk_class in [
+            "java/security/AccessControlContext",
+            "javax/naming/InitialContext",
+            "javax/security/auth/Subject",
+            "javax/security/auth/login/LoginContext",
+            "javax/sql/DataSource",
+        ] {
+            assert!(
+                registrations.iter().any(|(class, _, _)| class == jdk_class),
+                "core JDK bridge {jdk_class} disappeared with application packs disabled"
+            );
+        }
+        let mut leaks = Vec::new();
+        for family in ShimFamily::ALL {
+            for key in registered_keys(family) {
+                if registrations.contains(&key) {
+                    leaks.push(format!("{family:?}:{key:?}"));
+                }
+            }
+        }
+        assert!(leaks.is_empty(), "application pack classes leaked into core: {leaks:?}");
     }
 
     /// `NativeKind` is ambient (`current_category` persists across

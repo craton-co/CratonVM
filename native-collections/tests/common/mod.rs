@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use cratonvm_native_api::{
     ffi::UpcallEntry, AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata,
-    NativeContext, NativeMethodRegistry, StackTraceEntry,
+    NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+    NativeInvokeAccess, NativeMethodRegistry, NativeSystemAccess, NativeThreadAccess,
+    StackTraceEntry,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
@@ -237,7 +239,7 @@ impl MockCtx {
     /// harness (task #13) where the harness just needs distinct
     /// `ObjectRef`s on which to exercise identity-hash stability.
     pub fn alloc_object_simple(&mut self, class_id: u32) -> ObjectRef {
-        <Self as NativeContext>::alloc_object(self, ClassId::new(class_id), 0)
+        <Self as NativeHeapAccess>::alloc_object(self, ClassId::new(class_id), 0)
     }
 
     pub fn set_object_class_id_for_test(&mut self, obj: ObjectRef, new_class_id: ClassId) {
@@ -327,7 +329,8 @@ impl MockCtx {
     }
 }
 
-impl NativeContext for MockCtx {
+impl cratonvm_native_api::NativeClassAccess for MockCtx {
+
     // ------------------------------------------------------------------
     // Class loading / dispatch — synthetic class registry only.
     // ------------------------------------------------------------------
@@ -336,14 +339,178 @@ impl NativeContext for MockCtx {
         Ok(None)
     }
 
-    fn new_object(&mut self, class_name: &str) -> MethodCallResult {
-        let cid = self.ensure_class_initialized(class_name)?;
-        let obj = self.alloc_entry(HeapEntry::Object {
-            class_id: cid,
-            fields: vec![Value::Object(None); 4],
-        });
-        Ok(Some(Value::Object(Some(obj))))
+    fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
+        self.class_names.get(&class_id.as_u32()).cloned()
     }
+
+    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
+        match self.entry_index(obj) {
+            Some(idx) => match &self.heap_ref()[idx] {
+                HeapEntry::Object { class_id, .. } => *class_id,
+                HeapEntry::Array { .. } => ClassId::new(0),
+            },
+            None => ClassId::new(0),
+        }
+    }
+    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
+        false
+    }
+
+    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
+        if let Some(&id) = self.name_to_id.get(name) {
+            return Ok(ClassId::new(id));
+        }
+        let id = self.next_class_id;
+        self.next_class_id += 1;
+        self.class_names.insert(id, name.to_string());
+        self.name_to_id.insert(name.to_string(), id);
+        Ok(ClassId::new(id))
+    }
+
+    fn is_subclass(&self, c: ClassId, p: ClassId) -> bool {
+        c == p
+    }
+    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
+        None
+    }
+    fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
+        self.name_to_id.get(name).copied().map(ClassId::new)
+    }
+    fn loader_id_of_class(&self, _c: ClassId) -> i32 {
+        2
+    }
+    fn is_record_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn is_sealed_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
+        Vec::new()
+    }
+    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
+        Vec::new()
+    }
+    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.class_interfaces.get())
+                .get(&class_id.as_u32())
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+    fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.lambda_functional_interfaces.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
+    }
+    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.lambda_proxy_hosts.get())
+                .get(&class_id.as_u32())
+                .cloned()
+        }
+    }
+    fn class_access_flags(&self, _c: ClassId) -> u16 {
+        0
+    }
+    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
+        let name_obj = self.create_string(name);
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(0),
+            fields: vec![Value::Int(0), Value::Object(Some(name_obj))],
+        })
+    }
+
+    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+    fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
+        Vec::new()
+    }
+    fn method_parameter_annotations(
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Vec<Vec<AnnotationData>> {
+        Vec::new()
+    }
+    fn class_signature(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
+        None
+    }
+    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
+        None
+    }
+    fn method_annotation_default(
+        &self,
+        _c: ClassId,
+        _m: &str,
+        _d: &str,
+    ) -> Option<AnnotationElementValue> {
+        None
+    }
+
+    fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
+        None
+    }
+    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
+        None
+    }
+    fn list_application_class_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn register_dynamic_classpath(&mut self, _p: &[String]) {}
+    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
+        None
+    }
+    fn define_class_with_loader(&mut self, _n: &str, _b: &[u8], _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
+        None
+    }
+    fn allocate_loader_id(&mut self) -> u32 {
+        0
+    }
+
+    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
+        true
+    }
+    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+        true
+    }
+    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
+        true
+    }
+    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
+        true
+    }
+    fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
+
 
     fn invoke(&mut self, class: &str, method: &str, _d: &str, a: &[Value]) -> MethodCallResult {
         // Just enough of the JDK static boxers for the natives that
@@ -389,6 +556,91 @@ impl NativeContext for MockCtx {
         Ok(None)
     }
 
+    fn invoke_virtual(&mut self, r: ObjectRef, m: &str, d: &str, a: &[Value]) -> MethodCallResult {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.invoke_virtual_log.get()).push((
+                r.as_ptr() as usize,
+                m.to_string(),
+                d.to_string(),
+                a.to_vec(),
+            ));
+        }
+        if m == "compare"
+            && d == "(Ljava/lang/Object;Ljava/lang/Object;)I"
+            && self.class_name_of_id(self.class_id_of_object(r)).as_deref()
+                == Some("test/LiquibaseTieComparator")
+        {
+            let order_of = |ctx: &MockCtx, v: Value| -> i32 {
+                match v {
+                    Value::Object(Some(o)) => match ctx.get_field(o, 0) {
+                        Value::Int(order) => order,
+                        _ => 0,
+                    },
+                    _ => 0,
+                }
+            };
+            let left = a.first().copied().unwrap_or(Value::Object(None));
+            let right = a.get(1).copied().unwrap_or(Value::Object(None));
+            let cmp = order_of(self, left).cmp(&order_of(self, right)) as i32;
+            return Ok(Some(Value::Int(if cmp == 0 { 1 } else { cmp })));
+        }
+        match (m, d) {
+            ("complete", "(Ljava/lang/Object;)Z") => {
+                let val = a.first().copied().unwrap_or(Value::Object(None));
+                let stored = if matches!(val, Value::Object(None)) {
+                    let cid = self
+                        .ensure_class_initialized(
+                            "java/util/concurrent/CompletableFuture$AltResult",
+                        )
+                        .unwrap();
+                    let alt = self.alloc_object(cid, 1);
+                    self.set_field(alt, 0, Value::Object(None));
+                    Value::Object(Some(alt))
+                } else {
+                    val
+                };
+                self.set_field(r, 0, stored);
+                return Ok(Some(Value::Int(1)));
+            }
+            ("obtrudeException", "(Ljava/lang/Throwable;)V") => {
+                let exc = a.first().copied().unwrap_or(Value::Object(None));
+                let cid = self
+                    .ensure_class_initialized("java/util/concurrent/CompletableFuture$AltResult")
+                    .unwrap();
+                let alt = self.alloc_object(cid, 1);
+                self.set_field(alt, 0, exc);
+                self.set_field(r, 0, Value::Object(Some(alt)));
+                return Ok(None);
+            }
+            ("postComplete", "()V") => return Ok(None),
+            _ => {}
+        }
+        let slot = unsafe { &mut *self.invoke_virtual_result.get() };
+        let result = if let Some(r) = slot.take() {
+            r
+        } else {
+            Ok(None)
+        };
+        if unsafe { *self.relocate_pins_on_invoke.get() } {
+            self.relocate_native_pins();
+        }
+        result
+    }
+}
+
+impl cratonvm_native_api::NativeHeapAccess for MockCtx {
+
+
+    fn new_object(&mut self, class_name: &str) -> MethodCallResult {
+        let cid = self.ensure_class_initialized(class_name)?;
+        let obj = self.alloc_entry(HeapEntry::Object {
+            class_id: cid,
+            fields: vec![Value::Object(None); 4],
+        });
+        Ok(Some(Value::Object(Some(obj))))
+    }
+
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
         let k = obj.as_ptr() as usize;
         // SAFETY: single-threaded test code.
@@ -401,29 +653,6 @@ impl NativeContext for MockCtx {
         *counter = counter.wrapping_add(1);
         map.insert(k, h);
         h
-    }
-
-    fn record_printed_value(&mut self, _v: Value) {}
-
-    fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
-        self.class_names.get(&class_id.as_u32()).cloned()
-    }
-
-    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
-        match self.entry_index(obj) {
-            Some(idx) => match &self.heap_ref()[idx] {
-                HeapEntry::Object { class_id, .. } => *class_id,
-                HeapEntry::Array { .. } => ClassId::new(0),
-            },
-            None => ClassId::new(0),
-        }
-    }
-
-    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
-        Vec::new()
-    }
-    fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
-        None
     }
 
     // ------------------------------------------------------------------
@@ -497,9 +726,6 @@ impl NativeContext for MockCtx {
             ("java/util/ArrayList$Itr", "this$0") => Some(3),
             _ => None,
         }
-    }
-    fn method_exists(&self, _c: &str, _m: &str, _d: &str) -> bool {
-        false
     }
 
     // ------------------------------------------------------------------
@@ -614,66 +840,11 @@ impl NativeContext for MockCtx {
         })
     }
 
-    fn record_printed_line(&mut self, _t: String) {}
-    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
-        None
-    }
-    fn get_system_property(&self, _k: &str) -> Option<String> {
-        None
-    }
-    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
-        None
-    }
-
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Object {
             class_id,
             fields: vec![Value::Object(None); num_fields],
         })
-    }
-
-    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
-        if let Some(&id) = self.name_to_id.get(name) {
-            return Ok(ClassId::new(id));
-        }
-        let id = self.next_class_id;
-        self.next_class_id += 1;
-        self.class_names.insert(id, name.to_string());
-        self.name_to_id.insert(name.to_string(), id);
-        Ok(ClassId::new(id))
-    }
-
-    fn ensure_synthetic_class(&mut self, name: &str, _num_fields: usize) -> ClassId {
-        self.ensure_class_initialized(name)
-            .unwrap_or(ClassId::new(0))
-    }
-
-    fn is_subclass(&self, c: ClassId, p: ClassId) -> bool {
-        c == p
-    }
-    fn superclass_of(&self, _c: ClassId) -> Option<ClassId> {
-        None
-    }
-    fn is_interface_class(&self, _c: ClassId) -> bool {
-        false
-    }
-    fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
-        self.name_to_id.get(name).copied().map(ClassId::new)
-    }
-    fn loader_id_of_class(&self, _c: ClassId) -> i32 {
-        2
-    }
-    fn is_record_class(&self, _c: ClassId) -> bool {
-        false
-    }
-    fn record_components(&self, _c: ClassId) -> Vec<(String, String)> {
-        Vec::new()
-    }
-    fn is_sealed_class(&self, _c: ClassId) -> bool {
-        false
-    }
-    fn permitted_subclasses(&self, _c: ClassId) -> Vec<String> {
-        Vec::new()
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
@@ -685,6 +856,67 @@ impl NativeContext for MockCtx {
             None => 0,
         }
     }
+
+    fn heap_allocated_bytes(&self) -> usize {
+        0
+    }
+
+    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        self.get_field(obj, index)
+    }
+    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        self.set_field(obj, index, value)
+    }
+    fn compare_and_swap_field(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        expected: Value,
+        new_val: Value,
+    ) -> bool {
+        let current = self.get_field(obj, index);
+        if current == expected {
+            self.set_field(obj, index, new_val);
+            true
+        } else {
+            false
+        }
+    }
+    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
+        let cid = self.ensure_class_initialized(class_name).ok()?;
+        Some(self.alloc_object(cid, 4))
+    }
+
+    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        // SAFETY: single-threaded test code.
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        let idx = roots.len();
+        roots.push(obj);
+        idx
+    }
+
+    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (&*self.native_pin_roots.get())
+                .get(handle)
+                .copied()
+                .unwrap_or(fallback)
+        }
+    }
+
+    fn unpin_native_roots(&mut self, base: usize) {
+        // SAFETY: single-threaded test code.
+        let roots = unsafe { &mut *self.native_pin_roots.get() };
+        if base < roots.len() {
+            roots.truncate(base);
+        }
+    }
+    fn discover_reference(&mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>) {}
+}
+
+impl cratonvm_native_api::NativeThreadAccess for MockCtx {
+
 
     // ------------------------------------------------------------------
     // Threading — single-threaded stubs.
@@ -727,230 +959,8 @@ impl NativeContext for MockCtx {
         Vec::new()
     }
 
-    fn heap_allocated_bytes(&self) -> usize {
-        0
-    }
-    fn loaded_class_count(&self) -> usize {
-        0
-    }
-    fn gc_collection_count(&self) -> u64 {
-        0
-    }
-    fn force_gc(&mut self) {}
-
-    fn declared_fields(&self, _c: ClassId) -> Vec<FieldMetadata> {
-        Vec::new()
-    }
-    fn declared_methods(&self, _c: ClassId) -> Vec<MethodMetadata> {
-        Vec::new()
-    }
-    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.class_interfaces.get())
-                .get(&class_id.as_u32())
-                .cloned()
-                .unwrap_or_default()
-        }
-    }
-    fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.lambda_functional_interfaces.get())
-                .get(&class_id.as_u32())
-                .cloned()
-        }
-    }
-    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.lambda_proxy_hosts.get())
-                .get(&class_id.as_u32())
-                .cloned()
-        }
-    }
-    fn class_access_flags(&self, _c: ClassId) -> u16 {
-        0
-    }
-    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
-        Value::Int(0)
-    }
-    fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
-    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
-        let name_obj = self.create_string(name);
-        self.alloc_entry(HeapEntry::Object {
-            class_id: ClassId::new(0),
-            fields: vec![Value::Int(0), Value::Object(Some(name_obj))],
-        })
-    }
-
-    fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
-        use std::sync::OnceLock;
-        static T: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
-        T.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
-    }
-
-    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
-        self.get_field(obj, index)
-    }
-    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
-        self.set_field(obj, index, value)
-    }
-    fn compare_and_swap_field(
-        &mut self,
-        obj: ObjectRef,
-        index: usize,
-        expected: Value,
-        new_val: Value,
-    ) -> bool {
-        let current = self.get_field(obj, index);
-        if current == expected {
-            self.set_field(obj, index, new_val);
-            true
-        } else {
-            false
-        }
-    }
-
     fn park(&mut self, _t: Option<std::time::Duration>) {}
     fn unpark(&self, _o: ObjectRef) {}
-    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
-        let cid = self.ensure_class_initialized(class_name).ok()?;
-        Some(self.alloc_object(cid, 4))
-    }
-
-    fn class_annotations(&self, _c: ClassId) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-    fn method_annotations(&self, _c: ClassId, _m: &str, _d: &str) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-    fn field_annotations(&self, _c: ClassId, _f: &str) -> Vec<AnnotationData> {
-        Vec::new()
-    }
-    fn method_parameter_annotations(
-        &self,
-        _c: ClassId,
-        _m: &str,
-        _d: &str,
-    ) -> Vec<Vec<AnnotationData>> {
-        Vec::new()
-    }
-    fn class_signature(&self, _c: ClassId) -> Option<String> {
-        None
-    }
-    fn method_signature(&self, _c: ClassId, _m: &str, _d: &str) -> Option<String> {
-        None
-    }
-    fn field_signature(&self, _c: ClassId, _f: &str) -> Option<String> {
-        None
-    }
-    fn method_annotation_default(
-        &self,
-        _c: ClassId,
-        _m: &str,
-        _d: &str,
-    ) -> Option<AnnotationElementValue> {
-        None
-    }
-
-    fn invoke_virtual(&mut self, r: ObjectRef, m: &str, d: &str, a: &[Value]) -> MethodCallResult {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (*self.invoke_virtual_log.get()).push((
-                r.as_ptr() as usize,
-                m.to_string(),
-                d.to_string(),
-                a.to_vec(),
-            ));
-        }
-        if m == "compare"
-            && d == "(Ljava/lang/Object;Ljava/lang/Object;)I"
-            && self.class_name_of_id(self.class_id_of_object(r)).as_deref()
-                == Some("test/LiquibaseTieComparator")
-        {
-            let order_of = |ctx: &MockCtx, v: Value| -> i32 {
-                match v {
-                    Value::Object(Some(o)) => match ctx.get_field(o, 0) {
-                        Value::Int(order) => order,
-                        _ => 0,
-                    },
-                    _ => 0,
-                }
-            };
-            let left = a.first().copied().unwrap_or(Value::Object(None));
-            let right = a.get(1).copied().unwrap_or(Value::Object(None));
-            let cmp = order_of(self, left).cmp(&order_of(self, right)) as i32;
-            return Ok(Some(Value::Int(if cmp == 0 { 1 } else { cmp })));
-        }
-        match (m, d) {
-            ("complete", "(Ljava/lang/Object;)Z") => {
-                let val = a.first().copied().unwrap_or(Value::Object(None));
-                let stored = if matches!(val, Value::Object(None)) {
-                    let cid = self
-                        .ensure_class_initialized(
-                            "java/util/concurrent/CompletableFuture$AltResult",
-                        )
-                        .unwrap();
-                    let alt = self.alloc_object(cid, 1);
-                    self.set_field(alt, 0, Value::Object(None));
-                    Value::Object(Some(alt))
-                } else {
-                    val
-                };
-                self.set_field(r, 0, stored);
-                return Ok(Some(Value::Int(1)));
-            }
-            ("obtrudeException", "(Ljava/lang/Throwable;)V") => {
-                let exc = a.first().copied().unwrap_or(Value::Object(None));
-                let cid = self
-                    .ensure_class_initialized("java/util/concurrent/CompletableFuture$AltResult")
-                    .unwrap();
-                let alt = self.alloc_object(cid, 1);
-                self.set_field(alt, 0, exc);
-                self.set_field(r, 0, Value::Object(Some(alt)));
-                return Ok(None);
-            }
-            ("postComplete", "()V") => return Ok(None),
-            _ => {}
-        }
-        let slot = unsafe { &mut *self.invoke_virtual_result.get() };
-        let result = if let Some(r) = slot.take() {
-            r
-        } else {
-            Ok(None)
-        };
-        if unsafe { *self.relocate_pins_on_invoke.get() } {
-            self.relocate_native_pins();
-        }
-        result
-    }
-
-    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
-        // SAFETY: single-threaded test code.
-        let roots = unsafe { &mut *self.native_pin_roots.get() };
-        let idx = roots.len();
-        roots.push(obj);
-        idx
-    }
-
-    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
-        // SAFETY: single-threaded test code.
-        unsafe {
-            (&*self.native_pin_roots.get())
-                .get(handle)
-                .copied()
-                .unwrap_or(fallback)
-        }
-    }
-
-    fn unpin_native_roots(&mut self, base: usize) {
-        // SAFETY: single-threaded test code.
-        let roots = unsafe { &mut *self.native_pin_roots.get() };
-        if base < roots.len() {
-            roots.truncate(base);
-        }
-    }
 
     fn get_scoped_value(&self, _k: u64) -> Option<Value> {
         None
@@ -959,6 +969,63 @@ impl NativeContext for MockCtx {
     fn pop_scoped_value(&mut self) {}
     fn scoped_value_depth(&self) -> usize {
         0
+    }
+}
+
+impl cratonvm_native_api::NativeExceptionAccess for MockCtx {
+
+
+    fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
+        Vec::new()
+    }
+    fn get_stack_trace(&self, _h: i32) -> Option<Vec<StackTraceEntry>> {
+        None
+    }
+}
+
+impl cratonvm_native_api::NativeGpuAccess for MockCtx {
+
+}
+
+impl cratonvm_native_api::NativeSystemAccess for MockCtx {
+
+
+    fn record_printed_value(&mut self, _v: Value) {}
+
+    fn record_printed_line(&mut self, _t: String) {}
+    fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
+        None
+    }
+    fn get_system_property(&self, _k: &str) -> Option<String> {
+        None
+    }
+    fn set_system_property(&mut self, _k: &str, _v: &str) -> Option<String> {
+        None
+    }
+
+    fn ensure_synthetic_class(&mut self, name: &str, _num_fields: usize) -> ClassId {
+        self.ensure_class_initialized(name)
+            .unwrap_or(ClassId::new(0))
+    }
+    fn is_interface_class(&self, _c: ClassId) -> bool {
+        false
+    }
+    fn loaded_class_count(&self) -> usize {
+        0
+    }
+    fn gc_collection_count(&self) -> u64 {
+        0
+    }
+    fn force_gc(&mut self) {}
+    fn get_static_field(&self, _c: ClassId, _i: usize) -> Value {
+        Value::Int(0)
+    }
+    fn set_static_field(&mut self, _c: ClassId, _i: usize, _v: Value) {}
+
+    fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
+        use std::sync::OnceLock;
+        static T: OnceLock<cratonvm_native_api::fd_table::FileDescriptorTable> = OnceLock::new();
+        T.get_or_init(cratonvm_native_api::fd_table::FileDescriptorTable::new)
     }
 
     fn allocate_native_memory(&mut self, _s: usize, _a: usize) -> Option<(i64, *mut u8)> {
@@ -977,47 +1044,10 @@ impl NativeContext for MockCtx {
     fn get_upcall_info(&self, _s: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
         None
     }
-
-    fn module_name_of_class(&self, _c: ClassId) -> Option<String> {
-        None
-    }
-    fn find_resource(&self, _n: &str) -> Option<Vec<u8>> {
-        None
-    }
-    fn list_application_class_names(&self) -> Vec<String> {
-        Vec::new()
-    }
-    fn register_dynamic_classpath(&mut self, _p: &[String]) {}
-    fn define_class_from_bytes(&mut self, _n: &str, _b: &[u8]) -> Option<ClassId> {
-        None
-    }
-    fn define_class_with_loader(&mut self, _n: &str, _b: &[u8], _l: u32) -> Option<ClassId> {
-        None
-    }
-    fn class_id_by_name_and_loader(&self, _n: &str, _l: u32) -> Option<ClassId> {
-        None
-    }
-    fn allocate_loader_id(&mut self) -> u32 {
-        0
-    }
-    fn discover_reference(&mut self, _t: u8, _r: ObjectRef, _f: ObjectRef, _q: Option<ObjectRef>) {}
-
-    fn is_package_exported_unqualified(&self, _m: &str, _p: &str) -> bool {
-        true
-    }
-    fn is_package_exported_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-        true
-    }
-    fn is_package_open_unqualified(&self, _m: &str, _p: &str) -> bool {
-        true
-    }
-    fn is_package_open_to(&self, _m: &str, _p: &str, _t: &str) -> bool {
-        true
-    }
-    fn check_deep_reflection_access(&self, _a: ClassId, _t: ClassId) -> Result<(), String> {
-        Ok(())
-    }
 }
+
+
+
 
 // ------------------------------------------------------------------
 // Test helpers — register the natives once per test, then dispatch.

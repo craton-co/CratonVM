@@ -1520,6 +1520,8 @@ fn hostname_string() -> String {
 
 #[cfg(test)]
 mod hostname_string_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     #[test]
     fn hostname_string_agrees_with_the_crate_wide_resolver() {
         // Two registrations of `InetAddress.getLocalHost()` exist (this phase-E
@@ -12117,6 +12119,8 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::NativeContext;

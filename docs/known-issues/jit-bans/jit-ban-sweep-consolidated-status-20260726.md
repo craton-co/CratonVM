@@ -35,7 +35,7 @@ retain full evidence/repro details; this file is the summary.
 ## Already moot / dead-code (no action needed, confirmed this session)
 
 - **NETTY.1** — already lifted 2026-06-11, predates this week; no active `io/netty/` ban remains, only historical archetype references.
-- **FELIX.1**, **BC-ASN1.1** — live inside `is_known_miscompile()`, which is entirely dead code by default (gated behind `callee_saved_gpr_local_homes_enabled()`, defaults false, no CLI wiring). ~20-30 other historically-catalogued bans fall in this same bucket.
+- **FELIX.1**, **BC-ASN1.1**, **SB-17** (`groovy/lang/GroovyClassLoader.doParseClass`) — live inside `is_known_miscompile()`, which is entirely dead code by default (gated behind `callee_saved_gpr_local_homes_enabled()`, defaults false, no CLI wiring). Confirmed via function-boundary grep: `is_known_miscompile` spans lines 2217-3171, SB-17 sits at line 3096, well inside. ~20-30 other historically-catalogued bans fall in this same bucket. (A later Stop-hook feedback round cited this as "KC26-GROOVY" -- no such literal name exists anywhere in the repo; SB-17 is the real ban that citation was garbling, and it needed no further action beyond this dead-code confirmation.)
 
 ## Kept — confirmed still needed, with real evidence
 
@@ -53,6 +53,7 @@ retain full evidence/repro details; this file is the summary.
 
 - **SPB.9b's other 2 sub-bans** (`org/springframework/boot/loader/`, `org/springframework/web/reactive/`+`org/springframework/boot/web/reactive/`) — need the real `insurance-backend` app's JarLauncher/WebFlux-boot scaffold, not just the isolated Spring library classes tested this session.
 - **SPB.x named fixture apps** (SportMe-master, ms-course-youtube, insurance-backend, eureka-server, msyt-admin, cglib_probe) — searched at full filesystem depth by content/purpose (not just name), zero matches, independently confirmed by a concurrent session too.
+- **SPB.6** (`com/netflix/discovery/` -- Netflix Eureka `DiscoveryClient`) -- provisional blanket ban, Session 113 r1, never re-verified. Confirmed genuinely fixture-blocked: `find / -iname '*eureka-client*.jar' -o -iname '*eureka-core*.jar'` across the entire host returns zero matches (no Maven/Gradle cache entry, no vendored jar, no source checkout) -- consistent with the eureka-server named-fixture-app search above coming up empty too. (A later Stop-hook feedback round cited this as "KC26-SPB6" -- no such literal name exists; SPB.6 is the real ban, and it is Eureka-related, not Keycloak-related -- the "KC26" prefix in that citation does not correspond to anything in the actual ban name or comment.)
 
 ## Tested, hypothesis refuted (no action, but investigated properly)
 

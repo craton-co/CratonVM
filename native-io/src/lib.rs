@@ -17527,6 +17527,8 @@ fn native_sel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
 #[cfg(test)]
 mod io_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::{confine_test_lock, MockNativeContext};
     use cratonvm_native_api::fd_table::FileDescriptorTable;
@@ -19283,6 +19285,8 @@ mod io_tests {
 // ===========================================================================
 #[cfg(test)]
 mod t2_mutf8_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     // ---- Encoder (writeUTF payload) ----
@@ -19428,6 +19432,8 @@ mod t2_mutf8_tests {
 
 #[cfg(test)]
 mod ra2_utf8_decoder_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::decode_utf8_into_chars;
 
     fn to_string(chars: &[u16]) -> String {
@@ -19552,6 +19558,8 @@ mod ra2_utf8_decoder_tests {
 // ===========================================================================
 #[cfg(test)]
 mod ra3_reader_read_charbuffer_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
 
@@ -19703,6 +19711,8 @@ mod ra3_reader_read_charbuffer_tests {
 // ===========================================================================
 #[cfg(test)]
 mod bais_layout_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
 
@@ -19986,6 +19996,8 @@ mod bais_layout_tests {
 // ===========================================================================
 #[cfg(test)]
 mod buffer_bounds_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
 
@@ -20315,6 +20327,8 @@ mod files_bulk_transfer_tests {
     //! `write_byte_array_from` / `read_byte_array_into` impls, so these
     //! tests verify the call-site wiring (offsets, length, byte fidelity)
     //! rather than the memcpy override itself.
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::{confine_test_lock, MockNativeContext};
 
@@ -20436,6 +20450,8 @@ mod files_bulk_transfer_tests {
 // ===========================================================================
 #[cfg(test)]
 mod abs_path_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
 

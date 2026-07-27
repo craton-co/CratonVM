@@ -36,7 +36,7 @@ static WRITE_COUNTS: Mutex<Option<HashMap<(usize, usize), u32>>> = Mutex::new(No
 
 #[inline]
 fn enabled() -> bool {
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some())
+    *ENABLED.get_or_init(|| crate::flags::runtime_var_os("CRATONVM_DBG_FIELD_WATCH").is_some())
 }
 
 /// Register `obj` for write tracking. Idempotent. No-op unless

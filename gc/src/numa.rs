@@ -385,7 +385,7 @@ fn detect_windows() -> Option<NumaTopology> {
     // TODO: when the `windows` crate becomes a dependency of `gc/`, switch
     // to `GetLogicalProcessorInformationEx(RelationNumaNode, ...)` here.
     // For now: single node sized from NUMBER_OF_PROCESSORS, with all CPUs.
-    let n = std::env::var("NUMBER_OF_PROCESSORS")
+    let n = cratonvm_types::flags::runtime_var("NUMBER_OF_PROCESSORS")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or_else(available_cpu_count)

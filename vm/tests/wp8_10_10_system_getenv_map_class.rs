@@ -9,7 +9,7 @@
 //! delegate to the backing map, while also matching libraries such as System
 //! Rules that reflect on `System.getenv().getClass().getDeclaredField("m")`.
 
-use cratonvm_native_api::NativeContext;
+use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess, NativeInvokeAccess};
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::types::Value;
 use cratonvm_vm::vm::{NativeContextImpl, Vm};

@@ -288,6 +288,8 @@ pub(crate) fn sphincs_hash_2n_n(in64: &[u8; 64]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// RFC 8439 §2.3.2 ChaCha20 block-function known-answer test. The input

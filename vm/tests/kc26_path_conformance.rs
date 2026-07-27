@@ -30,7 +30,7 @@ fn read_ws(rel: &str) -> String {
 
 #[test]
 fn kc26_path_get_file_system_registered() {
-    let src = read_ws("native-builtins/src/phases_late.rs");
+    let src = read_ws("native-builtins/src/phases_late/nio_file.rs");
     assert!(
         src.contains("\"getFileSystem\"") && src.contains("()Ljava/nio/file/FileSystem;"),
         "[KC26.1] Path.getFileSystem() must be registered"
@@ -44,7 +44,7 @@ fn kc26_path_get_file_system_registered() {
 
 #[test]
 fn kc26_path_resolve_registered() {
-    let src = read_ws("native-builtins/src/phases_late.rs");
+    let src = read_ws("native-builtins/src/phases_late/nio_file.rs");
     let has_resolve_string =
         src.contains("\"resolve\"") && src.contains("(Ljava/lang/String;)Ljava/nio/file/Path;");
     let has_resolve_path =
@@ -66,7 +66,7 @@ fn kc26_path_resolve_registered() {
 
 #[test]
 fn kc26_path_navigation_methods_registered() {
-    let src = read_ws("native-builtins/src/phases_late.rs");
+    let src = read_ws("native-builtins/src/phases_late/nio_file.rs");
 
     let methods = &[
         ("getParent", "()Ljava/nio/file/Path;"),
@@ -95,7 +95,7 @@ fn kc26_path_navigation_methods_registered() {
 
 #[test]
 fn kc26_path_object_methods_registered() {
-    let src = read_ws("native-builtins/src/phases_late.rs");
+    let src = read_ws("native-builtins/src/phases_late/nio_file.rs");
 
     // toString, equals, hashCode should be registered for path
     let path_section_start = src.find("let path = \"java/nio/file/Path\"").unwrap_or(0);
@@ -122,7 +122,7 @@ fn kc26_path_object_methods_registered() {
 
 #[test]
 fn kc26_filesystems_get_default_registered() {
-    let src = read_ws("native-builtins/src/phases_late.rs");
+    let src = read_ws("native-builtins/src/phases_late/nio_file.rs");
     assert!(
         src.contains("\"java/nio/file/FileSystems\"") && src.contains("\"getDefault\""),
         "[KC26.5] FileSystems.getDefault() must be registered"
@@ -136,7 +136,7 @@ fn kc26_filesystems_get_default_registered() {
 
 #[test]
 fn kc26_filesystem_methods_registered() {
-    let src = read_ws("native-builtins/src/phases_late.rs");
+    let src = read_ws("native-builtins/src/phases_late/nio_file.rs");
 
     let methods = &[
         "getSeparator",
@@ -169,7 +169,7 @@ fn kc26_filesystem_methods_registered() {
 
 #[test]
 fn kc26_path_advanced_navigation_registered() {
-    let src = read_ws("native-builtins/src/phases_late.rs");
+    let src = read_ws("native-builtins/src/phases_late/nio_file.rs");
 
     assert!(
         src.contains("\"resolveSibling\""),

@@ -686,7 +686,7 @@ where
 fn zerocopy_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
+    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
 }
 
 /// Returns `true` only when `obj`'s header describes a primitive array whose

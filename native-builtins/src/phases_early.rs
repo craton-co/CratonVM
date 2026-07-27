@@ -7888,6 +7888,8 @@ fn fjp_state_clear() {
 
 #[cfg(test)]
 mod fjp_gc_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]
@@ -20305,6 +20307,8 @@ fn native_scanner_find_within_horizon_string_int(
 // ===========================================================================
 #[cfg(test)]
 mod t2_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};

@@ -1384,7 +1384,7 @@ pub extern "C" fn x64_deopt_entry(
         // (process-lifetime, see `CompiledMethod`'s Drop) — valid to read.
         let guard = unsafe { &*epoch_guard };
         if guard.is_superseded() {
-            if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
                 eprintln!(
                     "[cratonvm-deopt] x64 frame-deopt SUPERSEDED (creation_epoch={} < live) — \
                      skipping reconstruction, routing to safe re-run",
@@ -1417,7 +1417,7 @@ pub extern "C" fn x64_deopt_entry(
     let point = unsafe { &*point };
     let regs = unsafe { &*regs };
     let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
-    if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
         // Resume-side trace: confirms the frame-deopt trampoline fired and at
         // which bci/reason (deopt-osr Step 8 OSR-exit shows reason=OsrExit), with
         // the RESOLVED locals/stack so a wrong reconstruction is visible.

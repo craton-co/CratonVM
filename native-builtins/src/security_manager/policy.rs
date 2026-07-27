@@ -727,8 +727,8 @@ fn utf8_char_len(b: u8) -> usize {
 /// 2. A test-injected override registered through
 ///    [`set_test_property_resolver`] (test-only path; see the unit
 ///    tests below).
-/// 3. The process environment via `std::env::var`.  This catches
-///    `${JAVA_HOME}`, `${HOME}`, `${USER}`, etc.  `std::env::var`
+/// 3. The process environment via `cratonvm_types::flags::runtime_var`.  This catches
+///    `${JAVA_HOME}`, `${HOME}`, `${USER}`, etc.  `cratonvm_types::flags::runtime_var`
 ///    returns `Err(NotPresent)` for unset vars, which we propagate
 ///    as `None` so the enclosing grant gets disabled.
 ///
@@ -747,7 +747,7 @@ fn resolve_property(name: &str) -> Option<String> {
     if let Some(value) = test_property_resolver(name) {
         return Some(value);
     }
-    if let Ok(value) = std::env::var(name) {
+    if let Ok(value) = cratonvm_types::flags::runtime_var(name) {
         return Some(value);
     }
     None
@@ -1203,12 +1203,12 @@ impl<'a> Parser<'a> {
     }
 
     /// WP6.8 — expand `${name}` references using
-    /// `std::env::var(name)` (so JDK's `-Djava.home=...` and any
+    /// `cratonvm_types::flags::runtime_var(name)` (so JDK's `-Djava.home=...` and any
     /// shell-set environment variable both work as substitution
     /// sources).  The resolution order matches JDK
     /// `PolicyParser.expand`:
     ///
-    /// 1. If `name` resolves via `std::env::var`, use that value.
+    /// 1. If `name` resolves via `cratonvm_types::flags::runtime_var`, use that value.
     /// 2. If `name == "/"` it expands to the platform path
     ///    separator (`File.separator` in Java).
     /// 3. Otherwise the substitution fails — the caller surfaces
@@ -1326,6 +1326,8 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     #[test]

@@ -2546,6 +2546,8 @@ pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tls_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 
