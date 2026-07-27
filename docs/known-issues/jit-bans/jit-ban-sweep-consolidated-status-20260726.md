@@ -21,9 +21,9 @@ retain full evidence/repro details; this file is the summary.
 | SUNEC-INTPOLY | `sun/security/util/math/intpoly/` | real EC keygen/sign/verify |
 | ANTLR.1 | `groovyjarjarantlr4/` | real groovy-3.0.21.jar |
 | HIB-LONGTAIL.3 | `GenerationTargetToScript.<init>` | shadowing analysis |
-| HIB-ANTLR.1 | `org/antlr/v4/runtime/` | shadowed no-op (see below) |
+| HIB-ANTLR.1 | `org/antlr/v4/runtime/` | real Hibernate ORM 8.0 HQL suite; shadowed no-op when removed, but the shadow (HIB-LONGTAIL.1's second prefix) was itself dropped 2026-07-27 on a 57-class A/B — `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` |
 | TOMCAT-DOHEAD-JUNIT-ITERATOR.1 | `TestClass.collectAnnotatedMethodValues` | real junit-4.13.2, blanket-ban-lifted-too |
-| JSONSMART-PARSER.1 | `net/minidev/json/parser/` | real json-smart-2.3.jar; re-confirmed 2026-07-27 against json-smart-2.6.0 (3M round-trip ops, 0 errors) — `docs/internal/jsonsmart-parser-jit-retired-20260727.md` |
+| JSONSMART-PARSER.1 | `net/minidev/json/parser/` | real json-smart-2.3.jar; re-confirmed 2026-07-27 against json-smart-2.6.0 (3M round-trip ops, 0 errors), ban retired |
 | SPB.9 | `org/slf4j/`,`ch/qos/logback/`,`org/apache/commons/logging/` | real jcl-over-slf4j+logback |
 | JASPER-JDT.2 | `org/eclipse/jdt/internal/compiler/parser/` | real Tomcat TestCompiler, 2x2 repeated runs |
 | JASPER-JDT.3 | `org/eclipse/jdt/internal/compiler/ast/` | real Tomcat TestFormAuthenticatorA, 2x2 repeated runs |
@@ -57,26 +57,37 @@ lifted):
   loader id got mistagged into a different runtime package, defeating
   package-private `@Bean`-override detection in the vtable builder. Back to
   8/8 (10/10 scenarios, 95/95 checks, no regressions).
-- `docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md`
+- `docs/known-issues/resolvabletype-equals-jit-narrowed-20260727.md`
   -- real `ClassCastException` (`ResolvableType[]` cast to `ResolvableType`)
-  in `Profiles.<clinit>`, but only under `CRATONVM_JIT_THRESHOLD=1`
-  (a `<clinit>` essentially never reaches real JIT tiers otherwise) --
-  low real-world priority, tracked for a future session.
+  in `Profiles.<clinit>`, only under `CRATONVM_JIT_THRESHOLD=1` (a
+  `<clinit>` essentially never reaches real JIT tiers otherwise) -- low
+  real-world priority but a genuine live miscompile. **Narrowed further**
+  this session via precise `CRATONVM_JIT_DENY` bisection across all 10
+  JIT-compiled `ResolvableType` methods down to exactly
+  `ResolvableType.equals(Object)` (not `equalsType`, `hashCode`,
+  `calculateHashCode`, `resolve`, or either `forType` overload). The
+  compiled x86 was disassembled and correlated to the documented 4-way
+  Polymorphic Inline Cache (PIC) codegen in `jit/src/x64.rs` (the
+  `CRIT-8`/`HIGH-7` comment block) -- root cause NOT yet confirmed (the
+  PIC mechanism itself is heavily used elsewhere without issue, so the
+  defect is likely specific to this call site's slot state, not the
+  template) -- full repro commands, disassembly artifact, and concrete
+  next steps recorded for a future session.
 
 ## Already moot / dead-code (no action needed, confirmed this session)
 
 - **NETTY.1** — already lifted 2026-06-11, predates this week; no active `io/netty/` ban remains, only historical archetype references.
-- **FELIX.1**, **BC-ASN1.1**, **SB-17** (`groovy/lang/GroovyClassLoader.doParseClass`) — lived inside `is_known_miscompile()`, which was entirely dead code by default (gated behind a private, default-false `callee_saved_gpr_local_homes_enabled()` copy in `skip_list.rs`). **CLOSED 2026-07-27: that whole block was deleted**, along with ~20-30 other historically-catalogued bans in the same bucket. BC-ASN1.1's `Calendar.isFieldSet` was additionally verified JIT-compiled and correct; SB-17's own probe (real `groovy-3.0.21.jar` parsing) instead exposed a *different*, live JIT bug — an `ExecutableBuffer` overflow that panicked and aborted the VM instead of falling back to the single-pass backend — fixed the same day in `jit/src/ir_lower.rs`. See `docs/internal/is-known-miscompile-block-retired-20260727.md`. (A later Stop-hook feedback round cited this as "KC26-GROOVY" -- no such literal name exists anywhere in the repo; SB-17 is the real ban that citation was garbling.)
+- **FELIX.1**, **BC-ASN1.1**, **SB-17** (`groovy/lang/GroovyClassLoader.doParseClass`) — lived inside `is_known_miscompile()`, which was entirely dead code by default (gated behind a private, default-false `callee_saved_gpr_local_homes_enabled()` copy in `skip_list.rs`). **CLOSED 2026-07-27: that whole block was deleted**, along with ~20-30 other historically-catalogued bans in the same bucket. BC-ASN1.1's `Calendar.isFieldSet` was additionally verified JIT-compiled and correct; SB-17's own probe (real `groovy-3.0.21.jar` parsing) instead exposed a *different*, live JIT bug — an `ExecutableBuffer` overflow that panicked and aborted the VM instead of falling back to the single-pass backend — fixed the same day in `jit/src/ir_lower.rs`. (A later Stop-hook feedback round cited this as "KC26-GROOVY" -- no such literal name exists anywhere in the repo; SB-17 is the real ban that citation was garbling.)
 
 ## Kept — confirmed still needed, with real evidence
 
-- ~~**JAXB** (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27.** The QName-compare corruption no longer reproduces, including on a pre-fix binary under this session's own exact 2026-07-26 configuration, so it was closed by general JIT work landed between the two dates. What the 4000-iteration probe was still dying on was a separate general bug in a **JDK** class, now fixed. `docs/internal/jaxb-jit-ban-removed-20260727.md`.
+- ~~**JAXB** (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27.** The QName-compare corruption no longer reproduces, including on a pre-fix binary under this session's own exact 2026-07-26 configuration, so it was closed by general JIT work landed between the two dates. What the 4000-iteration probe was still dying on was a separate general bug in a **JDK** class, now fixed.
 - **ES fragile cluster** (`org/elasticsearch/`) — real ES 9.6.0-SNAPSHOT checkout, 18-class sample found a real regression (`FloatFieldBlockLoaderTests`). `docs/known-issues/es-fragile-cluster-confirmed-needed-20260726.md`.
 - **HIB-TEMPORAL.1** (`org/hibernate/`) — real Hibernate ORM 8.0 harness, lifting causes a full `StrategySelectionException` bootstrap cascade. `docs/known-issues/hib-temporal-1-still-needed-20260726.md`.
 
 ## Blocked — real, still-open, NOT this session's to fix (architectural)
 
-- ~~**Keycloak class-resolution loader-blindness**~~ / ~~**KC26-PIC.1 / KC26-RX.1 / KC26.LR**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). See `docs/internal/keycloak/keycloak-boot-blocked-version-null-20260726.md`. (The original entries claimed `ClassManager::find_class_bytes_delegated` needed a fourth loader path across "149 call sites"; that file was never touched. The defect was ordering: a fabricated stub is registered globally under `Application`, which poisons the binary name so the owning custom loader can never define the real class.)
+- ~~**Keycloak class-resolution loader-blindness**~~ / ~~**KC26-PIC.1 / KC26-RX.1 / KC26.LR**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). (The original entries claimed `ClassManager::find_class_bytes_delegated` needed a fourth loader path across "149 call sites"; that file was never touched. The defect was ordering: a fabricated stub is registered globally under `Application`, which poisons the binary name so the owning custom loader can never define the real class.)
 - **SuppressWarnings annotation bug** — any source containing `@SuppressWarnings("...")` fails in-process javac compilation (unrelated to any JIT ban, reproduces with JIT fully disabled). `docs/known-issues/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
 
 ## Blocked — genuinely missing fixture, confirmed absent (double-checked)
@@ -91,13 +102,13 @@ lifted):
 
 ## Found, not a ban, new VM bugs discovered this session
 
-- ~~**`java.io.Writer.write(char[])` silently drops output under JIT**~~ — **CLOSED 2026-07-27**, does not reproduce on dev. Two corrections to the original writeup: the compiled overload was `write(String)`, not `write(char[])` (`BISECT_SKIP` matches by method *name*), and the bug is unrelated to the LICM defect found while closing it. `docs/internal/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
-- **JIT LICM / speculative pre-header bypassed by a forward branch into the loop header** — found 2026-07-27 while closing the two entries above, **FIXED**. A general x86-64 codegen defect: any hoist or speculative guard emitted at a loop header is skipped by an edge that enters the header from outside the loop, so the loop runs against an uninitialised cache slot (and, in the speculative-BCE case, against elided bounds checks whose guard never ran). This is also what **HIB-LONGTAIL.2** (`AttributesImpl.ensureCapacity`, removed from the skip list on 2026-07-26 as "no longer reproduces") really was — it was ~30%-per-run flaky and had been under-sampled, not fixed. `docs/internal/jit-licm-preheader-bypass-20260727.md`.
+- ~~**`java.io.Writer.write(char[])` silently drops output under JIT**~~ — **CLOSED 2026-07-27**, does not reproduce on dev. Two corrections to the original writeup: the compiled overload was `write(String)`, not `write(char[])` (`BISECT_SKIP` matches by method *name*), and the bug is unrelated to the LICM defect found while closing it.
+- **JIT LICM / speculative pre-header bypassed by a forward branch into the loop header** — found 2026-07-27 while closing the two entries above, **FIXED**. A general x86-64 codegen defect: any hoist or speculative guard emitted at a loop header is skipped by an edge that enters the header from outside the loop, so the loop runs against an uninitialised cache slot (and, in the speculative-BCE case, against elided bounds checks whose guard never ran). This is also what **HIB-LONGTAIL.2** (`AttributesImpl.ensureCapacity`, removed from the skip list on 2026-07-26 as "no longer reproduces") really was — it was ~30%-per-run flaky and had been under-sampled, not fixed.
 - **`Class.getResourceAsStream`/`getResource` classloader-blindness** — FIXED this session (see removal list logic above; this was a real fix, not a ban).
 
 ## Flagged, not yet investigated (real, high-value, explicitly recommended for a future session)
 
-- ~~**Undocumented blanket `org/junit/` + 3 siblings**~~ — **CLOSED 2026-07-27, all four REMOVED.** The ES-specific leg this entry called for was completed and initially aborted 58/60 classes — but the cause was not a miscompile these bans guarded against. It was `jit/src/ir_lower.rs` panicking (`expect`) on an overflowed code buffer instead of taking `lower_inner`'s existing `buf.overflowed()` bail to the single-pass backend, triggered by exactly one class, `org/junit/internal/MethodSorter`. Fixing that (13 patch sites now `.ok()`, matching `x64.rs`) ALSO removed 7 pre-existing SIGABRTs from the default-settings ES baseline. With the fix in, baseline-vs-lifted is byte-for-byte identical across ES 60/60, Hibernate 160/160 and Spring Boot 40/40. Retired to `docs/internal/blanket-org-junit-ban-undocumented-shadow-20260726.md`.
+- ~~**Undocumented blanket `org/junit/` + 3 siblings**~~ — **CLOSED 2026-07-27, all four REMOVED.** The ES-specific leg this entry called for was completed and initially aborted 58/60 classes — but the cause was not a miscompile these bans guarded against. It was `jit/src/ir_lower.rs` panicking (`expect`) on an overflowed code buffer instead of taking `lower_inner`'s existing `buf.overflowed()` bail to the single-pass backend, triggered by exactly one class, `org/junit/internal/MethodSorter`. Fixing that (13 patch sites now `.ok()`, matching `x64.rs`) ALSO removed 7 pre-existing SIGABRTs from the default-settings ES baseline. With the fix in, baseline-vs-lifted is byte-for-byte identical across ES 60/60, Hibernate 160/160 and Spring Boot 40/40.
 
 ## What genuinely remains unaddressed by this session
 

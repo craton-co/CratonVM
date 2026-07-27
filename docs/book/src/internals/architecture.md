@@ -6,7 +6,7 @@ major subsystems fit together. The following chapters drill into each subsystem.
 
 ## Crate layout
 
-CratonVM is a Cargo workspace of **20 member crates**. (The `fuzz/` directory is
+CratonVM is a Cargo workspace of **22 member crates**. (The `fuzz/` directory is
 a separate, standalone workspace — a nightly-only libFuzzer harness — and is
 *not* a workspace member, because its `#![no_main]` harness trips the production
 lints.)
@@ -15,8 +15,10 @@ lints.)
 |-------|-----------|---------|
 | `cratonvm-reader` | `reader/` | `.class` file parser |
 | `cratonvm-types` | `types/` | Shared types (`Value`, `ClassId`, `ObjectRef`) |
-| `cratonvm-native-api` | `native-api/` | `NativeContext` trait & FD table |
-| `cratonvm-native-builtins` | `native-builtins/` | `java.lang.*` (and crypto, reflection, …) natives |
+| `cratonvm-native-api` | `native-api/` | Native capability facade and FD table |
+| `cratonvm-native-builtins` | `native-builtins/` | `java.lang.*`, registration, and Java-object marshalling |
+| `cratonvm-native-builtins-crypto` | `native-builtins-crypto/` | Separately compiled crypto compatibility kernels |
+| `cratonvm-native-builtins-security` | `native-builtins-security/` | Separately compiled JDK security and SunEC native pack |
 | `cratonvm-native-collections` | `native-collections/` | `java.util.*` natives |
 | `cratonvm-native-io` | `native-io/` | `java.io` / `java.nio` natives |
 | `cratonvm-native-awt` | `native-awt/` | AWT/Swing/Java2D bridge natives (headless, no OS windows) |
@@ -34,7 +36,8 @@ lints.)
 | `cratonvm-embed` | `cratonvm-embed/` | Curated, semver-stable Rust embedding facade |
 | `cratonvm-difftest` | `difftest/` | Differential-testing harness against a reference JDK |
 
-It is roughly **880,000 lines of Rust**. The project builds on Rust **1.80+**
+It is roughly **1.35 million lines of Rust** as of 2026-07-27. The project
+builds on Rust **1.80+**
 (edition 2021).
 
 ## Dependency flow
@@ -44,6 +47,8 @@ vm-cli → vm → {classloading, gc, jit, native-builtins, native-collections,
                native-io, native-awt, jfr}
               → {reader, types, native-api, jit-api, jit-cuda,
                  cuda-bridge, craton-gpu}
+
+native-builtins → {native-builtins-crypto, native-builtins-security}
 
 libcratonvm   → vm   (C-ABI / JNI Invocation API embedding shim)
 cratonvm-embed → vm  (curated, semver-stable Rust embedding facade)
@@ -81,6 +86,8 @@ cratonvm-embed → vm  (curated, semver-stable Rust embedding facade)
 | Loading, linking, verification | `classloading` | [Class Loading & Verification](class-loading.md) |
 | Threads, monitors, safepoints | `vm` (`threading/`) | [Threading & Concurrency](threading.md) |
 | Standard-library natives | `native-*` | [Native Methods](native-methods.md) |
+| Startup state machine | `vm` (`vm/vm_init.rs`) | [Runtime Lifecycle](runtime-lifecycle.md) |
+| Cross-boundary invariants | all runtime crates | [Runtime Contracts](runtime-contracts.md) |
 
 ## Key design decisions
 
@@ -92,16 +99,21 @@ cratonvm-embed → vm  (curated, semver-stable Rust embedding facade)
    exceptions (handled by the interpreter at catch/finally blocks); a separate
    variant wraps internal VM errors. Keeping them distinct prevents VM bugs from
    masquerading as catchable Java exceptions.
-3. **Structure-of-Arrays value layout.** Frames and operand stacks store value
-   payloads and type tags in separate arrays, for better cache behavior and
-   tag-based GC scanning.
-4. **Direct bytecode-to-x86-64, with an optional IR.** The JIT's default path
-   compiles bytecode directly to machine code in a single pass; methods that
-   qualify are routed through an optional sea-of-nodes IR for broader
-   optimization before instruction selection.
+3. **Compact frame values.** Frames and operand stacks use 8-byte NaN-boxed
+   `CompactValue` slots, with a parallel kind array only for ambiguous raw
+   `long`/`double` patterns. The wider `Value` enum stays at runtime/native
+   boundaries rather than defining frame or heap layout.
+4. **Two JIT front ends, one runtime-sensitive lowering contract.** The
+   baseline path lowers bytecode directly; qualifying methods use a
+   sea-of-nodes IR. Allocation, hashed virtual/interface dispatch, and live
+   monitor calls are emitted through `jit::runtime_lowering` so the tiers share
+   runtime semantics.
 5. **Hashed native dispatch.** Native methods are looked up by hashing
    `"class.method:descriptor"`, giving O(1) dispatch with collision detection at
    registration time.
+6. **Typed startup.** `BootstrapPhase<Allocated>` advances through
+   `ClassesReady`, `NativesReady`, and `RuntimeReady`; only the final state can
+   finish initialization.
 
 ## In-source canonical docs
 

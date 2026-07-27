@@ -156,8 +156,21 @@ other GPU options require a `--features gpu-driver` build — see
 
 ## Documentation
 
+- [Complete manual](docs/book/src/SUMMARY.md) — installation, use,
+  compatibility, security, performance, operations, embedding, architecture,
+  contributing, and reference
+- [Documentation index](docs/README.md) — map of maintained standalone and
+  manual references
 - [ARCHITECTURE.md](ARCHITECTURE.md) — crate layout and subsystem design
 - [BENCHMARK.md](BENCHMARK.md) — benchmark methodology and full results
+- [Performance tuning](docs/book/src/performance/tuning.md) — measurement-first
+  tuning workflow
+- [Deployment and operations](docs/book/src/operations/deployment.md) —
+  packaging, sizing, security boundaries, rollout, and rollback
+- [Incident response](docs/book/src/operations/incident-response.md) —
+  crash/hang/OOM/wrong-result diagnostic runbook
+- [Runtime lifecycle](docs/book/src/internals/runtime-lifecycle.md) and
+  [runtime contracts](docs/book/src/internals/runtime-contracts.md)
 - [docs/GC.md](docs/GC.md) — collectors, barriers, heap layout
 - [docs/JIT_OPTIMIZATION.md](docs/JIT_OPTIMIZATION.md) — the JIT optimization journey
 - [docs/gpu/README.md](docs/gpu/README.md) — GPU offload reference

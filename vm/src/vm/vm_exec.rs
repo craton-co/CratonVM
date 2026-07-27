@@ -556,6 +556,34 @@ thread_local! {
     /// specific SharedVm so sequential in-process VMs cannot alias ClassIds.
     static PRIMITIVE_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, ClassId)>> =
         const { std::cell::Cell::new(None) };
+
+    /// Last class this host thread confirmed is **not** a primitive wrapper,
+    /// scoped to a `SharedVm` exactly like `PRIMITIVE_WRAPPER_CLASS_CACHE`.
+    ///
+    /// Only the positive answer used to be memoized, so every
+    /// `fast_unbox_primitive_wrapper` call on a non-wrapper key re-took the
+    /// `class_manager` read lock and cloned the class's `Arc<str>` name just to
+    /// conclude "no". `map_hash_key` and `map_keys_equal` both start with an
+    /// unbox attempt, so a single String-keyed `ConcurrentHashMap.get` paid
+    /// that seven times over (measured: 7.2 locked lookups per `get`), and the
+    /// contended lock plus the `Arc` refcount traffic on the shared
+    /// `java/lang/String` metadata is what made the lookup collapse under
+    /// concurrency. "Is not a wrapper" is exactly as durable a fact as "is" —
+    /// a `ClassId`'s name is fixed for the life of the VM — so both answers are
+    /// cached now.
+    static NON_PRIMITIVE_WRAPPER_CLASS_CACHE: std::cell::Cell<Option<(usize, ClassId)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Shared tail of `fast_unbox_primitive_wrapper`: read the boxed primitive out
+/// of an object whose class has already been confirmed to be a JDK wrapper.
+fn read_wrapper_primitive_field(shared: &SharedVm, obj: ObjectRef) -> Option<Value> {
+    match shared.mem.heap.get_field(obj, 0) {
+        value @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
+            Some(value)
+        }
+        _ => None,
+    }
 }
 
 fn recover_stale_lambda_receiver_from_native_pins(
@@ -6926,27 +6954,34 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     ) -> Option<Value> {
         let mut index = 0;
         while index < self.thread.jit_hashmap_string_node_cache.len() {
-            let entry = self.thread.jit_hashmap_string_node_cache[index].clone();
-            if entry.map != map {
+            // Copy out only the `Copy` fields. This used to `.clone()` the whole
+            // entry, which also deep-copied its `String` key — a heap
+            // allocation for EVERY entry scanned on EVERY probe, on the hottest
+            // map path in the VM, and this variant does not even look at that
+            // key (it compares the Java String objects directly below).
+            let (entry_map, entry_node, mod_count_slot, entry_mod_count) = {
+                let entry = &self.thread.jit_hashmap_string_node_cache[index];
+                (entry.map, entry.node, entry.mod_count_slot, entry.mod_count)
+            };
+            if entry_map != map {
                 index += 1;
                 continue;
             }
-            let Value::Int(mod_count) = self.shared.mem.heap.get_field(map, entry.mod_count_slot)
-            else {
+            let Value::Int(mod_count) = self.shared.mem.heap.get_field(map, mod_count_slot) else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             };
-            if mod_count != entry.mod_count {
+            if mod_count != entry_mod_count {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             }
-            let Value::Object(Some(node_key)) = self.shared.mem.heap.get_field(entry.node, 1)
+            let Value::Object(Some(node_key)) = self.shared.mem.heap.get_field(entry_node, 1)
             else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             };
             if compact_java_strings_equal(self.shared, key, node_key) {
-                return Some(self.shared.mem.heap.get_field(entry.node, 2));
+                return Some(self.shared.mem.heap.get_field(entry_node, 2));
             }
             index += 1;
         }
@@ -6956,21 +6991,26 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
     fn hashmap_string_node_cache_get(&mut self, map: ObjectRef, key: &str) -> Option<Value> {
         let mut index = 0;
         while index < self.thread.jit_hashmap_string_node_cache.len() {
-            let entry = self.thread.jit_hashmap_string_node_cache[index].clone();
-            if entry.map != map || entry.key != key {
-                index += 1;
-                continue;
-            }
-            let Value::Int(mod_count) = self.shared.mem.heap.get_field(map, entry.mod_count_slot)
-            else {
+            // Compare the cached key by BORROW and copy out only the `Copy`
+            // fields — see the sibling probe above; the old `.clone()` paid a
+            // `String` allocation per entry scanned just to run this compare.
+            let (entry_node, mod_count_slot, entry_mod_count) = {
+                let entry = &self.thread.jit_hashmap_string_node_cache[index];
+                if entry.map != map || entry.key != key {
+                    index += 1;
+                    continue;
+                }
+                (entry.node, entry.mod_count_slot, entry.mod_count)
+            };
+            let Value::Int(mod_count) = self.shared.mem.heap.get_field(map, mod_count_slot) else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             };
-            if mod_count != entry.mod_count {
+            if mod_count != entry_mod_count {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             }
-            return Some(self.shared.mem.heap.get_field(entry.node, 2));
+            return Some(self.shared.mem.heap.get_field(entry_node, 2));
         }
         None
     }
@@ -10644,19 +10684,24 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     fn fast_unbox_primitive_wrapper(&self, obj: ObjectRef) -> Option<Option<Value>> {
         let class_id = self.shared.mem.heap.class_id_of(obj);
         let vm_key = self.shared as *const SharedVm as usize;
-        let cached =
-            PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, class_id)));
-        let is_wrapper = cached || {
-            let class_name = self
-                .shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(class_id)
-                .map(|class| class.name.clone());
-            let recognized = class_name.as_deref().is_some_and(|name| {
+        if PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, class_id))) {
+            return Some(read_wrapper_primitive_field(self.shared, obj));
+        }
+        if NON_PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, class_id))) {
+            return Some(None);
+        }
+        // `matches!` runs against a borrow of the name under the guard rather
+        // than cloning the `Arc<str>` out — the clone/drop pair was itself a
+        // contended atomic on shared class metadata.
+        let recognized = self
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|class| {
                 matches!(
-                    name,
+                    class.name.as_ref(),
                     "java/lang/Integer"
                         | "java/lang/Long"
                         | "java/lang/Boolean"
@@ -10667,22 +10712,22 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                         | "java/lang/Double"
                 )
             });
-            if recognized {
-                PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| {
-                    cache.set(Some((vm_key, class_id)));
-                });
+        match recognized {
+            Some(true) => {
+                PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.set(Some((vm_key, class_id))));
+                Some(read_wrapper_primitive_field(self.shared, obj))
             }
-            recognized
-        };
-        if !is_wrapper {
-            return Some(None);
+
+            Some(false) => {
+                NON_PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.set(Some((vm_key, class_id))));
+                Some(None)
+            }
+            // Class not resolvable (early bootstrap, or a synthetic id with no
+            // class-store entry). Answer "not a wrapper" as before, but do NOT
+            // memoize it — unlike a resolved name, this can change once the
+            // class is registered.
+            None => Some(None),
         }
-        Some(match self.shared.mem.heap.get_field(obj, 0) {
-            value @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
-                Some(value)
-            }
-            _ => None,
-        })
     }
 
     fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
@@ -12303,9 +12348,43 @@ pub fn invoke_or_native(
     // already be loaded. Class-init state is monotonic, so this call is
     // cheap (a single atomic load) once initialized and can never
     // regress an already-initialized class back to needing the check.
+    // Resolving the dispatch class by NAME is ambiguous whenever more than one
+    // loader has defined that name -- `get_loaded_class_id` / `invoke_shared`
+    // then answer `None` / `ClassNotFound` and the call surfaces as a
+    // `NoClassDefFoundError` for a class that is very much loaded. Groovy is
+    // the everyday case: `GroovyScriptFactory` compiles the same script class
+    // through a FRESH `GroovyClassLoader` per application context, so by the
+    // second context `org/springframework/scripting/groovy/TestFactoryBean`
+    // names two distinct classes (`scripting.groovy.GroovyScriptFactoryTests`,
+    // 11 of 38 methods, JIT-only because the interpreter's own dispatch is
+    // ClassId-based and never re-resolves the name).
+    //
+    // A virtual call's receiver IS the authoritative answer: when its runtime
+    // class carries exactly this name, dispatch on that ClassId instead of
+    // asking the (ambiguous) global name table.
+    let receiver_class_id = match args.first() {
+        Some(Value::Object(Some(receiver))) => {
+            let cid = shared.mem.heap.class_id_of(*receiver);
+            let same_name = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(cid)
+                .map(|c| c.name.as_ref() == effective_class)
+                .unwrap_or(false);
+            if same_name {
+                Some(cid)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
     {
         let cm = shared.classes.class_manager.read();
-        if let Some(class_id) = cm.get_loaded_class_id(effective_class) {
+        if let Some(class_id) =
+            receiver_class_id.or_else(|| cm.get_loaded_class_id(effective_class))
+        {
             if let Some(class) = cm.class_store.get(class_id) {
                 if !class.is_synthetic_stub {
                     drop(cm);
@@ -13020,7 +13099,7 @@ pub(super) fn proxy_invoke_handler(
         return proxy_unbox_primitive_return(
             ctx.shared,
             descriptor,
-            proxy_annotation_handler_invoke(ctx.shared, handler_ref, method_name, args),
+            proxy_annotation_handler_invoke(ctx.shared, ctx.thread, handler_ref, method_name, args),
         );
     }
 
@@ -13359,7 +13438,21 @@ fn annotation_proxy_invoke(
     method_name: &str,
     args: &[Value],
 ) -> MethodCallResult {
-    annotation_proxy_dispatch_impl(ctx.shared, proxy, method_name, args)
+    // Route through the SHARED entry point, not `annotation_proxy_dispatch_impl`
+    // directly: only the shared one carries the `asMap` handler and the
+    // cross-type `equals` delegation (an `AnnotationProxy` compared against a
+    // FOREIGN annotation proxy of the same type -- e.g. Spring's
+    // `MergedAnnotation.synthesize()` JDK proxy -- must delegate to that
+    // proxy's own `equals`, or equality is asymmetric).
+    //
+    // This is the path a native takes via `NativeContext::invoke_virtual`,
+    // which is how AssertJ's natively-shimmed
+    // `StandardComparisonStrategy.areEqual` performs its final
+    // `actual.equals(other)`. Bypassing the delegation made
+    // `assertThat(realAnnotation).isEqualTo(synthesizedAnnotation)` fail while
+    // the identical call written in Java passed
+    // (`core.annotation.MergedAnnotationsTests.equalsForSynthesizedAnnotations`).
+    annotation_proxy_invoke_shared(ctx.shared, ctx.thread, proxy, method_name, args)
 }
 
 /// Shared-interpreter version of `proxy_invoke_handler` вЂ” callable from the
@@ -13413,6 +13506,7 @@ fn proxy_unbox_primitive_return(
 /// annotation equality compares its members rather than proxy identity.
 fn proxy_annotation_handler_invoke(
     shared: &SharedVm,
+    thread: &mut JvmThread,
     handler_ref: ObjectRef,
     method_name: &str,
     args: &[Value],
@@ -13436,7 +13530,15 @@ fn proxy_annotation_handler_invoke(
             }
         }
     }
-    annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args)
+    // Fall through to the SHARED entry point, not `annotation_proxy_dispatch_impl`:
+    // only the shared one delegates `equals` to a FOREIGN annotation proxy of
+    // the same type (e.g. Spring's `MergedAnnotation.synthesize()` proxy, whose
+    // handler is Spring's own, not an `AnnotationProxy`). Without it
+    // `realAnnotation.equals(synthesized)` answered false while
+    // `synthesized.equals(realAnnotation)` answered true -- asymmetric equality,
+    // surfacing as `core.annotation.MergedAnnotationsTests
+    // .equalsForSynthesizedAnnotations`.
+    annotation_proxy_invoke_shared(shared, thread, handler_ref, method_name, args)
 }
 
 pub(crate) fn proxy_invoke_handler_shared(
@@ -13466,7 +13568,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         return proxy_unbox_primitive_return(
             shared,
             descriptor,
-            proxy_annotation_handler_invoke(shared, handler_ref, method_name, args),
+            proxy_annotation_handler_invoke(shared, thread, handler_ref, method_name, args),
         );
     }
 
