@@ -69,15 +69,34 @@ it, and why the 2026-07-26 Hibernate sample came back byte-for-byte clean.
 
 ### The fix
 
-All thirteen sites now use `.ok()`. An overflowed buffer discards the IR
-artifact and falls back to single-pass instead of aborting the process.
+This session converted all thirteen sites to `.ok()`. **A concurrent session
+independently found and fixed the same bug** (reaching it from a completely
+different workload — `GroovyClassLoader.parseClass`, panicking at
+`offset: 4125` rather than 4382) and landed first on `dev`, with a better-
+factored version: a `Lowerer::patch_or_bail` helper carrying a `debug_assert!`
+that `try_patch_i32` really did mark the buffer overflowed, plus a full doc
+comment, applied at fourteen sites. **The merge took theirs**; this session's
+`.ok()` conversion is superseded and is not what shipped. The behaviour is
+identical — an overflowed buffer discards the IR artifact and falls back to
+single-pass instead of aborting the process.
 
-Regression witness: `no_patch_site_panics_on_an_overflowed_buffer` in
-`jit/src/ir_lower.rs`'s test module asserts no patch site in the file uses
-`expect`/`unwrap`. A behavioural test cannot reach these emitters without a
-graph large enough to overflow `lower_inner`'s own estimate — exactly the
-condition that estimate exists to prevent — so the invariant is asserted where
-it can actually be checked.
+What this session contributes on top, and what remains in the tree:
+
+- The **regression witness**, `no_patch_site_panics_on_an_overflowed_buffer` in
+  `jit/src/ir_lower.rs`'s test module: asserts that NO patch site in the file
+  uses `expect`/`unwrap`. It passes against the `patch_or_bail` form and would
+  catch a future site reintroducing the abort in either style. A behavioural
+  test cannot reach these emitters without a graph large enough to overflow
+  `lower_inner`'s own estimate — exactly the condition that estimate exists to
+  prevent — so the invariant is asserted where it can actually be checked.
+- The **attribution**: that this bug is what the four blanket bans were hiding,
+  reached through `org/junit/internal/MethodSorter`, and therefore that the bans
+  are safe to remove. The concurrent fix was made for its own reasons and did
+  not touch the bans.
+
+That two sessions hit the same panic within hours, from Elasticsearch and from
+Groovy respectively, is itself evidence the site was widely reachable rather
+than an Elasticsearch curiosity.
 
 Confirmed directly: with `BISECT_ONLY=org/junit/internal/MethodSorter` and
 `ALLOW_PACKAGES=org/junit/`, the command that used to abort now returns rc=0
@@ -138,6 +157,34 @@ Two methodological notes worth keeping:
   harness's own 420s per-class cap in both ES legs, and Spring Boot's
   `ConfigurationPropertySourcesTests` hangs identically in every config. Those
   are pre-existing and diff away.
+
+### Re-verified after merging `dev` (two independent fixes combined)
+
+Because `dev` had landed its own `patch_or_bail` version of the same fix, the
+merged tree is a combination neither session tested. It was rebuilt and
+re-verified rather than assumed:
+
+- `cargo test --release -p cratonvm-jit --lib` — **1029 passed, 0 failed**,
+  including this session's `no_patch_site_panics_on_an_overflowed_buffer`
+  witness against the `patch_or_bail` form.
+- `cargo test --release -p cratonvm-vm --lib skip_list` — **69 passed, 0
+  failed.**
+- ES 60-class A/B on the merged binary — **0 SIGABRTs in both legs** (the whole
+  point), 58/60 identical.
+
+The 2 remaining ES differences are a **flaky SIGSEGV that is not ours**:
+
+- `BulkProcessor2Tests` crashed once in the lifted leg — then **10/10 clean in
+  BOTH configs** on repeat.
+- `NodeConnectionsServiceTests` crashed in the **baseline** leg (bans active),
+  which lifting the bans cannot cause — and repeats put its baseline crash rate
+  at **1 in 10** (`1 1 1 139 1 1 1 1 1 1`).
+
+Note these `rc=139` crashes do **not** appear in the pre-merge 60-class run of
+this session's own fixed binary (which was 60/60 identical with zero SIGSEGV).
+They arrived with the ~64 files of other sessions' work pulled in by the `dev`
+merge, and they reproduce with the bans ACTIVE. **Flagged, not fixed here** —
+out of scope for this doc, but a real intermittent crash somebody should chase.
 
 ### Residuals closed at the same time
 
