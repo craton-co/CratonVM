@@ -137,6 +137,23 @@ All runs one-class-per-process on the Windows host, real JDK 25,
 used for the sweep; through the suite runner (which bumps it to 12 g) it passes
 in 198 s. It needs more than the 300 s default timeout.
 
+Re-verified after merging `origin/dev` @ `4e0dfa151` (which brought 11 unrelated
+`.rs` changes, several in the JIT). Interleaved A/B on the merged tree,
+`TestNonBlockingCoordinator`: **clean dev 0/6 PASS (still ~145 s per run, the
+original pathological time); dev + these fixes 5/5 PASS at 12–20 s.** Across
+every post-merge coordinator run: **18 PASS / 19**.
+
+The one non-PASS was a 400 s stall with
+`STW cross-thread JIT takeover is still waiting for cooperative mutators
+rounds=64 pending=4 taken=0`, seen exactly once and never reproduced in the 18
+runs since. It is in JIT stop-the-world takeover machinery that none of these
+changes touch, and if anything cause 3 makes that machinery *less* likely to
+stall (a thread parked on the old `parking_lot` mutex was a non-cooperating
+mutator outside any blocking region; it no longer parks there at all). It was
+not seen on the clean-dev control either, but those runs fail differently and
+much more slowly, so that is not a clean comparison. **Left unattributed** —
+if it recurs, it needs its own investigation, not a re-open of this doc.
+
 ## Residual — NOT this bug
 
 `org.apache.catalina.tribes.group.TestGroupChannelSenderConnections`
