@@ -2874,22 +2874,25 @@ pub fn set_precise_exception_frame_request(on: bool) {
 }
 
 thread_local! {
-    /// One-shot `(start_pc, end_pc, handler_pc)` list for the next method
-    /// compile on this thread. Consumed at `compile_with_param_slots` entry.
+    /// One-shot `[start_pc, end_pc)` list of the next method's exception-table
+    /// protected ranges, published by the bytecode front-end.
     ///
-    /// The back-end otherwise never sees the exception table, and the liveness
-    /// scan that feeds the deopt/exceptional-frame snapshot needs it: without
-    /// exception edges a local that only the handler reads is computed dead
-    /// throughout the protected range, and the snapshot then drops it.
-    static PENDING_EXCEPTION_HANDLER_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// The backend is otherwise entirely exception-table-blind, and that is
+    /// fine for every lowering that RETURNS to this frame: the shared exception
+    /// stub re-enters the interpreter at the throwing bci and the method's own
+    /// handler table takes over from there. It is NOT fine for the sibling
+    /// tail-call, which tears this frame down and `JMP`s into the callee, so an
+    /// exception the callee raises unwinds straight past a handler that was
+    /// supposed to catch it. See `pc_is_protected`.
+    static PROTECTED_RANGES_REQUEST: std::cell::Cell<Option<Vec<(u32, u32)>>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Stage this method's exception table for the next compile on this thread.
-/// Empty (the default) keeps the historical exception-blind behaviour for call
-/// sites that have no table to give.
-pub fn set_pending_exception_handler_ranges(ranges: Vec<(usize, usize, usize)>) {
-    PENDING_EXCEPTION_HANDLER_RANGES.with(|c| *c.borrow_mut() = ranges);
+/// Publish the next method compile's exception-table protected ranges.
+/// One-shot, like [`set_precise_exception_frame_request`], so a bailed compile
+/// cannot leak its ranges into the next unrelated method on this worker thread.
+pub fn set_protected_ranges_request(ranges: Vec<(u32, u32)>) {
+    PROTECTED_RANGES_REQUEST.with(|c| c.set(if ranges.is_empty() { None } else { Some(ranges) }));
 }
 
 thread_local! {
@@ -7949,6 +7952,10 @@ struct Compiler {
     /// This method uses frame-preserving exception exits for handlers that
     /// read non-parameter locals (RBC.6 precise-handler continuation).
     precise_exception_frames: bool,
+    /// `[start_pc, end_pc)` ranges covered by this method's exception table.
+    /// Empty when the method has no handlers. Consulted only by
+    /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
+    protected_ranges: Vec<(u32, u32)>,
     /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
     /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
     /// Forces `has_dispatch` for the SAME thread-availability reason as
@@ -9023,6 +9030,7 @@ impl Compiler {
         cache_jit_thread_for_inline_new: bool,
         reserve_stack_floor: bool,
         precise_exception_frames: bool,
+        protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
         // Each local takes 8 bytes: [rbp - 8], [rbp - 16], ...
@@ -9330,6 +9338,7 @@ impl Compiler {
             emitted_athrow: false,
             emitted_monitor_call: false,
             precise_exception_frames,
+            protected_ranges,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             forward_patches: Vec::new(),
@@ -18364,6 +18373,22 @@ impl Compiler {
     /// dispatching a `J`/`D`-returning callee sound (a `Pack.bigEndianToLong`
     /// SHA-512 word == `0x8000_0000_0000_0000` would otherwise be misread as a
     /// deopt and the caller would silently bail mid-method).
+    /// Is `pc` inside any of this method's exception-table protected ranges?
+    ///
+    /// Only the sibling tail-call needs this. Every other lowering keeps this
+    /// frame alive across the call and routes a pending exception through the
+    /// shared stub, which re-enters the interpreter at the throwing bci where
+    /// the method's own handler table applies. A tail-call has already run
+    /// `emit_epilogue_without_ret` by the time the callee executes, so there is
+    /// no frame left to catch into and the exception escapes to this method's
+    /// caller instead — the wrong handler, silently.
+    fn pc_is_protected(&self, pc: usize) -> bool {
+        let pc = pc as u32;
+        self.protected_ranges
+            .iter()
+            .any(|(start, end)| pc >= *start && pc < *end)
+    }
+
     fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
         // The bytecode compiler has just emitted the dispatch, so its local
         // homes still describe the point at which an exception from that call
@@ -24999,8 +25024,13 @@ impl Compiler {
                                     (b'V', 0xB1) => true,
                                     _ => false,
                                 };
-                            let is_sibling_tail =
-                                tail_op_matches && callee_needs_ctx == self.needs_heap;
+                            // A tail-call inside a try region would tear this
+                            // frame down before the callee runs, so anything it
+                            // throws escapes the handler that covers this pc
+                            // (see `pc_is_protected`). Demote to a normal CALL.
+                            let is_sibling_tail = tail_op_matches
+                                && callee_needs_ctx == self.needs_heap
+                                && !self.pc_is_protected(pc);
 
                             // Round-8 wave-3: sibling-tail demotion.
                             // Tail-calling with stack args is non-trivial
@@ -25203,8 +25233,14 @@ impl Compiler {
                         // Self-recursive call (no invoke_info, no direct_call)
                         let n = self.num_params;
 
-                        // Check for tail call: invokestatic self at PC, xreturn at PC+3
-                        let is_tail_call = pc + 3 < code_len && matches!(code[pc + 3], 0xac..=0xb0); // ireturn..areturn
+                        // Check for tail call: invokestatic self at PC, xreturn at PC+3.
+                        // Never inside a try region — the tail form tears this
+                        // frame down, so a throw from the self-recursive callee
+                        // would bypass the handler covering this pc
+                        // (see `pc_is_protected`).
+                        let is_tail_call = pc + 3 < code_len
+                            && matches!(code[pc + 3], 0xac..=0xb0) // ireturn..areturn
+                            && !self.pc_is_protected(pc);
 
                         // jit-invokedynamic-groovy-regression fix: a method
                         // containing a live invokedynamic site (compiled as an
@@ -28834,10 +28870,10 @@ pub fn compile_with_param_slots(
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
-    // One-shot like the requests above: taken here so a bail below cannot leak
-    // this method's ranges into the next compile on this worker thread.
-    let exception_handler_ranges: Vec<(usize, usize, usize)> =
-        PENDING_EXCEPTION_HANDLER_RANGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    // Same one-shot discipline as the flag above.
+    let protected_ranges = PROTECTED_RANGES_REQUEST
+        .with(|c| c.take())
+        .unwrap_or_default();
     // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
     // but the published artifact KEEPS its OSR entries — the trampoline's
     // register-seeded entry contract is exactly what the assignments
@@ -29321,6 +29357,7 @@ pub fn compile_with_param_slots(
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
         precise_exception_frames,
+        protected_ranges,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
     // Safepoint publication plan (arch-2026-07-26 R1). Built here rather than
@@ -29653,7 +29690,7 @@ pub fn compile_with_param_slots(
             code,
             code_len,
             num_params,
-            &exception_handler_ranges,
+            &exception_ranges,
         );
         compiler.local_liveness = liveness;
         compiler.local_liveness_covered = covered;

@@ -7439,12 +7439,39 @@ fn precise_handler_frames_enabled() -> bool {
 /// exception table already exits through an x64 runtime call site that can
 /// publish a precise reason-9 exceptional frame.
 ///
-/// This deliberately recognises only `invokestatic` and monitor operations.
-/// It is enough for javac's ordinary synchronized-loop shape (the synthetic
-/// catch-all protects arithmetic/control-flow plus `monitorexit`) while
-/// keeping array, field, allocation, cast, divide, `athrow`, and ldc failure
-/// paths behind the existing params-only safety gate until each of those
-/// lowerings publishes the same snapshot.
+/// This recognises the four invoke opcodes plus the monitor operations, and
+/// keeps array, field, allocation, cast, divide, `athrow` and ldc failure paths
+/// behind the existing params-only safety gate until each of those lowerings
+/// publishes the same snapshot.
+///
+/// The three non-static invokes (`invokevirtual` / `invokespecial` /
+/// `invokeinterface`, 0xb6/0xb7/0xb9) were added 2026-07-27 after auditing
+/// every lowering their codegen arm can select. Refusing them left ordinary
+/// `try`/`catch` methods permanently interpreted:
+/// `org.apache.tomcat.util.buf.CharsetCache.getCharset` (tomcat doc 23) and
+/// `org.apache.tomcat.util.buf.StringCache.toString` (tomcat doc 30) each die
+/// on a single `invokevirtual` inside their protected range, and an
+/// interpreted `getCharset` costs ~15us per call against ~2us compiled.
+///
+/// The `0xb6 | 0xb7 | 0xb9` arm of `x64::compile` has exactly four exits, and
+/// all four are safe:
+///
+/// * the scalar-replacement `<init>` skip and the `java/lang/Object.<init>()V`
+///   elision emit no call at all, so they cannot throw;
+/// * the inline path is unreachable here — `try_compile_inner` already runs
+///   `inline_sites.clear()` whenever `precise_exception_frames` is set, for
+///   exactly this reason (an inlined callee's throwing operations would land in
+///   this body without independently snapshotting each one); and
+/// * the direct-call path and the MIC / `jit_invoke_dispatch` path both end in
+///   `emit_post_invoke_exception_check`, which is what builds and records the
+///   reason-9 deopt point.
+///
+/// The one lowering that could not honour this is the sibling tail-call, which
+/// tears the frame down before the callee runs, so a throw escapes past the
+/// handler covering that pc. It is now suppressed inside protected ranges
+/// outright (`x64::Compiler::pc_is_protected`) — that was a latent hole for
+/// `invokestatic`, which this list has always admitted, not something the
+/// opcodes added here introduced.
 #[cfg(target_arch = "x86_64")]
 fn precise_exception_frame_sites_supported(
     code: &[u8],
@@ -7472,9 +7499,13 @@ fn precise_exception_frame_sites_supported(
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
+        // 0xb6 invokevirtual, 0xb7 invokespecial, 0xb8 invokestatic,
+        // 0xb9 invokeinterface, 0xc2/0xc3 monitorenter/monitorexit.
+        // 0xba (invokedynamic) is deliberately NOT here: it lowers to an
+        // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb8 | 0xc2 | 0xc3)
+            && !matches!(op, 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
         {
             return false;
         }
@@ -9536,20 +9567,15 @@ fn try_compile_inner(
     // attempt cannot leak the request into the next method compiled on this
     // thread.
     x64::set_precise_exception_frame_request(precise_exception_frames);
-    // Same one-shot discipline: the back-end's liveness scan needs the
-    // exception edges of THIS method (see
-    // `regalloc::live_locals_per_pc_with_handlers`).
-    x64::set_pending_exception_handler_ranges(
+    // Same one-shot contract, set at the same point and for the same reason.
+    // Unlike the flag above this is published for EVERY method with handlers,
+    // not just the precise-frame ones: the sibling tail-call it suppresses
+    // escapes a handler regardless of how that handler reconstructs its locals.
+    x64::set_protected_ranges_request(
         cached
             .exception_table
             .iter()
-            .map(|e| {
-                (
-                    e.start_pc as usize,
-                    e.end_pc as usize,
-                    e.handler_pc as usize,
-                )
-            })
+            .map(|entry| (entry.start_pc as u32, entry.end_pc as u32))
             .collect(),
     );
     // Pure-kernel GPR local homes: this is the METHOD-ENTRY compile path
