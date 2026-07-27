@@ -50,6 +50,14 @@ unbuilt Maven test-webapp submodule, and 2 not-yet-triaged oddities), are in
 
 (HotSpot PASS, CratonVM FAIL/HANG/NOSUMMARY/CRASH, same fixture, same run)
 
+> **90 remaining as of 2026-07-27.** `org.apache.catalina.realm.TestJNDIRealmIntegration`
+> (listed HANG below) is FIXED and re-verified on **this same Linux host and
+> fixture** at dev `66ee9f037`: 5/5 `OK (76 tests)` in 18-34s each, zero
+> stale-pointer events. Root cause was TOMCAT-JNDIREALM-JIT.3 — a per-thread
+> GC-root gap (`string_case_cache` published only to the GC initiator), which
+> also let both `com/unboundid/` JIT bans be removed. See
+> [docs/internal/fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md](../../docs/internal/fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md).
+
 ```
 jakarta.servlet.jsp.el.TestScopedAttributeELResolver          FAIL
 org.apache.catalina.connector.TestResponsePerformance          NOSUMMARY

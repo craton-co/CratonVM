@@ -2471,6 +2471,20 @@ impl<'a> NativeContextImpl<'a> {
             snapshot.push(entry.map);
             snapshot.push(entry.node);
         }
+        // TOMCAT-JNDIREALM-JIT.3 (2026-07-26) — the ASCII case-conversion
+        // cache, under the identical contract as the HashMap node cache above:
+        // three raw `ObjectRef`s per entry that live in NO frame, so this
+        // deposit is the only marking view a peer collector has of them while
+        // this thread is parked. Omitting it let the non-moving young sweep
+        // reclaim a cached `first`/`second` String, after which the owner's
+        // next `get_ascii_case_string_cached` returned the freed address as an
+        // all-zero-header `java/lang/String` receiver. The wake-side remap is
+        // below in `check_post_block_gc_refs`.
+        for entry in &self.thread.string_case_cache {
+            snapshot.push(entry.source);
+            snapshot.push(entry.first);
+            snapshot.push(entry.second);
+        }
         // JNI local references (INT-5): this thread's `JNI_LOCAL_FRAMES`
         // handles. A JNI native that obtained local refs and then re-entered
         // Java (parking at a safepoint) or blocked leaves them populated —
@@ -2789,6 +2803,19 @@ impl<'a> NativeContextImpl<'a> {
             // current-thread `update_all_roots` remap in `memory/gc.rs`.
             for entry in &mut self.thread.jit_hashmap_string_node_cache {
                 for obj_ref in [&mut entry.map, &mut entry.node] {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = fixup.get(&old_addr) {
+                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
+                }
+            }
+            // TOMCAT-JNDIREALM-JIT.3 — blocked-wake remap companion to the
+            // ASCII case-conversion cache publish in
+            // `deposit_root_snapshot_inner`. Without it a move taken while this
+            // thread was parked leaves the cache holding from-space addresses
+            // that the next case conversion would hand back to bytecode.
+            for entry in &mut self.thread.string_case_cache {
+                for obj_ref in [&mut entry.source, &mut entry.first, &mut entry.second] {
                     let old_addr = obj_ref.as_ptr() as usize;
                     if let Some(&new_addr) = fixup.get(&old_addr) {
                         *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
@@ -4332,6 +4359,30 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         invoke_special_shared(
             self.shared,
             self.thread,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
+    fn invoke_special_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Same primitive the JIT's invokespecial resolution uses
+        // (`invoke_special_shared_on_class`) — reused here for reflective
+        // `Method.invoke` dispatch of private / cross-package package-private
+        // instance methods, which has the identical loader-identity
+        // requirement. See the trait method's doc comment.
+        invoke_special_shared_on_class(
+            self.shared,
+            self.thread,
+            class_id,
             class_name,
             method_name,
             descriptor,

@@ -1251,46 +1251,42 @@ fn should_skip_jit_internal(
         // regression witness. `is_snakeyaml_emitter_emit_jit_corruption` is
         // kept as a helper for now (no other caller) in case of regression.
 
-        // TOMCAT-JNDIREALM-RDN.1 (2026-07-15) — the real-network
-        // TestJNDIRealmIntegration matrix passes 76/76 interpreted (and on
-        // HotSpot) but fails 15/76 with the default JIT. The failures are the
-        // RFC 4514 special-character credential cases plus the escaped
-        // semicolon OU cases; both reduce to the in-memory LDAP server's RDN
-        // matching path. Package bisection reduced the producer to
-        // com/unboundid/ldap/sdk/, and method bisection showed that interpreting
-        // only RDN.getNameValuePairs restores the complete 76/76 matrix while
-        // every neighbouring RDN comparison/normalisation method remains JIT
-        // eligible. Keep this small accessor interpreted under the conservative
-        // policy until the JIT's array-backed SortedSet return path is
-        // root-caused. NOTE: since TOMCAT-JNDIREALM-JIT.2 below widened the
-        // ban to all of com/unboundid/, lifting for diagnosis needs the full
-        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ prefix; the narrower
-        // com/unboundid/ldap/sdk/ entry only clears this guard, not JIT.2's.
-        if class_name == "com/unboundid/ldap/sdk/RDN"
-            && method_name == "getNameValuePairs"
-            && !package_allowed("com/unboundid/ldap/sdk/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-
-        // TOMCAT-JNDIREALM-JIT.2 (2026-07-23) -- a second, independent
-        // JIT-only corruption remains in the UnboundID in-memory LDAP path.
-        // The 76-case TestJNDIRealmIntegration matrix is clean in --nojit and
-        // on HotSpot, but default JIT intermittently reuses a zero-header
-        // String receiver during DN/RDN matching (and can subsequently crash).
-        // The pre-existing RDN.getNameValuePairs guard is insufficient: the
-        // failure reproduces when only com/unboundid/* is JIT-eligible, while
-        // the individual ldap/sdk, ldap/matchingrules, asn1, and util package
-        // slices are each clean.  That identifies a cross-package compiled
-        // interaction, not an LDAP or native-JNDI contract issue.  Keep
-        // UnboundID bytecode interpreted under the conservative policy until
-        // the x64 producer is narrowed; callers retain normal JIT coverage. The
-        // guard is explicitly liftable for continuing bisection.
-        if class_name.starts_with("com/unboundid/")
-            && !package_allowed("com/unboundid/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // TOMCAT-JNDIREALM-RDN.1 (2026-07-15) and TOMCAT-JNDIREALM-JIT.2
+        // (2026-07-23) -- BOTH REMOVED 2026-07-26. RDN.1 kept the single
+        // accessor `com/unboundid/ldap/sdk/RDN.getNameValuePairs` interpreted
+        // (15/76 special-character-credential and escaped-OU failures in
+        // Tomcat's `TestJNDIRealmIntegration`); JIT.2 then widened the ban to
+        // ALL of `com/unboundid/` after a second, cross-package producer kept
+        // reusing a zero-header `String` receiver during the in-memory LDAP
+        // server's DN/RDN matching (assertion failures plus access
+        // violations). Both were re-verified as still-live as recently as
+        // 2026-07-26 02:43 UTC.
+        //
+        // Re-verified on this tree with the real 76-case matrix (real UnboundID
+        // in-memory LDAP server, real sockets, the suite runner's own env:
+        // CRATONVM_REAL_NET_SOCKETS / REAL_AQS / ROOTSNAP_CACHE). A same-box
+        // control build at dev e4e4053bb (2026-07-24, the first dev commit
+        // after JIT.2 was recorded) still fails 4 of 5 lifted runs with the
+        // documented signature, so the harness genuinely reproduces here --
+        // this is not a stopped-reproducing-on-Windows artifact.
+        // `CRATONVM_DBG_JITC=1` confirms 566 UnboundID compile events per run
+        // across every package the bisection implicated -- `ldap/sdk` (RDN
+        // included: `getNameValuePairs`, `compare`, `compareTo`),
+        // `ldap/matchingrules`, `ldap/listener`, `ldap/protocol`, `asn1`,
+        // `ldif`, `util` -- i.e. the guarded code really is compiled now, C1
+        // and C2, not merely admitted.
+        //
+        // The bans are removed only because the PRODUCER was found and fixed,
+        // not merely because the assertions stopped failing: TOMCAT-JNDIREALM-
+        // JIT.3, `thread.string_case_cache` missing from every cross-thread GC
+        // root path (see `update_root_snapshot` / `deposit_root_snapshot_inner`
+        // and the frozen-peer scan). Method bisection pinned the trigger to the
+        // single method `com/unboundid/util/StaticUtils.toLowerCase`
+        // (`CRATONVM_JIT_BISECT_SKIP` on it alone took the reclaimed-live-String
+        // count from 3-4 per run to 0 while all other UnboundID classes stayed
+        // compiled), and that method's only work is the case-conversion call
+        // whose per-thread result cache was the unrooted holder. See
+        // `docs/internal/fixed-suite-bugs/tomcat/jndirealmintegration-unboundid-jit-corruption-FIXED.md`.
 
         if callee_saved_gpr_local_homes_enabled()
             && is_known_miscompile(class_name, method_name)
@@ -3686,71 +3682,35 @@ mod tests {
     }
 
     #[test]
-    fn unboundid_rdn_name_value_pairs_skipped_conservatively() {
-        assert_eq!(
-            check(
-                "com/unboundid/ldap/sdk/RDN",
-                "getNameValuePairs",
-                false,
-                true,
-                SkipPolicy::Conservative,
+    fn unboundid_is_jit_eligible_after_jndirealm_ban_removal() {
+        // TOMCAT-JNDIREALM-RDN.1 + JIT.2 removed 2026-07-26. Both the single
+        // accessor RDN.1 named and the wider set of UnboundID classes JIT.2
+        // covered must now be eligible under the CONSERVATIVE policy with no
+        // allow-packages override -- that is exactly the configuration the
+        // real 76-case TestJNDIRealmIntegration matrix runs in.
+        for (class_name, method_name) in [
+            ("com/unboundid/ldap/sdk/RDN", "getNameValuePairs"),
+            ("com/unboundid/ldap/sdk/RDN", "compare"),
+            ("com/unboundid/ldap/sdk/RDN", "compareTo"),
+            ("com/unboundid/ldap/sdk/RDNNameValuePair", "compareTo"),
+            (
+                "com/unboundid/ldap/matchingrules/CaseIgnoreStringMatchingRule",
+                "normalizeInternal",
             ),
-            Some(SkipReason::RustJvmTestFixture)
-        );
-        assert_eq!(
-            check(
-                "com/unboundid/ldap/sdk/RDN",
-                "compare",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "TOMCAT-JNDIREALM-JIT.2 keeps ALL of com/unboundid/ interpreted \
-             (cross-package String-receiver corruption), not just \
-             RDN.getNameValuePairs"
-        );
-    }
-
-    #[test]
-    fn unboundid_rdn_name_value_pairs_lifts_with_allow_packages() {
-        assert_eq!(
-            check_with(
-                "com/unboundid/ldap/sdk/RDN",
-                "getNameValuePairs",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["com/unboundid/"],
-            ),
-            None,
-            "CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ must lift the \
-             TOMCAT-JNDIREALM-JIT.2 package ban for bisection"
-        );
-        assert_eq!(
-            check_with(
-                "com/unboundid/ldap/sdk/RDN",
-                "getNameValuePairs",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["com/unboundid/ldap/sdk/"],
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "a narrower allow entry must NOT lift the JIT.2 ban: the \
-             corruption is a cross-package compiled interaction, so partial \
-             lifts of individually-clean slices would mask the repro"
-        );
-        assert_eq!(
-            check(
-                "com/unboundid/ldap/sdk/RDN",
-                "getNameValuePairs",
-                false,
-                true,
-                SkipPolicy::Aggressive,
-            ),
-            None
-        );
+            ("com/unboundid/asn1/ASN1OctetString", "getValue"),
+            ("com/unboundid/util/ByteStringBuffer", "append"),
+        ] {
+            assert_eq!(
+                check(class_name, method_name, false, true, SkipPolicy::Conservative),
+                None,
+                "{class_name}.{method_name} must be JIT eligible under the \
+                 conservative policy after the TOMCAT-JNDIREALM ban removal"
+            );
+            assert_eq!(
+                check(class_name, method_name, false, true, SkipPolicy::Aggressive),
+                None
+            );
+        }
     }
 
     #[test]
