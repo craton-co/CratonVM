@@ -3196,42 +3196,73 @@ mod tests {
     }
 
     #[test]
-    fn jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal() {
-        // Both JASPER-JDT.2 (org/eclipse/jdt/internal/compiler/parser/) and
-        // JASPER-JDT.3 (org/eclipse/jdt/internal/compiler/ast/) were
-        // removed 2026-07-26 -- see the removal comments above
-        // should_skip_jit_internal for the re-verification evidence (each:
-        // 2 baseline + 2 lifted runs of a real Tomcat integration test
-        // suite -- TestCompiler for JASPER-JDT.2, TestFormAuthenticatorA
-        // for JASPER-JDT.3 -- all runs clean).
-        for method in ["consumeRule", "consumeTypeImportOnDemandDeclarationName"] {
-            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
-                assert_eq!(
-                    check(
-                        "org/eclipse/jdt/internal/compiler/parser/Parser",
-                        method,
-                        false,
-                        true,
-                        policy,
-                    ),
-                    None,
-                    "org/eclipse/jdt/internal/compiler/parser/Parser.{method} must be JIT-eligible now that JASPER-JDT.2 is removed"
-                );
-            }
-        }
-        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
-            assert_eq!(
-                check(
-                    "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
-                    "analyseCode",
-                    false,
-                    true,
-                    policy,
-                ),
-                None,
-                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.analyseCode must be JIT-eligible now that JASPER-JDT.3 is removed"
+    fn jdt_parser_and_ast_packages_are_banned_after_jasper_jdt_2_3_restore() {
+        // JASPER-JDT.2 (`.../compiler/parser/`) and JASPER-JDT.3
+        // (`.../compiler/ast/`) were REMOVED 2026-07-26 and RESTORED
+        // 2026-07-27 -- see the restore comment in `should_skip_jit_internal`.
+        // The removal's four re-verification runs were all made while
+        // `helpers::direct_virtual_compiled_callee_entry_enabled()` was
+        // default-OFF, which gates the only write of `mic.cached_entry_ptr`:
+        // the compiled-to-compiled virtual dispatch this family lives in was
+        // inert for the whole verification, so those runs could not have
+        // reproduced the defect. Turning the flag on brought it straight back
+        // (`jakarta.el.TestOptionalELResolverInJsp`, 3/3 FAIL on / 3/3 PASS
+        // off, same binary).
+        //
+        // This test used to assert the opposite. It was left asserting
+        // JIT-eligibility when the bans came back, so it was failing on `dev`.
+        // Both entries live in the module's `SkipPolicy::Conservative`
+        // block,
+        // like every other package ban here, so Conservative is what they are
+        // asserted under.
+        for (class_name, method) in [
+            (
+                "org/eclipse/jdt/internal/compiler/parser/Parser",
+                "consumeRule",
+            ),
+            (
+                "org/eclipse/jdt/internal/compiler/parser/Parser",
+                "consumeTypeImportOnDemandDeclarationName",
+            ),
+            (
+                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
+                "analyseCode",
+            ),
+        ] {
+            assert!(
+                check(class_name, method, false, true, SkipPolicy::Conservative).is_some(),
+                "{class_name}.{method} must stay JIT-banned: JASPER-JDT.2/.3 are restored"
             );
         }
+    }
+
+    #[test]
+    fn jasper_jdt_bans_are_liftable_for_bisection() {
+        // Both halves stay individually liftable via CRATONVM_JIT_ALLOW_PACKAGES
+        // so a future attempt to remove them can bisect -- but only with the
+        // virtual direct-entry path ON, or it measures nothing.
+        assert_eq!(
+            check_with(
+                "org/eclipse/jdt/internal/compiler/parser/Parser",
+                "consumeRule",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/eclipse/jdt/internal/compiler/parser/"],
+            ),
+            None
+        );
+        assert_eq!(
+            check_with(
+                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
+                "analyseCode",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/eclipse/jdt/internal/compiler/ast/"],
+            ),
+            None
+        );
     }
 
     #[test]

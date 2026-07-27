@@ -1,12 +1,29 @@
-# `org/h2/` JIT ban (HIB-LONGTAIL.1) — residuals 1–3 CLOSED, residual 4 re-measured, ban STAYS
+# `org/h2/` JIT ban (HIB-LONGTAIL.1) — residuals 1–3 CLOSED, residual 4 root-caused, ban STAYS
 
-**Status:** residuals 1, 2 and 3 are FIXED. Residual 4 is still open but is now
-quantified instead of guessed, and the fix the previous revision proposed for it
-is measured and shown to be far too small. The ban itself stays, on new evidence
-that is different from — and stronger than — the evidence it used to rest on.
+**Status (2026-07-27, second pass):** residuals 1, 2 and 3 stay FIXED, and the
+two things the previous revision left open are now closed:
 
-None of the three closed residuals was an H2 bug. Two of them were one general
-VM defect; the third was two concurrency defects stacked.
+* **The `memLZF:` correctness failure is fixed.** It was not a memory-ordering
+  violation in compiled `org/h2` code. `AtomicIntegerArray.compareAndSet` — the
+  spin lock the test uses — was not a compare-and-swap at all. Every
+  read-modify-write native on `AtomicIntegerArray`, `AtomicLongArray`,
+  `AtomicReferenceArray` and `VarHandle` was a bare read followed by a bare
+  write. General VM defect, not H2, not JIT.
+* **The socket half of residual 1's `interruptor` gap is fixed.**
+  `SocketChannel` / `ServerSocketChannel` were left with a null
+  `AbstractInterruptibleChannel.interruptor` because seeding it needs an
+  allocation on a path that carries a warning against allocating. Sequencing the
+  allocation after the monitor fields and pinning across it removes the
+  objection.
+
+**Residual 4 is root-caused** and is no longer "a flat interpreter tail with no
+second hot spot to attack". The 8,600x is one shape of cost in one filesystem
+prefix, plus a JIT compile-cache livelock. Half of it is fixed; the other half
+is named precisely enough to be a bounded project instead of a mystery.
+
+The ban itself **stays**.
+
+None of the closed residuals was an H2 bug.
 
 Predecessors, both archived, neither needed to act on this:
 
@@ -78,13 +95,28 @@ was `NULL` on CratonVM and `…$1` on HotSpot, on every channel, always.
 Fixed by constructing the real `AbstractInterruptibleChannel$1` in the bridge.
 Witness: `regression-suite/src/RChannelInterrupt.java`.
 
-**Still open, deliberately:** `SocketChannel`/`ServerSocketChannel` are built the
-same way and have the same null `interruptor`. Not fixed there — the shared
-`init_channel_locks` carries an explicit, empirically-earned warning against
-allocating on that path (an allocation there previously relocated the channel
-under concurrent load and left `closeLock` null, killing the Apache
-httpasyncclient reactor). Seeding `interruptor` needs an allocation, so it needs
-that path reworked first.
+**Bug B, socket half — now also FIXED (2026-07-27).**
+`SocketChannel` and `ServerSocketChannel` are built by the same bridge and had
+the same null `interruptor`. The previous revision left them alone on the
+grounds that seeding the field needs an allocation, and the shared
+`init_channel_locks` (`native-io/src/socket_channel.rs`) carries an explicit,
+empirically-earned warning against allocating on that path: an allocation there
+once relocated the channel under concurrent load and left `closeLock` null,
+killing the Apache httpasyncclient reactor.
+
+That objection is about **ordering**, not about allocating as such. The three
+monitor fields are now seeded *first* — a moving GC rewrites the reference they
+hold along with every other, so a lock seeded before the allocation survives the
+move — and only then is the interruptor built, with `ch` pinned across the call
+and the live address read back (`pin_native_root` / `read_native_pin`, the
+native stale-local pattern `FileChannelImpl` already uses). `init_channel_locks`
+now returns the post-GC ref and is `#[must_use]`, so no caller can keep using a
+stale one. All three construction sites (`SocketChannel.open`,
+`ServerSocketChannel.open`, `accept`) are covered.
+Witness: `regression-suite/src/RSocketChannelInterrupt.java` — asserts a
+non-null `interruptor` of the JDK's own `AbstractInterruptibleChannel$…` type
+**and** a non-null `closeLock` on all three, so a regression in either direction
+fails. It fails on the pre-fix binary on the first channel it looks at.
 
 ## Residuals 2 and 3 — `TestFreeSpace`, `TestNestedJoins` "300s hang" — FIXED
 
@@ -113,41 +145,180 @@ With the flag on, both classes pass with the ban lifted: `TestFreeSpace` 86s and
 `TestNestedJoins` 54s against a 300s cap — both faster than their own
 ban-in-place times (105s / 157s).
 
-## Residual 4 — `TestFileSystem.testConcurrent` on `nioMemLZF:1:` — STILL OPEN, re-measured
+## The `memLZF:` correctness failure — FIXED, and it was not what the doc said
 
-The class is not uniformly slow. Instrumented per prefix, every other filesystem
-clears in 1–7s (≈13s total); `nioMemLZF:1:` `testConcurrent` alone does not
-finish inside a 25-minute cap. Instrumenting the operation loop gives the rate:
+The previous revision recorded this as the most concrete blocker to lifting the
+ban: with the ban lifted, `TestFileSystem`'s `memLZF:` `testConcurrent` failed
+intermittently (2 of 4 runs) with
 
-| | per 100 operations |
-|---|---|
-| HotSpot | 7–13 ms |
-| CratonVM (ban in place) | ~86,500 ms |
+```
+java.lang.AssertionError: Expected: 3900 actual: 3897
+java.lang.AssertionError: Expected: 5128 actual: 5168
+```
 
-**~8,600x, and steady** (86.5s, 86.5s, 82.8s, 87.2s per 100 ops) — a constant
-per-operation cost, not a leak, livelock or degradation. 10,000 operations at
-that rate is ~2.4 hours.
+and it concluded: "The reader holds the same `AtomicIntegerArray` spin lock the
+writer held … seeing fresh file contents with a stale `expected` is a
+memory-ordering violation … That points at compiled `org/h2` code reordering
+across `AtomicIntegerArray.set`/`compareAndSet`."
 
-**The previous revision's "one concrete lead" is measured and is not enough.**
-It proposed threading `ResolvedMethod::native_target`/`native_kind` through
-`invoke_or_native` so the native registry is not probed per call, citing a
-profile that attributed 12.2% to `NativeMethodRegistry::slot_for_exact`. That
-attribution still holds — `slot_for_exact` remains the single largest symbol at
-7.6–12.4% depending on configuration — but a 12% saving against an 8,600x gap
-is not a fix, and the profile behind it is otherwise flat: a long interpreter
-tail with no second hot spot to attack. This is a throughput project on
-interpreted LZF + `ByteBuffer` inside a backoff-free spin lock, not a residual.
+The reader does not hold the same lock, because there was no lock.
+`AtomicIntegerArray.compareAndSet` was implemented as
 
-Lifting the `org/h2/` ban does not help either (it stalls at the same prefix),
-and it makes the sibling `memLZF:` prefix fail outright — see below.
+```rust
+let cur = ctx.get_array_element(arr, idx);
+if cur == expected {
+    ctx.set_array_element(arr, idx, Value::Int(update));
+    Ok(Some(Value::Int(1)))          // "I won"
+}
+```
+
+— a plain read, a comparison, and a plain write, with nothing in between. Two
+threads can both read `0` and both report success. H2 spells its lock exactly
+this way:
+
+```java
+while (!locks.compareAndSet(pos, 0, 1)) { }
+try { e = expected.get(pos); f.read(byteBuff, pos * 64 * 1024); }
+finally { locks.set(pos, 0); }
+```
+
+so writer and reader ran the critical section simultaneously, and the reader
+read one of `expected` / the file on each side of the writer's update. That
+produces mismatches in **both** directions, which is what the two recorded
+assertions show (3900 vs 3897 one way, 5128 vs 5168 the other) — a pure
+reordering story only explains one.
+
+It is a general VM defect, and it was the whole family, not one method:
+`AtomicIntegerArray`, `AtomicLongArray` and `AtomicReferenceArray` had this
+shape in **both** of their registration sites
+(`native-builtins/src/util_concurrent_ext.rs`, used in real-JDK mode, and
+`native-builtins/src/phases_early.rs`, used in synthetic-jdk mode) for
+`compareAndSet`, `getAndSet`, `getAndAdd`, `getAndIncrement`, `getAndDecrement`,
+`incrementAndGet` and `decrementAndGet`. `VarHandle.compareAndSet` and its
+`weakCompareAndSet*` aliases (`native-builtins/src/phases_late/reflect_invoke.rs`)
+had it too, on both the array-element and instance-field paths. The scalar
+`AtomicInteger` / `AtomicLong` natives were always correct — they use
+`NativeContext::compare_and_swap_field`, which takes the per-object CAS lock.
+The array classes simply never got the same treatment.
+
+Fixed by routing every array RMW through `compare_and_swap_field`, which already
+special-cases array receivers, via two helpers in `util_concurrent_ext.rs`
+(`atomic_array_cas`, `atomic_array_rmw`). While there: the interpreter
+force-routes a fixed method list for these three classes to a native (the "C23"
+block in `vm/src/vm/vm_exec.rs`, because the real JDK bodies go through
+`VarHandles$Array$*`), and a dozen names on that list had no registration and so
+fell back to exactly the bytecode the force-route exists to avoid —
+`addAndGet`, `lazySet`, `getPlain`/`setPlain`, `getAcquire`/`setRelease`,
+`getOpaque`/`setOpaque`, `weakCompareAndSet*`, `compareAndExchange*`. Registered.
+`VarHandle` statics keep the old read-then-write shape: there is no static-field
+CAS primitive on `NativeContext` to route them through.
+
+Witness: `regression-suite/src/RAtomicArray.java`. Four threads take a
+per-slot `compareAndSet` lock 80,000 times and check that only one is ever
+inside; plus contended `getAndIncrement`/`addAndGet` totals, contended
+`AtomicReferenceArray` null→token claims, and single-threaded return-value
+conformance diffed against HotSpot. It fails on the pre-fix binary **on every
+run, within a second**, which is the useful part: the H2 face needed a 10,000
+operation run and reproduced 2 times in 4.
+
+## Residual 4 — `TestFileSystem.testConcurrent` on `nioMemLZF:1:` — root-caused
+
+The previous revision measured the gap and stopped, calling the profile "a long
+interpreter tail with no second hot spot to attack" and the whole thing "a
+throughput project on interpreted LZF + `ByteBuffer` inside a backoff-free spin
+lock". Three of those four nouns are wrong.
+
+Measurements below are from `LzfProbe`, a standalone replica of
+`testConcurrent` (see *Reproducing*) that reports ms per 100 operations, so the
+loop can be measured in seconds instead of against a 25-minute cap.
+
+**It is not the spin lock.** Running the writer alone, with no reader thread and
+therefore no contention at all, still costs 42,860 ms per 100 operations against
+HotSpot's 7–13 ms.
+
+**It is not LZF, and it is not interpretation in general.** The same probe on
+the same data through the *uncompressed* sibling prefix is 7.5 ms per 100
+operations — HotSpot speed. And the `byte[]`-backed compressed prefix,
+`memLZF:`, which runs the identical `CompressLZF` code, is 1.93 ms/op against
+HotSpot's 0.06 — a 32x interpreter ratio, entirely ordinary.
+
+| prefix (writer only, 100 ops) | HotSpot | CratonVM |
+|---|---|---|
+| `nioMemFS:` (no compression) | ~7 ms | 7.5 ms |
+| `memLZF:` (LZF over `byte[]`) | ~6 ms | ~193 ms |
+| `nioMemLZF:1:` (LZF over `ByteBuffer`) | 7–13 ms | 42,860 ms |
+
+**What it actually is:** `FileNioMemData` stores its pages as
+`ByteBuffer.allocateDirect`, so it calls the `CompressLZF.compress(ByteBuffer,
+…)` / `expand(ByteBuffer, ByteBuffer)` overloads, which read and write **one
+byte at a time through `DirectByteBuffer.get(int)` / `put(int, byte)`**. A 64 KB
+page is ~65,000 of those per pass and each one is a full interpreted
+`invokevirtual` into a JDK method — roughly half a microsecond end-to-end. Two
+to four page passes per operation is ~250 KB of per-byte traffic, which is the
+428 ms. `memLZF:` runs the same algorithm over a `byte[]`, where the same loop
+is `baload`/`bastore`, and is 200x faster for it.
+
+The profile is consistent with that and only reads as "flat" if you do not know
+what is being called: `NativeMethodRegistry::slot_for_exact` 14.4%,
+`try_jit_compile_callee` 8.2%, `__memcmp_evex_movbe` 3.9%,
+`jit_invoke_virtual_mic` 3.2%, `execute_invokevirtual_cached` 2.7%,
+`safe_native_call_impl` 2.7%, `invoke_or_native` 2.3% — every one of them
+per-invoke dispatch overhead, paid ~65,000 times per page. `slot_for_exact` is
+top because it is a *miss*: `DirectByteBuffer.get(I)B` is real JDK bytecode, so
+the registry is digested and probed on every call only to answer "no native".
+
+This is still a project, but a bounded and general one — per-call-site
+memoisation of the native-registry answer, or an interpreter intrinsic for
+`ByteBuffer` element access — and it is worth far more than this test. It is
+**not** fixed here.
+
+### What IS fixed: the OSR compile livelock
+
+`CRATONVM_DBG_JIT_COMPILED` on the ban-lifted arm showed
+`org/h2/compress/CompressLZF.compress(Ljava/nio/ByteBuffer;I[BI)I` — the hottest
+method in the whole workload — being OSR-compiled **701 times in 20
+operations**. `CRATONVM_DBG_JITC` showed all of them at the *same* back-edge,
+`entry_pc=220`.
+
+The cause is a disagreement inside the OSR pipeline. A compile is requested for
+one back-edge PC; the artifact then decides for itself which PCs it will accept,
+and `can_osr_enter` refuses any PC whose `osr_dead_mask` is non-zero. Those two
+decisions can disagree — the compile succeeds and the resulting body refuses the
+very entry it was compiled for — and nothing memoised the disagreement, so the
+next trip over the same back-edge ran the full x64 pipeline again, forever, for
+zero executed compiled code. It is the same waste loop this module already
+memoises twice (RBC.2's 2,610 recompiles of `SecP521R1Curve$1.lookup`, RBC.4's
+35,923 re-run pipelines on `Nat.inc`) and it was simply missing a third memo.
+
+Two fixes, both in the general JIT:
+
+1. **A per-(method, entry_pc) OSR reject memo** (`jit::mark_osr_entry_rejected` /
+   `is_osr_entry_rejected`, consulted by `compile_osr_artifact`). The verdict is
+   a pure function of a deterministic compile, so it is permanent. Keyed per PC,
+   not per method, because a method's other back-edges are usually fine.
+   **701 compiles → 1.**
+2. **A precise `osr_dead_mask`** (`jit/src/x64.rs`). The mask was
+   `every register-resident local not live at this PC`, but the hazard the
+   2026-07-04 refusal rests on is *sharing*: a dead local whose register is also
+   a live local's home. A dead local that owns its register outright has no
+   coalesced state to reconstruct. The mask now names only the sharing ones.
+   `CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1` restores the old behaviour.
+   `CRATONVM_DBG_OSR_META` now prints the published mask next to the blanket set
+   it is refined from — it previously recomputed the blanket value and so would
+   have silently disagreed with the real metadata.
+
+`entry_pc=220` in `CompressLZF.compress` is still refused after (2): its two
+dead locals genuinely do share registers with live ones. The memo is what turns
+that from a livelock into a single wasted compile.
 
 ## Where the ban stands — it STAYS
 
-Same-binary 218-class A/B, with the dispatch fix in place throughout:
+Same-binary 218-class A/B from the previous revision, with the dispatch fix in
+place throughout:
 
 | arm | PASS | FAIL | HANG | CRASH |
 |---|---|---|---|---|
-| dispatch flag OFF, ban in place (previous dev behaviour) | 162 | 24 | 32 | 0 |
+| dispatch flag OFF, ban in place (pre-2026-07-27 dev behaviour) | 162 | 24 | 32 | 0 |
 | dispatch flag ON, ban in place | **166** | 21 | 31 | 0 |
 | dispatch flag ON, ban lifted | 155 | 28 | 32 | 3 |
 
@@ -156,28 +327,14 @@ were re-run 3x each in isolation and both are artifacts of running three suites
 concurrently (`TestMvccMultiThreaded` passes 3/3 in *both* configurations;
 `TestOpenClose` hangs 3/3 in *both*).
 
-Lifting the ban still costs 11 net PASS and introduces three CRASHes
-(`TestRunscript`, `TestPageStoreCoverage`, `TestReopen`). Note that
-`TestReopen` was one of the six classes the previous revision recorded as
-*closed* — it regressed again once the dispatch fix let compiled H2 code
-actually run compiled, which is a good reason to distrust any per-class verdict
-taken before that fix.
-
-The most concrete new blocker is a **correctness** failure, not a throughput
-one: with the ban lifted, `TestFileSystem`'s `memLZF:` `testConcurrent` fails
-intermittently (2 of 4 runs) with
-
-```
-java.lang.AssertionError: Expected: 3900 actual: 3897
-java.lang.AssertionError: Expected: 5128 actual: 5168
-```
-
-The reader holds the same `AtomicIntegerArray` spin lock the writer held, and
-reads `expected.get(pos)` and then the file contents; seeing fresh file contents
-with a stale `expected` is a memory-ordering violation, since the writer wrote
-the file, then `expected`, then released the lock. That points at compiled
-`org/h2` code reordering across `AtomicIntegerArray.set`/`compareAndSet`, and it
-is the thing to root-cause before lifting this ban is worth attempting again.
+The `memLZF:` correctness failure that this revision fixes was the strongest
+argument against lifting, and it is gone. What remains is the throughput
+deficit: lifting still costs net PASS, `nioMemLZF:` still does not finish, and
+the three CRASHes (`TestRunscript`, `TestPageStoreCoverage`, `TestReopen`) are
+untouched by anything here. Note that `TestReopen` was one of the six classes an
+earlier revision recorded as *closed* — it regressed again once the dispatch fix
+let compiled H2 code actually run compiled, which is a good reason to distrust
+any per-class verdict taken before that fix.
 
 ## The flip's own fallout: two Eclipse JDT bans had to be RESTORED
 
@@ -207,11 +364,7 @@ reproduced the defect whatever its state. Same shadowing shape this module
 already annotates for other removed bans, just hidden behind a flag instead of
 behind another rule.
 
-Both are restored. `parser/` is directly re-confirmed by the bisection above;
-`ast/` is restored on the shadowing argument alone — its own repro
-(`TestFormAuthenticatorA`) has not been re-run under the flag, and leaving it
-out would assert something no measurement supports. With both back,
-`TestOptionalELResolverInJsp` is 3/3 PASS with the flag on.
+Both are restored. `parser/` is directly re-confirmed by the bisection above.
 
 **The rule this leaves behind:** any ban whose mechanism is compiled-to-compiled
 virtual dispatch must be re-verified with
@@ -219,45 +372,19 @@ virtual dispatch must be re-verified with
 nothing. That flag was default-OFF for the entire period in which the
 2026-07-25/26 ban sweep did its removals.
 
-## The flip's own fallout: two Eclipse JDT bans had to be RESTORED
+(This section appeared twice, verbatim, in the previous revision. Deduplicated.)
 
-Turning the dispatch flag on regressed one Tomcat class:
-`jakarta.el.TestOptionalELResolverInJsp` went PASS -> FAIL, reproducibly (3/3
-with the flag on, 3/3 PASS with it off, same binary, run in isolation). Its JSP
-compile dies inside the Eclipse JDT compiler with
+### The unit test the restore left failing
 
-```
-ClassCastException: org.eclipse.jdt.internal.compiler.ast.QualifiedTypeReference
-  cannot be cast to org.eclipse.jdt.internal.compiler.ast.FieldDeclaration
-  -> JasperException: Unable to compile class for JSP  -> HTTP 500
-```
-
-`CRATONVM_JIT_DENY` bisection puts it in
-`org/eclipse/jdt/internal/compiler/parser/` — denying that one package restores
-PASS, while denying `ast/`, `lookup/` or `util/` does not.
-
-That package is **JASPER-JDT.2**, and it was REMOVED on 2026-07-26 as "no longer
-reproduces on current dev", along with its sibling JASPER-JDT.3 (`ast/`). Both
-removals were careful — four repeat runs each, real Tomcat fixtures — and both
-are void, because every one of those runs was made while the virtual
-direct-entry path was default-OFF. With that flag off a compiled caller never
-reaches a compiled callee at all, so the compiled-to-compiled dispatch these
-bans guard was *inert during the verification*: those runs could not have
-reproduced the defect whatever its state. Same shadowing shape this module
-already annotates for other removed bans, just hidden behind a flag instead of
-behind another rule.
-
-Both are restored. `parser/` is directly re-confirmed by the bisection above;
-`ast/` is restored on the shadowing argument alone — its own repro
-(`TestFormAuthenticatorA`) has not been re-run under the flag, and leaving it
-out would assert something no measurement supports. With both back,
-`TestOptionalELResolverInJsp` is 3/3 PASS with the flag on.
-
-**The rule this leaves behind:** any ban whose mechanism is compiled-to-compiled
-virtual dispatch must be re-verified with
-`CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` **on**, or it verifies
-nothing. That flag was default-OFF for the entire period in which the
-2026-07-25/26 ban sweep did its removals.
+`vm/src/jit/skip_list.rs` still carried
+`jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal`,
+asserting `check(...) == None` for both packages. The restore put the ban entries
+back and did not touch the test, so it asserted the opposite of the shipped
+behaviour and was failing on `dev`. Replaced with
+`jdt_parser_and_ast_packages_are_banned_after_jasper_jdt_2_3_restore` plus
+`jasper_jdt_bans_are_liftable_for_bisection`, which pins that each half stays
+individually liftable via `CRATONVM_JIT_ALLOW_PACKAGES` so a future removal
+attempt can still bisect.
 
 ## Also fixed — `ClassCastException` named an array receiver by its component
 
@@ -269,7 +396,7 @@ descriptor. Fixed in both; nested and primitive arrays covered; asserted on the
 interpreted and the compiled path in
 `regression-suite/src/RJitArrayTypecheck.java`.
 
-## Two diagnostics added, both permanent and env-gated
+## Three diagnostics added, all permanent and env-gated
 
 * `CRATONVM_DBG_INTERRUPT` — one line plus the Java frame stack for every
   `Thread.interrupt()`. A spurious interrupt is invisible where it is
@@ -278,16 +405,47 @@ interpreted and the compiled path in
 * `CRATONVM_DBG_JIT_COMPILED` — one line per successfully published
   compilation. The only way to answer "is this method actually running
   compiled?", which is exactly what an A/B that differs only in throughput
-  cannot tell you.
+  cannot tell you. Tallying its output is what found the 701-compile livelock.
+* `CRATONVM_DBG_JITC` `OSR-compile` / `OSR-reuse` / `OSR-reject` lines carry
+  `entry_pc`, which is what separated "many back-edges" from "one back-edge, 256
+  times" in about a minute.
 
 ## Not caused by any of this, found on the way
 
-`RCollections` and `RReflect` in `regression-suite/` already fail on `dev`,
-independently (verified on three separately built dev-based binaries and with
-the dispatch flag both on and off): a null `String` receiver in a collections
-path, and an empty `getSimpleName()` for an anonymous class.
+`RCollections` and `RReflect` in `regression-suite/` were recorded here as
+failing on `dev`. They pass now: `fix/regsuite-rcollections-rreflect-20260726`
+landed on `dev` in the meantime (`75fdcdbff`, `AbstractSet.hashCode` on foreign
+layouts + anonymous/local class naming). Verified, not assumed — the full
+17-class suite is green on the binary this revision was validated with.
 
 ## Reproducing
+
+### The atomic-array defect (seconds, no H2 needed)
+
+```bash
+CV=<binary> JDK=/data/data/jdk25-real ONLY=RAtomicArray bash regression-suite/run.sh
+```
+
+### The `nioMemLZF:` throughput gap (minutes, no suite runner needed)
+
+`LzfProbe.java` (a standalone replica of `testConcurrent` with per-100-operation
+timing; `-Dprobe.reader=false` drops the reader thread to separate contention
+from per-operation cost):
+
+```bash
+H2CP=/data/data/h2database/h2/target/classes
+javac -cp $H2CP -d /data/tmp/probe LzfProbe.java
+TMPDIR=/data/tmp <binary> --java-home /data/data/jdk25-real \
+  -Dprobe.reader=false -cp $H2CP:/data/tmp/probe \
+  LzfProbe 'nioMemLZF:1:/probe' 100
+```
+
+Swap the prefix for `nioMemFS:1:`, `memLZF:1:` or `memFS:1:` for the comparison
+row. Add `CRATONVM_DBG_JIT_COMPILED=1` and pipe through
+`grep DBG_JIT_COMPILED | sed 's/.*: //' | sort | uniq -c | sort -rn` to see the
+compile tally.
+
+### The full suite
 
 ```bash
 cd apps/h2database-suite-runner
@@ -314,6 +472,12 @@ re-runs.
 - `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment and the restored
   `JASPER-JDT.2`/`.3` entries.
 - `vm/src/jit/helpers.rs` — `direct_virtual_compiled_callee_entry_enabled`.
+- `native-builtins/src/util_concurrent_ext.rs` — `atomic_array_cas` /
+  `atomic_array_rmw`, and the comment recording why the array atomics were not
+  atomic.
+- `jit/src/x64.rs` — the precise `osr_dead_mask`.
+- `docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md` — the
+  2026-07-04 decision the dead-mask refinement is careful to preserve.
 - `docs/known-issues/jit-bans/jit-ban-sweep-consolidated-status-20260726.md` — the sweep this came out of.
 - `docs/known-issues/jit-bans/full-ban-inventory-status-20260726.md` — the cross-session ban tracker.
 - `docs/known-issues/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` — the

@@ -6228,6 +6228,82 @@ pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
 }
 
+// ---------------------------------------------------------------------------
+// OSR entry-point reject memo
+// ---------------------------------------------------------------------------
+//
+// An OSR compile is requested for one specific back-edge PC, but the artifact
+// it produces decides for itself which PCs it will accept: `can_osr_enter`
+// refuses any PC whose `osr_dead_mask` is non-zero (a dead interpreter local
+// sharing a compiled location with a live one — state OSR cannot reconstruct).
+// Those two decisions are made by different parts of the pipeline, and they can
+// disagree: the compile succeeds and the resulting body then refuses the very
+// entry it was compiled for.
+//
+// Nothing memoised that disagreement, so the next trip over the same back-edge
+// ran the FULL x64 pipeline again, for the same PC, to the same conclusion —
+// forever. Measured on `org/h2/compress/CompressLZF.compress(Ljava/nio/
+// ByteBuffer;I[BI)I`: 256 compiles of `entry_pc=220` in ten operations of H2's
+// `TestFileSystem` `nioMemLZF:` case, zero OSR entries, zero compiled code
+// executed (2026-07-27). Same shape as the two waste loops this module already
+// memoises — RBC.2's 2,610 recompiles of `SecP521R1Curve$1.lookup` and RBC.4's
+// 35,923 re-run pipelines on `Nat.inc`.
+//
+// The rejection is a pure function of the compile, which is deterministic for a
+// given method, so it is permanent. It is keyed per (method, entry_pc) rather
+// than per method: a method's other back-edges are usually fine, and banning
+// all of them would cost real throughput.
+static OSR_ENTRY_REJECTS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn osr_entry_rejects() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>> {
+    OSR_ENTRY_REJECTS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+fn osr_reject_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
+    // Same sentinel-ClassId rationale as `is_jit_bail_listed`: this is a
+    // negative cache, so a cross-loader name collision only costs one method
+    // one OSR entry point.
+    compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    )
+}
+
+/// Whether a previous OSR compile for this method produced a body that refused
+/// to OSR-enter at `entry_pc`. Checked before re-running the OSR pipeline.
+pub fn is_osr_entry_rejected(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) -> bool {
+    osr_entry_rejects()
+        .read()
+        .contains(&(osr_reject_key(class_name, method_name, descriptor), entry_pc))
+}
+
+/// Record that compiling this method for `entry_pc` yields a body that cannot
+/// enter there, so the pipeline is never re-run for that PC.
+pub fn mark_osr_entry_rejected(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) {
+    osr_entry_rejects()
+        .write()
+        .insert((osr_reject_key(class_name, method_name, descriptor), entry_pc));
+}
+
+/// Diagnostic: number of (method, entry_pc) pairs currently OSR-reject-memoed.
+pub fn osr_entry_reject_count() -> usize {
+    osr_entry_rejects().read().len()
+}
+
 /// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
 /// `None` = disabled.
 fn jit_deny_filter() -> Option<&'static Vec<String>> {

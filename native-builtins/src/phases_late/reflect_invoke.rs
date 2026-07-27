@@ -212,6 +212,35 @@ pub(crate) fn vh_get(ctx: &dyn NativeContext, vh: ObjectRef, target: Option<Obje
     }
 }
 
+/// Resolve the `(holder object, field slot)` a non-static VarHandle points at,
+/// so a caller can use the real `compare_and_swap_field` primitive instead of
+/// a `vh_get` / `vh_set` pair with a race between them.
+///
+/// Returns `None` for static VarHandles (no static-field CAS primitive exists)
+/// and for the legacy array-backed convention that `vh_get` falls back to
+/// (`object_num_fields(vh) < VH_NUM_FIELDS`), both of which keep the old path.
+pub(crate) fn vh_instance_slot(
+    ctx: &dyn NativeContext,
+    vh: ObjectRef,
+    target: Option<ObjectRef>,
+) -> Option<(ObjectRef, usize)> {
+    if ctx.object_num_fields(vh) < VH_NUM_FIELDS {
+        return None;
+    }
+    if ctx.get_field(vh, VH_IS_STATIC).as_int().unwrap_or(0) != 0 {
+        return None;
+    }
+    let field_idx = ctx.get_field(vh, VH_FIELD_INDEX).as_int().unwrap_or(0) as usize;
+    let obj = target.or_else(|| {
+        if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) {
+            o
+        } else {
+            None
+        }
+    })?;
+    Some((obj, field_idx))
+}
+
 /// Write the value a VarHandle points to (instance or static).
 pub(crate) fn vh_set(
     ctx: &mut dyn NativeContext,
@@ -967,11 +996,14 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             };
             let expected = args.get(3).copied().unwrap_or(Value::Object(None));
             let new_val = args.get(4).copied().unwrap_or(Value::Object(None));
-            let current = ctx.get_array_element(arr, idx);
-            let success = values_equal(&current, &expected);
-            if success {
-                ctx.set_array_element(arr, idx, new_val);
-            }
+            // `compare_and_swap_field` special-cases array receivers and does
+            // the read/compare/write under the per-object CAS lock. The old
+            // `get_array_element` + `set_array_element` pair had nothing
+            // between the two, so two threads could both observe `expected`
+            // and both report success -- a `compareAndSet` that provides no
+            // mutual exclusion. Same defect the atomic-array natives carried
+            // (see `util_concurrent_ext::atomic_array_cas`, 2026-07-27).
+            let success = ctx.compare_and_swap_field(arr, idx, expected, new_val);
             return Ok(Some(Value::Int(if success { 1 } else { 0 })));
         }
         let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
@@ -992,6 +1024,14 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
                 args.get(3).copied().unwrap_or(Value::Object(None)),
             )
         };
+        // Instance fields go through the real CAS primitive; the plain
+        // read-then-write this used to do let two threads both win the same
+        // compareAndSet. Statics keep the old shape: there is no static-field
+        // CAS on `NativeContext` to route them through.
+        if let Some((holder, field_idx)) = vh_instance_slot(ctx, this, target) {
+            let success = ctx.compare_and_swap_field(holder, field_idx, expected, new_val);
+            return Ok(Some(Value::Int(if success { 1 } else { 0 })));
+        }
         let current = vh_get(ctx, this, target);
         let success = values_equal(&current, &expected);
         if success {

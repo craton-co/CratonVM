@@ -379,7 +379,11 @@ fn alloc_obj(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> O
 /// overridable `SocketChannelImpl.close`), so a null `closeLock` killed the
 /// reactor worker under load → "I/O reactor has been shut down" (ES
 /// testManyAsyncRequests). Idempotent; safe to call on any channel.
-fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) {
+///
+/// Returns the channel ref, which the caller MUST use from here on: seeding
+/// `interruptor` allocates, and an allocation can move `ch`.
+#[must_use]
+fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
     // Seed each monitor field with the channel object ITSELF rather than a fresh
     // `new Object()`. The fields only need to be a non-null, stable monitor; the
     // channel is one, and using it avoids the allocation entirely — which matters
@@ -389,11 +393,68 @@ fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) {
     // testManyAsyncRequests). `synchronized(closeLock)` then `synchronized(keyLock)`
     // both lock the same channel monitor reentrantly (same thread) — correct, and
     // distinct channels still use distinct monitors.
+    //
+    // These three MUST be seeded before `seed_channel_interruptor` below, which
+    // does allocate: if that allocation moves `ch`, a moving GC rewrites the
+    // reference stored in these slots along with every other, so a lock seeded
+    // first survives the move. A lock seeded after would be written to a stale
+    // address instead — which is the exact failure the paragraph above records.
     for f in ["closeLock", "keyLock", "regLock"] {
         if !matches!(ctx.get_field_by_name(ch, f), Value::Object(Some(_))) {
             ctx.set_field_by_name(ch, f, Value::Object(Some(ch)));
         }
     }
+    seed_channel_interruptor(ctx, ch)
+}
+
+/// Seed `AbstractInterruptibleChannel.interruptor` on a bridge-built channel.
+///
+/// `interruptor` is a `final` field the real `AbstractInterruptibleChannel()`
+/// constructor always assigns, and `begin()` dereferences it unconditionally
+/// once `Thread.currentThread().isInterrupted()` is true. CratonVM builds
+/// socket channels without running that constructor, so the slot stayed null
+/// and ANY channel operation on a thread whose interrupt flag happened to be
+/// set died with
+/// `NullPointerException: Cannot invoke "sun.nio.ch.Interruptible.interrupt(
+/// java.lang.Thread)" because "this.interruptor" is null`
+/// instead of performing the specified asynchronous close.
+///
+/// `sun/nio/ch/FileChannelImpl` was fixed for the H2 `TestStreamStore` NPE on
+/// 2026-07-26; the socket channels were left open then because seeding needs an
+/// allocation and this path carries an empirically-earned warning against
+/// allocating (see `init_channel_locks`). Sequencing the allocation AFTER the
+/// three monitor fields, and pinning `ch` across it, removes that objection:
+/// nothing that can be left null by a relocation is written afterwards, and the
+/// caller is handed the post-GC ref.
+///
+/// Returns the (possibly relocated) channel ref.
+#[must_use]
+fn seed_channel_interruptor(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
+    if matches!(ctx.get_field_by_name(ch, "interruptor"), Value::Object(Some(_))) {
+        return ch;
+    }
+    // `new_object_initialized` allocates and runs bytecode, either of which can
+    // relocate `ch`; pin it across the call and read the live address back
+    // (native stale-local family).
+    let pin = ctx.pin_native_root(ch);
+    let interruptor = ctx
+        .new_object_initialized(
+            "java/nio/channels/spi/AbstractInterruptibleChannel$1",
+            "(Ljava/nio/channels/spi/AbstractInterruptibleChannel;)V",
+            &[Value::Object(Some(ch))],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Object(None));
+    let ch = ctx.read_native_pin(pin, ch);
+    ctx.unpin_native_roots(pin);
+    // In synthetic-JDK mode the anonymous class does not exist and the
+    // construction above fails; writing null is then exactly the previous
+    // behaviour, and `set_field_by_name` is a no-op when the slot is absent.
+    if matches!(interruptor, Value::Object(Some(_))) {
+        ctx.set_field_by_name(ch, "interruptor", interruptor);
+    }
+    ch
 }
 
 /// Layout convention:
@@ -836,7 +897,7 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
 /// or connect yet; that happens on `connect`.
 fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    init_channel_locks(ctx, ch);
+    let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -2563,7 +2624,7 @@ pub(crate) fn supported_socket_options_pub(ctx: &mut dyn NativeContext) -> Metho
 
 fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", N_FIELDS);
-    init_channel_locks(ctx, ch);
+    let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -2705,7 +2766,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tcp_blocking_state().write().insert(new_id, blocking);
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    init_channel_locks(ctx, child);
+    let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(
         ctx,
