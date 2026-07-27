@@ -224,6 +224,9 @@ struct Lowerer<'a> {
     /// instance-field reads route through it so receivers are validated against
     /// the live heap before any object-header dereference.
     getfield: usize,
+    /// Compact-layout/TLAB-aware object allocation helper. Live `Op::New`
+    /// nodes use the same shared runtime-lowering stub as the baseline tier.
+    new_object: usize,
     /// Cooperative GC poll flag and no-argument slow path. IR values are
     /// canonicalized in frame slots, so the slow-path call needs no spill.
     safepoint_flag_addr: usize,
@@ -332,6 +335,9 @@ impl<'a> Lowerer<'a> {
             if helpers.getfield != 0 && matches!(n.op, Op::Load(_)) {
                 needs_context = true;
             }
+            if matches!(n.op, Op::New { .. }) {
+                needs_context = true;
+            }
         }
 
         // Frame layout (rbp downward): locals, [context slot], spills, [args
@@ -405,6 +411,7 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
+            new_object: helpers.new_object,
             safepoint_flag_addr: helpers.safepoint_flag_addr,
             safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
@@ -1675,6 +1682,40 @@ impl<'a> Lowerer<'a> {
                 // MOV RAX, RDX
                 self.buf.emit(&[0x48, 0x89, 0xD0]);
                 self.patch_div_overflow_after(ovf_after);
+                self.store_rax(slot);
+            }
+            Op::New {
+                class_id,
+                num_fields,
+            } => {
+                let slot = self.alloc_slot(id);
+                crate::runtime_lowering::emit_new_object_stub(
+                    &mut self.buf,
+                    self.context_slot_off,
+                    self.new_object,
+                    *class_id,
+                    *num_fields,
+                    self.frame_record,
+                );
+
+                // `jit_new_object` returns null after publishing a pending
+                // initialization/OOM exception. Convert that private sentinel
+                // to the JIT-wide i64::MIN return before entering the shared
+                // exception epilogue, matching the baseline tier.
+                self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+                self.buf.emit(&[0x0F, 0x85]); // JNZ allocated
+                let allocated_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+                self.buf.emit_byte(0xE9); // JMP shared exception epilogue
+                let exception_patch = self.buf.pos();
+                self.buf.emit(&[0; 4]);
+                self.call_exc_patches.push(exception_patch);
+                let allocated = self.buf.pos();
+                let rel = allocated as i32 - (allocated_patch as i32 + 4);
+                self.buf
+                    .try_patch_i32(allocated_patch, rel)
+                    .expect("allocation success patch in-bounds");
                 self.store_rax(slot);
             }
             Op::Neg => {
@@ -3138,6 +3179,17 @@ pub(crate) fn lower_inner(
     // site keeps the historical helper dispatch.
     ic_slots: &HashMap<usize, (usize, usize)>,
 ) -> Option<CompiledMethod> {
+    // A live object allocation is now supported by the common allocation
+    // stub. A zero helper pointer is only possible in synthetic unit-test
+    // tables; reject it instead of emitting a call through address zero.
+    if helpers.new_object == 0
+        && graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, Op::New { .. }))
+    {
+        return None;
+    }
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
     // MIC + 4-way-PIC dual-ABI inline-cache site emits ~360 and a direct call
@@ -3287,6 +3339,97 @@ mod tests {
     /// all-integer (usize) fields, so an all-zero bit pattern is a valid value.
     fn no_helpers() -> JitRuntimeHelpers {
         unsafe { std::mem::zeroed() }
+    }
+
+    #[test]
+    fn live_new_uses_shared_allocation_stub_and_context_abi() {
+        extern "C" fn allocate(vm: i64, class_id: i64, num_fields: i64) -> i64 {
+            vm + class_id * 100 + num_fields
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let allocation = graph.add(
+            Op::New {
+                class_id: 23,
+                num_fields: 7,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            Some(0),
+        );
+        graph.exit = graph.add(
+            Op::Return,
+            IrType::Void,
+            vec![ctrl, allocation],
+            Some(3),
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.new_object = allocate as *const () as usize;
+        let compiled =
+            lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation must lower");
+        assert!(compiled.needs_context);
+        // SAFETY: the synthetic helper treats the context as an integer and the
+        // generated method has no Java arguments.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(11, &[])
+                .expect("allocation call")
+        };
+        assert_eq!(result, 11 + 23 * 100 + 7);
+    }
+
+    #[test]
+    fn live_new_converts_null_failure_to_jit_exception_sentinel() {
+        extern "C" fn fail(_: i64, _: i64, _: i64) -> i64 {
+            0
+        }
+
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let start = graph.add(Op::Start, IrType::Control, vec![], None);
+        graph.entry = start;
+        let ctrl = graph.add(Op::Proj(0), IrType::Control, vec![start], None);
+        let mem = graph.add(Op::Proj(1), IrType::Memory, vec![start], None);
+        let allocation = graph.add(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            IrType::Ref,
+            vec![ctrl, mem],
+            Some(0),
+        );
+        graph.exit = graph.add(
+            Op::Return,
+            IrType::Void,
+            vec![ctrl, allocation],
+            Some(3),
+        );
+
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.new_object = fail as *const () as usize;
+        let compiled = lower(&graph, &schedule, 0, 0, &helpers).expect("live allocation");
+        // SAFETY: helper ignores the synthetic context.
+        assert_eq!(
+            unsafe { compiled.try_call_with_context(1, &[]) },
+            Ok(i64::MIN)
+        );
     }
 
     #[test]

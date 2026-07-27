@@ -3803,6 +3803,21 @@ pub fn set_integer_int_value_direct_fn(addr: usize) {
     INTEGER_INT_VALUE_DIRECT_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Direct thin-lock monitor helpers registered by the VM at bootstrap.
+///
+/// They stay outside `JitRuntimeHelpers` to avoid expanding that stable
+/// cross-crate ABI for process-lifetime addresses. Generated code reaches
+/// them through `runtime_lowering::emit_monitor_stub`.
+pub static MONITOR_ENTER_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub static MONITOR_EXIT_DIRECT_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_monitor_direct_fns(enter: usize, exit: usize) {
+    MONITOR_ENTER_DIRECT_FN.store(enter, std::sync::atomic::Ordering::Release);
+    MONITOR_EXIT_DIRECT_FN.store(exit, std::sync::atomic::Ordering::Release);
+}
+
 /// Resolve a method invocation to a JIT call-site intrinsic, if one applies.
 ///
 /// Returns `Some((entry, num_params, return_type))` where `entry` is the
@@ -7986,16 +8001,15 @@ fn try_compile_inner(
                     }
                 }
 
-                // An `Op::New` that SURVIVED escape analysis (it escaped, so it
-                // was not scalar-replaced) has no IR lowering — `ir_lower` has
-                // no allocation path and would emit nothing for it, leaving a
-                // garbage object reference. Bail to single-pass rather than
-                // miscompile. (Scalar-replaced News are already `Op::Dead`.)
-                let has_live_new = graph
+                // Arrays still use the baseline tier's specialized allocation
+                // lowering. Escaping object allocations are supported directly
+                // by the optimizing tier through the shared allocation stub;
+                // scalar-replaced objects are already `Op::Dead`.
+                let has_live_new_array = graph
                     .nodes
                     .iter()
-                    .any(|n| matches!(n.op, ir::Op::New { .. } | ir::Op::NewArray { .. }));
-                if !has_live_new {
+                    .any(|n| matches!(n.op, ir::Op::NewArray { .. }));
+                if !has_live_new_array {
                     let schedule = ir_schedule::schedule(&graph);
                     // wire-tiered-manager Step 4 (PGO handoff C1 → C2): hand the
                     // optimizing IR (C2) lowerer the profiled branch bias so it can

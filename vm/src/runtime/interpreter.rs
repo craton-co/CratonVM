@@ -25808,6 +25808,14 @@ pub(crate) fn is_mockito_debugging_native_override(
     ) {
         return false;
     }
+    // Off by default: the real `LocationFactory` selector runs and picks the
+    // StackWalker-backed `LocationImpl`, as on HotSpot. The legacy native
+    // returned a `Java8LocationImpl` with a hardcoded
+    // `"-> at <<unknown line>>"`, which erased the call site from every
+    // Mockito diagnostic. See `flags::mockito_legacy_selectors`.
+    if !cratonvm_types::flags::mockito_legacy_selectors() {
+        return false;
+    }
     method_name == "create"
         && matches!(
             descriptor,
@@ -27633,12 +27641,13 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    // Mockito's ModuleMemberAccessor eagerly selects an instrumentation-backed
-    // Java-9 implementation by bootstrapping Byte Buddy in its class
-    // initializer.  The registered bridge returns Mockito's own reflection
-    // implementation, which is the library's supported fallback and avoids
-    // that unsupported eager bootstrap.
-    if class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+    // Mockito's ModuleMemberAccessor selects an instrumentation-backed Java-9
+    // implementation. The legacy bridge short-circuited that to the reflection
+    // fallback on every run — a silent HotSpot divergence that breaks access to
+    // strongly-encapsulated members. Off by default; see
+    // `flags::mockito_legacy_selectors`.
+    if cratonvm_types::flags::mockito_legacy_selectors()
+        && class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
         && method_name == "delegate"
         && method_descriptor == "()Lorg/mockito/plugins/MemberAccessor;"
     {
