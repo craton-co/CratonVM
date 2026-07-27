@@ -1,9 +1,10 @@
 # `@ForkedClassPath` + `Mockito.verify()` → `NotAMockException`: `Method.invoke` resolved a cross-package package-private declaring class **by name** — FIXED
 
-**Status: FIXED — 2026-07-26.** Worktree
+**Status: FIXED — 2026-07-26/27.** Worktree
 `CratonVM-forkedclasspath-delegation-20260726`, branch
-`fix/forkedclasspath-parent-delegation-20260726`, binary
-`cratonvm-forkcp-fix.exe`.
+`fix/forkedclasspath-parent-delegation-20260726`, final binary
+`cratonvm-forkcp-final.exe` (branched from `dev` `95e4d9929`, merged up to
+`dev` `57c89f2de`).
 
 Closes the long-standing OPEN doc
 `docs/known-issues/springboot/tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`
@@ -282,12 +283,32 @@ grep -rl "@ForkedClassPath\|@ClassPathExclusions\|@ClassPathOverrides\|@CompileW
 
 Kept at `C:\craton\forkrepro-20260726\loaderiso-regress.tsv`.
 
-### Broad sweep
+### Broad sweep — 583 classes, zero regressions
 
 `core/spring-boot` + `core/spring-boot-test` + `core/spring-boot-autoconfigure`
 + `module/spring-boot-tomcat` + `module/spring-boot-jetty` +
-`module/spring-boot-web-server` — **583 classes** — on the final merged binary.
-See the run at `.suite/results/broad-FIX-20260727/`.
+`module/spring-boot-web-server`, on the final merged binary
+(`.suite/results/broad-FIX-20260727/`):
+
+| PASS | FAIL | HANG | EMPTY |
+|---:|---:|---:|---:|
+| 559 | 12 | 2 | 10 |
+
+`EMPTY` is a harness artifact, not a failure: those 10 are abstract base test
+classes (`AbstractPropertyMapperTests`, `AbstractJsonParserTests`,
+`AbstractLoggingSystemTests`, …) that declare no runnable tests of their own.
+
+Every one of the 14 non-passing classes was then re-run on the **negative-control
+binary** — the same merged tree built without only the `lang_class.rs` call site
+(`.suite/results/broad-NEGCTL-20260727/`). A diff of *(status, failed-test count)*
+across all 14 is **identical**, including both HANGs
+(`JettyServletWebServerFactoryTests`, `TomcatServletWebServerFactoryTests` — the
+already-documented Xerces/TLD-scan throughput wall, which needs ~800-1100s and
+exceeds the 420s sweep budget).
+
+Since a regression could only appear as a class that fails *with* the fix, and
+every such class fails identically *without* it, the sweep shows no regression
+attributable to this change.
 
 ### Both target classes
 
