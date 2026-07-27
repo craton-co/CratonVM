@@ -79,7 +79,7 @@ pub enum TcpHandle {
     /// the endpoint's acceptor thread is registering the socket it accepted.
     /// (`net.rs`'s `NetSocketHandle::Stream` is `Arc<TcpStream>` for the same
     /// reason.)
-    Stream(std::sync::Arc<TcpStream>),
+    Stream(Arc<TcpStream>),
     /// A client socket after `SocketChannel.bind()` but before `connect()`.
     /// Retaining the actual OS descriptor is essential: the later connect
     /// must keep Hazelcast's requested outbound port instead of silently
@@ -1257,6 +1257,18 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
+    // A Unix-domain channel has no `java.net.Socket` view: the real
+    // `SocketChannelImpl.socket()` throws `UnsupportedOperationException` for
+    // any non-INET family, and a `SocketAdaptor` built over one would hand out
+    // `InetSocketAddress`-shaped answers that do not exist. Tomcat guards its
+    // own `socket()` calls on `getUnixDomainSocketPath() == null`; match the
+    // JDK so anything that does not guard fails the same way it would there.
+    if is_unix_family(ctx, this) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Not supported".into(),
+        }
+        .into());
+    }
     // Mirror the real `SocketChannelImpl.socket()` → `SocketAdaptor.create(this)`:
     // the adaptor is a proper `java.net.Socket` subclass whose option getters
     // (`getKeepAlive`/`getTcpNoDelay`/…), `connect`, `getInputStream`/
@@ -1373,6 +1385,19 @@ fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sa = obj_or_none(args, 1).ok_or_else(|| ioex("bind: null SocketAddress"))?;
     if read_reg_id(ctx, this).is_some() {
         return Err(ioex("bind: channel is already bound or connected"));
+    }
+    // Binding the *client* end of a Unix-domain connection to an explicit path
+    // (giving the socket a name of its own) is a JDK capability nothing in the
+    // supported workloads uses, and the INET decoder below would mangle the
+    // address into a bogus host:port. Reject it plainly instead. An unnamed
+    // client socket — the normal case, and what `connect()` produces — needs
+    // no bind at all.
+    if decode_unix_socket_address(ctx, sa)?.is_some() {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Binding a Unix domain SocketChannel to an explicit path is not supported"
+                .into(),
+        }
+        .into());
     }
     let (host, port) = decode_socket_address(ctx, sa)?;
     let bind_text = if host.is_empty() {
@@ -3667,6 +3692,14 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
+    // As in `sc_socket`: a Unix-domain listener has no `java.net.ServerSocket`
+    // view, and the real `ServerSocketChannelImpl.socket()` throws here too.
+    if is_unix_family(ctx, this) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Not supported".into(),
+        }
+        .into());
+    }
     if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
         if let Value::Object(Some(cached)) = ctx.get_field(this, SSC_SOCKET_CACHE) {
             return Ok(Some(Value::Object(Some(cached))));
