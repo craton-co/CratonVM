@@ -2184,6 +2184,82 @@ impl ClassManager {
         )
     }
 
+    /// The `InnerClasses` entry a synthetic stub should carry, derived from its
+    /// binary name.
+    ///
+    /// A synthetic stub is minted from a name alone — there is no class file to
+    /// read an `InnerClasses` attribute from — so every JDK member class
+    /// modelled as a stub reported the TOP-LEVEL answer to the whole reflection
+    /// family that consults that attribute. `java.util.Map$Entry` had simple
+    /// name `"Map$Entry"` (not `"Entry"`), canonical name
+    /// `"java.util.Map$Entry"` (not `"java.util.Map.Entry"`), a null
+    /// `getDeclaringClass()`/`getEnclosingClass()`, and `isMemberClass() ==
+    /// false`. Same for `java.util.HashMap$Node`,
+    /// `java.util.Collections$UnmodifiableList`, and every other stubbed
+    /// nested class.
+    ///
+    /// Synthesize the entry javac would have emitted, but ONLY for the
+    /// unambiguous member-class shape `Outer$Member`, where `Member` is a Java
+    /// identifier not starting with a digit. Everything else keeps the honest
+    /// top-level answer:
+    ///
+    ///   * a leading digit marks an anonymous (`Outer$1`) or local
+    ///     (`Outer$1Loc`) class, whose real entry javac writes with a zeroed
+    ///     `outer_class_info_index` (and, for anonymous, `inner_name_index`).
+    ///     That is not reconstructible from the name, and guessing "member"
+    ///     would be worse than reporting top-level.
+    ///   * `$$` is the generated-proxy convention (Spring CGLIB
+    ///     `$$SpringCGLIB$$`, ByteBuddy, EasyMock `$$$EasyMock$`, and lambda
+    ///     hidden classes `Host$$Lambda/0x…`). Those are genuine TOP-LEVEL
+    ///     classes whose literal binary name happens to contain `$`, and
+    ///     `lang_class::simple_class_name` deliberately does not split them —
+    ///     see the EasyMock `isAClassMock` note there.
+    ///   * `com/sun/proxy/$Proxy0` has nothing before the `$` in its last
+    ///     segment, so it is top-level too.
+    ///
+    /// The entry's `access_flags` are the stub's own
+    /// ([`synthetic_stub_access_flags`]) rather than a guess. That keeps
+    /// `Class.getModifiers()` — which prefers the `InnerClasses` flags over the
+    /// class's own for a nested class (JVMS §4.7.6) — returning exactly what it
+    /// did before this entry existed. In particular no `ACC_STATIC` is
+    /// invented: whether a nested class is static is not derivable from its
+    /// name (`HashMap$Node` is static, `HashMap$KeyIterator` is not).
+    fn synthetic_inner_classes(name: &str) -> Vec<InnerClassEntry> {
+        // Arrays have no InnerClasses attribute; `$$` is the generated-proxy
+        // convention, never a javac nested class.
+        if name.starts_with('[') || name.contains("$$") {
+            return Vec::new();
+        }
+        let Some(split) = name.rfind('$') else {
+            return Vec::new();
+        };
+        let (outer_class, inner_name) = (&name[..split], &name[split + 1..]);
+        // `Outer` must actually name something: reject `$Foo` and
+        // `com/sun/proxy/$Proxy0`, where the `$` opens the last name segment.
+        if outer_class.is_empty() || outer_class.ends_with('/') {
+            return Vec::new();
+        }
+        // `Member` must be a Java identifier that does not start with a digit.
+        // (Splitting on the LAST `$` means it cannot itself contain one.)
+        let mut chars = inner_name.chars();
+        let is_member_name = match chars.next() {
+            Some(first) => {
+                (first.is_alphabetic() || first == '_')
+                    && chars.all(|c| c.is_alphanumeric() || c == '_')
+            }
+            None => false,
+        };
+        if !is_member_name {
+            return Vec::new();
+        }
+        vec![InnerClassEntry {
+            inner_class: name.to_string(),
+            outer_class: outer_class.to_string(),
+            inner_name: inner_name.to_string(),
+            access_flags: Self::synthetic_stub_access_flags(name),
+        }]
+    }
+
     /// Register a minimal synthetic class with the given name and field count.
     ///
     /// If a class with this name is already loaded, returns its existing
@@ -2377,7 +2453,7 @@ impl ClassManager {
             nest_members: Vec::new(),
             record_components: Vec::new(),
             permitted_subclasses: Vec::new(),
-            inner_classes: Vec::new(),
+            inner_classes: Self::synthetic_inner_classes(name),
             enclosing_method: None,
             hidden: false,
             module_name: None,
@@ -6187,7 +6263,7 @@ impl ClassManager {
             nest_members: Vec::new(),
             record_components: Vec::new(),
             permitted_subclasses: Vec::new(),
-            inner_classes: Vec::new(),
+            inner_classes: Self::synthetic_inner_classes(name),
             enclosing_method: None,
             hidden: false,
             module_name: None,
@@ -12522,6 +12598,66 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // synthetic_inner_classes — name-derived InnerClasses for synthetic stubs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn synthetic_inner_classes_derives_the_member_class_shape() {
+        let entries = ClassManager::synthetic_inner_classes("java/util/Map$Entry");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].inner_class, "java/util/Map$Entry");
+        assert_eq!(entries[0].outer_class, "java/util/Map");
+        assert_eq!(entries[0].inner_name, "Entry");
+        // The entry carries the stub's own flags, so `Class.getModifiers()` —
+        // which prefers the InnerClasses flags for a nested class — is
+        // unchanged by the entry's mere existence.
+        assert_eq!(
+            entries[0].access_flags,
+            ClassManager::synthetic_stub_access_flags("java/util/Map$Entry")
+        );
+    }
+
+    #[test]
+    fn synthetic_inner_classes_handles_deeper_nesting_and_underscores() {
+        let entries = ClassManager::synthetic_inner_classes("java/util/HashMap$Node");
+        assert_eq!(entries[0].outer_class, "java/util/HashMap");
+        assert_eq!(entries[0].inner_name, "Node");
+        // Splitting on the LAST `$` makes the immediately-enclosing class the
+        // outer one, as javac emits.
+        let entries = ClassManager::synthetic_inner_classes("a/B$C$D");
+        assert_eq!(entries[0].outer_class, "a/B$C");
+        assert_eq!(entries[0].inner_name, "D");
+        let entries = ClassManager::synthetic_inner_classes("a/B$_Impl2");
+        assert_eq!(entries[0].inner_name, "_Impl2");
+    }
+
+    #[test]
+    fn synthetic_inner_classes_declines_non_member_shapes() {
+        // Top-level: no `$` at all.
+        assert!(ClassManager::synthetic_inner_classes("java/util/HashMap").is_empty());
+        // Anonymous / local: leading digit is not reconstructible as a member.
+        assert!(ClassManager::synthetic_inner_classes("P3$1").is_empty());
+        assert!(ClassManager::synthetic_inner_classes("P3$1Local").is_empty());
+        // Generated-proxy `$$` convention (CGLIB / ByteBuddy / EasyMock /
+        // lambda hidden classes) — genuine top-level classes.
+        assert!(ClassManager::synthetic_inner_classes("P3$$Lambda/0x80000000").is_empty());
+        assert!(
+            ClassManager::synthetic_inner_classes("com/example/Foo$$SpringCGLIB$$0").is_empty()
+        );
+        assert!(ClassManager::synthetic_inner_classes(
+            "org/easymock/mocks/InitialDirContext$$$EasyMock$1"
+        )
+        .is_empty());
+        // JDK dynamic proxies: the `$` opens the last name segment.
+        assert!(ClassManager::synthetic_inner_classes("com/sun/proxy/$Proxy0").is_empty());
+        assert!(ClassManager::synthetic_inner_classes("$Foo").is_empty());
+        // Trailing `$` leaves an empty member name.
+        assert!(ClassManager::synthetic_inner_classes("a/B$").is_empty());
+        // Arrays have no InnerClasses attribute.
+        assert!(ClassManager::synthetic_inner_classes("[Ljava/util/Map$Entry;").is_empty());
     }
 
     #[test]
