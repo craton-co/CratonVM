@@ -171,6 +171,105 @@ fn t1_oom_dump_written_flag_starts_unset() {
 }
 
 // ===========================================================================
+// obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording` actually starts a
+// recording at boot, instead of being permanently unreachable.
+// ===========================================================================
+
+#[test]
+fn d12_start_flight_recording_config_defaults_off() {
+    let cfg = VmConfig::default();
+    assert!(cfg.jfr_start_recording.is_none());
+}
+
+#[test]
+fn d12_start_flight_recording_starts_a_running_recording_at_boot() {
+    let mut cfg = VmConfig::default();
+    cfg.jfr_start_recording = Some(cratonvm_vm::config::JfrStartRecordingConfig {
+        filename: None,
+        duration: None,
+        max_age: None,
+        max_events: Some(10_000),
+        dump_on_exit: true,
+    });
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+
+    // The recording this boot path created must exist and be Running — not
+    // just "some global flag somewhere is true", which could race against
+    // another JFR-using test in the same binary (JFR_ENABLED is one
+    // process-wide flag). `jfr_dump_on_exit` names the exact recording id
+    // this VM's own boot path started, so asserting on that recording's own
+    // state is race-free regardless of what else is running concurrently.
+    let target = vm
+        .shared
+        .debug
+        .jfr_dump_on_exit
+        .lock()
+        .clone()
+        .expect("dump_on_exit=true must populate jfr_dump_on_exit");
+    let (recording_id, _filename) = target;
+
+    let fr = vm.shared.debug.flight_recorder.lock();
+    let rec = fr
+        .get_recording(recording_id)
+        .expect("the recording this VM started must still be registered");
+    assert_eq!(rec.state, cratonvm_jfr::RecordingState::Running);
+}
+
+#[test]
+fn d12_start_flight_recording_dump_on_exit_false_leaves_no_exit_target() {
+    let mut cfg = VmConfig::default();
+    cfg.jfr_start_recording = Some(cratonvm_vm::config::JfrStartRecordingConfig {
+        filename: None,
+        duration: None,
+        max_age: None,
+        max_events: None,
+        dump_on_exit: false,
+    });
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+    assert!(vm.shared.debug.jfr_dump_on_exit.lock().is_none());
+}
+
+#[test]
+fn d12_dump_recording_via_the_stashed_exit_target_produces_a_real_jfr_file() {
+    let mut cfg = VmConfig::default();
+    let path = std::env::temp_dir().join("cratonvm-d12-jfr-e2e.jfr");
+    let _ = std::fs::remove_file(&path);
+    cfg.jfr_start_recording = Some(cratonvm_vm::config::JfrStartRecordingConfig {
+        filename: Some(path.to_str().unwrap().to_string()),
+        duration: None,
+        max_age: None,
+        max_events: None,
+        dump_on_exit: true,
+    });
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+
+    let (recording_id, filename) = vm
+        .shared
+        .debug
+        .jfr_dump_on_exit
+        .lock()
+        .clone()
+        .expect("dump_on_exit=true must populate jfr_dump_on_exit");
+    assert_eq!(filename, path.to_str().unwrap());
+
+    // Exercises exactly what the pre-exit hook does at real process exit,
+    // without needing to actually exit the test process.
+    let bytes = vm
+        .shared
+        .debug
+        .flight_recorder
+        .lock()
+        .dump_recording(recording_id, &path)
+        .expect("dump_recording must succeed for a Running recording");
+    assert!(bytes > 0, "JFR dump should write a non-zero file");
+
+    let raw = std::fs::read(&path).unwrap();
+    // JFR v2.0 binary format magic: "FLR ".
+    assert!(raw.starts_with(b"FLR "), "file must start with the JFR magic");
+    let _ = std::fs::remove_file(&path);
+}
+
+// ===========================================================================
 // T1.6.8 — JMM smoke test: monotonic clock under concurrent thread spawns
 // ===========================================================================
 

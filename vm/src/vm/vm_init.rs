@@ -2596,6 +2596,7 @@ impl SharedVm {
                 oom_dump_written: std::sync::atomic::AtomicBool::new(false),
                 missing_natives_log: parking_lot::Mutex::new(Vec::new()),
                 flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
+                jfr_dump_on_exit: parking_lot::Mutex::new(None),
                 #[cfg(feature = "experimental-debug")]
                 debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
                 #[cfg(feature = "experimental-debug")]
@@ -4937,6 +4938,70 @@ impl Vm {
         // `install_real_agent_env_bridge` in `runtime/jvmti.rs`. Same `Weak`,
         // idempotent, last-writer-wins shape as the two hooks just above.
         crate::runtime::jvmti::install_real_agent_env_bridge(&shared);
+
+        // obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording`. Before
+        // this, vm-cli never called `start_recording` (see the retracted
+        // claim this comment replaces), so `cratonvm_jfr::is_enabled()` was
+        // permanently false and the ~30 wired `emit_*` call sites never
+        // captured anything. `config.jfr_start_recording` is `None` unless
+        // the flag was passed, so this is a no-op — same cost as before —
+        // on every VM that doesn't request it.
+        if let Some(jfr_cfg) = shared.config.jfr_start_recording.clone() {
+            let mut settings = cratonvm_jfr::RecordingSettings::new("cratonvm");
+            settings.max_age = jfr_cfg.max_age;
+            settings.max_size = jfr_cfg.max_events;
+            settings.duration = jfr_cfg.duration;
+            settings.dump_on_exit = jfr_cfg.dump_on_exit;
+            let recording_id = {
+                let mut fr = shared.debug.flight_recorder.lock();
+                let id = fr.new_recording(settings);
+                fr.start_recording(id);
+                id
+            };
+            if jfr_cfg.dump_on_exit {
+                let filename = jfr_cfg.filename.clone().unwrap_or_else(|| {
+                    format!("./cratonvm-recording-{}.jfr", std::process::id())
+                });
+                *shared.debug.jfr_dump_on_exit.lock() = Some((recording_id, filename));
+            }
+            // obsaudit D12 — the reclamation half of the fix. Before this,
+            // `ThreadRingRegistry::reclaim_retired_shards` only ran from
+            // inside `drain_all`, which only ran at dump time — harmless
+            // only because the disabled gate above kept ordinary threads
+            // from ever registering a shard. A recording that now actually
+            // runs continuously needs its per-thread rings drained
+            // periodically, both to keep events flowing into the
+            // repository (rather than only at final dump) and to let
+            // retired+empty shards from thread churn actually get
+            // reclaimed instead of accumulating in the registry `Vec` for
+            // the recording's whole lifetime. One drain per second is
+            // frequent enough that a 1024-capacity ring on a
+            // moderately-busy thread will not silently drop events
+            // between drains, and cheap enough (an empty repository drain
+            // is a handful of shard-list iterations) to run indefinitely.
+            let weak_shared = Arc::downgrade(&shared);
+            let duration = jfr_cfg.duration;
+            std::thread::Builder::new()
+                .name("JFR-Periodic-Drain".into())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let Some(shared) = weak_shared.upgrade() else {
+                            break; // VM torn down (e.g. an in-process test) — stop.
+                        };
+                        let mut fr = shared.debug.flight_recorder.lock();
+                        fr.drain_per_thread_into_repository();
+                        if let Some(d) = duration {
+                            if started.elapsed() >= d {
+                                fr.stop_recording(recording_id);
+                                break;
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
 
         // KC16-watchdog: install the wait-site frame dumper so a thread
         // parked in `Object.wait()` (e.g. AsyncFutureTask.await) can emit

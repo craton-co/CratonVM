@@ -17,8 +17,8 @@ established first, per subsystem, before any code change.**
 
 | Subsystem | Reachable on a default build? | Produces real data? | Data trustworthy? |
 |---|---|---|---|
-| **JFR emit surface** (`jfr/src/builtin.rs`, ~30 VM call sites) | Compiled in and called — but every `emit_*` returns early on `is_enabled()`, which is **permanently false** | **No** | n/a |
-| **JFR recording lifecycle** (`new_recording` / `start_recording`) | **No** — zero callers outside `#[cfg(test)]`; no `-XX:StartFlightRecording`; no working jcmd verb | No | n/a |
+| **JFR emit surface** (`jfr/src/builtin.rs`, ~30 VM call sites) | Compiled in and called; `is_enabled()` is real once `-XX:StartFlightRecording` starts a recording (D12) | **Yes, when a recording is active** | Yes for the fields these sites populate |
+| **JFR recording lifecycle** (`new_recording` / `start_recording`) | **Yes (D12)** — `-XX:StartFlightRecording` calls both from `Vm::new`; jcmd verbs still the D3 stubs (bundled with D15) | Yes | Yes — `max_age`/`max_size` are now enforced, not just stored |
 | **JFR file writer** (`dump_to_file`) | **No** — no caller outside the `jfr` crate | n/a | Format is a documented **bespoke** encoding, not stock JFR: not loadable by JMC / `jfr print` |
 | **JVMTI event delivery** (`runtime/jvmti.rs`) | Yes — global manager installed from `SharedVm::new`; `fire_*` driven by interpreter / classloading / GC hooks | Fires; in-tree/test listeners always worked, and a real native agent now receives 9 of ~26 event kinds via the D14 bridge | Yes — see D1, D2, D14 |
 | **JVMTI native agents** (`-agentpath:`) | Yes, via `vm/src/jvmti/agent.rs` (real `dlopen` + `Agent_OnLoad`), feature `experimental-debug` (default-on) | Yes | Agents reach a **different** `EventManager`, now bridged (D14) for VMInit/VMDeath/ThreadStart/ThreadEnd/ClassLoad/ClassPrepare/GC-start-finish/ObjectFree; `JvmtiCapabilities::potential()` was corrected to advertise `false` for the event kinds that remain unbridged, so `AddCapabilities` no longer over-promises |
@@ -38,8 +38,10 @@ established first, per subsystem, before any code change.**
   a real native agent (`vm/src/jvmti/`) now receives 9 of ~26 event kinds via
   a bridge (D14) with an honest, correspondingly-narrowed capability set —
   full unification of the two implementations remains open.
-* JFR captures nothing (D12, open); jcmd/attach is unreachable from another
-  process (D15, open).
+* **JFR** — captures real events once `-XX:StartFlightRecording` starts a
+  recording (D12 fixed); jcmd `JFR.*`/attach is still unreachable from
+  another process (D15, open) — see D12's own section for why jcmd wiring
+  waits for D15.
 
 ---
 
@@ -278,29 +280,72 @@ in `runtime/interpreter.rs` now thread the calling thread through. Related,
 still open: object IDs are raw heap addresses, so under a relocating
 collector two dumps disagree and a recycled address can alias.
 
-### D12 — JFR is unreachable; `RecordingSettings` has five inert fields — **DOCUMENTED**
+### D12 — JFR is unreachable; `RecordingSettings` has five inert fields — **FIXED**
 
-`vm-cli` never calls `start_recording` (the code's own comment in
-`vm_init.rs:5041` says so), there is no `-XX:StartFlightRecording`, and the
-jcmd verbs were the stubs of D3. `is_enabled()` is permanently false, so the
-~30 wired `emit_*` call sites are one relaxed atomic load each and capture
-nothing.
+`vm-cli` never called `start_recording`, there was no
+`-XX:StartFlightRecording`, and the jcmd verbs were the stubs of D3.
+`is_enabled()` was permanently false, so the ~30 wired `emit_*` call sites
+were one relaxed atomic load each and captured nothing.
 
 Separately, `RecordingSettings::{max_age, max_size, disk, dump_on_exit,
-duration}` are **read by no code**. `max_size` and `max_age` in particular are
-honest-looking retention knobs that do nothing: a recording's only bound is
-`EventRepository::default()`'s fixed 100 000-event ring. These must not be
-surfaced as a CLI option, jcmd argument, or `jdk.jfr` API until enforced.
-Contract pinned by `obsaudit_max_size_and_max_age_are_not_enforced`.
+duration}` were **read by no code**. `max_size` and `max_age` in particular
+were honest-looking retention knobs that did nothing: a recording's only
+bound was `EventRepository::default()`'s fixed 100 000-event ring.
 
-**Memory is bounded** (the audit's specific question): per-thread ring 1024
-entries fixed, per-recording repository 100 000 events with eviction. One
-latent hazard: `ThreadRingRegistry` reclaims retired+empty shards only from
-inside `drain_all`, which runs at dump time — so reclamation never runs today.
-Harmless only because the disabled gate keeps ordinary threads from registering
-a shard at all; it becomes a real per-thread leak the moment a long-lived
-recording starts on a thread-churning workload. Fix reclamation as part of
-wiring the trigger, not after.
+**Fixed (2026-07-26):**
+
+* **The trigger.** `-XX:StartFlightRecording[:filename=...,duration=...,
+  maxage=...,maxevents=...,dumponexit=...]` (`vm-cli/src/main.rs`) starts a
+  real recording from `Vm::new` (`vm/src/vm/vm_init.rs`). Bare
+  `-XX:StartFlightRecording` works with HotSpot's defaults (`dumponexit=true`,
+  no other limits). Deliberately **not** offered: `disk=` (recordings stay
+  memory-only — see below) and HotSpot's `maxsize=` name, reused here as
+  `maxevents=` instead, because `jfr::RecordingSettings::max_size` bounds an
+  *event count*, not bytes — keeping HotSpot's byte-denominated name would
+  have meant something silently different in CratonVM, which is worse than
+  not offering it. jcmd `JFR.start`/`JFR.stop`/`JFR.dump` are unchanged (still
+  D3's honest-error stubs) — wiring them to the now-real `start_recording`/
+  `dump_recording` calls is bundled with D15 (the jcmd dispatch surface),
+  not here.
+* **`max_age` / `max_size`.** `jfr::repository::EventRepository` gained
+  `with_max_age(max_events, max_age_nanos)`; `Recording::new` uses it instead
+  of `EventRepository::default()`, so both are real, continuously-enforced
+  retention bounds now — not a CLI-only illusion. Age is compared against
+  each pushed event's own `start_time` (no wall-clock dependency inside the
+  library). The original contract pin
+  (`obsaudit_max_size_and_max_age_are_not_enforced`) is renamed
+  `obsaudit_max_size_and_max_age_are_enforced` and now asserts the opposite —
+  see the doc comment for how the test still forces a deterministic result.
+* **`dump_on_exit`.** The VM's existing pre-`std::process::exit` hook
+  (`vm-cli/src/main.rs`, the same one `cleanup_staged_archive_copies` already
+  used) now also dumps the flagged recording via `process_vm()` +
+  `FlightRecorder::dump_recording`. Covers Java-initiated exit
+  (`System.exit`/`Runtime.exit`/`Runtime.halt`) — the common real-application
+  shutdown path; a hard native crash or an unrelated direct
+  `std::process::exit` call elsewhere in the Rust CLI would still miss it, an
+  honestly-documented residual rather than a claimed 100%-coverage guarantee.
+* **`duration`.** A background "JFR-Periodic-Drain" thread (spawned only
+  when `-XX:StartFlightRecording` is used) stops the recording once the
+  configured duration elapses.
+* **`disk`.** Still **inert** — there is no disk-backed repository;
+  recordings remain memory-only until an explicit dump. Not exposed by the
+  new CLI flag for this reason; still left in place as "the right shape for
+  the eventual implementation" per `RecordingSettings`'s own doc comment.
+
+**The reclamation leak — fixed as part of the trigger, per this doc's own
+instruction.** `ThreadRingRegistry` reclaimed retired+empty shards only from
+inside `drain_all`, which used to run only at dump time. The same
+periodic-drain thread that enforces `duration` also calls
+`FlightRecorder::drain_per_thread_into_repository()` once a second for the
+lifetime of the recording, so `reclaim_retired_shards` now actually runs
+continuously while a recording is active — a long-lived recording on a
+thread-churning workload no longer accumulates retired shards for its whole
+lifetime.
+
+**Memory is bounded** (the audit's original question, still true and now
+backed by real enforcement rather than accident): per-thread ring 1024
+entries fixed, per-recording repository bounded by `max_size` (default
+100 000) with real age-eviction on top when `max_age` is set.
 
 ### D13 — `runtime::jvmti::AgentRegistry::load_agents` loads nothing — **FIXED (removed)**
 
@@ -382,7 +427,12 @@ warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
 | `vm/src/jvmti/capabilities.rs` | D14: `potential()` no longer advertises capabilities for unbridged event kinds; 2 new tests |
 | `vm/src/jvmti/mod.rs` | D14: `test_full_workflow` updated (no longer requests a now-`false` capability) |
 | `jfr/src/lib.rs` | D12 LIVENESS + memory-bounds block |
-| `jfr/src/recording.rs` | D12 inert-field docs; 2 tests |
+| `jfr/src/recording.rs` | D12 fixed: `Recording::new` enforces `max_size`/`max_age` via `EventRepository::with_max_age`; `RecordingSettings` doc comment updated; contract pin renamed to `obsaudit_max_size_and_max_age_are_enforced` (now asserts enforcement); 1 new test |
+| `jfr/src/repository.rs` | D12 fixed: `EventRepository::with_max_age` + `evict_front` helper (shared by size-cap and age-cap eviction) |
+| `vm/src/config.rs` | D12: `JfrStartRecordingConfig` + `VmConfig::jfr_start_recording` |
+| `vm/src/vm/realms/debug_realm.rs` | D12: `jfr_dump_on_exit` field (recording id + filename for the pre-exit dump) |
+| `vm/src/vm/vm_init.rs` | D12: `Vm::new` starts the recording, spawns the periodic drain/duration-watcher thread (also fixes the `ThreadRingRegistry` reclamation leak) |
+| `vm-cli/src/main.rs` | D12: `-XX:StartFlightRecording[:opts]` parsing (`parse_jfr_start_recording_opts`, `parse_jfr_duration`); pre-exit hook dumps the recording via `process_vm()`; 10 new tests |
 
 D1, D13, D14 rows above: built and tested on the Azure host
 (`fix/observability-audit-20260726`) — `cratonvm-classloading` full suite,

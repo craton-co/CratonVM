@@ -47,6 +47,14 @@ pub struct DebugRealm {
     /// Java Flight Recorder — records VM events (GC, thread, class loading, compilation).
     pub flight_recorder: parking_lot::Mutex<cratonvm_jfr::FlightRecorder>,
 
+    /// obsaudit D12 (2026-07-26) — `(recording_id, filename)` for the
+    /// `-XX:StartFlightRecording` recording that should be dumped when the
+    /// VM exits, if `dumponexit` was not explicitly set to `false`. `None`
+    /// when no such recording exists (the flag was never passed) or when
+    /// `dumponexit=false` was requested. Read by the pre-exit hook installed
+    /// in `vm-cli/src/main.rs`'s `run()`.
+    pub jfr_dump_on_exit: parking_lot::Mutex<Option<(u64, String)>>,
+
     /// JVMTI debug state — breakpoints, step requests, and event callbacks.
     #[cfg(feature = "experimental-debug")]
     pub debug_state: parking_lot::Mutex<crate::debug::DebugState>,
