@@ -7220,8 +7220,10 @@ mod antlr_prediction_context_tests {
             .is_some());
     }
 
+    /// `MockMethodAdvice.isOverridden` is a genuine semantic bridge and stays
+    /// registered unconditionally.
     #[test]
-    fn mockito_debugging_intrinsics_are_registered_for_location_factory() {
+    fn mockito_is_overridden_intrinsic_is_always_registered() {
         let mut registry = NativeMethodRegistry::new();
         register_mockito_debugging_intrinsics(&mut registry);
 
@@ -7232,33 +7234,49 @@ mod antlr_prediction_context_tests {
                 "(Ljava/lang/Object;Ljava/lang/reflect/Method;)Z",
             )
             .is_some());
+    }
+
+    /// The `Location` / `MemberAccessor` *selector* overrides forced Mockito
+    /// onto its fallback implementations on every run, diverging from HotSpot
+    /// (`LocationImpl` / `InstrumentationMemberAccessor`) and erasing the call
+    /// site from every Mockito diagnostic. They must NOT be registered unless
+    /// `CRATONVM_MOCKITO_LEGACY_SELECTORS` opts back in — which this test
+    /// process does not, since the flag is latched from the environment.
+    #[test]
+    fn mockito_selector_overrides_are_off_by_default() {
+        if cratonvm_types::flags::mockito_legacy_selectors() {
+            return; // explicit opt-in in this environment; nothing to assert
+        }
+        let mut registry = NativeMethodRegistry::new();
+        register_mockito_debugging_intrinsics(&mut registry);
+
         assert!(registry
             .find(
                 MOCKITO_LOCATION_FACTORY,
                 "create",
                 "()Lorg/mockito/invocation/Location;",
             )
-            .is_some());
+            .is_none());
         assert!(registry
             .find(
                 MOCKITO_LOCATION_FACTORY,
                 "create",
                 "(Z)Lorg/mockito/invocation/Location;",
             )
-            .is_some());
+            .is_none());
         assert!(registry
             .find(
                 MOCKITO_LOCATION_FACTORY_DEFAULT,
                 "create",
                 "(Z)Lorg/mockito/invocation/Location;",
             )
-            .is_some());
+            .is_none());
         assert!(registry
             .find(
                 MOCKITO_MODULE_MEMBER_ACCESSOR,
                 "delegate",
                 "()Lorg/mockito/plugins/MemberAccessor;",
             )
-            .is_some());
+            .is_none());
     }
 }

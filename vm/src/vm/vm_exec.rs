@@ -15799,11 +15799,13 @@ fn invoke_on_class_shared_inner(
                                 (method_name, descriptor),
                                 ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
-                        // Mockito's Java-9 member accessor eagerly bootstraps
-                        // Byte Buddy just to choose its instrumentation path.
-                        // Use the registered bridge to its built-in reflection
-                        // fallback before that unsupported bootstrap begins.
-                        || (class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+                        // Legacy Mockito selector override (off by default —
+                        // see `flags::mockito_legacy_selectors`): forced the
+                        // reflection fallback instead of letting the real
+                        // `delegate()` pick `InstrumentationMemberAccessor`.
+                        // Must stay in sync with the interpreter's gate.
+                        || (cratonvm_types::flags::mockito_legacy_selectors()
+                            && class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
                             && method_name == "delegate"
                             && descriptor == "()Lorg/mockito/plugins/MemberAccessor;")
                         || ((class_name == "javax/net/ssl/SSLSocketFactory"
