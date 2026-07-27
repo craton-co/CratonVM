@@ -1086,7 +1086,7 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
 /// record layout exactly. Trusted certs are written as tag-2 entries; private
 /// keys as tag-1 with the (plaintext) key bytes — `load_jks` keeps them as-is
 /// when JKS key-recovery doesn't apply.
-fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
+pub(crate) fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
     let cert_type: &[u8] = b"X.509";
     let mut body: Vec<u8> = Vec::new();
     body.extend_from_slice(&JKS_MAGIC.to_be_bytes());
@@ -1274,7 +1274,7 @@ fn jks_recover_key(epki_der: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Whether a JKS key entry is still wrapped in Sun's KeyProtector envelope.
-fn is_jks_encrypted_private_key(der: &[u8]) -> bool {
+pub(crate) fn is_jks_encrypted_private_key(der: &[u8]) -> bool {
     const JKS_KEY_PROTECTOR_OID: &[u8] = b"\x06\x0a\x2b\x06\x01\x04\x01\x2a\x02\x11\x01\x01";
     der.windows(JKS_KEY_PROTECTOR_OID.len())
         .any(|window| window == JKS_KEY_PROTECTOR_OID)
@@ -1680,7 +1680,7 @@ fn read_stream_to_end(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<u8>
     out
 }
 
-fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
 
     // null InputStream is "create empty". Real-JDK does the same.
@@ -1799,7 +1799,7 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     Ok(Some(Value::Object(None)))
 }
 
-fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let password = args
@@ -1916,7 +1916,10 @@ pub(crate) fn private_key_der_from_proxy(
     })
 }
 
-fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_get_certificate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -1945,7 +1948,10 @@ fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     )))))
 }
 
-fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_get_certificate_chain(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -1978,7 +1984,7 @@ fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Object(Some(arr))))
 }
 
-fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
 
@@ -2017,7 +2023,7 @@ pub(crate) fn keystore_aliases(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     engine_aliases(ctx, &engine_args)
 }
 
-fn engine_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let n = keystore_lookup(id).map(|s| s.entries.len()).unwrap_or(0);
@@ -2033,7 +2039,10 @@ pub(crate) fn keystore_size(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     engine_size(ctx, &engine_args)
 }
 
-fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_contains_alias(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -2046,7 +2055,7 @@ fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Int(if present { 1 } else { 0 })))
 }
 
-fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -2066,7 +2075,10 @@ fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(Some(Value::Int(if yes { 1 } else { 0 })))
 }
 
-fn engine_is_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_is_certificate_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -2107,9 +2119,13 @@ fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// bytecode for setCertificateEntry updates its own `entries` field, which the
 /// natives never read — so `setCertificateEntry` was invisible to `aliases()`
 /// (keycloak TruststoreBuilder: merged truststore reported 0 entries). Intercept
-/// it and write the same side-table the reads consult. The cert DER is obtained
-/// from the real `Certificate.getEncoded()`.
-fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// it and write the same side-table the reads consult. The cert DER comes from
+/// [`certificate_der`] (real `Certificate.getEncoded()`, with a fallback for
+/// this module's own synthetic X.509 mirror).
+pub(crate) fn engine_set_certificate_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -2120,20 +2136,9 @@ fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(c))) => *c,
         _ => return Ok(None),
     };
-    // Pull the DER via the real Certificate.getEncoded().
-    let der = match ctx.invoke_virtual(cert, "getEncoded", "()[B", &[]) {
-        Ok(Some(Value::Object(Some(arr)))) => {
-            let len = ctx.array_length(arr);
-            let mut v = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Value::Int(b) = ctx.get_array_element(arr, i) {
-                    v.push(b as u8);
-                }
-            }
-            v
-        }
-        _ => Vec::new(),
-    };
+    // Pull the DER via the real Certificate.getEncoded() (with the synthetic
+    // mirror fallback — see `certificate_der`).
+    let der = certificate_der(ctx, cert);
     if der.is_empty() {
         // No encoding available — nothing to store (lenient; real JDK would
         // throw KeyStoreException, but a valid Certificate always encodes).
@@ -2147,10 +2152,13 @@ fn engine_set_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// chain) -- in-memory PrivateKey entry (companion to
 /// engine_set_certificate_entry; see keystore_set_key_entry's doc comment
 /// for why this matters). The key's PKCS#8 DER comes from the real
-/// `PrivateKey.getEncoded()`; each chain cert's DER from the real
-/// `Certificate.getEncoded()`, same extraction pattern
-/// engine_set_certificate_entry already uses for a single cert.
-fn engine_set_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `PrivateKey.getEncoded()` (falling back to [`private_key_der_from_proxy`]
+/// for this module's compact four-slot key proxy); each chain cert's DER from
+/// [`certificate_der`], the same extraction engine_set_certificate_entry uses.
+pub(crate) fn engine_set_key_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -2161,19 +2169,17 @@ fn engine_set_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(None),
     };
-    let key_der = match ctx.invoke_virtual(key, "getEncoded", "()[B", &[]) {
-        Ok(Some(Value::Object(Some(arr)))) => {
-            let len = ctx.array_length(arr);
-            let mut v = Vec::with_capacity(len);
-            for i in 0..len {
-                if let Value::Int(b) = ctx.get_array_element(arr, i) {
-                    v.push(b as u8);
-                }
-            }
-            v
-        }
-        _ => Vec::new(),
-    };
+    let mut key_der = read_encoded_byte_array(ctx, key);
+    if key_der.is_empty() {
+        // `engine_get_key`'s compact four-slot `PrivateKey` proxy carries a
+        // `(store_id, alias_hash)` handle instead of an in-object DER; when
+        // `java/security/PrivateKey.getEncoded` is not the jca::key_factory
+        // shim (which resolves that handle itself) the virtual call yields
+        // nothing. Resolve the handle directly before giving up — otherwise
+        // `ks2.setKeyEntry(a, ks1.getKey(a, pw), pw, ks1.getCertificateChain(a))`
+        // (the standard keystore-merge idiom) silently dropped the entry.
+        key_der = private_key_der_from_proxy(ctx, key).unwrap_or_default();
+    }
     if key_der.is_empty() {
         // No PKCS#8 encoding available (e.g. a PKCS#11/HSM-backed key with
         // getEncoded() == null) -- nothing we can stage natively. Lenient,
@@ -2185,16 +2191,8 @@ fn engine_set_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let len = ctx.array_length(*chain_arr);
         for i in 0..len {
             if let Value::Object(Some(cert)) = ctx.get_array_element(*chain_arr, i) {
-                if let Ok(Some(Value::Object(Some(cert_bytes)))) =
-                    ctx.invoke_virtual(cert, "getEncoded", "()[B", &[])
-                {
-                    let clen = ctx.array_length(cert_bytes);
-                    let mut cv = Vec::with_capacity(clen);
-                    for j in 0..clen {
-                        if let Value::Int(b) = ctx.get_array_element(cert_bytes, j) {
-                            cv.push(b as u8);
-                        }
-                    }
+                let cv = certificate_der(ctx, cert);
+                if !cv.is_empty() {
                     chain.push(cv);
                 }
             }
@@ -2234,7 +2232,7 @@ fn engine_set_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 /// engineDeleteEntry(String alias) -- in-memory removal (companion to
 /// engine_set_certificate_entry; same side-table consistency rationale).
-fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let alias = args
@@ -2252,7 +2250,7 @@ fn engine_delete_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 /// (keycloak TruststoreBuilderTest.testMergedTrustStore). Writing JKS (which
 /// CV's load path detects by magic and parses via load_jks) round-trips the
 /// entries through CV regardless of the declared KeyStore type.
-fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn engine_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
     let out = match args.get(1) {
@@ -2293,6 +2291,206 @@ fn read_string_arg(ctx: &mut dyn NativeContext, v: &Value) -> Option<String> {
         Value::Object(Some(o)) => ctx.read_string(*o),
         _ => None,
     }
+}
+
+/// Copy a Java `byte[]` out of the heap. Returns an empty vec for anything
+/// that is not a non-empty array.
+fn read_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
+    let len = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Value::Int(b) = ctx.get_array_element(arr, i) {
+            out.push(b as u8);
+        }
+    }
+    out
+}
+
+/// Invoke `getEncoded()[B` on `obj` and copy the result out. Empty vec when the
+/// call fails, returns null, or returns a zero-length array.
+fn read_encoded_byte_array(ctx: &mut dyn NativeContext, obj: ObjectRef) -> Vec<u8> {
+    match ctx.invoke_virtual(obj, "getEncoded", "()[B", &[]) {
+        Ok(Some(Value::Object(Some(arr)))) => read_byte_array(ctx, arr),
+        _ => Vec::new(),
+    }
+}
+
+/// DER encoding of a `java.security.cert.Certificate`.
+///
+/// Prefers the real `Certificate.getEncoded()`. Falls back to the raw DER this
+/// module itself stashes in slot 3 of the synthetic
+/// `java/security/cert/X509Certificate` mirror ([`make_x509_mirror`]): in
+/// synthetic-JDK mode the registered `X509Certificate.getEncoded()` shim
+/// (`phases_late::ssl_security`) hands back an EMPTY array unless the
+/// `legacy-synthetic-crypto` cert store is compiled in, so the virtual call
+/// alone loses the very bytes we put there. Without the fallback,
+/// `setCertificateEntry` on a mirror-backed certificate stored nothing and
+/// `aliases()`/`size()` reported an empty keystore.
+///
+/// The fallback is deliberately narrow — it fires only for objects whose exact
+/// class is the synthetic mirror — so it can never misread an unrelated field
+/// of a real `sun.security.x509.X509CertImpl`.
+fn certificate_der(ctx: &mut dyn NativeContext, cert: ObjectRef) -> Vec<u8> {
+    let der = read_encoded_byte_array(ctx, cert);
+    if !der.is_empty() {
+        return der;
+    }
+    if !matches!(ctx.heap_kind_of(cert), cratonvm_types::ObjectKind::Object) {
+        return Vec::new();
+    }
+    if ctx.object_num_fields(cert) <= 3 {
+        return Vec::new();
+    }
+    let cls_id = ctx.class_id_of_object(cert);
+    match ctx.class_name_of_id(cls_id) {
+        Some(name) if name == "java/security/cert/X509Certificate" => {
+            match ctx.get_field(cert, 3) {
+                Value::Object(Some(arr)) => read_byte_array(ctx, arr),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Get this keystore's `KEYSTORE_REGISTRY` id, allocating and stamping an empty
+/// store when it has none yet.
+///
+/// `get_store_id` answers 0 for a keystore that was never `engineLoad`ed, and
+/// every mutator (`keystore_set_cert_entry`, …) silently no-ops on id 0. The
+/// synthetic-JDK `java.security.KeyStore` in `tls.rs` needs a store the moment
+/// its first entry is set, so give it one on demand; `set_store_id` records the
+/// id on the object's slot/named field AND in the identity side-table, so every
+/// later read resolves the same store.
+pub(crate) fn keystore_ensure_store_id(ctx: &mut dyn NativeContext, ks_obj: ObjectRef) -> i32 {
+    let target = unwrap_keystore_spi(ctx, ks_obj);
+    let existing = get_store_id(ctx, target);
+    if existing != 0 {
+        return existing;
+    }
+    let id = keystore_register(LoadedKeyStore::default());
+    set_store_id(ctx, target, id);
+    id
+}
+
+/// True when `id`'s store currently holds `alias`. Used by the public
+/// `KeyStore` shim to verify a mutation actually landed before reporting
+/// success (a dropped entry must surface as `KeyStoreException`, not silence).
+pub(crate) fn keystore_has_alias(id: i32, alias: &str) -> bool {
+    registry()
+        .read()
+        .stores
+        .get(&id)
+        .map(|s| s.entries.contains_key(alias))
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Public `java.security.KeyStore` shims
+//
+// The public `KeyStore` wrapper is intercepted by `tls.rs` (synthetic-JDK mode)
+// and `phases_early.rs`. Both must reach THIS module's registry-backed engine
+// surface rather than reimplementing storage, otherwise the public API and the
+// SPI disagree about what the keystore contains. Each shim unwraps a real
+// `keyStoreSpi` delegate when there is one (so we drive the same object
+// `engineLoad` stamped) and otherwise operates on the wrapper itself — the
+// synthetic `KeyStore` has no SPI and IS its own store. Same shape as
+// `keystore_aliases`/`keystore_size` above.
+// ---------------------------------------------------------------------------
+
+/// Rewrite `args[0]` to the SPI delegate (or the receiver itself) and hand the
+/// call to one of the `engine_*` implementations.
+fn via_spi(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    engine: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
+) -> MethodCallResult {
+    let this = this_arg(args)?;
+    let spi = unwrap_keystore_spi(ctx, this);
+    let mut engine_args = args.to_vec();
+    engine_args[0] = Value::Object(Some(spi));
+    engine(ctx, &engine_args)
+}
+
+/// `KeyStore.load(InputStream, char[])` → `engineLoad`.
+pub(crate) fn keystore_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    via_spi(ctx, args, engine_load)
+}
+
+/// `KeyStore.getKey(String, char[])` → `engineGetKey`.
+pub(crate) fn keystore_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    via_spi(ctx, args, engine_get_key)
+}
+
+/// `KeyStore.getCertificate(String)` → `engineGetCertificate`.
+pub(crate) fn keystore_get_certificate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_get_certificate)
+}
+
+/// `KeyStore.getCertificateChain(String)` → `engineGetCertificateChain`.
+pub(crate) fn keystore_get_certificate_chain(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_get_certificate_chain)
+}
+
+/// `KeyStore.containsAlias(String)` → `engineContainsAlias`.
+pub(crate) fn keystore_contains_alias(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_contains_alias)
+}
+
+/// `KeyStore.isKeyEntry(String)` → `engineIsKeyEntry`.
+pub(crate) fn keystore_is_key_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_is_key_entry)
+}
+
+/// `KeyStore.isCertificateEntry(String)` → `engineIsCertificateEntry`.
+pub(crate) fn keystore_is_certificate_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_is_certificate_entry)
+}
+
+/// `KeyStore.setCertificateEntry(String, Certificate)` → the SPI mutator.
+/// (`_native` suffix: the plain names belong to this module's registry-level
+/// `keystore_set_cert_entry` / `keystore_set_key_entry` helpers.)
+pub(crate) fn keystore_set_certificate_entry_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_set_certificate_entry)
+}
+
+/// `KeyStore.setKeyEntry(String, Key, char[], Certificate[])` → the SPI mutator.
+pub(crate) fn keystore_set_key_entry_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_set_key_entry)
+}
+
+/// `KeyStore.deleteEntry(String)` → `engineDeleteEntry`.
+pub(crate) fn keystore_delete_entry_native(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    via_spi(ctx, args, engine_delete_entry)
+}
+
+/// `KeyStore.store(OutputStream, char[])` → `engineStore` (the JKS writer).
+pub(crate) fn keystore_store(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    via_spi(ctx, args, engine_store)
 }
 
 pub(crate) fn make_x509_mirror(
