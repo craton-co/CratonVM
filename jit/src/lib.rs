@@ -7095,6 +7095,58 @@ fn local_handler_reads_unsafe_local(
     false
 }
 
+/// Whether every potentially throwing bytecode covered by this method's
+/// exception table already exits through an x64 runtime call site that can
+/// publish a precise reason-9 exceptional frame.
+///
+/// This deliberately recognises only `invokestatic` and monitor operations.
+/// It is enough for javac's ordinary synchronized-loop shape (the synthetic
+/// catch-all protects arithmetic/control-flow plus `monitorexit`) while
+/// keeping array, field, allocation, cast, divide, `athrow`, and ldc failure
+/// paths behind the existing params-only safety gate until each of those
+/// lowerings publishes the same snapshot.
+#[cfg(target_arch = "x86_64")]
+fn precise_exception_frame_sites_supported(
+    code: &[u8],
+    code_len: usize,
+    exception_table: &[cratonvm_reader::attribute::ExceptionTableEntry],
+) -> bool {
+    let covered = |pc: usize| {
+        exception_table
+            .iter()
+            .any(|entry| pc >= entry.start_pc as usize && pc < entry.end_pc as usize)
+    };
+    let may_throw_without_precise_frame = |op: u8| {
+        matches!(
+            op,
+            0x12..=0x14 // ldc family (String/class resolution can allocate)
+                | 0x2e..=0x35 // array loads
+                | 0x4f..=0x56 // array stores
+                | 0x6c | 0x6d | 0x70 | 0x71 // integer divide/remainder
+                | 0xb2..=0xba // fields, invokes, and invokedynamic
+                | 0xbb..=0xc1 // allocations, arraylength, athrow, and casts
+                | 0xc5 // multianewarray
+        )
+    };
+
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        if covered(pc)
+            && may_throw_without_precise_frame(op)
+            && !matches!(op, 0xb8 | 0xc2 | 0xc3)
+        {
+            return false;
+        }
+        let len = x64::bytecode_len_at(code, pc);
+        if len == 0 || pc.saturating_add(len) > code_len {
+            return false;
+        }
+        pc += len;
+    }
+    true
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn try_compile_inner(
     cached: &CachedBytecodeMethod,
@@ -7342,6 +7394,7 @@ fn try_compile_inner(
     // same method). See `local_handler_reads_unsafe_local`'s own doc
     // comment, and `regalloc::handler_has_unsafe_local_read`'s, for the
     // full algorithm and soundness argument.
+    let mut precise_exception_frames = false;
     if !cached.exception_table.is_empty() {
         let unsafe_local = local_handler_reads_unsafe_local(
             code,
@@ -7357,12 +7410,26 @@ fn try_compile_inner(
             );
         }
         if unsafe_local {
-            // The current exception router can restore only incoming
-            // parameters. A handler that reads a later local must remain
-            // interpreted until the precise exceptional-frame handoff covers
-            // every compiled-call sink. Compiling it is unsound: a propagated
-            // exception reaches the handler with that local reset to null/zero.
-            return None;
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !precise_exception_frame_sites_supported(
+                    code,
+                    code_len,
+                    &cached.exception_table,
+                ) {
+                    // A handler that reads a later local remains interpreted
+                    // unless every throwing site in its protected ranges can
+                    // publish that local through the precise exceptional-frame
+                    // handoff. Compiling any broader shape would reset the
+                    // handler local to null/zero on an exception.
+                    return None;
+                }
+                precise_exception_frames = true;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                return None;
+            }
         }
     }
 
@@ -8995,6 +9062,14 @@ fn try_compile_inner(
     // intrinsic matcher nor `x64::compile` needs the VM class registry.
     let string_layout: Option<StringFieldLayout> = string_layout_resolver.and_then(|r| r());
 
+    // A protected invokestatic in the narrow precise-handler shape must retain
+    // its explicit post-call reason-9 guard. Inlining would move the callee's
+    // throwing operations into this body without independently snapshotting
+    // each one, invalidating `precise_exception_frame_sites_supported`.
+    if precise_exception_frames {
+        inline_sites.clear();
+    }
+
     // round-7 fix (bug 1): from this point on, any `None` return is a
     // permanent backend bail — the resolver pre-checks all completed
     // successfully and we're about to walk the full
@@ -9048,6 +9123,11 @@ fn try_compile_inner(
     );
 
     x64::set_pending_verified_max_stack(cached.max_stack as usize);
+    // The request is one-shot and consumed at x64 compiler entry. Set it only
+    // after every resolver/admission early return above so a failed front-end
+    // attempt cannot leak the request into the next method compiled on this
+    // thread.
+    x64::set_precise_exception_frame_request(precise_exception_frames);
     // Pure-kernel GPR local homes: this is the METHOD-ENTRY compile path
     // (OSR artifacts go through the interpreter's `compile_osr_artifact`,
     // which never sets this), so request the kernel register homes. The
@@ -14039,7 +14119,8 @@ mod tests {
 
     /// RG.6 — JIT scanner accepts `monitorenter` (0xc2) and `monitorexit`
     /// (0xc3) so synchronized blocks are JIT-eligible. The compiler then
-    /// either elides the lock (escape-analysis proves thread-local) or bails.
+    /// either elides the exact lock site (escape analysis proves its receiver
+    /// thread-local) or lowers it through the direct thin-lock runtime stub.
     #[test]
     fn rg6_jit_accepts_monitor_enter_exit() {
         // aconst_null, dup (0x59), monitorenter, monitorexit, pop (0x57), ireturn
@@ -14048,6 +14129,88 @@ mod tests {
             is_jit_compatible(&code, code.len(), "()I"),
             "monitorenter/exit must be accepted so synchronized methods can JIT"
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn synchronized_cleanup_has_precise_exception_site_coverage() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        // javac-style synchronized cleanup: save the lock in local 1, execute
+        // a non-throwing body, release it, and use a catch-all handler to
+        // release + rethrow. The handler reads the non-parameter lock local,
+        // while every potentially throwing protected instruction is a monitor
+        // runtime call that publishes a reason-9 snapshot.
+        let code = vec![
+            0x2a, // 0: aload_0
+            0x59, // 1: dup
+            0x4c, // 2: astore_1
+            0xc2, // 3: monitorenter
+            0x03, // 4: iconst_0
+            0x3d, // 5: istore_2
+            0x84, 0x02, 0x01, // 6: iinc 2, 1
+            0x2b, // 9: aload_1
+            0xc3, // 10: monitorexit
+            0xb1, // 11: return
+            0x4e, // 12: astore_3
+            0x2b, // 13: aload_1
+            0xc3, // 14: monitorexit
+            0x2d, // 15: aload_3
+            0xbf, // 16: athrow
+        ];
+        let table = vec![
+            ExceptionTableEntry {
+                start_pc: 4,
+                end_pc: 11,
+                handler_pc: 12,
+                catch_type: 0,
+            },
+            ExceptionTableEntry {
+                start_pc: 12,
+                end_pc: 15,
+                handler_pc: 12,
+                catch_type: 0,
+            },
+        ];
+        assert!(local_handler_reads_unsafe_local(
+            &code,
+            code.len(),
+            &table,
+            "(Ljava/lang/Object;)V",
+            true,
+        ));
+        assert!(precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table,
+        ));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn protected_field_access_keeps_unsafe_handler_interpreted() {
+        use cratonvm_reader::attribute::ExceptionTableEntry;
+
+        let code = vec![
+            0x2a, // 0: aload_0
+            0xb4, 0x00, 0x01, // 1: getfield #1
+            0x57, // 4: pop
+            0xb1, // 5: return
+            0x4c, // 6: astore_1
+            0x2b, // 7: aload_1
+            0xbf, // 8: athrow
+        ];
+        let table = vec![ExceptionTableEntry {
+            start_pc: 0,
+            end_pc: 5,
+            handler_pc: 6,
+            catch_type: 0,
+        }];
+        assert!(!precise_exception_frame_sites_supported(
+            &code,
+            code.len(),
+            &table,
+        ));
     }
 
     /// RG.7 — `System.arraycopy` is routed through the native registry as an

@@ -11606,6 +11606,60 @@ fn find_exception_handler_impl(
 /// is pushed with `pc` at the handler and the exception on the operand
 /// stack; the interpreter resumes the catch block. Otherwise the exception
 /// propagates to the caller.
+/// Consume an optional reason-9 frame published by the x64 backend and route
+/// a pending Java exception with the exact throw bci and reconstructed locals.
+///
+/// `None` means the compiled method used the historical params-only route.
+/// A matching but unmappable frame fails closed by propagating the exception;
+/// entering a handler with zeroed non-parameter locals would be a silent
+/// miscompile. A foreign nested-callee frame is restored for its owner.
+fn route_jit_signal_exception(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    caller_frame_idx: usize,
+    cached: &Arc<CachedBytecodeMethod>,
+    fallback_throw_pc: usize,
+    exc: ObjectRef,
+    fallback_locals: &[Value],
+) -> Result<CachedCallResult, MethodCallFailed> {
+    let precise = match cratonvm_jit::deopt::take_last_deopt() {
+        Some(rframe)
+            if deopt_frame_matches_method(
+                &rframe,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            ) =>
+        {
+            let bci = rframe.bci as usize;
+            let Some(locals) = ir_deopt_locals(&rframe.locals) else {
+                return Err(MethodCallFailed::ExceptionThrown(exc));
+            };
+            Some((bci, locals))
+        }
+        Some(rframe) => {
+            cratonvm_jit::deopt::restash_last_deopt(rframe);
+            None
+        }
+        None => None,
+    };
+    let (throw_pc, locals) = match precise.as_ref() {
+        Some((bci, locals)) => (*bci, locals.as_slice()),
+        None => (fallback_throw_pc, fallback_locals),
+    };
+    route_jit_exception_through_method(
+        shared,
+        thread,
+        caller_frame_idx,
+        cached,
+        throw_pc,
+        exc,
+        locals,
+    )
+}
+
+/// Search the cached exception table and construct the interpreter handler
+/// frame from the locals selected by `route_jit_signal_exception`.
 fn route_jit_exception_through_method(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -38222,7 +38276,7 @@ fn execute_jit_call(
             } else {
                 usize::MAX
             };
-            return route_jit_exception_through_method(
+            return route_jit_signal_exception(
                 shared,
                 thread,
                 frame_idx,
@@ -38291,7 +38345,7 @@ fn execute_jit_call(
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38329,7 +38383,7 @@ fn execute_jit_call(
         ) {
             Ok(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38362,7 +38416,7 @@ fn execute_jit_call(
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38687,7 +38741,7 @@ fn execute_jit_call_decoded(
             } else {
                 usize::MAX
             };
-            return route_jit_exception_through_method(
+            return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )
             .map(Some);
@@ -38719,7 +38773,7 @@ fn execute_jit_call_decoded(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38742,7 +38796,7 @@ fn execute_jit_call_decoded(
             Some(&msg),
         ) {
             Ok(exc) => {
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38768,7 +38822,7 @@ fn execute_jit_call_decoded(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
