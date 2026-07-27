@@ -3256,40 +3256,58 @@ mod tests {
     }
 
     #[test]
-    fn jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal() {
-        // Both JASPER-JDT.2 (org/eclipse/jdt/internal/compiler/parser/) and
-        // JASPER-JDT.3 (org/eclipse/jdt/internal/compiler/ast/) were
-        // removed 2026-07-26 -- see the removal comments above
-        // should_skip_jit_internal for the re-verification evidence (each:
-        // 2 baseline + 2 lifted runs of a real Tomcat integration test
-        // suite -- TestCompiler for JASPER-JDT.2, TestFormAuthenticatorA
-        // for JASPER-JDT.3 -- all runs clean).
-        for method in ["consumeRule", "consumeTypeImportOnDemandDeclarationName"] {
-            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
-                assert_eq!(
-                    check(
-                        "org/eclipse/jdt/internal/compiler/parser/Parser",
-                        method,
-                        false,
-                        true,
-                        policy,
-                    ),
-                    None,
-                    "org/eclipse/jdt/internal/compiler/parser/Parser.{method} must be JIT-eligible now that JASPER-JDT.2 is removed"
-                );
-            }
-        }
-        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+    fn jdt_parser_and_ast_packages_are_banned_under_conservative_after_jasper_jdt_2_3_restore() {
+        // JASPER-JDT.2 (`org/eclipse/jdt/internal/compiler/parser/`) and
+        // JASPER-JDT.3 (`org/eclipse/jdt/internal/compiler/ast/`) were removed
+        // 2026-07-26 and then RESTORED -- see the loop over those two prefixes
+        // in should_skip_jit_internal and its comment: the removal evidence was
+        // void because those runs never lifted the ban that was shadowing them,
+        // so removing them would assert something no measurement supports.
+        //
+        // This test previously asserted the opposite (that both packages are
+        // JIT-eligible) and was left behind by that restore, so it failed on
+        // `dev`. It now pins the restored state: banned under Conservative,
+        // eligible under Aggressive (which bypasses the whole block), and
+        // liftable per-package via the allow-list.
+        let cases = [
+            (
+                "org/eclipse/jdt/internal/compiler/parser/Parser",
+                "consumeRule",
+                "org/eclipse/jdt/internal/compiler/parser/",
+            ),
+            (
+                "org/eclipse/jdt/internal/compiler/parser/Parser",
+                "consumeTypeImportOnDemandDeclarationName",
+                "org/eclipse/jdt/internal/compiler/parser/",
+            ),
+            (
+                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
+                "analyseCode",
+                "org/eclipse/jdt/internal/compiler/ast/",
+            ),
+        ];
+        for (class_name, method, prefix) in cases {
             assert_eq!(
-                check(
-                    "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
-                    "analyseCode",
+                check(class_name, method, false, true, SkipPolicy::Conservative),
+                Some(SkipReason::RustJvmTestFixture),
+                "{class_name}.{method} must stay interpreted under Conservative -- JASPER-JDT.2/.3 were restored",
+            );
+            assert_eq!(
+                check(class_name, method, false, true, SkipPolicy::Aggressive),
+                None,
+                "{class_name}.{method} must be JIT-eligible under Aggressive, which bypasses the Conservative-only block",
+            );
+            assert_eq!(
+                check_with(
+                    class_name,
+                    method,
                     false,
                     true,
-                    policy,
+                    SkipPolicy::Conservative,
+                    &[prefix],
                 ),
                 None,
-                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.analyseCode must be JIT-eligible now that JASPER-JDT.3 is removed"
+                "{class_name}.{method} must be JIT-eligible once {prefix} is explicitly allowed",
             );
         }
     }
