@@ -66,11 +66,7 @@ macro_rules! cached_is_ok {
 /// inline check.
 #[inline]
 pub fn disable_jit() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_DISABLE_JIT") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => false,
-    })
+    cratonvm_types::flags().jit.disable_jit
 }
 
 /// `CRATONVM_JIT_THRESHOLD` — invocation count at which a method becomes

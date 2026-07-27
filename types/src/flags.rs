@@ -784,6 +784,11 @@ impl GcFlags {
 /// crates are here so far; the rest arrive with the `jit` migration.
 #[derive(Debug, Clone, Default)]
 pub struct JitFlags {
+    /// `CRATONVM_DISABLE_JIT` — process-wide interpreter-only kill switch.
+    ///
+    /// This is typed because the launcher must be able to overlay `--nojit`
+    /// before publishing the immutable configuration snapshot.
+    pub disable_jit: bool,
     /// `CRATONVM_SHADOW_STACK` — use the JIT shadow stack for root discovery.
     /// Read from `gc`, `jit` and `vm`, which is why it is in the shared config
     /// rather than a crate-private cache.
@@ -798,6 +803,7 @@ pub struct JitFlags {
 impl JitFlags {
     fn from_source(src: &dyn FlagSource) -> Self {
         Self {
+            disable_jit: parse::non_empty_non_zero(src, "CRATONVM_DISABLE_JIT"),
             shadow_stack: parse::present(src, "CRATONVM_SHADOW_STACK"),
             method_stats: parse::exactly_one(src, "CRATONVM_DBG_JIT_METHOD_STATS"),
         }
@@ -1719,7 +1725,18 @@ impl VmFlags {
     /// every field below. Legacy per-flag names are what the grouped tokens
     /// expand *to*, so setting one directly still works unchanged.
     pub fn from_env() -> Self {
-        let raw = MapSource::from_process_env();
+        Self::from_env_with_overrides(MapSource::empty())
+    }
+
+    /// Build from one process-environment snapshot plus launcher overrides.
+    ///
+    /// Overrides win over inherited variables, then grouped flag expressions
+    /// are resolved across the combined source. Launchers should use this
+    /// instead of mutating `environ` after argument parsing: once any
+    /// CratonVM flag is read, the process configuration is immutable.
+    pub fn from_env_with_overrides(overrides: MapSource) -> Self {
+        let mut raw = MapSource::from_process_env();
+        raw.0.extend(overrides.0);
         Self::from_source(&crate::flag_groups::resolve(&raw))
     }
 }
@@ -1851,6 +1868,17 @@ mod tests {
         assert_eq!(f.gc.dbg_stale_objref_cycles, 1);
         assert_eq!(f.gc.dbg_watch_cell, 0);
         assert_eq!(f.gc.dbg_blocked_access, BlockedAccessMode::Off);
+        assert!(!f.jit.disable_jit);
+    }
+
+    #[test]
+    fn launcher_override_and_grouped_flags_share_one_resolved_snapshot() {
+        let mut raw = src(&[("CRATONVM_DBG", "jit-method-stats")]);
+        raw.0
+            .extend(MapSource::empty().with("CRATONVM_DISABLE_JIT", "1").0);
+        let f = VmFlags::from_source(&crate::flag_groups::resolve(&raw));
+        assert!(f.jit.disable_jit);
+        assert!(f.jit.method_stats);
     }
 
     #[test]

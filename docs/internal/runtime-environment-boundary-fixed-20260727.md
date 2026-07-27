@@ -26,6 +26,14 @@ string compatibility boundary:
   `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY` are now part of the canonical
   inventory.
 
+The launcher now installs that snapshot before crash handlers or other
+subsystems initialize. `--nojit` is applied as a typed overlay while scanning
+only the launcher portion of expanded argv; it no longer calls
+`std::env::set_var` after parsing. This also closes the discovered failure mode
+where an earlier flag read latched JIT-on and made the CLI option silently
+ineffective. `CRATONVM_DISABLE_JIT=1` and `--nojit` now select the same fully
+interpreted execution path.
+
 The flag-surface check rejects new direct environment reads in those crates, so
 future configuration must either use a typed `VmFlags` field or the immutable
 compatibility boundary.
@@ -34,6 +42,7 @@ compatibility boundary.
 
 * `tools/flag-census/check-surface.sh`
 * `cargo test -p cratonvm-types`
+* `cargo test -p cratonvm-cli --test cli_nojit`
 * `cargo check -p cratonvm-reader -p cratonvm-vm -p cratonvm-jit -p cratonvm-gc
   -p cratonvm-classloading -p cratonvm-native-api
   -p cratonvm-native-builtins -p cratonvm-native-collections`
