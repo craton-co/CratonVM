@@ -45,7 +45,7 @@ smaller/individual differences not yet clustered.
 > `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`,
 > `DataRedisHealthContributorAutoConfigurationTests` — see
 > `RESULTS-20260723.md`'s residual table) is fixed — see
-> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
+> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](../../internal/fixed-suite-bugs/springboot/data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
 > Root cause: `URLClassLoader.findClass`/`findResource` rebuilt the whole
 > classpath scan from scratch on every call (no caching), and `JarFile`
 > entry lookups eagerly decompressed every entry in a jar just to answer an

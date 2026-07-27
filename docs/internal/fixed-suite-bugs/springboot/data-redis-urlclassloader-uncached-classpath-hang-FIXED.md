@@ -86,7 +86,7 @@ bugs — see "Residuals unmasked" below).
   completes in ~215s, 22/23 tests pass — the one remaining failure
   (pre-existing, unrelated, previously masked by the class-level hang) is
   **also now FIXED 2026-07-23**, see
-  `../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`.
+  `data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`.
   Full class now 23/23 PASS.
 - Regression sweep: 82 classes (all `module/spring-boot-data-redis` +
   71 classes across the codebase using `@ClassPathExclusions`/
@@ -224,7 +224,7 @@ class carries `@ClassPathExclusions("spring-data-envers-*.jar")`, which
 routes the *entire* test class through JUnit5's
 `ModifiedClassPathExtension` — a nested `Launcher` re-runs the whole test
 under a **second**, `ModifiedClassPathClassLoader` instance (see
-`modifiedclasspath-aether-network-hang-cluster.md` in
+`modifiedclasspath-aether-network-hang-cluster-FIXED.md` in
 `docs/internal/fixed-suite-bugs/springboot/` for the mechanism). Every
 diagnostic above was traced against whichever load actually printed —
 never confirmed *which* classloader's copy of
