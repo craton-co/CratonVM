@@ -640,9 +640,9 @@ impl<'a> Lowerer<'a> {
         self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
         self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
         let rel = self.buf.pos() as i32 - (clear_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(clear_patch, rel)
-            .expect("IR safepoint poll patch in-bounds");
+        // IR safepoint poll -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, clear_patch, rel);
     }
 
     /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
@@ -1016,9 +1016,9 @@ impl<'a> Lowerer<'a> {
             self.call_exc_patches.push(patch);
         }
         let rel = self.buf.pos() as i32 - (fast_skip_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(fast_skip_patch, rel)
-            .expect("ir_lower self-call stack-sample patch in-bounds");
+        // ir_lower self-call stack-sample -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, fast_skip_patch, rel);
 
         // Marshal args into this method's OWN entry ABI — IDENTICAL to the
         // register list `emit_prologue` reads incoming args from: abi[0] = the
@@ -1061,9 +1061,9 @@ impl<'a> Lowerer<'a> {
         // .keep:
         let keep_off = self.buf.pos();
         let rel = keep_off as i32 - (keep_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(keep_patch, rel)
-            .expect("ir_lower self-call sentinel keep patch in-bounds");
+        // ir_lower self-call sentinel keep -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, keep_patch, rel);
         // Spill the return value.
         self.store_rax(slot);
     }
@@ -1481,9 +1481,9 @@ impl<'a> Lowerer<'a> {
             // .keep: patch the JNE above to land here.
             let keep_off = self.buf.pos();
             let rel = keep_off as i32 - (keep_patch as i32 + 4);
-            self.buf
-                .try_patch_i32(keep_patch, rel)
-                .expect("ir_lower call-sentinel keep patch in-bounds");
+            // ir_lower call-sentinel keep -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, keep_patch, rel);
         } else {
             self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
             let patch = self.buf.pos();
@@ -1500,9 +1500,9 @@ impl<'a> Lowerer<'a> {
         for p in patches {
             // rel32 = target - (rel32_field_offset + 4); target = entry = 0.
             let rel = 0i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("ir_lower self-call rel32 patch in-bounds");
+            // ir_lower self-call rel32 -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, p, rel);
         }
     }
 
@@ -1713,9 +1713,9 @@ impl<'a> Lowerer<'a> {
                 self.call_exc_patches.push(exception_patch);
                 let allocated = self.buf.pos();
                 let rel = allocated as i32 - (allocated_patch as i32 + 4);
-                self.buf
-                    .try_patch_i32(allocated_patch, rel)
-                    .expect("allocation success patch in-bounds");
+                // allocation success -- tolerated on an overflowed buffer; see
+                // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                Self::patch_or_bail(&mut self.buf, allocated_patch, rel);
                 self.store_rax(slot);
             }
             Op::Neg => {
@@ -1962,9 +1962,9 @@ impl<'a> Lowerer<'a> {
                 // continue: patch the JNZ to here (fall-through past the deopt).
                 let cont = self.buf.pos();
                 let rel = cont as i32 - (jnz_patch as i32 + 4);
-                self.buf
-                    .try_patch_i32(jnz_patch, rel)
-                    .expect("guard JNZ patch in-bounds");
+                // guard JNZ -- tolerated on an overflowed buffer; see
+                // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                Self::patch_or_bail(&mut self.buf, jnz_patch, rel);
             }
             // getfield read — `Op::Load`. The IR builder emits only
             // `Op::Load(MemKind::Int)` (int-category instance fields, slice 1
@@ -2407,9 +2407,9 @@ impl<'a> Lowerer<'a> {
                         // around_first: the jumped-to edge. Patch the Jcc here.
                         let around_first = self.buf.pos();
                         let rel = around_first as i32 - (jcc_patch as i32 + 4);
-                        self.buf
-                            .try_patch_i32(jcc_patch, rel)
-                            .expect("codegen patch in-bounds");
+                        // codegen -- tolerated on an overflowed buffer; see
+                        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+                        Self::patch_or_bail(&mut self.buf, jcc_patch, rel);
                         self.emit_phi_copies(block_idx, second_block);
                         self.buf.emit_byte(0xE9); // JMP second_block
                         let jmp_second = self.buf.pos();
@@ -2437,9 +2437,9 @@ impl<'a> Lowerer<'a> {
         for &(patch_pos, target_block) in &self.branch_patches {
             let target_offset = self.block_offsets[target_block];
             let rel32 = target_offset as i32 - (patch_pos as i32 + 4);
-            self.buf
-                .try_patch_i32(patch_pos, rel32)
-                .expect("codegen patch in-bounds");
+            // codegen -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, patch_pos, rel32);
         }
     }
 
@@ -2633,9 +2633,9 @@ impl<'a> Lowerer<'a> {
         let do_div = self.buf.pos();
         for p in [jne1, jne2] {
             let rel = do_div as i32 - (p as i32 + 4);
-            self.buf
-                .try_patch_i32(p, rel)
-                .expect("div-overflow JNE patch in-bounds");
+            // div-overflow JNE -- tolerated on an overflowed buffer; see
+            // `Self::patch_or_bail` / `patch_rel32_to_here`.
+            Self::patch_or_bail(&mut self.buf, p, rel);
         }
         after_patch
     }
@@ -2646,9 +2646,9 @@ impl<'a> Lowerer<'a> {
     fn patch_div_overflow_after(&mut self, after_patch: usize) {
         let cont = self.buf.pos();
         let rel = cont as i32 - (after_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(after_patch, rel)
-            .expect("div-overflow JMP patch in-bounds");
+        // div-overflow JMP -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, after_patch, rel);
     }
 
     /// Emit a deopt-on-zero branch, given the caller has already emitted a
@@ -2698,9 +2698,9 @@ impl<'a> Lowerer<'a> {
         // continue:
         let cont = self.buf.pos();
         let rel = cont as i32 - (jcc_patch as i32 + 4);
-        self.buf
-            .try_patch_i32(jcc_patch, rel)
-            .expect("deopt-unless Jcc patch in-bounds");
+        // deopt-unless Jcc -- tolerated on an overflowed buffer; see
+        // `Self::patch_or_bail` / `patch_rel32_to_here`.
+        Self::patch_or_bail(&mut self.buf, jcc_patch, rel);
     }
 
     /// IR FP tier (Slice B) — emit the JVMS null + bounds deopt guards for an

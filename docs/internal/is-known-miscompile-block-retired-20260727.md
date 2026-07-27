@@ -137,15 +137,31 @@ with no unwinding catch, so a method body that outgrew its estimated buffer
 took the whole process down. (`offset == len` in the panic: the branch's own
 `rel32` placeholder had already been dropped by the sticky-overflow `emit`.)
 
-Fixed in `jit/src/ir_lower.rs` by routing both stub patch loops through a new
+Fixed in `jit/src/ir_lower.rs` by routing the patch through a new
 `patch_or_bail` helper that honours the documented contract — the same
-convention `patch_rel32_to_here` already followed. A `debug_assert!` keeps the
+convention `patch_rel32_to_here` already followed, and which the file's
+`try_patch_byte` sites already used via `.ok()`. A `debug_assert!` keeps the
 invariant loud in debug builds: a patch failure must have marked the buffer
 overflowed, which is exactly what makes the compile discardable.
 
+**It was a family of 13, not one.** Fixing only the two stub emitters was not
+enough: the very next real-fixture run, Tomcat's
+`org.apache.jasper.compiler.TestGenerator`, aborted at a *third* site —
+
+```
+thread 'http-nio-127.0.0.1-auto-8-exec-3' panicked at jit/src/ir_lower.rs:638:14:
+IR safepoint poll patch in-bounds: PatchFailed { kind: "i32", offset: 4864 }
+```
+
+— so every remaining `try_patch_i32(..).expect(..)` in the lowerer was
+converted too: the safepoint poll, the self-call stack-sample / sentinel-keep /
+rel32 patches, the call-sentinel keep, the guard JNZ, both generic
+`patch_branches` sites, both div-overflow patches, and the deopt-unless Jcc.
+Thirteen sites in total, all of them reachable the same way.
+
 This defect is **not** specific to Groovy — any method whose lowered body
 exceeds `nodes*32 + calls*448 + 1024` bytes reaches it. Groovy's AST/parser
-code is simply the shape that got there first in a probe.
+code and Tomcat's JSP compiler are simply the shapes that got there first.
 
 ### (b) `dev` did not compile
 
