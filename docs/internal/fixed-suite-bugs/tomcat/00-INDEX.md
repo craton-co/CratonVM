@@ -86,11 +86,15 @@ in the remaining 11. Also flagged: two remaining-11 classes
 this directory claiming they're already fixed, but both still fail/hang on
 current `dev` — not reconciled yet. See group 16's addendum for full detail.
 
-> **`TestJNDIRealmIntegration` reconciled 2026-07-26.** The class is 76/76 with
-> the JIT fully enabled on `com/unboundid/`, and its real producer
+> **`TestJNDIRealmIntegration` reconciled 2026-07-26/27.** The class is 76/76
+> with the JIT fully enabled on `com/unboundid/`, and its real producer
 > (TOMCAT-JNDIREALM-JIT.3 — `string_case_cache` published only to the GC
 > initiator, so any peer-initiated sweep reclaimed the cached case-conversion
-> Strings) is fixed, with both JIT guards removed. See
+> Strings) is fixed, with both JIT guards removed. **Verified on BOTH hosts**:
+> 47 runs on the Windows box and 5 runs on the Azure Linux host against its own
+> fixture, all `OK (76 tests)` with zero stale-pointer events — so its **HANG**
+> row in the group-18/RESULTS-20260724 Linux table is resolved, not merely
+> untested. See
 > [jndirealmintegration-unboundid-jit-corruption-FIXED.md](jndirealmintegration-unboundid-jit-corruption-FIXED.md).
 > `TestMapperPerformance` remains unreconciled.
 

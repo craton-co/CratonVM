@@ -111,6 +111,16 @@ All runs: real JDK 25, real sockets, the suite runner's own environment
 | dev `95e4d9929` (pre-fix) | guards lifted | 76/76 × 38 runs | **3–4 (bug live, masked by the CP-class fallback)** |
 | this branch, pre-merge | **guards removed**, no env overrides | 76/76 × 25 runs | **0** |
 | this branch, after merging dev (+159 commits) | **guards removed**, no env overrides | 76/76 × 22 runs | **0** |
+| dev `66ee9f037` on **Linux** (Azure host, `x86_64` 6.17.0-azure) | **guards removed**, no env overrides | 76/76 × 5 runs | **0** |
+
+The Linux row matters because the root cause is a cross-thread GC-root gap, not
+anything platform-specific, and because the 2026-07-24 Linux 6-shard run
+(`apps/tomcat-suite-runner/RESULTS-20260724-cwdfix.md`) listed this class as
+**HANG** among its 91 confirmed CratonVM-only regressions. It is no longer
+hanging: 5/5 `OK (76 tests)` in 18-34s each, 0 stale-pointer events across all
+five runs, against that host's own Tomcat fixture
+(`/data/data/apps/tomcat`, `cp-linux-fixed.txt`, real JDK 25 at
+`/home/victor/jdk25`).
 
 The control build is the important row: the documented corruption still
 reproduces on this box in this harness at the pre-fix commit, so "clean on
