@@ -29,6 +29,18 @@ Every case runs in a fresh process, pins one CPU, alternates HotSpot and
 CratonVM within each repetition, and records the checksum. Runs are invalid if
 deterministic checksums differ.
 
+The focused interface-dispatch gate additionally requires JIT execution to
+beat `--nojit` for mono-, four-way poly-, and sixteen-way megamorphic shapes,
+and checks that a four-receiver unrolled call site stops entering the cache
+helper after warm-up:
+
+```bash
+tools/architecture-probe-20260726/check-interface-jit-performance-20260727.sh \
+  -Exe /data/data/bin/cratonvm-complete-remediation-20260726-r16 \
+  --java-home /usr/lib/jvm/java-17-openjdk-amd64 \
+  --iterations 1000000 --reps 3 --cpu 13
+```
+
 Build CratonVM under a unique name and run:
 
 ```bash

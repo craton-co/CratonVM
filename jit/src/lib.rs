@@ -1215,12 +1215,12 @@ pub struct CompiledMethod {
     /// pointers; they are freed when this `CompiledMethod` is dropped.
     pub _jit_mic_slots: Vec<Box<JitMICSlot>>,
     /// Owned polymorphic inline cache slots. JIT code references these via
-    /// raw pointers (embedded as imm64 in the inline 3-way cascade emitted
+    /// raw pointers (embedded as imm64 in the inline 4-way cascade emitted
     /// by `Compiler::compile_op_invokevirtual`); they are freed when this
     /// `CompiledMethod` is dropped.
     ///
     /// HIGH-7 — populated eagerly at first compile for every
-    /// invokevirtual / invokeinterface bci. Slots start empty (all 3
+    /// invokevirtual / invokeinterface bci. Slots start empty (all 4
     /// `cached_class_id` entries == 0), so the inline cascade falls
     /// straight through to the slow-path helper on cold sites; once the
     /// helper has populated a slot, subsequent dispatches take the
@@ -2788,10 +2788,10 @@ fn call_site_is_hot(
 ///    because the IR had no inline cache and a virtual site paid the full
 ///    helper round trip WITH a dynamic target lookup. They are now admitted:
 ///    `ir_lower::emit_inline_cache_call` (jit-inlining-and-ir-calls) gives such
-///    a site the same monomorphic-then-3-way-polymorphic cascade the
+///    a site the same monomorphic-then-4-way-polymorphic cascade the
 ///    single-pass backend emits, and `CRATONVM_JIT_IR_CALL_VIRTUAL` inverted
 ///    from opt-in to opt-out with it. Admission is subject to
-///    `ir_virtual_calls_enabled()` for the same reason the statically-bound
+///    caller-supplied virtual-call policy for the same reason the statically-bound
 ///    kinds are subject to `ir_direct_calls_enabled()`: with the capability
 ///    switched off, the IR is back to paying the helper per call and the
 ///    original rejection is still the right answer.
@@ -2812,6 +2812,7 @@ pub fn c2_upgrade_would_engage(
     descriptor: &str,
     ir_emit_long: bool,
     ir_emit_fp: bool,
+    ir_emit_virtual_calls: bool,
 ) -> bool {
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
@@ -2825,7 +2826,7 @@ pub fn c2_upgrade_would_engage(
         // dynamically-bound kinds need the inline-cache capability. Anything
         // else (there is nothing else — `indy` is rejected above) is refused.
         let statics_ok = ir_direct_calls_enabled();
-        let virtuals_ok = ir_virtual_calls_enabled();
+        let virtuals_ok = ir_emit_virtual_calls;
         let all_lowerable = scan.invoke_ops.iter().all(|(_, _, opcode)| match *opcode {
             0xb8 | 0xb7 => statics_ok,
             0xb6 | 0xb9 => virtuals_ok,
@@ -4465,41 +4466,39 @@ impl Default for JitMICSlot {
 
 /// Maximum number of entries a `JitPICSlot` holds.
 ///
-/// Three slots is the HotSpot default for C1's PIC. In practice almost
-/// all polymorphic call sites observed fewer than three distinct
-/// receiver types over the lifetime of a method; higher arities fall
-/// off to megamorphic (plain vtable) dispatch.
-pub const JIT_PIC_ENTRIES: usize = 3;
+/// Four entries cover the common bimorphic-to-small-polymorphic interface
+/// shapes (including the architecture probe's four implementations) without
+/// entering LFU eviction on every cycle.
+pub const JIT_PIC_ENTRIES: usize = 4;
 
-/// Polymorphic inline cache slot: a 3-way associative cache for
+/// Polymorphic inline cache slot: a 4-way associative cache for
 /// virtual call dispatch targeting a call site that has exhibited
 /// polymorphism (more than one receiver type observed).
 ///
 /// # Promotion path
 ///
 /// ```text
-/// uncompiled → MIC (1-entry) → PIC (3-entry) → megamorphic vtable
+/// uncompiled → MIC (1-entry) → PIC (4-entry) → megamorphic vtable
 /// ```
 ///
 /// The JIT installs a [`JitMICSlot`] at every virtual call site. On a
 /// recorded miss count > `MIC_TO_PIC_THRESHOLD` the adaptive
 /// recompiler upgrades the site to a `JitPICSlot`. If the PIC itself
-/// records > `PIC_TO_MEGA_THRESHOLD` misses after filling all 3
+/// records > `PIC_TO_MEGA_THRESHOLD` misses after filling all 4
 /// entries, the site is deoptimized to a generic vtable dispatch.
 ///
 /// # Memory layout
 ///
-/// Entries are stored in plain arrays so the generated x86-64 stub
-/// can do a simple linear probe: `CMP RAX, [RBX+0]; JE entry0; CMP
-/// RAX, [RBX+16]; JE entry1; ...`. Each entry is 24 bytes
-/// (`class_id` + padding + `entry_ptr` + flags) — well within an L1
-/// line for the whole slot.
+/// Hot fields use a structure-of-arrays prefix so the generated x86-64 stub
+/// can linearly probe four packed class ids at offsets 0–12, then load the
+/// matching entry pointer at offsets 16–40 and ABI flag at offsets 48–51.
+/// The entire generated-code-visible prefix fits in one cache line.
 ///
 /// # Stable layout (CRIT-8 prerequisite)
 ///
 /// Marked `#[repr(C)]` and laid out so the JIT codegen in
 /// `jit/src/x64.rs` can emit raw `MOV eax, [pic_ptr + CLASS_ID_OFFSETS[i]]`
-/// for inline 3-way PIC dispatch. The `Mutex<Option<String>>` array —
+/// for inline 4-way PIC dispatch. The `Mutex<Option<String>>` array —
 /// whose internal representation is not guaranteed stable across
 /// `parking_lot` versions — is moved to the **tail** so its layout
 /// cannot disturb the hot-path offsets.
@@ -4513,22 +4512,20 @@ pub struct JitPICSlot {
     /// is empty (ClassId 0 is reserved for `java.lang.Object`, which
     /// cannot be a dispatch target here because invokevirtual on an
     /// Object reference goes through the vtable directly).
-    /// **JIT-hot — offsets 0, 4, 8.**
+    /// **JIT-hot — offsets 0, 4, 8, 12.**
     pub class_ids: [std::sync::atomic::AtomicU32; JIT_PIC_ENTRIES],
-    /// Padding so `entry_ptrs` lands at an 8-byte aligned offset.
-    _pad0: u32,
     /// Cached method entry pointers, parallel to `class_ids`.
-    /// **JIT-hot — offsets 16, 24, 32.**
+    /// **JIT-hot — offsets 16, 24, 32, 40.**
     pub entry_ptrs: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
     /// Whether the cached entry needs the VM context pointer as the
     /// first argument. Parallel to `class_ids`.
-    /// **JIT-hot — offsets 40, 41, 42.**
+    /// **JIT-hot — offsets 48, 49, 50, 51.**
     pub needs_context: [std::sync::atomic::AtomicBool; JIT_PIC_ENTRIES],
     /// Padding so the following `AtomicU64` counters land at an 8-byte
     /// aligned offset.
-    _pad1: [u8; 5],
+    _pad1: [u8; 4],
     /// Per-entry hit counter. Used to pick an eviction victim when a
-    /// fourth receiver type arrives.
+    /// fifth receiver type arrives.
     pub hits: [std::sync::atomic::AtomicU64; JIT_PIC_ENTRIES],
     /// Total cache misses (receiver not in any entry).
     pub misses: std::sync::atomic::AtomicU64,
@@ -4539,13 +4536,28 @@ pub struct JitPICSlot {
     /// Strong owners for compiled `entry_ptrs`; tail-only so hot offsets stay
     /// stable. Native targets leave the corresponding element empty.
     compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_PIC_ENTRIES],
+    /// Bounded secondary cache used after the four generated inline probes
+    /// miss. It keeps megamorphic sites from repeating method resolution and
+    /// compile-cache lookup on every invocation while leaving generated code
+    /// compact and the hot layout above unchanged.
+    megamorphic_entries:
+        parking_lot::RwLock<std::collections::HashMap<u32, JitMegamorphicEntry>>,
 }
+
+struct JitMegamorphicEntry {
+    entry_ptr: u64,
+    needs_context: bool,
+    _class_name: String,
+    owner: Option<Arc<CompiledMethod>>,
+}
+
+const JIT_MEGAMORPHIC_ENTRIES: usize = 64;
 
 /// Miss count on a `JitMICSlot` at which the adaptive recompiler
 /// promotes the site to a `JitPICSlot`.
 pub const MIC_TO_PIC_THRESHOLD: u64 = 3;
 
-/// Miss count on a full `JitPICSlot` (all 3 entries populated) at
+/// Miss count on a full `JitPICSlot` (all 4 entries populated) at
 /// which the adaptive recompiler deoptimizes the site to megamorphic
 /// vtable dispatch.
 pub const PIC_TO_MEGA_THRESHOLD: u64 = 20;
@@ -4553,17 +4565,17 @@ pub const PIC_TO_MEGA_THRESHOLD: u64 = 20;
 impl JitPICSlot {
     /// Byte offsets of [`Self::class_ids`] entries from the start of
     /// the struct. JIT codegen uses these to emit
-    /// `MOV eax, [pic_ptr + CLASS_ID_OFFSETS[i]]` for the inline 3-way
+    /// `MOV eax, [pic_ptr + CLASS_ID_OFFSETS[i]]` for the inline 4-way
     /// class comparisons.
-    pub const CLASS_ID_OFFSETS: [usize; JIT_PIC_ENTRIES] = [0, 4, 8];
+    pub const CLASS_ID_OFFSETS: [usize; JIT_PIC_ENTRIES] = [0, 4, 8, 12];
     /// Byte offsets of [`Self::entry_ptrs`] entries from the start of
     /// the struct. JIT codegen uses these to emit the indirect call
     /// target load on a PIC hit.
-    pub const ENTRY_PTR_OFFSETS: [usize; JIT_PIC_ENTRIES] = [16, 24, 32];
+    pub const ENTRY_PTR_OFFSETS: [usize; JIT_PIC_ENTRIES] = [16, 24, 32, 40];
     /// Byte offsets of [`Self::needs_context`] entries from the start
     /// of the struct. JIT codegen reads these to decide whether to
     /// thread the VM context pointer through the inline dispatch.
-    pub const NEEDS_CONTEXT_OFFSETS: [usize; JIT_PIC_ENTRIES] = [40, 41, 42];
+    pub const NEEDS_CONTEXT_OFFSETS: [usize; JIT_PIC_ENTRIES] = [48, 49, 50, 51];
 
     /// Create an empty PIC slot.
     pub fn new() -> Self {
@@ -4575,9 +4587,10 @@ impl JitPICSlot {
                 std::sync::atomic::AtomicU32::new(0),
                 std::sync::atomic::AtomicU32::new(0),
                 std::sync::atomic::AtomicU32::new(0),
+                std::sync::atomic::AtomicU32::new(0),
             ],
-            _pad0: 0,
             entry_ptrs: [
+                std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
@@ -4586,9 +4599,11 @@ impl JitPICSlot {
                 std::sync::atomic::AtomicBool::new(false),
                 std::sync::atomic::AtomicBool::new(false),
                 std::sync::atomic::AtomicBool::new(false),
+                std::sync::atomic::AtomicBool::new(false),
             ],
-            _pad1: [0; 5],
+            _pad1: [0; 4],
             hits: [
+                std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
                 std::sync::atomic::AtomicU64::new(0),
@@ -4598,12 +4613,15 @@ impl JitPICSlot {
                 parking_lot::Mutex::new(None),
                 parking_lot::Mutex::new(None),
                 parking_lot::Mutex::new(None),
+                parking_lot::Mutex::new(None),
             ],
             compiled_owners: [
                 parking_lot::Mutex::new(None),
                 parking_lot::Mutex::new(None),
                 parking_lot::Mutex::new(None),
+                parking_lot::Mutex::new(None),
             ],
+            megamorphic_entries: parking_lot::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -4659,7 +4677,7 @@ impl JitPICSlot {
     /// invokes the same sequence of atomic loads.
     #[inline]
     pub fn lookup(&self, class_id: u32) -> Option<(u64, bool)> {
-        // Scan all 3 entries. Because entries never share a class_id
+        // Scan all 4 entries. Because entries never share a class_id
         // (see `install`), at most one can match; we break out early
         // on the first hit.
         for i in 0..JIT_PIC_ENTRIES {
@@ -4678,12 +4696,25 @@ impl JitPICSlot {
 
     /// Install a new `(class_id → entry_ptr)` mapping.
     ///
+    /// - If the class is already present, refresh that entry in place.
     /// - If an empty slot exists (class_id == 0), use it.
     /// - Otherwise evict the entry with the fewest hits (LFU). The
     ///   evicted entry's class_id is cleared first so concurrent
     ///   readers can't accidentally dispatch to a stale pointer with
     ///   a new class id.
     pub fn install(&self, class_id: u32, class_name: &str, entry_ptr: u64, needs_ctx: bool) {
+        self.install_megamorphic(class_id, class_name, entry_ptr, needs_ctx);
+        // Refresh an existing mapping in place. Re-inserting the same class in
+        // a second slot wastes associativity and, once full, causes a stable
+        // polymorphic site to evict a different receiver on every helper miss.
+        for i in 0..JIT_PIC_ENTRIES {
+            if self.class_ids[i].load(std::sync::atomic::Ordering::Acquire) == class_id {
+                self.class_ids[i].store(0, std::sync::atomic::Ordering::Release);
+                defer_jit_owner(self.compiled_owners[i].lock().take());
+                self.write_entry(i, class_id, class_name, entry_ptr, needs_ctx);
+                return;
+            }
+        }
         // First preference: reuse an empty slot so hit counters for
         // existing entries aren't perturbed.
         for i in 0..JIT_PIC_ENTRIES {
@@ -4707,6 +4738,43 @@ impl JitPICSlot {
         self.class_ids[victim].store(0, std::sync::atomic::Ordering::Release);
         defer_jit_owner(self.compiled_owners[victim].lock().take());
         self.write_entry(victim, class_id, class_name, entry_ptr, needs_ctx);
+    }
+
+    fn install_megamorphic(
+        &self,
+        class_id: u32,
+        class_name: &str,
+        entry_ptr: u64,
+        needs_context: bool,
+    ) {
+        let mut entries = self.megamorphic_entries.write();
+        if entries.len() >= JIT_MEGAMORPHIC_ENTRIES && !entries.contains_key(&class_id) {
+            if let Some(victim) = entries.keys().next().copied() {
+                if let Some(old) = entries.remove(&victim) {
+                    defer_jit_owner(old.owner);
+                }
+            }
+        }
+        let replacement = JitMegamorphicEntry {
+            entry_ptr,
+            needs_context,
+            _class_name: class_name.to_string(),
+            owner: resolve_jit_entry_owner(entry_ptr as usize),
+        };
+        if let Some(old) = entries.insert(class_id, replacement) {
+            defer_jit_owner(old.owner);
+        }
+    }
+
+    /// Lookup used by the shared helper after the generated four-entry cascade
+    /// misses. The returned entry remains executable because this slot retains
+    /// its compiled owner until invalidation or slot destruction.
+    #[inline]
+    pub fn lookup_megamorphic(&self, class_id: u32) -> Option<(u64, bool)> {
+        self.megamorphic_entries
+            .read()
+            .get(&class_id)
+            .map(|entry| (entry.entry_ptr, entry.needs_context))
     }
 
     /// Core installation sequence. Writes entry_ptr before class_id
@@ -4745,6 +4813,15 @@ impl JitPICSlot {
             *self.class_names[i].lock() = None;
             defer_jit_owner(self.compiled_owners[i].lock().take());
         }
+        let drained: Vec<_> = self
+            .megamorphic_entries
+            .write()
+            .drain()
+            .filter_map(|(_, entry)| entry.owner)
+            .collect();
+        for owner in drained {
+            defer_jit_owner(Some(owner));
+        }
     }
 
     fn invalidate_targets(&self, targets: &std::collections::HashSet<usize>) {
@@ -4755,6 +4832,18 @@ impl JitPICSlot {
                 self.entry_ptrs[i].store(0, std::sync::atomic::Ordering::Release);
                 self.needs_context[i].store(false, std::sync::atomic::Ordering::Relaxed);
                 defer_jit_owner(self.compiled_owners[i].lock().take());
+            }
+        }
+        let mut entries = self.megamorphic_entries.write();
+        let victims: Vec<u32> = entries
+            .iter()
+            .filter_map(|(&class_id, entry)| {
+                targets.contains(&(entry.entry_ptr as usize)).then_some(class_id)
+            })
+            .collect();
+        for class_id in victims {
+            if let Some(entry) = entries.remove(&class_id) {
+                defer_jit_owner(entry.owner);
             }
         }
     }
@@ -4769,7 +4858,7 @@ impl JitPICSlot {
         hits + self.misses.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Number of entries currently populated (0..=3).
+    /// Number of entries currently populated (0..=4).
     pub fn entries_used(&self) -> usize {
         self.class_ids
             .iter()
@@ -4778,7 +4867,7 @@ impl JitPICSlot {
     }
 
     /// Whether the PIC has started receiving receiver types it can no
-    /// longer cache (all 3 slots populated AND miss count exceeds the
+    /// longer cache (all 4 slots populated AND miss count exceeds the
     /// promotion-to-megamorphic threshold).
     pub fn is_megamorphic(&self) -> bool {
         self.entries_used() == JIT_PIC_ENTRIES
@@ -6363,15 +6452,15 @@ pub fn direct_jit_callee_calls_enabled() -> bool {
 thread_local! {
     /// Per-thread override for [`ir_virtual_calls_enabled`], for tests that must
     /// exercise the "virtual calls declined" routing without mutating a
-    /// process-global env var (which would race parallel test threads). `None`
-    /// ⇒ fall back to the env var (i.e. enabled). Production never sets this.
+    /// process-global setting (which would race parallel test threads). `None`
+    /// means use the caller-supplied, centrally parsed VM policy.
     /// Mirrors the `SELFREC_DIRECT_TEST_OVERRIDE` convention.
     static IR_VIRTUAL_CALLS_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
 
 /// Test hook: force IR virtual/interface call lowering on (`Some(true)`) / off
-/// (`Some(false)`) for the CURRENT thread, or restore env behaviour (`None`).
+/// (`Some(false)`) for the CURRENT thread, or restore caller policy (`None`).
 /// Thread-local so parallel tests don't race. Not part of the stable API.
 #[doc(hidden)]
 pub fn __set_ir_virtual_calls_override(v: Option<bool>) {
@@ -6382,8 +6471,7 @@ pub fn __set_ir_virtual_calls_override(v: Option<bool>) {
 /// `invokevirtual` / `invokeinterface` (jit-inlining-and-ir-calls)?
 ///
 /// The capability itself is not new, but it was gated **opt-IN** at the VM call
-/// sites (`vm/src/runtime/env_cache.rs` computes it as
-/// `var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some()`) for a single, now-obsolete
+/// sites for a single, now-obsolete
 /// reason: the IR lowered every virtual call through the generic
 /// `jit_invoke_dispatch` helper with no inline cache, so admitting virtual calls
 /// made call-heavy methods SLOWER than the single-pass body they replaced —
@@ -6394,24 +6482,14 @@ pub fn __set_ir_virtual_calls_override(v: Option<bool>) {
 /// (`CRATONVM_JIT_IR_CALL`, `…_CALL_SPECIAL`, `…_LONG`, `…_FP`,
 /// `…_SELFREC_DIRECT`, `…_IR_DIRECT_CALL`), all of which default to true.
 ///
-/// `try_compile_inner` ORs the caller-supplied `ir_emit_virtual_calls` parameter
-/// with this, so the parameter can still force the capability ON but can no
-/// longer force it off.
-///
-/// FOLLOW-UP (outside this change's file scope): the `env_cache.rs` copy is now
-/// redundant and should be inverted to `map_or(true, |v| v != "0")` for
-/// consistency, after which this local gate can be deleted. See the design doc.
-///
-/// NOT OnceLock-cached, for the same reason as
-/// [`direct_jit_callee_calls_enabled`]: this is read at JIT-compile time only.
-pub fn ir_virtual_calls_enabled() -> bool {
+/// Configuration is parsed once by the VM and supplied through
+/// `ir_emit_virtual_calls`; the compiler library does not read process-global
+/// environment state. The test override only substitutes that supplied value.
+pub fn ir_virtual_calls_enabled(requested: bool) -> bool {
     if let Some(v) = IR_VIRTUAL_CALLS_TEST_OVERRIDE.with(|c| c.get()) {
         return v;
     }
-    match std::env::var("CRATONVM_JIT_IR_CALL_VIRTUAL") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    }
+    requested
 }
 
 /// Number of platform C-ABI integer argument registers a compiled callee entry
@@ -6431,6 +6509,15 @@ pub(crate) const fn ir_entry_abi_reg_count() -> usize {
     {
         6
     }
+}
+
+/// A dynamically dispatched bytecode site owns an inline cache regardless of
+/// whether its declared signature appears in the direct-call recursion deny
+/// set. The cache stores only concrete receiver targets resolved later by the
+/// runtime helper; it never bakes the declared target.
+#[inline]
+const fn invoke_kind_uses_inline_cache(invoke_kind: u8) -> bool {
+    matches!(invoke_kind, 0 | 2)
 }
 
 #[cfg(test)]
@@ -7391,7 +7478,7 @@ fn try_compile_inner(
         let mut ir_direct_callee_entries: Vec<usize> = Vec::new();
         // IR inline caches (jit-inlining-and-ir-calls): `pc → (mic_addr,
         // pic_addr)` for each virtual/interface site the IR lowerer may serve
-        // from a MIC + 3-way-PIC cascade, plus the owning boxes, which are moved
+        // from a MIC + 4-way-PIC cascade, plus the owning boxes, which are moved
         // onto the finished `CompiledMethod` so the baked imm64s stay valid.
         let mut ir_ic_slots: std::collections::HashMap<usize, (usize, usize)> =
             std::collections::HashMap::new();
@@ -7402,13 +7489,13 @@ fn try_compile_inner(
         // through the generic `jit_invoke_dispatch` helper with NO inline cache,
         // so admitting them made call-heavy methods slower than the single-pass
         // body they replaced. `ir_lower::emit_inline_cache_call` now emits the
-        // same MIC + 3-way-PIC cascade the single-pass backend does, so that
+        // same MIC + 4-way-PIC cascade the single-pass backend does, so that
         // reason is gone and the capability becomes opt-OUT
         // (`CRATONVM_JIT_IR_CALL_VIRTUAL=0`) rather than opt-in — matching every
         // other IR capability gate. The caller's parameter can still force it
         // ON; it can no longer force it off. See the design doc for the matching
         // `vm/src/runtime/env_cache.rs` cleanup.
-        let ir_emit_virtual_calls = ir_emit_virtual_calls || ir_virtual_calls_enabled();
+        let ir_emit_virtual_calls = ir_virtual_calls_enabled(ir_emit_virtual_calls);
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
             && !scan.invoke_ops.is_empty()
         {
@@ -8131,7 +8218,7 @@ fn try_compile_inner(
     // bci in the method, regardless of MIC miss history. Rationale:
     //   * The cost is small (≈64 B per call site; typical methods
     //     have <5 virtual call sites).
-    //   * The 3-way inline cascade is silent on empty slots: each
+    //   * The 4-way inline cascade is silent on empty slots: each
     //     entry's `cached_class_id == 0` fails the CMP and falls
     //     through to the helper, so cold sites pay zero extra cycles.
     //   * Once the runtime helper populates a slot, the inline
@@ -8718,7 +8805,14 @@ fn try_compile_inner(
             owned_invoke_infos.push(info);
             invoke_info.push((pc, info_ptr));
 
-            if (invoke_kind == 0 || invoke_kind == 2) && !is_recursive_call {
+            // Virtual/interface caches do not bake the declared target and
+            // therefore must not inherit the direct-call recursion deny set.
+            // Each entry is installed later by `jit_invoke_virtual_mic` after
+            // resolving the concrete receiver class under its own compile
+            // policy. Suppressing the slot here made an abstract interface
+            // signature that appeared in the active-cycle registry permanently
+            // use blind `jit_invoke_dispatch`, including OSR bodies.
+            if invoke_kind_uses_inline_cache(invoke_kind) {
                 let mic = Box::new(JitMICSlot::new());
                 if let Some(prof) = profile {
                     if let Some(receiver_counts) = prof.receivers.get(&pc) {
@@ -8731,7 +8825,7 @@ fn try_compile_inner(
 
                 // HIGH-7 — Eager PIC slot allocation alongside the
                 // MIC. See the strategy comment at the `pic_slots`
-                // declaration above. The PIC starts empty (all 3
+                // declaration above. The PIC starts empty (all 4
                 // entries have class_id == 0), so the inline cascade
                 // falls through to the helper on cold sites. The
                 // helper (`jit_invoke_virtual_mic`) populates entries
@@ -9772,6 +9866,14 @@ fn hsqldb_jit_deny_matches_slash_and_dot_names() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dynamic_dispatch_cache_eligibility_is_independent_of_recursion_metadata() {
+        assert!(invoke_kind_uses_inline_cache(0), "invokevirtual");
+        assert!(invoke_kind_uses_inline_cache(2), "invokeinterface");
+        assert!(!invoke_kind_uses_inline_cache(1), "invokespecial");
+        assert!(!invoke_kind_uses_inline_cache(3), "invokestatic");
+    }
 
     #[test]
     fn hibernate_biginteger_final_guard_matches_internal_and_dotted_names() {
@@ -11176,7 +11278,7 @@ mod tests {
     /// "…ONLY when `ir_emit_virtual_calls` is on", because the IR lowered
     /// virtual calls through the generic dispatch helper with no inline cache
     /// and admitting them was a throughput regression versus single-pass.
-    /// `ir_lower::emit_inline_cache_call` now emits the MIC + 3-way-PIC
+    /// `ir_lower::emit_inline_cache_call` now emits the MIC + 4-way-PIC
     /// cascade, so the capability became opt-OUT: the caller's parameter can
     /// still force it ON, but only the diagnostic
     /// `CRATONVM_JIT_IR_CALL_VIRTUAL=0` (here, its thread-local test override)
@@ -11263,9 +11365,8 @@ mod tests {
             "an Op::Call method must be needs_context"
         );
 
-        // Default (parameter false, no override): virtual calls are opt-OUT
-        // now, so the IR pipeline must STILL take this method. This is the
-        // assertion that inverted — it is the point of the change.
+        // The VM's centrally parsed default is true, so the IR pipeline takes
+        // the method without any compiler-local environment lookup.
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let by_default = try_compile(
             &cached,
@@ -11287,7 +11388,7 @@ mod tests {
             false, // ir_emit_calls OFF
             false, // ir_emit_special_calls OFF
             false, // ir_emit_long
-            false, // ir_emit_virtual_calls: caller does NOT force it
+            true,  // ir_emit_virtual_calls: VM's default-ON policy
             false, // ir_emit_fp OFF
             None,
         );
@@ -11299,9 +11400,8 @@ mod tests {
              emits MIC/PIC inline caches — the capability is opt-out, not opt-in"
         );
 
-        // Explicit opt-out (`CRATONVM_JIT_IR_CALL_VIRTUAL=0`, modelled by the
-        // thread-local override) → the builder bails on the invokevirtual →
-        // single-pass. Proves the escape hatch still works.
+        // Explicit opt-out, modelled by the thread-local override, wins over
+        // the caller's true policy and routes the method to single-pass.
         __set_ir_virtual_calls_override(Some(false));
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _without = try_compile(
@@ -11324,7 +11424,7 @@ mod tests {
             true,  // ir_emit_calls ON
             true,  // ir_emit_special_calls ON
             false, // ir_emit_long
-            false, // ir_emit_virtual_calls OFF
+            true,  // central policy ON; test override forces it OFF
             false, // ir_emit_fp OFF
             None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
@@ -11420,7 +11520,7 @@ mod tests {
     //
     // The JIT codegen emits raw `MOV` instructions against a
     // `JitPICSlot*` using the `CLASS_ID_OFFSETS` / `ENTRY_PTR_OFFSETS`
-    // / `NEEDS_CONTEXT_OFFSETS` constants for inline 3-way PIC
+    // / `NEEDS_CONTEXT_OFFSETS` constants for inline 4-way PIC
     // dispatch. Pin the offsets here so any layout drift (field
     // reorder, padding change, `parking_lot::Mutex` resize) fails
     // loudly instead of silently misreading bytes.
@@ -11845,18 +11945,20 @@ mod tests {
         pic.install(1, "A", 0x1000, false);
         pic.install(2, "B", 0x2000, false);
         pic.install(3, "C", 0x3000, false);
-        // Hit class 1 many times so class 2 and 3 look less warm.
+        pic.install(4, "D", 0x4000, false);
+        // Hit class 1 many times so class 2 and 4 look less warm.
         for _ in 0..10 {
             pic.lookup(1);
         }
         pic.lookup(3); // give class 3 at least one hit
-                       // Hit counters: [10, 0, 1] → victim = index 1 (class 2).
-        pic.install(4, "D", 0x4000, true);
-        // Class 1 and 3 remain; class 2 evicted; class 4 installed.
+                       // Hit counters: [10, 0, 1, 0] → first LFU is class 2.
+        pic.install(5, "E", 0x5000, true);
+        // Classes 1, 3, and 4 remain; class 2 is evicted; class 5 is installed.
         assert_eq!(pic.lookup(1), Some((0x1000, false)));
         assert!(pic.lookup(2).is_none());
         assert_eq!(pic.lookup(3), Some((0x3000, false)));
-        assert_eq!(pic.lookup(4), Some((0x4000, true)));
+        assert_eq!(pic.lookup(4), Some((0x4000, false)));
+        assert_eq!(pic.lookup(5), Some((0x5000, true)));
     }
 
     #[test]
@@ -11887,6 +11989,7 @@ mod tests {
         pic.install(1, "A", 0x1000, false);
         pic.install(2, "B", 0x2000, false);
         pic.install(3, "C", 0x3000, false);
+        pic.install(4, "D", 0x4000, false);
         // Not megamorphic yet — full but no misses.
         assert!(!pic.is_megamorphic());
         // Pound it with misses.
@@ -11900,13 +12003,34 @@ mod tests {
     fn test_jit_pic_slot_duplicate_install_overwrites() {
         let pic = JitPICSlot::new();
         pic.install(1, "A", 0x1000, false);
-        // Install again with a new pointer but same class_id → should
-        // fill the second empty slot rather than overwrite. That's
-        // slightly wasteful but correct: linear probe returns the
-        // first matching entry, so the old pointer still fires.
-        pic.install(1, "A", 0x1000, false);
-        assert_eq!(pic.entries_used(), 2);
-        assert_eq!(pic.lookup(1), Some((0x1000, false)));
+        pic.install(1, "A2", 0x2000, true);
+        assert_eq!(pic.entries_used(), 1);
+        assert_eq!(pic.lookup(1), Some((0x2000, true)));
+        assert_eq!(pic.lookup_megamorphic(1), Some((0x2000, true)));
+    }
+
+    #[test]
+    fn test_jit_pic_secondary_cache_survives_inline_eviction_and_clear() {
+        let pic = JitPICSlot::new();
+        for class_id in 1..=5 {
+            pic.install(
+                class_id,
+                &format!("C{class_id}"),
+                0x1000 + u64::from(class_id),
+                class_id % 2 == 0,
+            );
+        }
+        assert_eq!(pic.entries_used(), JIT_PIC_ENTRIES);
+        for class_id in 1..=5 {
+            assert_eq!(
+                pic.lookup_megamorphic(class_id),
+                Some((0x1000 + u64::from(class_id), class_id % 2 == 0))
+            );
+        }
+        pic.clear_entries();
+        for class_id in 1..=5 {
+            assert!(pic.lookup_megamorphic(class_id).is_none());
+        }
     }
 
     #[test]
@@ -11918,25 +12042,27 @@ mod tests {
         assert!(JIT_PIC_ENTRIES >= 2);
     }
 
-    // ── T17.Β.1 — PIC 3-way probe semantics ────────────────────────
+    // ── T17.Β.1 — PIC 4-way probe semantics ────────────────────────
 
-    /// Install 3 distinct `(class_id, entry_ptr)` entries and issue a
+    /// Fill every `(class_id, entry_ptr)` entry and issue a
     /// lookup for each. The pure-Rust [`JitPICSlot::lookup`] mirrors
     /// what the x64 emission does with `CMP RAX, [RBX+off]; JE
-    /// entry_i` for each of the 3 slots. All three must hit and the
+    /// entry_i` for each slot. All entries must hit and the
     /// miss counter must stay at 0.
     #[test]
-    fn t17_b_pic_3_hits() {
+    fn t17_b_pic_all_entries_hit() {
         let pic = JitPICSlot::new();
         pic.install(11, "A", 0xAAAA_0000, false);
         pic.install(22, "B", 0xBBBB_0000, true);
         pic.install(33, "C", 0xCCCC_0000, false);
+        pic.install(44, "D", 0xDDDD_0000, true);
         assert_eq!(pic.entries_used(), JIT_PIC_ENTRIES);
 
         // Each receiver class_id is one of the 3 probed slots.
         assert_eq!(pic.lookup(11), Some((0xAAAA_0000, false)));
         assert_eq!(pic.lookup(22), Some((0xBBBB_0000, true)));
         assert_eq!(pic.lookup(33), Some((0xCCCC_0000, false)));
+        assert_eq!(pic.lookup(44), Some((0xDDDD_0000, true)));
 
         // Miss counter stays at 0 — no probe fell through.
         assert_eq!(
@@ -11955,7 +12081,7 @@ mod tests {
         }
     }
 
-    /// A receiver whose class_id is not in any of the 3 slots must
+    /// A receiver whose class_id is not in any slot must
     /// fall through to the generic-helper path. In the pure-Rust
     /// mirror, that surfaces as `lookup` returning `None` and the
     /// miss counter incrementing.
@@ -11965,9 +12091,10 @@ mod tests {
         pic.install(11, "A", 0xAAAA_0000, false);
         pic.install(22, "B", 0xBBBB_0000, false);
         pic.install(33, "C", 0xCCCC_0000, false);
+        pic.install(44, "D", 0xDDDD_0000, false);
 
-        // 4th receiver type — no slot matches.
-        let res = pic.lookup(44);
+        // 5th receiver type — no slot matches.
+        let res = pic.lookup(55);
         assert!(
             res.is_none(),
             "miss on an unknown class_id must return None"
@@ -11979,8 +12106,8 @@ mod tests {
         );
 
         // Successive misses also increment the counter.
-        pic.lookup(55);
         pic.lookup(66);
+        pic.lookup(77);
         assert_eq!(
             pic.misses.load(std::sync::atomic::Ordering::Relaxed),
             3,
@@ -12005,17 +12132,19 @@ mod tests {
         pic.install(1, "A", 0x1000, false);
         pic.install(2, "B", 0x2000, false);
         pic.install(3, "C", 0x3000, false);
+        pic.install(4, "D", 0x4000, false);
         // Class 1 is hot, class 2 is cold, class 3 has 1 hit.
         for _ in 0..10 {
             pic.lookup(1);
         }
         pic.lookup(3);
-        // Evict LFU → slot 1 (class 2) goes, class 4 lands there.
-        pic.install(4, "D", 0x4000, true);
+        // Evict LFU → slot 1 (class 2) goes, class 5 lands there.
+        pic.install(5, "E", 0x5000, true);
         assert_eq!(pic.lookup(1), Some((0x1000, false)));
         assert!(pic.lookup(2).is_none(), "class 2 was the LFU victim");
         assert_eq!(pic.lookup(3), Some((0x3000, false)));
-        assert_eq!(pic.lookup(4), Some((0x4000, true)));
+        assert_eq!(pic.lookup(4), Some((0x4000, false)));
+        assert_eq!(pic.lookup(5), Some((0x5000, true)));
     }
 
     /// MIC must signal PIC promotion once miss count exceeds the
@@ -12070,6 +12199,7 @@ mod tests {
         pic.install(1, "A", 0x1000, false);
         pic.install(2, "B", 0x2000, false);
         pic.install(3, "C", 0x3000, false);
+        pic.install(4, "D", 0x4000, false);
         assert!(!pic.should_deopt_to_mega());
 
         // Pound with misses until the threshold is crossed.

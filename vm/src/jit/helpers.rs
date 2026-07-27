@@ -76,20 +76,20 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
     )
 }
 
-// The virtual-call counterpart of the flag above. Kept OFF by default,
-// unlike the static/special one: virtual dispatch's receiver-class ↔ entry
-// pairing is exactly the mechanism the IVFKnn investigation's stale-mirror
-// bug lived in, and this path was not independently validated against that
-// repro the way the static path was against bintrees16 — see
-// `direct_static_compiled_callee_entry_enabled` above for the flag this
-// mirrors and why that one is default-ON. Opt in for measurement/bisection
-// with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=1`.
+// The virtual-call counterpart of the flag above. Default-ON now that every
+// compilation path owns MIC/PIC slots, cache publication rejects class-only
+// profile seeds, both entry ABIs are lowered, and the generated caller
+// republishes its active frame after a raw call. Opt out for diagnosis with
+// `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`.
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var_os("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY").is_some()
-    })
+    *CACHE.get_or_init(
+        || match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -7340,7 +7340,7 @@ unsafe fn try_fast_lambda_int_to_double_apply(
 // info_ptr must point to a live JitInvokeInfo. args_ptr/num_args form a valid i64 slice.
 // mic_ptr must point to a live JitMICSlot used for monomorphic inline cache dispatch.
 // pic_ptr, when non-zero, must point to a live JitPICSlot co-allocated with the MIC at
-// the same call site; the helper populates its 3-way entries via `install` so the next
+// the same call site; the helper populates its 4-way entries via `install` so the next
 // invocation hits the inline cascade emitted in `jit/src/x64.rs`.
 // Transmutes within this function convert cached JIT entry pointers to function pointers
 // matching the compiled method's extern "C" calling convention.
@@ -7701,8 +7701,28 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         .load(std::sync::atomic::Ordering::Acquire);
 
     if crate::runtime::env_cache::jit_mic_dbg() {
+        let (pic_classes, pic_entries, pic_contexts) = if pic_ptr == 0 {
+            (
+                [0; cratonvm_jit::JIT_PIC_ENTRIES],
+                [0; cratonvm_jit::JIT_PIC_ENTRIES],
+                [false; cratonvm_jit::JIT_PIC_ENTRIES],
+            )
+        } else {
+            let pic = &*(pic_ptr as *const JitPICSlot);
+            (
+                std::array::from_fn(|i| {
+                    pic.class_ids[i].load(std::sync::atomic::Ordering::Acquire)
+                }),
+                std::array::from_fn(|i| {
+                    pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire)
+                }),
+                std::array::from_fn(|i| {
+                    pic.needs_context[i].load(std::sync::atomic::Ordering::Acquire)
+                }),
+            )
+        };
         eprintln!(
-            "[JIT_MIC] {}.{}{} cached_cid={} recv_cid={} entry={}",
+            "[JIT_MIC] {}.{}{} cached_cid={} recv_cid={} entry={} pic_ptr={:#x} pic_classes={:?} pic_entries={:?} pic_contexts={:?}",
             info.class_name,
             info.method_name,
             info.descriptor,
@@ -7710,7 +7730,36 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             receiver_cid,
             mic.cached_entry_ptr
                 .load(std::sync::atomic::Ordering::Acquire),
+            pic_ptr,
+            pic_classes,
+            pic_entries,
+            pic_contexts,
         );
+    }
+
+    // Megamorphic helper fast path. Generated code probes only the four-entry
+    // inline PIC; receiver types beyond that capacity land here. The PIC keeps
+    // a bounded secondary target cache so those misses still avoid repeated
+    // class hierarchy resolution and compile-cache probing.
+    if cached_cid != receiver_cid
+        && pic_ptr != 0
+        && direct_virtual_compiled_callee_entry_enabled()
+        && !redefine_jit_quiesced
+    {
+        let pic = &*(pic_ptr as *const JitPICSlot);
+        if let Some((entry, needs_context)) = pic.lookup_megamorphic(receiver_cid) {
+            if entry != 0 {
+                mic_prof::bump(&mic_prof::MIC_HIT_ENTRY);
+                if let Some(result) = try_call_compiled_entry_reentrant(
+                    entry as usize,
+                    needs_context,
+                    vm_ptr,
+                    args_slice,
+                ) {
+                    return result;
+                }
+            }
+        }
     }
 
     // --- Monomorphic Inline Cache: fast path ---
@@ -7865,7 +7914,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 mic.cached_needs_context
                     .store(needs_ctx, std::sync::atomic::Ordering::Release);
                 // CRIT-1 — also populate the co-allocated PIC so the
-                // inline 3-way cascade in `jit/src/x64.rs` hits on the
+                // inline 4-way cascade in `jit/src/x64.rs` hits on the
                 // next invocation. Without this the cascade's empty
                 // (class_id == 0) slots always fail and every dispatch
                 // pays the full helper cost. We only install when we
@@ -8006,7 +8055,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
         mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
-        // CRIT-1 — Populate the co-allocated PIC so the inline 3-way
+        // CRIT-1 — Populate the co-allocated PIC so the inline 4-way
         // cascade emitted in `jit/src/x64.rs` actually hits on subsequent
         // dispatches. Eager allocation made `pic_inline` always-true at
         // codegen, so the cascade is always emitted but stays cold until

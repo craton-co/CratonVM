@@ -854,7 +854,10 @@ pub fn jit_ir_long() -> bool {
 #[inline]
 pub fn jit_ir_call_virtual() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_IR_CALL_VIRTUAL").is_some())
+    *CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_IR_CALL_VIRTUAL")
+            .map_or(true, |v| v != "0" && !v.eq_ignore_ascii_case("false"))
+    })
 }
 
 #[inline]

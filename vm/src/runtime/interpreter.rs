@@ -5968,6 +5968,14 @@ pub fn execute(
                         Vec::new();
                     let mut direct_calls_early: Vec<(usize, crate::jit::JitDirectCall)> =
                         Vec::new();
+                    let mut mic_slots_early: Vec<(usize, *const crate::jit::JitMICSlot)> =
+                        Vec::new();
+                    let mut owned_mic_slots_early: Vec<Box<crate::jit::JitMICSlot>> =
+                        Vec::new();
+                    let mut pic_slots_early: Vec<(usize, *const crate::jit::JitPICSlot)> =
+                        Vec::new();
+                    let mut owned_pic_slots_early: Vec<Box<crate::jit::JitPICSlot>> =
+                        Vec::new();
                     // Per-allocation ctor-dispatch elision: a `new C(); dup;
                     // invokespecial C.<init>()V` whose `C.<init>` is the empty
                     // default constructor (`is_elidable_construction`) has NO
@@ -6166,6 +6174,14 @@ pub fn execute(
                             let info_ptr: *const _ = &*info;
                             owned_jit_invoke_infos.push(info);
                             invoke_info.push((pc, info_ptr));
+                            allocate_dynamic_dispatch_slots(
+                                invoke_kind,
+                                pc,
+                                &mut mic_slots_early,
+                                &mut owned_mic_slots_early,
+                                &mut pic_slots_early,
+                                &mut owned_pic_slots_early,
+                            );
                         }
                     }
                     // Resolve the deferred trivial-ctor sites now that `cm_lock`
@@ -6587,18 +6603,8 @@ pub fn execute(
                         anewarray_info,
                         invoke_info,
                         direct_calls_early,
-                        Vec::new(), // mic_slots — this early-compile path does
-                        // not yet allocate MICs (see existing TODO);
-                        // dispatch goes through the slow-path helper.
-                        Vec::new(), // pic_slots (HIGH-7) — eager PIC allocation
-                        // is wired in `jit::try_compile` (the main
-                        // hot-path entry). This early-compile path
-                        // emits the slow-path helper for every
-                        // invokevirtual/invokeinterface; promoting
-                        // it to inline PIC dispatch is a follow-up
-                        // (would mirror the MIC TODO above and
-                        // allocate `Box<JitPICSlot>` per
-                        // polymorphic call site in `invoke_info`).
+                        mic_slots_early,
+                        pic_slots_early,
                         ldc_info_early,
                         ldc_string_info_early, // wired 2026-07-18 — see the
                         // StringReference arm in the ldc resolver above.
@@ -6623,6 +6629,8 @@ pub fn execute(
                     // Attach owned metadata to compiled method
                     cm._jit_strings = owned_jit_strings;
                     cm._jit_invoke_infos = owned_jit_invoke_infos;
+                    cm._jit_mic_slots.extend(owned_mic_slots_early);
+                    cm._jit_pic_slots.extend(owned_pic_slots_early);
                     stamp_compilation_epoch(
                         shared,
                         &class_name_arc,
@@ -33058,6 +33066,66 @@ const OSR_THRESHOLD: u32 = 1_000;
 /// blocking / allocating call (`load_class_concurrent`, eager callee compile), and
 /// `PENDING_COMPACT_FIELD_INFO` is thread-local so the worker stages its own.
 #[allow(clippy::too_many_arguments)]
+/// Allocate the dynamic-dispatch cache pair consumed by both x64 compilation
+/// entry points owned by the interpreter.
+///
+/// Method-entry compilation in `cratonvm-jit` has always supplied these slots,
+/// but the interpreter's early-compile and OSR paths passed empty vectors. That
+/// backend skew forced every virtual/interface operation in a hot OSR loop
+/// through `jit_invoke_dispatch`, even though x64 already had MIC codegen.
+fn allocate_dynamic_dispatch_slots(
+    invoke_kind: u8,
+    pc: usize,
+    mic_slots: &mut Vec<(usize, *const crate::jit::JitMICSlot)>,
+    owned_mic_slots: &mut Vec<Box<crate::jit::JitMICSlot>>,
+    pic_slots: &mut Vec<(usize, *const crate::jit::JitPICSlot)>,
+    owned_pic_slots: &mut Vec<Box<crate::jit::JitPICSlot>>,
+) {
+    if !matches!(invoke_kind, 0 | 2) {
+        return;
+    }
+
+    let mic = Box::new(crate::jit::JitMICSlot::new());
+    let pic = Box::new(crate::jit::JitPICSlot::new());
+    let mic_ptr: *const crate::jit::JitMICSlot = &*mic;
+    let pic_ptr: *const crate::jit::JitPICSlot = &*pic;
+    owned_mic_slots.push(mic);
+    owned_pic_slots.push(pic);
+    mic_slots.push((pc, mic_ptr));
+    pic_slots.push((pc, pic_ptr));
+}
+
+#[cfg(test)]
+mod dynamic_dispatch_slot_tests {
+    use super::allocate_dynamic_dispatch_slots;
+
+    #[test]
+    fn caches_virtual_and_interface_sites_but_not_static_or_special_sites() {
+        for (kind, expected) in [(0, 1), (1, 0), (2, 1), (3, 0)] {
+            let mut mic = Vec::new();
+            let mut owned_mic = Vec::new();
+            let mut pic = Vec::new();
+            let mut owned_pic = Vec::new();
+            allocate_dynamic_dispatch_slots(
+                kind,
+                27,
+                &mut mic,
+                &mut owned_mic,
+                &mut pic,
+                &mut owned_pic,
+            );
+            assert_eq!(mic.len(), expected);
+            assert_eq!(owned_mic.len(), expected);
+            assert_eq!(pic.len(), expected);
+            assert_eq!(owned_pic.len(), expected);
+            if expected == 1 {
+                assert_eq!(mic[0].0, 27);
+                assert_eq!(pic[0].0, 27);
+            }
+        }
+    }
+}
+
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -33446,6 +33514,10 @@ fn compile_osr_artifact(
             let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
             let mut owned_jit_invoke_infos2: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
             let mut direct_calls2: Vec<(usize, crate::jit::JitDirectCall)> = Vec::new();
+            let mut mic_slots2: Vec<(usize, *const crate::jit::JitMICSlot)> = Vec::new();
+            let mut owned_mic_slots2: Vec<Box<crate::jit::JitMICSlot>> = Vec::new();
+            let mut pic_slots2: Vec<(usize, *const crate::jit::JitPICSlot)> = Vec::new();
+            let mut owned_pic_slots2: Vec<Box<crate::jit::JitPICSlot>> = Vec::new();
             // Pending invokestatic callee compilations: (pc, class, method, desc, param_count)
             let mut pending_callee_compiles: Vec<(usize, String, String, String, usize)> =
                 Vec::new();
@@ -33664,6 +33736,14 @@ fn compile_osr_artifact(
                     let info_ptr: *const _ = &*info;
                     owned_jit_invoke_infos2.push(info);
                     invoke_info.push((pc, info_ptr));
+                    allocate_dynamic_dispatch_slots(
+                        invoke_kind,
+                        pc,
+                        &mut mic_slots2,
+                        &mut owned_mic_slots2,
+                        &mut pic_slots2,
+                        &mut owned_pic_slots2,
+                    );
                 }
             }
 
@@ -34048,12 +34128,8 @@ fn compile_osr_artifact(
                 anewarray_info2,
                 invoke_info,
                 direct_calls2,
-                Vec::new(), // mic_slots — OSR-recompile path; dispatch still
-                // goes through the slow-path helper.
-                Vec::new(), // pic_slots (HIGH-7) — OSR-recompile path. Eager
-                // PIC allocation is wired in `jit::try_compile`;
-                // this codepath emits the slow-path helper for
-                // every invokevirtual/invokeinterface.
+                mic_slots2,
+                pic_slots2,
                 ldc_info2,
                 ldc_string_info2, // wired (perf/halfgap-20260717) — see the
                 // resolve block above; bytes owned by owned_jit_strings2 →
@@ -34088,6 +34164,8 @@ fn compile_osr_artifact(
             cm.compiled_via_osr = true;
             cm._jit_strings = owned_jit_strings2;
             cm._jit_invoke_infos = owned_jit_invoke_infos2;
+            cm._jit_mic_slots.extend(owned_mic_slots2);
+            cm._jit_pic_slots.extend(owned_pic_slots2);
             stamp_compilation_epoch(
                 shared,
                 &class_name_arc,
@@ -35860,9 +35938,10 @@ fn try_jit_upgrade_with_gate(
                 crate::runtime::env_cache::jit_ir_call_special(),
                 // inc 25/29: long methods → IR path. Now default-ON; `CRATONVM_JIT_IR_LONG=0` opts out.
                 crate::runtime::env_cache::jit_ir_long(),
-                // inc 26: invokevirtual/invokeinterface → Op::Call (dynamic
-                // dispatch via the helper), gated default-OFF (its own soak).
-                // `CRATONVM_JIT_IR_CALL_VIRTUAL=1` opts in.
+                // inc 26 + inline-cache lowering: invokevirtual/invokeinterface
+                // → Op::Call with MIC/PIC fast paths. Default-ON now that the IR
+                // backend has parity with single-pass dispatch;
+                // `CRATONVM_JIT_IR_CALL_VIRTUAL=0` opts out.
                 crate::runtime::env_cache::jit_ir_call_virtual(),
                 // inc 30 + Slices A/B/C: double/float XMM value tier. Now
                 // default-ON — the tier is opcode-complete (frem/drem, FP arrays,
@@ -37276,6 +37355,7 @@ fn background_compile_task(
                 &task.method_key.descriptor,
                 crate::runtime::env_cache::jit_ir_long(),
                 crate::runtime::env_cache::jit_ir_fp(),
+                crate::runtime::env_cache::jit_ir_call_virtual(),
             )
         })
         .unwrap_or(false);

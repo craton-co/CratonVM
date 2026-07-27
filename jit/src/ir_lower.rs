@@ -1161,17 +1161,27 @@ impl<'a> Lowerer<'a> {
         let _ = self.buf.try_patch_i32(patch, rel);
     }
 
-    /// Marshal a call's arguments into the compiled-callee entry ABI
-    /// ([`ENTRY_ABI_REGS`]) with the hidden VM context pointer in `abi[0]`.
+    /// Marshal a cache hit into the compiled-callee entry ABI.
     ///
-    /// Shared by every inline-cache hit path. Both the MIC and the PIC gate on
-    /// their cached `needs_context` byte before reaching here, so the context
-    /// pointer is always the right ABI shape for the cached target.
-    fn emit_ic_abi_marshal(&mut self, inputs: &[NodeId], num_args: usize) {
-        self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
+    /// Context-using artifacts receive the hidden VM pointer in `abi[0]`;
+    /// context-free artifacts receive Java arg0 there. Inline caches retain the
+    /// callee's ABI bit, so both shapes can use the cache instead of forcing
+    /// context-free methods back through the resolving helper.
+    fn emit_ic_abi_marshal(
+        &mut self,
+        inputs: &[NodeId],
+        num_args: usize,
+        needs_context: bool,
+    ) {
+        let base = if needs_context {
+            self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
+            1
+        } else {
+            0
+        };
         for i in 0..num_args {
             let arg = inputs[2 + i];
-            self.load_reg_from_frame(ENTRY_ABI_REGS[1 + i], self.slot_of(arg));
+            self.load_reg_from_frame(ENTRY_ABI_REGS[base + i], self.slot_of(arg));
         }
     }
 
@@ -1186,12 +1196,18 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// `CMP BYTE [R10 + disp], 0` — the cached-`needs_context` gate. A cached
-    /// target that does NOT take the VM pointer cannot be reached with this ABI
-    /// marshalling, so such an entry falls through to the helper.
+    /// `CMP BYTE [R10 + disp], 0` — selects the cached target's entry ABI.
     fn emit_cmp_byte_r10_disp_zero(&mut self, disp: u8) {
         // REX.B + 80 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
         self.buf.emit(&[0x41, 0x80, 0x7A, disp, 0x00]);
+    }
+
+    /// `CMP QWORD [R10 + disp], 0` — rejects a profile-seeded cache
+    /// entry whose class id is known but whose compiled target is not yet
+    /// installed.
+    fn emit_cmp_qword_r10_disp_zero(&mut self, disp: u8) {
+        // REX.W+B + 83 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
+        self.buf.emit(&[0x49, 0x83, 0x7A, disp, 0x00]);
     }
 
     /// `MOV R11, qword [R10 + disp] ; CALL R11` — the cached-entry indirect
@@ -1214,7 +1230,7 @@ impl<'a> Lowerer<'a> {
     }
 
     /// IR inline-cache lowering — serve a virtual / interface `Op::Call` from a
-    /// monomorphic (`JitMICSlot`) guard, then a 3-way polymorphic
+    /// monomorphic (`JitMICSlot`) guard, then a 4-way polymorphic
     /// (`JitPICSlot`) cascade, then the resolving `jit_invoke_virtual_mic`
     /// helper. This is the IR analogue of the single-pass backend's MIC/PIC
     /// codegen in `x64.rs`.
@@ -1241,15 +1257,19 @@ impl<'a> Lowerer<'a> {
     ///   ; ── monomorphic ──
     ///   MOV  R10, imm64 mic
     ///   CMP  EAX, [R10 + CACHED_CLASS_ID_OFFSET]     ; JNE .pic
-    ///   CMP  BYTE [R10 + CACHED_NEEDS_CONTEXT], 0    ; JE  .pic
-    ///   <marshal entry ABI> ; MOV R11,[R10+8] ; CALL R11 ; JMP .done
-    ///   ; ── polymorphic, 3-way ──
+    ///   CMP  BYTE [R10 + CACHED_NEEDS_CONTEXT], 0    ; JE  .mic_noctx
+    ///   <marshal context ABI> ; JMP .mic_call
+    /// .mic_noctx: <marshal context-free ABI>
+    /// .mic_call: MOV R11,[R10+8] ; CALL R11 ; JMP .done
+    ///   ; ── polymorphic, 4-way ──
     /// .pic:
     ///   MOV  R10, imm64 pic
-    ///   for i in 0..3:
+    ///   for i in 0..4:
     ///     CMP EAX, [R10+CLASS_ID_OFFSETS[i]]  ; JNE .pic_{i+1} (last: .slow)
-    ///     CMP BYTE [R10+NEEDS_CONTEXT[i]], 0  ; JE  .slow
-    ///     <marshal> ; MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11 ; JMP .done
+    ///     CMP BYTE [R10+NEEDS_CONTEXT[i]], 0  ; JE  .entry_noctx
+    ///     <marshal context ABI> ; JMP .entry_call
+    ///   .entry_noctx: <marshal context-free ABI>
+    ///   .entry_call: MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11 ; JMP .done
     ///   ; ── megamorphic / cold ──
     /// .slow:
     ///   <marshal args into the frame staging region>
@@ -1320,16 +1340,21 @@ impl<'a> Lowerer<'a> {
         self.emit_mov_reg_imm64(R10, mic as u64);
         self.emit_cmp_eax_r10_disp(JitMICSlot::CACHED_CLASS_ID_OFFSET as u8);
         let mic_miss = self.emit_jcc_rel32(0x85); // JNE .pic
+        self.emit_cmp_qword_r10_disp_zero(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
         self.emit_cmp_byte_r10_disp_zero(JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8);
-        let mic_noctx = self.emit_jcc_rel32(0x84); // JE .pic
-        self.emit_ic_abi_marshal(inputs, num_args);
+        let mic_noctx = self.emit_jcc_rel32(0x84); // JE .mic_noctx
+        self.emit_ic_abi_marshal(inputs, num_args, true);
+        let mic_call = self.emit_jmp_rel32();
+        self.patch_rel32_to_here(mic_noctx);
+        self.emit_ic_abi_marshal(inputs, num_args, false);
+        self.patch_rel32_to_here(mic_call);
         self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
         done_patches.push(self.emit_jmp_rel32());
 
-        // ── Polymorphic 3-way cascade ───────────────────────────────
+        // ── Polymorphic 4-way cascade ───────────────────────────────
         // .pic:
         self.patch_rel32_to_here(mic_miss);
-        self.patch_rel32_to_here(mic_noctx);
         self.emit_mov_reg_imm64(R10, pic as u64);
         let mut next_entry: Option<usize> = None;
         for i in 0..JIT_PIC_ENTRIES {
@@ -1343,9 +1368,15 @@ impl<'a> Lowerer<'a> {
             } else {
                 next_entry = Some(miss);
             }
-            self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
+            self.emit_cmp_qword_r10_disp_zero(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
-            self.emit_ic_abi_marshal(inputs, num_args);
+            self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
+            let noctx = self.emit_jcc_rel32(0x84); // JE .entry_noctx
+            self.emit_ic_abi_marshal(inputs, num_args, true);
+            let call = self.emit_jmp_rel32();
+            self.patch_rel32_to_here(noctx);
+            self.emit_ic_abi_marshal(inputs, num_args, false);
+            self.patch_rel32_to_here(call);
             self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
             done_patches.push(self.emit_jmp_rel32());
         }
@@ -3071,7 +3102,8 @@ pub(crate) fn lower_inner(
 ) -> Option<CompiledMethod> {
     // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
     // lowering: an arithmetic node emits well under 32 bytes, but a single
-    // MIC + 3-way-PIC inline-cache site emits ~250 and a direct call ~60. With
+    // MIC + 4-way-PIC dual-ABI inline-cache site emits ~360 and a direct call
+    // ~60. With
     // `ir_compatible`'s invoke budget raised to `ir::IR_MAX_INVOKES`,
     // under-estimating here would silently TRUNCATE the body —
     // `ExecutableBuffer::emit` sets a sticky `overflowed` flag and skips the
@@ -3086,7 +3118,7 @@ pub(crate) fn lower_inner(
         .nodes
         .len()
         .saturating_mul(32)
-        .saturating_add(call_nodes.saturating_mul(320))
+        .saturating_add(call_nodes.saturating_mul(448))
         .saturating_add(1024);
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
@@ -3387,7 +3419,7 @@ mod tests {
         assert_eq!(
             count_seq(&code, &[0x41, 0xFF, 0xD3]),
             1 + crate::JIT_PIC_ENTRIES,
-            "one cached-entry CALL R11 per inline-cache entry (MIC + 3-way PIC)"
+            "one cached-entry CALL R11 per inline-cache entry (MIC + 4-way PIC)"
         );
         // The miss path resolves AND populates via `jit_invoke_virtual_mic`.
         assert!(
@@ -3432,6 +3464,19 @@ mod tests {
             &code,
             &[0x4D, 0x8B, 0x5A, JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8]
         ));
+        assert!(
+            contains_seq(
+                &code,
+                &[
+                    0x49,
+                    0x83,
+                    0x7A,
+                    JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8,
+                    0x00
+                ]
+            ),
+            "a class-only profiled MIC seed must miss until entry_ptr is populated"
+        );
 
         // PIC: one guard + one needs-context gate + one entry load per entry.
         for i in 0..crate::JIT_PIC_ENTRIES {
@@ -3457,6 +3502,19 @@ mod tests {
                     &[0x4D, 0x8B, 0x5A, JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8]
                 ),
                 "PIC entry {i} cached-entry load must be emitted"
+            );
+            assert!(
+                contains_seq(
+                    &code,
+                    &[
+                        0x49,
+                        0x83,
+                        0x7A,
+                        JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8,
+                        0x00
+                    ]
+                ),
+                "PIC entry {i} must reject a class-only profile seed"
             );
         }
     }

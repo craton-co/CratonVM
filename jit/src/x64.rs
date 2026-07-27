@@ -7821,7 +7821,7 @@ struct Compiler {
     /// Polymorphic inline cache slots: (bytecode_pc, PIC slot pointer).
     /// For invokevirtual/invokeinterface call sites. A populated
     /// `pic_slots` entry supersedes the MIC for the same `pc` (PIC
-    /// is a 3-entry superset).
+    /// is a 4-entry superset).
     ///
     /// HIGH-7 wiring (now active): `jit/src/lib.rs::try_compile`
     /// eagerly allocates one `Box<JitPICSlot>` per polymorphic call
@@ -7829,7 +7829,7 @@ struct Compiler {
     /// `(pc, *const JitPICSlot)` pairs into `x64::compile()` via the
     /// new `pic_slots` parameter, which assigns this field. Slots
     /// start empty; the runtime helper populates them on miss, after
-    /// which subsequent invocations take the inline 3-way cascade.
+    /// which subsequent invocations take the inline 4-way cascade.
     pic_slots: Vec<(usize, *const super::JitPICSlot)>,
     /// Task #60 — Helper-call patch sites (Design B for shift-safe unrolling).
     ///
@@ -7847,16 +7847,18 @@ struct Compiler {
     helper_call_patches: Vec<usize>,
     /// Task #60 — IC (inline cache) patch sites for per-clone slot allocation.
     ///
-    /// Each entry is `(native_offset_of_imm64, kind)` where `kind == 0` for
-    /// MIC and `kind == 1` for PIC. The `native_offset_of_imm64` points at
+    /// Each entry is `(native_offset_of_imm64, kind, original_slot_ptr)` where
+    /// `kind == 0` for MIC and `kind == 1` for PIC. The native offset points at
     /// the 8-byte little-endian imm64 inside a 10-byte `MOV R10, imm64`
     /// (encoded via [`emit_mov_imm64_full`] so the imm64 lives at a
     /// deterministic offset regardless of operand value). The unroll
     /// duplicator mints a fresh `Box<JitMICSlot>` / `Box<JitPICSlot>` per
     /// IC site per copy and overwrites the duplicated imm64 to point at
     /// the new slot, so per-iteration cache hits do not collide across
-    /// unrolled copies.
-    ic_patches: Vec<(usize, u8)>,
+    /// unrolled copies. All immediates carrying the same original slot pointer
+    /// are rewritten to the same clone: this includes both the inline guard and
+    /// the slow helper's MIC/PIC arguments.
+    ic_patches: Vec<(usize, u8, usize)>,
     /// Task #60 — clone-minted MIC/PIC slots owned by the compiler.
     ///
     /// The byte-copy unroll duplicator allocates fresh `Box<JitMICSlot>` /
@@ -21566,10 +21568,10 @@ impl Compiler {
                                     .filter(|&&po| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
-                                let orig_ic_patches: Vec<(usize, u8)> = self
+                                let orig_ic_patches: Vec<(usize, u8, usize)> = self
                                     .ic_patches
                                     .iter()
-                                    .filter(|&&(po, _)| po >= body_start && po < body_end)
+                                    .filter(|&&(po, _, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
 
@@ -21677,23 +21679,29 @@ impl Compiler {
                                     // original slot — per-iteration cache
                                     // hits collide and miss across copies for
                                     // any receiver-type-varying loop.
-                                    for &(po, kind) in &orig_ic_patches {
+                                    let mut cloned_ic_slots: HashMap<(u8, usize), i64> =
+                                        HashMap::new();
+                                    for &(po, kind, original_ptr) in &orig_ic_patches {
                                         let copy_po = po + shift_us;
-                                        let fresh_ptr: i64 = match kind {
-                                            0 => {
-                                                let mic = Box::new(super::JitMICSlot::new());
-                                                let p: *const super::JitMICSlot = &*mic;
-                                                self.cloned_mic_slots.push(mic);
-                                                p as i64 // Cast: function pointer for JIT call target
-                                            }
-                                            1 => {
-                                                let pic = Box::new(super::JitPICSlot::new());
-                                                let p: *const super::JitPICSlot = &*pic;
-                                                self.cloned_pic_slots.push(pic);
-                                                p as i64 // Cast: function pointer for JIT call target
-                                            }
-                                            _ => unreachable!("unknown ic_patches kind {}", kind,),
-                                        };
+                                        let fresh_ptr = *cloned_ic_slots
+                                            .entry((kind, original_ptr))
+                                            .or_insert_with(|| match kind {
+                                                0 => {
+                                                    let mic = Box::new(super::JitMICSlot::new());
+                                                    let p: *const super::JitMICSlot = &*mic;
+                                                    self.cloned_mic_slots.push(mic);
+                                                    p as i64
+                                                }
+                                                1 => {
+                                                    let pic = Box::new(super::JitPICSlot::new());
+                                                    let p: *const super::JitPICSlot = &*pic;
+                                                    self.cloned_pic_slots.push(pic);
+                                                    p as i64
+                                                }
+                                                _ => {
+                                                    unreachable!("unknown ic_patches kind {}", kind)
+                                                }
+                                            });
                                         // Overwrite the 8-byte little-endian
                                         // imm64 baked into the duplicated
                                         // `MOV R10, imm64` (10-byte form).
@@ -21781,7 +21789,14 @@ impl Compiler {
                                     // shifted imm64 location with its kind
                                     // so any later pass can find it.
                                     self.ic_patches.extend(
-                                        orig_ic_patches.iter().map(|&(po, k)| (po + shift_us, k)),
+                                        orig_ic_patches
+                                            .iter()
+                                            .map(|&(po, k, ptr)| {
+                                                let cloned_ptr = *cloned_ic_slots
+                                                    .get(&(k, ptr))
+                                                    .expect("every copied IC immediate was patched");
+                                                (po + shift_us, k, cloned_ptr as usize)
+                                            }),
                                     );
                                 }
                             }
@@ -26569,7 +26584,7 @@ impl Compiler {
                             // and MIC are present (the adaptive recompiler
                             // promotes MIC → PIC and leaves the old MIC
                             // slot live as a fallback), PIC takes
-                            // precedence: it caches a 3-entry superset.
+                            // precedence: it caches a 4-entry superset.
                             let pic_ptr = self.pic_slots_idx.get(&pc).map(|&i| self.pic_slots[i].1);
                             if std::env::var_os("CRATONVM_DBG_JIT_GEN").is_some() {
                                 eprintln!(
@@ -26650,35 +26665,39 @@ impl Compiler {
                             //   offset  8  AtomicU64  cached_entry_ptr
                             //   offset 16  AtomicBool cached_needs_context
                             //
-                            // HIGH-7 follow-up — Inline 3-way PIC fast-path
+                            // HIGH-7 follow-up — Inline 4-way PIC fast-path
                             // guard. `JitPICSlot` is now `#[repr(C)]` with
                             // hot atomic fields at the front (see
                             // `jit/src/lib.rs:1305` and the layout assertion
                             // `test_jit_pic_slot_offsets`):
                             //
-                            //   CLASS_ID_OFFSETS     = [0, 4, 8]
-                            //   ENTRY_PTR_OFFSETS    = [16, 24, 32]
-                            //   NEEDS_CONTEXT_OFFSETS = [40, 41, 42]
+                            //   CLASS_ID_OFFSETS      = [0, 4, 8, 12]
+                            //   ENTRY_PTR_OFFSETS     = [16, 24, 32, 40]
+                            //   NEEDS_CONTEXT_OFFSETS = [48, 49, 50, 51]
                             //
                             // The Mutex<Option<String>> array (`class_names`)
                             // is moved to the tail so its unstable layout
                             // cannot disturb these offsets.
                             //
                             // When a PIC slot is allocated at this PC, we
-                            // emit a 3-way cascade in place of the MIC probe.
-                            // PIC supersedes MIC (it is a 3-entry superset)
+                            // emit a 4-way cascade in place of the MIC probe.
+                            // PIC supersedes MIC (it is a 4-entry superset)
                             // so we do not emit BOTH guards.
                             //
                             // Hot-path sequence (PIC, ≈5 cycles on slot-0 hit):
                             //   mov   r10, imm64(pic)
                             //   mov   rax, [rbp - receiver_spill]
                             //   mov   eax, [rax]                       ; class_id @ ObjectHeader+0
-                            //   ; --- per slot i in 0..3 ---
+                            //   ; --- per slot i in 0..4 ---
                             //   cmp   eax, [r10 + CLASS_ID_OFFSETS[i]]
                             //   jne   .try_{i+1}  (or .miss for i==2)
                             //   cmp   byte [r10 + NEEDS_CONTEXT_OFFSETS[i]], 0
-                            //   je    .miss                            ; only inline ctx=true
-                            //   <load callee-ABI args: vm_ptr + arg_slots[0..n]>
+                            //   je    .noctx
+                            //   <load context ABI: vm_ptr + arg_slots[0..n]>
+                            //   jmp   .call
+                            // .noctx:
+                            //   <load context-free ABI: arg_slots[0..n]>
+                            // .call:
                             //   call  qword [r10 + ENTRY_PTR_OFFSETS[i]]
                             //   jmp   .done
                             //   ; --- end per-slot ---
@@ -26704,10 +26723,9 @@ impl Compiler {
                             // Fast-path eligibility (same as MIC):
                             //   1. pic_ptr OR mic_ptr is Some.
                             //   2. The receiver exists (n >= 1).
-                            //   3. The cached entry uses the JIT-context ABI
-                            //      (`cached_needs_context == true`); checked
-                            //      inline. Non-ctx callees fall to the
-                            //      helper.
+                            //   3. The cached entry's `needs_context` bit is
+                            //      checked inline and selects the matching
+                            //      compiled-entry ABI.
                             //   4. Total callee-ABI arg count (1 vm_ptr + n)
                             //      fits in ARG_REGS.
                             let needs_ctx_arg_count = n + 1; // vm_ptr + n receiver/params
@@ -26724,11 +26742,10 @@ impl Compiler {
                             // comment for the closing fixes and the
                             // regression this default avoids; opt out with
                             // `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0`). The MIC
-                            // publishes one receiver class exactly once, with
-                            // an installing sentinel until its target and ABI
-                            // fields are complete. The multi-entry PIC has not
-                            // gained the same publication protocol, so it
-                            // stays off even when this flag is set.
+                            // and PIC both publish entry pointer + ABI before
+                            // the release-store of class id. Generated guards
+                            // also reject a zero entry pointer, covering
+                            // class-only profile seeds.
                             //
                             // Spring SpEL's flawed-pattern threshold test drives
                             // catastrophic regex backtracking through the mutually
@@ -26747,7 +26764,9 @@ impl Compiler {
                             let inline_virtual_ic_allowed =
                                 crate::direct_jit_callee_calls_enabled()
                                 && !regex_backtracking_frame;
-                            let pic_inline = false;
+                            let pic_inline = inline_virtual_ic_allowed
+                                && pic_ptr.is_some()
+                                && args_fit;
                             let mic_inline = inline_virtual_ic_allowed
                                 && !pic_inline
                                 && mic_ptr.is_some()
@@ -26763,7 +26782,7 @@ impl Compiler {
                             // byte); MIC and the last PIC slot use these
                             // when the skip distance is small enough.
                             let mut done_patch: Option<usize> = None;
-                            let mut miss_patches: Vec<usize> = Vec::new();
+                            let mut mic_miss_patches32: Vec<usize> = Vec::new();
 
                             if pic_inline {
                                 let pic = pic_ptr.expect("pic_inline ⇒ pic_ptr Some");
@@ -26771,9 +26790,9 @@ impl Compiler {
                                 // Cache the layout constants locally so a
                                 // future const-rename in lib.rs surfaces as
                                 // a compile error here.
-                                const CLASS_ID_OFFS: [u8; 3] = [0, 4, 8];
-                                const ENTRY_PTR_OFFS: [u8; 3] = [16, 24, 32];
-                                const NEEDS_CTX_OFFS: [u8; 3] = [40, 41, 42];
+                                const CLASS_ID_OFFS: [u8; 4] = [0, 4, 8, 12];
+                                const ENTRY_PTR_OFFS: [u8; 4] = [16, 24, 32, 40];
+                                const NEEDS_CTX_OFFS: [u8; 4] = [48, 49, 50, 51];
 
                                 // Compile-time sanity: the byte offsets we
                                 // hardcode in the encodings below must
@@ -26784,12 +26803,15 @@ impl Compiler {
                                     super::JitPICSlot::CLASS_ID_OFFSETS[0] == 0
                                         && super::JitPICSlot::CLASS_ID_OFFSETS[1] == 4
                                         && super::JitPICSlot::CLASS_ID_OFFSETS[2] == 8
+                                        && super::JitPICSlot::CLASS_ID_OFFSETS[3] == 12
                                         && super::JitPICSlot::ENTRY_PTR_OFFSETS[0] == 16
                                         && super::JitPICSlot::ENTRY_PTR_OFFSETS[1] == 24
                                         && super::JitPICSlot::ENTRY_PTR_OFFSETS[2] == 32
-                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[0] == 40
-                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[1] == 41
-                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[2] == 42
+                                        && super::JitPICSlot::ENTRY_PTR_OFFSETS[3] == 40
+                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[0] == 48
+                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[1] == 49
+                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[2] == 50
+                                        && super::JitPICSlot::NEEDS_CONTEXT_OFFSETS[3] == 51
                                 );
 
                                 // R10 = pic_ptr (imm64, fixed 10-byte form).
@@ -26803,7 +26825,8 @@ impl Compiler {
                                 // copies for any receiver-type-varying loop.
                                 let ic_imm64_off = self.buf.pos() + 2;
                                 self.emit_mov_imm64_full(R10, pic as *const _ as i64); // Cast: function pointer for JIT call target
-                                self.ic_patches.push((ic_imm64_off, 1)); // 1 = PIC
+                                self.ic_patches
+                                    .push((ic_imm64_off, 1, pic as *const _ as usize)); // 1 = PIC
                                                                          // SECURITY FIX (V1) INVARIANT: R10 holds the
                                                                          // PIC slot base pointer from here until each
                                                                          // per-slot `MOV R11,[R10+disp]; CALL R11`
@@ -26817,7 +26840,7 @@ impl Compiler {
                                                                          // — never R10), so R10 stays the trusted base.
 
                                 // ---- Hoist callee ABI marshalling out of
-                                // the 3-way cascade. Previously each slot
+                                // the 4-way cascade. Previously each slot
                                 // re-loaded `vm_ptr + n args` into
                                 // ARG_REGS[0..=n] (~26 bytes per slot on
                                 // x86-64 SysV with n=4), tripling the
@@ -26936,7 +26959,7 @@ impl Compiler {
                                 // opcode); used to resolve inter-slot
                                 // `jne` rel8 patches once all slots are
                                 // emitted.
-                                let mut slot_starts: [usize; 3] = [0; 3];
+                                let mut slot_starts: [usize; 4] = [0; 4];
                                 // (patch_pos, target_slot_index) for each
                                 // inter-slot `jne` rel8 that needs to land
                                 // at the start of slot `target_slot_index`.
@@ -26957,7 +26980,7 @@ impl Compiler {
                                 // to the same shared `.miss` target.
                                 let mut miss_patches_rel32: Vec<usize> = vec![pic_null_miss_patch];
 
-                                for i in 0..3usize {
+                                for i in 0..crate::JIT_PIC_ENTRIES {
                                     slot_starts[i] = self.buf.pos();
 
                                     // CMP EAX, dword [R10 + CLASS_ID_OFFS[i]]
@@ -26975,7 +26998,7 @@ impl Compiler {
                                         self.buf.emit(&[0x41, 0x3B, 0x42, CLASS_ID_OFFS[i]]);
                                     }
 
-                                    if i < 2 {
+                                    if i + 1 < crate::JIT_PIC_ENTRIES {
                                         // JNE rel8 → start of slot i+1
                                         // (patched below once slot i+1's
                                         // start position is known).
@@ -26991,8 +27014,8 @@ impl Compiler {
                                     } else {
                                         // Final slot: JNE rel32 → .miss
                                         // (6 bytes: 0x0F 0x85 + i32 disp).
-                                        // Slot 2's miss target sits past
-                                        // slots 0..2 cascades is reachable
+                                        // The final slot's miss target sits past
+                                        // the whole cascade and may be reachable
                                         // in rel8 but we keep rel32 for
                                         // consistency with slot 0/1 and
                                         // because the slow-path prelude
@@ -27002,6 +27025,22 @@ impl Compiler {
                                         miss_patches_rel32.push(self.buf.pos() - 4);
                                     }
 
+                                    // A receiver profile may pre-populate only
+                                    // class_id; entry_ptr remains zero until
+                                    // the resolving helper compiles and
+                                    // publishes a concrete target.
+                                    // CMP QWORD [R10 + ENTRY_PTR_OFFS[i]], 0
+                                    self.buf.emit(&[
+                                        0x49,
+                                        0x83,
+                                        0x7A,
+                                        ENTRY_PTR_OFFS[i],
+                                        0x00,
+                                    ]);
+                                    // JE rel32 → .miss
+                                    self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                    miss_patches_rel32.push(self.buf.pos() - 4);
+
                                     // CMP BYTE [R10 + NEEDS_CTX_OFFS[i]], 0
                                     // 5 bytes: REX.B (0x41) + 80 /7 + modrm
                                     //   modrm = mod(01) reg(/7=111) rm(010)
@@ -27009,14 +27048,12 @@ impl Compiler {
                                     //   + disp8 + imm8(0)
                                     self.buf.emit(&[0x41, 0x80, 0x7A, NEEDS_CTX_OFFS[i], 0x00]);
 
-                                    // JE rel32 → .miss (6 bytes:
-                                    // 0x0F 0x84 + i32 disp).  CRIT-3:
-                                    // rel8 here overflowed in release
-                                    // builds for n>=5 args, silently
-                                    // wrapping into the next slot — UB
-                                    // dispatch. rel32 always fits.
+                                    // JE rel32 → .noctx. Both ABI shapes are
+                                    // valid cache hits; small interface
+                                    // implementations are commonly
+                                    // context-free.
                                     self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
-                                    miss_patches_rel32.push(self.buf.pos() - 4);
+                                    let noctx_patch = self.buf.pos() - 4;
 
                                     // Callee ABI args (vm_ptr + n) have
                                     // already been materialised once in
@@ -27024,6 +27061,40 @@ impl Compiler {
                                     // (HIGH-perf hoist; see comment at
                                     // the top of the PIC body). Slot
                                     // bodies must NOT touch ARG_REGS.
+
+                                    // Context ABI is already live. Skip the
+                                    // alternate marshalling block.
+                                    self.buf.emit(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                                    let ctx_call_patch = self.buf.pos() - 4;
+
+                                    // .noctx: Java args start at ARG_REGS[0].
+                                    let noctx_off = self.buf.pos();
+                                    let noctx_rel =
+                                        (noctx_off as i64) - (noctx_patch as i64 + 4);
+                                    debug_assert!(
+                                        (i32::MIN as i64..=i32::MAX as i64)
+                                            .contains(&noctx_rel)
+                                    );
+                                    self.buf
+                                        .try_patch_i32(noctx_patch, noctx_rel as i32)
+                                        .ok();
+                                    for j in 0..n {
+                                        let spill_off =
+                                            args_base_offset + ((n - 1 - j) as i32) * 8;
+                                        self.emit_load_local(ARG_REGS[j], spill_off);
+                                    }
+
+                                    // .call
+                                    let call_off = self.buf.pos();
+                                    let call_rel =
+                                        (call_off as i64) - (ctx_call_patch as i64 + 4);
+                                    debug_assert!(
+                                        (i32::MIN as i64..=i32::MAX as i64)
+                                            .contains(&call_rel)
+                                    );
+                                    self.buf
+                                        .try_patch_i32(ctx_call_patch, call_rel as i32)
+                                        .ok();
 
                                     // SECURITY FIX (V1): do NOT keep the
                                     // call target live in memory addressed
@@ -27067,7 +27138,7 @@ impl Compiler {
                                     // (remaining slot bodies + slow path)
                                     // routinely exceeds 127 bytes. Slot 2's
                                     // .done jump is short but we keep rel32
-                                    // uniform — 3 extra bytes total vs
+                                    // uniform to keep patching simple.
                                     // branching logic.
                                     // E9 cd: JMP rel32 (5 bytes).
                                     self.buf.emit(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
@@ -27091,7 +27162,7 @@ impl Compiler {
                                 }
 
                                 // .miss: patch all `je needs_ctx → .miss`
-                                // and (for slot 2) `jne → .miss` to land
+                                // and the final slot's `jne → .miss` to land
                                 // HERE — the start of the slow-path block
                                 // emitted below.  CRIT-3: these are all
                                 // rel32 form, so the patch site holds a
@@ -27112,10 +27183,8 @@ impl Compiler {
                                         .try_patch_i32(*patch, rel as i32) // Cast: rel32 displacement
                                         .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                 }
-                                // `miss_patches` (the legacy rel8 vector)
-                                // remains in scope for the MIC arm below;
-                                // PIC inline does not push into it any
-                                // more, so nothing to clear here.
+                                // The MIC arm maintains its own rel32 miss
+                                // patches; PIC uses the vector above.
                             } else if mic_inline {
                                 let mic = mic_ptr.expect("mic_inline ⇒ mic_ptr Some");
                                 // R10 = mic_ptr (imm64, fixed 10-byte form).
@@ -27125,7 +27194,8 @@ impl Compiler {
                                 // to overwrite with a per-copy fresh MIC slot.
                                 let ic_imm64_off = self.buf.pos() + 2;
                                 self.emit_mov_imm64_full(R10, mic as *const _ as i64); // Cast: function pointer for JIT call target
-                                self.ic_patches.push((ic_imm64_off, 0)); // 0 = MIC
+                                self.ic_patches
+                                    .push((ic_imm64_off, 0, mic as *const _ as usize)); // 0 = MIC
                                                                          // SECURITY FIX (V1) INVARIANT: R10 holds the
                                                                          // MIC slot base pointer from here until the
                                                                          // `MOV R11,[R10+8]; CALL R11` below. Every
@@ -27150,9 +27220,11 @@ impl Compiler {
                                 // NullPointerException per JVMS invokevirtual.
                                 //   TEST RAX, RAX  (48 85 C0)
                                 self.buf.emit(&[0x48, 0x85, 0xC0]);
-                                //   JZ rel8 → .miss  (2 bytes, patched)
-                                self.buf.emit(&[0x74, 0x00]);
-                                miss_patches.push(self.buf.pos() - 1);
+                                //   JZ rel32 → .miss. The dual-ABI
+                                // marshalling blocks make the miss span larger
+                                // than rel8 for otherwise tiny callees.
+                                self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                mic_miss_patches32.push(self.buf.pos() - 4);
 
                                 // MOV EAX, dword [RAX]  — load class_id (ObjectHeader+0).
                                 // 2 bytes: 8B 00
@@ -27162,17 +27234,32 @@ impl Compiler {
                                 // 3 bytes: REX.B (0x41) + 3B /r + modrm(00 000 010)
                                 self.buf.emit(&[0x41, 0x3B, 0x02]);
 
-                                // JNE rel8 → .miss  (2 bytes, patched)
-                                self.buf.emit(&[0x75, 0x00]);
-                                miss_patches.push(self.buf.pos() - 1);
+                                // JNE rel32 → .miss.
+                                self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                                mic_miss_patches32.push(self.buf.pos() - 4);
 
-                                // CMP BYTE [R10 + 16], 0  — gate on cached_needs_context.
+                                // A profiled MIC can publish the receiver class
+                                // before the helper has installed a compiled
+                                // target. Never CALL a class-only seed.
+                                // CMP QWORD [R10 + 8], 0
+                                self.buf.emit(&[0x49, 0x83, 0x7A, 0x08, 0x00]);
+                                // JE rel32 → .miss
+                                self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                mic_miss_patches32.push(self.buf.pos() - 4);
+
+                                // CMP BYTE [R10 + 16], 0  — select cached entry ABI.
                                 // 5 bytes: REX.B (0x41) + 80 /7 + modrm(01 111 010) + disp8 + imm8
                                 self.buf.emit(&[0x41, 0x80, 0x7A, 0x10, 0x00]);
 
-                                // JE rel8 → .miss  (needs_ctx == false ⇒ fall back to helper)
-                                self.buf.emit(&[0x74, 0x00]);
-                                miss_patches.push(self.buf.pos() - 1);
+                                // JE rel32 → .noctx. Context-free compiled
+                                // methods use Java arg0 in ARG_REGS[0], while
+                                // context-using methods reserve that register
+                                // for vm_ptr. The cache publishes this ABI bit;
+                                // honoring both shapes is essential because
+                                // small interface implementations almost
+                                // always compile context-free.
+                                self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                let noctx_patch = self.buf.pos() - 4;
 
                                 // ---- Set up callee ABI: (vm_ptr, arg_slots[0..n]) ----
                                 // vm_ptr → ARG_REGS[0]
@@ -27182,6 +27269,35 @@ impl Compiler {
                                     let spill_off = args_base_offset + ((n - 1 - i) as i32) * 8; // Cast: x86-64 immediate encoding
                                     self.emit_load_local(ARG_REGS[i + 1], spill_off);
                                 }
+
+                                // JMP rel32 → .call, skipping the no-context
+                                // marshalling block.
+                                self.buf.emit(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
+                                let ctx_call_patch = self.buf.pos() - 4;
+
+                                // .noctx: Java args begin at ARG_REGS[0].
+                                let noctx_off = self.buf.pos();
+                                let noctx_rel = (noctx_off as i64) - (noctx_patch as i64 + 4);
+                                debug_assert!(
+                                    (i32::MIN as i64..=i32::MAX as i64).contains(&noctx_rel)
+                                );
+                                self.buf
+                                    .try_patch_i32(noctx_patch, noctx_rel as i32)
+                                    .ok();
+                                for i in 0..n {
+                                    let spill_off = args_base_offset + ((n - 1 - i) as i32) * 8;
+                                    self.emit_load_local(ARG_REGS[i], spill_off);
+                                }
+
+                                // .call
+                                let call_off = self.buf.pos();
+                                let call_rel = (call_off as i64) - (ctx_call_patch as i64 + 4);
+                                debug_assert!(
+                                    (i32::MIN as i64..=i32::MAX as i64).contains(&call_rel)
+                                );
+                                self.buf
+                                    .try_patch_i32(ctx_call_patch, call_rel as i32)
+                                    .ok();
 
                                 // SECURITY FIX (V1): same hardening as the
                                 // PIC arm — never CALL indirectly through a
@@ -27213,18 +27329,18 @@ impl Compiler {
                                 self.buf.emit(&[0xE9, 0x00, 0x00, 0x00, 0x00]);
                                 done_patches32.push(self.buf.pos() - 4);
 
-                                // .miss: patch both rel8 sites here.
+                                // .miss: patch both rel32 sites here.
                                 let miss_off = self.buf.pos();
-                                for patch in &miss_patches {
+                                for patch in &mic_miss_patches32 {
                                     // Widening: usize/u32 offset -> i64 (no truncation; for rel/displacement math)
-                                    let rel = (miss_off as i64) - (*patch as i64 + 1);
+                                    let rel = (miss_off as i64) - (*patch as i64 + 4);
                                     debug_assert!(
-                                        (-128..=127).contains(&rel),
-                                        "inline MIC miss branch overflowed rel8 ({} bytes)",
+                                        (i32::MIN as i64..=i32::MAX as i64).contains(&rel),
+                                        "inline MIC miss branch overflowed rel32 ({} bytes)",
                                         rel
                                     );
                                     self.buf
-                                        .try_patch_byte(*patch, rel as u8) // Cast: rel8 displacement
+                                        .try_patch_i32(*patch, rel as i32)
                                         .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                                 }
                             }
@@ -27257,7 +27373,7 @@ impl Compiler {
                             if let Some(mic) = mic_ptr {
                                 // MIC-optimized dispatch: pass MIC slot as 5th
                                 // arg and (CRIT-1) PIC slot as 6th arg so the
-                                // helper can populate the inline 3-way cascade
+                                // helper can populate the inline 4-way cascade
                                 // via `JitPICSlot::install` on every successful
                                 // resolution. A `pic_ptr == 0` tells the helper
                                 // no PIC is installed for this site.
@@ -27276,12 +27392,26 @@ impl Compiler {
                                 #[cfg(target_os = "windows")]
                                 {
                                     // 5th arg at [RSP + 32]
-                                    self.emit_mov_imm64(RAX, mic as *const _ as i64); // Cast: function pointer for JIT call target
+                                    let mic_arg_imm64_off = self.buf.pos() + 2;
+                                    self.emit_mov_imm64_full(RAX, mic as *const _ as i64);
+                                    self.ic_patches.push((
+                                        mic_arg_imm64_off,
+                                        0,
+                                        mic as *const _ as usize,
+                                    ));
                                                                                       // MOV [RSP + 32], RAX
                                     self.rex_w();
                                     self.buf.emit(&[0x89, 0x44, 0x24, 0x20]);
                                     // 6th arg at [RSP + 40]
-                                    self.emit_mov_imm64(RAX, pic_arg);
+                                    let pic_arg_imm64_off = self.buf.pos() + 2;
+                                    self.emit_mov_imm64_full(RAX, pic_arg);
+                                    if let Some(pic) = pic_ptr {
+                                        self.ic_patches.push((
+                                            pic_arg_imm64_off,
+                                            1,
+                                            pic as *const _ as usize,
+                                        ));
+                                    }
                                     // MOV [RSP + 40], RAX
                                     self.rex_w();
                                     self.buf.emit(&[0x89, 0x44, 0x24, 0x28]);
@@ -27289,8 +27419,22 @@ impl Compiler {
                                 #[cfg(not(target_os = "windows"))]
                                 {
                                     // SysV: 5th arg in R8, 6th in R9.
-                                    self.emit_mov_imm64(R8, mic as *const _ as i64); // Cast: function pointer for JIT call target
-                                    self.emit_mov_imm64(R9, pic_arg);
+                                    let mic_arg_imm64_off = self.buf.pos() + 2;
+                                    self.emit_mov_imm64_full(R8, mic as *const _ as i64);
+                                    self.ic_patches.push((
+                                        mic_arg_imm64_off,
+                                        0,
+                                        mic as *const _ as usize,
+                                    ));
+                                    let pic_arg_imm64_off = self.buf.pos() + 2;
+                                    self.emit_mov_imm64_full(R9, pic_arg);
+                                    if let Some(pic) = pic_ptr {
+                                        self.ic_patches.push((
+                                            pic_arg_imm64_off,
+                                            1,
+                                            pic as *const _ as usize,
+                                        ));
+                                    }
                                 }
                                 self.emit_call_absolute(self.helpers.invoke_virtual_mic);
                             } else {
@@ -28285,13 +28429,13 @@ pub fn compile_with_param_slots(
     invoke_info: Vec<(usize, *const JitInvokeInfo)>,
     direct_calls: Vec<(usize, super::JitDirectCall)>,
     mic_slots: Vec<(usize, *const super::JitMICSlot)>,
-    // HIGH-7 — Inline 3-way PIC slots passed alongside MIC slots.
+    // HIGH-7 — Inline 4-way PIC slots passed alongside MIC slots.
     //
     // Each entry is `(bytecode_pc, &JitPICSlot as *const _)`. When a
     // PIC slot is present at a given pc, the codegen in
-    // `Compiler::compile_op_invokevirtual` emits the 3-way inline
+    // `Compiler::compile_op_invokevirtual` emits the 4-way inline
     // cascade in place of the MIC probe (PIC supersedes MIC — it is
-    // a 3-entry superset). The slot itself is allocated and owned by
+    // a 4-entry superset). The slot itself is allocated and owned by
     // the caller (`jit/src/lib.rs::try_compile`); it must outlive the
     // compiled method, which is ensured by attaching the boxed slot
     // to `CompiledMethod._jit_pic_slots`.
@@ -29006,14 +29150,14 @@ pub fn compile_with_param_slots(
         );
     }
     compiler.mic_slots = mic_slots;
-    // HIGH-7 — Inline 3-way PIC fast-path wiring (now active).
+    // HIGH-7 — Inline 4-way PIC fast-path wiring (now active).
     //
     // The codegen in `Compiler::compile_op_invokevirtual` (search
     // `pic_inline`) keys off `compiler.pic_slots`. With the
     // `pic_slots` parameter now threaded through, callers that
     // eagerly allocate a `Box<JitPICSlot>` per polymorphic call
     // site (see `jit/src/lib.rs::try_compile`) activate the inline
-    // cascade. Slots start empty (class_id == 0 at all 3 entries),
+    // cascade. Slots start empty (class_id == 0 at all 4 entries),
     // so the CMP cascade falls straight through to the helper on
     // first invocation; once the runtime helper populates a slot,
     // subsequent dispatches take the inline fast path.
@@ -41024,27 +41168,25 @@ mod tests {
         assert_eq!(result_f, 0.0);
     }
 
-    /// Per-clone MIC slot allocation. Compile a loop containing an
-    /// invokevirtual with a caller-supplied MIC slot, verify the
-    /// resulting CompiledMethod owns ADDITIONAL MIC slot boxes (one
+    /// Per-clone PIC slot allocation. Compile a loop containing an
+    /// invokevirtual with caller-supplied MIC/PIC slots, verify the
+    /// resulting CompiledMethod owns ADDITIONAL PIC slot boxes (one
     /// per duplicated IC site), and that those new boxes' raw
     /// pointers actually appear baked into the emitted instruction
     /// stream at distinct addresses.
     ///
-    /// The inline MIC fast path is default-ON — see
+    /// The inline dynamic-call fast path is default-ON — see
     /// `direct_jit_callee_calls_enabled` — but this test sets its env var
     /// explicitly anyway so it stays correct if the default ever flips back.
-    /// The multi-entry PIC path stays permanently disabled even when the
-    /// flag is set (it has not gained the MIC's atomic
-    /// receiver-class/entry publication protocol), so this exercises the
-    /// monomorphic MIC path, which the flag does cover.
+    /// PIC supersedes MIC when both slots exist, so this exercises the
+    /// polymorphic path and its release-published receiver/entry pairs.
     ///
     /// This is a static / structural check — we don't execute the
     /// loop (the test invoke helpers would panic), but verifying the
     /// duplicator minted-and-baked the right number of fresh slots
     /// is sufficient to prove the per-clone path runs.
     #[test]
-    fn test_unroll_mints_per_clone_mic_slots() {
+    fn test_unroll_mints_per_clone_pic_slots() {
         // Not OnceLock-cached (see `direct_jit_callee_calls_enabled`), so
         // setting it here is observed immediately; no other jit test asserts
         // on invoke-info/PIC/MIC-slot counts, so this is safe under parallel
@@ -41132,7 +41274,7 @@ mod tests {
 
         // The compile *may* bail before duplicating if the loop body
         // hits an unsupported path. We assert compilation succeeds
-        // and that AT LEAST one extra MIC slot was minted (3 expected
+        // and that AT LEAST one extra PIC slot was minted (3 expected
         // from 4x unroll, but the static heuristic could pick 2x for
         // a body ≤ 50 bytes — either way the extra count > 0 proves
         // the per-clone path ran). The static unroller threshold is
@@ -41165,34 +41307,33 @@ mod tests {
 
         // Compilation should succeed: the body has a back-edge and
         // the unroller fires. After unrolling, the compiled method's
-        // `_jit_mic_slots` should contain the per-clone MIC slots
+        // `_jit_pic_slots` should contain the per-clone PIC slots
         // freshly minted by the duplicator.
         //
         // Body span is 15 bytes (pc 4..=19) → static heuristic picks
         // 4x unroll (3 extra copies). The inline-IC fast path engages
-        // for invokevirtual with `args_fit && mic_ptr.is_some()` (PIC
-        // stays disabled unconditionally), which holds here (n=1,
+        // for invokevirtual with `args_fit && pic_ptr.is_some()`, which holds here (n=1,
         // vm_ptr+1 ≤ ARG_REGS.len()). So 3 fresh MIC slots should be
         // minted (one per copy).
         let method = compiled.expect("invokevirtual-in-loop must compile");
         std::env::remove_var("CRATONVM_JIT_DIRECT_CALLEE_CALLS");
         // The compiled method does NOT carry the caller-supplied
-        // MIC slot in its _jit_mic_slots (that vector is owned by
+        // PIC slot in its _jit_pic_slots (that vector is owned by
         // the caller in the production path; in this test the box
-        // is held by the local `caller_mic`). It DOES carry the
+        // is held by the local `caller_pic`). It DOES carry the
         // duplicator-minted clones. Verify count > 0 to confirm
         // the per-clone path ran.
-        let cloned_mics = method._jit_mic_slots.len();
+        let cloned_pics = method._jit_pic_slots.len();
         assert!(
-            cloned_mics >= 1,
-            "expected at least one cloned MIC slot from unroll, got {} \
+            cloned_pics >= 1,
+            "expected at least one cloned PIC slot from unroll, got {} \
              — per-clone IC slot allocation did not run",
-            cloned_mics,
+            cloned_pics,
         );
         // And no duplicates among the cloned slots' raw pointers.
-        // Each Box<JitMICSlot> has a unique heap address.
+        // Each Box<JitPICSlot> has a unique heap address.
         let mut ptrs: Vec<usize> = method
-            ._jit_mic_slots
+            ._jit_pic_slots
             .iter()
             // Cast: non-negative index/count to usize
             .map(|b| b.as_ref() as *const _ as usize)
@@ -41206,9 +41347,32 @@ mod tests {
         assert_eq!(
             dedup_len,
             ptrs.len(),
-            "cloned MIC slots must have distinct addresses (collision \
+            "cloned PIC slots must have distinct addresses (collision \
              would mean cache hits cross-pollute between unrolled copies)",
         );
+        let machine_code = method._buffer.as_slice();
+        let count_imm64 = |ptr: usize| {
+            let needle = (ptr as u64).to_le_bytes();
+            machine_code
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        };
+        for pic in &method._jit_pic_slots {
+            let ptr = pic.as_ref() as *const _ as usize;
+            assert!(
+                count_imm64(ptr) >= 2,
+                "each cloned PIC must be embedded in both its inline guard and \
+                 its slow-helper PIC argument"
+            );
+        }
+        for mic in &method._jit_mic_slots {
+            let ptr = mic.as_ref() as *const _ as usize;
+            assert!(
+                count_imm64(ptr) >= 1,
+                "each cloned MIC must be embedded in its slow-helper MIC argument"
+            );
+        }
 
         // Keep the caller-supplied boxes alive until end of scope —
         // the JIT code baked their addresses into the original
