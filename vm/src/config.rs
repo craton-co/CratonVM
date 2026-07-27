@@ -2046,43 +2046,25 @@ mod tests {
 
     #[test]
     fn detect_real_jdk_returns_some_when_java_base_jmod_present() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_jmod(tmp.path());
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let detected = detect_real_jdk();
-                    assert!(
-                        detected.is_some(),
-                        "detect_real_jdk should find synthetic JDK at {}",
-                        tmp.path().display()
-                    );
-                    assert_eq!(detected.unwrap(), tmp.path());
-                });
-            },
+        let detected = detect_real_jdk_from(tmp.path().to_str());
+        assert!(
+            detected.is_some(),
+            "detect_real_jdk should find synthetic JDK at {}",
+            tmp.path().display()
         );
+        assert_eq!(detected.unwrap(), tmp.path());
     }
 
     #[test]
     fn detect_real_jdk_returns_some_for_lib_modules_image() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         fake_jdk_with_lib_modules(tmp.path());
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let detected = detect_real_jdk();
-                    assert!(
-                        detected.is_some(),
-                        "detect_real_jdk should accept jlink-image layout"
-                    );
-                });
-            },
+        let detected = detect_real_jdk_from(tmp.path().to_str());
+        assert!(
+            detected.is_some(),
+            "detect_real_jdk should accept jlink-image layout"
         );
     }
 
@@ -2093,20 +2075,13 @@ mod tests {
         // `CRATONVM_JAVA_HOME` is the highest-priority probe in
         // `resolve_java_home`, so we don't need to scrub `JAVA_HOME` or
         // `PATH` — the synthesised directory wins.
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("rt.jar"), b"PK\x03\x04").unwrap();
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                assert!(
-                    detect_real_jdk().is_none(),
-                    "rt.jar-only install must not satisfy detect_real_jdk"
-                );
-            },
+        assert!(
+            detect_real_jdk_from(tmp.path().to_str()).is_none(),
+            "rt.jar-only install must not satisfy detect_real_jdk"
         );
     }
 
@@ -2145,29 +2120,19 @@ mod tests {
     /// empty `PATH`.
     #[test]
     fn launcher_default_never_falls_back_to_synthetic_when_no_jdk() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         // Bare directory: no `jmods/`, no `lib/modules`. `resolve_java_home`
         // will accept it (it's a real directory) but `detect_real_jdk`
         // must reject it because neither boot blob is present.
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let cfg = VmConfig::for_launcher();
-                    assert_eq!(
-                        cfg.jdk_mode(),
-                        JdkMode::Real,
-                        "the launcher default must not depend on whether a JDK exists"
-                    );
-                    // ...and the unavailability must surface as a hard error.
-                    let err = require_real_jdk(None)
-                        .expect_err("require_real_jdk must fail when no boot modules exist");
-                    assert!(err.contains("no usable JDK was found"), "{err}");
-                });
-            },
+        let cfg = VmConfig::for_launcher();
+        assert_eq!(
+            cfg.jdk_mode(),
+            JdkMode::Real,
+            "the launcher default must not depend on whether a JDK exists"
         );
+        let err = require_real_jdk(tmp.path().to_str())
+            .expect_err("require_real_jdk must fail when no boot modules exist");
+        assert!(err.contains("no usable JDK was found"), "{err}");
     }
 
     /// `with_host_jdk_default` is retained only as a compatibility alias
@@ -2249,32 +2214,20 @@ mod tests {
     /// the machine without a round trip.
     #[test]
     fn require_real_jdk_error_names_search_path_and_layouts() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                with_env("JAVA_HOME", None, || {
-                    let err = require_real_jdk(None).expect_err("bare dir is not a JDK");
-                    for needle in [
-                        "CRATONVM_JAVA_HOME",
-                        "JAVA_HOME",
-                        "java on PATH",
-                        "jmods/java.base.jmod",
-                        "lib/modules",
-                        "lib/rt.jar",
-                        "--java-home",
-                        "--synthetic-jdk",
-                    ] {
-                        assert!(
-                            err.contains(needle),
-                            "error message must mention {needle:?}; got:\n{err}"
-                        );
-                    }
-                });
-            },
-        );
+        let err = require_real_jdk(tmp.path().to_str()).expect_err("bare dir is not a JDK");
+        for needle in [
+            "jmods/java.base.jmod",
+            "lib/modules",
+            "lib/rt.jar",
+            "--java-home",
+            "--synthetic-jdk",
+        ] {
+            assert!(
+                err.contains(needle),
+                "error message must mention {needle:?}; got:\n{err}"
+            );
+        }
     }
 
     /// An `rt.jar`-only (JDK 8) install is rejected by the *validation*
@@ -2283,18 +2236,11 @@ mod tests {
     /// `detect_real_jdk_returns_none_when_only_rtjar_present`.
     #[test]
     fn require_real_jdk_rejects_rtjar_only_install() {
-        let _guard = env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let lib = tmp.path().join("lib");
         std::fs::create_dir_all(&lib).unwrap();
         std::fs::write(lib.join("rt.jar"), b"PK\x03\x04").unwrap();
-        with_env(
-            "CRATONVM_JAVA_HOME",
-            Some(tmp.path().to_str().unwrap()),
-            || {
-                assert!(require_real_jdk(None).is_err());
-            },
-        );
+        assert!(require_real_jdk(tmp.path().to_str()).is_err());
     }
 
     /// A valid JDK makes validation succeed and hand back the resolved

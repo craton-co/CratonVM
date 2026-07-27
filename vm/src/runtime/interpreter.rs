@@ -43098,12 +43098,21 @@ mod wave1_adoption_tests {
         assert!(shared_cell
             .callback(&registry, "java/lang/Sample", "a", "()V")
             .is_none());
-        let leaked = shared_cell.callback(&registry, "java/lang/Sample", "b", "()V");
-        assert!(
-            leaked.is_none(),
-            "this asserts the FOOTGUN, not desired behaviour: a shared cell \
-             redeems triple A's negative for triple B"
-        );
+        let leaked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            shared_cell.callback(&registry, "java/lang/Sample", "b", "()V")
+        }));
+        if cfg!(debug_assertions) {
+            assert!(
+                leaked.is_err(),
+                "debug builds must reject cross-triple memo-cell reuse"
+            );
+        } else {
+            assert!(
+                leaked.unwrap().is_none(),
+                "release builds demonstrate the footgun: a shared cell \
+                 redeems triple A's negative for triple B"
+            );
+        }
 
         // `find` proves the native really is registered and resolvable — the
         // shared cell was simply wrong.

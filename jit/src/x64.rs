@@ -21788,16 +21788,25 @@ impl Compiler {
                                     // IC patches: same idea — record the
                                     // shifted imm64 location with its kind
                                     // so any later pass can find it.
-                                    self.ic_patches.extend(
-                                        orig_ic_patches
-                                            .iter()
-                                            .map(|&(po, k, ptr)| {
-                                                let cloned_ptr = *cloned_ic_slots
-                                                    .get(&(k, ptr))
-                                                    .expect("every copied IC immediate was patched");
-                                                (po + shift_us, k, cloned_ptr as usize)
-                                            }),
-                                    );
+                                    let mut cloned_patches =
+                                        Vec::with_capacity(orig_ic_patches.len());
+                                    for &(po, kind, original_ptr) in &orig_ic_patches {
+                                        let Some(&cloned_ptr) =
+                                            cloned_ic_slots.get(&(kind, original_ptr))
+                                        else {
+                                            // An incomplete IC clone would leave generated
+                                            // code pointing at the wrong call-site state.
+                                            // Reject this compilation and fall back to the
+                                            // interpreter instead of publishing unsafe code.
+                                            return false;
+                                        };
+                                        cloned_patches.push((
+                                            po + shift_us,
+                                            kind,
+                                            cloned_ptr as usize,
+                                        ));
+                                    }
+                                    self.ic_patches.extend(cloned_patches);
                                 }
                             }
                         }
