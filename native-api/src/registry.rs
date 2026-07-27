@@ -1629,45 +1629,6 @@ pub trait NativeInvokeAccess: NativeClassAccess {
         self.invoke(class_name, method_name, descriptor, args)
     }
 
-    /// [`Self::invoke_special`] for a caller that ALREADY holds the declaring
-    /// class's resolved `ClassId`.
-    ///
-    /// Same rationale as [`Self::invoke_by_class_id`] (see its doc comment for
-    /// the full argument), applied to the invokespecial dispatch contract.
-    /// `invoke_special` resolves `class_name` through the loader-blind global
-    /// lookup, which collapses to ONE copy per binary name — so a caller that
-    /// knows the exact declaring class must not throw that identity away.
-    ///
-    /// The concrete bug this exists for: `Method.invoke` routes a *private* or
-    /// *cross-package package-private* instance method through
-    /// `invoke_special` (both must bypass virtual dispatch — JLS §8.4.8.1).
-    /// The `Method` mirror's own `clazz` slot already names the exact declaring
-    /// class, but the name-based re-resolution picked the APPLICATION-loader
-    /// copy whenever an isolating loader (Spring Boot's
-    /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
-    /// own copy of that class. JUnit then ran the application copy's bytecode
-    /// against a fork-loaded receiver, so every subsequent constant-pool
-    /// resolution in that method left the fork's namespace: `Mockito.mock()`
-    /// registered its mock in the fork's `MockUtil.mockMakers`, while
-    /// `Mockito.verify()` — now executing application-loader bytecode —
-    /// consulted the application copy's separate, empty map and threw
-    /// `NotAMockException`. See docs/internal/fixed-suite-bugs/springboot/
-    /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
-    ///
-    /// Default implementation falls back to the name-based
-    /// [`Self::invoke_special`] for contexts with no ClassId fast path.
-    fn invoke_special_by_class_id(
-        &mut self,
-        class_id: ClassId,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        let _ = class_id;
-        self.invoke_special(class_name, method_name, descriptor, args)
-    }
-
     /// Like [`Self::invoke_special`] but for a native that IS ITSELF the
     /// native registered for `(class_name, method_name, descriptor)` and
     /// must run that class's own real bytecode body directly.
@@ -1690,6 +1651,39 @@ pub trait NativeInvokeAccess: NativeClassAccess {
     ///
     /// Default implementation falls back to [`Self::invoke_special`] -- safe
     /// for any context with no such native-reentrancy hazard (mocks, tests).
+    /// [`Self::invoke_special`] for a caller that ALREADY holds the declaring
+    /// class's resolved `ClassId`.
+    ///
+    /// Same rationale as [`Self::invoke_by_class_id`] (see its doc comment for
+    /// the full argument), applied to the invokespecial dispatch contract.
+    /// `invoke_special` resolves `class_name` through the loader-blind global
+    /// lookup, which collapses to ONE copy per binary name - so a caller that
+    /// knows the exact declaring class must not throw that identity away.
+    ///
+    /// The concrete bug this exists for: `Method.invoke` routes a *private* or
+    /// *cross-package package-private* instance method through
+    /// `invoke_special` (both must bypass virtual dispatch - JLS 8.4.8.1).
+    /// The `Method` mirror's own `clazz` slot already names the exact declaring
+    /// class, but the name-based re-resolution picked the APPLICATION-loader
+    /// copy whenever an isolating loader (Spring Boot's
+    /// `ModifiedClassPathClassLoader` under `@ForkedClassPath`) had defined its
+    /// own copy of that class. See docs/internal/fixed-suite-bugs/springboot/
+    /// servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
+    ///
+    /// Default implementation falls back to the name-based
+    /// [`Self::invoke_special`] for contexts with no ClassId fast path.
+    fn invoke_special_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let _ = class_id;
+        self.invoke_special(class_name, method_name, descriptor, args)
+    }
+
     fn invoke_special_bytecode_only(
         &mut self,
         class_name: &str,

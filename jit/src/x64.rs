@@ -1696,14 +1696,11 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                 needs_heap = true;
                 pc += 3;
             }
-            // T5.2.8 — monitorenter / monitorexit. Accepted by the
-            // scanner so methods with `synchronized` blocks are
-            // JIT-eligible. Lock elision in the compiler path skips
-            // the actual monitor operation when escape analysis
-            // proves the receiver is thread-local; otherwise the
-            // compiler bails to the interpreter (see the 0xC2/0xC3
-            // handler in `compile_bytecode`).
+            // monitorenter / monitorexit. Non-escaping locks are elided;
+            // live locks call the VM's direct mark-word helper, which needs
+            // the hidden VM context just like allocation/field helpers.
             0xC2 | 0xC3 => {
+                needs_heap = true;
                 pc += 1;
             }
             // RBC.6 — athrow. Accepted; `has_athrow` is recorded so callers
@@ -1899,7 +1896,7 @@ struct SimdFpArraySum {
 }
 
 /// Get the byte length of a bytecode instruction at `pc`.
-fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
+pub(crate) fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
     match code[pc] {
         // 2-byte: bipush(0x10), ldc(0x12), iload..aload(0x15..0x19),
         // istore..astore(0x36..0x3a), ret(0xa9), newarray(0xbc).
@@ -7676,6 +7673,10 @@ struct Compiler {
     /// dispatch-aware route that drains the pending JIT exception (the
     /// `!has_dispatch` fast path returns the raw value without draining).
     emitted_athrow: bool,
+    /// A live monitorenter/monitorexit runtime call was emitted. The VM helper
+    /// needs the per-thread JIT TLS even on an otherwise call-free method, so
+    /// this forces dispatch-aware entry.
+    emitted_monitor_call: bool,
     /// This method uses frame-preserving exception exits for handlers that
     /// read non-parameter locals (RBC.6 precise-handler continuation).
     precise_exception_frames: bool,
@@ -9052,6 +9053,7 @@ impl Compiler {
             dbg_last_pc: 0,
             dbg_last_op: 0,
             emitted_athrow: false,
+            emitted_monitor_call: false,
             precise_exception_frames,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
@@ -9527,6 +9529,22 @@ impl Compiler {
         };
         let mut locals = Vec::with_capacity(self.num_locals);
         for i in 0..self.num_locals {
+            // A dead local must not be decoded from its machine home. JVM
+            // frames initialise unused slots with a non-pointer sentinel
+            // (`u64::MAX` in the x64 frame); method-wide type classification
+            // may still label that slot as a reference because a later handler
+            // first defines it with `astore`. Decoding the stale sentinel as
+            // `StackSlotRef` produces an invalid ObjectRef before the handler
+            // can overwrite it. `Undefined` maps to an inert zero and is sound
+            // precisely because liveness proves no path reads the old value
+            // before its next definition.
+            if i < 64 {
+                let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
+                if live_here & (1u64 << i) == 0 {
+                    locals.push(FrameValue::Undefined);
+                    continue;
+                }
+            }
             // Phase B: a local holding a scalar-replaced object's dummy ref is
             // emitted as a `VirtualObject` (first sighting) / `VirtualObjectRef`
             // (a shared later sighting), NOT as a `StackSlotRef`/`RegisterRef` to
@@ -9579,29 +9597,6 @@ impl Compiler {
             } else {
                 // No kind table (gate off / unmapped) — Phase-A int/provenance.
                 frame_value_for_slot(reg, xmm, off, false)
-            };
-            // OSR-exit dead-local fix (see `local_liveness`'s doc comment):
-            // an `Unsupported` non-oop local whose machine location can't be
-            // decoded at `bci` doesn't need rejecting the whole snapshot IF
-            // it's provably dead here — nothing between `bci` and its next
-            // definition reads it, so its resumed value is irrelevant. Only
-            // applied to non-oop slots (`is_oop` is false in this arm): a
-            // dead ref-typed local keeps the existing conservative behaviour,
-            // since substituting a bogus non-null pointer would risk a GC
-            // hazard the way substituting a bogus int never can.
-            // `local_liveness` is empty when `deopt_real_enabled()` didn't run
-            // the scan, so `unwrap_or(u64::MAX)` degrades to the old
-            // behaviour (every slot "live", never override) rather than
-            // panicking or mis-treating everything as dead.
-            let fv = if !is_oop && matches!(fv, FrameValue::Unsupported) && i < 64 {
-                let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
-                if live_here & (1u64 << i) == 0 {
-                    FrameValue::Undefined
-                } else {
-                    fv
-                }
-            } else {
-                fv
             };
             locals.push(fv);
         }
@@ -27797,10 +27792,14 @@ impl Compiler {
                             //     HotSpot also bails on these),
                             //   - or the method's prologue did not stash
                             //     `vm_ptr` in a frame slot.
-                            self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                            self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32); // Cast: x86-64 immediate encoding
-                            self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32); // Cast: x86-64 immediate encoding
-                            self.emit_call_absolute(self.helpers.new_object);
+                            crate::runtime_lowering::emit_new_object_stub(
+                                &mut self.buf,
+                                self.heap_local_offset,
+                                self.helpers.new_object,
+                                class_id_raw,
+                                num_fields,
+                                self.helpers.frame_record,
+                            );
                         }
                         // T1.1.a — `new` is a GC-triggering safepoint.
                         // Emit an oop map for the slots that were live
@@ -28187,42 +28186,57 @@ impl Compiler {
                     }
                 }
 
-                // T5.2.8 — monitorenter / monitorexit: lock elision.
-                //
-                // If the receiver was scalar-replaced by escape analysis
-                // (i.e. the object is thread-local and never escapes),
-                // the lock is trivially non-contended and can be elided.
-                // We pop the receiver slot and emit nothing.
-                //
-                // If the receiver is NOT scalar-replaced, we bail to
-                // the interpreter (no JIT monitor helper exists yet).
+                // monitorenter / monitorexit: exact lock elision followed by
+                // the direct thin-lock runtime stub for every live receiver.
                 0xC2 | 0xC3 => {
-                    let recv_slot = self.pop_stack();
-                    // Check: is the receiver a scalar-replaced object?
-                    // Scalar-replaced objects have a zero "pointer" on the
-                    // stack (a placeholder that's never dereferenced).
-                    // We recognize them by checking if the load is from
-                    // a scalar-replaced frame slot.
-                    //
-                    // For now, simply elide if ANY scalar replacement is
-                    // active in this method (conservative but correct:
-                    // if there's no SR, the method doesn't have monitors
-                    // on non-escaping objects, so the bail is safe).
-                    if self.scalar_replaced.is_empty() {
-                        // No escape analysis active → can't elide → bail.
+                    if self.sr_monitor_scalar_ops.contains(&pc) {
+                        // Proven scalar receiver: lock cannot be observed or
+                        // contended. Phase C records its depth for deopt relock.
+                        let _ = self.pop_stack();
+                        pc += 1;
+                        continue;
+                    }
+
+                    // The old "any scalar replacement in this method" test
+                    // could elide a lock on an unrelated escaping receiver.
+                    // Only the exact per-PC proof above may remove the lock.
+                    let helper = if op == 0xC2 {
+                        crate::MONITOR_ENTER_DIRECT_FN
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    } else {
+                        crate::MONITOR_EXIT_DIRECT_FN
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    };
+                    if helper == 0 || !self.needs_heap {
                         return false;
                     }
-                    // Lock elided — emit nothing. The object is thread-
-                    // local so the monitor is never contended.
-                    // Phase C: an elision over a SCALAR object is recorded in
-                    // `sr_monitor_at` and relocked on resume, so it does NOT block
-                    // deopt. Only an elision over a NON-scalar object (not in
-                    // `sr_monitor_scalar_ops`) leaves no recordable trace and keeps
-                    // the method off the resume path.
-                    if !self.sr_monitor_scalar_ops.contains(&pc) {
-                        self.has_elided_monitor = true;
-                    }
-                    let _ = recv_slot;
+                    // Keep the receiver on the abstract stack while publishing
+                    // safepoint roots; moving GC can then rewrite its shadow
+                    // home during a contended enter. Pop only after the push.
+                    self.flush_scratch_registers();
+                    self.emit_pre_safepoint_spill();
+                    let recv_slot = self.pop_stack();
+                    let recv_offset = match recv_slot {
+                        StackSlot::Frame(offset) => offset,
+                        StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                            let Some(offset) = self.reserve_spill_slots(1) else {
+                                return false;
+                            };
+                            self.emit_store_local(offset, reg);
+                            offset
+                        }
+                        StackSlot::Xmm(_) => return false,
+                    };
+                    crate::runtime_lowering::emit_monitor_stub(
+                        &mut self.buf,
+                        self.heap_local_offset,
+                        recv_offset,
+                        helper,
+                        self.helpers.frame_record,
+                    );
+                    self.emitted_monitor_call = true;
+                    self.emit_oop_map_for_safepoint();
+                    self.emit_post_invoke_exception_check(b'V');
                     pc += 1;
                 }
 
@@ -28901,7 +28915,9 @@ pub fn compile_with_param_slots(
     let scalar_base = max_locals + (if needs_heap { 1 } else { 0 }) + num_hoists;
     let empty_non_escaping = std::collections::HashSet::new();
     let non_escaping_for_sr =
-        if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some() {
+        if precise_exception_frames
+            || cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_SCALAR_REPLACEMENT").is_some()
+        {
             &empty_non_escaping
         } else {
             &non_escaping_new
@@ -29351,6 +29367,10 @@ pub fn compile_with_param_slots(
         // draining it, which would leak the exception (and mis-read the
         // sentinel as a return value). Force the dispatch-aware route.
         || compiler.emitted_athrow
+        // Live monitor helpers call `jit_thread_mut()` to identify the owner
+        // and to enter GC-blocked parking on contention. A monitor-only method
+        // otherwise looks call-free and would take the TLS-free fast entry.
+        || compiler.emitted_monitor_call
         // A fallible `newarray` OOM bail needs the per-thread TLS set so the
         // helper can GC + construct the OOME (same rationale as direct_calls).
         || compiler.emitted_alloc_oom_check
@@ -30166,6 +30186,100 @@ mod tests {
             jit_card_old_base: 0,
             jit_card_old_end: 0,
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn live_monitor_ops_execute_direct_runtime_stubs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static ENTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+        static LAST_CONTEXT: AtomicUsize = AtomicUsize::new(0);
+        static LAST_OBJECT: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn monitor_enter_stub(context: i64, object: i64) -> i64 {
+            LAST_CONTEXT.store(context as usize, Ordering::SeqCst);
+            LAST_OBJECT.store(object as usize, Ordering::SeqCst);
+            ENTER_CALLS.fetch_add(1, Ordering::SeqCst);
+            object
+        }
+
+        unsafe extern "C" fn monitor_exit_stub(context: i64, object: i64) -> i64 {
+            LAST_CONTEXT.store(context as usize, Ordering::SeqCst);
+            LAST_OBJECT.store(object as usize, Ordering::SeqCst);
+            EXIT_CALLS.fetch_add(1, Ordering::SeqCst);
+            object
+        }
+
+        ENTER_CALLS.store(0, Ordering::SeqCst);
+        EXIT_CALLS.store(0, Ordering::SeqCst);
+        crate::set_monitor_direct_fns(
+            monitor_enter_stub as *const () as usize,
+            monitor_exit_stub as *const () as usize,
+        );
+
+        // static int locked(Object o) {
+        //     monitorenter(o); monitorexit(o); return 7;
+        // }
+        // Keeping the receiver live and passing no scalar-replacement facts
+        // proves both bytecodes reach the runtime lowering rather than the
+        // exact per-site elision path.
+        let code = [
+            0x2a, // aload_0
+            0xc2, // monitorenter
+            0x2a, // aload_0
+            0xc3, // monitorexit
+            0x10, 0x07, // bipush 7
+            0xac, // ireturn
+            0x00, 0x00,
+        ];
+        let compiled = compile(
+            &code,
+            7,
+            1,
+            1,
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("live monitor operations should compile through direct stubs");
+        assert!(
+            compiled.has_dispatch,
+            "live monitor helpers require dispatch-aware entry to publish JIT_THREAD"
+        );
+
+        let context = 0x1111_i64;
+        let object = 0x2222_i64;
+        // SAFETY: the generated method has the context ABI and one i64 object
+        // parameter; the test stubs do not dereference either synthetic value.
+        let result = unsafe {
+            compiled
+                .try_call_with_context(context, &[object])
+                .expect("compiled monitor method should execute")
+        };
+
+        assert_eq!(result, 7);
+        assert_eq!(ENTER_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(EXIT_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(LAST_CONTEXT.load(Ordering::SeqCst), context as usize);
+        assert_eq!(LAST_OBJECT.load(Ordering::SeqCst), object as usize);
     }
 
     // -----------------------------------------------------------------------

@@ -1825,6 +1825,30 @@ pub fn is_installed() -> bool {
     FLAGS.get().is_some()
 }
 
+/// Opt back in to the pre-2026-07-27 Mockito selector overrides.
+///
+/// CratonVM used to intercept `LocationFactory.create` and
+/// `ModuleMemberAccessor.delegate` with natives that unconditionally produced
+/// Mockito's *fallback* implementations (a `Java8LocationImpl` carrying a
+/// hardcoded `"-> at <<unknown line>>"`, and `ReflectionMemberAccessor`).
+/// HotSpot picks `LocationImpl` (StackWalker) and
+/// `InstrumentationMemberAccessor`; both real selectors now run here too.
+///
+/// `CRATONVM_COMPAT=mockito-legacy-selectors` (or the legacy spelling
+/// `CRATONVM_MOCKITO_LEGACY_SELECTORS=1`) restores the old interception as an
+/// escape hatch. Read through `runtime_var` so it stays inside the declared
+/// flag surface; cached, and not on any hot path — every caller gates on a
+/// class-name match first.
+pub fn mockito_legacy_selectors() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            runtime_var("CRATONVM_MOCKITO_LEGACY_SELECTORS").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

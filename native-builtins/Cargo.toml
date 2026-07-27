@@ -36,6 +36,8 @@ gpu-offload = []
 [dependencies]
 cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+cratonvm-native-builtins-crypto = { path = "../native-builtins-crypto", version = "0.3.0" }
+cratonvm-native-builtins-security = { path = "../native-builtins-security", version = "0.3.0" }
 cratonvm-native-io = { path = "../native-io", version = "0.3.0" }
 cratonvm-native-collections = { path = "../native-collections", version = "0.3.0" }
 cratonvm-reader = { path = "../reader", version = "0.3.0" }
@@ -146,9 +148,6 @@ num-bigint = "0.4"
 # default-on under route_ec_to_real). Bypasses the ~14 s one-time per-curve
 # generator-table precompute. P-256/384/521 (RustCrypto 0.13 family, aligned
 # elliptic-curve version).
-p256 = "0.13"
-p384 = "0.13"
-p521 = "0.13"
 aes-gcm = "0.10"
 aes = "0.8"
 argon2 = "0.5.3"
