@@ -24178,7 +24178,37 @@ fn host_line_separator(ctx: &dyn NativeContext) -> String {
 /// `println` to honour `line.separator` and emit NO leading BOM (the
 /// underlying `stream_write` writes UTF-8 bytes raw, which is what Java
 /// specifies for println).
+/// Real `PrintWriter.println` ends with `if (autoFlush) out.flush();`. The
+/// shared `println` natives below wrote straight through without it, so a
+/// `new PrintWriter(stream, true)` left its `BufferedWriter` unflushed until
+/// something else happened to flush -- `MockMvcTester.debug(out)`'s report
+/// came back truncated mid-way through
+/// (`test.web.servlet.assertj.MockMvcTesterIntegrationTests`). `print` must
+/// NOT flush (the JDK only auto-flushes on a newline), so this hook lives on
+/// the writeln path alone.
+fn printwriter_autoflush_if_needed(ctx: &mut dyn NativeContext, args: &[Value]) {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return;
+    };
+    // Only the plain `java.io.PrintWriter` carrier: a subclass runs its own
+    // bytecode (which already honours `autoFlush`), and the fd-backed
+    // `PrintStream` path is unbuffered, so flushing it every line would be
+    // pure overhead on a very hot path.
+    if ctx.class_name_of_id(ctx.class_id_of_object(this)).as_deref() != Some("java/io/PrintWriter") {
+        return;
+    }
+    if !matches!(ctx.get_field_by_name(this, "autoFlush"), Value::Int(v) if v != 0) {
+        return;
+    }
+    let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
+}
+
 fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
+    stream_writeln_inner(ctx, args, text);
+    printwriter_autoflush_if_needed(ctx, args);
+}
+
+fn stream_writeln_inner(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
     // LOCK-SCOPE (2026-07-21): see `stream_write` — the Java-interpreting
     // helpers must not run under the stdio print mutex; only the fd write
     // pair (text + separator) stays atomic.
