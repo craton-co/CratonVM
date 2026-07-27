@@ -6,10 +6,16 @@ the `cratonvm-vm` crate under `vm/src/runtime/`.
 
 ## The dispatch loop
 
-The core is a single dispatch loop that matches on the current bytecode and
-executes it. CratonVM implements **140+ fast-path opcodes** directly in the
-loop: each reads its operands, manipulates the operand stack and local
-variables, and advances the program counter.
+The core is a single dispatch loop. The common path reads verified raw
+bytecode, implements **140+ fast-path opcodes**, and fuses selected sequences
+as superinstructions. Unsupported opcodes and guarded edge cases fall through
+to the shared decoded handler.
+
+Package names do not select interpreter semantics: application, framework, and
+JDK bytecode use the same verified path. When verification is disabled, the VM
+also disables unchecked local/stack handlers and uses the bounds-checked
+decoded path. Quickened methods keep decoded instructions behind an O(1)
+bytecode-PC lookup, so branches do not re-decode from the method start.
 
 Key runtime modules:
 
@@ -24,12 +30,14 @@ Key runtime modules:
 
 ## The value representation
 
-Operands and locals are typed values. Rather than storing a tagged enum per slot
-(payload + tag interleaved), CratonVM uses a **Structure-of-Arrays** layout: one
-array holds the raw 64-bit payloads and a parallel array holds the type tags.
-This is more cache-friendly and lets the garbage collector scan a frame for
-object references by walking the tag array — it knows exactly which slots hold
-references without parsing values.
+Operands and locals use 8-byte NaN-boxed `CompactValue` slots. Tags are encoded
+inline for ordinary values; a parallel kind array preserves the ambiguous raw
+`long`/`double` bit patterns that cannot carry a NaN-box tag without changing
+Java-visible bits. The operand stack uses the same compact representation.
+
+This keeps the common slot to eight bytes while preserving exact primitive
+bits and enough type information for GC/root scanning. Conversion to the wider
+`Value` boundary type happens only where a runtime/native API needs it.
 
 ## Frames and the call stack
 

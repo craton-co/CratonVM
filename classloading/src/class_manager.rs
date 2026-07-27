@@ -2441,6 +2441,16 @@ impl ClassManager {
                 self.note_synthetic_upgrade_absent(name);
             }
         }
+        // `CRATONVM_DBG_STUB_BT=<substring>` -- same hook as the one in
+        // `load_class`'s synthetic-stub fallback, for the OTHER way a stub
+        // gets minted. Without it a stub fabricated through this entry point
+        // is indistinguishable from a real class at the Java level.
+        if let Some(want) = dbg_stub_bt_filter() {
+            if !want.is_empty() && name.contains(want) {
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("[DBG_STUB_BT] ensure_synthetic_class stub for {name}\n{bt}");
+            }
+        }
         // Every synthetic stub object IS-A `java.lang.Object`, so its
         // superclass must be `java/lang/Object` (not `None`). Without this
         // link, method dispatch on a synthetic-stub receiver — e.g. a

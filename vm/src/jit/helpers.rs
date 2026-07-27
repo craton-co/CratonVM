@@ -4251,13 +4251,120 @@ pub unsafe extern "C" fn jit_putstatic_object(
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    /// Last resolved JIT type-check target on this mutator. Compiled loops
-    /// repeatedly execute the same checkcast/instanceof site, whose class-name
+    /// Resolved JIT type-check targets on this mutator. Compiled loops
+    /// repeatedly execute the same checkcast/instanceof sites, whose class-name
     /// bytes live in the immutable JIT string table. Class IDs are stable for
     /// a VM, so `(vm, ptr, len)` is a complete cache key.
+    ///
+    /// This holds SEVERAL entries, not one. It used to be a single `Cell`, and
+    /// because the key is the class-name *pointer*, two distinct type-check
+    /// sites — even two `checkcast`s to the very same class, which get separate
+    /// string-table entries — evicted each other on every iteration. Every
+    /// execution then missed and re-ran `find_unique_class_by_name`, which
+    /// allocates two host `String`s (`to_string()` plus a `'/'`→`'.'`
+    /// `replace`) before it even looks anything up. Measured: in a loop whose
+    /// body holds one type-check site the site costs ~64ns, and a second site
+    /// in the same body costs ~1750ns *each* — a 27x cliff that any
+    /// `instanceof` ladder or twice-casting method falls off. A short linear
+    /// scan cannot thrash that way.
     static JIT_TYPECHECK_TARGET_CACHE:
-        std::cell::Cell<Option<(usize, usize, usize, u32)>> =
-        const { std::cell::Cell::new(None) };
+        std::cell::RefCell<Vec<(usize, usize, usize, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Memoized *positive* answers from `ClassManager::is_subclass_of` for the
+    /// JIT type-check path, keyed by `(vm, child_class_id, parent_class_id)`.
+    ///
+    /// `is_subclass_of` is not cheap: it takes the process-wide
+    /// `class_manager` read lock, allocates an `FxHashSet` visited set, and
+    /// then DFS-walks the superclass chain *and* every transitively implemented
+    /// interface. `jit_typecheck_resolve` calls it on every `checkcast` /
+    /// `instanceof` whose receiver class is not *identical* to the target —
+    /// i.e. on every genuinely polymorphic type check, which is the common
+    /// case. A compiled loop doing `checkcast` on the result of a map lookup
+    /// (`(Charset) cache.get(name)`, the shape
+    /// `org.apache.tomcat.util.buf.CharsetCache.getCharset` has) therefore paid
+    /// a lock acquisition, a heap allocation and a hierarchy walk per
+    /// iteration. With several mutator threads in that loop the contended read
+    /// lock dominated everything else.
+    ///
+    /// Only `true` answers are memoized, and that is deliberate. A class's
+    /// superclass and interface lists are fixed when it is defined, so once a
+    /// subtype relation holds it holds for the life of the `SharedVm` — a
+    /// cached `true` can never go stale. A `false`, in contrast, can be
+    /// observed while the hierarchy is still being populated (a supertype not
+    /// yet in the class store makes that DFS branch stop early), so caching it
+    /// could pin a wrong answer; those keep paying the full walk exactly as
+    /// before. The cache is also bypassed entirely while any class redefine is
+    /// in flight, matching `jit_hashmap_receiver_is_exact`.
+    static JIT_SUBTYPE_POSITIVE_CACHE:
+        std::cell::RefCell<Vec<(usize, u32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Entry cap for [`JIT_SUBTYPE_POSITIVE_CACHE`]. Scanned linearly (the same
+/// shape `jit_hashmap_string_node_cache` uses) rather than direct-mapped: a
+/// direct-mapped table silently collides two hot pairs into one slot, and a
+/// loop alternating between them then misses *every* time — measured at a 40%
+/// miss rate over just five distinct receiver classes. A linear scan over this
+/// many `(usize, u32, u32)` entries cannot collide and is a handful of
+/// compares.
+const JIT_SUBTYPE_CACHE_CAP: usize = 32;
+
+/// Entry cap for [`JIT_TYPECHECK_TARGET_CACHE`]. One entry per distinct
+/// type-check *site* reached on this thread; 64 covers a long `instanceof`
+/// ladder plus the sites around it.
+const JIT_TYPECHECK_TARGET_CACHE_CAP: usize = 64;
+
+/// Record `(site key) -> resolved target class id`, evicting the oldest entry
+/// once the cache is full.
+fn jit_typecheck_target_cache_put(cache_key: (usize, usize, usize), target: ClassId) {
+    JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = (cache_key.0, cache_key.1, cache_key.2, target.as_u32());
+        if let Some(slot) = cache.iter_mut().find(|(vm, ptr, len, _)| {
+            *vm == cache_key.0 && *ptr == cache_key.1 && *len == cache_key.2
+        }) {
+            *slot = entry;
+            return;
+        }
+        if cache.len() >= JIT_TYPECHECK_TARGET_CACHE_CAP {
+            cache.remove(0);
+        }
+        cache.push(entry);
+    });
+}
+
+/// `ClassManager::is_subclass_of` with the positive-answer memo described on
+/// [`JIT_SUBTYPE_POSITIVE_CACHE`]. Behaviour-identical to calling
+/// `is_subclass_of` directly: a hit can only ever replace a call that would
+/// have returned `true` with `true`.
+fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> bool {
+    let vm_key = vm as *const SharedVm as usize;
+    let key = (vm_key, child.as_u32(), parent.as_u32());
+    let redefined = crate::classloading::any_class_redefined();
+    if !redefined {
+        let hit =
+            JIT_SUBTYPE_POSITIVE_CACHE.with(|cache| cache.borrow().iter().any(|e| *e == key));
+        if hit {
+            return true;
+        }
+    }
+    let is_subclass = {
+        vm.classes
+            .class_manager
+            .read()
+            .is_subclass_of(child, parent)
+    };
+    if is_subclass && !redefined {
+        JIT_SUBTYPE_POSITIVE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= JIT_SUBTYPE_CACHE_CAP {
+                cache.remove(0);
+            }
+            cache.push(key);
+        });
+    }
+    is_subclass
 }
 
 /// Common type-check resolution shared by `jit_checkcast` and `jit_instanceof`.
@@ -4372,11 +4479,12 @@ unsafe fn jit_typecheck_resolve(
     );
     let cached_target = JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
         cache
-            .get()
-            .and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
-                (cached_vm == cache_key.0 && cached_ptr == cache_key.1 && cached_len == cache_key.2)
-                    .then(|| ClassId::new(raw))
+            .borrow()
+            .iter()
+            .find(|(cached_vm, cached_ptr, cached_len, _)| {
+                *cached_vm == cache_key.0 && *cached_ptr == cache_key.1 && *cached_len == cache_key.2
             })
+            .map(|(_, _, _, raw)| ClassId::new(*raw))
     });
     let target_class_id_opt = if cached_target.is_some() {
         cached_target
@@ -4387,14 +4495,7 @@ unsafe fn jit_typecheck_resolve(
             .read()
             .find_unique_class_by_name(class_name);
         if let Some(target) = resolved {
-            JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((
-                    cache_key.0,
-                    cache_key.1,
-                    cache_key.2,
-                    target.as_u32(),
-                )))
-            });
+            jit_typecheck_target_cache_put(cache_key, target);
         }
         resolved
     };
@@ -4402,12 +4503,7 @@ unsafe fn jit_typecheck_resolve(
         if obj_class_id == target_class_id {
             return true;
         }
-        let is_subclass = vm
-            .classes
-            .class_manager
-            .read()
-            .is_subclass_of(obj_class_id, target_class_id);
-        if is_subclass {
+        if jit_is_subclass_of_cached(vm, obj_class_id, target_class_id) {
             return true;
         }
         // Lambda proxy fallback uses the *already-resolved* target id.
@@ -4469,23 +4565,11 @@ unsafe fn jit_typecheck_resolve(
             thread_ref.native_pin_roots.truncate(idx);
         }
         if let Ok(target_class_id) = load_result {
-            JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((
-                    cache_key.0,
-                    cache_key.1,
-                    cache_key.2,
-                    target_class_id.as_u32(),
-                )))
-            });
+            jit_typecheck_target_cache_put(cache_key, target_class_id);
             if obj_class_id == target_class_id {
                 return true;
             }
-            let is_subclass = vm
-                .classes
-                .class_manager
-                .read()
-                .is_subclass_of(obj_class_id, target_class_id);
-            if is_subclass {
+            if jit_is_subclass_of_cached(vm, obj_class_id, target_class_id) {
                 return true;
             }
             if crate::runtime::interpreter::lambda_proxy_satisfies_public(
@@ -4646,6 +4730,15 @@ pub unsafe extern "C" fn jit_checkcast(
         obj_ref.as_ptr() as i64
     } else {
         if cv_trace_enabled() {
+            // The receiver's OBJECT KIND disambiguates this failure: for a
+            // reference array the header stores the *component* class id, and
+            // the message below renders it by the component name — so a
+            // genuine `T[]` → `T` refusal prints as "X cannot be cast to X"
+            // and reads like a class-identity split. Print kind + array
+            // descriptor so the two are separable (see SPRING-CRHM.1 in
+            // `vm/src/jit/skip_list.rs`, where exactly that cost hours).
+            let kind = vm.mem.heap.kind_of(obj_ref);
+            let arr_desc = crate::runtime::interpreter::array_descriptor_of(vm, obj_ref);
             let cm = vm.classes.class_manager.read();
             let obj_cls_name = cm
                 .get_class(obj_class_id)
@@ -4653,8 +4746,10 @@ pub unsafe extern "C" fn jit_checkcast(
                 .unwrap_or_else(|| "<none>".into());
             let target_cid = cm.find_unique_class_by_name(class_name);
             eprintln!(
-                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
+                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} kind={:?} arr_desc={:?} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
                 obj_ptr,
+                kind,
+                arr_desc,
                 obj_class_id.as_u32(),
                 obj_cls_name,
                 class_name,
@@ -5311,6 +5406,14 @@ fn handle_jit_dispatch_error(
         MethodCallFailed::InternalError(VmError::ClassFile(ClassFileError::ClassNotFound {
             ref class_name,
         })) => {
+            // `CRATONVM_DBG_LINKAGE_BT=1` -- the third place a
+            // `NoClassDefFoundError` reaches Java (see the matching hooks in
+            // `runtime::exceptions`). Only the Rust backtrace names the JIT
+            // dispatch site that could not resolve the class.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some() {
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("[DBG_LINKAGE_BT] jit NoClassDefFoundError {class_name}\n{bt}");
+            }
             if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
@@ -5679,7 +5782,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         *count == crate::runtime::env_cache::jit_invocation_threshold()
                     });
                     if should_compile {
-                        if let Some((entry, needs_context)) =
+                        if let Some((_callee_pin, entry, needs_context)) =
                             crate::runtime::interpreter::try_jit_compile_callee(
                                 vm,
                                 &target.class_name,
@@ -5688,16 +5791,25 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                 true,
                             )
                         {
-                            VIRTUAL_DISPATCH_CACHE.with(|dc| {
-                                dc.borrow_mut().insert(
-                                    key,
-                                    DispatchCache {
-                                        entry,
-                                        needs_context,
-                                        _owner: cratonvm_jit::pin_jit_entry(entry),
-                                    },
-                                );
-                            });
+                            // `_callee_pin` keeps the callee mapped across the
+                            // cache publication and the direct call below.
+                            // Only publish a raw entry we can keep alive:
+                            // `_owner` is the sole keep-alive for this
+                            // thread-local pointer, so caching with `None`
+                            // would let a later tier-up `put` unmap the body
+                            // under it.
+                            if let Some(owner) = cratonvm_jit::pin_jit_entry(entry) {
+                                VIRTUAL_DISPATCH_CACHE.with(|dc| {
+                                    dc.borrow_mut().insert(
+                                        key,
+                                        DispatchCache {
+                                            entry,
+                                            needs_context,
+                                            _owner: Some(owner),
+                                        },
+                                    );
+                                });
+                            }
                             if let Some(rc) = try_call_compiled_entry_reentrant(
                                 entry,
                                 needs_context,
@@ -5850,23 +5962,27 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         });
     if should_compile {
         // Try to compile the callee and cache it
-        if let Some((entry, needs_ctx)) = try_compile_callee(vm, info) {
+        if let Some((_callee_pin, entry, needs_ctx)) = try_compile_callee(vm, info) {
             if crate::runtime::env_cache::jit_dispatch_dbg() {
                 eprintln!(
                     "[JIT_DISPATCH_ARM/compile] {}.{} entry=0x{:x}",
                     info.class_name, info.method_name, entry,
                 );
             }
-            DISPATCH_CACHE.with(|dc| {
-                dc.borrow_mut().insert(
-                    info_key,
-                    DispatchCache {
-                        entry,
-                        needs_context: needs_ctx,
-                        _owner: cratonvm_jit::pin_jit_entry(entry),
-                    },
-                );
-            });
+            // See the virtual-dispatch sibling above: an unowned raw entry
+            // must not be cached.
+            if let Some(owner) = cratonvm_jit::pin_jit_entry(entry) {
+                DISPATCH_CACHE.with(|dc| {
+                    dc.borrow_mut().insert(
+                        info_key,
+                        DispatchCache {
+                            entry,
+                            needs_context: needs_ctx,
+                            _owner: Some(owner),
+                        },
+                    );
+                });
+            }
             // SAFETY: entry was just produced by try_compile_callee, which returns a validated
             // JIT entry pointer. CRIT round-5 fix: bail explicitly to the interpreter on
             // >ARG_REGS args via `bail_to_interpreter` (matches the MIC fast-path).
@@ -6214,9 +6330,15 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 // SAFETY: Caller must ensure vm is a valid SharedVm reference and info points to a live
 // JitInvokeInfo. Delegates to try_jit_compile_callee which accesses the class manager
 // and JIT compiler; no raw pointer dereferences occur within this function itself.
-unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usize, bool)> {
+#[allow(clippy::type_complexity)]
+unsafe fn try_compile_callee(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     use crate::runtime::interpreter::try_jit_compile_callee;
-    // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
+    // JIT-dispatch callee compile — optimized (C2-equivalent) tier. The
+    // artifact comes back with the entry so the caller can keep it mapped for
+    // as long as it calls or caches that address.
     try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor, true)
 }
 
@@ -7419,13 +7541,15 @@ unsafe fn try_fast_lambda_int_to_double_apply(
         Err(_) => return Ok(None),
     };
     let box_args = [value.to_bits() as i64];
-    if let Some((entry, needs_context)) = crate::runtime::interpreter::try_jit_compile_callee(
-        vm,
-        "java/lang/Double",
-        "valueOf",
-        "(D)Ljava/lang/Double;",
-        true,
-    ) {
+    if let Some((_callee_pin, entry, needs_context)) =
+        crate::runtime::interpreter::try_jit_compile_callee(
+            vm,
+            "java/lang/Double",
+            "valueOf",
+            "(D)Ljava/lang/Double;",
+            true,
+        )
+    {
         if let Some(boxed) =
             try_call_compiled_entry_reentrant(entry, needs_context, vm_ptr, &box_args)
         {
@@ -8010,7 +8134,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // machine-code cascade would bypass it. Keep dispatch on the
         // `invoke_or_native` path so the exception routes through the callee's
         // own table.
-        if let Some((entry_ptr, needs_ctx)) = compile_res {
+        if let Some((_callee_pin, entry_ptr, needs_ctx)) = compile_res {
+            // `_callee_pin` holds the callee artifact across the publications
+            // below: `update`/`install` take their own keep-alive by resolving
+            // the entry, and that resolution can only succeed while the
+            // artifact is alive.
             // jit-invokedynamic-groovy-regression fix: also never publish an
             // artifact containing an unconditional invokedynamic trap — the
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
@@ -8019,10 +8147,25 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             if !mic_callee_has_exception_table(vm, receiver_class_id, info)
                 && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
             {
-                mic.cached_entry_ptr
-                    .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
-                mic.cached_needs_context
-                    .store(needs_ctx, std::sync::atomic::Ordering::Release);
+                // Publish through `update`, never with a raw store: `update` is
+                // the only writer that also resolves and RETAINS the callee's
+                // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
+                //
+                // Until 2026-07-27 this branch stored `cached_entry_ptr`
+                // directly, so a slot reached through the "class cached, target
+                // unresolved" shape (what `prepopulate` seeds and what
+                // `clear_compiled_entry` leaves behind after every
+                // invalidation) ended up holding a RAW entry pointer with no
+                // keep-alive. The next tier-up `put` for that callee replaced
+                // its shard snapshot, dropped the last `Arc`, and `munmap`ped
+                // the body — while the inline `MOV R11,[mic+8]; CALL R11`
+                // cascade emitted by `jit/src/x64.rs` still called it. That is
+                // the ElasticSearch `NodeConnectionsServiceTests` SIGSEGV
+                // (`rip == r11 ==` first byte of a retired code mapping) and,
+                // once the address was recycled by a later allocation, the
+                // json-smart "re-parse returned another method's result"
+                // corruption.
+                mic.update(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
                 // CRIT-1 — also populate the co-allocated PIC so the
                 // inline 4-way cascade in `jit/src/x64.rs` hits on the
                 // next invocation. Without this the cascade's empty
@@ -8140,9 +8283,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             true,
         )
     };
-    let (entry_ptr, needs_ctx) = match compile_res {
-        Some((ptr, nc)) => (ptr as u64, nc),
-        None => (0, false),
+    // `_callee_pin` must outlive the `mic.update` / `pic.install` below — see
+    // the matching note in the cache-hit branch.
+    let (_callee_pin, entry_ptr, needs_ctx) = match compile_res {
+        Some((pin, ptr, nc)) => (Some(pin), ptr as u64, nc),
+        None => (None, 0, false),
     };
 
     // BUG-H: never publish a direct compiled entry for a callee that declares a

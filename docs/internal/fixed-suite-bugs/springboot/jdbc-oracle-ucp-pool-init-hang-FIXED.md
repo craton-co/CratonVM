@@ -66,3 +66,16 @@ one class per process.
 
 All four final stderr logs are free of the previous out-of-bounds field-read
 warnings and `Semaphore$Sync.getState` spin signature.
+
+## Note (2026-07-23): a different, unrelated `OracleUcpDataSourcePoolMetadataTests` failure found
+
+`OracleUcpDataSourcePoolMetadataTests` fails again in the
+`RunName=craton-rerun-20260723` rerun (5/6 pass), but **not** a recurrence of
+this hang — no spin, no `Semaphore$Sync` involvement, finishes in ~10s. New,
+distinct symptom (`getPoolSizeOneConnection`, `UCP-45069: Universal
+Connection Pool is empty` on the first on-demand connection borrow from a
+fresh empty pool) — see
+[`../../../known-issues/springboot/oracleucp-poolsizeoneconnection-connection-pool-empty-20260723.md`](../../../known-issues/springboot/oracleucp-poolsizeoneconnection-connection-pool-empty-20260723.md).
+Filed separately rather than reopening this doc since the mechanism this doc
+fixed (synthetic-`Semaphore`/real-AQS layout) is confirmed unrelated to the
+new failure.

@@ -16,7 +16,16 @@ Needs a Tomcat checkout with:
   .../conf/logging.properties` cascading into `A child container failed
   during start`),
 - a flat classpath file (jars + compiled-class dirs, `:`-joined) at
-  `$TC_ROOT/.suite/cp-linux-fixed.txt`,
+  `$TC_ROOT/.suite/cp-linux-fixed.txt`. It **must include Ant's own
+  `ant.jar` + `ant-launcher.jar`**: `org.apache.catalina.ant.TestDeployTask`
+  drives Tomcat's `DeployTask` Ant task and `org.apache.jasper.JspC` (under
+  test in `org.apache.jasper.TestJspC`) extends `org.apache.tools.ant.Task`,
+  so without them both classes die with `NoClassDefFoundError:
+  org/apache/tools/ant/Task` on *either* VM — a fixture gap that is easily
+  misread as a CratonVM regression. The Windows `.ps1` harness's
+  `Build-Classpath` adds them automatically; the Linux file is hand-built, so
+  append `/usr/share/java/ant.jar` + `/usr/share/java/ant-launcher.jar`
+  (`apt-get install ant`) by hand,
 - a class list at `$TC_ROOT/.suite/all-tests.txt` (one FQCN per line, **no
   CRLF** - if generated on Windows and `scp`'d over, run
   `sed -i 's/\r$//' all-tests.txt` first or every class name fails to resolve).
