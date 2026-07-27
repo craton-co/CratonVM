@@ -2364,6 +2364,8 @@ pub fn parse_socket_addr(text: &str) -> Option<SocketAddr> {
 #[cfg(test)]
 #[allow(non_snake_case)] // Test names intentionally mirror JDK method names.
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_support::MockNativeContext;
     use std::io::{Read as _, Write as _};

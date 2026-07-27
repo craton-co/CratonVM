@@ -461,7 +461,6 @@ name = "cratonvm-classloading"
 version = "0.3.0"
 dependencies = [
  "const-oid",
- "cratonvm-jit",
  "cratonvm-jit-api",
  "cratonvm-native-api",
  "cratonvm-reader",
@@ -536,7 +535,6 @@ name = "cratonvm-gc"
 version = "0.3.0"
 dependencies = [
  "cratonvm-jit",
- "cratonvm-native-collections",
  "cratonvm-types",
  "loom",
  "parking_lot",
@@ -636,6 +634,8 @@ dependencies = [
  "chacha20poly1305",
  "cratonvm-classloading",
  "cratonvm-native-api",
+ "cratonvm-native-builtins-crypto",
+ "cratonvm-native-builtins-security",
  "cratonvm-native-collections",
  "cratonvm-native-io",
  "cratonvm-reader",
@@ -657,9 +657,6 @@ dependencies = [
  "num-bigint",
  "openssl",
  "p12",
- "p256",
- "p384",
- "p521",
  "parking_lot",
  "quick-xml",
  "regex",
@@ -686,9 +683,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratonvm-native-builtins-crypto"
+version = "0.3.0"
+dependencies = [
+ "sha3",
+]
+
+[[package]]
+name = "cratonvm-native-builtins-security"
+version = "0.3.0"
+dependencies = [
+ "cratonvm-native-api",
+ "cratonvm-types",
+ "num-bigint",
+ "num-traits",
+ "p256",
+ "p384",
+ "p521",
+]
+
+[[package]]
 name = "cratonvm-native-collections"
 version = "0.3.0"
 dependencies = [
+ "cratonvm-gc",
  "cratonvm-native-api",
  "cratonvm-types",
  "parking_lot",

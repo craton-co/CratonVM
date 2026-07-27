@@ -65,6 +65,8 @@ pub fn intrinsic_long_parse_long(ctx: &mut dyn NativeContext, args: &[Value]) ->
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeCallback;
 

@@ -167,7 +167,7 @@ fn sibox(i: u32) -> u32 {
 
 /// Port of `AESEngine.encryptBlock`. `kw` is the expanded key schedule
 /// (`KW[round][col]`); `inb`/`outb` are 16-byte blocks. `ROUNDS == kw.len()-1`.
-pub(crate) fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
+pub fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
     let rounds = kw.len() - 1;
     let c0 = le_to_u32(inb, 0);
     let c1 = le_to_u32(inb, 4);
@@ -234,7 +234,7 @@ pub(crate) fn encrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
 
 /// Port of `AESEngine.decryptBlock` (equivalent inverse cipher; `kw` is the
 /// decryption schedule BC produced via `generateWorkingKey(.., false)`).
-pub(crate) fn decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
+pub fn decrypt_block(kw: &[[u32; 4]], inb: &[u8], outb: &mut [u8]) {
     let rounds = kw.len() - 1;
     let c0 = le_to_u32(inb, 0);
     let c1 = le_to_u32(inb, 4);
@@ -335,7 +335,7 @@ fn inv_mcol(x: u32) -> u32 {
 /// (the caller raises `IllegalArgumentException`, matching BC). `for_encryption
 /// == false` applies the equivalent-inverse-cipher `inv_mcol` to the middle
 /// round keys, exactly as BC does.
-pub(crate) fn generate_working_key(key: &[u8], for_encryption: bool) -> Option<Vec<[u32; 4]>> {
+pub fn generate_working_key(key: &[u8], for_encryption: bool) -> Option<Vec<[u32; 4]>> {
     let key_len = key.len();
     if key_len < 16 || key_len > 32 || (key_len & 7) != 0 {
         return None;
@@ -469,6 +469,8 @@ pub(crate) fn generate_working_key(key: &[u8], for_encryption: bool) -> Option<V
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     fn unhex(s: &str) -> Vec<u8> {

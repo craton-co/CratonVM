@@ -866,6 +866,8 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod cds_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 
@@ -1421,7 +1423,8 @@ mod cds_tests {
     // =========================================================================
     struct PanicContext;
 
-    impl cratonvm_native_api::NativeContext for PanicContext {
+    impl cratonvm_native_api::NativeClassAccess for PanicContext {
+
         fn is_package_exported_unqualified(&self, _: &str, _: &str) -> bool {
             panic!("MockNativeContext: is_package_exported_unqualified not implemented for testing")
         }
@@ -1441,19 +1444,152 @@ mod cds_tests {
         ) -> Result<(), String> {
             panic!("MockNativeContext: check_deep_reflection_access not implemented for testing")
         }
-        fn resolve_field_index_by_class_id(
-            &self,
-            _: cratonvm_types::ClassId,
-            _: &str,
-        ) -> Option<usize> {
-            panic!("MockNativeContext: resolve_field_index_by_class_id not implemented for testing")
-        }
         fn load_class(&mut self, _: &str) -> cratonvm_types::error::MethodCallResult {
             panic!("MockNativeContext: load_class not implemented for testing")
         }
-        fn new_object(&mut self, _: &str) -> cratonvm_types::error::MethodCallResult {
-            panic!("MockNativeContext: new_object not implemented for testing")
+        fn class_name_of_id(&self, _: cratonvm_types::ClassId) -> Option<String> {
+            panic!("MockNativeContext: class_name_of_id not implemented for testing")
         }
+        fn class_id_of_object(&self, _: cratonvm_types::ObjectRef) -> cratonvm_types::ClassId {
+            panic!("MockNativeContext: class_id_of_object not implemented for testing")
+        }
+        fn method_exists(&self, _: &str, _: &str, _: &str) -> bool {
+            false
+        }
+        fn ensure_class_initialized(
+            &mut self,
+            _: &str,
+        ) -> Result<cratonvm_types::ClassId, cratonvm_types::error::MethodCallFailed> {
+            panic!("MockNativeContext: ensure_class_initialized not implemented for testing")
+        }
+        fn is_subclass(&self, _: cratonvm_types::ClassId, _: cratonvm_types::ClassId) -> bool {
+            panic!("MockNativeContext: is_subclass not implemented for testing")
+        }
+        fn superclass_of(&self, _: cratonvm_types::ClassId) -> Option<cratonvm_types::ClassId> {
+            panic!("MockNativeContext: superclass_of not implemented for testing")
+        }
+        fn class_id_by_name(&self, _: &str) -> Option<cratonvm_types::ClassId> {
+            panic!("MockNativeContext: class_id_by_name not implemented for testing")
+        }
+        fn loader_id_of_class(&self, _: cratonvm_types::ClassId) -> i32 {
+            2
+        }
+        fn is_record_class(&self, _: cratonvm_types::ClassId) -> bool {
+            panic!("MockNativeContext: is_record_class not implemented for testing")
+        }
+        fn record_components(&self, _: cratonvm_types::ClassId) -> Vec<(String, String)> {
+            panic!("MockNativeContext: record_components not implemented for testing")
+        }
+        fn is_sealed_class(&self, _: cratonvm_types::ClassId) -> bool {
+            panic!("MockNativeContext: is_sealed_class not implemented for testing")
+        }
+        fn permitted_subclasses(&self, _: cratonvm_types::ClassId) -> Vec<String> {
+            panic!("MockNativeContext: permitted_subclasses not implemented for testing")
+        }
+        fn declared_fields(
+            &self,
+            _: cratonvm_types::ClassId,
+        ) -> Vec<cratonvm_native_api::FieldMetadata> {
+            panic!("MockNativeContext: declared_fields not implemented for testing")
+        }
+        fn declared_methods(
+            &self,
+            _: cratonvm_types::ClassId,
+        ) -> Vec<cratonvm_native_api::MethodMetadata> {
+            panic!("MockNativeContext: declared_methods not implemented for testing")
+        }
+        fn class_interfaces(&self, _: cratonvm_types::ClassId) -> Vec<cratonvm_types::ClassId> {
+            panic!("MockNativeContext: class_interfaces not implemented for testing")
+        }
+        fn class_access_flags(&self, _: cratonvm_types::ClassId) -> u16 {
+            panic!("MockNativeContext: class_access_flags not implemented for testing")
+        }
+        fn primitive_class_mirror(&mut self, _: &str) -> cratonvm_types::ObjectRef {
+            panic!("MockNativeContext: primitive_class_mirror not implemented for testing")
+        }
+        fn class_annotations(
+            &self,
+            _: cratonvm_types::ClassId,
+        ) -> Vec<cratonvm_native_api::AnnotationData> {
+            panic!("MockNativeContext: class_annotations not implemented for testing")
+        }
+        fn method_annotations(
+            &self,
+            _: cratonvm_types::ClassId,
+            _: &str,
+            _: &str,
+        ) -> Vec<cratonvm_native_api::AnnotationData> {
+            panic!("MockNativeContext: method_annotations not implemented for testing")
+        }
+        fn field_annotations(
+            &self,
+            _: cratonvm_types::ClassId,
+            _: &str,
+        ) -> Vec<cratonvm_native_api::AnnotationData> {
+            panic!("MockNativeContext: field_annotations not implemented for testing")
+        }
+        fn module_name_of_class(&self, _: cratonvm_types::ClassId) -> Option<String> {
+            panic!("MockNativeContext: module_name_of_class not implemented for testing")
+        }
+        fn find_resource(&self, _: &str) -> Option<Vec<u8>> {
+            panic!("MockNativeContext: find_resource not implemented for testing")
+        }
+        fn list_application_class_names(&self) -> Vec<String> {
+            panic!("MockNativeContext: list_application_class_names not implemented for testing")
+        }
+        fn register_dynamic_classpath(&mut self, _: &[String]) {
+            panic!("MockNativeContext: register_dynamic_classpath not implemented for testing")
+        }
+        fn define_class_from_bytes(
+            &mut self,
+            _: &str,
+            _: &[u8],
+        ) -> Option<cratonvm_types::ClassId> {
+            panic!("MockNativeContext: define_class_from_bytes not implemented for testing")
+        }
+        fn define_class_with_loader(
+            &mut self,
+            _: &str,
+            _: &[u8],
+            _: u32,
+        ) -> Option<cratonvm_types::ClassId> {
+            panic!("MockNativeContext: define_class_with_loader not implemented for testing")
+        }
+        fn class_id_by_name_and_loader(&self, _: &str, _: u32) -> Option<cratonvm_types::ClassId> {
+            panic!("MockNativeContext: class_id_by_name_and_loader not implemented for testing")
+        }
+        fn allocate_loader_id(&mut self) -> u32 {
+            panic!("MockNativeContext: allocate_loader_id not implemented for testing")
+        }
+        fn method_parameter_annotations(
+            &self,
+            _: cratonvm_types::ClassId,
+            _: &str,
+            _: &str,
+        ) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
+            panic!("PanicContext::method_parameter_annotations not implemented for testing")
+        }
+        fn method_annotation_default(
+            &self,
+            _: cratonvm_types::ClassId,
+            _: &str,
+            _: &str,
+        ) -> Option<cratonvm_native_api::AnnotationElementValue> {
+            panic!("PanicContext::method_annotation_default not implemented for testing")
+        }
+        fn class_signature(&self, _: cratonvm_types::ClassId) -> Option<String> {
+            None
+        }
+        fn method_signature(&self, _: cratonvm_types::ClassId, _: &str, _: &str) -> Option<String> {
+            None
+        }
+        fn field_signature(&self, _: cratonvm_types::ClassId, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    impl cratonvm_native_api::NativeInvokeAccess for PanicContext {
+
         fn invoke(
             &mut self,
             _: &str,
@@ -1463,23 +1599,31 @@ mod cds_tests {
         ) -> cratonvm_types::error::MethodCallResult {
             panic!("MockNativeContext: invoke not implemented for testing")
         }
+        fn invoke_virtual(
+            &mut self,
+            _: cratonvm_types::ObjectRef,
+            _: &str,
+            _: &str,
+            _: &[Value],
+        ) -> cratonvm_types::error::MethodCallResult {
+            panic!("MockNativeContext: invoke_virtual not implemented for testing")
+        }
+    }
+
+    impl cratonvm_native_api::NativeHeapAccess for PanicContext {
+
+        fn resolve_field_index_by_class_id(
+            &self,
+            _: cratonvm_types::ClassId,
+            _: &str,
+        ) -> Option<usize> {
+            panic!("MockNativeContext: resolve_field_index_by_class_id not implemented for testing")
+        }
+        fn new_object(&mut self, _: &str) -> cratonvm_types::error::MethodCallResult {
+            panic!("MockNativeContext: new_object not implemented for testing")
+        }
         fn identity_hash_code(&self, _: cratonvm_types::ObjectRef) -> i32 {
             panic!("MockNativeContext: identity_hash_code not implemented for testing")
-        }
-        fn record_printed_value(&mut self, _: Value) {
-            panic!("MockNativeContext: record_printed_value not implemented for testing")
-        }
-        fn class_name_of_id(&self, _: cratonvm_types::ClassId) -> Option<String> {
-            panic!("MockNativeContext: class_name_of_id not implemented for testing")
-        }
-        fn class_id_of_object(&self, _: cratonvm_types::ObjectRef) -> cratonvm_types::ClassId {
-            panic!("MockNativeContext: class_id_of_object not implemented for testing")
-        }
-        fn capture_stack_trace(&mut self, _: i32) -> Vec<cratonvm_native_api::StackTraceEntry> {
-            panic!("MockNativeContext: capture_stack_trace not implemented for testing")
-        }
-        fn get_stack_trace(&self, _: i32) -> Option<Vec<cratonvm_native_api::StackTraceEntry>> {
-            panic!("MockNativeContext: get_stack_trace not implemented for testing")
         }
         fn get_field(&self, _: cratonvm_types::ObjectRef, _: usize) -> Value {
             panic!("MockNativeContext: get_field not implemented for testing")
@@ -1495,9 +1639,6 @@ mod cds_tests {
         }
         fn resolve_field_index(&self, _: &str, _: &str) -> Option<usize> {
             panic!("MockNativeContext: resolve_field_index not implemented for testing")
-        }
-        fn method_exists(&self, _: &str, _: &str, _: &str) -> bool {
-            false
         }
         fn new_array(
             &mut self,
@@ -1540,18 +1681,6 @@ mod cds_tests {
         fn get_class_mirror(&mut self, _: cratonvm_types::ClassId) -> cratonvm_types::ObjectRef {
             panic!("MockNativeContext: get_class_mirror not implemented for testing")
         }
-        fn record_printed_line(&mut self, _: String) {
-            panic!("MockNativeContext: record_printed_line not implemented for testing")
-        }
-        fn get_system_stream(&self, _: &str) -> Option<cratonvm_types::ObjectRef> {
-            panic!("MockNativeContext: get_system_stream not implemented for testing")
-        }
-        fn get_system_property(&self, _: &str) -> Option<String> {
-            None
-        }
-        fn set_system_property(&mut self, _: &str, _: &str) -> Option<String> {
-            panic!("MockNativeContext: set_system_property not implemented for testing")
-        }
         fn alloc_object(
             &mut self,
             _: cratonvm_types::ClassId,
@@ -1559,42 +1688,43 @@ mod cds_tests {
         ) -> cratonvm_types::ObjectRef {
             panic!("MockNativeContext: alloc_object not implemented for testing")
         }
-        fn ensure_class_initialized(
-            &mut self,
-            _: &str,
-        ) -> Result<cratonvm_types::ClassId, cratonvm_types::error::MethodCallFailed> {
-            panic!("MockNativeContext: ensure_class_initialized not implemented for testing")
-        }
-        fn is_subclass(&self, _: cratonvm_types::ClassId, _: cratonvm_types::ClassId) -> bool {
-            panic!("MockNativeContext: is_subclass not implemented for testing")
-        }
-        fn superclass_of(&self, _: cratonvm_types::ClassId) -> Option<cratonvm_types::ClassId> {
-            panic!("MockNativeContext: superclass_of not implemented for testing")
-        }
-        fn is_interface_class(&self, _: cratonvm_types::ClassId) -> bool {
-            panic!("MockNativeContext: is_interface_class not implemented for testing")
-        }
-        fn class_id_by_name(&self, _: &str) -> Option<cratonvm_types::ClassId> {
-            panic!("MockNativeContext: class_id_by_name not implemented for testing")
-        }
-        fn loader_id_of_class(&self, _: cratonvm_types::ClassId) -> i32 {
-            2
-        }
-        fn is_record_class(&self, _: cratonvm_types::ClassId) -> bool {
-            panic!("MockNativeContext: is_record_class not implemented for testing")
-        }
-        fn record_components(&self, _: cratonvm_types::ClassId) -> Vec<(String, String)> {
-            panic!("MockNativeContext: record_components not implemented for testing")
-        }
-        fn is_sealed_class(&self, _: cratonvm_types::ClassId) -> bool {
-            panic!("MockNativeContext: is_sealed_class not implemented for testing")
-        }
-        fn permitted_subclasses(&self, _: cratonvm_types::ClassId) -> Vec<String> {
-            panic!("MockNativeContext: permitted_subclasses not implemented for testing")
-        }
         fn object_num_fields(&self, _: cratonvm_types::ObjectRef) -> usize {
             panic!("MockNativeContext: object_num_fields not implemented for testing")
         }
+        fn get_field_volatile(&self, _: cratonvm_types::ObjectRef, _: usize) -> Value {
+            panic!("MockNativeContext: get_field_volatile not implemented for testing")
+        }
+        fn set_field_volatile(&self, _: cratonvm_types::ObjectRef, _: usize, _: Value) {
+            panic!("MockNativeContext: set_field_volatile not implemented for testing")
+        }
+        fn compare_and_swap_field(
+            &mut self,
+            _: cratonvm_types::ObjectRef,
+            _: usize,
+            _: Value,
+            _: Value,
+        ) -> bool {
+            panic!("MockNativeContext: compare_and_swap_field not implemented for testing")
+        }
+        fn allocate_instance(&mut self, _: &str) -> Option<cratonvm_types::ObjectRef> {
+            panic!("MockNativeContext: allocate_instance not implemented for testing")
+        }
+        fn discover_reference(
+            &mut self,
+            _: u8,
+            _: cratonvm_types::ObjectRef,
+            _: cratonvm_types::ObjectRef,
+            _: Option<cratonvm_types::ObjectRef>,
+        ) {
+            panic!("MockNativeContext: discover_reference not implemented for testing")
+        }
+        fn heap_allocated_bytes(&self) -> usize {
+            panic!("PanicContext::heap_allocated_bytes not implemented for testing")
+        }
+    }
+
+    impl cratonvm_native_api::NativeThreadAccess for PanicContext {
+
         fn thread_id(&self) -> u64 {
             panic!("MockNativeContext: thread_id not implemented for testing")
         }
@@ -1641,89 +1771,11 @@ mod cds_tests {
         fn is_interrupted(&self, _: bool) -> bool {
             panic!("MockNativeContext: is_interrupted not implemented for testing")
         }
-        fn declared_fields(
-            &self,
-            _: cratonvm_types::ClassId,
-        ) -> Vec<cratonvm_native_api::FieldMetadata> {
-            panic!("MockNativeContext: declared_fields not implemented for testing")
-        }
-        fn declared_methods(
-            &self,
-            _: cratonvm_types::ClassId,
-        ) -> Vec<cratonvm_native_api::MethodMetadata> {
-            panic!("MockNativeContext: declared_methods not implemented for testing")
-        }
-        fn class_interfaces(&self, _: cratonvm_types::ClassId) -> Vec<cratonvm_types::ClassId> {
-            panic!("MockNativeContext: class_interfaces not implemented for testing")
-        }
-        fn class_access_flags(&self, _: cratonvm_types::ClassId) -> u16 {
-            panic!("MockNativeContext: class_access_flags not implemented for testing")
-        }
-        fn get_static_field(&self, _: cratonvm_types::ClassId, _: usize) -> Value {
-            panic!("MockNativeContext: get_static_field not implemented for testing")
-        }
-        fn set_static_field(&mut self, _: cratonvm_types::ClassId, _: usize, _: Value) {
-            panic!("MockNativeContext: set_static_field not implemented for testing")
-        }
-        fn primitive_class_mirror(&mut self, _: &str) -> cratonvm_types::ObjectRef {
-            panic!("MockNativeContext: primitive_class_mirror not implemented for testing")
-        }
-        fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
-            panic!("MockNativeContext: fd_table not implemented for testing")
-        }
-        fn get_field_volatile(&self, _: cratonvm_types::ObjectRef, _: usize) -> Value {
-            panic!("MockNativeContext: get_field_volatile not implemented for testing")
-        }
-        fn set_field_volatile(&self, _: cratonvm_types::ObjectRef, _: usize, _: Value) {
-            panic!("MockNativeContext: set_field_volatile not implemented for testing")
-        }
-        fn compare_and_swap_field(
-            &mut self,
-            _: cratonvm_types::ObjectRef,
-            _: usize,
-            _: Value,
-            _: Value,
-        ) -> bool {
-            panic!("MockNativeContext: compare_and_swap_field not implemented for testing")
-        }
         fn park(&mut self, _: Option<std::time::Duration>) {
             panic!("MockNativeContext: park not implemented for testing")
         }
         fn unpark(&self, _: cratonvm_types::ObjectRef) {
             panic!("MockNativeContext: unpark not implemented for testing")
-        }
-        fn allocate_instance(&mut self, _: &str) -> Option<cratonvm_types::ObjectRef> {
-            panic!("MockNativeContext: allocate_instance not implemented for testing")
-        }
-        fn class_annotations(
-            &self,
-            _: cratonvm_types::ClassId,
-        ) -> Vec<cratonvm_native_api::AnnotationData> {
-            panic!("MockNativeContext: class_annotations not implemented for testing")
-        }
-        fn method_annotations(
-            &self,
-            _: cratonvm_types::ClassId,
-            _: &str,
-            _: &str,
-        ) -> Vec<cratonvm_native_api::AnnotationData> {
-            panic!("MockNativeContext: method_annotations not implemented for testing")
-        }
-        fn field_annotations(
-            &self,
-            _: cratonvm_types::ClassId,
-            _: &str,
-        ) -> Vec<cratonvm_native_api::AnnotationData> {
-            panic!("MockNativeContext: field_annotations not implemented for testing")
-        }
-        fn invoke_virtual(
-            &mut self,
-            _: cratonvm_types::ObjectRef,
-            _: &str,
-            _: &str,
-            _: &[Value],
-        ) -> cratonvm_types::error::MethodCallResult {
-            panic!("MockNativeContext: invoke_virtual not implemented for testing")
         }
         fn get_scoped_value(&self, _: u64) -> Option<Value> {
             panic!("MockNativeContext: get_scoped_value not implemented for testing")
@@ -1736,6 +1788,63 @@ mod cds_tests {
         }
         fn scoped_value_depth(&self) -> usize {
             panic!("MockNativeContext: scoped_value_depth not implemented for testing")
+        }
+        fn monitor_enter(&mut self, _: cratonvm_types::ObjectRef) {
+            panic!("MockNativeContext: monitor_enter not implemented for testing")
+        }
+        fn monitor_exit(&mut self, _: cratonvm_types::ObjectRef) {
+            panic!("MockNativeContext: monitor_exit not implemented for testing")
+        }
+        fn active_thread_count(&self) -> i32 {
+            panic!("PanicContext::active_thread_count not implemented for testing")
+        }
+        fn enumerate_threads(&self, _: usize) -> Vec<cratonvm_types::ObjectRef> {
+            panic!("PanicContext::enumerate_threads not implemented for testing")
+        }
+    }
+
+    impl cratonvm_native_api::NativeExceptionAccess for PanicContext {
+
+        fn capture_stack_trace(&mut self, _: i32) -> Vec<cratonvm_native_api::StackTraceEntry> {
+            panic!("MockNativeContext: capture_stack_trace not implemented for testing")
+        }
+        fn get_stack_trace(&self, _: i32) -> Option<Vec<cratonvm_native_api::StackTraceEntry>> {
+            panic!("MockNativeContext: get_stack_trace not implemented for testing")
+        }
+    }
+
+    impl cratonvm_native_api::NativeGpuAccess for PanicContext {
+
+    }
+
+    impl cratonvm_native_api::NativeSystemAccess for PanicContext {
+
+        fn record_printed_value(&mut self, _: Value) {
+            panic!("MockNativeContext: record_printed_value not implemented for testing")
+        }
+        fn record_printed_line(&mut self, _: String) {
+            panic!("MockNativeContext: record_printed_line not implemented for testing")
+        }
+        fn get_system_stream(&self, _: &str) -> Option<cratonvm_types::ObjectRef> {
+            panic!("MockNativeContext: get_system_stream not implemented for testing")
+        }
+        fn get_system_property(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn set_system_property(&mut self, _: &str, _: &str) -> Option<String> {
+            panic!("MockNativeContext: set_system_property not implemented for testing")
+        }
+        fn is_interface_class(&self, _: cratonvm_types::ClassId) -> bool {
+            panic!("MockNativeContext: is_interface_class not implemented for testing")
+        }
+        fn get_static_field(&self, _: cratonvm_types::ClassId, _: usize) -> Value {
+            panic!("MockNativeContext: get_static_field not implemented for testing")
+        }
+        fn set_static_field(&mut self, _: cratonvm_types::ClassId, _: usize, _: Value) {
+            panic!("MockNativeContext: set_static_field not implemented for testing")
+        }
+        fn fd_table(&self) -> &cratonvm_native_api::fd_table::FileDescriptorTable {
+            panic!("MockNativeContext: fd_table not implemented for testing")
         }
         fn allocate_native_memory(&mut self, _: usize, _: usize) -> Option<(i64, *mut u8)> {
             panic!("MockNativeContext: allocate_native_memory not implemented for testing")
@@ -1758,63 +1867,6 @@ mod cds_tests {
         fn get_upcall_info(&self, _: usize) -> Option<(cratonvm_types::ObjectRef, Vec<i32>, i32)> {
             panic!("MockNativeContext: get_upcall_info not implemented for testing")
         }
-        fn module_name_of_class(&self, _: cratonvm_types::ClassId) -> Option<String> {
-            panic!("MockNativeContext: module_name_of_class not implemented for testing")
-        }
-        fn find_resource(&self, _: &str) -> Option<Vec<u8>> {
-            panic!("MockNativeContext: find_resource not implemented for testing")
-        }
-        fn list_application_class_names(&self) -> Vec<String> {
-            panic!("MockNativeContext: list_application_class_names not implemented for testing")
-        }
-        fn register_dynamic_classpath(&mut self, _: &[String]) {
-            panic!("MockNativeContext: register_dynamic_classpath not implemented for testing")
-        }
-        fn define_class_from_bytes(
-            &mut self,
-            _: &str,
-            _: &[u8],
-        ) -> Option<cratonvm_types::ClassId> {
-            panic!("MockNativeContext: define_class_from_bytes not implemented for testing")
-        }
-        fn discover_reference(
-            &mut self,
-            _: u8,
-            _: cratonvm_types::ObjectRef,
-            _: cratonvm_types::ObjectRef,
-            _: Option<cratonvm_types::ObjectRef>,
-        ) {
-            panic!("MockNativeContext: discover_reference not implemented for testing")
-        }
-        fn monitor_enter(&mut self, _: cratonvm_types::ObjectRef) {
-            panic!("MockNativeContext: monitor_enter not implemented for testing")
-        }
-        fn monitor_exit(&mut self, _: cratonvm_types::ObjectRef) {
-            panic!("MockNativeContext: monitor_exit not implemented for testing")
-        }
-        fn define_class_with_loader(
-            &mut self,
-            _: &str,
-            _: &[u8],
-            _: u32,
-        ) -> Option<cratonvm_types::ClassId> {
-            panic!("MockNativeContext: define_class_with_loader not implemented for testing")
-        }
-        fn class_id_by_name_and_loader(&self, _: &str, _: u32) -> Option<cratonvm_types::ClassId> {
-            panic!("MockNativeContext: class_id_by_name_and_loader not implemented for testing")
-        }
-        fn allocate_loader_id(&mut self) -> u32 {
-            panic!("MockNativeContext: allocate_loader_id not implemented for testing")
-        }
-        fn active_thread_count(&self) -> i32 {
-            panic!("PanicContext::active_thread_count not implemented for testing")
-        }
-        fn enumerate_threads(&self, _: usize) -> Vec<cratonvm_types::ObjectRef> {
-            panic!("PanicContext::enumerate_threads not implemented for testing")
-        }
-        fn heap_allocated_bytes(&self) -> usize {
-            panic!("PanicContext::heap_allocated_bytes not implemented for testing")
-        }
         fn loaded_class_count(&self) -> usize {
             panic!("PanicContext::loaded_class_count not implemented for testing")
         }
@@ -1822,32 +1874,10 @@ mod cds_tests {
             panic!("PanicContext::gc_collection_count not implemented for testing")
         }
         fn force_gc(&mut self) {}
-        fn method_parameter_annotations(
-            &self,
-            _: cratonvm_types::ClassId,
-            _: &str,
-            _: &str,
-        ) -> Vec<Vec<cratonvm_native_api::AnnotationData>> {
-            panic!("PanicContext::method_parameter_annotations not implemented for testing")
-        }
-        fn method_annotation_default(
-            &self,
-            _: cratonvm_types::ClassId,
-            _: &str,
-            _: &str,
-        ) -> Option<cratonvm_native_api::AnnotationElementValue> {
-            panic!("PanicContext::method_annotation_default not implemented for testing")
-        }
-        fn class_signature(&self, _: cratonvm_types::ClassId) -> Option<String> {
-            None
-        }
-        fn method_signature(&self, _: cratonvm_types::ClassId, _: &str, _: &str) -> Option<String> {
-            None
-        }
-        fn field_signature(&self, _: cratonvm_types::ClassId, _: &str) -> Option<String> {
-            None
-        }
     }
+
+
+
 
     #[test]
     fn test_is_dumping_class_list_returns_zero() {

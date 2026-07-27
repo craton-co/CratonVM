@@ -24238,7 +24238,7 @@ mod tests {
             .classes
             .class_manager
             .read()
-            .find_class_by_name("test/NotAnAnnotation")
+            .find_unique_class_by_name("test/NotAnAnnotation")
             .unwrap();
         let mirror = {
             let mut ctx = NativeContextImpl {
@@ -24272,7 +24272,7 @@ mod tests {
             .classes
             .class_manager
             .read()
-            .find_class_by_name("test/MyAnnotation")
+            .find_unique_class_by_name("test/MyAnnotation")
             .unwrap();
         let mirror = {
             let mut ctx = NativeContextImpl {
@@ -46509,7 +46509,7 @@ mod tests {
         }
         let string_id = {
             let cm = shared.classes.class_manager.read();
-            cm.find_class_by_name("java/lang/String")
+            cm.find_bootstrap_class_by_name("java/lang/String")
         };
 
         if let Some(sid) = string_id {
@@ -57405,7 +57405,7 @@ mod tests {
     #[test]
     fn bootstrap_with_real_jdk() {
         // Skip if no JDK available
-        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME").ok().or_else(|| {
             let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
             if p.exists() {
                 Some(p.to_string_lossy().into_owned())
@@ -57530,7 +57530,7 @@ mod tests {
     #[test]
     fn resolve_field_index_real_jdk() {
         // Skip if no JDK available
-        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME").ok().or_else(|| {
             let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
             if p.exists() {
                 Some(p.to_string_lossy().into_owned())
@@ -57591,7 +57591,7 @@ mod tests {
     /// Helper to create a VM with real JDK on boot classpath.
     /// Returns None if no JDK is available.
     fn vm_with_real_jdk() -> Option<Vm> {
-        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME").ok().or_else(|| {
             let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
             if p.exists() {
                 Some(p.to_string_lossy().into_owned())
@@ -58020,7 +58020,7 @@ mod tests {
     #[test]
     fn real_jdk_hello_world_e2e() {
         // Discover JAVA_HOME
-        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME").ok().or_else(|| {
             let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
             if p.exists() {
                 Some(p.to_string_lossy().into_owned())
@@ -67558,7 +67558,7 @@ mod tests {
         // Prove that collection classes (ArrayList, Collections, HashMap) load
         // from real JDK .class files with real bytecode, not synthetic stubs.
 
-        let java_home = std::env::var("JAVA_HOME").ok().or_else(|| {
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME").ok().or_else(|| {
             let p = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
             if p.exists() {
                 Some(p.to_string_lossy().into_owned())

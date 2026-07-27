@@ -2474,6 +2474,15 @@ pub(crate) fn register_mockito_debugging_intrinsics(registry: &mut NativeMethodR
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;)Z",
         native_mockito_mock_method_advice_is_overridden,
     );
+    // The two *selector* overrides below forced Mockito onto its fallback
+    // `Location` / `MemberAccessor` implementations on every run — a silent
+    // divergence from HotSpot (which picks `LocationImpl` and
+    // `InstrumentationMemberAccessor`) that cost every Mockito diagnostic its
+    // call site. They are off by default now; see
+    // `cratonvm_types::flags::mockito_legacy_selectors`.
+    if !cratonvm_types::flags::mockito_legacy_selectors() {
+        return;
+    }
     registry.register(
         MOCKITO_LOCATION_FACTORY,
         "create",

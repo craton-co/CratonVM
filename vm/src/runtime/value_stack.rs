@@ -29,7 +29,7 @@ static DIAG_INIT: std::sync::Once = std::sync::Once::new();
 #[inline(always)]
 fn stack_diag_enabled() -> bool {
     DIAG_INIT.call_once(|| {
-        if std::env::var("CRATONVM_DEBUG_STACK_TAG").ok().as_deref() == Some("1") {
+        if cratonvm_types::flags::runtime_var("CRATONVM_DEBUG_STACK_TAG").ok().as_deref() == Some("1") {
             DIAG_ENABLED.store(true, Ordering::Relaxed);
         }
     });
@@ -184,7 +184,7 @@ const KIND_DOUBLE: u8 = 2;
 fn longroot_strict() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_LONGROOT_STRICT").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_LONGROOT_STRICT").is_some())
 }
 
 /// Cached `CRATONVM_LONGREWRITE_LOOSE` escape hatch: restore the pre-registry
@@ -195,7 +195,7 @@ fn longroot_strict() -> bool {
 fn longrewrite_loose() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_LONGREWRITE_LOOSE").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_LONGREWRITE_LOOSE").is_some())
 }
 
 /// Cached `CRATONVM_DBG_LONGROOT` gate: log every rooting the O1 hybrid
@@ -204,7 +204,7 @@ fn longrewrite_loose() -> bool {
 fn longroot_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_LONGROOT").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LONGROOT").is_some())
 }
 
 #[derive(Debug)]

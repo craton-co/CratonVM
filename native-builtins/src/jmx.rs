@@ -4797,6 +4797,8 @@ fn track_created_mbean_server(ctx: &mut dyn NativeContext, server: ObjectRef) ->
 
 #[cfg(test)]
 mod jmx_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
 

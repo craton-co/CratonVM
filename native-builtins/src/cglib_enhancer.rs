@@ -4779,6 +4779,8 @@ pub fn register_cglib_enhancer(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod fb_ref_bytecode_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// Structural regression guard for `emit_bean_override`'s `fb_ref`

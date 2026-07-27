@@ -116,6 +116,165 @@ fn loaded_classes_probe(
         .map(|(_, &id)| id)
 }
 
+/// Resolve an already-defined class through one requesting loader's reachable
+/// namespaces. Built-in loaders are strictly parent-first and never delegate
+/// down to a child. A user loader may prefer its own definition when its Java
+/// `loadClass` policy is known to be child-first; otherwise its simplified
+/// parent is the complete built-in chain.
+#[inline]
+fn loaded_class_for_requesting_loader(
+    map: &LoadedClassesMap,
+    requesting_loader: ClassLoaderId,
+    name: &str,
+    user_own_first: bool,
+) -> Option<ClassId> {
+    match requesting_loader {
+        ClassLoaderId::Bootstrap | ClassLoaderId::Extension | ClassLoaderId::Application => {
+            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                if let Some(id) = loaded_classes_probe(map, *loader_id, name) {
+                    return Some(id);
+                }
+                if *loader_id == requesting_loader {
+                    break;
+                }
+            }
+            None
+        }
+        ClassLoaderId::UserDefined(_) => {
+            if user_own_first {
+                if let Some(id) = loaded_classes_probe(map, requesting_loader, name) {
+                    return Some(id);
+                }
+            }
+            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                if let Some(id) = loaded_classes_probe(map, *loader_id, name) {
+                    return Some(id);
+                }
+            }
+            if user_own_first {
+                None
+            } else {
+                loaded_classes_probe(map, requesting_loader, name)
+            }
+        }
+    }
+}
+
+/// Return a class only when exactly one loader has defined `name`.
+///
+/// This is the fail-closed operation for genuinely context-free diagnostic or
+/// metadata paths. It must never be used where an initiating class/loader is
+/// available: ambiguity is information loss, not permission to choose the
+/// first map entry.
+#[inline]
+fn unique_loaded_class(map: &LoadedClassesMap, name: &str) -> Option<ClassId> {
+    let mut found = None;
+    for ((_, stored_name), &id) in map {
+        if stored_name.as_ref() != name {
+            continue;
+        }
+        if found.is_some_and(|prior| prior != id) {
+            return None;
+        }
+        found = Some(id);
+    }
+    found
+}
+
+#[cfg(test)]
+mod loader_lookup_tests {
+    use super::*;
+
+    fn definitions(entries: &[(ClassLoaderId, &str, u32)]) -> LoadedClassesMap {
+        entries
+            .iter()
+            .map(|(loader, name, id)| ((*loader, Arc::<str>::from(*name)), ClassId::new(*id)))
+            .collect()
+    }
+
+    #[test]
+    fn built_in_lookup_is_parent_first_and_never_delegates_down() {
+        let all = definitions(&[
+            (ClassLoaderId::Bootstrap, "p/X", 1),
+            (ClassLoaderId::Extension, "p/X", 2),
+            (ClassLoaderId::Application, "p/X", 3),
+        ]);
+        assert_eq!(
+            loaded_class_for_requesting_loader(
+                &all,
+                ClassLoaderId::Application,
+                "p/X",
+                true
+            ),
+            Some(ClassId::new(1))
+        );
+        assert_eq!(
+            loaded_class_for_requesting_loader(
+                &all,
+                ClassLoaderId::Extension,
+                "p/X",
+                true
+            ),
+            Some(ClassId::new(1))
+        );
+
+        let app_only = definitions(&[(ClassLoaderId::Application, "p/Y", 4)]);
+        assert_eq!(
+            loaded_class_for_requesting_loader(
+                &app_only,
+                ClassLoaderId::Bootstrap,
+                "p/Y",
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            loaded_class_for_requesting_loader(
+                &app_only,
+                ClassLoaderId::Extension,
+                "p/Y",
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn user_lookup_never_scans_an_unrelated_user_namespace() {
+        let first = ClassLoaderId::UserDefined(11);
+        let second = ClassLoaderId::UserDefined(12);
+        let map = definitions(&[
+            (ClassLoaderId::Application, "p/X", 1),
+            (first, "p/X", 2),
+            (second, "p/Y", 3),
+        ]);
+        assert_eq!(
+            loaded_class_for_requesting_loader(&map, first, "p/X", true),
+            Some(ClassId::new(2))
+        );
+        assert_eq!(
+            loaded_class_for_requesting_loader(&map, first, "p/X", false),
+            Some(ClassId::new(1))
+        );
+        assert_eq!(
+            loaded_class_for_requesting_loader(&map, first, "p/Y", true),
+            None
+        );
+    }
+
+    #[test]
+    fn context_free_lookup_fails_closed_on_loader_ambiguity() {
+        let map = definitions(&[
+            (ClassLoaderId::Application, "p/X", 1),
+            (ClassLoaderId::UserDefined(11), "p/X", 2),
+            (ClassLoaderId::UserDefined(12), "p/Y", 3),
+        ]);
+        assert_eq!(unique_loaded_class(&map, "p/X"), None);
+        assert_eq!(unique_loaded_class(&map, "p/Y"), Some(ClassId::new(3)));
+        assert_eq!(unique_loaded_class(&map, "p/Z"), None);
+    }
+}
+
 /// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON) — **the single
 /// source of truth**. `vm::runtime::env_cache::loader_aware_resolution` and
 /// the `native-builtins::classloader::loader_aware_resolution` twin both now
@@ -279,84 +438,13 @@ impl<'a> ClassStoreHierarchy<'a> {
         // probe the bucket using a custom equality closure — no `Arc<str>`
         // is allocated unless we are about to insert.
         if let Some(req) = self.requesting_loader {
-            // Build the requesting loader's resolution order: by the JVM
-            // parent-delegation model, a name is sought in the parents
-            // first, then in the loader itself.
-            //
-            //   * Bootstrap / Extension / Application — the prefix of
-            //     BUILTIN_LOADER_DELEGATION_CHAIN up to and including the
-            //     requesting loader (parents-first, then self).
-            //   * UserDefined(_) — delegate to the full built-in chain
-            //     (its parent in our simplified hierarchy is the
-            //     application loader), then probe the user loader itself.
-            //
-            // The FIRST loader in that order that has defined `name` is the
-            // class this reference resolves to — exactly the loader-faithful
-            // answer, with no ambiguity from same-named classes defined by
-            // unrelated loaders further down the global map.
-            //
-            // Round 9 audit fix (HIGH #6): the built-in prefix is taken
-            // from the canonical `BUILTIN_LOADER_DELEGATION_CHAIN` constant
-            // rather than re-inlining (Bootstrap, Extension, Application);
-            // adding a new built-in loader only requires editing that
-            // constant in `loaders.rs`.
-            match req {
-                ClassLoaderId::Bootstrap
-                | ClassLoaderId::Extension
-                | ClassLoaderId::Application => {
-                    for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-                        if let Some(id) =
-                            loaded_classes_probe(self.loaded_classes, *loader_id, name)
-                        {
-                            return Some(id);
-                        }
-                        // Stop once we have probed the requesting loader
-                        // itself: a builtin loader never delegates *down* to
-                        // its children, so classes a child (e.g. the app
-                        // loader) defined must not satisfy a parent's
-                        // reference.
-                        if *loader_id == req {
-                            break;
-                        }
-                    }
-                }
-                ClassLoaderId::UserDefined(_) => {
-                    // Loader-faithful gate: an *overriding* user loader (one that
-                    // redefines `loadClass` to define its OWN per-loader copy of a
-                    // name instead of delegating — e.g. Hibernate's package-scoped
-                    // `EnhancingClassLoader`) is the JVMS §5.4.3 initiating loader
-                    // for references in the classes it defines, so its own copy
-                    // wins over a same-named parent copy. `define_class_with_options`
-                    // already links such a class's superclass to the loader's own
-                    // enhanced copy (`resolve_supertype`); the verifier's hierarchy
-                    // lookup MUST agree, otherwise an enhanced subclass's
-                    // `invokespecial <super>.<init>` is rejected (the
-                    // `uninitializedThis` owner — the loader's enhanced `Person` —
-                    // would not match a parents-first un-enhanced `Person`,
-                    // failing `is_subclass` → spurious VerifyError, define returns
-                    // null, JDK `postDefineClass` NPEs). So probe the user loader's
-                    // OWN definitions FIRST when the gate is on. A loader that does
-                    // NOT define its own copy simply misses here and falls through
-                    // to the built-in chain — same answer as before; gate-off keeps
-                    // the legacy parents-first order → byte-identical.
-                    if loader_aware_resolution() {
-                        if let Some(id) = loaded_classes_probe(self.loaded_classes, req, name) {
-                            return Some(id);
-                        }
-                    }
-                    // Parents first (the entire built-in chain) …
-                    for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-                        if let Some(id) =
-                            loaded_classes_probe(self.loaded_classes, *loader_id, name)
-                        {
-                            return Some(id);
-                        }
-                    }
-                    // … then the user-defined loader's own definitions.
-                    if let Some(id) = loaded_classes_probe(self.loaded_classes, req, name) {
-                        return Some(id);
-                    }
-                }
+            if let Some(id) = loaded_class_for_requesting_loader(
+                self.loaded_classes,
+                req,
+                name,
+                loader_aware_resolution(),
+            ) {
+                return Some(id);
             }
             // Not found along the requesting loader's delegation path. Per
             // the loader-faithful model this reference is unresolved here
@@ -2184,6 +2272,82 @@ impl ClassManager {
         )
     }
 
+    /// The `InnerClasses` entry a synthetic stub should carry, derived from its
+    /// binary name.
+    ///
+    /// A synthetic stub is minted from a name alone — there is no class file to
+    /// read an `InnerClasses` attribute from — so every JDK member class
+    /// modelled as a stub reported the TOP-LEVEL answer to the whole reflection
+    /// family that consults that attribute. `java.util.Map$Entry` had simple
+    /// name `"Map$Entry"` (not `"Entry"`), canonical name
+    /// `"java.util.Map$Entry"` (not `"java.util.Map.Entry"`), a null
+    /// `getDeclaringClass()`/`getEnclosingClass()`, and `isMemberClass() ==
+    /// false`. Same for `java.util.HashMap$Node`,
+    /// `java.util.Collections$UnmodifiableList`, and every other stubbed
+    /// nested class.
+    ///
+    /// Synthesize the entry javac would have emitted, but ONLY for the
+    /// unambiguous member-class shape `Outer$Member`, where `Member` is a Java
+    /// identifier not starting with a digit. Everything else keeps the honest
+    /// top-level answer:
+    ///
+    ///   * a leading digit marks an anonymous (`Outer$1`) or local
+    ///     (`Outer$1Loc`) class, whose real entry javac writes with a zeroed
+    ///     `outer_class_info_index` (and, for anonymous, `inner_name_index`).
+    ///     That is not reconstructible from the name, and guessing "member"
+    ///     would be worse than reporting top-level.
+    ///   * `$$` is the generated-proxy convention (Spring CGLIB
+    ///     `$$SpringCGLIB$$`, ByteBuddy, EasyMock `$$$EasyMock$`, and lambda
+    ///     hidden classes `Host$$Lambda/0x…`). Those are genuine TOP-LEVEL
+    ///     classes whose literal binary name happens to contain `$`, and
+    ///     `lang_class::simple_class_name` deliberately does not split them —
+    ///     see the EasyMock `isAClassMock` note there.
+    ///   * `com/sun/proxy/$Proxy0` has nothing before the `$` in its last
+    ///     segment, so it is top-level too.
+    ///
+    /// The entry's `access_flags` are the stub's own
+    /// ([`synthetic_stub_access_flags`]) rather than a guess. That keeps
+    /// `Class.getModifiers()` — which prefers the `InnerClasses` flags over the
+    /// class's own for a nested class (JVMS §4.7.6) — returning exactly what it
+    /// did before this entry existed. In particular no `ACC_STATIC` is
+    /// invented: whether a nested class is static is not derivable from its
+    /// name (`HashMap$Node` is static, `HashMap$KeyIterator` is not).
+    fn synthetic_inner_classes(name: &str) -> Vec<InnerClassEntry> {
+        // Arrays have no InnerClasses attribute; `$$` is the generated-proxy
+        // convention, never a javac nested class.
+        if name.starts_with('[') || name.contains("$$") {
+            return Vec::new();
+        }
+        let Some(split) = name.rfind('$') else {
+            return Vec::new();
+        };
+        let (outer_class, inner_name) = (&name[..split], &name[split + 1..]);
+        // `Outer` must actually name something: reject `$Foo` and
+        // `com/sun/proxy/$Proxy0`, where the `$` opens the last name segment.
+        if outer_class.is_empty() || outer_class.ends_with('/') {
+            return Vec::new();
+        }
+        // `Member` must be a Java identifier that does not start with a digit.
+        // (Splitting on the LAST `$` means it cannot itself contain one.)
+        let mut chars = inner_name.chars();
+        let is_member_name = match chars.next() {
+            Some(first) => {
+                (first.is_alphabetic() || first == '_')
+                    && chars.all(|c| c.is_alphanumeric() || c == '_')
+            }
+            None => false,
+        };
+        if !is_member_name {
+            return Vec::new();
+        }
+        vec![InnerClassEntry {
+            inner_class: name.to_string(),
+            outer_class: outer_class.to_string(),
+            inner_name: inner_name.to_string(),
+            access_flags: Self::synthetic_stub_access_flags(name),
+        }]
+    }
+
     /// Register a minimal synthetic class with the given name and field count.
     ///
     /// If a class with this name is already loaded, returns its existing
@@ -2377,7 +2541,7 @@ impl ClassManager {
             nest_members: Vec::new(),
             record_components: Vec::new(),
             permitted_subclasses: Vec::new(),
-            inner_classes: Vec::new(),
+            inner_classes: Self::synthetic_inner_classes(name),
             enclosing_method: None,
             hidden: false,
             module_name: None,
@@ -3498,7 +3662,39 @@ impl ClassManager {
                     return Ok(id);
                 }
             }
-            this.load_class(internal)
+            match this.load_class(internal) {
+                Err(VmError::Linkage(LinkageError::IncompatibleClassChangeError { message }))
+                    if message.contains("already defined by") =>
+                {
+                    // Benign concurrent-definition race: this recursive
+                    // supertype/interface resolution (superclass or
+                    // interfaces of the class currently being defined) lost
+                    // a race against ANOTHER thread that independently
+                    // defined the exact same (loader, name) pair in the
+                    // meantime -- e.g. a background thread pool eagerly
+                    // resolving a class (Spring Boot's
+                    // OnClassCondition$ThreadedOutcomesResolver, or a
+                    // Reactor Schedulers worker touching
+                    // reactor/core/scheduler/NonBlocking) while the main
+                    // thread recursively links a DIFFERENT class that also
+                    // implements/extends it. Unlike a genuine duplicate
+                    // `defineClass` call from application code, this path
+                    // has no loader-level lock protecting it (that
+                    // protection -- see native-builtins's
+                    // `url_classloader_define_locks` -- only covers the
+                    // top-level `URLClassLoader.findClass` entry point, not
+                    // this internal recursive resolution). Prefer the
+                    // winner's already-registered copy instead of failing
+                    // this class's own definition outright.
+                    match loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
+                        Some(id) => Ok(id),
+                        None => Err(VmError::Linkage(
+                            LinkageError::IncompatibleClassChangeError { message },
+                        )),
+                    }
+                }
+                other => other,
+            }
         };
         let superclass_id = match class_file.super_class {
             Some(ref super_name) => match resolve_supertype(self, &**super_name) {
@@ -4306,7 +4502,7 @@ impl ClassManager {
                 .access_flags
                 .contains(cratonvm_reader::class_access_flags::MethodAccessFlags::ABSTRACT);
             let is_native = method.is_native();
-            let num_params_u16 = cratonvm_jit::count_param_slots(&method.descriptor) as u16;
+            let num_params_u16 = cratonvm_jit_api::count_param_slots(&method.descriptor) as u16;
             let dispatch: Option<VtableMethodSnapshot> = if is_abstract {
                 None
             } else if let Some(code_attr) = method.code() {
@@ -4538,6 +4734,14 @@ impl ClassManager {
             .find_resource(name)
             .or_else(|| self.extension.class_path().find_resource(name))
             .or_else(|| self.application.class_path().find_resource(name))
+    }
+
+    /// Test only the application classpath for a resource, without reading or
+    /// inflating it. This deliberately excludes bootstrap and extension
+    /// modules so an identically named JDK resource cannot enable an
+    /// application compatibility pack.
+    pub fn application_contains_resource(&self, name: &str) -> bool {
+        self.application.class_path().contains_resource(name)
     }
 
     /// Return a URL string for every classpath entry that contains a resource
@@ -5841,10 +6045,9 @@ impl ClassManager {
 
     /// Loader-aware class lookup — JVMS §5.3/§5.4.3 delegation semantics
     /// keyed on `(requesting_loader, name)` identity rather than on `name`
-    /// alone. Checks `requesting_loader`'s own namespace first (the classes
-    /// it has itself defined), then walks
-    /// [`BUILTIN_LOADER_DELEGATION_CHAIN`] (Bootstrap → Extension →
-    /// Application) up to the bootstrap loader.
+    /// alone. Built-in loaders use strict parent-first delegation and never
+    /// search a child namespace. User-defined loaders prefer their own exact
+    /// definition, then the simplified built-in parent chain.
     ///
     /// This is the sound replacement for [`Self::find_class_by_name`]:
     /// unlike that method (and unlike [`Self::find_class_by_name_in_loader`],
@@ -5890,9 +6093,13 @@ impl ClassManager {
             vec![slash, dot]
         };
 
-        // Own namespace first: classes `requesting_loader` itself defined.
         for key in &keys {
-            if let Some(id) = loaded_classes_probe(&self.loaded_classes, requesting_loader, key) {
+            if let Some(id) = loaded_class_for_requesting_loader(
+                &self.loaded_classes,
+                requesting_loader,
+                key,
+                true,
+            ) {
                 if let Some(class) = self.get_class(id) {
                     if class.hidden {
                         continue;
@@ -5901,21 +6108,60 @@ impl ClassManager {
                 return Some(id);
             }
         }
+        None
+    }
 
-        // Then the built-in delegation chain up to Bootstrap. Skip
-        // `requesting_loader` itself if it's one of the three built-ins —
-        // already probed above.
-        for key in &keys {
-            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
-                if *loader_id == requesting_loader {
-                    continue;
+    /// Resolve a loaded class through the defining loader of
+    /// `requesting_class_id`.
+    ///
+    /// This is the preferred convenience API for constant-pool, exception,
+    /// reflection and JIT metadata paths that already carry the class whose
+    /// symbolic reference is being resolved.
+    #[inline]
+    pub fn find_class_by_name_for_class(
+        &self,
+        name: &str,
+        requesting_class_id: ClassId,
+    ) -> Option<ClassId> {
+        let loader = self.get_loader_id(requesting_class_id)?;
+        self.find_class_by_name_for_loader(name, loader)
+    }
+
+    /// Resolve an exact bootstrap definition. A bootstrap lookup never
+    /// delegates down to extension, application or user namespaces.
+    pub fn find_bootstrap_class_by_name(&self, name: &str) -> Option<ClassId> {
+        let slash = if name.contains('.') && !name.contains('/') {
+            name.replace('.', "/")
+        } else {
+            name.to_string()
+        };
+        let dot = slash.replace('/', ".");
+        for key in [&slash, &dot] {
+            if let Some(id) =
+                loaded_classes_probe(&self.loaded_classes, ClassLoaderId::Bootstrap, key)
+            {
+                if self.get_class(id).is_some_and(|class| !class.hidden) {
+                    return Some(id);
                 }
-                if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, key) {
-                    if let Some(class) = self.get_class(id) {
-                        if class.hidden {
-                            continue;
-                        }
-                    }
+            }
+        }
+        None
+    }
+
+    /// Context-free lookup that succeeds only when one loader has defined the
+    /// requested name. This is safe for diagnostics and legacy metadata that
+    /// genuinely carry no initiating loader; runtime resolution should use
+    /// [`Self::find_class_by_name_for_class`] instead.
+    pub fn find_unique_class_by_name(&self, name: &str) -> Option<ClassId> {
+        let slash = if name.contains('.') && !name.contains('/') {
+            name.replace('.', "/")
+        } else {
+            name.to_string()
+        };
+        let dot = slash.replace('/', ".");
+        for key in [&slash, &dot] {
+            if let Some(id) = unique_loaded_class(&self.loaded_classes, key) {
+                if self.get_class(id).is_some_and(|class| !class.hidden) {
                     return Some(id);
                 }
             }
@@ -6187,7 +6433,7 @@ impl ClassManager {
             nest_members: Vec::new(),
             record_components: Vec::new(),
             permitted_subclasses: Vec::new(),
-            inner_classes: Vec::new(),
+            inner_classes: Self::synthetic_inner_classes(name),
             enclosing_method: None,
             hidden: false,
             module_name: None,
@@ -12491,7 +12737,7 @@ fn compute_field_layout(
 }
 
 fn field_trace_enabled() -> bool {
-    std::env::var("CRATON_FIELD_TRACE").is_ok()
+    cratonvm_types::flags::runtime_var("CRATON_FIELD_TRACE").is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -12522,6 +12768,66 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // synthetic_inner_classes — name-derived InnerClasses for synthetic stubs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn synthetic_inner_classes_derives_the_member_class_shape() {
+        let entries = ClassManager::synthetic_inner_classes("java/util/Map$Entry");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].inner_class, "java/util/Map$Entry");
+        assert_eq!(entries[0].outer_class, "java/util/Map");
+        assert_eq!(entries[0].inner_name, "Entry");
+        // The entry carries the stub's own flags, so `Class.getModifiers()` —
+        // which prefers the InnerClasses flags for a nested class — is
+        // unchanged by the entry's mere existence.
+        assert_eq!(
+            entries[0].access_flags,
+            ClassManager::synthetic_stub_access_flags("java/util/Map$Entry")
+        );
+    }
+
+    #[test]
+    fn synthetic_inner_classes_handles_deeper_nesting_and_underscores() {
+        let entries = ClassManager::synthetic_inner_classes("java/util/HashMap$Node");
+        assert_eq!(entries[0].outer_class, "java/util/HashMap");
+        assert_eq!(entries[0].inner_name, "Node");
+        // Splitting on the LAST `$` makes the immediately-enclosing class the
+        // outer one, as javac emits.
+        let entries = ClassManager::synthetic_inner_classes("a/B$C$D");
+        assert_eq!(entries[0].outer_class, "a/B$C");
+        assert_eq!(entries[0].inner_name, "D");
+        let entries = ClassManager::synthetic_inner_classes("a/B$_Impl2");
+        assert_eq!(entries[0].inner_name, "_Impl2");
+    }
+
+    #[test]
+    fn synthetic_inner_classes_declines_non_member_shapes() {
+        // Top-level: no `$` at all.
+        assert!(ClassManager::synthetic_inner_classes("java/util/HashMap").is_empty());
+        // Anonymous / local: leading digit is not reconstructible as a member.
+        assert!(ClassManager::synthetic_inner_classes("P3$1").is_empty());
+        assert!(ClassManager::synthetic_inner_classes("P3$1Local").is_empty());
+        // Generated-proxy `$$` convention (CGLIB / ByteBuddy / EasyMock /
+        // lambda hidden classes) — genuine top-level classes.
+        assert!(ClassManager::synthetic_inner_classes("P3$$Lambda/0x80000000").is_empty());
+        assert!(
+            ClassManager::synthetic_inner_classes("com/example/Foo$$SpringCGLIB$$0").is_empty()
+        );
+        assert!(ClassManager::synthetic_inner_classes(
+            "org/easymock/mocks/InitialDirContext$$$EasyMock$1"
+        )
+        .is_empty());
+        // JDK dynamic proxies: the `$` opens the last name segment.
+        assert!(ClassManager::synthetic_inner_classes("com/sun/proxy/$Proxy0").is_empty());
+        assert!(ClassManager::synthetic_inner_classes("$Foo").is_empty());
+        // Trailing `$` leaves an empty member name.
+        assert!(ClassManager::synthetic_inner_classes("a/B$").is_empty());
+        // Arrays have no InnerClasses attribute.
+        assert!(ClassManager::synthetic_inner_classes("[Ljava/util/Map$Entry;").is_empty());
     }
 
     #[test]
@@ -13713,7 +14019,7 @@ mod tests {
     fn find_jmods_dir() -> Option<std::path::PathBuf> {
         use std::path::PathBuf;
         // JAVA_HOME
-        if let Ok(val) = std::env::var("JAVA_HOME") {
+        if let Ok(val) = cratonvm_types::flags::runtime_var("JAVA_HOME") {
             let p = PathBuf::from(&val).join("jmods");
             if p.is_dir() {
                 return Some(p);

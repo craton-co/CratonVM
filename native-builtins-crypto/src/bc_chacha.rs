@@ -129,7 +129,7 @@ fn chacha_rounds(s: &mut [u32; 16], rounds: i32) {
 /// int[] input, int[] x)` — the stream-cipher block function: permute `input`
 /// and write `x[i] = state_i + input[i]`. `input` and `x` may be distinct
 /// arrays (they are, in `generateKeyStream`). Byte-identical to the bytecode.
-pub(crate) fn chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
+pub fn chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
     let mut s = [0u32; 16];
     for k in 0..16 {
         s[k] = input[k] as u32;
@@ -146,7 +146,7 @@ pub(crate) fn chacha_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
 /// `org.bouncycastle.crypto.engines.Salsa20Engine.salsaCore(int rounds,
 /// int[] input, int[] x)` - the Salsa20 stream-cipher block function.
 /// Transcribed from BC's Java source; all additions are Java int wrapping adds.
-pub(crate) fn salsa_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
+pub fn salsa_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
     let mut x00 = input[0] as u32;
     let mut x01 = input[1] as u32;
     let mut x02 = input[2] as u32;
@@ -211,7 +211,7 @@ pub(crate) fn salsa_core(rounds: i32, input: &[i32; 16], x: &mut [i32; 16]) {
     }
 }
 
-pub(crate) fn permute(rounds: i32, x: &mut [i32; 16]) {
+pub fn permute(rounds: i32, x: &mut [i32; 16]) {
     let mut s = [0u32; 16];
     for k in 0..16 {
         s[k] = x[k] as u32;
@@ -235,7 +235,7 @@ pub(crate) const SPHINCS_CHACHA_ROUNDS: i32 = 12;
 /// bytecode does around `permute`. `out` and `input` may alias — the callers
 /// pass `chacha_permute(x, x)` — so all input is consumed before any output is
 /// written. Byte-identical to the bytecode (`Pack` little-endian == LE bytes).
-pub(crate) fn chacha_permute_bytes(out: &mut [u8; 64], input: &[u8; 64]) {
+pub fn chacha_permute_bytes(out: &mut [u8; 64], input: &[u8; 64]) {
     let mut s = [0u32; 16];
     for k in 0..16 {
         s[k] = u32::from_le_bytes([
@@ -256,7 +256,7 @@ pub(crate) const SPHINCS_HASHC: [u8; 32] = *b"expand 32-byte to 64-byte state!";
 
 /// `HashFunctions.hash_n_n`: `out = chacha_permute(in32 || hashc)[0..32]`.
 /// (The SPHINCS one-block hash; `HASH_BYTES == 32`.)
-pub(crate) fn sphincs_hash_n_n(in32: &[u8; 32]) -> [u8; 32] {
+pub fn sphincs_hash_n_n(in32: &[u8; 32]) -> [u8; 32] {
     let mut x = [0u8; 64];
     x[..32].copy_from_slice(in32);
     x[32..].copy_from_slice(&SPHINCS_HASHC);
@@ -270,7 +270,7 @@ pub(crate) fn sphincs_hash_n_n(in32: &[u8; 32]) -> [u8; 32] {
 /// `HashFunctions.hash_2n_n`: two-block compression `in64 -> out32`.
 /// `x = in[0..32] || hashc; permute(x); x[0..32] ^= in[32..64]; permute(x);
 ///  out = x[0..32]`.
-pub(crate) fn sphincs_hash_2n_n(in64: &[u8; 64]) -> [u8; 32] {
+pub fn sphincs_hash_2n_n(in64: &[u8; 64]) -> [u8; 32] {
     let mut x = [0u8; 64];
     x[..32].copy_from_slice(&in64[..32]);
     x[32..].copy_from_slice(&SPHINCS_HASHC);
@@ -288,6 +288,8 @@ pub(crate) fn sphincs_hash_2n_n(in64: &[u8; 64]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// RFC 8439 §2.3.2 ChaCha20 block-function known-answer test. The input

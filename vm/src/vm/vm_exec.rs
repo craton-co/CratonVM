@@ -20,7 +20,8 @@ use crate::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeErro
 use crate::memory::heap::{ArrayElementType, ObjectKind};
 use crate::native::io::FileDescriptorTable;
 use crate::native::registry::{
-    FieldMetadata, MethodMetadata, NativeContext, NativeThreadBlocker, StackTraceEntry,
+    FieldMetadata, MethodMetadata, NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess,
+    NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess, NativeThreadBlocker, StackTraceEntry,
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
@@ -136,7 +137,7 @@ fn debug_log_thread_mirror_identity(shared: &SharedVm, thread_id: u64, obj: Obje
 fn thread_start_handoff_grace() -> std::time::Duration {
     static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *GRACE.get_or_init(|| {
-        let millis = std::env::var("CRATONVM_THREAD_START_GRACE_MS")
+        let millis = cratonvm_types::flags::runtime_var("CRATONVM_THREAD_START_GRACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
@@ -545,7 +546,7 @@ fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
         .classes
         .class_manager
         .read()
-        .find_class_by_name("java/lang/Object")?;
+        .find_bootstrap_class_by_name("java/lang/Object")?;
     let _ = OBJECT_CLASS_ID.set(resolved); // races are harmless; loser just re-resolves next time
     Some(resolved)
 }
@@ -624,12 +625,12 @@ fn recover_stale_lambda_receiver_from_native_pins(
 fn youngscan_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNGSCAN").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_YOUNGSCAN").is_some())
 }
 
 /// Cached `CRATONVM_DBG_BLOCKGC` gate — blocked-GC/pin canaries on the
 /// native-call funnel and the pin/unpin paths. PERF (perf/halfgap-20260717):
-/// the uncached `std::env::var_os` probes of this flag ran on EVERY native
+/// the uncached `cratonvm_types::flags::runtime_var_os` probes of this flag ran on EVERY native
 /// call (the PIN-UNDERFLOW guard) and on pin-table operations; `getenv`
 /// linear-scans `environ`, and the probes measured ~7% of a HashMapOnly-4M
 /// run. Same read-once semantics every other debug flag in this codebase
@@ -639,7 +640,7 @@ fn youngscan_enabled() -> bool {
 fn blockgc_dbg() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some())
 }
 
 /// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
@@ -656,7 +657,7 @@ thread_local! {
 fn youngscan_straystack_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some())
+    *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STRAYSTACK").is_some())
 }
 
 /// Throttle stride for the whole-young scan (every Nth native). Default 1.
@@ -665,7 +666,7 @@ fn youngscan_stride() -> u64 {
     use std::sync::OnceLock;
     static S: OnceLock<u64> = OnceLock::new();
     *S.get_or_init(|| {
-        std::env::var("CRATONVM_YOUNGSCAN_STRIDE")
+        cratonvm_types::flags::runtime_var("CRATONVM_YOUNGSCAN_STRIDE")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&v| v > 0)
@@ -799,7 +800,10 @@ fn safe_native_call_impl(
     // (millions of calls). Keep both scratch buffers inline for the small-
     // arity case; longer slices (e.g. Set.of during Surefire bootstrap)
     // fall back to the original heap buffers with identical behavior.
-    const INLINE_NATIVE_ARGS: usize = 4;
+    // Eight covers receiver + the full register-argument envelope of both
+    // supported x64 ABIs and avoids heap scratch for common constructor and
+    // reflection bridges with 5-7 Java arguments.
+    const INLINE_NATIVE_ARGS: usize = crate::jit::helpers::INLINE_JIT_NATIVE_ARGS;
     let mut inline_forwarded = [Value::Object(None); INLINE_NATIVE_ARGS];
     let mut heap_forwarded: Vec<Value>;
     let forwarded_args: &mut [Value] = if args.len() <= INLINE_NATIVE_ARGS {
@@ -1966,7 +1970,7 @@ fn cold_log_overlay_corruption(
         // map then runs real bytecode and works. Flagging these drowns the
         // genuinely-broken overlays. Set CRATONVM_DBG_OVERLAY_ALL=1 to see
         // them too.
-        if std::env::var_os("CRATONVM_DBG_OVERLAY_ALL").is_none() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OVERLAY_ALL").is_none() {
             if let Some(map_id) = cm.get_loaded_class_id("java/util/Map") {
                 if cm.is_subclass_of(class_id, map_id) {
                     return;
@@ -2280,7 +2284,7 @@ impl<'a> NativeContextImpl<'a> {
         let trace =
             crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
         drop(cm);
-        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STTRACE").is_some() {
             eprintln!(
                 "STTRACE_DBG_CAP frames={} depth={}",
                 self.thread.frames.len(),
@@ -2736,7 +2740,7 @@ impl<'a> NativeContextImpl<'a> {
         );
         if !fixup.is_empty() {
             // BUG-03 trace (gated): record that the blocked-wake remap ran for main.
-            if self.thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
+            if self.thread.thread_id.0 == 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
                 let jto = self
                     .thread
                     .java_thread_obj
@@ -3061,7 +3065,10 @@ impl<'a> NativeContextImpl<'a> {
     /// the inner class is absent).
     pub(crate) fn build_thread_field_holder(&mut self) -> Option<ObjectRef> {
         let holder_class =
-            <Self as NativeContext>::ensure_class_initialized(self, "java/lang/Thread$FieldHolder")
+            <Self as NativeClassAccess>::ensure_class_initialized(
+                self,
+                "java/lang/Thread$FieldHolder",
+            )
                 .ok()?;
         let holder_num_fields = {
             let cm = self.shared.classes.class_manager.read();
@@ -3287,7 +3294,7 @@ impl<'a> NativeContextImpl<'a> {
         };
 
         let tg_class =
-            <Self as NativeContext>::ensure_class_initialized(self, "java/lang/ThreadGroup")
+            <Self as NativeClassAccess>::ensure_class_initialized(self, "java/lang/ThreadGroup")
                 .ok()?;
         let tg_num_fields = {
             let cm = self.shared.classes.class_manager.read();
@@ -3574,7 +3581,7 @@ thread_local! {
 
 fn unpin_ring_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_UNPIN_RING").is_some())
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNPIN_RING").is_some())
 }
 
 struct VmNativeThreadBlocker {
@@ -3780,36 +3787,2523 @@ fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectR
             .all(|(&byte, unit)| byte == unit[0] && unit[1] == 0)
 }
 
-impl<'a> NativeContext for NativeContextImpl<'a> {
-    // See the `NativeContext::refresh_root_snapshot` doc comment
-    // (native-api/src/registry.rs) for the full rationale — this closes the
-    // "pinned a long-lived batch, then drove long re-entrant/JIT-heavy
-    // execution without ever blocking or self-initiating GC" gap by reusing
-    // the existing blocking-path deposit mechanism without actually
-    // blocking.
-    fn refresh_root_snapshot(&mut self) {
-        // cceres3 ROOT FIX (WildFly boot CCE long tail): this is a
-        // NON-blocking republish — the caller (the native-collections stream
-        // drain loops) keeps executing Java right after it. The old
-        // `deposit_root_snapshot()` call was the raise=true variant: it set
-        // `in_blocked_region` and nothing ever consumed it, so the identity
-        // census EXCLUDED the running thread from every subsequent STW pause
-        // (moving collections completed under its feet), its
-        // `gc_block_state.fixup` accumulated unconsumed (observed live:
-        // fixup_pending=44 across four raise=true deposits while running 43
-        // frames deep in infinispan/management-model stream work), and every
-        // frame ref it held or stored went stale — the poisoned-island
-        // producer behind the WFLYCTL0079 / "Object cannot be cast to X"
-        // family. The no-flag variant republishes pins/snapshot without
-        // touching the flag — exactly what a still-running thread needs.
-        self.deposit_root_snapshot_no_flag();
-    }
+impl<'a> NativeClassAccess for NativeContextImpl<'a> {
+
 
     fn load_class(&mut self, name: &str) -> MethodCallResult {
         let class_id = self.shared.load_class_concurrent(name)?;
         let mirror = super::get_or_create_class_mirror(self.shared, class_id);
         Ok(Some(Value::Object(Some(mirror))))
     }
+
+    fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.name.to_string())
+    }
+
+    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
+        self.shared.mem.heap.class_id_of(obj)
+    }
+
+    fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
+        match self.shared.load_class_concurrent(class_name) {
+            Ok(class_id) => self
+                .shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .is_some_and(|c| c.is_synthetic_stub),
+            Err(_) => false,
+        }
+    }
+
+    fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
+        use cratonvm_types::ClassLoaderId;
+        let cm = self.shared.classes.class_manager.read();
+        match cm.get_loader_id(class_id) {
+            Some(ClassLoaderId::Bootstrap) => 0,
+            Some(ClassLoaderId::Extension) => 1,
+            Some(ClassLoaderId::Application) => 2,
+            Some(ClassLoaderId::UserDefined(id)) => id as i32,
+            None => 2, // default to app loader
+        }
+    }
+
+    fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        let class_id = match cm.get_loaded_class_id(class_name) {
+            Some(id) => id,
+            None => return false,
+        };
+        // Walk the class hierarchy looking for the method
+        let mut current = Some(class_id);
+        while let Some(cid) = current {
+            if let Some(class) = cm.class_store.get(cid) {
+                if class.find_method(method_name, descriptor).is_some() {
+                    return true;
+                }
+                // Also check if it's a synthetic stub (native-only class) вЂ” methods
+                // are registered in the native registry, not in the class file
+                if class.is_synthetic_stub {
+                    return true; // assume native methods exist
+                }
+                current = class.superclass;
+            } else {
+                break;
+            }
+        }
+        // Also check native method registry
+        self.shared
+            .natives
+            .native_methods
+            .find(class_name, method_name, descriptor)
+            .is_some()
+    }
+
+    fn class_declares_method(&self, class_id: ClassId, name: &str, descriptor: &str) -> bool {
+        // Declared-only check: inspect this exact class, NOT its superclasses.
+        //
+        // Exclude compiler-generated bridge methods (ACC_BRIDGE, 0x0040).
+        // A bridge is not a genuine override in the OOP sense CratonVM's
+        // callers care about ("does this class provide its OWN real
+        // implementation") -- it is javac's forwarding stub for visibility
+        // (e.g. `StringBuilder.substring(int)` forwarding to its
+        // package-private superclass `AbstractStringBuilder`'s real
+        // implementation) or covariant-return erasure. Counting it as a
+        // "declared override" broke
+        // `native_mockito_mock_method_advice_is_overridden`'s ancestor walk:
+        // for a Mockito inline mock of `StringBuilder`, it saw
+        // `StringBuilder`'s bridge `substring(int)` between the mock's own
+        // class and `AbstractStringBuilder` (the reflected Method's real
+        // declaring class) and concluded "overridden -- do not intercept
+        // here", silently skipping Mockito's advice and returning the real
+        // (empty-buffer) computation instead of the stubbed answer. Real
+        // JDK reflection call sites never see bridges as "the" declared
+        // method for this kind of check (ByteBuddy's own `MethodGraph`
+        // merges a bridge into its bridged target), so excluding them here
+        // matches that semantics. The other two callers (constructor checks,
+        // a `ClassLoader.findResources` override probe) are unaffected:
+        // constructors can never be bridges, and `findResources`'s fixed,
+        // non-generic signature is never bridge-erased in practice.
+        let cm = self.shared.classes.class_manager.read();
+        match cm.class_store.get(class_id) {
+            Some(class) => class
+                .find_method(name, descriptor)
+                .is_some_and(|m| !m.is_bridge()),
+            None => false,
+        }
+    }
+
+    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
+        let class_id = self.shared.load_class_concurrent(name)?;
+        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+        Ok(class_id)
+    }
+
+    fn ensure_class_initialized_with_class_id(
+        &mut self,
+        class_id: ClassId,
+    ) -> Result<(), MethodCallFailed> {
+        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)
+    }
+
+    fn register_lambda_proxy(
+        &mut self,
+        functional_interface: &str,
+        sam_method_name: &str,
+        sam_descriptor: &str,
+        impl_class: &str,
+        impl_member: &str,
+        impl_descriptor: &str,
+        impl_ref_kind: u8,
+        instantiated_descriptor: &str,
+        capture_types: &str,
+    ) -> u32 {
+        use crate::classloading::resolution::{LambdaCallSite, MethodHandle};
+        use std::sync::Arc;
+
+        // Reflective `LambdaMetafactory` (e.g. log4j2's `ServiceLoaderUtil`)
+        // builds the same lambda metadata the `invokedynamic` opcode would —
+        // route it through the identical `lambda_proxies` table so the
+        // interpreter's SAM dispatch handles instances uniformly.
+        let kind =
+            MethodHandleKind::from_tag(impl_ref_kind).unwrap_or(MethodHandleKind::InvokeStatic);
+        let proxy_class_id = self.shared.alloc_lambda_proxy_id();
+        let call_site = LambdaCallSite {
+            functional_interface_id: None,
+            functional_interface: Arc::from(functional_interface),
+            sam_method_name: Arc::from(sam_method_name),
+            sam_descriptor: Arc::from(sam_descriptor),
+            impl_handle: MethodHandle {
+                kind,
+                class_name: Arc::from(impl_class),
+                member_name: Arc::from(impl_member),
+                descriptor: Arc::from(impl_descriptor),
+            },
+            instantiated_descriptor: Arc::from(instantiated_descriptor),
+            capture_types: capture_types.chars().collect(),
+            proxy_class_id,
+        };
+        let mut proxies = self.shared.classes.lambda_proxies.write();
+        if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
+            proxies.insert(proxy_class_id, call_site);
+            proxy_class_id.as_u32()
+        } else {
+            0
+        }
+    }
+
+    fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| cs.functional_interface.to_string())
+    }
+
+    fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| {
+                (
+                    cs.sam_method_name.to_string(),
+                    cs.sam_descriptor.to_string(),
+                    cs.instantiated_descriptor.to_string(),
+                )
+            })
+    }
+
+    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
+        // Prefer the recorded *defining* class (where the lambda / method-ref's
+        // invokedynamic appears) — this is what HotSpot names the proxy after and
+        // reports as the nest host, even for a cross-class method reference whose
+        // implementation method lives in a different class.
+        if let Some(host_id) = self
+            .shared
+            .classes
+            .lambda_proxy_hosts
+            .read()
+            .get(&class_id)
+            .copied()
+        {
+            if let Some(name) = self
+                .shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(host_id)
+                .map(|c| c.name.to_string())
+            {
+                return Some(name);
+            }
+        }
+        // Fallback (lambda proxies created off the indy bootstrap path, e.g. in
+        // tests): the implementation method handle's owner — correct for genuine
+        // lambdas and same-class method references.
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| cs.impl_handle.class_name.to_string())
+    }
+
+    fn lambda_proxy_serial_metadata(
+        &self,
+        class_id: ClassId,
+    ) -> Option<cratonvm_native_api::LambdaSerialMetadata> {
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| cratonvm_native_api::LambdaSerialMetadata {
+                functional_interface: cs.functional_interface.to_string(),
+                sam_method_name: cs.sam_method_name.to_string(),
+                sam_descriptor: cs.sam_descriptor.to_string(),
+                impl_class: cs.impl_handle.class_name.to_string(),
+                impl_member: cs.impl_handle.member_name.to_string(),
+                impl_descriptor: cs.impl_handle.descriptor.to_string(),
+                impl_ref_kind: cs.impl_handle.kind.as_tag(),
+                instantiated_descriptor: cs.instantiated_descriptor.to_string(),
+                capture_types: cs.capture_types.iter().collect(),
+            })
+    }
+
+    fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
+        if self
+            .shared
+            .classes
+            .class_manager
+            .read()
+            .is_subclass_of(child, parent)
+        {
+            return true;
+        }
+        // Synthetic lambda proxy ClassIds (>= 0x8000_0000) are not in the
+        // class manager, so `is_subclass_of` always reports false. Reflection
+        // callers like CGLIB's `CallbackInfo.determineType` then conclude that
+        // the lambda doesn't implement its functional interface and throw
+        // `IllegalStateException("Unknown callback type ...")`. Route through
+        // `lambda_proxy_satisfies` so reflective `isAssignableFrom`,
+        // `isInstance`, and friends agree with the interpreter's
+        // checkcast/instanceof view.
+        if child.as_u32() >= 0x8000_0000 {
+            return crate::runtime::interpreter::lambda_proxy_satisfies_public(
+                self.shared,
+                child,
+                parent,
+            );
+        }
+        false
+    }
+
+    fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .and_then(|c| c.superclass)
+    }
+
+    fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_unique_class_by_name(name)
+    }
+
+    fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_class_by_name_for_class(name, near)
+    }
+
+    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .resolve_fast_path_class_id(name)
+    }
+
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        crate::runtime::interpreter::resolve_class_loader_aware(
+            self.shared,
+            self.thread,
+            referencing_class_id,
+            name,
+        )
+    }
+
+    fn is_record_class(&self, class_id: ClassId) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.is_record())
+            .unwrap_or(false)
+    }
+
+    fn record_components(&self, class_id: ClassId) -> Vec<(String, String)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| {
+                c.record_components
+                    .iter()
+                    .map(|rc| (rc.name.clone(), rc.descriptor.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_sealed_class(&self, class_id: ClassId) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.is_sealed())
+            .unwrap_or(false)
+    }
+
+    fn permitted_subclasses(&self, class_id: ClassId) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.permitted_subclasses.clone())
+            .unwrap_or_default()
+    }
+
+    // -- T13: java/lang/Class metadata methods --
+
+    fn class_file_version(&self, class_id: ClassId) -> u16 {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.version.major)
+            .unwrap_or(65)
+    }
+
+    fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| {
+                c.inner_classes
+                    .iter()
+                    .map(|ic| {
+                        (
+                            ic.inner_class.clone(),
+                            ic.outer_class.clone(),
+                            ic.inner_name.clone(),
+                            ic.access_flags,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn enclosing_method(&self, class_id: ClassId) -> Option<(String, String, String)> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .and_then(|c| {
+                c.enclosing_method.as_ref().map(|em| {
+                    (
+                        em.class_name.clone(),
+                        em.method_name.clone(),
+                        em.method_descriptor.clone(),
+                    )
+                })
+            })
+    }
+
+    fn declaring_class(&self, class_id: ClassId) -> Option<ClassId> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        let this_name = &class.name;
+        // Find the InnerClasses entry where inner_class == this class
+        for ic in &class.inner_classes {
+            if ic.inner_class.as_str() == &**this_name
+                && !ic.outer_class.is_empty()
+                && !ic.inner_name.is_empty()
+            {
+                // Resolve outer class name to ClassId
+                return cm.find_class_by_name_for_class(&ic.outer_class, class_id);
+            }
+        }
+        None
+    }
+
+    fn nest_host_name(&self, class_id: ClassId) -> Option<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .and_then(|c| c.nest_host.clone())
+    }
+
+    fn nest_member_names(&self, class_id: ClassId) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.nest_members.clone())
+            .unwrap_or_default()
+    }
+
+    fn class_num_total_fields(&self, class_id: ClassId) -> usize {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.num_total_fields)
+            .unwrap_or(0)
+    }
+
+    fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
+        let cm = self.shared.classes.class_manager.read();
+        let Some(class) = cm.get_class(class_id) else {
+            return Vec::new();
+        };
+        let mut static_idx = 0usize;
+        let mut instance_idx = 0usize;
+        class
+            .fields
+            .iter()
+            .map(|f| {
+                let slot = if f.is_static() {
+                    let idx = static_idx;
+                    static_idx += 1;
+                    idx
+                } else {
+                    let idx = class.first_field_index + instance_idx;
+                    instance_idx += 1;
+                    idx
+                };
+                FieldMetadata {
+                    name: f.name.to_string(),
+                    descriptor: f.descriptor.to_string(),
+                    access_flags: f.access_flags.bits(),
+                    slot_index: slot,
+                    declaring_class_id: class_id,
+                    is_static: f.is_static(),
+                }
+            })
+            .collect()
+    }
+
+    fn declared_methods(&self, class_id: ClassId) -> Vec<MethodMetadata> {
+        let cm = self.shared.classes.class_manager.read();
+        let Some(class) = cm.get_class(class_id) else {
+            return Vec::new();
+        };
+        class
+            .methods
+            .iter()
+            .map(|m| {
+                // WP2.5 v3 — populate `exceptions` from the JVMS §4.7.5
+                // `Exceptions` attribute when present. Used by the proxy
+                // generator to thread the declared throws set into
+                // `<clinit>` so the dispatch helper's UTE wrap can match
+                // thrown exceptions against the method's declared set.
+                let exceptions: Vec<String> = m
+                    .attributes
+                    .iter()
+                    .find_map(|a| match a.as_decoded() {
+                        Some(cratonvm_reader::attribute::Attribute::Exceptions {
+                            exception_indices,
+                        }) => Some(
+                            exception_indices
+                                .iter()
+                                .filter_map(|idx| {
+                                    class.constant_pool.get_class_name(*idx).map(str::to_string)
+                                })
+                                .collect::<Vec<String>>(),
+                        ),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                MethodMetadata {
+                    name: m.name.to_string(),
+                    descriptor: m.descriptor.to_string(),
+                    access_flags: m.access_flags.bits(),
+                    declaring_class_id: class_id,
+                    exceptions,
+                }
+            })
+            .collect()
+    }
+
+    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
+        let cm = self.shared.classes.class_manager.read();
+        cm.get_class(class_id)
+            .map(|c| c.interfaces.clone())
+            .unwrap_or_default()
+    }
+
+    fn class_access_flags(&self, class_id: ClassId) -> u16 {
+        let cm = self.shared.classes.class_manager.read();
+        cm.get_class(class_id)
+            .map(|c| c.access_flags.bits())
+            .unwrap_or(0)
+    }
+
+    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
+        super::get_or_create_primitive_mirror(self.shared, name)
+    }
+
+    fn class_annotations(&self, class_id: ClassId) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let mut result = Vec::new();
+        for ann in &class.annotations {
+            if let Some(data) = convert_annotation(ann, &class.constant_pool) {
+                result.push(data);
+            }
+        }
+        result
+    }
+
+    fn method_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_annotations_from_attributes(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn field_annotations(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for f in &class.fields {
+            if &*f.name == field_name {
+                return extract_annotations_from_attributes(&f.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn class_signature(&self, class_id: ClassId) -> Option<String> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        class.signature.clone()
+    }
+
+    fn method_signature(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Option<String> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                for attr in &m.attributes {
+                    if let Some(cratonvm_reader::attribute::Attribute::Signature(s)) =
+                        attr.as_decoded()
+                    {
+                        // `s: &Arc<str>` (round 4 reader). Caller wants
+                        // an owned `String`; materialise once.
+                        return Some(s.to_string());
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    fn method_parameters(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<(String, u16)> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                for attr in &m.attributes {
+                    if let Some(cratonvm_reader::attribute::Attribute::MethodParameters(params)) =
+                        attr.as_decoded()
+                    {
+                        // JVMS 4.7.24: name_index == 0 means an anonymous /
+                        // synthetic parameter вЂ” surface it as an empty
+                        // string so the caller can fall back to "argN".
+                        return params
+                            .iter()
+                            .map(|p| {
+                                let name = if p.name_index == 0 {
+                                    String::new()
+                                } else {
+                                    class
+                                        .constant_pool
+                                        .get_utf8(p.name_index)
+                                        .unwrap_or("")
+                                        .to_string()
+                                };
+                                (name, p.access_flags)
+                            })
+                            .collect();
+                    }
+                }
+                return Vec::new();
+            }
+        }
+        Vec::new()
+    }
+
+    fn field_signature(&self, class_id: ClassId, field_name: &str) -> Option<String> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        for f in &class.fields {
+            if &*f.name == field_name {
+                for attr in &f.attributes {
+                    if let Some(cratonvm_reader::attribute::Attribute::Signature(s)) =
+                        attr.as_decoded()
+                    {
+                        // `s: &Arc<str>` (round 4 reader). Caller wants
+                        // an owned `String`; materialise once.
+                        return Some(s.to_string());
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    fn method_parameter_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_parameter_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn method_return_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_return_type_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn method_return_type_argument_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_return_type_argument_annotations(
+                    &m.attributes,
+                    &class.constant_pool,
+                );
+            }
+        }
+        Vec::new()
+    }
+
+    fn method_parameter_type_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_parameter_type_annotations(&m.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn field_type_annotations(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Vec<crate::native::registry::AnnotationData> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for f in &class.fields {
+            if &*f.name == field_name {
+                return extract_field_type_annotations(&f.attributes, &class.constant_pool);
+            }
+        }
+        Vec::new()
+    }
+
+    fn field_type_argument_annotations(
+        &self,
+        class_id: ClassId,
+        field_name: &str,
+    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for f in &class.fields {
+            if &*f.name == field_name {
+                return extract_field_type_argument_annotations(
+                    &f.attributes,
+                    &class.constant_pool,
+                );
+            }
+        }
+        Vec::new()
+    }
+
+    fn method_parameter_type_argument_annotations(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                return extract_parameter_type_argument_annotations(
+                    &m.attributes,
+                    &class.constant_pool,
+                );
+            }
+        }
+        Vec::new()
+    }
+
+    /// `Class.getAnnotatedSuperclass()` / `Class.getAnnotatedInterfaces()`
+    /// (and their `getAnnotatedActualTypeArguments()` chains) — see
+    /// `extract_class_extends_type_annotations` for why this re-parses the
+    /// cached original bytes rather than reading from `Class`.
+    fn class_extends_type_annotations(
+        &self,
+        class_id: ClassId,
+        supertype_index: u16,
+    ) -> crate::native::registry::TypeArgAnnotations {
+        let bytes = {
+            let cm = self.shared.classes.class_manager.read();
+            match cm.class_bytes_cache.get(&class_id) {
+                Some(b) => b.clone(),
+                None => return Default::default(),
+            }
+        };
+        extract_class_extends_type_annotations(&bytes, supertype_index)
+    }
+
+    fn method_annotation_default(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Option<crate::native::registry::AnnotationElementValue> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return None,
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                for attr in &m.attributes {
+                    if let Some(cratonvm_reader::attribute::Attribute::AnnotationDefault(ev)) =
+                        attr.as_decoded()
+                    {
+                        return convert_element_value(ev, &class.constant_pool);
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    fn method_exceptions(
+        &self,
+        class_id: ClassId,
+        method_name: &str,
+        method_desc: &str,
+    ) -> Vec<String> {
+        let cm = self.shared.classes.class_manager.read();
+        let class = match cm.get_class(class_id) {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        for m in &class.methods {
+            if &*m.name == method_name && &*m.descriptor == method_desc {
+                for attr in &m.attributes {
+                    if let Some(cratonvm_reader::attribute::Attribute::Exceptions {
+                        exception_indices,
+                    }) = attr.as_decoded()
+                    {
+                        return exception_indices
+                            .iter()
+                            .filter_map(|idx| {
+                                class
+                                    .constant_pool
+                                    .get_class_name(*idx)
+                                    .map(|s| s.to_string())
+                            })
+                            .collect();
+                    }
+                }
+                return Vec::new();
+            }
+        }
+        Vec::new()
+    }
+
+    fn module_name_of_class(&self, class_id: ClassId) -> Option<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .and_then(|c| c.module_name.clone())
+    }
+
+    fn reads_module(&self, reader: &str, provider: &str) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        if cm.module_registry.is_empty() {
+            return true;
+        }
+        cm.module_registry.reads(reader, provider)
+    }
+
+    fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        if cm.module_registry.is_empty() {
+            return true;
+        }
+        cm.module_registry
+            .is_package_exported_unqualified(module_name, pkg)
+    }
+
+    fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        if cm.module_registry.is_empty() {
+            return true;
+        }
+        cm.module_registry
+            .is_package_exported_to(module_name, pkg, to_module)
+    }
+
+    fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        if cm.module_registry.is_empty() {
+            return true;
+        }
+        cm.module_registry
+            .is_package_open_unqualified(module_name, pkg)
+    }
+
+    fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        if cm.module_registry.is_empty() {
+            return true;
+        }
+        cm.module_registry
+            .is_package_open_to(module_name, pkg, to_module)
+    }
+
+    fn module_add_reads(&mut self, reader: &str, provider: &str) {
+        self.shared
+            .classes
+            .class_manager
+            .write()
+            .module_registry
+            .add_reads(reader, provider);
+    }
+
+    fn module_add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
+        self.shared
+            .classes
+            .class_manager
+            .write()
+            .module_registry
+            .add_exports(module_name, pkg, target);
+    }
+
+    fn module_add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
+        self.shared
+            .classes
+            .class_manager
+            .write()
+            .module_registry
+            .add_opens(module_name, pkg, target);
+    }
+
+    fn module_packages(&self, module_name: &str) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .packages_of(module_name)
+    }
+
+    fn module_uses(&self, module_name: &str) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .map(|d| d.uses.clone())
+            .unwrap_or_default()
+    }
+
+    fn module_is_open(&self, module_name: &str) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .get(module_name)
+            .is_some_and(|d| d.is_open)
+    }
+
+    fn all_module_names(&self) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .module_names()
+    }
+
+    fn module_for_package(&self, pkg: &str) -> Option<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .module_for_package(pkg)
+            .map(|s| s.to_string())
+    }
+
+    fn set_class_hidden(&mut self, class_id: ClassId) {
+        let mut cm = self.shared.classes.class_manager_write();
+        if let Some(class) = cm.get_class_mut(class_id) {
+            class.hidden = true;
+        }
+    }
+
+    fn is_class_hidden(&self, class_id: ClassId) -> bool {
+        let cm = self.shared.classes.class_manager.read();
+        cm.get_class(class_id)
+            .map(|c| c.is_hidden())
+            .unwrap_or(false)
+    }
+
+    fn copy_nest_info(&mut self, source_class: ClassId, target_class: ClassId) {
+        // NEW-8: hidden classes created with the NESTMATE ClassOption
+        // inherit the lookup class's nest host and nest members. We copy
+        // the relevant fields onto the target so that member access
+        // checks see the hidden class as a legitimate nestmate.
+        let mut cm = self.shared.classes.class_manager_write();
+        // Grab the nest info from the source class first (release the
+        // immutable borrow before we take a mutable one).
+        let (nest_host, nest_members) = match cm.get_class(source_class) {
+            Some(src) => {
+                // If source is itself a nest member, it has a nest_host
+                // pointing at the host. If it IS the host (or has no
+                // nest info), use source's own name so the hidden class
+                // becomes a member of source's nest.
+                let host = src
+                    .nest_host
+                    .clone()
+                    .unwrap_or_else(|| src.name.to_string());
+                (host, src.nest_members.clone())
+            }
+            None => return,
+        };
+        if let Some(target) = cm.get_class_mut(target_class) {
+            target.nest_host = Some(nest_host);
+            target.nest_members = nest_members;
+        }
+    }
+
+    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
+        // NEW-8: force the class's <clinit> to run now. The interpreter's
+        // `ensure_class_initialized_shared` handles thread-safe init and
+        // skips classes that are already initialized.
+        //
+        // HIB-CV-26 fix (2026-07-16): pass the result straight through
+        // instead of collapsing it into a `String`. `<clinit>` failures
+        // already come back from `ensure_class_initialized_shared` with
+        // the correct two-layer identity: a Java exception raised by a
+        // static initializer is already wrapped as a catchable
+        // `ExceptionInInitializerError`/`NoClassDefFoundError`
+        // (`MethodCallFailed::ExceptionThrown`) per JVMS §5.5, and only a
+        // genuine VM bug is `MethodCallFailed::InternalError`. Flattening
+        // both into a string here (as the old code did) forced every
+        // caller of `initialize_class` — including `Class.forName` — to
+        // re-wrap ordinary `<clinit>` exceptions as an unrecoverable
+        // `VmError::Internal`, aborting the whole VM instead of letting
+        // Java code catch them.
+        crate::vm::vm_util::ensure_class_initialized_shared(&self.shared, self.thread, class_id)
+    }
+
+    fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .module_registry
+            .service_providers(service_class)
+    }
+
+    fn check_deep_reflection_access(
+        &self,
+        accessor_class_id: ClassId,
+        target_class_id: ClassId,
+    ) -> Result<(), String> {
+        let cm = self.shared.classes.class_manager.read();
+        // No modules registered в†’ classpath-only mode, allow.
+        if cm.module_registry.is_empty() {
+            return Ok(());
+        }
+        let accessor = match cm.get_class(accessor_class_id) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let target = match cm.get_class(target_class_id) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let accessor_mod = accessor
+            .module_name
+            .as_deref()
+            .unwrap_or(crate::classloading::module::UNNAMED_MODULE);
+        let target_mod = target
+            .module_name
+            .as_deref()
+            .unwrap_or(crate::classloading::module::UNNAMED_MODULE);
+        let target_pkg = crate::classloading::module::package_of(&target.name);
+        cm.module_registry
+            .check_deep_reflection_access(accessor_mod, target_mod, target_pkg)
+    }
+
+    fn find_resource(&self, name: &str) -> Option<Vec<u8>> {
+        self.shared.classes.class_manager.read().find_resource(name)
+    }
+
+    fn class_bytes(&self, class_id: ClassId) -> Option<Vec<u8>> {
+        let cm = self.shared.classes.class_manager.read();
+        cm.class_bytes_cache
+            .get(&class_id)
+            .map(|bytes| bytes.to_vec())
+    }
+
+    fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_all_resource_urls(name)
+    }
+
+    fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_all_resource_bytes(name)
+    }
+
+    fn find_class_source_path(&self, class_name: &str) -> Option<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_class_source_path(class_name)
+    }
+
+    fn class_code_base(&self, class_id: ClassId) -> Option<String> {
+        let cm = self.shared.classes.class_manager.read();
+        let cls = cm.class_store.get(class_id)?;
+        cls.code_source.as_ref()?.url.clone()
+    }
+
+    fn class_code_source_cert_digests(&self, class_id: ClassId) -> Vec<String> {
+        let cm = self.shared.classes.class_manager.read();
+        match cm.class_store.get(class_id) {
+            Some(cls) => cls
+                .code_source
+                .as_ref()
+                .map(|cs| cs.certificate_sha256.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
+        let cm = self.shared.classes.class_manager.read();
+        match cm.class_store.get(class_id) {
+            Some(cls) => cls
+                .code_source
+                .as_ref()
+                .map(|cs| cs.certificates.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
+    fn class_id_from_mirror(&self, mirror: ObjectRef) -> Option<ClassId> {
+        super::class_id_from_mirror(self.shared, mirror)
+    }
+
+    fn list_application_class_names(&self) -> Vec<String> {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .list_application_class_names()
+    }
+
+    fn register_dynamic_classpath(&mut self, paths: &[String]) {
+        self.shared
+            .classes
+            .class_manager
+            .write()
+            .extend_application_classpath(paths);
+    }
+
+    fn register_bootstrap_classpath(&mut self, paths: &[String]) {
+        self.shared
+            .classes
+            .class_manager
+            .write()
+            .extend_bootstrap_classpath(paths);
+    }
+
+    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
+        use cratonvm_types::ClassLoaderId;
+        let mut cm = self.shared.classes.class_manager_write();
+        match cm.define_class(name, bytes, ClassLoaderId::Application) {
+            Ok(cid) => {
+                // Release the ClassManager write lock before calling
+                // `invalidate_jit_for_class` (which takes a read lock on
+                // the same manager).
+                drop(cm);
+                // Invalidate JIT-compiled methods that inlined from this class (Session 31)
+                let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
+                if evicted > 0 {
+                    tracing::debug!(
+                        "JIT: invalidated {evicted} method(s) due to class reload: {name}"
+                    );
+                }
+                // T5.4.4 вЂ” additionally consult the InvalidationManager's
+                // LeafClass/class_dependencies entries.
+                let cha_evicted = self.shared.invalidate_jit_for_class(name);
+                if cha_evicted > 0 {
+                    tracing::debug!(
+                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
+                    );
+                }
+                Some(cid)
+            }
+            Err(e) => {
+                tracing::debug!("defineClass failed for {name}: {e:?}");
+                None
+            }
+        }
+    }
+
+    fn define_hidden_class_from_bytes(
+        &mut self,
+        stored_name: &str,
+        bytes: &[u8],
+    ) -> Result<ClassId, String> {
+        use cratonvm_classloading::DefineClassOptions;
+        use cratonvm_types::ClassLoaderId;
+        let mut cm = self.shared.classes.class_manager_write();
+        let options = DefineClassOptions {
+            override_name: Some(stored_name.to_string()),
+            hidden: true,
+            ..Default::default()
+        };
+        match cm.define_class_with_options(stored_name, bytes, ClassLoaderId::Application, options)
+        {
+            Ok(cid) => {
+                // Hidden classes cannot be inlined from (they may be
+                // unloaded independently), but we still invalidate the
+                // JIT cache defensively.
+                let evicted = self
+                    .shared
+                    .jit
+                    .jit_cache
+                    .write()
+                    .invalidate_for_class(stored_name);
+                if evicted > 0 {
+                    tracing::debug!(
+                        "JIT: invalidated {evicted} method(s) due to hidden class define: {stored_name}"
+                    );
+                }
+                Ok(cid)
+            }
+            Err(e) => Err(format!("{e:?}")),
+        }
+    }
+
+    fn define_class_with_loader(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        loader_id: u32,
+    ) -> Option<ClassId> {
+        use cratonvm_types::ClassLoaderId;
+        let mut cm = self.shared.classes.class_manager_write();
+        match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
+            Ok(cid) => {
+                drop(cm);
+                let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
+                if evicted > 0 {
+                    tracing::debug!(
+                        "JIT: invalidated {evicted} method(s) due to class reload: {name}"
+                    );
+                }
+                // T5.4.4 вЂ” CHA-listener invalidation
+                let cha_evicted = self.shared.invalidate_jit_for_class(name);
+                if cha_evicted > 0 {
+                    tracing::debug!(
+                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
+                    );
+                }
+                Some(cid)
+            }
+            Err(e) => {
+                tracing::debug!("defineClass (loader {loader_id}) failed for {name}: {e:?}");
+                None
+            }
+        }
+    }
+
+    fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
+        use cratonvm_types::ClassLoaderId;
+        let cm = self.shared.classes.class_manager.read();
+        cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
+    }
+
+    fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
+        use cratonvm_types::ClassLoaderId;
+        let cm = self.shared.classes.class_manager.read();
+        cm.class_defined_by_loader_exact(name, ClassLoaderId::UserDefined(loader_id))
+    }
+
+    fn define_class_full(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        loader_id: u32,
+        opts: cratonvm_native_api::DefineClassFull,
+    ) -> Result<ClassId, String> {
+        // WP2.3: single backend for all four entry points
+        // (Unsafe.defineClass, jdk.internal.misc.Unsafe.defineClass,
+        // MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2).
+        use cratonvm_classloading::{CodeSource, DefineClassOptions};
+        use cratonvm_types::ClassLoaderId;
+        let cl_id = if loader_id == 0 {
+            ClassLoaderId::Application
+        } else {
+            ClassLoaderId::UserDefined(loader_id)
+        };
+        let code_source =
+            if opts.code_source_url.is_none() && opts.code_source_certificates.is_empty() {
+                None
+            } else {
+                Some(CodeSource::new(
+                    opts.code_source_url.clone(),
+                    opts.code_source_certificates.clone(),
+                ))
+            };
+        let define_opts = DefineClassOptions {
+            override_name: opts.override_name.clone(),
+            hidden: opts.hidden,
+            skip_verification: opts.skip_verification,
+            code_source,
+            allow_redefine: opts.allow_redefine,
+            nest_host_class_name: opts.nest_host_class_name.clone(),
+            privileged_define: opts.privileged_define,
+            force_loader_faithful_linking: opts.force_loader_faithful_linking,
+            ..Default::default()
+        };
+
+        let cid = {
+            let mut cm = self.shared.classes.class_manager_write();
+            cm.define_class_with_options(name, bytes, cl_id, define_opts)
+                .map_err(|e| format!("{e:?}"))?
+        };
+
+        // Invalidate JIT for any class with the same name (handles redefine).
+        let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
+        if evicted > 0 {
+            tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
+        }
+        let cha_evicted = self.shared.invalidate_jit_for_class(name);
+        if cha_evicted > 0 {
+            tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
+        }
+
+        if opts.initialize {
+            // Best-effort init; failures bubble back as Err.
+            if let Err(e) = self.initialize_class(cid) {
+                return Err(format!("initialize after define failed for {name}: {e}"));
+            }
+        }
+        Ok(cid)
+    }
+
+    fn redefine_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
+        // WP2.4-F1 вЂ” JEP 109 redefine path: route to
+        // `class_manager::redefine_class` (Agent 2.4-B) which performs
+        // the in-place method-body swap, refreshes the vtable, bumps
+        // the per-class `redefine_generations` counter, and fires the
+        // JIT invalidate hook. Earlier versions of this binding called
+        // `define_class_with_options(allow_redefine: true)`, which
+        // minted a fresh ClassId for the redefined class and left the
+        // ORIGINAL ClassId's `Class.methods` table untouched вЂ” so the
+        // already-loaded `Target` instance kept dispatching to the
+        // pre-transform bytecode and the per-thread invoke cache
+        // (keyed on the original ClassId) never observed a generation
+        // bump.  The route below makes the in-place swap semantics
+        // observable end-to-end.
+        self.redefine_class_with(class_id, new_bytes, false)
+    }
+
+    /// `Instrumentation.retransformClasses` path. Same in-place swap as
+    /// `redefine_class`, but preserves the class's ORIGINAL cached bytes so the
+    /// NEXT retransform re-runs the transformer chain from the original rather
+    /// than the already-woven bytes (otherwise `mockStatic(X)` followed by
+    /// `mock(X)` double-instruments X and the instance mock fails).
+    fn retransform_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
+        self.redefine_class_with(class_id, new_bytes, true)
+    }
+
+    fn list_loaded_class_ids(&self) -> Vec<ClassId> {
+        let cm = self.shared.classes.class_manager.read();
+        cm.class_store.iter().map(|c| c.id).collect()
+    }
+
+    fn list_initiated_class_ids(&self, loader_id: u32) -> Vec<ClassId> {
+        use cratonvm_types::ClassLoaderId;
+        let cl_id = if loader_id == 0 {
+            ClassLoaderId::Application
+        } else {
+            ClassLoaderId::UserDefined(loader_id)
+        };
+        let cm = self.shared.classes.class_manager.read();
+        cm.class_store
+            .iter()
+            .filter(|c| c.loader_id == cl_id)
+            .map(|c| c.id)
+            .collect()
+    }
+
+    fn allocate_loader_id(&mut self) -> u32 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // User-defined loader namespace ids MUST start at 3: the `ClassLoaderId`
+        // i32 encoding (see `loader_id_of_class` / `define_class_full`) reserves
+        // 0=Bootstrap, 1=Extension, 2=Application. Starting the counter at 1
+        // handed the first two user loaders ids 1 and 2, which alias
+        // `UserDefined(1)`↔Extension and `UserDefined(2)`↔Application — so a
+        // user-loader namespace was indistinguishable from a built-in one. That
+        // broke loader-faithful resolution for bytecode-enhanced Hibernate
+        // entities: the `EnhancingClassLoader` got namespace 2, its enhanced
+        // entity was stored as `UserDefined(2)`, and `inherit_lookup_loader`'s
+        // `raw < 3` guard then re-homed the ByteBuddy instantiator into the
+        // Application namespace, so `new Country` resolved the *un-enhanced* copy
+        // → `ClassCastException`/`PersistentAttributeInterceptable`. Starting at 3
+        // guarantees every allocated namespace is a genuine `UserDefined` id.
+        static NEXT_LOADER_ID: AtomicU32 = AtomicU32::new(3);
+        NEXT_LOADER_ID.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
+
+
+    fn invoke(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        invoke_shared(
+            self.shared,
+            self.thread,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
+    fn invoke_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        _class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        invoke_by_class_id_shared(
+            self.shared,
+            self.thread,
+            class_id,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
+    fn invoke_special(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // WP2.9 -- invokespecial semantics: invoke the *resolved* method on
+        // `class_name` with no virtual dispatch and no iface/abstract retarget
+        // to the receiver's concrete class. Required for `Lookup.findSpecial`
+        // private-to-private calls and default-method super-call patterns.
+        invoke_special_shared(
+            self.shared,
+            self.thread,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
+    fn invoke_special_by_class_id(
+        &mut self,
+        class_id: ClassId,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Same primitive the JIT's invokespecial resolution uses
+        // (`invoke_special_shared_on_class`) - reused here for reflective
+        // `Method.invoke` dispatch of private / cross-package package-private
+        // instance methods, which has the identical loader-identity
+        // requirement. See the trait method's doc comment.
+        invoke_special_shared_on_class(
+            self.shared,
+            self.thread,
+            class_id,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
+    fn invoke_special_bytecode_only(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        invoke_special_bytecode_only_shared(
+            self.shared,
+            self.thread,
+            class_name,
+            method_name,
+            descriptor,
+            args,
+        )
+    }
+
+    // -- LinkResolver wiring (round-9 HIGH #7) -------------------------
+    //
+    // Probe / insert into the per-VM `LinkResolver` cache for Java-side
+    // reflection natives. Mirrors the JNI `GetMethodID` / `GetFieldID`
+    // wiring (round-8 CRIT #2) so Spring / Hibernate / ByteBuddy
+    // identical-triple probes through `Class.getDeclaredMethod` etc.
+    // hit the same cache as their JNI counterparts.
+
+    fn link_resolver_get_method(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<(ClassId, u32)> {
+        use cratonvm_classloading::resolution::ResolvedMember;
+        match self
+            .shared
+            .classes
+            .link_resolver
+            .get(class_id, name, descriptor)?
+        {
+            ResolvedMember::Method {
+                declaring_class_id,
+                index,
+            } => Some((declaring_class_id, index)),
+            // A cached `NotFound` is a legitimate hit — return `None` so
+            // the caller short-circuits without re-walking the hierarchy.
+            // The caller distinguishes "cache cold miss" from "cache hit:
+            // not found" by checking `link_resolver_get_method` once and
+            // proceeding to the metadata walk only if `None` came back
+            // (the walk re-confirms NotFound and re-inserts; the cost is
+            // a single redundant cold-miss walk in the rare case the
+            // class genuinely lacks the member).
+            ResolvedMember::NotFound => None,
+            // Method probe matched a Field entry — should never happen
+            // for properly-keyed lookups but degrade safely.
+            ResolvedMember::Field { .. } => None,
+        }
+    }
+
+    fn link_resolver_insert_method(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+        declaring: ClassId,
+        index: u32,
+    ) {
+        use cratonvm_classloading::resolution::ResolvedMember;
+        self.shared.classes.link_resolver.insert(
+            class_id,
+            cratonvm_types::intern_arc(name),
+            cratonvm_types::intern_arc(descriptor),
+            ResolvedMember::Method {
+                declaring_class_id: declaring,
+                index,
+            },
+        );
+    }
+
+    fn link_resolver_get_field(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+    ) -> Option<(ClassId, u32, bool)> {
+        use cratonvm_classloading::resolution::ResolvedMember;
+        match self
+            .shared
+            .classes
+            .link_resolver
+            .get(class_id, name, descriptor)?
+        {
+            ResolvedMember::Field {
+                declaring_class_id,
+                absolute_index,
+                is_static,
+            } => Some((declaring_class_id, absolute_index, is_static)),
+            ResolvedMember::NotFound => None,
+            ResolvedMember::Method { .. } => None,
+        }
+    }
+
+    fn link_resolver_insert_field(
+        &self,
+        class_id: ClassId,
+        name: &str,
+        descriptor: &str,
+        declaring: ClassId,
+        absolute_index: u32,
+        is_static: bool,
+    ) {
+        use cratonvm_classloading::resolution::ResolvedMember;
+        self.shared.classes.link_resolver.insert(
+            class_id,
+            cratonvm_types::intern_arc(name),
+            cratonvm_types::intern_arc(descriptor),
+            ResolvedMember::Field {
+                declaring_class_id: declaring,
+                absolute_index,
+                is_static,
+            },
+        );
+    }
+
+    fn invoke_virtual(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let mut receiver = self.shared.mem.heap.load_and_forward(receiver);
+        let mut receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
+        if let Some(recovered) = recover_stale_lambda_receiver_from_native_pins(
+            self.shared,
+            &*self.thread,
+            receiver_class_id,
+            method_name,
+            descriptor,
+            args,
+        ) {
+            receiver = recovered;
+            receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
+        }
+        // Check if the receiver is a lambda proxy.
+        let call_site = {
+            let proxies = self.shared.classes.lambda_proxies.read();
+            proxies.get(&receiver_class_id).cloned()
+        };
+        if crate::runtime::env_cache::invoke_virtual_entry_trace()
+            && method_name == "aotContributedInitializerStartsManagementContext"
+        {
+            eprintln!(
+                "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} receiver_class_id={:?} is_lambda_proxy={}",
+                method_name,
+                receiver_class_id,
+                call_site.is_some()
+            );
+        }
+
+        // Keep the receiver and arguments rooted across the dispatch decision:
+        // the selected lambda body can allocate immediately after this block.
+        let sam_compat_pin_base = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(receiver);
+        let arg_pins: Vec<Option<usize>> = args
+            .iter()
+            .map(|a| match a {
+                Value::Object(Some(o)) => {
+                    let idx = self.thread.native_pin_roots.len();
+                    self.thread.native_pin_roots.push(*o);
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .collect();
+
+        if let Some(lcs) = call_site.filter(|lcs| {
+            // A lambda only implements its exact SAM descriptor. Same-named
+            // defaults must run their bytecode, even when a null argument is
+            // assignable to both the default and SAM parameter types.
+            method_name == &*lcs.sam_method_name && descriptor == &*lcs.sam_descriptor
+        }) {
+            // Re-read receiver and args through the pins before the selected
+            // lambda body can allocate and move them.
+            receiver = self.thread.native_pin_roots[sam_compat_pin_base];
+            let refreshed_args: Vec<Value> = args
+                .iter()
+                .zip(arg_pins.iter())
+                .map(|(orig, pin)| match pin {
+                    Some(idx) => Value::Object(Some(self.thread.native_pin_roots[*idx])),
+                    None => *orig,
+                })
+                .collect();
+            self.thread.native_pin_roots.truncate(sam_compat_pin_base);
+
+            // Lambda dispatch: read captured values from proxy fields, then
+            // prepend them to the invocation args.
+            let num_captures = lcs.capture_types.len();
+            let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + refreshed_args.len());
+            for i in 0..num_captures {
+                full_args.push(self.shared.mem.heap.get_field(receiver, i));
+            }
+            full_args.extend_from_slice(&refreshed_args);
+
+            // Coerce args between SAM and impl descriptors (box/unbox
+            // primitives at the SAM boundary so impl sees matched types).
+            let sam_desc = lcs.sam_descriptor.clone();
+            let impl_desc = lcs.impl_handle.descriptor.clone();
+            let inst_desc = lcs.instantiated_descriptor.clone();
+            let (_, sam_ret) = crate::runtime::interpreter::split_method_descriptor(&sam_desc);
+            let (_, impl_ret) = crate::runtime::interpreter::split_method_descriptor(&impl_desc);
+            let receiver_present = matches!(
+                lcs.impl_handle.kind,
+                MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface
+            );
+            crate::runtime::interpreter::coerce_lambda_args(
+                self.shared,
+                self.thread,
+                &sam_desc,
+                &impl_desc,
+                &inst_desc,
+                &mut full_args,
+                receiver_present,
+                num_captures,
+            )?;
+
+            // Drive loader-faithful resolution here because this native
+            // callback can be the first reference to the implementation owner
+            // (for example a constructor method reference reached through a
+            // native Stream pipeline). A passive cache-only lookup can miss and
+            // incorrectly fall back to the application-loader copy.
+            let impl_override = crate::runtime::interpreter::lambda_impl_dispatch_override_driven(
+                self.shared,
+                self.thread,
+                &lcs,
+            );
+            // Dispatch by method handle kind.
+            let raw_result = match lcs.impl_handle.kind {
+                MethodHandleKind::InvokeStatic => {
+                    if let Some(impl_cid) = impl_override {
+                        invoke_on_class_shared_no_retarget(
+                            self.shared,
+                            self.thread,
+                            impl_cid,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    } else {
+                        self.invoke_or_native(
+                            &lcs.impl_handle.class_name,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    }
+                }
+                MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
+                    // First arg is the receiver for the target method.
+                    if full_args.is_empty() {
+                        return Err(VmError::Internal {
+                            message: "invoke_virtual: InvokeVirtual/InvokeInterface with no args"
+                                .to_string(),
+                        }
+                        .into());
+                    }
+                    // BUG-07: when the target receiver is ITSELF a lambda proxy,
+                    // the method being invoked is that proxy's own SAM (or a
+                    // method on its functional interface) and is only resolvable
+                    // through lambda-proxy dispatch. This happens with an unbound
+                    // instance method reference used as a higher-order function —
+                    // e.g. `stream.map(Supplier::get)` over a stream of `() -> x`
+                    // lambdas: the mapper's impl handle is `InvokeInterface
+                    // Supplier.get`, and each receiver is a synthetic `Supplier`
+                    // lambda proxy. `invoke_or_native` does not consult the
+                    // lambda-proxy table, so it misses the SAM and falls through
+                    // to a wrong/default result (observed: an empty ArrayList,
+                    // later mis-cast → ClassCastException). Recurse through
+                    // `invoke_virtual`, which dispatches both lambda proxies and
+                    // ordinary objects correctly.
+                    let receiver_is_lambda_proxy = match &full_args[0] {
+                        Value::Object(Some(r)) => {
+                            let rcv_id = self.shared.mem.heap.class_id_of(*r);
+                            self.shared
+                                .classes
+                                .lambda_proxies
+                                .read()
+                                .contains_key(&rcv_id)
+                        }
+                        _ => false,
+                    };
+                    if receiver_is_lambda_proxy {
+                        if let Value::Object(Some(recv)) = full_args[0] {
+                            self.invoke_virtual(
+                                recv,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args[1..],
+                            )
+                        } else {
+                            // unreachable: receiver_is_lambda_proxy implies an object
+                            Ok(None)
+                        }
+                    } else {
+                        let private_impl_class =
+                            crate::runtime::interpreter::lambda_private_impl_dispatch_class(
+                                self.shared,
+                                &lcs,
+                            );
+                        let rcv_id_opt = match &full_args[0] {
+                            Value::Object(Some(r)) => Some(self.shared.mem.heap.class_id_of(*r)),
+                            _ => None,
+                        };
+                        let target_class = match rcv_id_opt {
+                            Some(rcv_id) => self
+                                .shared
+                                .classes
+                                .class_manager
+                                .read()
+                                .get_class(rcv_id)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_else(|| lcs.impl_handle.class_name.to_string()),
+                            None => lcs.impl_handle.class_name.to_string(),
+                        };
+                        // Loader-faithful (gated): dispatch on the receiver's exact
+                        // class_id when it diverges from the by-name global copy, so a
+                        // bytecode-enhanced receiver runs its own lambda body.
+                        let vov = if crate::runtime::env_cache::loader_aware_resolution() {
+                            rcv_id_opt.filter(|rcv| {
+                                *rcv != ClassId::new(0)
+                                    && !self.shared.classes.lambda_proxies.read().contains_key(rcv)
+                                    && {
+                                        let cm = self.shared.classes.class_manager.read();
+                                        cm.get_class(*rcv)
+                                            .map(|c| &*c.name == target_class.as_str())
+                                            .unwrap_or(false)
+                                            && cm.get_loaded_class_id(&target_class) != Some(*rcv)
+                                    }
+                            })
+                        } else {
+                            None
+                        };
+                        let result = if let Some(impl_cid) = private_impl_class {
+                            invoke_on_class_shared_no_retarget(
+                                self.shared,
+                                self.thread,
+                                impl_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )
+                        } else if let Some(rcv_cid) = vov {
+                            invoke_on_class_shared(
+                                self.shared,
+                                self.thread,
+                                rcv_cid,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )
+                        } else {
+                            self.invoke_or_native(
+                                &target_class,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &full_args,
+                            )
+                        };
+                        // If the receiver's class didn't have the method, fall back
+                        // to the class specified in the lambda call site. This handles
+                        // objects with generic ClassId (e.g., stub Object) where the
+                        // lambda actually targets a specific class (e.g., PrintStream).
+                        //
+                        // CRIT (double-invoke): only retry when the NoSuchMethodError
+                        // is for THIS dispatch's own SAM method (i.e. the impl method
+                        // genuinely wasn't found on the receiver's runtime class). A
+                        // NoSuchMethodError for a DIFFERENT method means the SAM method
+                        // WAS found and ran, and the error bubbled up from a nested
+                        // call deep inside it — re-invoking here would run the
+                        // (side-effecting) method a SECOND time. That is exactly the
+                        // "InvocationInterceptors called invocation multiple times" /
+                        // NodeTestTask double-`prepare` corruption: a Hibernate
+                        // bytecode-enhanced `$$_hibernate_*` NSME thrown inside a JUnit
+                        // `TestTask::execute` lambda made `forEach` re-run `execute()`,
+                        // nulling `parentContext` on the second pass.
+                        match &result {
+                            Err(MethodCallFailed::InternalError(VmError::Linkage(
+                                LinkageError::NoSuchMethodError {
+                                    method_name,
+                                    method_descriptor,
+                                    ..
+                                },
+                            ))) if target_class.as_str() != &*lcs.impl_handle.class_name
+                                && method_name.as_str() == &*lcs.impl_handle.member_name
+                                && method_descriptor.as_str() == &*lcs.impl_handle.descriptor =>
+                            {
+                                self.invoke_or_native(
+                                    &lcs.impl_handle.class_name,
+                                    &lcs.impl_handle.member_name,
+                                    &lcs.impl_handle.descriptor,
+                                    &full_args,
+                                )
+                            }
+                            _ => result,
+                        }
+                    }
+                }
+                MethodHandleKind::InvokeSpecial => {
+                    if let Some(impl_cid) = impl_override {
+                        invoke_on_class_shared_no_retarget(
+                            self.shared,
+                            self.thread,
+                            impl_cid,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    } else {
+                        self.invoke_or_native(
+                            &lcs.impl_handle.class_name,
+                            &lcs.impl_handle.member_name,
+                            &lcs.impl_handle.descriptor,
+                            &full_args,
+                        )
+                    }
+                }
+                MethodHandleKind::NewInvokeSpecial => {
+                    let class_id = match impl_override {
+                        Some(cid) => cid,
+                        None => self
+                            .shared
+                            .classes
+                            .class_manager
+                            .write()
+                            .load_class(&lcs.impl_handle.class_name)?,
+                    };
+                    // Array-constructor reference (`SomeType[]::new`) — see the
+                    // identical check in the sibling `interpreter.rs` path for
+                    // the full rationale. `load_class` resolves an array-shaped
+                    // impl class name to its synthesized array ClassId, but the
+                    // object-allocation + `<init>` dispatch below does not apply
+                    // to arrays (no fields, no constructor) and was silently
+                    // discarding the requested length, producing a corrupted
+                    // zero-field pseudo-object that fails a later checkcast to
+                    // the real array type.
+                    let array_info = self
+                        .shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(class_id)
+                        .and_then(|c| c.array_info.clone());
+                    if let Some(array_info) = array_info {
+                        let length =
+                            full_args.first().and_then(Value::as_int).ok_or_else(|| {
+                                VmError::Internal {
+                                    message: "array-constructor-reference: missing length arg"
+                                        .to_string(),
+                                }
+                            })?;
+                        if length < 0 {
+                            Err(RuntimeError::NegativeArraySizeException { size: length }.into())
+                        } else {
+                            let length = length as usize;
+                            let arr = if array_info.array_dimension == 1 {
+                                match &*array_info.leaf_component_name {
+                                    "boolean" => self.new_array(ArrayElementType::Boolean, length),
+                                    "char" => self.new_array(ArrayElementType::Char, length),
+                                    "float" => self.new_array(ArrayElementType::Float, length),
+                                    "double" => self.new_array(ArrayElementType::Double, length),
+                                    "byte" => self.new_array(ArrayElementType::Byte, length),
+                                    "short" => self.new_array(ArrayElementType::Short, length),
+                                    "int" => self.new_array(ArrayElementType::Int, length),
+                                    "long" => self.new_array(ArrayElementType::Long, length),
+                                    _ => self.new_ref_array(array_info.component_class_id, length),
+                                }
+                            } else {
+                                self.new_ref_array(array_info.component_class_id, length)
+                            };
+                            Ok(Some(Value::Object(Some(arr))))
+                        }
+                    } else {
+                        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+                        // Use `num_total_fields` (inherited + declared instance
+                        // fields), matching the `New` opcode and the sibling
+                        // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
+                        // is wrong here: it counts this class's declared fields
+                        // *including statics* while omitting inherited instance
+                        // fields, so a subclass constructor reference (e.g. JUnit5's
+                        // `DefaultClassDescriptor::new`, whose 2 fields are all
+                        // inherited from `AbstractAnnotatedDescriptorWrapper`)
+                        // under-allocates to 0 slots and trips the GC `get_field`
+                        // bounds guard on every inherited-field access.
+                        let num_fields = self
+                            .shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(class_id)
+                            .map(|c| c.num_total_fields)
+                            .unwrap_or(0);
+                        let new_obj = match self
+                            .shared
+                            .mem
+                            .heap
+                            .try_alloc_object(class_id, num_fields)
+                        {
+                            Some(obj) => obj,
+                            None => {
+                                self.thread.tlab.retire();
+                                crate::runtime::interpreter::maybe_gc_forced_pub(
+                                    self.shared,
+                                    self.thread,
+                                );
+                                self.shared.mem.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
+                                    MethodCallFailed::InternalError(crate::error::VmError::Runtime(
+                                        crate::error::RuntimeError::OutOfMemoryError {
+                                            message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
+                                        },
+                                    ))
+                                })?
+                            }
+                        };
+                        let new_obj_pin = self.thread.native_pin_roots.len();
+                        self.thread.native_pin_roots.push(new_obj);
+                        let init_result = {
+                            let mut init_args = Vec::with_capacity(1 + full_args.len());
+                            init_args.push(Value::Object(Some(new_obj)));
+                            init_args.extend_from_slice(&full_args);
+                            invoke_on_class_shared(
+                                self.shared,
+                                self.thread,
+                                class_id,
+                                &lcs.impl_handle.member_name,
+                                &lcs.impl_handle.descriptor,
+                                &init_args,
+                            )
+                        };
+                        let forwarded = self
+                            .thread
+                            .native_pin_roots
+                            .get(new_obj_pin)
+                            .copied()
+                            .unwrap_or(new_obj);
+                        self.thread.native_pin_roots.truncate(new_obj_pin);
+                        init_result?;
+                        Ok(Some(Value::Object(Some(forwarded))))
+                    }
+                }
+                _ => {
+                    // GetField, GetStatic, PutField, PutStatic вЂ” very rare for
+                    // functional interfaces, defer with a descriptive error.
+                    Err(VmError::Internal {
+                        message: format!(
+                            "invoke_virtual: unsupported MethodHandle kind {:?} for lambda proxy",
+                            lcs.impl_handle.kind
+                        ),
+                    }
+                    .into())
+                }
+            };
+            // Coerce return value from impl's descriptor back to SAM's view.
+            let r = match raw_result {
+                Ok(result) => result,
+                Err(MethodCallFailed::InternalError(VmError::Linkage(
+                    LinkageError::NoSuchMethodError {
+                        class_name,
+                        method_name,
+                        method_descriptor,
+                    },
+                ))) => {
+                    if let Some(result) = object_serialization_hook_neutral_result(
+                        &method_name,
+                        &method_descriptor,
+                        &full_args,
+                    ) {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                            eprintln!(
+                                "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
+                                class_name, method_name, method_descriptor
+                            );
+                        }
+                        result
+                    } else {
+                        return Err(MethodCallFailed::InternalError(VmError::Linkage(
+                            LinkageError::NoSuchMethodError {
+                                class_name,
+                                method_name,
+                                method_descriptor,
+                            },
+                        )));
+                    }
+                }
+                Err(err) => return Err(err),
+            };
+            crate::runtime::interpreter::coerce_return(
+                self.shared,
+                self.thread,
+                &sam_ret,
+                &impl_ret,
+                r,
+            )
+        } else {
+            if crate::runtime::env_cache::invoke_virtual_entry_trace()
+                && method_name == "aotContributedInitializerStartsManagementContext"
+            {
+                eprintln!(
+                    "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch",
+                    method_name
+                );
+            }
+            // Not a lambda-dispatch call after all (the receiver wasn't a
+            // recognized proxy, or the `.filter()` predicate above rejected
+            // it) -- release the pins from the GC-safety block above. Refresh
+            // `receiver` through its pin in case the SAM-compatibility check
+            // ran (and triggered a GC) before the predicate rejected the
+            // match; `args` itself is not rebuilt here for the (rare, only
+            // reachable when a lambda receiver's SAM-shaped overload check
+            // fails) non-lambda fallback dispatch on a lambda-proxy receiver
+            // -- see the GC-safety comment above this block's `if`.
+            receiver = self.thread.native_pin_roots[sam_compat_pin_base];
+            self.thread.native_pin_roots.truncate(sam_compat_pin_base);
+            // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
+            // If the receiver IS a lambda proxy but calling a non-SAM method
+            // (e.g. andThen), dispatch on the functional interface class.
+            //
+            // KC26 array.clone() bug: array objects store their COMPONENT class
+            // id (e.g. `OptionCategory`) in the header — NOT the array class
+            // id. Calling `get_class(receiver_class_id).name` for an array
+            // receiver therefore returns the component class name. Routing
+            // dispatch through the component then resolves `clone()` to the
+            // *component's* override (`Enum.clone()` for enum arrays — which
+            // is the JDK's deliberate CNSE-thrower) instead of `Object.clone`
+            // (the array-cloning native). Per JVMS §4.4.1, every array class's
+            // method table is `Object`'s — short-circuit array receivers to
+            // `java/lang/Object` here, matching the parallel logic in
+            // `invoke_or_native` and `try_stackless_invoke`.
+            // `resolved_from_receiver` tracks whether `class_name` is just the
+            // receiver's own class name (the plain-object case). When it is, the
+            // final dispatch keys on `receiver_class_id` DIRECTLY rather than
+            // re-resolving the name — otherwise a class a custom loader defined
+            // (load-time weaving, webapp isolation) collapses to the same-named
+            // class some other loader registered first, so a reflective
+            // `Method.invoke` on the loader-private instance runs the wrong
+            // body (JVMS §5.3). Arrays (dispatch on Object) and lambda-proxy
+            // non-SAM calls (dispatch on the functional interface) must keep the
+            // name-based path, so the flag is false there.
+            let mut resolved_from_receiver = false;
+            let class_name =
+                if self.shared.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+                    "java/lang/Object".to_string()
+                } else {
+                    let lambda_iface = {
+                        let proxies = self.shared.classes.lambda_proxies.read();
+                        proxies
+                            .get(&receiver_class_id)
+                            .map(|lcs| lcs.functional_interface.to_string())
+                    };
+                    match lambda_iface {
+                        Some(iface) => iface,
+                        None => {
+                            let by_id = self
+                                .shared
+                                .classes
+                                .class_manager
+                                .read()
+                                .get_class(receiver_class_id)
+                                .map(|c| c.name.to_string());
+                            match by_id {
+                                Some(n) => {
+                                    resolved_from_receiver = true;
+                                    n
+                                }
+                                None => format!("<unknown class {}>", receiver_class_id),
+                            }
+                        }
+                    }
+                };
+
+            // Check for java.lang.reflect.Proxy dynamic proxy dispatch.
+            // When Java code calls any method on a Proxy$Instance object, we
+            // intercept and forward to the InvocationHandler.invoke().
+            if class_name == "java/lang/reflect/Proxy$Instance"
+                || crate::runtime::interpreter::class_chain_reaches_proxy_instance(
+                    self.shared,
+                    receiver_class_id,
+                )
+            {
+                return proxy_invoke_handler(self, receiver, method_name, descriptor, args);
+            }
+
+            // Check for annotation proxy dispatch.
+            // When Java code calls annotation.value(), annotation.path(), etc.,
+            // look up the element by method name in the proxy's stored elements.
+            if class_name == "java/lang/annotation/AnnotationProxy" {
+                let result = annotation_proxy_invoke(self, receiver, method_name, args)?;
+                // Unbox primitive-returning members so `invoke_virtual`'s
+                // contract matches bytecode methods (which yield a raw
+                // primitive Value for a primitive return descriptor). The
+                // proxy stores members as BOXED wrappers; returning them boxed
+                // makes a re-entrant caller like `Method.invoke`'s `box_value`
+                // DOUBLE-box — it stores the wrapper reference in a fresh
+                // wrapper's value slot, so a later `intValue()` reads the
+                // pointer (a positive int) instead of the real value. That is
+                // exactly how ByteBuddy's `JavaDispatcher`-driven read of
+                // `@Advice.OnMethodEnter.skipOnIndex()` (declared `default -1`)
+                // saw a bogus `>= 0` index, throwing "void is not an array
+                // type but an index for a relocation is defined" and failing
+                // Hibernate's BytecodeProvider service-load.
+                if let Some(value) = result {
+                    let ret = descriptor
+                        .rsplit(')')
+                        .next()
+                        .unwrap_or("L")
+                        .chars()
+                        .next()
+                        .unwrap_or('L');
+                    let unboxed = match ret {
+                        'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
+                            if let Value::Object(Some(obj)) = value {
+                                self.shared.mem.heap.get_field(obj, 0)
+                            } else {
+                                value
+                            }
+                        }
+                        _ => value,
+                    };
+                    return Ok(Some(unboxed));
+                }
+                return Ok(None);
+            }
+
+            // `Class.forName(name, ..., loader)` invokes `loadClass(String)`
+            // through this NativeContext path.  For a subclass that merely
+            // inherits ClassLoader's implementation, virtual resolution must
+            // execute CratonVM's base ClassLoader native (which performs
+            // parent-first delegation and loader-local lookup), not the
+            // real-JDK bytecode/global-resolution fallback. Preserve genuine
+            // subclass overrides by checking the method's actual declarer.
+            //
+            // Spring's `DynamicClassLoader` is such an inheriting subclass;
+            // its generated classes deliberately live in the forked parent.
+            // The normal receiver resolver can retain the inherited JDK body
+            // before the base native gate sees it, collapsing this lookup to
+            // the global same-named class. Route this known inheriting loader
+            // directly through the base native to preserve parent-first
+            // fork-loader identity.
+            if method_name == "loadClass"
+                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
+                && class_name == "org/springframework/core/test/tools/DynamicClassLoader"
+            {
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(Value::Object(Some(receiver)));
+                full_args.extend_from_slice(args);
+                return self.invoke_or_native(
+                    "java/lang/ClassLoader",
+                    method_name,
+                    descriptor,
+                    &full_args,
+                );
+            }
+            if method_name == "loadClass"
+                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
+                && resolved_from_receiver
+            {
+                let use_base_loader_native = {
+                    let cm = self.shared.classes.class_manager.read();
+                    cm.get_class(receiver_class_id)
+                        .map(|receiver_class| {
+                            receiver_class.name.as_ref() == "java/lang/ClassLoader"
+                                || !receiver_class.methods.iter().any(|method| {
+                                    method.name.as_ref() == method_name
+                                        && method.descriptor.as_ref() == descriptor
+                                })
+                        })
+                        .unwrap_or(false)
+                };
+                if use_base_loader_native {
+                    let mut full_args = Vec::with_capacity(1 + args.len());
+                    full_args.push(Value::Object(Some(receiver)));
+                    full_args.extend_from_slice(args);
+                    return self.invoke_or_native(
+                        "java/lang/ClassLoader",
+                        method_name,
+                        descriptor,
+                        &full_args,
+                    );
+                }
+            }
+
+            // Prepend receiver to args.
+            let mut full_args = Vec::with_capacity(1 + args.len());
+            full_args.push(Value::Object(Some(receiver)));
+            full_args.extend_from_slice(args);
+
+            // `invoke_on_class_shared` dispatches on `receiver_class_id`
+            // directly rather than re-resolving `class_name` through the
+            // global class map — it preserves native-override precedence
+            // while resolving the actual receiver hierarchy, which matters
+            // for a method-local anonymous class (the global map's
+            // name->id lookup can collapse it onto an unrelated same-named
+            // class registered by another loader, landing on an inherited
+            // Object member instead of the receiver's concrete override —
+            // notably `toString()` reached from a native call such as
+            // String.format's `%s`).
+            //
+            // That path does more locking than `invoke_or_native` and is
+            // unsafe to make the default for every `resolved_from_receiver`
+            // call: routing ALL ordinary virtual dispatch through it
+            // (rather than gating it to cases that actually need exact-
+            // class resolution) reintroduced a startup hang — Spring
+            // Boot's `BackgroundPreinitializingApplicationListener` runs
+            // Hibernate Validator's reflection-heavy constraint-helper
+            // warmup concurrently with the main thread's own bean/class
+            // initialization, and making this heavier path the hot path
+            // for every virtual call from both threads deadlocked them
+            // (see docs/internal/springboot/embedded-tomcat-loopback-self-connect-silent-hang-FIXED.md).
+            // Keep it scoped to the two cases that actually need it: the
+            // original loader-identity divergence this mechanism was built
+            // for, and the specific anonymous-`toString()` shape the
+            // regression test (`vm/tests/string_format_throwing_tostring.rs`)
+            // covers.
+            let needs_exact_class_dispatch = resolved_from_receiver
+                && (method_name == "toString" && descriptor == "()Ljava/lang/String;"
+                    || self
+                        .shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_loaded_class_id(&class_name)
+                        != Some(receiver_class_id));
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
+                && method_name == "aotContributedInitializerStartsManagementContext"
+            {
+                let global_id = self
+                    .shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&class_name);
+                eprintln!(
+                    "[NEEDS-EXACT-TRACE] method={} class_name={} resolved_from_receiver={} receiver_class_id={:?} global_lookup_id={:?} needs_exact_class_dispatch={}",
+                    method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
+                );
+            }
+            if needs_exact_class_dispatch {
+                invoke_on_class_shared(
+                    self.shared,
+                    self.thread,
+                    receiver_class_id,
+                    method_name,
+                    descriptor,
+                    &full_args,
+                )
+            } else {
+                self.invoke_or_native(&class_name, method_name, descriptor, &full_args)
+            }
+        }
+    }
+
+    fn invoke_virtual_declared(
+        &mut self,
+        declared_class: &str,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        let result = self.invoke_virtual(receiver, method_name, descriptor, args);
+        match &result {
+            Err(MethodCallFailed::InternalError(VmError::Linkage(
+                LinkageError::NoSuchMethodError {
+                    class_name,
+                    method_name: nsme_method,
+                    method_descriptor,
+                    ..
+                },
+            ))) if class_name == "java/lang/Object"
+                && declared_class != "java/lang/Object"
+                && nsme_method == method_name
+                && method_descriptor == descriptor
+                && !is_object_member(method_name, descriptor) =>
+            {
+                let mut full_args = Vec::with_capacity(1 + args.len());
+                full_args.push(Value::Object(Some(receiver)));
+                full_args.extend_from_slice(args);
+                self.invoke_or_native(declared_class, method_name, descriptor, &full_args)
+            }
+            _ => result,
+        }
+    }
+
+    fn invoke_virtual_bytecode_only(
+        &mut self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+        args: &[Value],
+    ) -> MethodCallResult {
+        // Call straight into `interpreter::execute` — the actual "just run
+        // this bytecode, no native check" primitive that
+        // `invoke_on_class_shared_inner` itself falls back to once it has
+        // decided native doesn't apply. `invoke_on_class_shared` is NOT
+        // sufficient here: besides its primary `check_override` gate (which
+        // IS skipped for an ordinary concrete method like
+        // `ThreadPoolExecutor.execute`/`submit`/`shutdown`), it has a
+        // SECOND, unconditional native-registry check for any non-interface
+        // declaring class (`override_cb` in `invoke_on_class_shared_inner`,
+        // vm_exec.rs) that re-finds this exact native regardless of the
+        // first gate — routing through `invoke_on_class_shared` reintroduced
+        // infinite recursion (confirmed via a depth-counter probe: `execute`
+        // called itself on the same receiver until the native stack
+        // overflowed) instead of actually reaching bytecode.
+        let receiver = self.shared.mem.heap.load_and_forward(receiver);
+        let class_id = self.shared.mem.heap.class_id_of(receiver);
+        let declaring_class_id = {
+            let cm = self.shared.classes.class_manager.read();
+            crate::classloading::find_method_recursive(
+                class_id,
+                method_name,
+                descriptor,
+                &cm.class_store,
+            )
+            .map(|(_, declaring_id)| declaring_id)
+            .unwrap_or(class_id)
+        };
+        let mut full_args = Vec::with_capacity(1 + args.len());
+        full_args.push(Value::Object(Some(receiver)));
+        full_args.extend_from_slice(args);
+        crate::runtime::interpreter::execute(
+            self.shared,
+            self.thread,
+            declaring_class_id,
+            method_name,
+            descriptor,
+            &full_args,
+        )
+    }
+}
+
+impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
+
 
     fn new_object(&mut self, class_name: &str) -> MethodCallResult {
         let class_id = self.shared.load_class_concurrent(class_name)?;
@@ -4310,103 +6804,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         );
     }
 
-    fn invoke(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        invoke_shared(
-            self.shared,
-            self.thread,
-            class_name,
-            method_name,
-            descriptor,
-            args,
-        )
-    }
-
-    fn invoke_by_class_id(
-        &mut self,
-        class_id: ClassId,
-        _class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        invoke_by_class_id_shared(
-            self.shared,
-            self.thread,
-            class_id,
-            method_name,
-            descriptor,
-            args,
-        )
-    }
-
-    fn invoke_special(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        // WP2.9 -- invokespecial semantics: invoke the *resolved* method on
-        // `class_name` with no virtual dispatch and no iface/abstract retarget
-        // to the receiver's concrete class. Required for `Lookup.findSpecial`
-        // private-to-private calls and default-method super-call patterns.
-        invoke_special_shared(
-            self.shared,
-            self.thread,
-            class_name,
-            method_name,
-            descriptor,
-            args,
-        )
-    }
-
-    fn invoke_special_by_class_id(
-        &mut self,
-        class_id: ClassId,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        // Same primitive the JIT's invokespecial resolution uses
-        // (`invoke_special_shared_on_class`) — reused here for reflective
-        // `Method.invoke` dispatch of private / cross-package package-private
-        // instance methods, which has the identical loader-identity
-        // requirement. See the trait method's doc comment.
-        invoke_special_shared_on_class(
-            self.shared,
-            self.thread,
-            class_id,
-            class_name,
-            method_name,
-            descriptor,
-            args,
-        )
-    }
-
-    fn invoke_special_bytecode_only(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        invoke_special_bytecode_only_shared(
-            self.shared,
-            self.thread,
-            class_name,
-            method_name,
-            descriptor,
-            args,
-        )
-    }
-
     fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
         // C28: identityHashCode must NEVER return 0. JDK's
         // InvokerBytecodeGenerator uses identityHashCode as a HashMap key and
@@ -4438,33 +6835,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn is_executing_instance_method(
-        &self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-    ) -> bool {
-        let receiver = self.shared.mem.heap.load_and_forward(receiver);
-        self.thread.frames.iter().rev().any(|frame| {
-            if frame.method_name() != method_name || frame.method_descriptor() != descriptor {
-                return false;
-            }
-            matches!(
-                frame.get_local(0),
-                Value::Object(Some(this)) if self.shared.mem.heap.load_and_forward(this) == receiver
-            )
-        })
-    }
-
-    fn dbg_set_watch_cell(&mut self, addr: usize) {
-        cratonvm_gc::heap::set_dynamic_watch(addr);
-        crate::runtime::crash_handler::arm_generic_heap_watch(addr);
-    }
-
-    fn vm_identity(&self) -> usize {
-        self.shared.vm_identity
-    }
-
     fn register_var_handle_root(&mut self, vh: ObjectRef) {
         // B-J: keep VarHandles alive (and copied into the GC pointer-map) so
         // their `static final` holder slots remap correctly across a move.
@@ -4483,513 +6853,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .read()
             .get(&identity_key)
             .copied()
-    }
-
-    fn record_printed_value(&mut self, value: Value) {
-        self.thread.printed.push(value);
-    }
-
-    fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.name.to_string())
-    }
-
-    fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
-        self.shared.mem.heap.class_id_of(obj)
-    }
-
-    fn fast_unbox_primitive_wrapper(&self, obj: ObjectRef) -> Option<Option<Value>> {
-        let class_id = self.shared.mem.heap.class_id_of(obj);
-        let vm_key = self.shared as *const SharedVm as usize;
-        let cached =
-            PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, class_id)));
-        let is_wrapper = cached || {
-            let class_name = self
-                .shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(class_id)
-                .map(|class| class.name.clone());
-            let recognized = class_name.as_deref().is_some_and(|name| {
-                matches!(
-                    name,
-                    "java/lang/Integer"
-                        | "java/lang/Long"
-                        | "java/lang/Boolean"
-                        | "java/lang/Character"
-                        | "java/lang/Byte"
-                        | "java/lang/Short"
-                        | "java/lang/Float"
-                        | "java/lang/Double"
-                )
-            });
-            if recognized {
-                PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| {
-                    cache.set(Some((vm_key, class_id)));
-                });
-            }
-            recognized
-        };
-        if !is_wrapper {
-            return Some(None);
-        }
-        Some(match self.shared.mem.heap.get_field(obj, 0) {
-            value @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
-                Some(value)
-            }
-            _ => None,
-        })
-    }
-
-    /// Phase 5: override the GPU dispatch escape hatch. Delegates
-    /// to `crate::runtime::offload::dispatch_method_from_native`
-    /// when the gpu-offload feature is on; otherwise returns None
-    /// (the trait's default).
-    fn gpu_dispatch_method(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        java_args: &[Value],
-    ) -> Option<u64> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            Some(crate::runtime::offload::dispatch_method_from_native(
-                self.shared,
-                class_name,
-                method_name,
-                descriptor,
-                java_args,
-            ))
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = (class_name, method_name, descriptor, java_args);
-            None
-        }
-    }
-
-    /// GpuStream affinity — override the stream-mint escape hatch.
-    /// Delegates to `OffloadCache::stream_create` on the per-VM
-    /// default-ordinal cache when the gpu-offload feature is on;
-    /// otherwise returns `None` (the trait's default).
-    fn gpu_stream_create(&mut self) -> Option<u64> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            self.shared
-                .offload_registry
-                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
-                .stream_create()
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            None
-        }
-    }
-
-    /// GpuStream affinity — override the stream-release escape hatch.
-    /// Delegates to `OffloadCache::stream_release`; a no-op when the
-    /// gpu-offload feature is off (the trait's default already
-    /// covers that, but the cache lookup itself is guarded the same
-    /// way every other GPU override in this impl is).
-    fn gpu_stream_release(&mut self, handle: u64) {
-        #[cfg(feature = "gpu-offload")]
-        {
-            self.shared
-                .offload_registry
-                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
-                .stream_release(handle);
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = handle;
-        }
-    }
-
-    /// GpuStream affinity — stream-affine sibling of
-    /// `gpu_dispatch_method`. Delegates to
-    /// `crate::runtime::offload::dispatch_method_from_native_on_stream`
-    /// (same class/method resolution + marshalling as
-    /// `gpu_dispatch_method`, plus the `stream_handle` resolution
-    /// step) when the gpu-offload feature is on; otherwise returns
-    /// `None` (the trait's default, which itself falls back to
-    /// `gpu_dispatch_method`).
-    fn gpu_dispatch_method_on_stream(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        descriptor: &str,
-        java_args: &[Value],
-        stream_handle: Option<u64>,
-    ) -> Option<u64> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            Some(
-                crate::runtime::offload::dispatch_method_from_native_on_stream(
-                    self.shared,
-                    class_name,
-                    method_name,
-                    descriptor,
-                    java_args,
-                    stream_handle,
-                ),
-            )
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = (
-                class_name,
-                method_name,
-                descriptor,
-                java_args,
-                stream_handle,
-            );
-            None
-        }
-    }
-
-    /// Phase 6 #4 (2026-07-11: switched to the non-blocking poll) —
-    /// query the real GPU submission registry for `handle`'s completion
-    /// state.
-    ///
-    /// Previously a pure `sub.status.lock()` peek: it read whatever
-    /// `SubmissionStatus` the submission already carried but never
-    /// asked the device anything, so it could never observe a
-    /// completion that some other caller (`futureSynchronize`/`get()`)
-    /// hadn't already finalized — `futureIsDone` stayed `false` forever
-    /// for a submission nobody was blocking on. Now delegates to
-    /// `runtime::offload::poll_submission_status`, which finalizes the
-    /// submission inline (bounded work only — by the time it does, the
-    /// device event has already fired) the first time it observes the
-    /// device-side work as done. `Native.futureIsDone`/`futureStatus`
-    /// (`native-builtins/src/craton_gpu.rs`) are therefore now
-    /// genuinely non-blocking-but-live rather than only ever reporting
-    /// stale `Running`.
-    fn gpu_future_status(&self, handle: u64) -> Option<i32> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            let outcome = crate::runtime::offload::poll_submission_status(self.shared, handle)?;
-            Some(match outcome {
-                crate::runtime::offload::PollOutcome::Running => 0,
-                crate::runtime::offload::PollOutcome::Completed => 1,
-                crate::runtime::offload::PollOutcome::Failed => 2,
-            })
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = handle;
-            None
-        }
-    }
-
-    /// 2026-07-11 — `NativeContext::gpu_future_take_result` override.
-    /// See the trait doc comment (`native-api/src/registry.rs`) for the
-    /// full contract; this is the read half that hands back a completed
-    /// submission's `SerializedResult` (translated into the
-    /// `native-api`-side `GpuFutureResult` transport enum, since
-    /// `native-api` cannot depend on this crate's `offload` types).
-    ///
-    /// Reuses `poll_submission_status` — the same non-blocking,
-    /// finalize-only-if-the-device-already-reported-done path
-    /// `gpu_future_status` now uses — so a caller that already observed
-    /// `isDone() == true` gets the result with no wait, and a caller
-    /// that hasn't gets `None` rather than an implicit block.
-    fn gpu_future_take_result(
-        &self,
-        handle: u64,
-    ) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            use crate::runtime::offload::{PollOutcome, SerializedResult, SubmissionStatus};
-
-            // Only a terminal `Completed` outcome carries a result;
-            // `Running` and `Failed` (and an unknown handle, which
-            // `poll_submission_status` already reports as `None`) don't.
-            // This never blocks: `poll_submission_status` only ever
-            // finalizes inline when the device has already reported the
-            // work done, never by waiting for it to.
-            if crate::runtime::offload::poll_submission_status(self.shared, handle)?
-                != PollOutcome::Completed
-            {
-                return None;
-            }
-            let sub = crate::runtime::offload::lookup_submission(handle)?;
-            let status = sub.status.lock();
-            match &*status {
-                SubmissionStatus::Completed { result } => Some(match result {
-                    SerializedResult::Void => cratonvm_native_api::registry::GpuFutureResult::Void,
-                    SerializedResult::ScalarI32(v) => {
-                        cratonvm_native_api::registry::GpuFutureResult::ScalarI32(*v)
-                    }
-                    SerializedResult::ScalarI64(v) => {
-                        cratonvm_native_api::registry::GpuFutureResult::ScalarI64(*v)
-                    }
-                    SerializedResult::ScalarF32(v) => {
-                        cratonvm_native_api::registry::GpuFutureResult::ScalarF32(*v)
-                    }
-                    SerializedResult::ScalarF64(v) => {
-                        cratonvm_native_api::registry::GpuFutureResult::ScalarF64(*v)
-                    }
-                    // `finalize_submission` never actually constructs one
-                    // of these today: array outputs are copied back to
-                    // the caller's own Java array via `MarshalWriteback`
-                    // writeback entries (drained by `finalize_submission`
-                    // itself), not stamped into `SerializedResult` — its
-                    // `scalar_result` local is only ever set by the
-                    // single Part-E scalar writeback kind, so a
-                    // `Completed` status here only ever holds `Void` or a
-                    // `Scalar*` variant in practice. These arms are
-                    // therefore unreachable today; map to `Void`
-                    // defensively rather than panic if that ever changes.
-                    SerializedResult::PrimitiveArrayI32 { .. }
-                    | SerializedResult::PrimitiveArrayI64 { .. }
-                    | SerializedResult::PrimitiveArrayF32 { .. }
-                    | SerializedResult::PrimitiveArrayF64 { .. } => {
-                        cratonvm_native_api::registry::GpuFutureResult::Void
-                    }
-                }),
-                // `poll_submission_status` just reported `Completed`
-                // under its own lock acquisition; this re-locks and
-                // should see the same terminal state (a submission never
-                // regresses out of a terminal status). Stay defensive
-                // rather than assume that invariant instead of checking it.
-                _ => None,
-            }
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = handle;
-            None
-        }
-    }
-
-    /// Phase 8 #1: evict the device-buffer cache entry for a
-    /// GpuArray handle. Called from `Native.releaseArray` when Java
-    /// drops the wrapper.
-    fn gpu_release_array_cache(&mut self, handle: u64) {
-        #[cfg(feature = "gpu-offload")]
-        {
-            crate::runtime::offload::device_cache::release(handle);
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = handle;
-        }
-    }
-
-    /// Phase 10 #1: wipe the explicit-submit input-residency
-    /// cache. Called from `Native.releaseExecutor` so device
-    /// buffers cached for plain JVM primitive arrays are freed when
-    /// the Java `GpuExecutor` is closed.
-    fn gpu_clear_input_cache(&mut self) {
-        #[cfg(feature = "gpu-offload")]
-        {
-            crate::runtime::offload::input_cache::clear_all();
-        }
-    }
-
-    /// Phase 9 #1: materialise dirty device-side bytes into a
-    /// host buffer. The caller (the `Native.arrayToHost` shim)
-    /// stamps the returned bytes into the resident store before
-    /// rebuilding the Java array. None means "no download
-    /// needed" — either the entry is unknown or already-clean.
-    fn gpu_array_download_if_dirty(&self, handle: u64) -> Option<Vec<u8>> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            crate::runtime::offload::device_cache::download_into_bytes_if_dirty(handle)
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = handle;
-            None
-        }
-    }
-
-    /// Phase 6 #5 + Phase 9 #2 push 2: resolve a lambda proxy back to
-    /// its target method + captured values for GPU dispatch.
-    ///
-    /// Non-static targets (`InvokeVirtual` / `InvokeSpecial`) are
-    /// admitted when the captured-value list begins with a non-null
-    /// receiver — the receiver becomes `java_args[0]` to
-    /// [`dispatch_method_from_native`], which extracts the analyzer's
-    /// recorded `this_field_cps` from the receiver before processing
-    /// remaining captures as kernel args.
-    ///
-    /// Still rejected:
-    /// - `InvokeInterface` (no fixture today)
-    /// - `NewInvokeSpecial` (heap construction on the device — no GPU
-    ///   semantics)
-    /// - `GetField` / `PutField` / `GetStatic` / `PutStatic` method
-    ///   handles (no GPU semantics for arbitrary field access)
-    fn gpu_resolve_lambda_target(
-        &self,
-        callable: ObjectRef,
-    ) -> Option<(String, String, String, Vec<Value>)> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            use crate::classloading::resolution::MethodHandleKind;
-            let cid = self.shared.mem.heap.class_id_of(callable);
-            let proxies = self.shared.classes.lambda_proxies.read();
-            let lcs = proxies.get(&cid)?;
-            // Phase 9 #2 — admit InvokeStatic, InvokeVirtual, and
-            // InvokeSpecial. The analyzer's non-static relaxation
-            // means a virtual/special call's target can be admitted
-            // when its body uses the `aload_0; getfield <field>`
-            // shape; the marshaller extracts those fields from the
-            // receiver. Other handle kinds remain CPU-only.
-            let kind_admitted = matches!(
-                lcs.impl_handle.kind,
-                MethodHandleKind::InvokeStatic
-                    | MethodHandleKind::InvokeVirtual
-                    | MethodHandleKind::InvokeSpecial
-            );
-            if !kind_admitted {
-                tracing::debug!(
-                    target: "gpu.offload",
-                    handle_kind = ?lcs.impl_handle.kind,
-                    target_class = %lcs.impl_handle.class_name,
-                    target_member = %lcs.impl_handle.member_name,
-                    "lambda target rejected: handle kind has no GPU lowering",
-                );
-                return None;
-            }
-            // Merge bridge: `impl_handle` fields are `Arc<str>` in the
-            // current reader; the GPU lambda-resolver tuple is typed
-            // `String`. Convert explicitly.
-            let class_name = lcs.impl_handle.class_name.to_string();
-            let member_name = lcs.impl_handle.member_name.to_string();
-            let descriptor = lcs.impl_handle.descriptor.to_string();
-            let n_captures = lcs.capture_types.len();
-            drop(proxies);
-            let mut captures = Vec::with_capacity(n_captures);
-            for i in 0..n_captures {
-                captures.push(self.shared.mem.heap.get_field(callable, i));
-            }
-            Some((class_name, member_name, descriptor, captures))
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = callable;
-            None
-        }
-    }
-
-    /// Phase 6 #4 + Phase 7 #1: block on the GPU submission and
-    /// run its deferred writebacks. If the submission still carries
-    /// a FinalizeState (the kernel may still be running on the GPU),
-    /// this is the call that:
-    ///   1. waits on the recorded event,
-    ///   2. drains all the device-to-host writebacks,
-    ///   3. drops the SafepointToken (releases GC).
-    /// Idempotent — subsequent calls find FinalizeState already
-    /// taken and return the cached terminal status.
-    fn gpu_future_synchronize(&self, handle: u64) -> Option<Result<(), String>> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            let sub = crate::runtime::offload::lookup_submission(handle)?;
-            Some(crate::runtime::offload::finalize_submission(
-                self.shared,
-                &sub,
-            ))
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            let _ = handle;
-            None
-        }
-    }
-
-    /// GPU device enumeration: delegate to the real CUDA bridge probe.
-    ///
-    /// `cuda_bridge::probe()` reports the primary device (ordinal 0) or
-    /// `Err(DeviceError::NoDriver)` when no driver is present or the
-    /// bridge was built in stub mode. We translate `Ok(caps)` into a
-    /// single-entry list and any `Err` into an empty list — so the
-    /// `Native.deviceCount` shim returns a truthful `0` on a driverless
-    /// host rather than fabricating a device.
-    fn gpu_device_info(&self) -> Vec<(String, u32, u32, u64)> {
-        #[cfg(feature = "gpu-offload")]
-        {
-            match cuda_bridge::probe() {
-                Ok(caps) => vec![(
-                    caps.name,
-                    caps.compute_major,
-                    caps.compute_minor,
-                    caps.total_global_mem,
-                )],
-                Err(_) => Vec::new(),
-            }
-        }
-        #[cfg(not(feature = "gpu-offload"))]
-        {
-            Vec::new()
-        }
-    }
-
-    fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
-        match self.shared.load_class_concurrent(class_name) {
-            Ok(class_id) => self
-                .shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(class_id)
-                .is_some_and(|c| c.is_synthetic_stub),
-            Err(_) => false,
-        }
-    }
-
-    fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
-        use cratonvm_types::ClassLoaderId;
-        let cm = self.shared.classes.class_manager.read();
-        match cm.get_loader_id(class_id) {
-            Some(ClassLoaderId::Bootstrap) => 0,
-            Some(ClassLoaderId::Extension) => 1,
-            Some(ClassLoaderId::Application) => 2,
-            Some(ClassLoaderId::UserDefined(id)) => id as i32,
-            None => 2, // default to app loader
-        }
-    }
-
-    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
-        self.capture_current_stack_trace()
-    }
-
-    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
-        let trace = self.capture_current_stack_trace();
-        self.shared
-            .store_throwable_stack_trace(throwable, trace.clone());
-        trace
-    }
-
-    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
-        let r = self.shared.throwable_stack_trace(throwable_hash);
-        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
-            eprintln!(
-                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={}",
-                r.is_some(),
-                r.as_ref().map_or(0, Vec::len),
-            );
-        }
-        r
-    }
-
-    fn frame_class_ids(&self) -> Vec<ClassId> {
-        // `self.thread.frames` is stored outermost-first (index 0 = the
-        // oldest call still on the stack); reverse so callers see
-        // innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
-        // convention (see its own callers, e.g. `resolve_caller_class_id`).
-        self.thread
-            .frames
-            .iter()
-            .rev()
-            .map(|f| f.class_id)
-            .collect()
     }
 
     // -- Heap access methods --
@@ -5157,153 +7020,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     ) -> Option<usize> {
         let cm = self.shared.classes.class_manager.read();
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
-    }
-
-    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
-        // NIO-SERVER-SOCKET: `Unsafe.allocateMemory` returns synthetic arena
-        // handles (base 0x10_0000_0000), not real pointers. A
-        // `DirectByteBuffer.address()` from `Util.getTemporaryDirectBuffer`
-        // reaching `Net.read0`/`SocketDispatcher` is such a handle — route it
-        // through the off-heap store. Real OS pointers fall through to raw.
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
-            return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
-        }
-        // Reject null / negative handles. Returning `false` (not performing the
-        // copy) is how this layer signals failure; the native caller turns that
-        // into the appropriate Java exception. The bounds of `out` itself are
-        // the Java-side array bounds — the caller has already sliced the array,
-        // so `out.len()` is the validated request size.
-        if addr <= 0 {
-            return false;
-        }
-        // Guard against an `addr + len` range that wraps past the end of the
-        // address space (a forged length on a high `addr`). Such a copy would
-        // read out-of-bounds / UB; refuse it instead. `addr > 0` here, so the
-        // `as u64` cast is exact.
-        if !native_range_is_in_bounds(addr as u64, out.len()) {
-            return false;
-        }
-        // SAFETY: `addr` is a real, readable native pointer (not an arena
-        // handle); the `[addr, addr + out.len())` range is non-wrapping
-        // (checked above) and `out.len()` bytes are copied from it.
-        unsafe {
-            std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
-        }
-        true
-    }
-
-    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
-            return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
-        }
-        // Reject null / negative handles (failure is signalled by `false`; the
-        // native caller raises the appropriate Java exception). `data` is the
-        // Java-side source slice, already bounds-checked by the caller.
-        if addr <= 0 {
-            return false;
-        }
-        // Refuse a destination range `[addr, addr + len)` that would wrap past
-        // the end of the address space (forged length on a high `addr`) — such
-        // a write is out-of-bounds / UB. `addr > 0`, so `as u64` is exact.
-        if !native_range_is_in_bounds(addr as u64, data.len()) {
-            return false;
-        }
-        // DBG (bc math-ec): a raw copy whose destination aliases the MANAGED
-        // HEAP is the prime suspect for the `0x4`-into-Fp-reference-field
-        // corruption (e.g. Unsafe.copyMemory(heapSrc, off, null, heapAddr, n)
-        // routed here with a heap dst). Catch it with the live Java stack so
-        // the offending call site is pinned. is_heap_addr is region-membership
-        // only (no header read) so it is safe on an arbitrary address.
-        if std::env::var_os("CRATONVM_DBG_HEAPCOPY").is_some()
-            && self.shared.mem.heap.is_heap_addr(addr as usize).is_some()
-        {
-            let n = data.len().min(16);
-            eprintln!(
-                "[heapcopy-WRITE] addr=0x{:x} len={} data={:02x?}",
-                addr,
-                data.len(),
-                &data[..n],
-            );
-            for f in self.thread.frames.iter().rev().take(14) {
-                eprintln!(
-                    "[heapcopy-STK]   {}.{} pc={}",
-                    f.class_name(),
-                    f.method_name(),
-                    f.pc,
-                );
-            }
-        }
-        // SAFETY: `addr` is a real, writable native pointer (not an arena
-        // handle); `data.len()` bytes are copied to it.
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
-        }
-        true
-    }
-
-    fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
-        let cm = self.shared.classes.class_manager.read();
-        let class_id = match cm.get_loaded_class_id(class_name) {
-            Some(id) => id,
-            None => return false,
-        };
-        // Walk the class hierarchy looking for the method
-        let mut current = Some(class_id);
-        while let Some(cid) = current {
-            if let Some(class) = cm.class_store.get(cid) {
-                if class.find_method(method_name, descriptor).is_some() {
-                    return true;
-                }
-                // Also check if it's a synthetic stub (native-only class) вЂ” methods
-                // are registered in the native registry, not in the class file
-                if class.is_synthetic_stub {
-                    return true; // assume native methods exist
-                }
-                current = class.superclass;
-            } else {
-                break;
-            }
-        }
-        // Also check native method registry
-        self.shared
-            .natives
-            .native_methods
-            .find(class_name, method_name, descriptor)
-            .is_some()
-    }
-
-    fn class_declares_method(&self, class_id: ClassId, name: &str, descriptor: &str) -> bool {
-        // Declared-only check: inspect this exact class, NOT its superclasses.
-        //
-        // Exclude compiler-generated bridge methods (ACC_BRIDGE, 0x0040).
-        // A bridge is not a genuine override in the OOP sense CratonVM's
-        // callers care about ("does this class provide its OWN real
-        // implementation") -- it is javac's forwarding stub for visibility
-        // (e.g. `StringBuilder.substring(int)` forwarding to its
-        // package-private superclass `AbstractStringBuilder`'s real
-        // implementation) or covariant-return erasure. Counting it as a
-        // "declared override" broke
-        // `native_mockito_mock_method_advice_is_overridden`'s ancestor walk:
-        // for a Mockito inline mock of `StringBuilder`, it saw
-        // `StringBuilder`'s bridge `substring(int)` between the mock's own
-        // class and `AbstractStringBuilder` (the reflected Method's real
-        // declaring class) and concluded "overridden -- do not intercept
-        // here", silently skipping Mockito's advice and returning the real
-        // (empty-buffer) computation instead of the stubbed answer. Real
-        // JDK reflection call sites never see bridges as "the" declared
-        // method for this kind of check (ByteBuddy's own `MethodGraph`
-        // merges a bridge into its bridged target), so excluding them here
-        // matches that semantics. The other two callers (constructor checks,
-        // a `ClassLoader.findResources` override probe) are unaffected:
-        // constructors can never be bridges, and `findResources`'s fixed,
-        // non-generic signature is never bridge-erased in practice.
-        let cm = self.shared.classes.class_manager.read();
-        match cm.class_store.get(class_id) {
-            Some(class) => class
-                .find_method(name, descriptor)
-                .is_some_and(|m| !m.is_bridge()),
-            None => false,
-        }
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
@@ -5928,68 +7644,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         super::get_or_create_class_mirror(self.shared, class_id)
     }
 
-    fn record_printed_line(&mut self, text: String) {
-        self.thread.printed_lines.push(text);
-    }
-
-    fn get_system_stream(&self, name: &str) -> Option<ObjectRef> {
-        match name {
-            "out" => *self.shared.system_out.read(),
-            "err" => *self.shared.system_err.read(),
-            "in" => *self.shared.system_in.read(),
-            _ => None,
-        }
-    }
-
-    fn cache_system_stdin(&mut self, stream: ObjectRef) {
-        *self.shared.system_in.write() = Some(stream);
-    }
-
-    fn get_cached_module_mirror(&self, module_name: Option<&str>) -> Option<ObjectRef> {
-        let key = module_name.unwrap_or("");
-        self.shared.classes.module_mirrors.read().get(key).copied()
-    }
-
-    fn cache_module_mirror(&mut self, module_name: Option<&str>, module: ObjectRef) {
-        let key = module_name.unwrap_or("").to_string();
-        self.shared
-            .classes
-            .module_mirrors
-            .write()
-            .insert(key, module);
-    }
-
-    fn get_system_property(&self, key: &str) -> Option<String> {
-        let normalized = normalize_system_property_key(key);
-        self.shared
-            .system_properties
-            .read()
-            .get(normalized)
-            .cloned()
-    }
-
-    fn list_system_properties(&self) -> Vec<(String, String)> {
-        self.shared
-            .system_properties
-            .read()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    }
-
-    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
-        let normalized = normalize_system_property_key(key).to_string();
-        self.shared
-            .system_properties
-            .write()
-            .insert(normalized, value.to_string())
-    }
-
-    fn remove_system_property(&mut self, key: &str) -> Option<String> {
-        let normalized = normalize_system_property_key(key).to_string();
-        self.shared.system_properties.write().remove(&normalized)
-    }
-
     fn alloc_object(&mut self, class_id: ClassId, num_fields: usize) -> ObjectRef {
         // Defense-in-depth: a native caller must never allocate an object
         // with `ClassId::new(0)` (`java/lang/Object`, which declares zero
@@ -6021,7 +7675,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // per-allocation stack dump still fires every time.
             let dbg = {
                 static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *DBG.get_or_init(|| std::env::var("CRATONVM_DBG_ANONALLOC").is_ok())
+                *DBG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANONALLOC").is_ok())
             };
             if !dbg && num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
                 let cached = self.shared.classes.anon_class_cache[num_fields]
@@ -6219,397 +7873,273 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.mem.heap.alloc_object(class_id, slots)
     }
 
-    fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
-        let class_id = self.shared.load_class_concurrent(name)?;
-        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
-        Ok(class_id)
-    }
-
-    fn ensure_class_initialized_with_class_id(
-        &mut self,
-        class_id: ClassId,
-    ) -> Result<(), MethodCallFailed> {
-        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)
-    }
-
-    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
-        // Prefer the real class if it can be loaded — `ensure_synthetic_class`
-        // returns the existing id when the name is already registered, so a
-        // successful load here keeps native allocations on the real layout.
-        if let Ok(cid) = self.shared.load_class_concurrent(name) {
-            return cid;
-        }
-        // Real class unavailable: register a minimal synthetic class that
-        // declares `num_fields` instance fields. This guarantees the object
-        // header's `class_id` points at a class whose `num_total_fields`
-        // matches the allocated slot count, instead of `ClassId::new(0)`
-        // (`java/lang/Object`, zero declared fields) which the GC's
-        // `get_field` bounds guard rejects as an undersized layout.
-        self.shared
-            .classes
-            .class_manager
-            .write()
-            .ensure_synthetic_class(name, num_fields)
-    }
-
-    fn register_lambda_proxy(
-        &mut self,
-        functional_interface: &str,
-        sam_method_name: &str,
-        sam_descriptor: &str,
-        impl_class: &str,
-        impl_member: &str,
-        impl_descriptor: &str,
-        impl_ref_kind: u8,
-        instantiated_descriptor: &str,
-        capture_types: &str,
-    ) -> u32 {
-        use crate::classloading::resolution::{LambdaCallSite, MethodHandle};
-        use std::sync::Arc;
-
-        // Reflective `LambdaMetafactory` (e.g. log4j2's `ServiceLoaderUtil`)
-        // builds the same lambda metadata the `invokedynamic` opcode would —
-        // route it through the identical `lambda_proxies` table so the
-        // interpreter's SAM dispatch handles instances uniformly.
-        let kind =
-            MethodHandleKind::from_tag(impl_ref_kind).unwrap_or(MethodHandleKind::InvokeStatic);
-        let proxy_class_id = self.shared.alloc_lambda_proxy_id();
-        let call_site = LambdaCallSite {
-            functional_interface_id: None,
-            functional_interface: Arc::from(functional_interface),
-            sam_method_name: Arc::from(sam_method_name),
-            sam_descriptor: Arc::from(sam_descriptor),
-            impl_handle: MethodHandle {
-                kind,
-                class_name: Arc::from(impl_class),
-                member_name: Arc::from(impl_member),
-                descriptor: Arc::from(impl_descriptor),
-            },
-            instantiated_descriptor: Arc::from(instantiated_descriptor),
-            capture_types: capture_types.chars().collect(),
-            proxy_class_id,
-        };
-        let mut proxies = self.shared.classes.lambda_proxies.write();
-        if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
-            proxies.insert(proxy_class_id, call_site);
-            proxy_class_id.as_u32()
-        } else {
-            0
-        }
-    }
-
-    fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
-        self.shared
-            .classes
-            .lambda_proxies
-            .read()
-            .get(&class_id)
-            .map(|cs| cs.functional_interface.to_string())
-    }
-
-    fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
-        self.shared
-            .classes
-            .lambda_proxies
-            .read()
-            .get(&class_id)
-            .map(|cs| {
-                (
-                    cs.sam_method_name.to_string(),
-                    cs.sam_descriptor.to_string(),
-                    cs.instantiated_descriptor.to_string(),
-                )
-            })
-    }
-
-    fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
-        // Prefer the recorded *defining* class (where the lambda / method-ref's
-        // invokedynamic appears) — this is what HotSpot names the proxy after and
-        // reports as the nest host, even for a cross-class method reference whose
-        // implementation method lives in a different class.
-        if let Some(host_id) = self
-            .shared
-            .classes
-            .lambda_proxy_hosts
-            .read()
-            .get(&class_id)
-            .copied()
-        {
-            if let Some(name) = self
-                .shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(host_id)
-                .map(|c| c.name.to_string())
-            {
-                return Some(name);
-            }
-        }
-        // Fallback (lambda proxies created off the indy bootstrap path, e.g. in
-        // tests): the implementation method handle's owner — correct for genuine
-        // lambdas and same-class method references.
-        self.shared
-            .classes
-            .lambda_proxies
-            .read()
-            .get(&class_id)
-            .map(|cs| cs.impl_handle.class_name.to_string())
-    }
-
-    fn lambda_proxy_serial_metadata(
-        &self,
-        class_id: ClassId,
-    ) -> Option<cratonvm_native_api::LambdaSerialMetadata> {
-        self.shared
-            .classes
-            .lambda_proxies
-            .read()
-            .get(&class_id)
-            .map(|cs| cratonvm_native_api::LambdaSerialMetadata {
-                functional_interface: cs.functional_interface.to_string(),
-                sam_method_name: cs.sam_method_name.to_string(),
-                sam_descriptor: cs.sam_descriptor.to_string(),
-                impl_class: cs.impl_handle.class_name.to_string(),
-                impl_member: cs.impl_handle.member_name.to_string(),
-                impl_descriptor: cs.impl_handle.descriptor.to_string(),
-                impl_ref_kind: cs.impl_handle.kind.as_tag(),
-                instantiated_descriptor: cs.instantiated_descriptor.to_string(),
-                capture_types: cs.capture_types.iter().collect(),
-            })
-    }
-
-    fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
-        if self
-            .shared
-            .classes
-            .class_manager
-            .read()
-            .is_subclass_of(child, parent)
-        {
-            return true;
-        }
-        // Synthetic lambda proxy ClassIds (>= 0x8000_0000) are not in the
-        // class manager, so `is_subclass_of` always reports false. Reflection
-        // callers like CGLIB's `CallbackInfo.determineType` then conclude that
-        // the lambda doesn't implement its functional interface and throw
-        // `IllegalStateException("Unknown callback type ...")`. Route through
-        // `lambda_proxy_satisfies` so reflective `isAssignableFrom`,
-        // `isInstance`, and friends agree with the interpreter's
-        // checkcast/instanceof view.
-        if child.as_u32() >= 0x8000_0000 {
-            return crate::runtime::interpreter::lambda_proxy_satisfies_public(
-                self.shared,
-                child,
-                parent,
-            );
-        }
-        false
-    }
-
-    fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .and_then(|c| c.superclass)
-    }
-
-    fn is_interface_class(&self, class_id: ClassId) -> bool {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.is_interface())
-            .unwrap_or(false)
-    }
-
-    fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .find_class_by_name(name)
-    }
-
-    fn class_id_by_name_delegated(&self, name: &str) -> Option<ClassId> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .resolve_fast_path_class_id(name)
-    }
-
-    fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
-        let cm = self.shared.classes.class_manager.read();
-        if let Some(loader) = cm.get_loader_id(near) {
-            if let Some(id) = cm.find_class_by_name_in_loader(name, loader) {
-                return Some(id);
-            }
-        }
-        cm.find_class_by_name(name)
-    }
-
-    fn class_id_by_name_via_referencing_class(
-        &mut self,
-        referencing_class_id: ClassId,
-        name: &str,
-    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
-        crate::runtime::interpreter::resolve_class_loader_aware(
-            self.shared,
-            self.thread,
-            referencing_class_id,
-            name,
-        )
-    }
-
-    fn is_record_class(&self, class_id: ClassId) -> bool {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.is_record())
-            .unwrap_or(false)
-    }
-
-    fn record_components(&self, class_id: ClassId) -> Vec<(String, String)> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| {
-                c.record_components
-                    .iter()
-                    .map(|rc| (rc.name.clone(), rc.descriptor.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn is_sealed_class(&self, class_id: ClassId) -> bool {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.is_sealed())
-            .unwrap_or(false)
-    }
-
-    fn permitted_subclasses(&self, class_id: ClassId) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.permitted_subclasses.clone())
-            .unwrap_or_default()
-    }
-
-    // -- T13: java/lang/Class metadata methods --
-
-    fn class_file_version(&self, class_id: ClassId) -> u16 {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.version.major)
-            .unwrap_or(65)
-    }
-
-    fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| {
-                c.inner_classes
-                    .iter()
-                    .map(|ic| {
-                        (
-                            ic.inner_class.clone(),
-                            ic.outer_class.clone(),
-                            ic.inner_name.clone(),
-                            ic.access_flags,
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn enclosing_method(&self, class_id: ClassId) -> Option<(String, String, String)> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .and_then(|c| {
-                c.enclosing_method.as_ref().map(|em| {
-                    (
-                        em.class_name.clone(),
-                        em.method_name.clone(),
-                        em.method_descriptor.clone(),
-                    )
-                })
-            })
-    }
-
-    fn declaring_class(&self, class_id: ClassId) -> Option<ClassId> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = cm.get_class(class_id)?;
-        let this_name = &class.name;
-        // Find the InnerClasses entry where inner_class == this class
-        for ic in &class.inner_classes {
-            if ic.inner_class.as_str() == &**this_name
-                && !ic.outer_class.is_empty()
-                && !ic.inner_name.is_empty()
-            {
-                // Resolve outer class name to ClassId
-                return cm.find_class_by_name(&ic.outer_class);
-            }
-        }
-        None
-    }
-
-    fn nest_host_name(&self, class_id: ClassId) -> Option<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .and_then(|c| c.nest_host.clone())
-    }
-
-    fn nest_member_names(&self, class_id: ClassId) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.nest_members.clone())
-            .unwrap_or_default()
-    }
-
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
         self.shared.mem.heap.get_header(obj).num_slots() as usize
     }
 
-    fn class_num_total_fields(&self, class_id: ClassId) -> usize {
+    fn heap_allocated_bytes(&self) -> usize {
+        self.shared.mem.heap.allocated_bytes()
+    }
+
+    // -- WP0.2 ObjectStreamClass cache --
+
+    fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
+        self.shared.classes.osc_cache.get(class_id)
+    }
+
+    fn osc_cache_put(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
         self.shared
+            .classes
+            .osc_cache
+            .insert_if_absent(class_id, desc)
+    }
+
+    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        // T10.9.E вЂ” descriptor-aware volatile read.
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
+            Some(desc) => self.shared.mem.heap.get_field_volatile_as(obj, index, desc),
+            None => self.shared.mem.heap.get_field_volatile(obj, index),
+        }
+    }
+
+    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        if crate::runtime::env_cache::dbg_loader_trace() {
+            if let Value::Object(Some(o)) = value {
+                let new_cid = self.shared.mem.heap.class_id_of(o);
+                let cn = self
+                    .shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(new_cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                if cn.contains("RootReference") {
+                    eprintln!(
+                        "[LOADER-TRACE] set_field_volatile holder_obj={:p} slot={} new_obj={:p} new_class={} new_cid={}",
+                        obj.as_ptr(), index, o.as_ptr(), cn, new_cid.as_u32()
+                    );
+                }
+            }
+        }
+        // T10.9.E вЂ” descriptor-aware volatile write.
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
+            Some(desc) => self
+                .shared
+                .mem
+                .heap
+                .set_field_volatile_as(obj, index, value, desc),
+            None => self.shared.mem.heap.set_field_volatile(obj, index, value),
+        }
+        // write_barrier fires automatically inside set_field_volatile в†’ set_field
+    }
+
+    fn compare_and_swap_field(
+        &mut self,
+        obj: ObjectRef,
+        index: usize,
+        expected: Value,
+        new_val: Value,
+    ) -> bool {
+        // T19_H6: descriptor-aware CAS read+write so a long instance field
+        // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
+        let is_array = self.shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        let descriptor = if is_array {
+            None
+        } else {
+            resolve_field_descriptor_byte_cached(self.shared, class_id, index)
+        };
+        let swapped = self.shared.threads.monitors.with_cas_lock(obj, || {
+            let current = if is_array {
+                self.shared
+                    .mem
+                    .heap
+                    .get_array_element(obj, index)
+                    .unwrap_or(Value::Object(None))
+            } else if let Some(desc) = descriptor {
+                self.shared.mem.heap.get_field_volatile_as(obj, index, desc)
+            } else {
+                self.shared.mem.heap.get_field_volatile(obj, index)
+            };
+            if values_equal_for_cas(&current, &expected) {
+                // Task #42 (deferred from #25): SATB pre-barrier on
+                // the CAS-putfield / CAS-aastore path.  Without it,
+                // a successful CAS that overwrites an old ref slot
+                // between G1 initial-mark and remark would silently
+                // drop the old reference from the live closure —
+                // the same lost-object scenario the interpreter's
+                // putfield/aastore paths already guard against. We
+                // dispatch through `VmHeap::satb_barrier` (the
+                // available API on this branch); `satb_barrier`
+                // short-circuits on null and on non-Object payloads,
+                // so primitive `Unsafe.compareAndSwapInt/Long` and
+                // null→x CAS pays effectively nothing.  Fires
+                // strictly BEFORE the store to preserve SATB
+                // (pre, store, post) ordering. On a non-G1
+                // generational backend the call is also a cheap
+                // tag-test no-op.
+                self.shared.mem.heap.satb_barrier(current);
+                if is_array {
+                    let _ = self.shared.mem.heap.set_array_element(obj, index, new_val);
+                } else if let Some(desc) = descriptor {
+                    self.shared
+                        .mem
+                        .heap
+                        .set_field_volatile_as(obj, index, new_val, desc);
+                } else {
+                    self.shared.mem.heap.set_field_volatile(obj, index, new_val);
+                }
+                true
+            } else {
+                false
+            }
+        });
+        if swapped {
+            if crate::runtime::env_cache::dbg_loader_trace() {
+                if let Value::Object(Some(o)) = new_val {
+                    let new_cid = self.shared.mem.heap.class_id_of(o);
+                    let cn = self
+                        .shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(new_cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    if cn.contains("RootReference") {
+                        let holder_cid = self.shared.mem.heap.class_id_of(obj);
+                        let holder_cn = self
+                            .shared
+                            .classes
+                            .class_manager
+                            .read()
+                            .get_class(holder_cid)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[LOADER-TRACE] compare_and_swap_field SUCCESS holder_obj={:p} holder_class={} slot={} new_obj={:p} new_class={} new_cid={}",
+                            obj.as_ptr(), holder_cn, index, o.as_ptr(), cn, new_cid.as_u32()
+                        );
+                    }
+                }
+            }
+            self.shared.mem.heap.write_barrier(obj, new_val);
+        }
+        // T19.H7 diag: count CAS failures so we can spot a livelock.
+        // Static counter gated to ~5 emissions then 1 every 1M.
+        // Feature-gated (off by default) вЂ” see vm/Cargo.toml
+        // `experimental-t19-diag`. Re-enable with
+        // `--features experimental-t19-diag`.
+        #[cfg(feature = "experimental-t19-diag")]
+        if !swapped {
+            static CAS_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = CAS_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n % 1_000_000 == 0 {
+                let cn = self
+                    .shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| format!("cid={}", class_id.as_u32()));
+                tracing::debug!(
+                    target: "cratonvm::t19_h7_cas",
+                    "CAS FAIL #{n} class={cn} slot={index} desc={:?} expected={:?} new={:?}",
+                    descriptor.map(|b| b as char), expected, new_val,
+                );
+            }
+        }
+        swapped
+    }
+
+    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
+        let class_id = self
+            .shared
+            .classes
+            .class_manager
+            .write()
+            .load_class(class_name)
+            .ok()?;
+        let num_fields = self
+            .shared
             .classes
             .class_manager
             .read()
             .get_class(class_id)
             .map(|c| c.num_total_fields)
-            .unwrap_or(0)
+            .unwrap_or(0);
+        let obj = self.shared.mem.heap.alloc_object(class_id, num_fields);
+        crate::runtime::interpreter::init_primitive_fields(self.shared, obj, class_id);
+        Some(obj)
     }
+
+    fn discover_reference(
+        &mut self,
+        ref_type: u8,
+        reference_obj: ObjectRef,
+        referent: ObjectRef,
+        queue: Option<ObjectRef>,
+    ) {
+        use cratonvm_gc::ReferenceType;
+        let rt = match ref_type {
+            0 => ReferenceType::Weak,
+            1 => ReferenceType::Soft,
+            2 => ReferenceType::Phantom,
+            3 => ReferenceType::Cleaner,
+            _ => return,
+        };
+        let ref_addr = reference_obj.as_ptr() as usize;
+        let referent_addr = referent.as_ptr() as usize;
+        let queue_addr = queue.map(|q| q.as_ptr() as usize);
+        self.shared.mem.ref_processor.lock().discover_reference(
+            rt,
+            ref_addr,
+            referent_addr,
+            queue_addr,
+        );
+    }
+
+    /// Round-5 fix (HIGH): wire native `Reference.get()` into the
+    /// reference processor's SoftReference LRU so cached referents stay
+    /// alive across major GCs proportional to how recently the
+    /// application touched them. The cost is one `SystemTime::now()`
+    /// plus a short linear scan / `BTreeMap` re-key — the same overhead
+    /// HotSpot pays on every soft-ref `get()` call.
+    fn touch_soft_reference(&mut self, reference_obj: ObjectRef) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let ref_addr = reference_obj.as_ptr() as usize;
+        self.shared
+            .mem
+            .ref_processor
+            .lock()
+            .touch_soft_reference(ref_addr, now_ms);
+    }
+
+    /// INT-8: `Reference.get()` keep-alive — route the just-read referent
+    /// through the heap's standalone SATB barrier so an active G1 mark cycle logs
+    /// it as a root (the marker cannot see it through the hidden referent
+    /// slot). No-op when no cycle is active; on Generational/ZGC the
+    /// SATB barrier's marking-active gate keeps it equally cheap.
+    fn gc_reference_keep_alive(&mut self, referent: ObjectRef) {
+        // This is a keep-alive, not a reference store. `write_barrier_pre`
+        // must pair with a post-store barrier; using the standalone SATB
+        // enqueue avoids leaving that debug triad armed.
+        self.shared
+            .mem
+            .heap
+            .satb_barrier(Value::Object(Some(referent)));
+    }
+}
+
+impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
+
 
     // -- Threading methods --
 
@@ -6701,14 +8231,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 self.thread.pin_reason = "";
             }
         }
-    }
-
-    /// T1.6.7 вЂ” `Thread.holdsLock(Object)` real implementation.
-    fn current_thread_holds_lock(&self, obj: ObjectRef) -> bool {
-        self.shared
-            .threads
-            .monitors
-            .holds(obj, self.thread.thread_id)
     }
 
     fn monitor_wait(&mut self, mut obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
@@ -7054,7 +8576,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `-Xss` CLI flag will gate the *Java* stack-depth limit
         // (`max_stack_depth` in `JvmConfig`) independently of this native
         // budget.
-        let child_stack_size = std::env::var("RUST_MIN_STACK")
+        let child_stack_size = cratonvm_types::flags::runtime_var("RUST_MIN_STACK")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(8 * 1024 * 1024);
@@ -7243,7 +8765,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Gated diagnostic (CRATONVM_DBG_THREADSTART): log each spawned
             // thread's run-class on entry and its result on exit — surfaces
             // threads that never start their target or block inside run().
-            let dbg_ts = std::env::var("CRATONVM_DBG_THREADSTART").is_ok();
+            let dbg_ts = cratonvm_types::flags::runtime_var("CRATONVM_DBG_THREADSTART").is_ok();
             if dbg_ts {
                 let cn = shared_arc
                     .classes.class_manager
@@ -7351,7 +8873,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let pin_base = jvm_thread.native_pin_roots.len();
                     jvm_thread.native_pin_roots.push(exc);
                     let exc_ref = jvm_thread.native_pin_roots[pin_base];
-                    if std::env::var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
                         let cid = shared_arc.mem.heap.class_id_of(exc_ref);
                         let cname = shared_arc
                             .classes.class_manager
@@ -8140,6 +9662,979 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.threads.virtual_thread_manager.wake_waiters(key);
     }
 
+    fn active_thread_count(&self) -> i32 {
+        self.shared.threads.thread_registry.alive_count() as i32
+    }
+
+    fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef> {
+        self.shared
+            .threads
+            .thread_registry
+            .alive_thread_objects(max)
+    }
+
+    fn begin_blocking_region(&mut self) {
+        self.begin_blocking_region_with_state(1);
+    }
+
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region_with_state(3);
+    }
+
+    fn end_blocking_region(&mut self) {
+        // T19.H1 — leave the blocked region; clear the mark and re-sync
+        // with any GC that ran while we were blocked.
+        self.shared.mem.gc_barrier.mark_blocked_region_leave();
+        self.check_post_block_gc();
+    }
+
+    fn end_blocking_region_refs(&mut self, refs: &mut [Value]) {
+        // Like `end_blocking_region`, but also rewrites the caller's
+        // native-local raw `Value` refs through the accumulated blocked-GC
+        // fixup (the `ReferenceQueue.remove` poll receiver would otherwise
+        // keep its stale pre-GC address — the stale-receiver writer).
+        self.shared.mem.gc_barrier.mark_blocked_region_leave();
+        self.check_post_block_gc_refs(refs);
+    }
+
+    fn park(&mut self, timeout: Option<std::time::Duration>) {
+        // JDK spec: if interrupted, park returns immediately (no exception, flag NOT cleared)
+        if self
+            .thread
+            .interrupted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        // AQS-PARK-PIN (Tomcat DoHead JIT×GC young-sweep corruption): real-JDK
+        // `LockSupport.park()` callers that track a blocker object (notably
+        // `AbstractQueuedSynchronizer$ConditionObject.await()`, via
+        // `LockSupport.setCurrentBlocker(this)` before the blocking call) write
+        // it into the real `java.lang.Thread.parkBlocker` field — which SHOULD
+        // already keep the ConditionObject (and transitively its `firstWaiter`
+        // wait-queue chain, e.g. the awaiting `ConditionNode`) reachable via
+        // ordinary field tracing from this thread's mirror (always a root, see
+        // `deposit_root_snapshot` below). But a JIT-compiled `await()` /
+        // `ConditionNode.block()` frame can ALSO hold the same objects purely
+        // in a callee-saved register that is never spilled to any scannable
+        // stack slot for the entire blocked duration — invisible to
+        // `scan_active_jit_frames`'s conservative stack scan (see
+        // docs/known-issues on the register-invisibility family). Re-read
+        // `parkBlocker` and pin it as an extra, register-independent
+        // `native_pin_roots` entry for the duration of the block: belt-and-
+        // suspenders alongside the field write, using the SAME object the JDK
+        // already considers "what this thread is parked on", so an AQS
+        // executor/poller worker's Condition chain survives a concurrent young
+        // GC even if every register-resident copy is missed. No-op (and thus
+        // free) whenever the mirror has no real `parkBlocker` field (synthetic
+        // JDK) or the field is currently null (park() called without a tracked
+        // blocker).
+        let mut blocker_pin = None;
+        if let Some(thread_obj) = self.thread.java_thread_obj {
+            if let Value::Object(Some(blocker)) = self.get_field_by_name(thread_obj, "parkBlocker")
+            {
+                blocker_pin = Some(self.pin_native_root(blocker));
+            }
+        }
+        // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
+        // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
+        // grow/realloc the young arena while this thread is parked, freeing
+        // the buffer the TLAB points into.
+        self.thread.tlab.retire();
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(1, std::sync::atomic::Ordering::Release);
+        // Deposit root snapshot before blocking so GC can scan this thread
+        self.deposit_root_snapshot();
+
+        // NEW-15.4: virtual-thread aware park — pinned VTs emit
+        // `jdk.VirtualThreadPinned`.
+        //
+        // A non-pinned VT used to `virtual_scheduler.release()` here and
+        // `.acquire()` after the park. That was removed 2026-07-26: the permit
+        // pool was disjoint from the real carriers, so the release freed no
+        // carrier (this OS thread stays blocked in `park_interruptible`
+        // either way — see §7.2 of
+        // `docs/internal/arch-2026-07-26/virtual-threads.md`), while the
+        // post-park `acquire()` was a live hang risk. Nothing else in the tree
+        // acquires from that pool, so with more concurrently-parked virtual
+        // threads than `carrier_count`, the surplus acquirers blocked on a
+        // permit no one would return — a carrier wedged waiting on a
+        // bookkeeping counter. Removing it loses no backpressure, because
+        // there was none to lose.
+        let is_virtual = matches!(self.thread.kind, crate::threading::ThreadKind::Virtual);
+        let pin_count = self.thread.pin_count;
+        if is_virtual && pin_count > 0 {
+            let reason = if self.thread.pin_reason.is_empty() {
+                "Pinned (park)"
+            } else {
+                self.thread.pin_reason
+            };
+            // Inline JFR emission (avoids borrowing self twice).
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let mut jfr = self.shared.debug.flight_recorder.lock();
+            cratonvm_jfr::builtin::emit_virtual_thread_pinned_event(
+                &mut jfr,
+                &self.thread.name,
+                reason,
+                self.thread.thread_id.0,
+                self.thread.thread_id.0,
+                now_ns,
+            );
+        }
+
+        let park_start = std::time::Instant::now();
+        // T19.H1 — mark GC-blocked across the park so a stop-the-world
+        // GC does not wait for this (parked, GC-safe) thread. The
+        // `BlockedGuard` clears the mark on drop regardless of how the
+        // park returns. A watchdog stack-dump request unparks this thread
+        // (see `request_stack_dump` → `unpark_all_for_stack_dump`); on
+        // return it re-enters the interpreter loop, whose top-of-loop poll
+        // emits its current frames — no per-park snapshot cost needed.
+        {
+            let blk = self.shared.mem.gc_barrier.enter_blocked();
+            // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
+            // investigation): correlate against [stw-expected]'s identity
+            // list to see whether this thread's park() call landed before
+            // or after the pause was requested, and whether pre_stw-gated
+            // arrival actually fires.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                eprintln!(
+                    "[stw-park] tid={} pre_stw={}",
+                    self.thread.thread_id.0, blk.pre_stw
+                );
+            }
+            if blk.pre_stw {
+                // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
+                // already raised `in_blocked_region` before this check.
+                let _ = self
+                    .shared
+                    .mem
+                    .gc_barrier
+                    .arrive_and_wait_auto(self.thread.thread_id);
+            }
+            self.thread
+                .park_state
+                .park_interruptible(timeout, &self.thread.interrupted);
+            drop(blk);
+        }
+        let park_dur = park_start.elapsed();
+
+        // Check if GC happened while we were blocked
+        self.check_post_block_gc();
+        // AQS-PARK-PIN: drop the extra `parkBlocker` root now that we're done
+        // blocking — we never read the value back (unlike `monitor_wait_keepalive`)
+        // since nothing here continues using it; it only needed to survive as a
+        // GC root for the parked duration above.
+        if let Some(pin) = blocker_pin {
+            self.unpin_native_roots(pin);
+        }
+        // Emit JFR thread park event
+        {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let timeout_ns = timeout.map(|d| d.as_nanos() as i64).unwrap_or(0);
+            let mut jfr = self.shared.debug.flight_recorder.lock();
+            cratonvm_jfr::builtin::emit_thread_park_event(
+                &mut jfr,
+                "java/util/concurrent/locks/LockSupport",
+                timeout_ns,
+                0, // address
+                self.thread.thread_id.0 as u64,
+                now_ns.saturating_sub(park_dur.as_nanos() as u64),
+                park_dur.as_nanos() as u64,
+            );
+        }
+    }
+
+    fn unpark(&self, thread_obj: ObjectRef) {
+        if let Some(tid) = resolve_thread_id_from_thread_obj(self.shared, thread_obj) {
+            if self.shared.threads.virtual_thread_manager.is_virtual(tid.0) {
+                self.shared
+                    .threads
+                    .virtual_thread_manager
+                    .cancel_wakeup(tid.0);
+                self.shared
+                    .threads
+                    .virtual_thread_manager
+                    .unpark_virtual(tid.0);
+                return;
+            }
+        }
+        // Find the ParkState associated with this Java Thread object
+        // by looking up in the thread registry.
+        if let Some(park_state) = self.shared.find_park_state_for_thread_obj(thread_obj) {
+            park_state.unpark();
+        } else if crate::runtime::env_cache::dbg_unpark_miss() {
+            // DBG: a miss here is a SILENTLY LOST WAKEUP — the caller's
+            // Thread-mirror address matched no registered thread. Print the
+            // stale address, what its header currently claims to be, and the
+            // registry's live mirror addresses so the delta (e.g. a young
+            // address whose thread was promoted to old gen) is visible.
+            let class_id = self.shared.mem.heap.class_id_of(thread_obj);
+            eprintln!(
+                "[unpark] MISS obj={:p} header_class_id={:?} registry={:x?}",
+                thread_obj.as_ptr(),
+                class_id,
+                self.shared.threads.thread_registry.debug_thread_obj_addrs(),
+            );
+        }
+    }
+
+    // -- Scoped Values (JEP 446, Java 25) --
+
+    fn get_scoped_value(&self, key_id: u64) -> Option<Value> {
+        // Search top-to-bottom for matching key_id
+        for (k, _key_ref, v) in self.thread.scoped_values.iter().rev() {
+            if *k == key_id {
+                return Some(*v);
+            }
+        }
+        None
+    }
+
+    fn push_scoped_value(&mut self, key_id: u64, value: Value) {
+        // Legacy API: no key ObjectRef supplied. Round-9 GC fix prefers
+        // `push_scoped_value_with_key` so the key itself is GC-pinned.
+        self.thread.scoped_values.push((key_id, None, value));
+    }
+
+    fn push_scoped_value_with_key(
+        &mut self,
+        key_id: u64,
+        key_ref: Option<cratonvm_types::ObjectRef>,
+        value: Value,
+    ) {
+        self.thread.scoped_values.push((key_id, key_ref, value));
+    }
+
+    fn pop_scoped_value(&mut self) {
+        self.thread.scoped_values.pop();
+    }
+
+    fn scoped_value_depth(&self) -> usize {
+        self.thread.scoped_values.len()
+    }
+}
+
+impl<'a> NativeExceptionAccess for NativeContextImpl<'a> {
+
+
+    fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
+        self.capture_current_stack_trace()
+    }
+
+    fn capture_throwable_stack_trace(&mut self, throwable: ObjectRef) -> Vec<StackTraceEntry> {
+        let trace = self.capture_current_stack_trace();
+        self.shared
+            .store_throwable_stack_trace(throwable, trace.clone());
+        trace
+    }
+
+    fn get_stack_trace(&self, throwable_hash: i32) -> Option<Vec<StackTraceEntry>> {
+        let r = self.shared.throwable_stack_trace(throwable_hash);
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STTRACE").is_some() {
+            eprintln!(
+                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={}",
+                r.is_some(),
+                r.as_ref().map_or(0, Vec::len),
+            );
+        }
+        r
+    }
+
+    fn frame_class_ids(&self) -> Vec<ClassId> {
+        // `self.thread.frames` is stored outermost-first (index 0 = the
+        // oldest call still on the stack); reverse so callers see
+        // innermost-first, matching `capture_stack_trace`'s `.iter().rev()`
+        // convention (see its own callers, e.g. `resolve_caller_class_id`).
+        self.thread
+            .frames
+            .iter()
+            .rev()
+            .map(|f| f.class_id)
+            .collect()
+    }
+}
+
+impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
+
+
+    /// Phase 5: override the GPU dispatch escape hatch. Delegates
+    /// to `crate::runtime::offload::dispatch_method_from_native`
+    /// when the gpu-offload feature is on; otherwise returns None
+    /// (the trait's default).
+    fn gpu_dispatch_method(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            Some(crate::runtime::offload::dispatch_method_from_native(
+                self.shared,
+                class_name,
+                method_name,
+                descriptor,
+                java_args,
+            ))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (class_name, method_name, descriptor, java_args);
+            None
+        }
+    }
+
+    /// GpuStream affinity — override the stream-mint escape hatch.
+    /// Delegates to `OffloadCache::stream_create` on the per-VM
+    /// default-ordinal cache when the gpu-offload feature is on;
+    /// otherwise returns `None` (the trait's default).
+    fn gpu_stream_create(&mut self) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .stream_create()
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            None
+        }
+    }
+
+    /// GpuStream affinity — override the stream-release escape hatch.
+    /// Delegates to `OffloadCache::stream_release`; a no-op when the
+    /// gpu-offload feature is off (the trait's default already
+    /// covers that, but the cache lookup itself is guarded the same
+    /// way every other GPU override in this impl is).
+    fn gpu_stream_release(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            self.shared
+                .offload_registry
+                .get_or_create(self.shared.config.gpu_device_ordinal, &self.shared.config)
+                .stream_release(handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// GpuStream affinity — stream-affine sibling of
+    /// `gpu_dispatch_method`. Delegates to
+    /// `crate::runtime::offload::dispatch_method_from_native_on_stream`
+    /// (same class/method resolution + marshalling as
+    /// `gpu_dispatch_method`, plus the `stream_handle` resolution
+    /// step) when the gpu-offload feature is on; otherwise returns
+    /// `None` (the trait's default, which itself falls back to
+    /// `gpu_dispatch_method`).
+    fn gpu_dispatch_method_on_stream(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+        java_args: &[Value],
+        stream_handle: Option<u64>,
+    ) -> Option<u64> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            Some(
+                crate::runtime::offload::dispatch_method_from_native_on_stream(
+                    self.shared,
+                    class_name,
+                    method_name,
+                    descriptor,
+                    java_args,
+                    stream_handle,
+                ),
+            )
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = (
+                class_name,
+                method_name,
+                descriptor,
+                java_args,
+                stream_handle,
+            );
+            None
+        }
+    }
+
+    /// Phase 6 #4 (2026-07-11: switched to the non-blocking poll) —
+    /// query the real GPU submission registry for `handle`'s completion
+    /// state.
+    ///
+    /// Previously a pure `sub.status.lock()` peek: it read whatever
+    /// `SubmissionStatus` the submission already carried but never
+    /// asked the device anything, so it could never observe a
+    /// completion that some other caller (`futureSynchronize`/`get()`)
+    /// hadn't already finalized — `futureIsDone` stayed `false` forever
+    /// for a submission nobody was blocking on. Now delegates to
+    /// `runtime::offload::poll_submission_status`, which finalizes the
+    /// submission inline (bounded work only — by the time it does, the
+    /// device event has already fired) the first time it observes the
+    /// device-side work as done. `Native.futureIsDone`/`futureStatus`
+    /// (`native-builtins/src/craton_gpu.rs`) are therefore now
+    /// genuinely non-blocking-but-live rather than only ever reporting
+    /// stale `Running`.
+    fn gpu_future_status(&self, handle: u64) -> Option<i32> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let outcome = crate::runtime::offload::poll_submission_status(self.shared, handle)?;
+            Some(match outcome {
+                crate::runtime::offload::PollOutcome::Running => 0,
+                crate::runtime::offload::PollOutcome::Completed => 1,
+                crate::runtime::offload::PollOutcome::Failed => 2,
+            })
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// 2026-07-11 — `NativeContext::gpu_future_take_result` override.
+    /// See the trait doc comment (`native-api/src/registry.rs`) for the
+    /// full contract; this is the read half that hands back a completed
+    /// submission's `SerializedResult` (translated into the
+    /// `native-api`-side `GpuFutureResult` transport enum, since
+    /// `native-api` cannot depend on this crate's `offload` types).
+    ///
+    /// Reuses `poll_submission_status` — the same non-blocking,
+    /// finalize-only-if-the-device-already-reported-done path
+    /// `gpu_future_status` now uses — so a caller that already observed
+    /// `isDone() == true` gets the result with no wait, and a caller
+    /// that hasn't gets `None` rather than an implicit block.
+    fn gpu_future_take_result(
+        &self,
+        handle: u64,
+    ) -> Option<cratonvm_native_api::registry::GpuFutureResult> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::runtime::offload::{PollOutcome, SerializedResult, SubmissionStatus};
+
+            // Only a terminal `Completed` outcome carries a result;
+            // `Running` and `Failed` (and an unknown handle, which
+            // `poll_submission_status` already reports as `None`) don't.
+            // This never blocks: `poll_submission_status` only ever
+            // finalizes inline when the device has already reported the
+            // work done, never by waiting for it to.
+            if crate::runtime::offload::poll_submission_status(self.shared, handle)?
+                != PollOutcome::Completed
+            {
+                return None;
+            }
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            let status = sub.status.lock();
+            match &*status {
+                SubmissionStatus::Completed { result } => Some(match result {
+                    SerializedResult::Void => cratonvm_native_api::registry::GpuFutureResult::Void,
+                    SerializedResult::ScalarI32(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarI32(*v)
+                    }
+                    SerializedResult::ScalarI64(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarI64(*v)
+                    }
+                    SerializedResult::ScalarF32(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarF32(*v)
+                    }
+                    SerializedResult::ScalarF64(v) => {
+                        cratonvm_native_api::registry::GpuFutureResult::ScalarF64(*v)
+                    }
+                    // `finalize_submission` never actually constructs one
+                    // of these today: array outputs are copied back to
+                    // the caller's own Java array via `MarshalWriteback`
+                    // writeback entries (drained by `finalize_submission`
+                    // itself), not stamped into `SerializedResult` — its
+                    // `scalar_result` local is only ever set by the
+                    // single Part-E scalar writeback kind, so a
+                    // `Completed` status here only ever holds `Void` or a
+                    // `Scalar*` variant in practice. These arms are
+                    // therefore unreachable today; map to `Void`
+                    // defensively rather than panic if that ever changes.
+                    SerializedResult::PrimitiveArrayI32 { .. }
+                    | SerializedResult::PrimitiveArrayI64 { .. }
+                    | SerializedResult::PrimitiveArrayF32 { .. }
+                    | SerializedResult::PrimitiveArrayF64 { .. } => {
+                        cratonvm_native_api::registry::GpuFutureResult::Void
+                    }
+                }),
+                // `poll_submission_status` just reported `Completed`
+                // under its own lock acquisition; this re-locks and
+                // should see the same terminal state (a submission never
+                // regresses out of a terminal status). Stay defensive
+                // rather than assume that invariant instead of checking it.
+                _ => None,
+            }
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Phase 8 #1: evict the device-buffer cache entry for a
+    /// GpuArray handle. Called from `Native.releaseArray` when Java
+    /// drops the wrapper.
+    fn gpu_release_array_cache(&mut self, handle: u64) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::release(handle);
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+        }
+    }
+
+    /// Phase 10 #1: wipe the explicit-submit input-residency
+    /// cache. Called from `Native.releaseExecutor` so device
+    /// buffers cached for plain JVM primitive arrays are freed when
+    /// the Java `GpuExecutor` is closed.
+    fn gpu_clear_input_cache(&mut self) {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::input_cache::clear_all();
+        }
+    }
+
+    /// Phase 9 #1: materialise dirty device-side bytes into a
+    /// host buffer. The caller (the `Native.arrayToHost` shim)
+    /// stamps the returned bytes into the resident store before
+    /// rebuilding the Java array. None means "no download
+    /// needed" — either the entry is unknown or already-clean.
+    fn gpu_array_download_if_dirty(&self, handle: u64) -> Option<Vec<u8>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            crate::runtime::offload::device_cache::download_into_bytes_if_dirty(handle)
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// Phase 6 #5 + Phase 9 #2 push 2: resolve a lambda proxy back to
+    /// its target method + captured values for GPU dispatch.
+    ///
+    /// Non-static targets (`InvokeVirtual` / `InvokeSpecial`) are
+    /// admitted when the captured-value list begins with a non-null
+    /// receiver — the receiver becomes `java_args[0]` to
+    /// [`dispatch_method_from_native`], which extracts the analyzer's
+    /// recorded `this_field_cps` from the receiver before processing
+    /// remaining captures as kernel args.
+    ///
+    /// Still rejected:
+    /// - `InvokeInterface` (no fixture today)
+    /// - `NewInvokeSpecial` (heap construction on the device — no GPU
+    ///   semantics)
+    /// - `GetField` / `PutField` / `GetStatic` / `PutStatic` method
+    ///   handles (no GPU semantics for arbitrary field access)
+    fn gpu_resolve_lambda_target(
+        &self,
+        callable: ObjectRef,
+    ) -> Option<(String, String, String, Vec<Value>)> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            use crate::classloading::resolution::MethodHandleKind;
+            let cid = self.shared.mem.heap.class_id_of(callable);
+            let proxies = self.shared.classes.lambda_proxies.read();
+            let lcs = proxies.get(&cid)?;
+            // Phase 9 #2 — admit InvokeStatic, InvokeVirtual, and
+            // InvokeSpecial. The analyzer's non-static relaxation
+            // means a virtual/special call's target can be admitted
+            // when its body uses the `aload_0; getfield <field>`
+            // shape; the marshaller extracts those fields from the
+            // receiver. Other handle kinds remain CPU-only.
+            let kind_admitted = matches!(
+                lcs.impl_handle.kind,
+                MethodHandleKind::InvokeStatic
+                    | MethodHandleKind::InvokeVirtual
+                    | MethodHandleKind::InvokeSpecial
+            );
+            if !kind_admitted {
+                tracing::debug!(
+                    target: "gpu.offload",
+                    handle_kind = ?lcs.impl_handle.kind,
+                    target_class = %lcs.impl_handle.class_name,
+                    target_member = %lcs.impl_handle.member_name,
+                    "lambda target rejected: handle kind has no GPU lowering",
+                );
+                return None;
+            }
+            // Merge bridge: `impl_handle` fields are `Arc<str>` in the
+            // current reader; the GPU lambda-resolver tuple is typed
+            // `String`. Convert explicitly.
+            let class_name = lcs.impl_handle.class_name.to_string();
+            let member_name = lcs.impl_handle.member_name.to_string();
+            let descriptor = lcs.impl_handle.descriptor.to_string();
+            let n_captures = lcs.capture_types.len();
+            drop(proxies);
+            let mut captures = Vec::with_capacity(n_captures);
+            for i in 0..n_captures {
+                captures.push(self.shared.mem.heap.get_field(callable, i));
+            }
+            Some((class_name, member_name, descriptor, captures))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = callable;
+            None
+        }
+    }
+
+    /// Phase 6 #4 + Phase 7 #1: block on the GPU submission and
+    /// run its deferred writebacks. If the submission still carries
+    /// a FinalizeState (the kernel may still be running on the GPU),
+    /// this is the call that:
+    ///   1. waits on the recorded event,
+    ///   2. drains all the device-to-host writebacks,
+    ///   3. drops the SafepointToken (releases GC).
+    /// Idempotent — subsequent calls find FinalizeState already
+    /// taken and return the cached terminal status.
+    fn gpu_future_synchronize(&self, handle: u64) -> Option<Result<(), String>> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            let sub = crate::runtime::offload::lookup_submission(handle)?;
+            Some(crate::runtime::offload::finalize_submission(
+                self.shared,
+                &sub,
+            ))
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            let _ = handle;
+            None
+        }
+    }
+
+    /// GPU device enumeration: delegate to the real CUDA bridge probe.
+    ///
+    /// `cuda_bridge::probe()` reports the primary device (ordinal 0) or
+    /// `Err(DeviceError::NoDriver)` when no driver is present or the
+    /// bridge was built in stub mode. We translate `Ok(caps)` into a
+    /// single-entry list and any `Err` into an empty list — so the
+    /// `Native.deviceCount` shim returns a truthful `0` on a driverless
+    /// host rather than fabricating a device.
+    fn gpu_device_info(&self) -> Vec<(String, u32, u32, u64)> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            match cuda_bridge::probe() {
+                Ok(caps) => vec![(
+                    caps.name,
+                    caps.compute_major,
+                    caps.compute_minor,
+                    caps.total_global_mem,
+                )],
+                Err(_) => Vec::new(),
+            }
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            Vec::new()
+        }
+    }
+}
+
+impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
+
+    // See the `NativeContext::refresh_root_snapshot` doc comment
+    // (native-api/src/registry.rs) for the full rationale — this closes the
+    // "pinned a long-lived batch, then drove long re-entrant/JIT-heavy
+    // execution without ever blocking or self-initiating GC" gap by reusing
+    // the existing blocking-path deposit mechanism without actually
+    // blocking.
+    fn refresh_root_snapshot(&mut self) {
+        // cceres3 ROOT FIX (WildFly boot CCE long tail): this is a
+        // NON-blocking republish — the caller (the native-collections stream
+        // drain loops) keeps executing Java right after it. The old
+        // `deposit_root_snapshot()` call was the raise=true variant: it set
+        // `in_blocked_region` and nothing ever consumed it, so the identity
+        // census EXCLUDED the running thread from every subsequent STW pause
+        // (moving collections completed under its feet), its
+        // `gc_block_state.fixup` accumulated unconsumed (observed live:
+        // fixup_pending=44 across four raise=true deposits while running 43
+        // frames deep in infinispan/management-model stream work), and every
+        // frame ref it held or stored went stale — the poisoned-island
+        // producer behind the WFLYCTL0079 / "Object cannot be cast to X"
+        // family. The no-flag variant republishes pins/snapshot without
+        // touching the flag — exactly what a still-running thread needs.
+        self.deposit_root_snapshot_no_flag();
+    }
+
+    fn is_executing_instance_method(
+        &self,
+        receiver: ObjectRef,
+        method_name: &str,
+        descriptor: &str,
+    ) -> bool {
+        let receiver = self.shared.mem.heap.load_and_forward(receiver);
+        self.thread.frames.iter().rev().any(|frame| {
+            if frame.method_name() != method_name || frame.method_descriptor() != descriptor {
+                return false;
+            }
+            matches!(
+                frame.get_local(0),
+                Value::Object(Some(this)) if self.shared.mem.heap.load_and_forward(this) == receiver
+            )
+        })
+    }
+
+    fn dbg_set_watch_cell(&mut self, addr: usize) {
+        cratonvm_gc::heap::set_dynamic_watch(addr);
+        crate::runtime::crash_handler::arm_generic_heap_watch(addr);
+    }
+
+    fn vm_identity(&self) -> usize {
+        self.shared.vm_identity
+    }
+
+    fn record_printed_value(&mut self, value: Value) {
+        self.thread.printed.push(value);
+    }
+
+    fn fast_unbox_primitive_wrapper(&self, obj: ObjectRef) -> Option<Option<Value>> {
+        let class_id = self.shared.mem.heap.class_id_of(obj);
+        let vm_key = self.shared as *const SharedVm as usize;
+        let cached =
+            PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, class_id)));
+        let is_wrapper = cached || {
+            let class_name = self
+                .shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(class_id)
+                .map(|class| class.name.clone());
+            let recognized = class_name.as_deref().is_some_and(|name| {
+                matches!(
+                    name,
+                    "java/lang/Integer"
+                        | "java/lang/Long"
+                        | "java/lang/Boolean"
+                        | "java/lang/Character"
+                        | "java/lang/Byte"
+                        | "java/lang/Short"
+                        | "java/lang/Float"
+                        | "java/lang/Double"
+                )
+            });
+            if recognized {
+                PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| {
+                    cache.set(Some((vm_key, class_id)));
+                });
+            }
+            recognized
+        };
+        if !is_wrapper {
+            return Some(None);
+        }
+        Some(match self.shared.mem.heap.get_field(obj, 0) {
+            value @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
+                Some(value)
+            }
+            _ => None,
+        })
+    }
+
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        // NIO-SERVER-SOCKET: `Unsafe.allocateMemory` returns synthetic arena
+        // handles (base 0x10_0000_0000), not real pointers. A
+        // `DirectByteBuffer.address()` from `Util.getTemporaryDirectBuffer`
+        // reaching `Net.read0`/`SocketDispatcher` is such a handle — route it
+        // through the off-heap store. Real OS pointers fall through to raw.
+        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+            return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
+        }
+        // Reject null / negative handles. Returning `false` (not performing the
+        // copy) is how this layer signals failure; the native caller turns that
+        // into the appropriate Java exception. The bounds of `out` itself are
+        // the Java-side array bounds — the caller has already sliced the array,
+        // so `out.len()` is the validated request size.
+        if addr <= 0 {
+            return false;
+        }
+        // Guard against an `addr + len` range that wraps past the end of the
+        // address space (a forged length on a high `addr`). Such a copy would
+        // read out-of-bounds / UB; refuse it instead. `addr > 0` here, so the
+        // `as u64` cast is exact.
+        if !native_range_is_in_bounds(addr as u64, out.len()) {
+            return false;
+        }
+        // SAFETY: `addr` is a real, readable native pointer (not an arena
+        // handle); the `[addr, addr + out.len())` range is non-wrapping
+        // (checked above) and `out.len()` bytes are copied from it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+            return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
+        }
+        // Reject null / negative handles (failure is signalled by `false`; the
+        // native caller raises the appropriate Java exception). `data` is the
+        // Java-side source slice, already bounds-checked by the caller.
+        if addr <= 0 {
+            return false;
+        }
+        // Refuse a destination range `[addr, addr + len)` that would wrap past
+        // the end of the address space (forged length on a high `addr`) — such
+        // a write is out-of-bounds / UB. `addr > 0`, so `as u64` is exact.
+        if !native_range_is_in_bounds(addr as u64, data.len()) {
+            return false;
+        }
+        // DBG (bc math-ec): a raw copy whose destination aliases the MANAGED
+        // HEAP is the prime suspect for the `0x4`-into-Fp-reference-field
+        // corruption (e.g. Unsafe.copyMemory(heapSrc, off, null, heapAddr, n)
+        // routed here with a heap dst). Catch it with the live Java stack so
+        // the offending call site is pinned. is_heap_addr is region-membership
+        // only (no header read) so it is safe on an arbitrary address.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_HEAPCOPY").is_some()
+            && self.shared.mem.heap.is_heap_addr(addr as usize).is_some()
+        {
+            let n = data.len().min(16);
+            eprintln!(
+                "[heapcopy-WRITE] addr=0x{:x} len={} data={:02x?}",
+                addr,
+                data.len(),
+                &data[..n],
+            );
+            for f in self.thread.frames.iter().rev().take(14) {
+                eprintln!(
+                    "[heapcopy-STK]   {}.{} pc={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.pc,
+                );
+            }
+        }
+        // SAFETY: `addr` is a real, writable native pointer (not an arena
+        // handle); `data.len()` bytes are copied to it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+        }
+        true
+    }
+
+    fn record_printed_line(&mut self, text: String) {
+        self.thread.printed_lines.push(text);
+    }
+
+    fn get_system_stream(&self, name: &str) -> Option<ObjectRef> {
+        match name {
+            "out" => *self.shared.system_out.read(),
+            "err" => *self.shared.system_err.read(),
+            "in" => *self.shared.system_in.read(),
+            _ => None,
+        }
+    }
+
+    fn cache_system_stdin(&mut self, stream: ObjectRef) {
+        *self.shared.system_in.write() = Some(stream);
+    }
+
+    fn get_cached_module_mirror(&self, module_name: Option<&str>) -> Option<ObjectRef> {
+        let key = module_name.unwrap_or("");
+        self.shared.classes.module_mirrors.read().get(key).copied()
+    }
+
+    fn cache_module_mirror(&mut self, module_name: Option<&str>, module: ObjectRef) {
+        let key = module_name.unwrap_or("").to_string();
+        self.shared
+            .classes
+            .module_mirrors
+            .write()
+            .insert(key, module);
+    }
+
+    fn get_system_property(&self, key: &str) -> Option<String> {
+        let normalized = normalize_system_property_key(key);
+        self.shared
+            .system_properties
+            .read()
+            .get(normalized)
+            .cloned()
+    }
+
+    fn list_system_properties(&self) -> Vec<(String, String)> {
+        self.shared
+            .system_properties
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    fn set_system_property(&mut self, key: &str, value: &str) -> Option<String> {
+        let normalized = normalize_system_property_key(key).to_string();
+        self.shared
+            .system_properties
+            .write()
+            .insert(normalized, value.to_string())
+    }
+
+    fn remove_system_property(&mut self, key: &str) -> Option<String> {
+        let normalized = normalize_system_property_key(key).to_string();
+        self.shared.system_properties.write().remove(&normalized)
+    }
+
+    fn ensure_synthetic_class(&mut self, name: &str, num_fields: usize) -> ClassId {
+        // Prefer the real class if it can be loaded — `ensure_synthetic_class`
+        // returns the existing id when the name is already registered, so a
+        // successful load here keeps native allocations on the real layout.
+        if let Ok(cid) = self.shared.load_class_concurrent(name) {
+            return cid;
+        }
+        // Real class unavailable: register a minimal synthetic class that
+        // declares `num_fields` instance fields. This guarantees the object
+        // header's `class_id` points at a class whose `num_total_fields`
+        // matches the allocated slot count, instead of `ClassId::new(0)`
+        // (`java/lang/Object`, zero declared fields) which the GC's
+        // `get_field` bounds guard rejects as an undersized layout.
+        self.shared
+            .classes
+            .class_manager
+            .write()
+            .ensure_synthetic_class(name, num_fields)
+    }
+
+    fn is_interface_class(&self, class_id: ClassId) -> bool {
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.is_interface())
+            .unwrap_or(false)
+    }
+
+    /// T1.6.7 вЂ” `Thread.holdsLock(Object)` real implementation.
+    fn current_thread_holds_lock(&self, obj: ObjectRef) -> bool {
+        self.shared
+            .threads
+            .monitors
+            .holds(obj, self.thread.thread_id)
+    }
+
     fn emit_virtual_thread_pinned_jfr(&mut self, reason: &'static str) {
         // Round-4: pin_reason is a JEP-491 enum-like literal — the underlying
         // `emit_virtual_thread_pinned_event` now requires `&'static str`.
@@ -8160,17 +10655,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             vt_id,
             now_ns,
         );
-    }
-
-    fn active_thread_count(&self) -> i32 {
-        self.shared.threads.thread_registry.alive_count() as i32
-    }
-
-    fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef> {
-        self.shared
-            .threads
-            .thread_registry
-            .alive_thread_objects(max)
     }
 
     /// T19_K2 вЂ” Register a native-spawned OS thread with the VM
@@ -8322,10 +10806,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         true
     }
 
-    fn heap_allocated_bytes(&self) -> usize {
-        self.shared.mem.heap.allocated_bytes()
-    }
-
     fn available_processor_count(&self) -> i32 {
         // Container-aware: prefer the cgroup-derived count the launcher stored
         // under `-XX:+UseContainerSupport`; otherwise fall back to the host
@@ -8372,223 +10852,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         crate::runtime::interpreter::force_gc_from_native(self.shared, self.thread);
     }
 
-    fn begin_blocking_region(&mut self) {
-        self.begin_blocking_region_with_state(1);
-    }
-
-    fn begin_timed_blocking_region(&mut self) {
-        self.begin_blocking_region_with_state(3);
-    }
-
-    fn end_blocking_region(&mut self) {
-        // T19.H1 — leave the blocked region; clear the mark and re-sync
-        // with any GC that ran while we were blocked.
-        self.shared.mem.gc_barrier.mark_blocked_region_leave();
-        self.check_post_block_gc();
-    }
-
-    fn end_blocking_region_refs(&mut self, refs: &mut [Value]) {
-        // Like `end_blocking_region`, but also rewrites the caller's
-        // native-local raw `Value` refs through the accumulated blocked-GC
-        // fixup (the `ReferenceQueue.remove` poll receiver would otherwise
-        // keep its stale pre-GC address — the stale-receiver writer).
-        self.shared.mem.gc_barrier.mark_blocked_region_leave();
-        self.check_post_block_gc_refs(refs);
-    }
-
-    fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
-        let cm = self.shared.classes.class_manager.read();
-        let Some(class) = cm.get_class(class_id) else {
-            return Vec::new();
-        };
-        let mut static_idx = 0usize;
-        let mut instance_idx = 0usize;
-        class
-            .fields
-            .iter()
-            .map(|f| {
-                let slot = if f.is_static() {
-                    let idx = static_idx;
-                    static_idx += 1;
-                    idx
-                } else {
-                    let idx = class.first_field_index + instance_idx;
-                    instance_idx += 1;
-                    idx
-                };
-                FieldMetadata {
-                    name: f.name.to_string(),
-                    descriptor: f.descriptor.to_string(),
-                    access_flags: f.access_flags.bits(),
-                    slot_index: slot,
-                    declaring_class_id: class_id,
-                    is_static: f.is_static(),
-                }
-            })
-            .collect()
-    }
-
-    fn declared_methods(&self, class_id: ClassId) -> Vec<MethodMetadata> {
-        let cm = self.shared.classes.class_manager.read();
-        let Some(class) = cm.get_class(class_id) else {
-            return Vec::new();
-        };
-        class
-            .methods
-            .iter()
-            .map(|m| {
-                // WP2.5 v3 — populate `exceptions` from the JVMS §4.7.5
-                // `Exceptions` attribute when present. Used by the proxy
-                // generator to thread the declared throws set into
-                // `<clinit>` so the dispatch helper's UTE wrap can match
-                // thrown exceptions against the method's declared set.
-                let exceptions: Vec<String> = m
-                    .attributes
-                    .iter()
-                    .find_map(|a| match a.as_decoded() {
-                        Some(cratonvm_reader::attribute::Attribute::Exceptions {
-                            exception_indices,
-                        }) => Some(
-                            exception_indices
-                                .iter()
-                                .filter_map(|idx| {
-                                    class.constant_pool.get_class_name(*idx).map(str::to_string)
-                                })
-                                .collect::<Vec<String>>(),
-                        ),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                MethodMetadata {
-                    name: m.name.to_string(),
-                    descriptor: m.descriptor.to_string(),
-                    access_flags: m.access_flags.bits(),
-                    declaring_class_id: class_id,
-                    exceptions,
-                }
-            })
-            .collect()
-    }
-
-    fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
-        let cm = self.shared.classes.class_manager.read();
-        cm.get_class(class_id)
-            .map(|c| c.interfaces.clone())
-            .unwrap_or_default()
-    }
-
-    // -- LinkResolver wiring (round-9 HIGH #7) -------------------------
-    //
-    // Probe / insert into the per-VM `LinkResolver` cache for Java-side
-    // reflection natives. Mirrors the JNI `GetMethodID` / `GetFieldID`
-    // wiring (round-8 CRIT #2) so Spring / Hibernate / ByteBuddy
-    // identical-triple probes through `Class.getDeclaredMethod` etc.
-    // hit the same cache as their JNI counterparts.
-
-    fn link_resolver_get_method(
-        &self,
-        class_id: ClassId,
-        name: &str,
-        descriptor: &str,
-    ) -> Option<(ClassId, u32)> {
-        use cratonvm_classloading::resolution::ResolvedMember;
-        match self
-            .shared
-            .classes
-            .link_resolver
-            .get(class_id, name, descriptor)?
-        {
-            ResolvedMember::Method {
-                declaring_class_id,
-                index,
-            } => Some((declaring_class_id, index)),
-            // A cached `NotFound` is a legitimate hit — return `None` so
-            // the caller short-circuits without re-walking the hierarchy.
-            // The caller distinguishes "cache cold miss" from "cache hit:
-            // not found" by checking `link_resolver_get_method` once and
-            // proceeding to the metadata walk only if `None` came back
-            // (the walk re-confirms NotFound and re-inserts; the cost is
-            // a single redundant cold-miss walk in the rare case the
-            // class genuinely lacks the member).
-            ResolvedMember::NotFound => None,
-            // Method probe matched a Field entry — should never happen
-            // for properly-keyed lookups but degrade safely.
-            ResolvedMember::Field { .. } => None,
-        }
-    }
-
-    fn link_resolver_insert_method(
-        &self,
-        class_id: ClassId,
-        name: &str,
-        descriptor: &str,
-        declaring: ClassId,
-        index: u32,
-    ) {
-        use cratonvm_classloading::resolution::ResolvedMember;
-        self.shared.classes.link_resolver.insert(
-            class_id,
-            cratonvm_types::intern_arc(name),
-            cratonvm_types::intern_arc(descriptor),
-            ResolvedMember::Method {
-                declaring_class_id: declaring,
-                index,
-            },
-        );
-    }
-
-    fn link_resolver_get_field(
-        &self,
-        class_id: ClassId,
-        name: &str,
-        descriptor: &str,
-    ) -> Option<(ClassId, u32, bool)> {
-        use cratonvm_classloading::resolution::ResolvedMember;
-        match self
-            .shared
-            .classes
-            .link_resolver
-            .get(class_id, name, descriptor)?
-        {
-            ResolvedMember::Field {
-                declaring_class_id,
-                absolute_index,
-                is_static,
-            } => Some((declaring_class_id, absolute_index, is_static)),
-            ResolvedMember::NotFound => None,
-            ResolvedMember::Method { .. } => None,
-        }
-    }
-
-    fn link_resolver_insert_field(
-        &self,
-        class_id: ClassId,
-        name: &str,
-        descriptor: &str,
-        declaring: ClassId,
-        absolute_index: u32,
-        is_static: bool,
-    ) {
-        use cratonvm_classloading::resolution::ResolvedMember;
-        self.shared.classes.link_resolver.insert(
-            class_id,
-            cratonvm_types::intern_arc(name),
-            cratonvm_types::intern_arc(descriptor),
-            ResolvedMember::Field {
-                declaring_class_id: declaring,
-                absolute_index,
-                is_static,
-            },
-        );
-    }
-
-    fn class_access_flags(&self, class_id: ClassId) -> u16 {
-        let cm = self.shared.classes.class_manager.read();
-        cm.get_class(class_id)
-            .map(|c| c.access_flags.bits())
-            .unwrap_or(0)
-    }
-
     fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value {
         super::get_static_shared(self.shared, class_id, field_index)
     }
@@ -8612,1645 +10875,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         None
     }
 
-    fn primitive_class_mirror(&mut self, name: &str) -> ObjectRef {
-        super::get_or_create_primitive_mirror(self.shared, name)
-    }
-
     fn fd_table(&self) -> &FileDescriptorTable {
         &self.shared.natives.fd_table
-    }
-
-    // -- WP0.2 ObjectStreamClass cache --
-
-    fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
-        self.shared.classes.osc_cache.get(class_id)
-    }
-
-    fn osc_cache_put(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
-        self.shared
-            .classes
-            .osc_cache
-            .insert_if_absent(class_id, desc)
-    }
-
-    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
-        // T10.9.E вЂ” descriptor-aware volatile read.
-        let class_id = self.shared.mem.heap.class_id_of(obj);
-        match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
-            Some(desc) => self.shared.mem.heap.get_field_volatile_as(obj, index, desc),
-            None => self.shared.mem.heap.get_field_volatile(obj, index),
-        }
-    }
-
-    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
-        if crate::runtime::env_cache::dbg_loader_trace() {
-            if let Value::Object(Some(o)) = value {
-                let new_cid = self.shared.mem.heap.class_id_of(o);
-                let cn = self
-                    .shared
-                    .classes
-                    .class_manager
-                    .read()
-                    .get_class(new_cid)
-                    .map(|c| c.name.to_string())
-                    .unwrap_or_default();
-                if cn.contains("RootReference") {
-                    eprintln!(
-                        "[LOADER-TRACE] set_field_volatile holder_obj={:p} slot={} new_obj={:p} new_class={} new_cid={}",
-                        obj.as_ptr(), index, o.as_ptr(), cn, new_cid.as_u32()
-                    );
-                }
-            }
-        }
-        // T10.9.E вЂ” descriptor-aware volatile write.
-        let class_id = self.shared.mem.heap.class_id_of(obj);
-        match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
-            Some(desc) => self
-                .shared
-                .mem
-                .heap
-                .set_field_volatile_as(obj, index, value, desc),
-            None => self.shared.mem.heap.set_field_volatile(obj, index, value),
-        }
-        // write_barrier fires automatically inside set_field_volatile в†’ set_field
-    }
-
-    fn compare_and_swap_field(
-        &mut self,
-        obj: ObjectRef,
-        index: usize,
-        expected: Value,
-        new_val: Value,
-    ) -> bool {
-        // T19_H6: descriptor-aware CAS read+write so a long instance field
-        // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
-        let is_array = self.shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
-        let class_id = self.shared.mem.heap.class_id_of(obj);
-        let descriptor = if is_array {
-            None
-        } else {
-            resolve_field_descriptor_byte_cached(self.shared, class_id, index)
-        };
-        let swapped = self.shared.threads.monitors.with_cas_lock(obj, || {
-            let current = if is_array {
-                self.shared
-                    .mem
-                    .heap
-                    .get_array_element(obj, index)
-                    .unwrap_or(Value::Object(None))
-            } else if let Some(desc) = descriptor {
-                self.shared.mem.heap.get_field_volatile_as(obj, index, desc)
-            } else {
-                self.shared.mem.heap.get_field_volatile(obj, index)
-            };
-            if values_equal_for_cas(&current, &expected) {
-                // Task #42 (deferred from #25): SATB pre-barrier on
-                // the CAS-putfield / CAS-aastore path.  Without it,
-                // a successful CAS that overwrites an old ref slot
-                // between G1 initial-mark and remark would silently
-                // drop the old reference from the live closure —
-                // the same lost-object scenario the interpreter's
-                // putfield/aastore paths already guard against. We
-                // dispatch through `VmHeap::satb_barrier` (the
-                // available API on this branch); `satb_barrier`
-                // short-circuits on null and on non-Object payloads,
-                // so primitive `Unsafe.compareAndSwapInt/Long` and
-                // null→x CAS pays effectively nothing.  Fires
-                // strictly BEFORE the store to preserve SATB
-                // (pre, store, post) ordering. On a non-G1
-                // generational backend the call is also a cheap
-                // tag-test no-op.
-                self.shared.mem.heap.satb_barrier(current);
-                if is_array {
-                    let _ = self.shared.mem.heap.set_array_element(obj, index, new_val);
-                } else if let Some(desc) = descriptor {
-                    self.shared
-                        .mem
-                        .heap
-                        .set_field_volatile_as(obj, index, new_val, desc);
-                } else {
-                    self.shared.mem.heap.set_field_volatile(obj, index, new_val);
-                }
-                true
-            } else {
-                false
-            }
-        });
-        if swapped {
-            if crate::runtime::env_cache::dbg_loader_trace() {
-                if let Value::Object(Some(o)) = new_val {
-                    let new_cid = self.shared.mem.heap.class_id_of(o);
-                    let cn = self
-                        .shared
-                        .classes
-                        .class_manager
-                        .read()
-                        .get_class(new_cid)
-                        .map(|c| c.name.to_string())
-                        .unwrap_or_default();
-                    if cn.contains("RootReference") {
-                        let holder_cid = self.shared.mem.heap.class_id_of(obj);
-                        let holder_cn = self
-                            .shared
-                            .classes
-                            .class_manager
-                            .read()
-                            .get_class(holder_cid)
-                            .map(|c| c.name.to_string())
-                            .unwrap_or_default();
-                        eprintln!(
-                            "[LOADER-TRACE] compare_and_swap_field SUCCESS holder_obj={:p} holder_class={} slot={} new_obj={:p} new_class={} new_cid={}",
-                            obj.as_ptr(), holder_cn, index, o.as_ptr(), cn, new_cid.as_u32()
-                        );
-                    }
-                }
-            }
-            self.shared.mem.heap.write_barrier(obj, new_val);
-        }
-        // T19.H7 diag: count CAS failures so we can spot a livelock.
-        // Static counter gated to ~5 emissions then 1 every 1M.
-        // Feature-gated (off by default) вЂ” see vm/Cargo.toml
-        // `experimental-t19-diag`. Re-enable with
-        // `--features experimental-t19-diag`.
-        #[cfg(feature = "experimental-t19-diag")]
-        if !swapped {
-            static CAS_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = CAS_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 5 || n % 1_000_000 == 0 {
-                let cn = self
-                    .shared
-                    .classes
-                    .class_manager
-                    .read()
-                    .get_class(class_id)
-                    .map(|c| c.name.to_string())
-                    .unwrap_or_else(|| format!("cid={}", class_id.as_u32()));
-                tracing::debug!(
-                    target: "cratonvm::t19_h7_cas",
-                    "CAS FAIL #{n} class={cn} slot={index} desc={:?} expected={:?} new={:?}",
-                    descriptor.map(|b| b as char), expected, new_val,
-                );
-            }
-        }
-        swapped
-    }
-
-    fn park(&mut self, timeout: Option<std::time::Duration>) {
-        // JDK spec: if interrupted, park returns immediately (no exception, flag NOT cleared)
-        if self
-            .thread
-            .interrupted
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        // AQS-PARK-PIN (Tomcat DoHead JIT×GC young-sweep corruption): real-JDK
-        // `LockSupport.park()` callers that track a blocker object (notably
-        // `AbstractQueuedSynchronizer$ConditionObject.await()`, via
-        // `LockSupport.setCurrentBlocker(this)` before the blocking call) write
-        // it into the real `java.lang.Thread.parkBlocker` field — which SHOULD
-        // already keep the ConditionObject (and transitively its `firstWaiter`
-        // wait-queue chain, e.g. the awaiting `ConditionNode`) reachable via
-        // ordinary field tracing from this thread's mirror (always a root, see
-        // `deposit_root_snapshot` below). But a JIT-compiled `await()` /
-        // `ConditionNode.block()` frame can ALSO hold the same objects purely
-        // in a callee-saved register that is never spilled to any scannable
-        // stack slot for the entire blocked duration — invisible to
-        // `scan_active_jit_frames`'s conservative stack scan (see
-        // docs/known-issues on the register-invisibility family). Re-read
-        // `parkBlocker` and pin it as an extra, register-independent
-        // `native_pin_roots` entry for the duration of the block: belt-and-
-        // suspenders alongside the field write, using the SAME object the JDK
-        // already considers "what this thread is parked on", so an AQS
-        // executor/poller worker's Condition chain survives a concurrent young
-        // GC even if every register-resident copy is missed. No-op (and thus
-        // free) whenever the mirror has no real `parkBlocker` field (synthetic
-        // JDK) or the field is currently null (park() called without a tracked
-        // blocker).
-        let mut blocker_pin = None;
-        if let Some(thread_obj) = self.thread.java_thread_obj {
-            if let Value::Object(Some(blocker)) = self.get_field_by_name(thread_obj, "parkBlocker")
-            {
-                blocker_pin = Some(self.pin_native_root(blocker));
-            }
-        }
-        // GCAUDIT-0711-FIX (finding 1a, adjacent): retire BEFORE deposit —
-        // see `monitor_enter_blocking`. CRIT (TLAB UAF): a STW GC can
-        // grow/realloc the young arena while this thread is parked, freeing
-        // the buffer the TLAB points into.
-        self.thread.tlab.retire();
-        self.thread
-            .gc_block_state
-            .java_state
-            .store(1, std::sync::atomic::Ordering::Release);
-        // Deposit root snapshot before blocking so GC can scan this thread
-        self.deposit_root_snapshot();
-
-        // NEW-15.4: virtual-thread aware park — pinned VTs emit
-        // `jdk.VirtualThreadPinned`.
-        //
-        // A non-pinned VT used to `virtual_scheduler.release()` here and
-        // `.acquire()` after the park. That was removed 2026-07-26: the permit
-        // pool was disjoint from the real carriers, so the release freed no
-        // carrier (this OS thread stays blocked in `park_interruptible`
-        // either way — see §7.2 of
-        // `docs/internal/arch-2026-07-26/virtual-threads.md`), while the
-        // post-park `acquire()` was a live hang risk. Nothing else in the tree
-        // acquires from that pool, so with more concurrently-parked virtual
-        // threads than `carrier_count`, the surplus acquirers blocked on a
-        // permit no one would return — a carrier wedged waiting on a
-        // bookkeeping counter. Removing it loses no backpressure, because
-        // there was none to lose.
-        let is_virtual = matches!(self.thread.kind, crate::threading::ThreadKind::Virtual);
-        let pin_count = self.thread.pin_count;
-        if is_virtual && pin_count > 0 {
-            let reason = if self.thread.pin_reason.is_empty() {
-                "Pinned (park)"
-            } else {
-                self.thread.pin_reason
-            };
-            // Inline JFR emission (avoids borrowing self twice).
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            let mut jfr = self.shared.debug.flight_recorder.lock();
-            cratonvm_jfr::builtin::emit_virtual_thread_pinned_event(
-                &mut jfr,
-                &self.thread.name,
-                reason,
-                self.thread.thread_id.0,
-                self.thread.thread_id.0,
-                now_ns,
-            );
-        }
-
-        let park_start = std::time::Instant::now();
-        // T19.H1 — mark GC-blocked across the park so a stop-the-world
-        // GC does not wait for this (parked, GC-safe) thread. The
-        // `BlockedGuard` clears the mark on drop regardless of how the
-        // park returns. A watchdog stack-dump request unparks this thread
-        // (see `request_stack_dump` → `unpark_all_for_stack_dump`); on
-        // return it re-enters the interpreter loop, whose top-of-loop poll
-        // emits its current frames — no per-park snapshot cost needed.
-        {
-            let blk = self.shared.mem.gc_barrier.enter_blocked();
-            // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
-            // investigation): correlate against [stw-expected]'s identity
-            // list to see whether this thread's park() call landed before
-            // or after the pause was requested, and whether pre_stw-gated
-            // arrival actually fires.
-            if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
-                eprintln!(
-                    "[stw-park] tid={} pre_stw={}",
-                    self.thread.thread_id.0, blk.pre_stw
-                );
-            }
-            if blk.pre_stw {
-                // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
-                // already raised `in_blocked_region` before this check.
-                let _ = self
-                    .shared
-                    .mem
-                    .gc_barrier
-                    .arrive_and_wait_auto(self.thread.thread_id);
-            }
-            self.thread
-                .park_state
-                .park_interruptible(timeout, &self.thread.interrupted);
-            drop(blk);
-        }
-        let park_dur = park_start.elapsed();
-
-        // Check if GC happened while we were blocked
-        self.check_post_block_gc();
-        // AQS-PARK-PIN: drop the extra `parkBlocker` root now that we're done
-        // blocking — we never read the value back (unlike `monitor_wait_keepalive`)
-        // since nothing here continues using it; it only needed to survive as a
-        // GC root for the parked duration above.
-        if let Some(pin) = blocker_pin {
-            self.unpin_native_roots(pin);
-        }
-        // Emit JFR thread park event
-        {
-            let now_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            let timeout_ns = timeout.map(|d| d.as_nanos() as i64).unwrap_or(0);
-            let mut jfr = self.shared.debug.flight_recorder.lock();
-            cratonvm_jfr::builtin::emit_thread_park_event(
-                &mut jfr,
-                "java/util/concurrent/locks/LockSupport",
-                timeout_ns,
-                0, // address
-                self.thread.thread_id.0 as u64,
-                now_ns.saturating_sub(park_dur.as_nanos() as u64),
-                park_dur.as_nanos() as u64,
-            );
-        }
-    }
-
-    fn unpark(&self, thread_obj: ObjectRef) {
-        if let Some(tid) = resolve_thread_id_from_thread_obj(self.shared, thread_obj) {
-            if self.shared.threads.virtual_thread_manager.is_virtual(tid.0) {
-                self.shared
-                    .threads
-                    .virtual_thread_manager
-                    .cancel_wakeup(tid.0);
-                self.shared
-                    .threads
-                    .virtual_thread_manager
-                    .unpark_virtual(tid.0);
-                return;
-            }
-        }
-        // Find the ParkState associated with this Java Thread object
-        // by looking up in the thread registry.
-        if let Some(park_state) = self.shared.find_park_state_for_thread_obj(thread_obj) {
-            park_state.unpark();
-        } else if crate::runtime::env_cache::dbg_unpark_miss() {
-            // DBG: a miss here is a SILENTLY LOST WAKEUP — the caller's
-            // Thread-mirror address matched no registered thread. Print the
-            // stale address, what its header currently claims to be, and the
-            // registry's live mirror addresses so the delta (e.g. a young
-            // address whose thread was promoted to old gen) is visible.
-            let class_id = self.shared.mem.heap.class_id_of(thread_obj);
-            eprintln!(
-                "[unpark] MISS obj={:p} header_class_id={:?} registry={:x?}",
-                thread_obj.as_ptr(),
-                class_id,
-                self.shared.threads.thread_registry.debug_thread_obj_addrs(),
-            );
-        }
-    }
-
-    fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
-        let class_id = self
-            .shared
-            .classes
-            .class_manager
-            .write()
-            .load_class(class_name)
-            .ok()?;
-        let num_fields = self
-            .shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .map(|c| c.num_total_fields)
-            .unwrap_or(0);
-        let obj = self.shared.mem.heap.alloc_object(class_id, num_fields);
-        crate::runtime::interpreter::init_primitive_fields(self.shared, obj, class_id);
-        Some(obj)
-    }
-
-    fn invoke_virtual(
-        &mut self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        let mut receiver = self.shared.mem.heap.load_and_forward(receiver);
-        let mut receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
-        if let Some(recovered) = recover_stale_lambda_receiver_from_native_pins(
-            self.shared,
-            &*self.thread,
-            receiver_class_id,
-            method_name,
-            descriptor,
-            args,
-        ) {
-            receiver = recovered;
-            receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
-        }
-        // Check if the receiver is a lambda proxy.
-        let call_site = {
-            let proxies = self.shared.classes.lambda_proxies.read();
-            proxies.get(&receiver_class_id).cloned()
-        };
-        if crate::runtime::env_cache::invoke_virtual_entry_trace()
-            && method_name == "aotContributedInitializerStartsManagementContext"
-        {
-            eprintln!(
-                "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} receiver_class_id={:?} is_lambda_proxy={}",
-                method_name,
-                receiver_class_id,
-                call_site.is_some()
-            );
-        }
-
-        // Keep the receiver and arguments rooted across the dispatch decision:
-        // the selected lambda body can allocate immediately after this block.
-        let sam_compat_pin_base = self.thread.native_pin_roots.len();
-        self.thread.native_pin_roots.push(receiver);
-        let arg_pins: Vec<Option<usize>> = args
-            .iter()
-            .map(|a| match a {
-                Value::Object(Some(o)) => {
-                    let idx = self.thread.native_pin_roots.len();
-                    self.thread.native_pin_roots.push(*o);
-                    Some(idx)
-                }
-                _ => None,
-            })
-            .collect();
-
-        if let Some(lcs) = call_site.filter(|lcs| {
-            // A lambda only implements its exact SAM descriptor. Same-named
-            // defaults must run their bytecode, even when a null argument is
-            // assignable to both the default and SAM parameter types.
-            method_name == &*lcs.sam_method_name && descriptor == &*lcs.sam_descriptor
-        }) {
-            // Re-read receiver and args through the pins before the selected
-            // lambda body can allocate and move them.
-            receiver = self.thread.native_pin_roots[sam_compat_pin_base];
-            let refreshed_args: Vec<Value> = args
-                .iter()
-                .zip(arg_pins.iter())
-                .map(|(orig, pin)| match pin {
-                    Some(idx) => Value::Object(Some(self.thread.native_pin_roots[*idx])),
-                    None => *orig,
-                })
-                .collect();
-            self.thread.native_pin_roots.truncate(sam_compat_pin_base);
-
-            // Lambda dispatch: read captured values from proxy fields, then
-            // prepend them to the invocation args.
-            let num_captures = lcs.capture_types.len();
-            let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + refreshed_args.len());
-            for i in 0..num_captures {
-                full_args.push(self.shared.mem.heap.get_field(receiver, i));
-            }
-            full_args.extend_from_slice(&refreshed_args);
-
-            // Coerce args between SAM and impl descriptors (box/unbox
-            // primitives at the SAM boundary so impl sees matched types).
-            let sam_desc = lcs.sam_descriptor.clone();
-            let impl_desc = lcs.impl_handle.descriptor.clone();
-            let inst_desc = lcs.instantiated_descriptor.clone();
-            let (_, sam_ret) = crate::runtime::interpreter::split_method_descriptor(&sam_desc);
-            let (_, impl_ret) = crate::runtime::interpreter::split_method_descriptor(&impl_desc);
-            let receiver_present = matches!(
-                lcs.impl_handle.kind,
-                MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface
-            );
-            crate::runtime::interpreter::coerce_lambda_args(
-                self.shared,
-                self.thread,
-                &sam_desc,
-                &impl_desc,
-                &inst_desc,
-                &mut full_args,
-                receiver_present,
-                num_captures,
-            )?;
-
-            // Loader-faithful impl owner (gated): dispatch a lambda whose
-            // enclosing class was defined by a child / bytecode-enhancing loader
-            // on that loader's copy of the impl class, not the global one (see
-            // `lambda_impl_dispatch_override`).
-            //
-            // Uses the DRIVEN variant, not the passive `lambda_impl_dispatch_override`.
-            // This `NativeContextImpl::invoke_virtual` path is the lambda dispatcher
-            // used when a *native* helper calls back into a lambda — most notably
-            // `native-collections`' Stream pipeline (`stream_process_chain` ->
-            // `invoke_deferred_stream_lambda`). A method reference evaluated only
-            // from inside such a native callback (e.g. `.map(Foo::new)` reached via
-            // `Stream.toList()`) can be the VERY FIRST reference to `Foo` from an
-            // isolated loader's namespace, so the passive cache-only lookup misses
-            // and the `NewInvokeSpecial`/`Invoke*` arms below fall back to the
-            // loader-BLIND `class_manager.load_class(name)` / `invoke_or_native(name)`,
-            // minting an Application-loader copy of a class the isolated loader owns.
-            //
-            // Concrete failure (docs/known-issues/springboot/
-            // micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md):
-            // Spring Boot's `OpenTelemetryEventPublisherBeansApplicationListener`
-            // builds its wrappers with
-            // `getBeansOfType(EventPublisher.class).values().stream()
-            //     .map(EventPublishingContextWrapper::new).toList()`. Under
-            // `@ForkedClassPath`'s `ModifiedClassPathClassLoader` the listener is
-            // child-loader-defined, but the constructor reference resolved
-            // `EventPublishingContextWrapper` (and hence its anonymous
-            // `ContextStorage` subclass `EventPublishingContextWrapper$1`) under the
-            // Application loader. That subclass then inherited the APPLICATION copy
-            // of `io.opentelemetry.context.ContextStorage`, whose default `root()`
-            // returns the Application `ArrayBasedContext.ROOT` — so `Context.current()`
-            // handed back a foreign-loader `Context`, `makeCurrent()` attached to the
-            // Application `ContextStorage` (which has no event-publishing wrapper),
-            // and no `EventPublisher` events were ever published: MDC `traceId`
-            // stayed null and `OtelEventListener.events` stayed empty.
-            // Mirrors the same fix already applied to the sibling `interpreter.rs`
-            // lambda dispatcher (`try_lambda_dispatch`).
-            let impl_override = crate::runtime::interpreter::lambda_impl_dispatch_override_driven(
-                self.shared,
-                self.thread,
-                &lcs,
-            );
-            // Dispatch by method handle kind.
-            let raw_result = match lcs.impl_handle.kind {
-                MethodHandleKind::InvokeStatic => {
-                    if let Some(impl_cid) = impl_override {
-                        invoke_on_class_shared_no_retarget(
-                            self.shared,
-                            self.thread,
-                            impl_cid,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &full_args,
-                        )
-                    } else {
-                        self.invoke_or_native(
-                            &lcs.impl_handle.class_name,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &full_args,
-                        )
-                    }
-                }
-                MethodHandleKind::InvokeVirtual | MethodHandleKind::InvokeInterface => {
-                    // First arg is the receiver for the target method.
-                    if full_args.is_empty() {
-                        return Err(VmError::Internal {
-                            message: "invoke_virtual: InvokeVirtual/InvokeInterface with no args"
-                                .to_string(),
-                        }
-                        .into());
-                    }
-                    // BUG-07: when the target receiver is ITSELF a lambda proxy,
-                    // the method being invoked is that proxy's own SAM (or a
-                    // method on its functional interface) and is only resolvable
-                    // through lambda-proxy dispatch. This happens with an unbound
-                    // instance method reference used as a higher-order function —
-                    // e.g. `stream.map(Supplier::get)` over a stream of `() -> x`
-                    // lambdas: the mapper's impl handle is `InvokeInterface
-                    // Supplier.get`, and each receiver is a synthetic `Supplier`
-                    // lambda proxy. `invoke_or_native` does not consult the
-                    // lambda-proxy table, so it misses the SAM and falls through
-                    // to a wrong/default result (observed: an empty ArrayList,
-                    // later mis-cast → ClassCastException). Recurse through
-                    // `invoke_virtual`, which dispatches both lambda proxies and
-                    // ordinary objects correctly.
-                    let receiver_is_lambda_proxy = match &full_args[0] {
-                        Value::Object(Some(r)) => {
-                            let rcv_id = self.shared.mem.heap.class_id_of(*r);
-                            self.shared
-                                .classes
-                                .lambda_proxies
-                                .read()
-                                .contains_key(&rcv_id)
-                        }
-                        _ => false,
-                    };
-                    if receiver_is_lambda_proxy {
-                        if let Value::Object(Some(recv)) = full_args[0] {
-                            self.invoke_virtual(
-                                recv,
-                                &lcs.impl_handle.member_name,
-                                &lcs.impl_handle.descriptor,
-                                &full_args[1..],
-                            )
-                        } else {
-                            // unreachable: receiver_is_lambda_proxy implies an object
-                            Ok(None)
-                        }
-                    } else {
-                        let private_impl_class =
-                            crate::runtime::interpreter::lambda_private_impl_dispatch_class(
-                                self.shared,
-                                &lcs,
-                            );
-                        let rcv_id_opt = match &full_args[0] {
-                            Value::Object(Some(r)) => Some(self.shared.mem.heap.class_id_of(*r)),
-                            _ => None,
-                        };
-                        let target_class = match rcv_id_opt {
-                            Some(rcv_id) => self
-                                .shared
-                                .classes
-                                .class_manager
-                                .read()
-                                .get_class(rcv_id)
-                                .map(|c| c.name.to_string())
-                                .unwrap_or_else(|| lcs.impl_handle.class_name.to_string()),
-                            None => lcs.impl_handle.class_name.to_string(),
-                        };
-                        // Loader-faithful (gated): dispatch on the receiver's exact
-                        // class_id when it diverges from the by-name global copy, so a
-                        // bytecode-enhanced receiver runs its own lambda body.
-                        let vov = if crate::runtime::env_cache::loader_aware_resolution() {
-                            rcv_id_opt.filter(|rcv| {
-                                *rcv != ClassId::new(0)
-                                    && !self.shared.classes.lambda_proxies.read().contains_key(rcv)
-                                    && {
-                                        let cm = self.shared.classes.class_manager.read();
-                                        cm.get_class(*rcv)
-                                            .map(|c| &*c.name == target_class.as_str())
-                                            .unwrap_or(false)
-                                            && cm.get_loaded_class_id(&target_class) != Some(*rcv)
-                                    }
-                            })
-                        } else {
-                            None
-                        };
-                        let result = if let Some(impl_cid) = private_impl_class {
-                            invoke_on_class_shared_no_retarget(
-                                self.shared,
-                                self.thread,
-                                impl_cid,
-                                &lcs.impl_handle.member_name,
-                                &lcs.impl_handle.descriptor,
-                                &full_args,
-                            )
-                        } else if let Some(rcv_cid) = vov {
-                            invoke_on_class_shared(
-                                self.shared,
-                                self.thread,
-                                rcv_cid,
-                                &lcs.impl_handle.member_name,
-                                &lcs.impl_handle.descriptor,
-                                &full_args,
-                            )
-                        } else {
-                            self.invoke_or_native(
-                                &target_class,
-                                &lcs.impl_handle.member_name,
-                                &lcs.impl_handle.descriptor,
-                                &full_args,
-                            )
-                        };
-                        // If the receiver's class didn't have the method, fall back
-                        // to the class specified in the lambda call site. This handles
-                        // objects with generic ClassId (e.g., stub Object) where the
-                        // lambda actually targets a specific class (e.g., PrintStream).
-                        //
-                        // CRIT (double-invoke): only retry when the NoSuchMethodError
-                        // is for THIS dispatch's own SAM method (i.e. the impl method
-                        // genuinely wasn't found on the receiver's runtime class). A
-                        // NoSuchMethodError for a DIFFERENT method means the SAM method
-                        // WAS found and ran, and the error bubbled up from a nested
-                        // call deep inside it — re-invoking here would run the
-                        // (side-effecting) method a SECOND time. That is exactly the
-                        // "InvocationInterceptors called invocation multiple times" /
-                        // NodeTestTask double-`prepare` corruption: a Hibernate
-                        // bytecode-enhanced `$$_hibernate_*` NSME thrown inside a JUnit
-                        // `TestTask::execute` lambda made `forEach` re-run `execute()`,
-                        // nulling `parentContext` on the second pass.
-                        match &result {
-                            Err(MethodCallFailed::InternalError(VmError::Linkage(
-                                LinkageError::NoSuchMethodError {
-                                    method_name,
-                                    method_descriptor,
-                                    ..
-                                },
-                            ))) if target_class.as_str() != &*lcs.impl_handle.class_name
-                                && method_name.as_str() == &*lcs.impl_handle.member_name
-                                && method_descriptor.as_str() == &*lcs.impl_handle.descriptor =>
-                            {
-                                self.invoke_or_native(
-                                    &lcs.impl_handle.class_name,
-                                    &lcs.impl_handle.member_name,
-                                    &lcs.impl_handle.descriptor,
-                                    &full_args,
-                                )
-                            }
-                            _ => result,
-                        }
-                    }
-                }
-                MethodHandleKind::InvokeSpecial => {
-                    if let Some(impl_cid) = impl_override {
-                        invoke_on_class_shared_no_retarget(
-                            self.shared,
-                            self.thread,
-                            impl_cid,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &full_args,
-                        )
-                    } else {
-                        self.invoke_or_native(
-                            &lcs.impl_handle.class_name,
-                            &lcs.impl_handle.member_name,
-                            &lcs.impl_handle.descriptor,
-                            &full_args,
-                        )
-                    }
-                }
-                MethodHandleKind::NewInvokeSpecial => {
-                    let class_id = match impl_override {
-                        Some(cid) => cid,
-                        None => self
-                            .shared
-                            .classes
-                            .class_manager
-                            .write()
-                            .load_class(&lcs.impl_handle.class_name)?,
-                    };
-                    // Array-constructor reference (`SomeType[]::new`) — see the
-                    // identical check in the sibling `interpreter.rs` path for
-                    // the full rationale. `load_class` resolves an array-shaped
-                    // impl class name to its synthesized array ClassId, but the
-                    // object-allocation + `<init>` dispatch below does not apply
-                    // to arrays (no fields, no constructor) and was silently
-                    // discarding the requested length, producing a corrupted
-                    // zero-field pseudo-object that fails a later checkcast to
-                    // the real array type.
-                    let array_info = self
-                        .shared
-                        .classes
-                        .class_manager
-                        .read()
-                        .get_class(class_id)
-                        .and_then(|c| c.array_info.clone());
-                    if let Some(array_info) = array_info {
-                        let length =
-                            full_args.first().and_then(Value::as_int).ok_or_else(|| {
-                                VmError::Internal {
-                                    message: "array-constructor-reference: missing length arg"
-                                        .to_string(),
-                                }
-                            })?;
-                        if length < 0 {
-                            Err(RuntimeError::NegativeArraySizeException { size: length }.into())
-                        } else {
-                            let length = length as usize;
-                            let arr = if array_info.array_dimension == 1 {
-                                match &*array_info.leaf_component_name {
-                                    "boolean" => self.new_array(ArrayElementType::Boolean, length),
-                                    "char" => self.new_array(ArrayElementType::Char, length),
-                                    "float" => self.new_array(ArrayElementType::Float, length),
-                                    "double" => self.new_array(ArrayElementType::Double, length),
-                                    "byte" => self.new_array(ArrayElementType::Byte, length),
-                                    "short" => self.new_array(ArrayElementType::Short, length),
-                                    "int" => self.new_array(ArrayElementType::Int, length),
-                                    "long" => self.new_array(ArrayElementType::Long, length),
-                                    _ => self.new_ref_array(array_info.component_class_id, length),
-                                }
-                            } else {
-                                self.new_ref_array(array_info.component_class_id, length)
-                            };
-                            Ok(Some(Value::Object(Some(arr))))
-                        }
-                    } else {
-                        super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
-                        // Use `num_total_fields` (inherited + declared instance
-                        // fields), matching the `New` opcode and the sibling
-                        // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
-                        // is wrong here: it counts this class's declared fields
-                        // *including statics* while omitting inherited instance
-                        // fields, so a subclass constructor reference (e.g. JUnit5's
-                        // `DefaultClassDescriptor::new`, whose 2 fields are all
-                        // inherited from `AbstractAnnotatedDescriptorWrapper`)
-                        // under-allocates to 0 slots and trips the GC `get_field`
-                        // bounds guard on every inherited-field access.
-                        let num_fields = self
-                            .shared
-                            .classes
-                            .class_manager
-                            .read()
-                            .get_class(class_id)
-                            .map(|c| c.num_total_fields)
-                            .unwrap_or(0);
-                        let new_obj = match self
-                            .shared
-                            .mem
-                            .heap
-                            .try_alloc_object(class_id, num_fields)
-                        {
-                            Some(obj) => obj,
-                            None => {
-                                self.thread.tlab.retire();
-                                crate::runtime::interpreter::maybe_gc_forced_pub(
-                                    self.shared,
-                                    self.thread,
-                                );
-                                self.shared.mem.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
-                                    MethodCallFailed::InternalError(crate::error::VmError::Runtime(
-                                        crate::error::RuntimeError::OutOfMemoryError {
-                                            message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
-                                        },
-                                    ))
-                                })?
-                            }
-                        };
-                        let new_obj_pin = self.thread.native_pin_roots.len();
-                        self.thread.native_pin_roots.push(new_obj);
-                        let init_result = {
-                            let mut init_args = Vec::with_capacity(1 + full_args.len());
-                            init_args.push(Value::Object(Some(new_obj)));
-                            init_args.extend_from_slice(&full_args);
-                            invoke_on_class_shared(
-                                self.shared,
-                                self.thread,
-                                class_id,
-                                &lcs.impl_handle.member_name,
-                                &lcs.impl_handle.descriptor,
-                                &init_args,
-                            )
-                        };
-                        let forwarded = self
-                            .thread
-                            .native_pin_roots
-                            .get(new_obj_pin)
-                            .copied()
-                            .unwrap_or(new_obj);
-                        self.thread.native_pin_roots.truncate(new_obj_pin);
-                        init_result?;
-                        Ok(Some(Value::Object(Some(forwarded))))
-                    }
-                }
-                _ => {
-                    // GetField, GetStatic, PutField, PutStatic вЂ” very rare for
-                    // functional interfaces, defer with a descriptive error.
-                    Err(VmError::Internal {
-                        message: format!(
-                            "invoke_virtual: unsupported MethodHandle kind {:?} for lambda proxy",
-                            lcs.impl_handle.kind
-                        ),
-                    }
-                    .into())
-                }
-            };
-            // Coerce return value from impl's descriptor back to SAM's view.
-            let r = match raw_result {
-                Ok(result) => result,
-                Err(MethodCallFailed::InternalError(VmError::Linkage(
-                    LinkageError::NoSuchMethodError {
-                        class_name,
-                        method_name,
-                        method_descriptor,
-                    },
-                ))) => {
-                    if let Some(result) = object_serialization_hook_neutral_result(
-                        &method_name,
-                        &method_descriptor,
-                        &full_args,
-                    ) {
-                        if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
-                            eprintln!(
-                                "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
-                                class_name, method_name, method_descriptor
-                            );
-                        }
-                        result
-                    } else {
-                        return Err(MethodCallFailed::InternalError(VmError::Linkage(
-                            LinkageError::NoSuchMethodError {
-                                class_name,
-                                method_name,
-                                method_descriptor,
-                            },
-                        )));
-                    }
-                }
-                Err(err) => return Err(err),
-            };
-            crate::runtime::interpreter::coerce_return(
-                self.shared,
-                self.thread,
-                &sam_ret,
-                &impl_ret,
-                r,
-            )
-        } else {
-            if crate::runtime::env_cache::invoke_virtual_entry_trace()
-                && method_name == "aotContributedInitializerStartsManagementContext"
-            {
-                eprintln!(
-                    "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch",
-                    method_name
-                );
-            }
-            // Not a lambda-dispatch call after all (the receiver wasn't a
-            // recognized proxy, or the `.filter()` predicate above rejected
-            // it) -- release the pins from the GC-safety block above. Refresh
-            // `receiver` through its pin in case the SAM-compatibility check
-            // ran (and triggered a GC) before the predicate rejected the
-            // match; `args` itself is not rebuilt here for the (rare, only
-            // reachable when a lambda receiver's SAM-shaped overload check
-            // fails) non-lambda fallback dispatch on a lambda-proxy receiver
-            // -- see the GC-safety comment above this block's `if`.
-            receiver = self.thread.native_pin_roots[sam_compat_pin_base];
-            self.thread.native_pin_roots.truncate(sam_compat_pin_base);
-            // Not a lambda proxy SAM call вЂ” normal virtual dispatch.
-            // If the receiver IS a lambda proxy but calling a non-SAM method
-            // (e.g. andThen), dispatch on the functional interface class.
-            //
-            // KC26 array.clone() bug: array objects store their COMPONENT class
-            // id (e.g. `OptionCategory`) in the header — NOT the array class
-            // id. Calling `get_class(receiver_class_id).name` for an array
-            // receiver therefore returns the component class name. Routing
-            // dispatch through the component then resolves `clone()` to the
-            // *component's* override (`Enum.clone()` for enum arrays — which
-            // is the JDK's deliberate CNSE-thrower) instead of `Object.clone`
-            // (the array-cloning native). Per JVMS §4.4.1, every array class's
-            // method table is `Object`'s — short-circuit array receivers to
-            // `java/lang/Object` here, matching the parallel logic in
-            // `invoke_or_native` and `try_stackless_invoke`.
-            // `resolved_from_receiver` tracks whether `class_name` is just the
-            // receiver's own class name (the plain-object case). When it is, the
-            // final dispatch keys on `receiver_class_id` DIRECTLY rather than
-            // re-resolving the name — otherwise a class a custom loader defined
-            // (load-time weaving, webapp isolation) collapses to the same-named
-            // class some other loader registered first, so a reflective
-            // `Method.invoke` on the loader-private instance runs the wrong
-            // body (JVMS §5.3). Arrays (dispatch on Object) and lambda-proxy
-            // non-SAM calls (dispatch on the functional interface) must keep the
-            // name-based path, so the flag is false there.
-            let mut resolved_from_receiver = false;
-            let class_name =
-                if self.shared.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
-                    "java/lang/Object".to_string()
-                } else {
-                    let lambda_iface = {
-                        let proxies = self.shared.classes.lambda_proxies.read();
-                        proxies
-                            .get(&receiver_class_id)
-                            .map(|lcs| lcs.functional_interface.to_string())
-                    };
-                    match lambda_iface {
-                        Some(iface) => iface,
-                        None => {
-                            let by_id = self
-                                .shared
-                                .classes
-                                .class_manager
-                                .read()
-                                .get_class(receiver_class_id)
-                                .map(|c| c.name.to_string());
-                            match by_id {
-                                Some(n) => {
-                                    resolved_from_receiver = true;
-                                    n
-                                }
-                                None => format!("<unknown class {}>", receiver_class_id),
-                            }
-                        }
-                    }
-                };
-
-            // Check for java.lang.reflect.Proxy dynamic proxy dispatch.
-            // When Java code calls any method on a Proxy$Instance object, we
-            // intercept and forward to the InvocationHandler.invoke().
-            if class_name == "java/lang/reflect/Proxy$Instance"
-                || crate::runtime::interpreter::class_chain_reaches_proxy_instance(
-                    self.shared,
-                    receiver_class_id,
-                )
-            {
-                return proxy_invoke_handler(self, receiver, method_name, descriptor, args);
-            }
-
-            // Check for annotation proxy dispatch.
-            // When Java code calls annotation.value(), annotation.path(), etc.,
-            // look up the element by method name in the proxy's stored elements.
-            if class_name == "java/lang/annotation/AnnotationProxy" {
-                let result = annotation_proxy_invoke(self, receiver, method_name, args)?;
-                // Unbox primitive-returning members so `invoke_virtual`'s
-                // contract matches bytecode methods (which yield a raw
-                // primitive Value for a primitive return descriptor). The
-                // proxy stores members as BOXED wrappers; returning them boxed
-                // makes a re-entrant caller like `Method.invoke`'s `box_value`
-                // DOUBLE-box — it stores the wrapper reference in a fresh
-                // wrapper's value slot, so a later `intValue()` reads the
-                // pointer (a positive int) instead of the real value. That is
-                // exactly how ByteBuddy's `JavaDispatcher`-driven read of
-                // `@Advice.OnMethodEnter.skipOnIndex()` (declared `default -1`)
-                // saw a bogus `>= 0` index, throwing "void is not an array
-                // type but an index for a relocation is defined" and failing
-                // Hibernate's BytecodeProvider service-load.
-                if let Some(value) = result {
-                    let ret = descriptor
-                        .rsplit(')')
-                        .next()
-                        .unwrap_or("L")
-                        .chars()
-                        .next()
-                        .unwrap_or('L');
-                    let unboxed = match ret {
-                        'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
-                            if let Value::Object(Some(obj)) = value {
-                                self.shared.mem.heap.get_field(obj, 0)
-                            } else {
-                                value
-                            }
-                        }
-                        _ => value,
-                    };
-                    return Ok(Some(unboxed));
-                }
-                return Ok(None);
-            }
-
-            // `Class.forName(name, ..., loader)` invokes `loadClass(String)`
-            // through this NativeContext path.  For a subclass that merely
-            // inherits ClassLoader's implementation, virtual resolution must
-            // execute CratonVM's base ClassLoader native (which performs
-            // parent-first delegation and loader-local lookup), not the
-            // real-JDK bytecode/global-resolution fallback. Preserve genuine
-            // subclass overrides by checking the method's actual declarer.
-            //
-            // Spring's `DynamicClassLoader` is such an inheriting subclass;
-            // its generated classes deliberately live in the forked parent.
-            // The normal receiver resolver can retain the inherited JDK body
-            // before the base native gate sees it, collapsing this lookup to
-            // the global same-named class. Route this known inheriting loader
-            // directly through the base native to preserve parent-first
-            // fork-loader identity.
-            if method_name == "loadClass"
-                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
-                && class_name == "org/springframework/core/test/tools/DynamicClassLoader"
-            {
-                let mut full_args = Vec::with_capacity(1 + args.len());
-                full_args.push(Value::Object(Some(receiver)));
-                full_args.extend_from_slice(args);
-                return self.invoke_or_native(
-                    "java/lang/ClassLoader",
-                    method_name,
-                    descriptor,
-                    &full_args,
-                );
-            }
-            if method_name == "loadClass"
-                && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;"
-                && resolved_from_receiver
-            {
-                let use_base_loader_native = {
-                    let cm = self.shared.classes.class_manager.read();
-                    cm.get_class(receiver_class_id)
-                        .map(|receiver_class| {
-                            receiver_class.name.as_ref() == "java/lang/ClassLoader"
-                                || !receiver_class.methods.iter().any(|method| {
-                                    method.name.as_ref() == method_name
-                                        && method.descriptor.as_ref() == descriptor
-                                })
-                        })
-                        .unwrap_or(false)
-                };
-                if use_base_loader_native {
-                    let mut full_args = Vec::with_capacity(1 + args.len());
-                    full_args.push(Value::Object(Some(receiver)));
-                    full_args.extend_from_slice(args);
-                    return self.invoke_or_native(
-                        "java/lang/ClassLoader",
-                        method_name,
-                        descriptor,
-                        &full_args,
-                    );
-                }
-            }
-
-            // Prepend receiver to args.
-            let mut full_args = Vec::with_capacity(1 + args.len());
-            full_args.push(Value::Object(Some(receiver)));
-            full_args.extend_from_slice(args);
-
-            // `invoke_on_class_shared` dispatches on `receiver_class_id`
-            // directly rather than re-resolving `class_name` through the
-            // global class map — it preserves native-override precedence
-            // while resolving the actual receiver hierarchy, which matters
-            // for a method-local anonymous class (the global map's
-            // name->id lookup can collapse it onto an unrelated same-named
-            // class registered by another loader, landing on an inherited
-            // Object member instead of the receiver's concrete override —
-            // notably `toString()` reached from a native call such as
-            // String.format's `%s`).
-            //
-            // That path does more locking than `invoke_or_native` and is
-            // unsafe to make the default for every `resolved_from_receiver`
-            // call: routing ALL ordinary virtual dispatch through it
-            // (rather than gating it to cases that actually need exact-
-            // class resolution) reintroduced a startup hang — Spring
-            // Boot's `BackgroundPreinitializingApplicationListener` runs
-            // Hibernate Validator's reflection-heavy constraint-helper
-            // warmup concurrently with the main thread's own bean/class
-            // initialization, and making this heavier path the hot path
-            // for every virtual call from both threads deadlocked them
-            // (see docs/internal/springboot/embedded-tomcat-loopback-self-connect-silent-hang-FIXED.md).
-            // Keep it scoped to the two cases that actually need it: the
-            // original loader-identity divergence this mechanism was built
-            // for, and the specific anonymous-`toString()` shape the
-            // regression test (`vm/tests/string_format_throwing_tostring.rs`)
-            // covers.
-            let needs_exact_class_dispatch = resolved_from_receiver
-                && (method_name == "toString" && descriptor == "()Ljava/lang/String;"
-                    || self
-                        .shared
-                        .classes
-                        .class_manager
-                        .read()
-                        .get_loaded_class_id(&class_name)
-                        != Some(receiver_class_id));
-            if std::env::var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
-                && method_name == "aotContributedInitializerStartsManagementContext"
-            {
-                let global_id = self
-                    .shared
-                    .classes
-                    .class_manager
-                    .read()
-                    .get_loaded_class_id(&class_name);
-                eprintln!(
-                    "[NEEDS-EXACT-TRACE] method={} class_name={} resolved_from_receiver={} receiver_class_id={:?} global_lookup_id={:?} needs_exact_class_dispatch={}",
-                    method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
-                );
-            }
-            if needs_exact_class_dispatch {
-                invoke_on_class_shared(
-                    self.shared,
-                    self.thread,
-                    receiver_class_id,
-                    method_name,
-                    descriptor,
-                    &full_args,
-                )
-            } else {
-                self.invoke_or_native(&class_name, method_name, descriptor, &full_args)
-            }
-        }
-    }
-
-    fn invoke_virtual_declared(
-        &mut self,
-        declared_class: &str,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        let result = self.invoke_virtual(receiver, method_name, descriptor, args);
-        match &result {
-            Err(MethodCallFailed::InternalError(VmError::Linkage(
-                LinkageError::NoSuchMethodError {
-                    class_name,
-                    method_name: nsme_method,
-                    method_descriptor,
-                    ..
-                },
-            ))) if class_name == "java/lang/Object"
-                && declared_class != "java/lang/Object"
-                && nsme_method == method_name
-                && method_descriptor == descriptor
-                && !is_object_member(method_name, descriptor) =>
-            {
-                let mut full_args = Vec::with_capacity(1 + args.len());
-                full_args.push(Value::Object(Some(receiver)));
-                full_args.extend_from_slice(args);
-                self.invoke_or_native(declared_class, method_name, descriptor, &full_args)
-            }
-            _ => result,
-        }
-    }
-
-    fn invoke_virtual_bytecode_only(
-        &mut self,
-        receiver: ObjectRef,
-        method_name: &str,
-        descriptor: &str,
-        args: &[Value],
-    ) -> MethodCallResult {
-        // Call straight into `interpreter::execute` — the actual "just run
-        // this bytecode, no native check" primitive that
-        // `invoke_on_class_shared_inner` itself falls back to once it has
-        // decided native doesn't apply. `invoke_on_class_shared` is NOT
-        // sufficient here: besides its primary `check_override` gate (which
-        // IS skipped for an ordinary concrete method like
-        // `ThreadPoolExecutor.execute`/`submit`/`shutdown`), it has a
-        // SECOND, unconditional native-registry check for any non-interface
-        // declaring class (`override_cb` in `invoke_on_class_shared_inner`,
-        // vm_exec.rs) that re-finds this exact native regardless of the
-        // first gate — routing through `invoke_on_class_shared` reintroduced
-        // infinite recursion (confirmed via a depth-counter probe: `execute`
-        // called itself on the same receiver until the native stack
-        // overflowed) instead of actually reaching bytecode.
-        let receiver = self.shared.mem.heap.load_and_forward(receiver);
-        let class_id = self.shared.mem.heap.class_id_of(receiver);
-        let declaring_class_id = {
-            let cm = self.shared.classes.class_manager.read();
-            crate::classloading::find_method_recursive(
-                class_id,
-                method_name,
-                descriptor,
-                &cm.class_store,
-            )
-            .map(|(_, declaring_id)| declaring_id)
-            .unwrap_or(class_id)
-        };
-        let mut full_args = Vec::with_capacity(1 + args.len());
-        full_args.push(Value::Object(Some(receiver)));
-        full_args.extend_from_slice(args);
-        crate::runtime::interpreter::execute(
-            self.shared,
-            self.thread,
-            declaring_class_id,
-            method_name,
-            descriptor,
-            &full_args,
-        )
-    }
-
-    fn class_annotations(&self, class_id: ClassId) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        let mut result = Vec::new();
-        for ann in &class.annotations {
-            if let Some(data) = convert_annotation(ann, &class.constant_pool) {
-                result.push(data);
-            }
-        }
-        result
-    }
-
-    fn method_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_annotations_from_attributes(&m.attributes, &class.constant_pool);
-            }
-        }
-        Vec::new()
-    }
-
-    fn field_annotations(
-        &self,
-        class_id: ClassId,
-        field_name: &str,
-    ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for f in &class.fields {
-            if &*f.name == field_name {
-                return extract_annotations_from_attributes(&f.attributes, &class.constant_pool);
-            }
-        }
-        Vec::new()
-    }
-
-    fn class_signature(&self, class_id: ClassId) -> Option<String> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = cm.get_class(class_id)?;
-        class.signature.clone()
-    }
-
-    fn method_signature(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Option<String> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = cm.get_class(class_id)?;
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                for attr in &m.attributes {
-                    if let Some(cratonvm_reader::attribute::Attribute::Signature(s)) =
-                        attr.as_decoded()
-                    {
-                        // `s: &Arc<str>` (round 4 reader). Caller wants
-                        // an owned `String`; materialise once.
-                        return Some(s.to_string());
-                    }
-                }
-                return None;
-            }
-        }
-        None
-    }
-
-    fn method_parameters(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<(String, u16)> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                for attr in &m.attributes {
-                    if let Some(cratonvm_reader::attribute::Attribute::MethodParameters(params)) =
-                        attr.as_decoded()
-                    {
-                        // JVMS 4.7.24: name_index == 0 means an anonymous /
-                        // synthetic parameter вЂ” surface it as an empty
-                        // string so the caller can fall back to "argN".
-                        return params
-                            .iter()
-                            .map(|p| {
-                                let name = if p.name_index == 0 {
-                                    String::new()
-                                } else {
-                                    class
-                                        .constant_pool
-                                        .get_utf8(p.name_index)
-                                        .unwrap_or("")
-                                        .to_string()
-                                };
-                                (name, p.access_flags)
-                            })
-                            .collect();
-                    }
-                }
-                return Vec::new();
-            }
-        }
-        Vec::new()
-    }
-
-    fn field_signature(&self, class_id: ClassId, field_name: &str) -> Option<String> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = cm.get_class(class_id)?;
-        for f in &class.fields {
-            if &*f.name == field_name {
-                for attr in &f.attributes {
-                    if let Some(cratonvm_reader::attribute::Attribute::Signature(s)) =
-                        attr.as_decoded()
-                    {
-                        // `s: &Arc<str>` (round 4 reader). Caller wants
-                        // an owned `String`; materialise once.
-                        return Some(s.to_string());
-                    }
-                }
-                return None;
-            }
-        }
-        None
-    }
-
-    fn method_parameter_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_parameter_annotations(&m.attributes, &class.constant_pool);
-            }
-        }
-        Vec::new()
-    }
-
-    fn method_return_type_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_return_type_annotations(&m.attributes, &class.constant_pool);
-            }
-        }
-        Vec::new()
-    }
-
-    fn method_return_type_argument_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_return_type_argument_annotations(
-                    &m.attributes,
-                    &class.constant_pool,
-                );
-            }
-        }
-        Vec::new()
-    }
-
-    fn method_parameter_type_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_parameter_type_annotations(&m.attributes, &class.constant_pool);
-            }
-        }
-        Vec::new()
-    }
-
-    fn field_type_annotations(
-        &self,
-        class_id: ClassId,
-        field_name: &str,
-    ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for f in &class.fields {
-            if &*f.name == field_name {
-                return extract_field_type_annotations(&f.attributes, &class.constant_pool);
-            }
-        }
-        Vec::new()
-    }
-
-    fn field_type_argument_annotations(
-        &self,
-        class_id: ClassId,
-        field_name: &str,
-    ) -> Vec<crate::native::registry::TypeArgAnnotations> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for f in &class.fields {
-            if &*f.name == field_name {
-                return extract_field_type_argument_annotations(
-                    &f.attributes,
-                    &class.constant_pool,
-                );
-            }
-        }
-        Vec::new()
-    }
-
-    fn method_parameter_type_argument_annotations(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                return extract_parameter_type_argument_annotations(
-                    &m.attributes,
-                    &class.constant_pool,
-                );
-            }
-        }
-        Vec::new()
-    }
-
-    /// `Class.getAnnotatedSuperclass()` / `Class.getAnnotatedInterfaces()`
-    /// (and their `getAnnotatedActualTypeArguments()` chains) — see
-    /// `extract_class_extends_type_annotations` for why this re-parses the
-    /// cached original bytes rather than reading from `Class`.
-    fn class_extends_type_annotations(
-        &self,
-        class_id: ClassId,
-        supertype_index: u16,
-    ) -> crate::native::registry::TypeArgAnnotations {
-        let bytes = {
-            let cm = self.shared.classes.class_manager.read();
-            match cm.class_bytes_cache.get(&class_id) {
-                Some(b) => b.clone(),
-                None => return Default::default(),
-            }
-        };
-        extract_class_extends_type_annotations(&bytes, supertype_index)
-    }
-
-    fn method_annotation_default(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Option<crate::native::registry::AnnotationElementValue> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return None,
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                for attr in &m.attributes {
-                    if let Some(cratonvm_reader::attribute::Attribute::AnnotationDefault(ev)) =
-                        attr.as_decoded()
-                    {
-                        return convert_element_value(ev, &class.constant_pool);
-                    }
-                }
-                return None;
-            }
-        }
-        None
-    }
-
-    fn method_exceptions(
-        &self,
-        class_id: ClassId,
-        method_name: &str,
-        method_desc: &str,
-    ) -> Vec<String> {
-        let cm = self.shared.classes.class_manager.read();
-        let class = match cm.get_class(class_id) {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        for m in &class.methods {
-            if &*m.name == method_name && &*m.descriptor == method_desc {
-                for attr in &m.attributes {
-                    if let Some(cratonvm_reader::attribute::Attribute::Exceptions {
-                        exception_indices,
-                    }) = attr.as_decoded()
-                    {
-                        return exception_indices
-                            .iter()
-                            .filter_map(|idx| {
-                                class
-                                    .constant_pool
-                                    .get_class_name(*idx)
-                                    .map(|s| s.to_string())
-                            })
-                            .collect();
-                    }
-                }
-                return Vec::new();
-            }
-        }
-        Vec::new()
-    }
-
-    // -- Scoped Values (JEP 446, Java 25) --
-
-    fn get_scoped_value(&self, key_id: u64) -> Option<Value> {
-        // Search top-to-bottom for matching key_id
-        for (k, _key_ref, v) in self.thread.scoped_values.iter().rev() {
-            if *k == key_id {
-                return Some(*v);
-            }
-        }
-        None
-    }
-
-    fn push_scoped_value(&mut self, key_id: u64, value: Value) {
-        // Legacy API: no key ObjectRef supplied. Round-9 GC fix prefers
-        // `push_scoped_value_with_key` so the key itself is GC-pinned.
-        self.thread.scoped_values.push((key_id, None, value));
-    }
-
-    fn push_scoped_value_with_key(
-        &mut self,
-        key_id: u64,
-        key_ref: Option<cratonvm_types::ObjectRef>,
-        value: Value,
-    ) {
-        self.thread.scoped_values.push((key_id, key_ref, value));
-    }
-
-    fn pop_scoped_value(&mut self) {
-        self.thread.scoped_values.pop();
-    }
-
-    fn scoped_value_depth(&self) -> usize {
-        self.thread.scoped_values.len()
     }
 
     // -- Panama FFI (JEP 454) --
@@ -10347,633 +10973,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .map(|e| (e.target, e.param_kinds.clone(), e.return_kind))
     }
 
-    fn module_name_of_class(&self, class_id: ClassId) -> Option<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .get_class(class_id)
-            .and_then(|c| c.module_name.clone())
-    }
-
-    fn reads_module(&self, reader: &str, provider: &str) -> bool {
-        let cm = self.shared.classes.class_manager.read();
-        if cm.module_registry.is_empty() {
-            return true;
-        }
-        cm.module_registry.reads(reader, provider)
-    }
-
-    fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
-        let cm = self.shared.classes.class_manager.read();
-        if cm.module_registry.is_empty() {
-            return true;
-        }
-        cm.module_registry
-            .is_package_exported_unqualified(module_name, pkg)
-    }
-
-    fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
-        let cm = self.shared.classes.class_manager.read();
-        if cm.module_registry.is_empty() {
-            return true;
-        }
-        cm.module_registry
-            .is_package_exported_to(module_name, pkg, to_module)
-    }
-
-    fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool {
-        let cm = self.shared.classes.class_manager.read();
-        if cm.module_registry.is_empty() {
-            return true;
-        }
-        cm.module_registry
-            .is_package_open_unqualified(module_name, pkg)
-    }
-
-    fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
-        let cm = self.shared.classes.class_manager.read();
-        if cm.module_registry.is_empty() {
-            return true;
-        }
-        cm.module_registry
-            .is_package_open_to(module_name, pkg, to_module)
-    }
-
-    fn module_add_reads(&mut self, reader: &str, provider: &str) {
-        self.shared
-            .classes
-            .class_manager
-            .write()
-            .module_registry
-            .add_reads(reader, provider);
-    }
-
-    fn module_add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
-        self.shared
-            .classes
-            .class_manager
-            .write()
-            .module_registry
-            .add_exports(module_name, pkg, target);
-    }
-
-    fn module_add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
-        self.shared
-            .classes
-            .class_manager
-            .write()
-            .module_registry
-            .add_opens(module_name, pkg, target);
-    }
-
-    fn module_packages(&self, module_name: &str) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .module_registry
-            .packages_of(module_name)
-    }
-
-    fn module_uses(&self, module_name: &str) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .module_registry
-            .get(module_name)
-            .map(|d| d.uses.clone())
-            .unwrap_or_default()
-    }
-
-    fn module_is_open(&self, module_name: &str) -> bool {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .module_registry
-            .get(module_name)
-            .is_some_and(|d| d.is_open)
-    }
-
-    fn all_module_names(&self) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .module_registry
-            .module_names()
-    }
-
-    fn module_for_package(&self, pkg: &str) -> Option<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .module_registry
-            .module_for_package(pkg)
-            .map(|s| s.to_string())
-    }
-
-    fn set_class_hidden(&mut self, class_id: ClassId) {
-        let mut cm = self.shared.classes.class_manager_write();
-        if let Some(class) = cm.get_class_mut(class_id) {
-            class.hidden = true;
-        }
-    }
-
-    fn is_class_hidden(&self, class_id: ClassId) -> bool {
-        let cm = self.shared.classes.class_manager.read();
-        cm.get_class(class_id)
-            .map(|c| c.is_hidden())
-            .unwrap_or(false)
-    }
-
-    fn copy_nest_info(&mut self, source_class: ClassId, target_class: ClassId) {
-        // NEW-8: hidden classes created with the NESTMATE ClassOption
-        // inherit the lookup class's nest host and nest members. We copy
-        // the relevant fields onto the target so that member access
-        // checks see the hidden class as a legitimate nestmate.
-        let mut cm = self.shared.classes.class_manager_write();
-        // Grab the nest info from the source class first (release the
-        // immutable borrow before we take a mutable one).
-        let (nest_host, nest_members) = match cm.get_class(source_class) {
-            Some(src) => {
-                // If source is itself a nest member, it has a nest_host
-                // pointing at the host. If it IS the host (or has no
-                // nest info), use source's own name so the hidden class
-                // becomes a member of source's nest.
-                let host = src
-                    .nest_host
-                    .clone()
-                    .unwrap_or_else(|| src.name.to_string());
-                (host, src.nest_members.clone())
-            }
-            None => return,
-        };
-        if let Some(target) = cm.get_class_mut(target_class) {
-            target.nest_host = Some(nest_host);
-            target.nest_members = nest_members;
-        }
-    }
-
-    fn initialize_class(&mut self, class_id: ClassId) -> Result<(), MethodCallFailed> {
-        // NEW-8: force the class's <clinit> to run now. The interpreter's
-        // `ensure_class_initialized_shared` handles thread-safe init and
-        // skips classes that are already initialized.
-        //
-        // HIB-CV-26 fix (2026-07-16): pass the result straight through
-        // instead of collapsing it into a `String`. `<clinit>` failures
-        // already come back from `ensure_class_initialized_shared` with
-        // the correct two-layer identity: a Java exception raised by a
-        // static initializer is already wrapped as a catchable
-        // `ExceptionInInitializerError`/`NoClassDefFoundError`
-        // (`MethodCallFailed::ExceptionThrown`) per JVMS §5.5, and only a
-        // genuine VM bug is `MethodCallFailed::InternalError`. Flattening
-        // both into a string here (as the old code did) forced every
-        // caller of `initialize_class` — including `Class.forName` — to
-        // re-wrap ordinary `<clinit>` exceptions as an unrecoverable
-        // `VmError::Internal`, aborting the whole VM instead of letting
-        // Java code catch them.
-        crate::vm::vm_util::ensure_class_initialized_shared(&self.shared, self.thread, class_id)
-    }
-
-    fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .module_registry
-            .service_providers(service_class)
-    }
-
-    fn check_deep_reflection_access(
-        &self,
-        accessor_class_id: ClassId,
-        target_class_id: ClassId,
-    ) -> Result<(), String> {
-        let cm = self.shared.classes.class_manager.read();
-        // No modules registered в†’ classpath-only mode, allow.
-        if cm.module_registry.is_empty() {
-            return Ok(());
-        }
-        let accessor = match cm.get_class(accessor_class_id) {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-        let target = match cm.get_class(target_class_id) {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-        let accessor_mod = accessor
-            .module_name
-            .as_deref()
-            .unwrap_or(crate::classloading::module::UNNAMED_MODULE);
-        let target_mod = target
-            .module_name
-            .as_deref()
-            .unwrap_or(crate::classloading::module::UNNAMED_MODULE);
-        let target_pkg = crate::classloading::module::package_of(&target.name);
-        cm.module_registry
-            .check_deep_reflection_access(accessor_mod, target_mod, target_pkg)
-    }
-
-    fn find_resource(&self, name: &str) -> Option<Vec<u8>> {
-        self.shared.classes.class_manager.read().find_resource(name)
-    }
-
-    fn class_bytes(&self, class_id: ClassId) -> Option<Vec<u8>> {
-        let cm = self.shared.classes.class_manager.read();
-        cm.class_bytes_cache
-            .get(&class_id)
-            .map(|bytes| bytes.to_vec())
-    }
-
-    fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .find_all_resource_urls(name)
-    }
-
-    fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .find_all_resource_bytes(name)
-    }
-
-    fn find_class_source_path(&self, class_name: &str) -> Option<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .find_class_source_path(class_name)
-    }
-
-    fn class_code_base(&self, class_id: ClassId) -> Option<String> {
-        let cm = self.shared.classes.class_manager.read();
-        let cls = cm.class_store.get(class_id)?;
-        cls.code_source.as_ref()?.url.clone()
-    }
-
-    fn class_code_source_cert_digests(&self, class_id: ClassId) -> Vec<String> {
-        let cm = self.shared.classes.class_manager.read();
-        match cm.class_store.get(class_id) {
-            Some(cls) => cls
-                .code_source
-                .as_ref()
-                .map(|cs| cs.certificate_sha256.clone())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        }
-    }
-
-    fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
-        let cm = self.shared.classes.class_manager.read();
-        match cm.class_store.get(class_id) {
-            Some(cls) => cls
-                .code_source
-                .as_ref()
-                .map(|cs| cs.certificates.clone())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        }
-    }
-
-    fn class_id_from_mirror(&self, mirror: ObjectRef) -> Option<ClassId> {
-        super::class_id_from_mirror(self.shared, mirror)
-    }
-
-    fn list_application_class_names(&self) -> Vec<String> {
-        self.shared
-            .classes
-            .class_manager
-            .read()
-            .list_application_class_names()
-    }
-
-    fn register_dynamic_classpath(&mut self, paths: &[String]) {
-        self.shared
-            .classes
-            .class_manager
-            .write()
-            .extend_application_classpath(paths);
-    }
-
-    fn register_bootstrap_classpath(&mut self, paths: &[String]) {
-        self.shared
-            .classes
-            .class_manager
-            .write()
-            .extend_bootstrap_classpath(paths);
-    }
-
-    fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
-        use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager_write();
-        match cm.define_class(name, bytes, ClassLoaderId::Application) {
-            Ok(cid) => {
-                // Release the ClassManager write lock before calling
-                // `invalidate_jit_for_class` (which takes a read lock on
-                // the same manager).
-                drop(cm);
-                // Invalidate JIT-compiled methods that inlined from this class (Session 31)
-                let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
-                if evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {evicted} method(s) due to class reload: {name}"
-                    );
-                }
-                // T5.4.4 вЂ” additionally consult the InvalidationManager's
-                // LeafClass/class_dependencies entries.
-                let cha_evicted = self.shared.invalidate_jit_for_class(name);
-                if cha_evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
-                    );
-                }
-                Some(cid)
-            }
-            Err(e) => {
-                tracing::debug!("defineClass failed for {name}: {e:?}");
-                None
-            }
-        }
-    }
-
-    fn define_hidden_class_from_bytes(
-        &mut self,
-        stored_name: &str,
-        bytes: &[u8],
-    ) -> Result<ClassId, String> {
-        use cratonvm_classloading::DefineClassOptions;
-        use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager_write();
-        let options = DefineClassOptions {
-            override_name: Some(stored_name.to_string()),
-            hidden: true,
-            ..Default::default()
-        };
-        match cm.define_class_with_options(stored_name, bytes, ClassLoaderId::Application, options)
-        {
-            Ok(cid) => {
-                // Hidden classes cannot be inlined from (they may be
-                // unloaded independently), but we still invalidate the
-                // JIT cache defensively.
-                let evicted = self
-                    .shared
-                    .jit
-                    .jit_cache
-                    .write()
-                    .invalidate_for_class(stored_name);
-                if evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {evicted} method(s) due to hidden class define: {stored_name}"
-                    );
-                }
-                Ok(cid)
-            }
-            Err(e) => Err(format!("{e:?}")),
-        }
-    }
-
-    fn define_class_with_loader(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-        loader_id: u32,
-    ) -> Option<ClassId> {
-        use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager_write();
-        match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
-            Ok(cid) => {
-                drop(cm);
-                let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
-                if evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {evicted} method(s) due to class reload: {name}"
-                    );
-                }
-                // T5.4.4 вЂ” CHA-listener invalidation
-                let cha_evicted = self.shared.invalidate_jit_for_class(name);
-                if cha_evicted > 0 {
-                    tracing::debug!(
-                        "JIT: invalidated {cha_evicted} method(s) via CHA listener for class: {name}"
-                    );
-                }
-                Some(cid)
-            }
-            Err(e) => {
-                tracing::debug!("defineClass (loader {loader_id}) failed for {name}: {e:?}");
-                None
-            }
-        }
-    }
-
-    fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
-        use cratonvm_types::ClassLoaderId;
-        let cm = self.shared.classes.class_manager.read();
-        cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
-    }
-
-    fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
-        use cratonvm_types::ClassLoaderId;
-        let cm = self.shared.classes.class_manager.read();
-        cm.class_defined_by_loader_exact(name, ClassLoaderId::UserDefined(loader_id))
-    }
-
-    fn define_class_full(
-        &mut self,
-        name: &str,
-        bytes: &[u8],
-        loader_id: u32,
-        opts: cratonvm_native_api::DefineClassFull,
-    ) -> Result<ClassId, String> {
-        // WP2.3: single backend for all four entry points
-        // (Unsafe.defineClass, jdk.internal.misc.Unsafe.defineClass,
-        // MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2).
-        use cratonvm_classloading::{CodeSource, DefineClassOptions};
-        use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
-        };
-        let code_source =
-            if opts.code_source_url.is_none() && opts.code_source_certificates.is_empty() {
-                None
-            } else {
-                Some(CodeSource::new(
-                    opts.code_source_url.clone(),
-                    opts.code_source_certificates.clone(),
-                ))
-            };
-        let define_opts = DefineClassOptions {
-            override_name: opts.override_name.clone(),
-            hidden: opts.hidden,
-            skip_verification: opts.skip_verification,
-            code_source,
-            allow_redefine: opts.allow_redefine,
-            nest_host_class_name: opts.nest_host_class_name.clone(),
-            privileged_define: opts.privileged_define,
-            force_loader_faithful_linking: opts.force_loader_faithful_linking,
-            ..Default::default()
-        };
-
-        let cid = {
-            let mut cm = self.shared.classes.class_manager_write();
-            cm.define_class_with_options(name, bytes, cl_id, define_opts)
-                .map_err(|e| format!("{e:?}"))?
-        };
-
-        // Invalidate JIT for any class with the same name (handles redefine).
-        let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
-        if evicted > 0 {
-            tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
-        }
-        let cha_evicted = self.shared.invalidate_jit_for_class(name);
-        if cha_evicted > 0 {
-            tracing::debug!("JIT: CHA-invalidated {cha_evicted} method(s) for: {name}");
-        }
-
-        if opts.initialize {
-            // Best-effort init; failures bubble back as Err.
-            if let Err(e) = self.initialize_class(cid) {
-                return Err(format!("initialize after define failed for {name}: {e}"));
-            }
-        }
-        Ok(cid)
-    }
-
-    fn redefine_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
-        // WP2.4-F1 вЂ” JEP 109 redefine path: route to
-        // `class_manager::redefine_class` (Agent 2.4-B) which performs
-        // the in-place method-body swap, refreshes the vtable, bumps
-        // the per-class `redefine_generations` counter, and fires the
-        // JIT invalidate hook. Earlier versions of this binding called
-        // `define_class_with_options(allow_redefine: true)`, which
-        // minted a fresh ClassId for the redefined class and left the
-        // ORIGINAL ClassId's `Class.methods` table untouched вЂ” so the
-        // already-loaded `Target` instance kept dispatching to the
-        // pre-transform bytecode and the per-thread invoke cache
-        // (keyed on the original ClassId) never observed a generation
-        // bump.  The route below makes the in-place swap semantics
-        // observable end-to-end.
-        self.redefine_class_with(class_id, new_bytes, false)
-    }
-
-    /// `Instrumentation.retransformClasses` path. Same in-place swap as
-    /// `redefine_class`, but preserves the class's ORIGINAL cached bytes so the
-    /// NEXT retransform re-runs the transformer chain from the original rather
-    /// than the already-woven bytes (otherwise `mockStatic(X)` followed by
-    /// `mock(X)` double-instruments X and the instance mock fails).
-    fn retransform_class(&mut self, class_id: ClassId, new_bytes: &[u8]) -> Result<(), String> {
-        self.redefine_class_with(class_id, new_bytes, true)
-    }
-
-    fn list_loaded_class_ids(&self) -> Vec<ClassId> {
-        let cm = self.shared.classes.class_manager.read();
-        cm.class_store.iter().map(|c| c.id).collect()
-    }
-
-    fn list_initiated_class_ids(&self, loader_id: u32) -> Vec<ClassId> {
-        use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
-        };
-        let cm = self.shared.classes.class_manager.read();
-        cm.class_store
-            .iter()
-            .filter(|c| c.loader_id == cl_id)
-            .map(|c| c.id)
-            .collect()
-    }
-
-    fn allocate_loader_id(&mut self) -> u32 {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        // User-defined loader namespace ids MUST start at 3: the `ClassLoaderId`
-        // i32 encoding (see `loader_id_of_class` / `define_class_full`) reserves
-        // 0=Bootstrap, 1=Extension, 2=Application. Starting the counter at 1
-        // handed the first two user loaders ids 1 and 2, which alias
-        // `UserDefined(1)`↔Extension and `UserDefined(2)`↔Application — so a
-        // user-loader namespace was indistinguishable from a built-in one. That
-        // broke loader-faithful resolution for bytecode-enhanced Hibernate
-        // entities: the `EnhancingClassLoader` got namespace 2, its enhanced
-        // entity was stored as `UserDefined(2)`, and `inherit_lookup_loader`'s
-        // `raw < 3` guard then re-homed the ByteBuddy instantiator into the
-        // Application namespace, so `new Country` resolved the *un-enhanced* copy
-        // → `ClassCastException`/`PersistentAttributeInterceptable`. Starting at 3
-        // guarantees every allocated namespace is a genuine `UserDefined` id.
-        static NEXT_LOADER_ID: AtomicU32 = AtomicU32::new(3);
-        NEXT_LOADER_ID.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn discover_reference(
-        &mut self,
-        ref_type: u8,
-        reference_obj: ObjectRef,
-        referent: ObjectRef,
-        queue: Option<ObjectRef>,
-    ) {
-        use cratonvm_gc::ReferenceType;
-        let rt = match ref_type {
-            0 => ReferenceType::Weak,
-            1 => ReferenceType::Soft,
-            2 => ReferenceType::Phantom,
-            3 => ReferenceType::Cleaner,
-            _ => return,
-        };
-        let ref_addr = reference_obj.as_ptr() as usize;
-        let referent_addr = referent.as_ptr() as usize;
-        let queue_addr = queue.map(|q| q.as_ptr() as usize);
-        self.shared.mem.ref_processor.lock().discover_reference(
-            rt,
-            ref_addr,
-            referent_addr,
-            queue_addr,
-        );
-    }
-
-    /// Round-5 fix (HIGH): wire native `Reference.get()` into the
-    /// reference processor's SoftReference LRU so cached referents stay
-    /// alive across major GCs proportional to how recently the
-    /// application touched them. The cost is one `SystemTime::now()`
-    /// plus a short linear scan / `BTreeMap` re-key — the same overhead
-    /// HotSpot pays on every soft-ref `get()` call.
-    fn touch_soft_reference(&mut self, reference_obj: ObjectRef) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let ref_addr = reference_obj.as_ptr() as usize;
-        self.shared
-            .mem
-            .ref_processor
-            .lock()
-            .touch_soft_reference(ref_addr, now_ms);
-    }
-
-    /// INT-8: `Reference.get()` keep-alive — route the just-read referent
-    /// through the heap's standalone SATB barrier so an active G1 mark cycle logs
-    /// it as a root (the marker cannot see it through the hidden referent
-    /// slot). No-op when no cycle is active; on Generational/ZGC the
-    /// SATB barrier's marking-active gate keeps it equally cheap.
-    fn gc_reference_keep_alive(&mut self, referent: ObjectRef) {
-        // This is a keep-alive, not a reference store. `write_barrier_pre`
-        // must pair with a post-store barrier; using the standalone SATB
-        // enqueue avoids leaving that debug triad armed.
-        self.shared
-            .mem
-            .heap
-            .satb_barrier(Value::Object(Some(referent)));
-    }
-
     fn record_thread_sleep(&mut self, sleep_nanos: i64, actual_duration_nanos: u64) {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -11047,6 +11046,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 }
+
+
+
 
 // ---------------------------------------------------------------------------
 // Annotation helpers
@@ -14769,7 +14771,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
-    if std::env::var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() && method_name == "value" {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() && method_name == "value" {
         let type_desc = match shared.mem.heap.get_field(proxy, 0) {
             Value::Object(Some(s)) => {
                 super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
@@ -14861,7 +14863,7 @@ fn annotation_member_declared_default(
         .classes
         .class_manager
         .read()
-        .find_class_by_name(&class_name)?;
+        .find_unique_class_by_name(&class_name)?;
     let cm = shared.classes.class_manager.read();
     let class = cm.get_class(cid)?;
     for m in &class.methods {
@@ -15534,7 +15536,7 @@ fn invoke_on_class_shared_inner(
             let recv_cid = shared.mem.heap.class_id_of(recv);
             let is_path = {
                 let cm = shared.classes.class_manager.read();
-                cm.find_class_by_name("java/nio/file/Path")
+                cm.find_bootstrap_class_by_name("java/nio/file/Path")
                     .map(|path_cid| cm.is_subclass_of(recv_cid, path_cid))
                     .unwrap_or(false)
             };
@@ -15799,11 +15801,13 @@ fn invoke_on_class_shared_inner(
                                 (method_name, descriptor),
                                 ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
-                        // Mockito's Java-9 member accessor eagerly bootstraps
-                        // Byte Buddy just to choose its instrumentation path.
-                        // Use the registered bridge to its built-in reflection
-                        // fallback before that unsupported bootstrap begins.
-                        || (class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+                        // Legacy Mockito selector override (off by default —
+                        // see `flags::mockito_legacy_selectors`): forced the
+                        // reflection fallback instead of letting the real
+                        // `delegate()` pick `InstrumentationMemberAccessor`.
+                        // Must stay in sync with the interpreter's gate.
+                        || (cratonvm_types::flags::mockito_legacy_selectors()
+                            && class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
                             && method_name == "delegate"
                             && descriptor == "()Lorg/mockito/plugins/MemberAccessor;")
                         || ((class_name == "javax/net/ssl/SSLSocketFactory"
@@ -19148,7 +19152,7 @@ fn invoke_on_class_shared_inner(
                 if let Some(result) =
                     object_serialization_hook_neutral_result(method_name, descriptor, args)
                 {
-                    if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
                         eprintln!(
                             "[rf-ser] neutral missing serialization hook {}.{}{} caller={}",
                             class_name,

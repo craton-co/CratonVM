@@ -606,6 +606,8 @@ pub fn rw_is_write_locked(parent_addr: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

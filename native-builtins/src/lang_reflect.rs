@@ -2505,6 +2505,8 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
 
     /// Smoke: registry exposes the WP2.1 surface without panicking and

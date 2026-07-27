@@ -996,7 +996,7 @@ pub(crate) fn is_loader_aware_resolution_eligible(
     loader_obj: ObjectRef,
 ) -> bool {
     // Loader-identity consolidation: this used to inline its own
-    // `std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION")` parse -- a FOURTH
+    // `cratonvm_types::flags::runtime_var("CRATONVM_LOADER_AWARE_RESOLUTION")` parse -- a FOURTH
     // copy of the same gate living right next to the crate's own
     // `loader_aware_resolution()` below. Route through that single
     // in-crate copy (which itself now delegates to
@@ -6009,7 +6009,7 @@ pub(crate) fn ucl_try_define_local_class(
     loader: ObjectRef,
     internal_name: &str,
 ) -> Option<MethodCallResult> {
-    if std::env::var("CRATONVM_DBG_UCLTRACE").is_ok() {
+    if cratonvm_types::flags::runtime_var("CRATONVM_DBG_UCLTRACE").is_ok() {
         let loader_cid = ctx.class_id_of_object(loader);
         let loader_class = ctx.class_name_of_id(loader_cid).unwrap_or_default();
         let paths = loader_constructor_url_paths(ctx, loader);
@@ -6192,6 +6192,36 @@ pub(crate) fn ucl_try_define_local_class(
             register_defining_loader(cid.as_u32(), loader_live);
             let mirror = ctx.get_class_mirror(cid);
             Ok(Some(Value::Object(Some(mirror))))
+        }
+        Ok(Err(msg)) if msg.contains("already defined by") => {
+            // Benign concurrent-definition race: ANOTHER thread (e.g. a
+            // background thread pool eagerly resolving classes, or a
+            // recursive supertype/interface resolution nested inside a
+            // DIFFERENT class's `define_class_full` -- see the sibling fix
+            // in `classloading::ClassManager`'s `resolve_supertype`)
+            // independently defined this exact (loader, name) pair between
+            // our `find_loaded_class_for_loader` pre-check above and this
+            // `define_class_full` call actually completing. The
+            // `url_classloader_define_locks` mutex above only serializes
+            // OTHER callers of THIS function for the same name; it cannot
+            // see a concurrent definer that reached `define_class_full`
+            // through a different, unlocked path. Recover by returning the
+            // winner's already-registered mirror instead of surfacing a
+            // spurious `NoClassDefFoundError`.
+            let loader_live = ctx.read_native_pin(loader_pin, loader);
+            match find_loaded_class_for_loader(ctx, loader_live, internal_name) {
+                Some(mirror) => Ok(Some(Value::Object(Some(mirror)))),
+                None => {
+                    tracing::warn!(
+                        "URLClassLoader.findClass({internal_name}) define failed: {msg}"
+                    );
+                    Err(cratonvm_types::error::LinkageError::ClassFormatError {
+                        class_name: internal_name.to_string(),
+                        message: format!("URLClassLoader.findClass: {msg}"),
+                    }
+                    .into())
+                }
+            }
         }
         Ok(Err(msg)) => {
             // Backstop for the same race as the double-checked probe above,
@@ -8771,6 +8801,8 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod classloader_tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::{NativeContext, NativeMethodRegistry};

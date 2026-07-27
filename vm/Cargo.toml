@@ -96,6 +96,7 @@ parking_lot.workspace = true
 regex = "1"
 libloading = "0.8"
 rustc-hash.workspace = true
+smallvec.workspace = true
 # NEW-20: bench-gate binary uses serde to read criterion estimates.json
 # files and the committed vm/bench/baseline.json file.
 serde = { version = "1", features = ["derive"] }
@@ -109,9 +110,6 @@ cratonvm-native-api = { path = "../native-api", features = ["test-mock"] }
 tracing-subscriber.workspace = true
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
-# Round-5 JFR Fix 1: tests construct `EventInstance` literals directly and
-# the `fields` slot is now `SmallVec<[EventValue; 8]>`. Workspace-pinned.
-smallvec.workspace = true
 
 [[bench]]
 name = "vm_benchmarks"

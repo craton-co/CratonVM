@@ -6661,6 +6661,8 @@ pub(crate) fn register_phase52_string_buffer(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
     use cratonvm_types::ArrayElementType;

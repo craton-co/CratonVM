@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 fn addr() -> usize {
     static A: OnceLock<usize> = OnceLock::new();
     *A.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_MEMWATCH")
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_MEMWATCH")
             .ok()
             .and_then(|v| {
                 let s = v.trim().trim_start_matches("0x").trim_start_matches("0X");

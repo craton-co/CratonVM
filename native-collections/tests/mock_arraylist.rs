@@ -5,6 +5,9 @@
 
 mod common;
 
+#[allow(unused_imports)]
+use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+
 use common::{boxed_int, build_registry, call, new_arraylist, MockCtx};
 use cratonvm_native_api::NativeContext;
 use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};

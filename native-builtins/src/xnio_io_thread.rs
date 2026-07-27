@@ -1527,6 +1527,8 @@ pub fn register_xnio_io_thread_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::sync::atomic::AtomicI32;
     use std::sync::{Arc, Barrier};

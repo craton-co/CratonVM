@@ -404,7 +404,9 @@ fn build_start_index(starts_pcs: &[u32]) -> Option<Box<[PcBlock]>> {
 /// Is `CRATONVM_QUICKEN_STATS` set? Read once — this gates a diagnostic only.
 fn stats_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_QUICKEN_STATS").is_some())
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_QUICKEN_STATS").is_some()
+    })
 }
 
 /// Print the running footprint of the quickened streams to stderr.
