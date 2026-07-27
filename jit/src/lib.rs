@@ -7132,9 +7132,16 @@ pub fn try_compile_with_invokespecial_resolver(
     // `vm/src/jit/skip_list.rs` alone does not lift it: `try_compile` returns
     // `None` here before any JAXB method can be compiled, so a "ban removed"
     // run that does not also pass `CRATONVM_JIT_ALLOW_PACKAGES` measures an
-    // uncompiled package. See `docs/internal/jaxb-jit-ban-removed-20260727.md`
-    // ("Completing the removal") for the JIT-entry counts that show the
-    // difference, and for the bisected root cause (`82b78bca5`).
+    // uncompiled package: `CRATONVM_DBG_JIT_ENTRY=1` over 900 iterations of
+    // the `JaxbQNameProbe` reproducer counts 0 `org/glassfish/jaxb/…` JIT
+    // entries with either gate present and 12923 with both gone. The
+    // corruption the ban existed for (a self-cast `QName cannot be cast to
+    // QName`, later an `UnmarshalException: unexpected element (uri:"",
+    // local:"widget")` at iteration 81) was never JAXB's: it was the
+    // `java/lang/String` compact-layout field intrinsic reading a primitive
+    // field four bytes high, fixed by `82b78bca5`. Bisected with that probe —
+    // dev `95e4d9929` fails at iteration 81, `82b78bca5` and later are clean.
+    // See the retired `jaxb-jit-ban-removed-20260727` write-up.
 
     // Keep the final admission gate aligned with the VM-side Xerces parser
     // guard. Background compilation bypasses the VM skip-list, and JITting
@@ -9487,6 +9494,25 @@ fn try_compile_inner(
     // and publishes the body without OSR entry points — see
     // `x64::kernel_reg_locals_enabled` for the safety argument.
     x64::set_kernel_reg_homes_request(true);
+    // Exception-handler entry edges are invisible to the backend's bytecode
+    // branch decoding, so stage this method's protected ranges for
+    // `find_bypassable_loop_headers`: a handler that can be entered from
+    // outside a loop lands in the body without running its pre-header. Staged
+    // as `(start_pc, end_pc, handler_pc)`, one-shot, taken at backend entry.
+    // An empty exception table stages an empty vec → unchanged codegen.
+    x64::set_pending_exception_ranges(
+        cached
+            .exception_table
+            .iter()
+            .map(|e| {
+                (
+                    e.start_pc as usize,
+                    e.end_pc as usize,
+                    e.handler_pc as usize,
+                )
+            })
+            .collect(),
+    );
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,

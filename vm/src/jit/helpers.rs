@@ -5311,6 +5311,14 @@ fn handle_jit_dispatch_error(
         MethodCallFailed::InternalError(VmError::ClassFile(ClassFileError::ClassNotFound {
             ref class_name,
         })) => {
+            // `CRATONVM_DBG_LINKAGE_BT=1` -- the third place a
+            // `NoClassDefFoundError` reaches Java (see the matching hooks in
+            // `runtime::exceptions`). Only the Rust backtrace names the JIT
+            // dispatch site that could not resolve the class.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some() {
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("[DBG_LINKAGE_BT] jit NoClassDefFoundError {class_name}\n{bt}");
+            }
             if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
