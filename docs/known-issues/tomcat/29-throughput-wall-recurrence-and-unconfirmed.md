@@ -58,6 +58,20 @@ Distinct in kind from `23-charsetcache-pathological-slowdown.md` (that one
 is a 3x slowdown of the supposedly-faster path — a real defect, not just
 "not yet as fast as HotSpot").
 
+> **Update 2026-07-27 — one member of this family is now root-caused, and it
+> is NOT a diffuse interpreter ceiling.**
+> `org.apache.tomcat.util.http.TestMethodPerformance` was chased down to two
+> *named* JIT-admission gates that leave its entire hot path interpreted: the
+> loop method is permanently OSR-denied by the RBC.7 `invokedynamic` ban
+> (triggered by its trailing `println("…" + duration + "ns")` string-concats),
+> and `StringCache.toString` is refused outright by the RBC.6
+> exception-handler-safety gate (triggered by its `synchronized` block's
+> javac-generated monitor handler). Full analysis, probe table, and fix
+> directions: [30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md).
+> Worth checking whether the other relative-performance-assertion classes
+> above fail the same way — `CRATONVM_DBG_JITC=1 CRATONVM_DBG_RBC6=1` names
+> the gate in one run.
+
 ## Unconfirmed / contention-suspected — do not treat as new regressions without a clean rerun
 
 - **`org.apache.jasper.compiler.TestGenerator`** — FAILed with a clean NPE
@@ -65,7 +79,7 @@ is a 3x slowdown of the supposedly-faster path — a real defect, not just
   run, but HANG at 1500s in the second (post-merge) run, never reaching that
   same test method. Given the Hashtable-size-doubling fix that landed on
   `dev` between the two runs is known to have broken Jasper/ECJ JSP
-  compilation entirely (see `19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md`),
+  compilation entirely (see `../../internal/fixed-suite-bugs/tomcat/19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md`),
   `testBug56581`'s NPE may already be fixed — the class just didn't get far
   enough to prove it in the post-merge run (many sequential embedded-server
   test methods ahead of it, same throughput-multiplication pattern as the
@@ -93,7 +107,7 @@ is a 3x slowdown of the supposedly-faster path — a real defect, not just
   been fixed on THIS host's `apps\tomcat-suite-runner\.suite\cp.txt` yet.
   The actual `%20`-decoding CratonVM bug this class also exercises
   (`bug58086a`) IS already fixed on `dev` per
-  `20-fixture-completion-regressions-closure-FIXED.md` — this class simply
+  `../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md` — this class simply
   never gets far enough to prove it on Windows because of the classpath
   gap. **Fix:** add `ant.jar`/`ant-launcher.jar` to this Windows harness's
   classpath the same way the Linux one was fixed, then rerun.

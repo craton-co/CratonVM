@@ -1063,6 +1063,12 @@ fn file_url_path(url: &str) -> Option<String> {
     Some(path)
 }
 
+/// Carrier class `URL.openConnection()` hands out for `jrt:` URLs -- the same
+/// class the real JDK's jrt protocol handler returns, so callers that test
+/// `instanceof HttpURLConnection` (Spring's `AbstractFileResolvingResource`)
+/// correctly see a plain `URLConnection`.
+const JRT_URL_CONNECTION: &str = "sun/net/www/protocol/jrt/JavaRuntimeURLConnection";
+
 fn synthetic_resource_url_content_len(ctx: &mut dyn NativeContext, url: &str) -> i64 {
     if let Some(path) = file_url_path(url) {
         return std::fs::metadata(path)
@@ -6270,6 +6276,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 )?;
                 return Ok(Some(Value::Object(Some(conn))));
             }
+            // `jrt:` (JEP 220 runtime image) URLs get their own carrier, exactly
+            // as the real JDK does (`sun.net.www.protocol.jrt.JavaRuntimeURLConnection`).
+            // Handing these the generic HttpURLConnection carrier made
+            // `con instanceof HttpURLConnection` true for a runtime-image
+            // resource, so Spring's `AbstractFileResolvingResource.isReadable`
+            // took its HTTP branch and fired a HEAD request at a jrt URL --
+            // `ClassPathResource("java/beans/Introspector.class").isReadable()`
+            // was false even though `openStream()` served the right 23755
+            // bytes (core.io.ModuleResourceTests.existingClassFileResource).
+            if ext.starts_with("jrt:") {
+                let conn = alloc_concurrent_synthetic(ctx, JRT_URL_CONNECTION, 16);
+                ctx.set_field(conn, HUC_URL, Value::Object(Some(this)));
+                ctx.set_field(conn, HUC_DO_INPUT, Value::Int(1));
+                ctx.set_field(conn, HUC_CONNECTED, Value::Int(0));
+                return Ok(Some(Value::Object(Some(conn))));
+            }
             // For `jar:` URLs, retain the JarURLConnection carrier so callers
             // that cast it continue to work. All other schemes need the
             // concrete HttpURLConnection carrier, including `file:`. The
@@ -6543,6 +6565,68 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // to the real-JDK setter, which probes the (uninitialised) connected
     // field and throws IllegalStateException. Make them no-ops on both
     // URLConnection and HttpURLConnection (registered separately).
+    // The `jrt:` carrier handed out by `URL.openConnection` above. Its
+    // methods are the same URLConnection bodies registered just below, but
+    // native lookup is by EXACT class, so the base-class registrations never
+    // reach a subclass carrier -- they have to be repeated here (the same
+    // reason `setUseCaches` is registered on both URLConnection and
+    // HttpURLConnection).
+    r.register(JRT_URL_CONNECTION, "connect", "()V", |_ctx, _args| Ok(None));
+    r.register(JRT_URL_CONNECTION, "setUseCaches", "(Z)V", |_ctx, _args| {
+        Ok(None)
+    });
+    r.register(
+        JRT_URL_CONNECTION,
+        "setDefaultUseCaches",
+        "(Z)V",
+        |_ctx, _args| Ok(None),
+    );
+    r.register(
+        JRT_URL_CONNECTION,
+        "getContentLength",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            let len = synthetic_resource_url_content_len(ctx, &url);
+            let v = if len < 0 || len > i32::MAX as i64 {
+                -1
+            } else {
+                len as i32
+            };
+            Ok(Some(Value::Int(v)))
+        },
+    );
+    r.register(
+        JRT_URL_CONNECTION,
+        "getContentLengthLong",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url = huc_url_string(ctx, this);
+            Ok(Some(Value::Long(synthetic_resource_url_content_len(
+                ctx, &url,
+            ))))
+        },
+    );
+    r.register(JRT_URL_CONNECTION, "getLastModified", "()J", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let url = huc_url_string(ctx, this);
+        Ok(Some(Value::Long(synthetic_resource_url_last_modified(&url))))
+    });
+    r.register(
+        JRT_URL_CONNECTION,
+        "getInputStream",
+        "()Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let url_obj = match ctx.get_field(this, HUC_URL) {
+                Value::Object(Some(o)) => o,
+                _ => return Err(ioex("JavaRuntimeURLConnection.getInputStream: no URL")),
+            };
+            ctx.invoke_virtual(url_obj, "openStream", "()Ljava/io/InputStream;", &[])
+        },
+    );
     r.register(
         "java/net/URLConnection",
         "setUseCaches",

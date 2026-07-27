@@ -3,7 +3,7 @@
 **Status:** 7 of 9 confirmed CratonVM-only regressions FIXED; the remaining
 2 are downstream of the already-tracked, deliberately-deferred
 interpreter/dispatch throughput ceiling
-([`04-embedded-server-throughput-wall-OPEN.md`](04-embedded-server-throughput-wall-OPEN.md)),
+([`../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md`](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md)),
 not new or independently-fixable bugs. Closes
 `../../tomcat/regressions-revealed-by-fixture-completion-20260723.md`.
 
@@ -164,7 +164,7 @@ narrowing WHY, and confirmed neither is a new or independently-fixable bug:
   failing) webapp takes 213–267s on CratonVM (measured across 3 separate
   runs, with and without the opt-in `CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT`
   + `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` mitigations already documented in
-  [`04-embedded-server-throughput-wall-OPEN.md`](04-embedded-server-throughput-wall-OPEN.md)
+  [`../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md`](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md)
   — those flags bought only ~20%, nowhere near enough). The test itself hard-codes
   a 30-second client-side read timeout
   (`SimpleHttpClient.connect(30000, 30000)`), so no per-suite timeout knob can
@@ -235,7 +235,7 @@ target.
 7 of 9 confirmed regressions fixed and verified; the 2 remaining
 (`TestManagerWebapp.testBug57700`, `TestSsl.testPost`) are the SAME
 already-tracked, deliberately-deferred interpreter/dispatch throughput
-ceiling (`04-embedded-server-throughput-wall-OPEN.md`) — fixing them requires
+ceiling (`../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md`) — fixing them requires
 that doc's own deferred, GC/safepoint-correctness-critical architectural work
 (cutting `update_root_snapshot` publish frequency, or a broader interpreter
 dispatch speedup), not a quick native-registration or logic fix. Both are

@@ -1053,6 +1053,28 @@ pub(crate) fn native_class_get_primitive_class(
     };
 
     let name = ctx.read_string(name_obj).unwrap_or_default();
+    // Only the nine primitive type names have a primitive mirror. This native
+    // backs BOTH `Class.getPrimitiveClass` (which the JDK only ever calls with
+    // a real primitive name) and JDK 25's `Class.forPrimitiveName(String)`,
+    // whose contract is to return **null** for anything else.
+    //
+    // `ObjectInputStream.resolveClass` is exactly that caller:
+    //   try { return Class.forName(name, false, latestUserDefinedLoader()); }
+    //   catch (ClassNotFoundException ex) {
+    //       Class<?> cl = Class.forPrimitiveName(name);
+    //       if (cl != null) return cl; else throw ex;
+    //   }
+    // Fabricating a primitive mirror for an arbitrary name therefore turned
+    // every genuinely-missing stream class into a bogus resolved class:
+    // deserializing an unknown type reported `InvalidClassException` instead
+    // of the `ClassNotFoundException` HotSpot raises
+    // (`util.SerializationUtilsTests.deserializeUndefined`).
+    if !matches!(
+        name.as_str(),
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void"
+    ) {
+        return Ok(Some(Value::Object(None)));
+    }
     let mirror = ctx.primitive_class_mirror(&name);
     Ok(Some(Value::Object(Some(mirror))))
 }
@@ -2278,6 +2300,7 @@ pub(crate) fn native_class_for_name(
                     // class (CNFE/NCDFE), and for any other failure type the
                     // raw exception is more informative than a synthesized
                     // CNFE(dotted_name). Matches HotSpot's behaviour.
+                    s111_dbg!("[S111-DBG] loadClass({}) threw, propagating", dotted_name);
                     return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
                         exc_ref,
                     ));
@@ -11900,8 +11923,24 @@ pub(crate) fn annotation_element_to_java_typed(
                 }
                 _ => "java/lang/Object".to_string(),
             };
-            let comp_cid = ctx
-                .class_id_by_name(&comp_name_owned)
+            // Resolve the COMPONENT through the declaring class's loader first,
+            // exactly as the scalar `Enum` and `Class` arms above already do.
+            // `class_id_by_name` is the loader-blind global lookup, so under
+            // classloader isolation the array's component came from the app
+            // loader while the attribute's declared return type came from the
+            // fork -- and Spring's `AnnotationTypeMapping.adapt` rejected the
+            // value with the self-contradictory "should be compatible with
+            // RequestMethod[] but a RequestMethod[] value was returned"
+            // (`test.context.aot.TestContextAotGeneratorIntegrationTests`,
+            // `test.context.aot.AotIntegrationTests`). `probes/ForkArrProbe.java`.
+            let comp_cid = container_loader
+                .and_then(|loader| {
+                    match resolve_annotation_class_via_loader(ctx, loader, &comp_name_owned) {
+                        Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                        Err(_) => None,
+                    }
+                })
+                .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
                     let _ = ctx.load_class(&comp_name_owned);
                     ctx.class_id_by_name(&comp_name_owned)
@@ -12082,16 +12121,48 @@ fn annotation_type_loadable(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> bool {
-    match annotation_desc_to_class_name(&ann.type_descriptor) {
-        Some(name) => {
-            if ctx.class_id_by_name(name).is_some() {
-                return true;
-            }
-            let _ = ctx.load_class(name);
-            ctx.class_id_by_name(name).is_some()
+    annotation_type_loadable_near(ctx, ann, None)
+}
+
+/// Is this annotation's TYPE resolvable, as seen from `declaring_class_id`?
+///
+/// `class_id_by_name` is `find_unique_class_by_name`: it deliberately answers
+/// `None` when a name is AMBIGUOUS, i.e. defined by more than one loader. Under
+/// classloader isolation (Spring's `@CompileWithForkedClassLoader` fork
+/// re-defines the whole framework, including the annotation types themselves)
+/// that makes every annotation on a member of a re-defined class look
+/// unloadable, so `getDeclaredAnnotations()` silently returned an EMPTY array
+/// while `getAnnotation(X)` -- which never consults this filter -- kept working.
+/// Spring's `MergedAnnotations.from(field)` goes through
+/// `getDeclaredAnnotations()`, so `@Autowired` detection found nothing and
+/// `AutowiredAnnotationBeanPostProcessor.processAheadOfTime` returned null for
+/// every forked test (`beans.factory.annotation
+/// .AutowiredAnnotationBeanRegistrationAotContributionTests`, 13 of 14 methods).
+///
+/// Resolve relative to the declaring class first (`class_id_by_name_near`,
+/// the same relation `create_annotation_proxy` uses to pick the proxy's
+/// annotation type), and only fall back to the global unique-name lookup.
+fn annotation_type_loadable_near(
+    ctx: &mut dyn NativeContext,
+    ann: &cratonvm_native_api::AnnotationData,
+    declaring_class_id: Option<ClassId>,
+) -> bool {
+    let Some(name) = annotation_desc_to_class_name(&ann.type_descriptor) else {
+        return false;
+    };
+    if let Some(near) = declaring_class_id {
+        if ctx.class_id_by_name_near(name, near).is_some() {
+            return true;
         }
-        None => false,
     }
+    if ctx.class_id_by_name(name).is_some() {
+        return true;
+    }
+    let _ = ctx.load_class(name);
+    if ctx.class_id_by_name(name).is_some() {
+        return true;
+    }
+    declaring_class_id.is_some_and(|near| ctx.class_id_by_name_near(name, near).is_some())
 }
 
 fn build_annotation_array(
@@ -12118,7 +12189,7 @@ fn build_annotation_array_for(
     let comp = annotation_component_class_id(ctx);
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
-        .filter(|a| annotation_type_loadable(ctx, a))
+        .filter(|a| annotation_type_loadable_near(ctx, a, declaring_class_id))
         .collect();
     let container_loader =
         declaring_class_id.and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
@@ -12139,7 +12210,7 @@ fn build_class_annotation_array(
     // Omit annotations whose type isn't loadable вЂ” see `annotation_type_loadable`.
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
-        .filter(|a| annotation_type_loadable(ctx, a))
+        .filter(|a| annotation_type_loadable_near(ctx, a, Some(queried_class_id)))
         .collect();
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
@@ -12159,7 +12230,7 @@ fn build_method_annotation_array(
 ) -> ObjectRef {
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
-        .filter(|a| annotation_type_loadable(ctx, a))
+        .filter(|a| annotation_type_loadable_near(ctx, a, Some(declaring_class_id)))
         .collect();
     let component = annotation_component_class_id(ctx);
     build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
@@ -15793,6 +15864,20 @@ pub(crate) fn native_class_get_class_loader(
         // class never spuriously reports a null loader.
         if !ctx.is_class_synthetic_stub(&class_name) {
             return Ok(Some(Value::Object(None)));
+        }
+    }
+    // A class registered under a USER-DEFINED loader namespace (id >= 3)
+    // belongs to that loader, even when no explicit `register_defining_loader`
+    // ran for it -- natives that define straight into a namespace
+    // (`define_class_full`, e.g. the config-class enhancer) never touch that
+    // side table. Falling through to the app-loader singleton below made
+    // `enhance(reloadedConfigClass, customLoader).getClassLoader()` report the
+    // app loader (`context.annotation.ConfigurationClassEnhancerTests
+    // .enhanceReloadedClass`).
+    if loader_type >= 3 {
+        if let Some(loader) = crate::classloader::loader_object_for_namespace_id(loader_type as u32)
+        {
+            return Ok(Some(Value::Object(Some(loader))));
         }
     }
     if loader_type == 1 {
