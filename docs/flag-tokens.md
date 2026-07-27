@@ -192,6 +192,7 @@ export inherited from a parent shell.
 | `indy-all` | `CRATONVM_DBG_INDY_ALL` |
 | `indy-generic` | `CRATONVM_DBG_INDY_GENERIC` |
 | `inline-fr` | `CRATONVM_DBG_INLINE_FR` |
+| `interrupt` | `CRATONVM_DBG_INTERRUPT` |
 | `intrinsic-stats` | `CRATONVM_INTRINSIC_STATS` |
 | `invoke-coerce` | `CRATONVM_DBG_INVOKE_COERCE` |
 | `invoke-virtual-entry-trace` | `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` |
@@ -209,6 +210,7 @@ export inherited from a parent shell.
 | `jit-bisect-only` | `CRATONVM_JIT_BISECT_ONLY` |
 | `jit-bisect-skip` | `CRATONVM_JIT_BISECT_SKIP` |
 | `jit-code` | `CRATONVM_DBG_JIT_CODE` |
+| `jit-compiled` | `CRATONVM_DBG_JIT_COMPILED` |
 | `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
 | `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
 | `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |

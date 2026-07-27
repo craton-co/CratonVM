@@ -9562,6 +9562,28 @@ fn native_hs_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     Ok(Some(Value::Int(if was_new { 1 } else { 0 })))
 }
 
+/// `HashSet.remove(Object)` against this VM's native backing map, for callers
+/// that registered their own override on a `HashSet` subclass and need the
+/// ordinary behaviour as a fallback.
+///
+/// Returns `None` when `this` has no native backing map, so the caller can
+/// still fall through to real bytecode. Falling through UNCONDITIONALLY is not
+/// safe: real `HashSet.remove` is `return map.remove(o) == PRESENT;`, and the
+/// synthetic backing map stores an `Int(1)` sentinel rather than JDK
+/// `HashSet.PRESENT` — so that identity comparison is always false and
+/// `remove()` deletes the element while reporting `false`.
+pub fn try_native_hashset_remove(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> Option<MethodCallResult> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    hs_backing_map(ctx, this)?;
+    Some(native_hs_remove(ctx, args))
+}
+
 fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,

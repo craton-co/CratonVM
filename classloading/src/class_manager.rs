@@ -3662,7 +3662,39 @@ impl ClassManager {
                     return Ok(id);
                 }
             }
-            this.load_class(internal)
+            match this.load_class(internal) {
+                Err(VmError::Linkage(LinkageError::IncompatibleClassChangeError { message }))
+                    if message.contains("already defined by") =>
+                {
+                    // Benign concurrent-definition race: this recursive
+                    // supertype/interface resolution (superclass or
+                    // interfaces of the class currently being defined) lost
+                    // a race against ANOTHER thread that independently
+                    // defined the exact same (loader, name) pair in the
+                    // meantime -- e.g. a background thread pool eagerly
+                    // resolving a class (Spring Boot's
+                    // OnClassCondition$ThreadedOutcomesResolver, or a
+                    // Reactor Schedulers worker touching
+                    // reactor/core/scheduler/NonBlocking) while the main
+                    // thread recursively links a DIFFERENT class that also
+                    // implements/extends it. Unlike a genuine duplicate
+                    // `defineClass` call from application code, this path
+                    // has no loader-level lock protecting it (that
+                    // protection -- see native-builtins's
+                    // `url_classloader_define_locks` -- only covers the
+                    // top-level `URLClassLoader.findClass` entry point, not
+                    // this internal recursive resolution). Prefer the
+                    // winner's already-registered copy instead of failing
+                    // this class's own definition outright.
+                    match loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
+                        Some(id) => Ok(id),
+                        None => Err(VmError::Linkage(
+                            LinkageError::IncompatibleClassChangeError { message },
+                        )),
+                    }
+                }
+                other => other,
+            }
         };
         let superclass_id = match class_file.super_class {
             Some(ref super_name) => match resolve_supertype(self, &**super_name) {

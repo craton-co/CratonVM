@@ -2298,6 +2298,23 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         return Ok(Some(Value::Int(0)));
     };
     let Some(source) = properties_keyset_source(ctx, this) else {
+        // An ordinary LinkedHashSet, not a `Properties.keySet()` snapshot.
+        // It still must NOT go to real bytecode: `HashSet.remove` is
+        // `return map.remove(o) == PRESENT;` and this VM's synthetic backing
+        // map stores an `Int(1)` sentinel, never JDK `HashSet.PRESENT`, so the
+        // identity comparison is always false — the element was removed but
+        // `remove()` answered `false`. (`LinkedHashSet` inherits `remove`, so
+        // this override is the only registration that sees such a call.)
+        //
+        // javac was the loudest victim: `Annotate.attributeAnnotation` puts an
+        // annotation type's elements in a `LinkedHashSet` and reports
+        // "duplicate element 'value' in annotation @X" when `members.remove`
+        // returns false — making EVERY annotation with a `value` element
+        // uncompilable by the in-process compiler that Spring's AOT
+        // `TestCompiler` uses.
+        if let Some(result) = cratonvm_native_collections::try_native_hashset_remove(ctx, args) {
+            return result;
+        }
         return ctx.invoke_virtual_bytecode_only(this, "remove", "(Ljava/lang/Object;)Z", &args[1..]);
     };
     if let Some(Value::Object(Some(elem))) = args.get(1).copied() {
@@ -2317,12 +2334,22 @@ fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         ctx.unpin_native_roots(this_pin);
         ctx.unpin_native_roots(source_pin);
         ctx.unpin_native_roots(elem_pin);
+        // Same reason as the non-snapshot branch above: real `HashSet.remove`
+        // bytecode compares the backing map's value against JDK `PRESENT`,
+        // which this VM's synthetic map never stores.
+        let fwd = [Value::Object(Some(this)), Value::Object(Some(elem))];
+        if let Some(result) = cratonvm_native_collections::try_native_hashset_remove(ctx, &fwd) {
+            return result;
+        }
         return ctx.invoke_virtual_bytecode_only(
             this,
             "remove",
             "(Ljava/lang/Object;)Z",
             &[Value::Object(Some(elem))],
         );
+    }
+    if let Some(result) = cratonvm_native_collections::try_native_hashset_remove(ctx, args) {
+        return result;
     }
     ctx.invoke_virtual_bytecode_only(this, "remove", "(Ljava/lang/Object;)Z", &args[1..])
 }

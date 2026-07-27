@@ -5319,6 +5319,7 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
         )
     }
 
+
     fn invoke_special(
         &mut self,
         class_name: &str,
@@ -9512,6 +9513,30 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
 
     fn thread_interrupt(&mut self, thread_obj: ObjectRef) {
         let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
+        // CRATONVM_DBG_INTERRUPT: name the Java frame that raised an interrupt.
+        // A spurious interrupt is invisible at the point it is CONSUMED (the
+        // victim only sees a flag), so the only way to attribute one is to
+        // record the producer. Kept permanently and env-gated for the same
+        // reason CRATONVM_DBG_CCE_BT is.
+        if std::env::var_os("CRATONVM_DBG_INTERRUPT").is_some() {
+            eprintln!(
+                "CRATONVM_DBG_INTERRUPT: target_obj=0x{:x} target_tid={:?} by_tid={}",
+                thread_obj.as_ptr() as usize,
+                tid.map(|t| t.0),
+                self.thread.thread_id.0
+            );
+            for (i, f) in self.thread.frames.iter().enumerate().rev().take(12) {
+                let cn = self
+                    .shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .get_class(f.class_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                eprintln!("  INT-STK[{i}] {}.{} pc={}", cn, f.method_name(), f.pc);
+            }
+        }
         if let Some(tid) = tid {
             // Set the interrupted flag via the registry (cross-thread safe)
             self.shared
@@ -15801,11 +15826,13 @@ fn invoke_on_class_shared_inner(
                                 (method_name, descriptor),
                                 ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
-                        // Mockito's Java-9 member accessor eagerly bootstraps
-                        // Byte Buddy just to choose its instrumentation path.
-                        // Use the registered bridge to its built-in reflection
-                        // fallback before that unsupported bootstrap begins.
-                        || (class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+                        // Legacy Mockito selector override (off by default —
+                        // see `flags::mockito_legacy_selectors`): forced the
+                        // reflection fallback instead of letting the real
+                        // `delegate()` pick `InstrumentationMemberAccessor`.
+                        // Must stay in sync with the interpreter's gate.
+                        || (cratonvm_types::flags::mockito_legacy_selectors()
+                            && class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
                             && method_name == "delegate"
                             && descriptor == "()Lorg/mockito/plugins/MemberAccessor;")
                         || ((class_name == "javax/net/ssl/SSLSocketFactory"

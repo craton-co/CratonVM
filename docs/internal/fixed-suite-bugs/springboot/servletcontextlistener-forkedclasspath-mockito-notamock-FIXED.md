@@ -270,9 +270,13 @@ loader-identity bug in this scenario.
 Two classes ARE a genuine divergence — but not a classloader one:
 `Java8LocationImpl` and `ReflectionMemberAccessor` are loaded on CratonVM and
 **never** on HotSpot, because Mockito silently selects its *fallback*
-`Location`/`MemberAccessor` implementations. Split out into
-[`../../../known-issues/springboot/mockito-silently-selects-fallback-location-and-memberaccessor.md`](../../../known-issues/springboot/mockito-silently-selects-fallback-location-and-memberaccessor.md)
-with the full ruled-out list.
+`Location`/`MemberAccessor` implementations. Split out, and **FIXED
+2026-07-27** — see
+[`mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md`](mockito-silently-selects-fallback-location-and-memberaccessor-FIXED.md).
+Root cause turned out to be two deliberate CratonVM native overrides of the
+selector methods themselves, not the branch/dispatch defect that split-out doc
+had hypothesised — and not fork-loader-related at all (it reproduces with no
+fork loader).
 
 ## Regression check
 

@@ -2288,12 +2288,15 @@ fn process_references_after_gc(
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
         let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.mem.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
-        let size = match shared.mem.heap.get_field(q_obj, 1) {
-            // RQ_FIELD_SIZE
-            Value::Int(v) => v,
-            _ => 0,
+        // RQ_FIELD_SIZE. Slot 1 is `size` in the synthetic two-slot shape but
+        // `queueLength` — a `long` — on a real JDK ReferenceQueue, whose own
+        // `enqueue0`/`poll0` bytecode reads it back. Preserve the stored width.
+        let new_size = match shared.mem.heap.get_field(q_obj, 1) {
+            Value::Long(v) => Value::Long(v + 1),
+            Value::Int(v) => Value::Int(v + 1),
+            _ => Value::Int(1),
         };
-        shared.mem.heap.set_field(q_obj, 1, Value::Int(size + 1));
+        shared.mem.heap.set_field(q_obj, 1, new_size);
         // Mark as enqueued — sentinel Int(1) distinguishes from "never had queue"
         shared.mem.heap.set_field(ref_obj, 1, Value::Int(1)); // REF_FIELD_QUEUE = enqueued sentinel
     }
@@ -11606,6 +11609,60 @@ fn find_exception_handler_impl(
 /// is pushed with `pc` at the handler and the exception on the operand
 /// stack; the interpreter resumes the catch block. Otherwise the exception
 /// propagates to the caller.
+/// Consume an optional reason-9 frame published by the x64 backend and route
+/// a pending Java exception with the exact throw bci and reconstructed locals.
+///
+/// `None` means the compiled method used the historical params-only route.
+/// A matching but unmappable frame fails closed by propagating the exception;
+/// entering a handler with zeroed non-parameter locals would be a silent
+/// miscompile. A foreign nested-callee frame is restored for its owner.
+fn route_jit_signal_exception(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    caller_frame_idx: usize,
+    cached: &Arc<CachedBytecodeMethod>,
+    fallback_throw_pc: usize,
+    exc: ObjectRef,
+    fallback_locals: &[Value],
+) -> Result<CachedCallResult, MethodCallFailed> {
+    let precise = match cratonvm_jit::deopt::take_last_deopt() {
+        Some(rframe)
+            if deopt_frame_matches_method(
+                &rframe,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            ) =>
+        {
+            let bci = rframe.bci as usize;
+            let Some(locals) = ir_deopt_locals(&rframe.locals) else {
+                return Err(MethodCallFailed::ExceptionThrown(exc));
+            };
+            Some((bci, locals))
+        }
+        Some(rframe) => {
+            cratonvm_jit::deopt::restash_last_deopt(rframe);
+            None
+        }
+        None => None,
+    };
+    let (throw_pc, locals) = match precise.as_ref() {
+        Some((bci, locals)) => (*bci, locals.as_slice()),
+        None => (fallback_throw_pc, fallback_locals),
+    };
+    route_jit_exception_through_method(
+        shared,
+        thread,
+        caller_frame_idx,
+        cached,
+        throw_pc,
+        exc,
+        locals,
+    )
+}
+
+/// Search the cached exception table and construct the interpreter handler
+/// frame from the locals selected by `route_jit_signal_exception`.
 fn route_jit_exception_through_method(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -23008,6 +23065,17 @@ fn checkcast_lambda_instantiated_args(
 /// for maps. The backing map's physical slot layout follows the loaded JDK
 /// class, so resolve its `size` field rather than assuming a fixed slot.
 fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str) -> String {
+    // An array receiver must render as its own type, not its component's.
+    // The header word of a reference array holds the COMPONENT class id, so
+    // the caller's `class_id_of` -> `class.name` lookup yields
+    // `java/lang/String` for a `String[]` and produces the nonsensical, and
+    // actively misleading, `java.lang.String cannot be cast to
+    // java.lang.String` (the TestObjectDataType failure, chased for a session
+    // as a class-identity split). HotSpot renders the descriptor instead:
+    // `[Ljava.lang.String;`.
+    if let Some(desc) = array_descriptor_of(shared, obj_ref) {
+        return desc;
+    }
     if raw_name != "cratonvm/internal/UnmodifiableMap" {
         return raw_name.to_string();
     }
@@ -25808,6 +25876,14 @@ pub(crate) fn is_mockito_debugging_native_override(
     ) {
         return false;
     }
+    // Off by default: the real `LocationFactory` selector runs and picks the
+    // StackWalker-backed `LocationImpl`, as on HotSpot. The legacy native
+    // returned a `Java8LocationImpl` with a hardcoded
+    // `"-> at <<unknown line>>"`, which erased the call site from every
+    // Mockito diagnostic. See `flags::mockito_legacy_selectors`.
+    if !cratonvm_types::flags::mockito_legacy_selectors() {
+        return false;
+    }
     method_name == "create"
         && matches!(
             descriptor,
@@ -27633,12 +27709,13 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    // Mockito's ModuleMemberAccessor eagerly selects an instrumentation-backed
-    // Java-9 implementation by bootstrapping Byte Buddy in its class
-    // initializer.  The registered bridge returns Mockito's own reflection
-    // implementation, which is the library's supported fallback and avoids
-    // that unsupported eager bootstrap.
-    if class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
+    // Mockito's ModuleMemberAccessor selects an instrumentation-backed Java-9
+    // implementation. The legacy bridge short-circuited that to the reflection
+    // fallback on every run — a silent HotSpot divergence that breaks access to
+    // strongly-encapsulated members. Off by default; see
+    // `flags::mockito_legacy_selectors`.
+    if cratonvm_types::flags::mockito_legacy_selectors()
+        && class_name == "org/mockito/internal/util/reflection/ModuleMemberAccessor"
         && method_name == "delegate"
         && method_descriptor == "()Lorg/mockito/plugins/MemberAccessor;"
     {
@@ -38251,7 +38328,7 @@ fn execute_jit_call(
             } else {
                 usize::MAX
             };
-            return route_jit_exception_through_method(
+            return route_jit_signal_exception(
                 shared,
                 thread,
                 frame_idx,
@@ -38320,7 +38397,7 @@ fn execute_jit_call(
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38358,7 +38435,7 @@ fn execute_jit_call(
         ) {
             Ok(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38391,7 +38468,7 @@ fn execute_jit_call(
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38716,7 +38793,7 @@ fn execute_jit_call_decoded(
             } else {
                 usize::MAX
             };
-            return route_jit_exception_through_method(
+            return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )
             .map(Some);
@@ -38748,7 +38825,7 @@ fn execute_jit_call_decoded(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38771,7 +38848,7 @@ fn execute_jit_call_decoded(
             Some(&msg),
         ) {
             Ok(exc) => {
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,
@@ -38797,7 +38874,7 @@ fn execute_jit_call_decoded(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                return route_jit_exception_through_method(
+                return route_jit_signal_exception(
                     shared,
                     thread,
                     frame_idx,

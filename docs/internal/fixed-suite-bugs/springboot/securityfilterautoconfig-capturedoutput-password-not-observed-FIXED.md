@@ -55,7 +55,7 @@ case it regresses. This is the same resolution shape as the sibling
 ## Residual status check (related doc)
 
 The doc's own "suggested next step" flagged a plausible connection to
-[`../../known-issues/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](../../known-issues/springboot/onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
+[`onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch-FIXED.md) (now FIXED)
 (`OnBeanCondition$Spec` intermittently seeing `@ConditionalOnMissingBean` as
 absent). That doc's own two affected classes were independently spot-checked
 as part of this verification pass (same binary, same checkout):
