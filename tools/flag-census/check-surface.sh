@@ -101,12 +101,12 @@ fi
 # Non-CratonVM values still have live `std::env` semantics, but they must enter
 # through `flags::runtime_var[_os]`. That function distinguishes declared VM
 # flags (one immutable snapshot) from application/OS variables (live reads).
-CORE_RUNTIME="vm jit gc classloading native-api native-builtins native-collections"
+CORE_RUNTIME="reader types vm jit gc classloading native-api native-builtins native-collections"
 bypasses=$(
   for c in $CORE_RUNTIME; do
     [ -d "$ROOT/$c/src" ] || continue
     grep -RnE 'std::env::var(_os)?[[:space:]]*\(' --include='*.rs' "$ROOT/$c/src" 2>/dev/null
-  done
+  done | grep -v "^$ROOT/types/src/flags.rs:"
 )
 if [ -n "$bypasses" ]; then
   fail=1

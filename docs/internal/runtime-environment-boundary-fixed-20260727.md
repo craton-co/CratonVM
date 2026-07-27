@@ -2,7 +2,7 @@
 
 ## Problem
 
-The runtime already exposed an immutable, typed `VmFlags` snapshot, but seven
+The runtime already exposed an immutable, typed `VmFlags` snapshot, but nine
 core crates still bypassed it with hundreds of direct `std::env::var` and
 `std::env::var_os` calls.  That made process-wide behavior depend on when a
 particular subsystem happened to read the environment, made flags difficult to
@@ -18,8 +18,9 @@ string compatibility boundary:
   are subsequently served from that immutable snapshot;
 * ordinary, undeclared operating-system and application variables retain live
   `std::env` semantics;
-* all direct `std::env::var`/`var_os` calls were removed from `vm`, `jit`, `gc`,
-  `classloading`, `native-api`, `native-builtins`, and `native-collections`;
+* all direct `std::env::var`/`var_os` calls were removed from `reader`, the
+  non-boundary modules of `types`, `vm`, `jit`, `gc`, `classloading`,
+  `native-api`, `native-builtins`, and `native-collections`;
 * the three previously undeclared diagnostic flags
   `CRATONVM_DBG_UCLTRACE`, `CRATONVM_MOVING_YOUNG_BAND_DBG`, and
   `CRATONVM_MOVING_YOUNG_NO_BAND_VERIFY` are now part of the canonical
@@ -33,7 +34,7 @@ compatibility boundary.
 
 * `tools/flag-census/check-surface.sh`
 * `cargo test -p cratonvm-types`
-* `cargo check -p cratonvm-vm -p cratonvm-jit -p cratonvm-gc
+* `cargo check -p cratonvm-reader -p cratonvm-vm -p cratonvm-jit -p cratonvm-gc
   -p cratonvm-classloading -p cratonvm-native-api
   -p cratonvm-native-builtins -p cratonvm-native-collections`
 

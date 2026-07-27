@@ -239,7 +239,7 @@ pub mod tracking {
         if cfg!(debug_assertions) {
             return true;
         }
-        match std::env::var("CRATONVM_LOCK_ORDER_CHECK") {
+        match crate::flags::runtime_var("CRATONVM_LOCK_ORDER_CHECK") {
             Ok(v) => {
                 let v = v.trim();
                 v.eq_ignore_ascii_case("1")

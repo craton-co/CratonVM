@@ -172,7 +172,7 @@ static COMPACT_ENABLED: OnceLock<bool> = OnceLock::new();
 /// uniform 16-byte-cell layout for A/B runs.
 #[inline]
 pub fn compact_ref_fields_enabled() -> bool {
-    *COMPACT_ENABLED.get_or_init(|| match std::env::var("CRATONVM_COMPACT_REF_FIELDS") {
+    *COMPACT_ENABLED.get_or_init(|| match crate::flags::runtime_var("CRATONVM_COMPACT_REF_FIELDS") {
         Ok(value) => {
             let value = value.trim();
             !matches!(
