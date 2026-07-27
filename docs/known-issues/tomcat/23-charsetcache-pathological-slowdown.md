@@ -153,7 +153,7 @@ even when the class times out.
 ## Not this bug
 
 Distinct from the general interpreter/JIT throughput ceiling in
-`29-throughput-wall-recurrence-and-unconfirmed.md` and
+`../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md` and
 `04-embedded-server-throughput-wall-OPEN.md`.
 Those are roughly-uniform overhead versus HotSpot. This is a specific method
 being refused compilation outright, plus a set of now-fixed hot-path defects.
