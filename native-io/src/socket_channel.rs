@@ -2551,6 +2551,12 @@ fn sc_supported_options(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
     supported_socket_options(ctx)
 }
 
+/// Same set for the asynchronous channels — see `async_socket::
+/// aio_supported_options`.
+pub(crate) fn supported_socket_options_pub(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    supported_socket_options(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // ServerSocketChannel — open / bind / accept / close
 // ---------------------------------------------------------------------------

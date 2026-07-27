@@ -15952,7 +15952,13 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
             }
             .into());
         }
+        // STW-COOPERATION: see the matching bracket in
+        // `servlet.rs`'s `ServerSocketChannel.accept` — a thread parked in a
+        // blocking `accept()` must be marked blocked or a concurrent STW
+        // waits for a safepoint arrival that can never happen.
+        ctx.begin_blocking_region();
         let stream_id = s2_blocking_accept(lid);
+        ctx.end_blocking_region();
         match stream_id {
             Some(sid) => {
                 let client = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
