@@ -28,6 +28,11 @@ The JIT has two ways to lower a method:
    This decouples optimization from instruction selection, enabling broader
    transformations. Methods that don't qualify fall back to the direct path.
 
+Both front ends use `runtime_lowering` for stateful operations whose ABI must
+not drift between tiers: object allocation, the compact hashed
+virtual/interface tail, and live monitor calls. The tiers differ in
+optimization policy, not in those runtime semantics.
+
 Key modules:
 
 | Module | Responsibility |
@@ -36,6 +41,7 @@ Key modules:
 | `x64.rs` | The x86-64 emitter, register allocation, and the LICM/BCE/SIMD analyses. |
 | `aarch64.rs` | The (partial) AArch64 backend. |
 | `ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs` | The optional IR pipeline. |
+| `runtime_lowering.rs` | Shared x86-64 allocation, hashed-dispatch, and monitor stubs. |
 
 ## Calling conventions
 
@@ -46,9 +52,25 @@ Compiled methods use one of two conventions:
   so they can reach the heap, class manager, and thread state for slow paths
   (field/array helpers, dispatch bridges, allocation, exceptions).
 
-Compiled code calls back into the VM for anything it doesn't inline: virtual /
-interface dispatch (via a helper bridge), `checkcast`/`instanceof`, allocation,
-and native methods.
+Compiled code handles supported operations inline and calls back into the VM
+for stateful slow paths. Virtual/interface sites use a monomorphic cache, a
+four-entry PIC, and then an eight-set/two-way atomically published hashed
+vtable tail before the miss helper. Allocation uses the shared TLAB-aware
+helper contract, while uncontended monitors enter the thin-lock helper path.
+
+The common native argument envelope retains up to eight decoded,
+forwarded/pinned slots inline; larger signatures spill safely.
+
+## Exceptions and deoptimization
+
+Runtime helpers publish exception/deoptimization state out of band and return
+the JIT sentinel. Call sites must check the signal because a Java `long` can
+legitimately have the same bits as the sentinel.
+
+For a protected throwing bytecode, the compiler must publish enough locals and
+operand state to route the Java exception table. Unsupported handler shapes
+fail closed to another tier or the interpreter. Dead locals are reconstructed
+as `Undefined`, never from an uninitialized machine home.
 
 ## Optimizations
 

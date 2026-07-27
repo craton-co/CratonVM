@@ -582,6 +582,129 @@ clean. None of these 9 beyond the original 3 residuals were independently
 root-caused; they're recorded here only as data points confirming the
 drift-merge resolution was thorough, not narrow.
 
+## Update 2026-07-23 — 6 more classes across 3 modules, two NEW residual shapes, all post-fix (not the original recursion bug returning)
+
+Re-triaging `craton-rerun-20260723`'s residual FAIL batch (a different task,
+`group4.tsv`) turned up 6 more classes that all carry
+`@ForkedClassPath`/`@ClassPathExclusions` (confirmed by source read, same
+method this doc already establishes) and whose failure stack traces run
+directly through `ModifiedClassPathExtension.interceptMethod`/`runTest`
+(confirmed by full stack capture on the Jersey classes — see Case B). None of
+these 6 show the original runaway-recursion `StackOverflowError`/HANG this
+doc's main fix addressed — the recursion guard is working correctly (each
+nested `Launcher` pass runs exactly once, as designed). Two distinct **new**
+failure shapes instead, both plausibly downstream of the July-19 fix's
+stricter isolated-loader semantics (`resolve_class_loader_aware`'s new
+`NoClassDefFoundError`-instead-of-global-fallback branch, per this doc's own
+"Confirmed root cause"/"The fix" sections above) but **not confirmed** to be
+caused by that fix specifically — filed as open residuals, not re-attributed
+to a regression without evidence.
+
+### Case A — `UniqueIdSelector [...] could not be resolved` at JUnit discovery time (4 classes, 3 modules)
+
+`ModifiedClassPathExtension.runTest(String testId)`
+(`ModifiedClassPathExtension.java:110-123`) builds a brand-new
+`LauncherDiscoveryRequest` via `DiscoverySelectors.selectUniqueId(testId)`,
+where `testId` is the **outer** pass's `extensionContext.getUniqueId()`, and
+re-discovers/re-executes that single test from scratch through the fresh
+`ModifiedClassPathClassLoader`. In these 4 classes, that inner discovery pass
+fails outright — JUnit Platform's `DiscoveryIssueNotifier` reports
+`UniqueIdSelector [uniqueId = ...] could not be resolved` as a critical
+discovery issue, which the launcher then surfaces as a single test failure
+(`DiscoveryIssueException`) with **no further stack trace** (JUnit's
+discovery-issue path doesn't carry one, same truncation this doc's "SOE
+evidence" section already noted for `StackOverflowError`). This happens for
+both plain `@Test` methods and (in one case) a `@ParameterizedTest`
+test-template-invocation node:
+
+| Module | Class | Method | Selector that fails to resolve |
+|---|---|---|---|
+| `module/spring-boot-micrometer-tracing-opentelemetry` | `OpenTelemetryEventPublishingContextWrapperBeansTestExecutionListenerIntegrationTests` (class-level `@ForkedClassPath`) | `wrapperIsInstalled()` | `[method:wrapperIsInstalled()]` |
+| `module/spring-boot-micrometer-tracing-opentelemetry` | `OpenTelemetryTracingAutoConfigurationTests` (method-level `@ForkedClassPath`, `OpenTelemetryTracingAutoConfigurationTests.java:514`) | `shouldPublishEventsWhenContextStorageIsInitializedEarly()` (1/36 — rest of the class passes) | `[method:shouldPublishEventsWhenContextStorageIsInitializedEarly()]` |
+| `module/spring-boot-session` | `SessionAutoConfigurationWithoutSecurityTests` (class-level `@ClassPathExclusions("spring-security-*")`) | `sessionCookieConfigurationIsAppliedToAutoConfiguredCookieSerializer()` | `[method:sessionCookieConfigurationIsAppliedToAutoConfiguredCookieSerializer()]` |
+| `module/spring-boot-micrometer-tracing-opentelemetry` | `OpenTelemetryBaggagePropagationIntegrationTests` (class-level `@ForkedClassPath`; this is the class formerly implicated in `crashfail-20260717-crash-cluster-FIXED.md`'s Cluster 1, now moved to package `.autoconfigure` per that doc's resolution note and actually runnable) | `shouldSetEntriesToMdcFromSpanWithBaggage`/`shouldRemoveEntriesFromMdcForNullSpan` (all 8 `@ParameterizedTest` invocations, `@EnumSource`) | `[test-template:shouldSetEntriesToMdcFromSpanWithBaggage(...)]/[test-template-invocation:#1..4]` (the dynamic-invocation variant of the same selector-resolution failure) |
+
+**Not root-caused.** Working hypothesis: the isolated `ModifiedClassPathClassLoader`
+built for the inner pass fails to fully re-resolve some type reachable from
+the test class (an interceptor, a lambda-captured type, or — for the
+`@ParameterizedTest` case — the `AutoConfig` enum backing `@EnumSource`) under
+the July-19 fix's stricter "isolated loader that can't resolve locally throws
+`NoClassDefFoundError` instead of falling through to the global store"
+behavior, and JUnit Jupiter's engine discovery swallows that into a
+`DiscoveryIssue` rather than propagating it as a visible exception — which
+would explain both the "could not be resolved" wording and the missing stack
+trace. Not confirmed by attaching a debugger to a live inner-pass discovery
+call; the strongest next step for whoever picks this up.
+
+Full logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard1/logs/module_spring-boot-micrometer-tracing-opentelemetry.org.springframework.boot.micrometer.tracin-6f0b5fa976e2.out.log`,
+`.../shard4/logs/module_spring-boot-micrometer-tracing-opentelemetry.org.springframework.boot.micrometer.tracin-662392d3f975.out.log`,
+`.../shard7/logs/module_spring-boot-session.org.springframework.boot.session.autoconfigure.SessionAutoConfigura-a56902f560f0.out.log`,
+`.../shard2/logs/module_spring-boot-micrometer-tracing-opentelemetry.org.springframework.boot.micrometer.tracin-262c1532d698.out.log`.
+
+### Case B — `NoClassDefFoundError: org.mockito.internal.creation.bytebuddy.MockMethodAdvice` at runtime, inside the inner pass (2 classes, `module/spring-boot-jersey`)
+
+`JerseySameManagementContextConfigurationTests` (2/7 fail) and
+`JerseyChildManagementContextConfigurationTests` (1/6 fail) — both explicitly
+listed in this doc's "Affected classes" table below, both previously verified
+100% passing after the July-19 fix. Unlike Case A, discovery succeeds and the
+test genuinely runs (full Spring context bootstrap, real bean creation
+attempts) — the inner pass's `ModifiedClassPathClassLoader`-loaded copy of the
+test class fails only when a test method under it calls `Mockito.mock(...)`:
+
+```
+java.lang.IllegalStateException: Could not initialize plugin: interface org.mockito.plugins.MockMaker (alternate: null)
+  ... Plugins.<clinit> -> PluginRegistry.<init> -> PluginLoader.loadPlugin -> DefaultMockitoPlugins.getDefaultPlugin -> DefaultMockitoPlugins.create
+Caused by: java.lang.reflect.InvocationTargetException: java.lang.NoClassDefFoundError: org.mockito.internal.creation.bytebuddy.MockMethodAdvice
+Caused by: java.lang.NoClassDefFoundError: org.mockito.internal.creation.bytebuddy.MockMethodAdvice
+```
+
+Both classes' `.err.log` show the standard "Mockito is currently
+self-attaching to enable the inline-mock-maker" notice before this. Working
+hypothesis, same family as Case A: Mockito's inline mock-maker self-attaches
+as a Java agent and injects/generates `MockMethodAdvice` in a way that used to
+be visible to every classloader via a global/bootstrap fallback path — the
+July-19 fix's stricter isolated-loader `NoClassDefFoundError`-instead-of-fallthrough
+change (this doc's own "The fix" section, `resolve_class_loader_aware`) is a
+plausible, but **not confirmed**, mechanism for why a `ModifiedClassPathClassLoader`-loaded
+class can no longer see it. `@ClassPathExclusions("spring-webmvc-*")` on both
+classes doesn't exclude anything Mockito-related, so this isn't the isolated
+loader correctly excluding a targeted jar — it looks like an unintended
+side effect on an unrelated, should-still-be-visible class.
+
+Full logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard3/logs/module_spring-boot-jersey.org.springframework.boot.jersey.autoconfigure.actuate.web.JerseySame-7a7aa1485f96.out.log`,
+`.../shard7/logs/module_spring-boot-jersey.org.springframework.boot.jersey.autoconfigure.actuate.web.JerseyChil-f4ff991cfbf9.out.log`.
+
+**Net assessment:** this doc's fix is not being reverted or contradicted by
+this update — the specific bug it fixed (runaway `Launcher.execute()`
+recursion) does not reproduce in any of these 6 classes. These are new,
+narrower residuals in the same isolated-classloader mechanism, most
+plausibly (not confirmed) fallout of the same stricter-resolution change that
+fixed the recursion, now blocking some legitimately-should-resolve lookups
+too. Needs a dedicated follow-up session with debugger access, out of scope
+for this triage pass (log-reading only, no rebuild/rerun available).
+
+## Regression note — confirmed still failing 2026-07-23 (craton-rerun-20260723), but with a NEW, different symptom
+
+8 classes from this cluster's `ModifiedClassPathExtension` family (7 of them
+from this doc's own "Affected classes" table below, plus
+`DuplicateJsonObjectContextCustomizerFactoryTests`) are FAILing again as of
+the 2026-07-23 rerun — **but not with the recursion/hang symptom this doc
+fixed**. The new symptom is a JUnit Platform `DiscoveryIssueException`
+("`UniqueIdSelector [...] could not be resolved`") during the same
+nested-`Launcher.discover()` call this doc's fix touched
+(`ModifiedClassPathExtension.runTest()`). No `StackOverflowError`, no hang,
+no repeating `InterceptingExecutableInvoker` warning — the recursion guard
+this doc fixed is confirmed still working. Root-caused (to the extent
+possible without a debugger attach) as a new, separate doc rather than
+reopening this one:
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md).
+`ConnectionFactoryUnwrapperTests` (this cluster's `StackOverflowError`
+example class) also regressed, but back to its *original* pre-fix symptom —
+see the regression note added to
+[`connectionfactoryunwrappertests-nested-outer-instance-identity-FIXED.md`](connectionfactoryunwrappertests-nested-outer-instance-identity-FIXED.md).
+
 ## Affected classes
 
 | Module | Class |

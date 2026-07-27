@@ -9,7 +9,7 @@ Collection](../user-guide/memory-and-gc.md).
 
 | Collector | Selection | Status |
 |-----------|-----------|--------|
-| **Generational** | default / `-XX:+UseGenerationalGC` | The default. Young/old generations with write barriers and a card table. The young generation uses a Cheney copying collector; the default young path is a non-moving sweep with selective promotion. |
+| **Generational** | default / `-XX:+UseGenerationalGC` | The default. Young/old generations with write barriers and a card table. The default young path is non-moving mark/sweep with selective promotion; moving evacuation is opt-in and fail-closed on incomplete root coverage. |
 | **G1** (region-based) | `-XX:+UseG1GC` | Experimental. The generational collector remains the safety net during its maturation. |
 | `zgc` | feature-gated stub | Not a selectable production collector — a metadata simulation plus a real stop-the-world mark-sweep heap that isn't wired into the backend dispatch. |
 
@@ -28,11 +28,11 @@ Two cross-cutting mechanisms keep generational collection correct:
   marking a *card* (a small region of the old generation) so the young collector
   can scan only the dirty cards instead of the whole old generation.
 - **Root scanning.** A collection starts from the roots — thread stacks
-  (interpreter frames and JIT frames), static fields, JNI references, and pinned
-  objects — and traces reachable objects. The Structure-of-Arrays frame layout
-  lets the collector identify reference slots from their type tags, and [precise
-  JIT stack maps](jit.md#precise-stack-maps-and-gc-safety) do the same for
-  compiled frames.
+  (interpreter frames and JIT frames), static fields, JNI references, pinned
+  objects, and registered VM/native side tables — and traces reachable
+  objects. Compact interpreter slots retain reference-kind information, while
+  [JIT stack maps](jit.md#precise-stack-maps-and-gc-safety) and the conservative
+  frame safety net cover compiled frames.
 
 ## Object layout
 
@@ -41,6 +41,13 @@ Objects carry a header followed by their fields:
 ```text
 [ ObjectHeader ] [ field0 ] [ field1 ] ...
 ```
+
+The compatibility header is currently 32 bytes. Instance fields use
+class-computed, alignment-aware compact offsets: primitive fields occupy their
+natural 1/2/4/8-byte widths and reference fields occupy eight bytes by default.
+With compressed oops explicitly enabled, reference fields/elements narrow to
+four bytes. The interpreter's `Value` type is a boundary representation, not
+the physical object-field layout.
 
 Arrays use **compact element sizes** — 1, 2, 4, or 8 bytes per element depending
 on the component type (so `byte[]` is one byte per element, `int[]` four,
@@ -63,10 +70,16 @@ Key modules:
 ## Native roots and JNI pinning
 
 Native code and embedders hold object references the collector must treat as
-roots. The GC maintains a **native-root registry** plus a **JNI pin set**: an
-object pinned for a critical section (for example, an array handed to native
-code, or — with the GPU feature — an array a GPU kernel is reading) is kept alive
-and not moved for the duration.
+roots. VM/native side tables register paired scan/remap callbacks through the
+root registry, and the collector consumes those providers without importing a
+Java-library overlay. The GC also maintains a **JNI pin set**: an object pinned
+for a critical section (for example, an array handed to native code, or — with
+the GPU feature — an array a GPU kernel is reading) is kept alive and not moved
+for the duration.
+
+Moving collection requires a per-cycle coverage proof. If any JIT/native/root
+owner cannot prove safe discovery and remapping, the cycle diverts to the
+non-moving path rather than relocating with incomplete information.
 
 ## Stop-the-world safepoints
 

@@ -5249,8 +5249,20 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         loader_id: u32,
     ) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let mut cm = self.shared.classes.class_manager_write();
-        match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
+        match cm.define_class(name, bytes, cl_id) {
             Ok(cid) => {
                 drop(cm);
                 let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
@@ -5277,14 +5289,38 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let cm = self.shared.classes.class_manager.read();
-        cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
+        cm.find_class_by_name_in_loader(name, cl_id)
     }
 
     fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
+        };
         let cm = self.shared.classes.class_manager.read();
-        cm.class_defined_by_loader_exact(name, ClassLoaderId::UserDefined(loader_id))
+        cm.class_defined_by_loader_exact(name, cl_id)
     }
 
     fn define_class_full(
@@ -5299,10 +5335,34 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2).
         use cratonvm_classloading::{CodeSource, DefineClassOptions};
         use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
+        // Must be the exact inverse of `loader_id_of_class`'s encoding
+        // (Bootstrap=0, Extension=1, Application=2, UserDefined(id)=id).
+        // This used to only special-case `0` (as Application, the
+        // pre-existing default-sentinel convention some callers rely on)
+        // and fell through everything else -- including `2` -- to
+        // `UserDefined(loader_id)`. A caller that round-trips a REAL
+        // loader id via `loader_id_of_class` (e.g. the CGLIB
+        // `@Configuration` enhancer fetching its superclass's own loader
+        // so the generated subclass is defined by the SAME loader) got
+        // `UserDefined(2)` back for the Application loader instead of
+        // `Application` -- a different `ClassLoaderId` that
+        // `same_runtime_package`'s `loader_id` equality check correctly
+        // treats as a DIFFERENT runtime package from the superclass's
+        // `Application` tag. That silently defeated package-private
+        // method-override detection for the whole generated class: every
+        // package-private `@Bean` override was treated as an unrelated,
+        // independent method in a fresh vtable slot rather than a true
+        // override of the inherited slot, so virtual dispatch to it from
+        // ordinary (non-invokespecial) call sites kept resolving to the
+        // superclass's original method body forever, breaking `@Bean`
+        // inter-method singleton-sharing (calling one `@Bean` method from
+        // another on `this` re-ran the real factory body instead of
+        // returning the container's cached instance).
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Application,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
         };
         let code_source =
             if opts.code_source_url.is_none() && opts.code_source_certificates.is_empty() {
@@ -5383,10 +5443,17 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn list_initiated_class_ids(&self, loader_id: u32) -> Vec<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let cl_id = if loader_id == 0 {
-            ClassLoaderId::Application
-        } else {
-            ClassLoaderId::UserDefined(loader_id)
+        // See `define_class_full`'s matching fix for why this must be the
+        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
+        // 1=Extension, 2=Application, else=UserDefined) rather than only
+        // special-casing one value -- a loader id round-tripped from
+        // `loader_id_of_class(Application)` (which returns 2) must decode
+        // back to `Application`, not `UserDefined(2)`.
+        let cl_id = match loader_id {
+            0 => ClassLoaderId::Bootstrap,
+            1 => ClassLoaderId::Extension,
+            2 => ClassLoaderId::Application,
+            other => ClassLoaderId::UserDefined(other),
         };
         let cm = self.shared.classes.class_manager.read();
         cm.class_store
@@ -12236,9 +12303,43 @@ pub fn invoke_or_native(
     // already be loaded. Class-init state is monotonic, so this call is
     // cheap (a single atomic load) once initialized and can never
     // regress an already-initialized class back to needing the check.
+    // Resolving the dispatch class by NAME is ambiguous whenever more than one
+    // loader has defined that name -- `get_loaded_class_id` / `invoke_shared`
+    // then answer `None` / `ClassNotFound` and the call surfaces as a
+    // `NoClassDefFoundError` for a class that is very much loaded. Groovy is
+    // the everyday case: `GroovyScriptFactory` compiles the same script class
+    // through a FRESH `GroovyClassLoader` per application context, so by the
+    // second context `org/springframework/scripting/groovy/TestFactoryBean`
+    // names two distinct classes (`scripting.groovy.GroovyScriptFactoryTests`,
+    // 11 of 38 methods, JIT-only because the interpreter's own dispatch is
+    // ClassId-based and never re-resolves the name).
+    //
+    // A virtual call's receiver IS the authoritative answer: when its runtime
+    // class carries exactly this name, dispatch on that ClassId instead of
+    // asking the (ambiguous) global name table.
+    let receiver_class_id = match args.first() {
+        Some(Value::Object(Some(receiver))) => {
+            let cid = shared.mem.heap.class_id_of(*receiver);
+            let same_name = shared
+                .classes
+                .class_manager
+                .read()
+                .get_class(cid)
+                .map(|c| c.name.as_ref() == effective_class)
+                .unwrap_or(false);
+            if same_name {
+                Some(cid)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
     {
         let cm = shared.classes.class_manager.read();
-        if let Some(class_id) = cm.get_loaded_class_id(effective_class) {
+        if let Some(class_id) =
+            receiver_class_id.or_else(|| cm.get_loaded_class_id(effective_class))
+        {
             if let Some(class) = cm.class_store.get(class_id) {
                 if !class.is_synthetic_stub {
                     drop(cm);
@@ -12953,7 +13054,7 @@ pub(super) fn proxy_invoke_handler(
         return proxy_unbox_primitive_return(
             ctx.shared,
             descriptor,
-            proxy_annotation_handler_invoke(ctx.shared, handler_ref, method_name, args),
+            proxy_annotation_handler_invoke(ctx.shared, ctx.thread, handler_ref, method_name, args),
         );
     }
 
@@ -13292,7 +13393,21 @@ fn annotation_proxy_invoke(
     method_name: &str,
     args: &[Value],
 ) -> MethodCallResult {
-    annotation_proxy_dispatch_impl(ctx.shared, proxy, method_name, args)
+    // Route through the SHARED entry point, not `annotation_proxy_dispatch_impl`
+    // directly: only the shared one carries the `asMap` handler and the
+    // cross-type `equals` delegation (an `AnnotationProxy` compared against a
+    // FOREIGN annotation proxy of the same type -- e.g. Spring's
+    // `MergedAnnotation.synthesize()` JDK proxy -- must delegate to that
+    // proxy's own `equals`, or equality is asymmetric).
+    //
+    // This is the path a native takes via `NativeContext::invoke_virtual`,
+    // which is how AssertJ's natively-shimmed
+    // `StandardComparisonStrategy.areEqual` performs its final
+    // `actual.equals(other)`. Bypassing the delegation made
+    // `assertThat(realAnnotation).isEqualTo(synthesizedAnnotation)` fail while
+    // the identical call written in Java passed
+    // (`core.annotation.MergedAnnotationsTests.equalsForSynthesizedAnnotations`).
+    annotation_proxy_invoke_shared(ctx.shared, ctx.thread, proxy, method_name, args)
 }
 
 /// Shared-interpreter version of `proxy_invoke_handler` вЂ” callable from the
@@ -13346,6 +13461,7 @@ fn proxy_unbox_primitive_return(
 /// annotation equality compares its members rather than proxy identity.
 fn proxy_annotation_handler_invoke(
     shared: &SharedVm,
+    thread: &mut JvmThread,
     handler_ref: ObjectRef,
     method_name: &str,
     args: &[Value],
@@ -13369,7 +13485,15 @@ fn proxy_annotation_handler_invoke(
             }
         }
     }
-    annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args)
+    // Fall through to the SHARED entry point, not `annotation_proxy_dispatch_impl`:
+    // only the shared one delegates `equals` to a FOREIGN annotation proxy of
+    // the same type (e.g. Spring's `MergedAnnotation.synthesize()` proxy, whose
+    // handler is Spring's own, not an `AnnotationProxy`). Without it
+    // `realAnnotation.equals(synthesized)` answered false while
+    // `synthesized.equals(realAnnotation)` answered true -- asymmetric equality,
+    // surfacing as `core.annotation.MergedAnnotationsTests
+    // .equalsForSynthesizedAnnotations`.
+    annotation_proxy_invoke_shared(shared, thread, handler_ref, method_name, args)
 }
 
 pub(crate) fn proxy_invoke_handler_shared(
@@ -13399,7 +13523,7 @@ pub(crate) fn proxy_invoke_handler_shared(
         return proxy_unbox_primitive_return(
             shared,
             descriptor,
-            proxy_annotation_handler_invoke(shared, handler_ref, method_name, args),
+            proxy_annotation_handler_invoke(shared, thread, handler_ref, method_name, args),
         );
     }
 
