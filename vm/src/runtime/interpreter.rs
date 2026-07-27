@@ -767,6 +767,20 @@ fn stw_take_over_and_wait(
             if let Some(r) = peer.native_pending_return {
                 xt_roots.push(r);
             }
+            // TOMCAT-JNDIREALM-JIT.3 — a frozen peer's per-thread native
+            // caches live in NO frame, so the frame walk above cannot reach
+            // them. A peer taken over mid-JIT is exactly a thread whose
+            // deposited snapshot is stale, so these must be contributed here
+            // too (same set as `deposit_root_snapshot_inner` publishes).
+            for entry in peer.jit_hashmap_string_node_cache.iter() {
+                xt_roots.push(entry.map);
+                xt_roots.push(entry.node);
+            }
+            for entry in peer.string_case_cache.iter() {
+                xt_roots.push(entry.source);
+                xt_roots.push(entry.first);
+                xt_roots.push(entry.second);
+            }
         }
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some() {
             eprintln!(
@@ -3454,6 +3468,22 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         snapshot.push(entry.map);
         snapshot.push(entry.node);
     }
+    // TOMCAT-JNDIREALM-JIT.3 (2026-07-26) — the ASCII case-conversion cache,
+    // exactly the same contract as the HashMap node cache above. It was wired
+    // into `roots::collect_roots` + `gc.rs` (the INITIATOR's own scan and
+    // remap) but into neither published snapshot, so a collection initiated by
+    // ANOTHER thread never saw it: the non-moving young sweep reclaimed the
+    // cached `first`/`second` Strings, and the owner's next
+    // `get_ascii_case_string_cached` handed the freed address straight back to
+    // bytecode as an all-zero-header `java/lang/String` receiver at
+    // `String.equals`/`String.indexOf`. Real repro: Tomcat's
+    // `TestJNDIRealmIntegration` 76-case matrix with `com/unboundid/`
+    // JIT-eligible, whose `StaticUtils.toLowerCase` is the hot cache consumer.
+    for entry in &thread.string_case_cache {
+        snapshot.push(entry.source);
+        snapshot.push(entry.first);
+        snapshot.push(entry.second);
+    }
     // JNI local references (INT-5, safepoint half): a JNI native that
     // obtained local refs and re-entered Java parks HERE — and a
     // cross-thread collector marks this thread only from this snapshot, so
@@ -3982,6 +4012,18 @@ pub(crate) fn apply_pointer_map_to_thread(
     // code resumes and probes the cache.
     for entry in &mut thread.jit_hashmap_string_node_cache {
         for obj_ref in [&mut entry.map, &mut entry.node] {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    // TOMCAT-JNDIREALM-JIT.3 — remap companion to the publish added above.
+    // Same reasoning as the HashMap node cache: the entries are raw
+    // `ObjectRef`s outside any frame, so a peer-initiated moving collection
+    // would strand them.
+    for entry in &mut thread.string_case_cache {
+        for obj_ref in [&mut entry.source, &mut entry.first, &mut entry.second] {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };

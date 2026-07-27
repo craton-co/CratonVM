@@ -9639,6 +9639,33 @@ fn native_dos_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // Path = 1-field synthetic (field 0 = String path)
 const PATH_FIELD_STR: usize = 0;
 
+/// Resolve a numeric uid/gid to its name via the passwd/group database.
+/// `db` is `/etc/passwd` or `/etc/group`; both are `name:x:<id>:...` records.
+/// Returns `None` off Unix, when the file is unreadable, or when the id has no
+/// entry — callers then use the decimal id, exactly like the JDK's own
+/// `UnixUserPrincipals` fallback.
+fn unix_id_name(db: &str, id: i32) -> Option<String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (db, id);
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let text = std::fs::read_to_string(db).ok()?;
+        for line in text.lines() {
+            let mut parts = line.split(':');
+            let name = parts.next()?;
+            let _passwd = parts.next();
+            let entry_id = parts.next()?.trim().parse::<i32>().ok();
+            if entry_id == Some(id) && !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+}
+
 fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -9654,6 +9681,42 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
         "init",
         "()I",
         |_ctx, _args| Ok(Some(cratonvm_types::Value::Int(0))),
+    );
+    // `UnixUserPrincipals.fromUid(uid)` / `fromGid(gid)` — reached from
+    // `UnixFileAttributes.owner()`/`group()`, i.e. from `Files.getOwner` and
+    // from any `PosixFileAttributes` consumer (Spring Boot's
+    // `ApplicationTemp` ownership check among them). Without these the call
+    // raised `UnsatisfiedLinkError` on the very first owner lookup.
+    //
+    // The real dispatcher throws `UnixException` for an unknown id and
+    // `fromUid`/`fromGid` then fall back to the decimal id as the name; we
+    // return those same decimal bytes directly rather than synthesising a
+    // `UnixException`, which is indistinguishable to every caller.
+    registry.register(
+        "sun/nio/fs/UnixNativeDispatcher",
+        "getpwuid",
+        "(I)[B",
+        |ctx, args| {
+            let uid = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            let name = unix_id_name("/etc/passwd", uid).unwrap_or_else(|| uid.to_string());
+            let bytes = name.as_bytes();
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            ctx.write_byte_array_from(arr, 0, bytes);
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+    registry.register(
+        "sun/nio/fs/UnixNativeDispatcher",
+        "getgrgid",
+        "(I)[B",
+        |ctx, args| {
+            let gid = args.first().and_then(|v| v.as_int()).unwrap_or(0);
+            let name = unix_id_name("/etc/group", gid).unwrap_or_else(|| gid.to_string());
+            let bytes = name.as_bytes();
+            let arr = ctx.new_array(ArrayElementType::Byte, bytes.len());
+            ctx.write_byte_array_from(arr, 0, bytes);
+            Ok(Some(Value::Object(Some(arr))))
+        },
     );
     registry.register(
         "sun/nio/fs/UnixNativeDispatcher",

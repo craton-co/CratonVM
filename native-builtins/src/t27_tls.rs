@@ -1306,7 +1306,10 @@ pub(crate) struct ServerRegistry {
 }
 
 pub(crate) struct TlsClientStreamEntry {
-    pub(crate) stream: StreamOwned<ClientConnection, TcpStream>,
+    /// Per-stream mutex, NOT guarded by `sreg()`. Blocking socket I/O on one
+    /// TLS connection must never hold the process-wide registry lock — see
+    /// `rustls_stream_read`'s doc comment.
+    pub(crate) stream: Arc<Mutex<StreamOwned<ClientConnection, TcpStream>>>,
     pub(crate) peer_host: String,
     pub(crate) peer_port: u16,
     pub(crate) negotiated_protocol: String,
@@ -1315,7 +1318,8 @@ pub(crate) struct TlsClientStreamEntry {
 }
 
 pub(crate) struct TlsServerStreamEntry {
-    pub(crate) stream: TlsServerStream,
+    /// Per-stream mutex — see `TlsClientStreamEntry::stream`.
+    pub(crate) stream: Arc<Mutex<TlsServerStream>>,
     pub(crate) sni_hostname: Option<String>,
     pub(crate) negotiated_protocol: String,
     pub(crate) negotiated_cipher: String,
@@ -2633,7 +2637,7 @@ pub(crate) fn rustls_client_connect(
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
 
     let entry = TlsClientStreamEntry {
-        stream,
+        stream: Arc::new(Mutex::new(stream)),
         peer_host: host.to_string(),
         peer_port: port,
         negotiated_protocol,
@@ -2797,7 +2801,7 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
         };
 
     let entry = TlsServerStreamEntry {
-        stream,
+        stream: Arc::new(Mutex::new(stream)),
         sni_hostname,
         negotiated_protocol,
         negotiated_cipher,
@@ -2952,7 +2956,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     reg.server_streams.insert(
         id,
         TlsServerStreamEntry {
-            stream: TlsServerStream::Rustls(stream),
+            stream: Arc::new(Mutex::new(TlsServerStream::Rustls(stream))),
             sni_hostname,
             negotiated_protocol,
             negotiated_cipher,
@@ -3020,7 +3024,7 @@ pub(crate) fn rustls_client_handshake_over_stream(
         .alpn_protocol()
         .and_then(|b| String::from_utf8(b.to_vec()).ok());
     let entry = TlsClientStreamEntry {
-        stream,
+        stream: Arc::new(Mutex::new(stream)),
         peer_host: host.to_string(),
         peer_port: 0,
         negotiated_protocol,
@@ -3292,8 +3296,23 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
 
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     let debug_srv = crate::nbflags().dbg_tls_srv;
-    let mut reg = sreg().lock();
-    if let Some(e) = reg.client_streams.get_mut(&id) {
+    // LOCK DISCIPLINE (stw-takeover / accept-close-deadlock family): resolve
+    // the id and clone the per-stream handle under `sreg()`, then RELEASE
+    // `sreg()` before blocking. Holding the process-wide registry mutex
+    // across a read that waits for a peer parks every other TLS operation in
+    // the process behind it — including the peer's own write — and a thread
+    // parked on a plain mutex inside a native call never reaches a safepoint,
+    // so a concurrent STW waits for it forever. Identical reasoning to
+    // `rustls_server_accept`'s fix; these sibling functions were missed then.
+    let (client, server) = {
+        let reg = sreg().lock();
+        (
+            reg.client_streams.get(&id).map(|e| e.stream.clone()),
+            reg.server_streams.get(&id).map(|e| e.stream.clone()),
+        )
+    };
+    if let Some(stream) = client {
+        let mut e = stream.lock();
         // FIX (TestSsl.testSni[JSSE]): a plain `SSLSocket.getInputStream()
         // .read()` on the client side used to propagate rustls's raw
         // `UnexpectedEof` ("peer closed connection without sending TLS
@@ -3305,9 +3324,10 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
         // Reuse the same EOF-tolerant read already established for the
         // native HTTP client bridge (`http_url_connection::
         // read_eof_tolerant`) instead of duplicating the tolerance logic.
-        return crate::http_url_connection::read_eof_tolerant(&mut e.stream, buf);
+        return crate::http_url_connection::read_eof_tolerant(&mut *e, buf);
     }
-    if let Some(e) = reg.server_streams.get_mut(&id) {
+    if let Some(stream) = server {
+        let mut e = stream.lock();
         if debug_srv {
             eprintln!(
                 "[dbg-tls-srv] stream_read ENTER id={} requested_len={}",
@@ -3315,7 +3335,7 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
                 buf.len()
             );
         }
-        let result = match &mut e.stream {
+        let result = match &mut *e {
             TlsServerStream::Rustls(s) => s.read(buf),
             TlsServerStream::Native(s) => s.read(buf),
             #[cfg(unix)]
@@ -3338,11 +3358,20 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
 /// Write to either a client- or server-side rustls stream.
 pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
     let debug_srv = crate::nbflags().dbg_tls_srv;
-    let mut reg = sreg().lock();
-    if let Some(e) = reg.client_streams.get_mut(&id) {
-        return e.stream.write(data);
+    // Same lock discipline as `rustls_stream_read` — see its doc comment.
+    let (client, server) = {
+        let reg = sreg().lock();
+        (
+            reg.client_streams.get(&id).map(|e| e.stream.clone()),
+            reg.server_streams.get(&id).map(|e| e.stream.clone()),
+        )
+    };
+    if let Some(stream) = client {
+        let mut e = stream.lock();
+        return e.write(data);
     }
-    if let Some(e) = reg.server_streams.get_mut(&id) {
+    if let Some(stream) = server {
+        let mut e = stream.lock();
         if debug_srv {
             eprintln!(
                 "[dbg-tls-srv] stream_write ENTER id={} len={}",
@@ -3350,7 +3379,7 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
                 data.len()
             );
         }
-        let result = match &mut e.stream {
+        let result = match &mut *e {
             TlsServerStream::Rustls(s) => s.write(data),
             TlsServerStream::Native(s) => s.write(data),
             #[cfg(unix)]
@@ -3372,23 +3401,38 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
 
 /// Close either a client- or server-side rustls stream (idempotent).
 pub(crate) fn rustls_stream_close(id: i32) {
-    let mut reg = sreg().lock();
-    if let Some(mut e) = reg.client_streams.remove(&id) {
-        e.stream.conn.send_close_notify();
-        let _ = e.stream.flush();
+    // Unregister under `sreg()`, then do the graceful shutdown outside it.
+    let (client, server) = {
+        let mut reg = sreg().lock();
+        (
+            reg.client_streams.remove(&id),
+            reg.server_streams.remove(&id),
+        )
+    };
+    // `try_lock`: a peer parked in a blocking read on this SAME stream holds
+    // the per-stream mutex, and waiting for it here would just relocate the
+    // old global-lock stall. The entry is already unregistered, so dropping
+    // our handle is sufficient — the socket closes when the last `Arc` goes.
+    if let Some(e) = client {
+        if let Some(mut s) = e.stream.try_lock() {
+            s.conn.send_close_notify();
+            let _ = s.flush();
+        }
     }
-    if let Some(mut e) = reg.server_streams.remove(&id) {
-        match &mut e.stream {
-            TlsServerStream::Rustls(s) => {
-                s.conn.send_close_notify();
-                let _ = s.flush();
-            }
-            TlsServerStream::Native(s) => {
-                let _ = s.shutdown();
-            }
-            #[cfg(unix)]
-            TlsServerStream::LegacyDsa(s) => {
-                let _ = s.shutdown();
+    if let Some(e) = server {
+        if let Some(mut guard) = e.stream.try_lock() {
+            match &mut *guard {
+                TlsServerStream::Rustls(s) => {
+                    s.conn.send_close_notify();
+                    let _ = s.flush();
+                }
+                TlsServerStream::Native(s) => {
+                    let _ = s.shutdown();
+                }
+                #[cfg(unix)]
+                TlsServerStream::LegacyDsa(s) => {
+                    let _ = s.shutdown();
+                }
             }
         }
     }
@@ -3442,9 +3486,14 @@ pub(crate) fn rustls_session_info(
 /// here despite being queried after the handshake loop that produced it has
 /// already returned.
 pub(crate) fn rustls_client_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
-    let reg = sreg().lock();
-    let entry = reg.client_streams.get(&id)?;
-    let certs = entry.stream.conn.peer_certificates()?;
+    // Clone the per-stream handle under `sreg()` and release it before
+    // touching the stream — see `rustls_stream_read`'s lock-discipline note.
+    let stream = {
+        let reg = sreg().lock();
+        reg.client_streams.get(&id)?.stream.clone()
+    };
+    let entry = stream.lock();
+    let certs = entry.conn.peer_certificates()?;
     if certs.is_empty() {
         return None;
     }

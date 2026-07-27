@@ -7090,7 +7090,39 @@ pub(crate) fn native_method_invoke(
         // with no retarget вЂ” exactly the invokespecial semantics a private
         // method requires, and exactly what a cross-package package-private
         // method also needs (see `crosses_package` above).
-        match ctx.invoke_special(&class_name, &method_name, &descriptor, &invoke_args) {
+        //
+        // Use the `Method` mirror's OWN already-resolved declaring `ClassId`
+        // rather than re-resolving `class_name`, for exactly the reason the
+        // static branch below documents: name-based resolution goes through the
+        // loader-blind global lookup, which collapses to ONE copy per binary
+        // name. When an isolating loader has defined its own copy of the
+        // declaring class, the name lookup returns the APPLICATION copy and we
+        // run that copy's bytecode against a receiver from the isolated loader
+        // — so every constant-pool reference inside the invoked method resolves
+        // in the wrong loader namespace from then on.
+        //
+        // Reproduced by Spring Boot's `@ForkedClassPath` tests whose test
+        // method is package-private and inherited from a base class in a
+        // DIFFERENT package (`crosses_package` → true), e.g.
+        // `TomcatServletWebServerServletContextListenerTests` extending
+        // `…web.server.servlet.AbstractServletWebServerServletContextListenerTests`:
+        // `Mockito.mock()` ran in the fork's namespace (called from the fork's
+        // own nested `@Configuration` class) while the test body's
+        // `Mockito.verify()` ran application-loader bytecode against the
+        // application copy of `MockUtil`, whose `mockMakers` map never saw the
+        // mock → `NotAMockException`. See docs/internal/fixed-suite-bugs/
+        // springboot/servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md.
+        let special_result = match mirror_class_id(ctx, declaring_mirror) {
+            Some(cid) => ctx.invoke_special_by_class_id(
+                cid,
+                &class_name,
+                &method_name,
+                &descriptor,
+                &invoke_args,
+            ),
+            None => ctx.invoke_special(&class_name, &method_name, &descriptor, &invoke_args),
+        };
+        match special_result {
             Ok(v) => v,
             Err(failure) => {
                 return Err(wrap_as_invocation_target_exception(ctx, failure));

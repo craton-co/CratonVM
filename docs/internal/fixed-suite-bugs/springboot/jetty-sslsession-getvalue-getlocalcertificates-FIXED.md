@@ -107,9 +107,9 @@ Full `module/spring-boot-jetty` (15 classes) rerun,
 | `JettyServletWebServerFactoryTests` | HANG at 300s (25 FAIL / 113 once given a 1500s budget) | 832.7s, **12 FAIL** (all the same already-tracked AssertJ NPE) |
 
 The other 13 classes in the module were unaffected (12 PASS, 1 —
-`JettyServletWebServerServletContextListenerTests` — hits a separate,
-already-tracked cross-cutting Mockito issue; see
-`tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`).
+`JettyServletWebServerServletContextListenerTests` — hit a separate
+cross-cutting Mockito issue, since **FIXED 2026-07-26**: see
+[`servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md`](servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md)).
 
 `JettyServletWebServerFactoryTests`'s HANG was never actually an infinite
 hang: the class's remaining, still-open Xerces/TLD-scan slowness residual

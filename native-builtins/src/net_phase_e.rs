@@ -3447,12 +3447,14 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 stream
                     .shutdown(std::net::Shutdown::Read)
                     .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
-            } else if let Some(entry) = reg.tls_streams.get(&sid) {
-                entry
-                    .stream
-                    .get_ref()
-                    .shutdown(std::net::Shutdown::Read)
-                    .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
+            } else {
+                // A TLS socket's id lives in `tls_streams`; use its cloned raw
+                // handle so this never waits on the per-stream TLS mutex —
+                // unblocking a parked reader is the whole point of `shutdown`.
+                if let Some(raw) = reg.tls_streams.get(&sid).and_then(|e| e.raw.as_ref()) {
+                    raw.shutdown(std::net::Shutdown::Read)
+                        .map_err(|e| ioex(format!("shutdown read failed: {e}")))?;
+                }
             }
         }
         sock_set(ctx, this, |s| s.input_shutdown = 1);
@@ -3467,12 +3469,14 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 stream
                     .shutdown(std::net::Shutdown::Write)
                     .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
-            } else if let Some(entry) = reg.tls_streams.get(&sid) {
-                entry
-                    .stream
-                    .get_ref()
-                    .shutdown(std::net::Shutdown::Write)
-                    .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
+            } else {
+                // A TLS socket's id lives in `tls_streams`; use its cloned raw
+                // handle so this never waits on the per-stream TLS mutex —
+                // unblocking a parked reader is the whole point of `shutdown`.
+                if let Some(raw) = reg.tls_streams.get(&sid).and_then(|e| e.raw.as_ref()) {
+                    raw.shutdown(std::net::Shutdown::Write)
+                        .map_err(|e| ioex(format!("shutdown write failed: {e}")))?;
+                }
             }
         }
         sock_set(ctx, this, |s| s.output_shutdown = 1);
@@ -3533,11 +3537,10 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
                 // own doc comment below); missing `tls_streams` here made
                 // both silently no-op for every TLS socket instead of
                 // configuring the real underlying TcpStream's read timeout.
-                entry
-                    .stream
-                    .get_ref()
-                    .set_read_timeout(d)
-                    .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
+                if let Some(raw) = entry.raw.as_ref() {
+                    raw.set_read_timeout(d)
+                        .map_err(|e| ioex(format!("setSoTimeout failed: {e}")))?;
+                }
             }
         }
         sock_set(ctx, this, |s| s.read_timeout_ms = ms);
@@ -3576,10 +3579,8 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             }
             // See the matching comment in setSoTimeout above: a TLS socket's
             // stream id lives in `tls_streams`, not `streams`.
-            if let Some(entry) = reg.tls_streams.get(&sid) {
-                let ms = entry
-                    .stream
-                    .get_ref()
+            if let Some(raw) = reg.tls_streams.get(&sid).and_then(|e| e.raw.as_ref()) {
+                let ms = raw
                     .read_timeout()
                     .map_err(|e| ioex(format!("getSoTimeout failed: {e}")))?
                     .map(|d| d.as_millis() as i32)
