@@ -2597,6 +2597,7 @@ impl SharedVm {
                 missing_natives_log: parking_lot::Mutex::new(Vec::new()),
                 flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
                 jfr_dump_on_exit: parking_lot::Mutex::new(None),
+                jcmd_processor: parking_lot::Mutex::new(None),
                 #[cfg(feature = "experimental-debug")]
                 debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
                 #[cfg(feature = "experimental-debug")]
@@ -4938,6 +4939,18 @@ impl Vm {
         // `install_real_agent_env_bridge` in `runtime/jvmti.rs`. Same `Weak`,
         // idempotent, last-writer-wins shape as the two hooks just above.
         crate::runtime::jvmti::install_real_agent_env_bridge(&shared);
+
+        // obsaudit D15 (2026-07-26) — open the real attach-API socket and
+        // register the *live* (real-VM-state-backed) jcmd command set. See
+        // the LIVENESS block and `AttachListener`'s doc comment in
+        // `runtime/serviceability.rs`: this must be `new_with_vm_state`,
+        // never the argument-less `JcmdProcessor::new()` (that one reports
+        // fabricated data for several commands). `shared.clone()` coerces
+        // to `Arc<dyn VmDiagnosticState>` via the `impl VmDiagnosticState
+        // for SharedVm` in this file.
+        *shared.debug.jcmd_processor.lock() = Some(
+            crate::runtime::serviceability::JcmdProcessor::new_with_vm_state(shared.clone()),
+        );
 
         // obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording`. Before
         // this, vm-cli never called `start_recording` (see the retracted

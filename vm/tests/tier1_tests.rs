@@ -264,8 +264,8 @@ fn d12_dump_recording_via_the_stashed_exit_target_produces_a_real_jfr_file() {
     assert!(bytes > 0, "JFR dump should write a non-zero file");
 
     let raw = std::fs::read(&path).unwrap();
-    // JFR v2.0 binary format magic: "FLR ".
-    assert!(raw.starts_with(b"FLR "), "file must start with the JFR magic");
+    // JFR v2.0 binary format magic: "FLR\0".
+    assert!(raw.starts_with(b"FLR\0"), "file must start with the JFR magic");
     let _ = std::fs::remove_file(&path);
 }
 
@@ -1573,4 +1573,110 @@ fn t1_gc_pause_budget_100k_objects_under_200ms() {
         elapsed < Duration::from_millis(200),
         "100k-object allocation took {elapsed:?} — must be < 200ms"
     );
+}
+
+
+// ===========================================================================
+// obsaudit D15 (2026-07-26) — the attach socket speaks the real HotSpot
+// Attach API wire protocol, not a bespoke one.
+// ===========================================================================
+
+/// Connects to a live `Vm`'s real attach socket and speaks the exact wire
+/// protocol a real `jcmd`/`jstack`/`jmap` uses (see the `AttachListener`
+/// doc comment in `runtime/serviceability.rs` for how this was verified
+/// against a real OpenJDK 21 client) — end to end, no `jcmd` binary
+/// required, so this runs in any CI environment.
+///
+/// This test's first version (before the framing fix landed) would have
+/// hung forever: the handler used to read until EOF, but a real client
+/// never closes its write side before reading the response, so server and
+/// client both block waiting on each other. The read timeout below turns
+/// that failure mode into a fast, clear test failure instead of a wedged
+/// test run.
+#[cfg(unix)]
+#[test]
+fn d15_attach_socket_speaks_the_real_wire_protocol() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let cfg = VmConfig::default();
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+    let socket_path = format!("/tmp/.java_pid{}", std::process::id());
+
+    // The listener thread starts asynchronously in `Vm::new` — briefly
+    // retry the connect rather than assume it has bound by the time this
+    // line runs.
+    let mut stream = None;
+    for _ in 0..50 {
+        match UnixStream::connect(&socket_path) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let mut stream = stream.expect("attach socket must be connectable shortly after Vm::new");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    // The real wire format: <version>\0<operation>\0<arg1>\0<arg2>\0<arg3>\0.
+    stream.write_all(b"1\0jcmd\0VM.version\0\0\0").unwrap();
+
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .expect("must receive a response within the read timeout, not hang");
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("0\n"),
+        "first line must be the decimal result code 0 (success): {response:?}"
+    );
+    assert!(
+        response.contains("CratonVM"),
+        "response body must be VM.version's real output: {response:?}"
+    );
+
+    let _ = &vm;
+}
+
+/// Same protocol, but the `threaddump` operation (what `jstack` sends) —
+/// covers the operation-name translation table, not just the generic
+/// `jcmd` passthrough.
+#[cfg(unix)]
+#[test]
+fn d15_attach_socket_threaddump_operation() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let cfg = VmConfig::default();
+    let vm = cratonvm_vm::vm::Vm::new(cfg);
+    let socket_path = format!("/tmp/.java_pid{}", std::process::id());
+
+    let mut stream = None;
+    for _ in 0..50 {
+        match UnixStream::connect(&socket_path) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let mut stream = stream.expect("attach socket must be connectable shortly after Vm::new");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+
+    stream.write_all(b"1\0threaddump\0\0\0\0").unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).expect("must not hang");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("0\n"));
+    assert!(response.contains("Full thread dump"));
+    assert!(response.contains("\"main\""));
+
+    let _ = &vm;
 }
