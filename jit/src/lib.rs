@@ -5942,6 +5942,30 @@ impl JitCache {
             }
         }
 
+        // Nothing matched -- the overwhelmingly common outcome, because this
+        // runs on EVERY class define and almost no define invalidates a CHA
+        // assumption. Bail before the three whole-cache passes below.
+        //
+        // Each of them is a no-op in this state, but not a cheap one: the
+        // closure loop below still makes a full pass over every shard, the
+        // retarget pass walks every compiled method's inline-cache slots with
+        // an empty set, and the publication loop CLONES all 128 shard maps
+        // only to find `next.len() == old_len` and drop them again. Together
+        // they were ~31% of total CPU on
+        // `beans.factory.aot.BeanRegistrationsAotContributionTests`, which
+        // defines classes continuously (AOT codegen + in-process javac):
+        // `invalidate_cached_targets` 12.8%, `HashMap::clone` 8.0%,
+        // `drop_in_place<JitKey>` 5.6%, `invalidate_for_class_change` 3.4%.
+        //
+        // Correct by construction: the closure loop only ever adds a method
+        // whose callee is ALREADY in `remove_entries`, so an empty set stays
+        // empty; `invalidate_cached_targets` of an empty set changes nothing;
+        // and `retain` with an empty set removes nothing, so no snapshot is
+        // published and the generation counter must not move.
+        if remove_entries.is_empty() {
+            return 0;
+        }
+
         // A raw direct caller of an invalidated body is invalid too. Compute
         // the transitive reverse closure before publishing any new snapshot.
         loop {
@@ -5976,23 +6000,30 @@ impl JitCache {
             }
         }
 
+        // Copy-on-write only the shards that actually lose an entry. The
+        // clone is the expensive half of a publication, and an invalidation
+        // typically touches one or two of the 64 shards.
+        let doomed = |map: &JitCacheMap| {
+            map.values()
+                .any(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+        };
         let mut removed = 0;
         for shard in self.shards.iter() {
             let current = shard.methods.load();
-            let mut next = (**current).clone();
-            let old_len = next.len();
-            next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
-            removed += old_len - next.len();
-            if next.len() != old_len {
+            if doomed(&current) {
+                let mut next = (**current).clone();
+                let old_len = next.len();
+                next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
+                removed += old_len - next.len();
                 shard.methods.store(Arc::new(next));
             }
 
             let current = shard.osr_methods.load();
-            let mut next = (**current).clone();
-            let old_len = next.len();
-            next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
-            removed += old_len - next.len();
-            if next.len() != old_len {
+            if doomed(&current) {
+                let mut next = (**current).clone();
+                let old_len = next.len();
+                next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
+                removed += old_len - next.len();
                 shard.osr_methods.store(Arc::new(next));
             }
         }
@@ -6498,6 +6529,82 @@ pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &st
 /// Diagnostic: number of methods currently bail-listed.
 pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
+}
+
+// ---------------------------------------------------------------------------
+// OSR entry-point reject memo
+// ---------------------------------------------------------------------------
+//
+// An OSR compile is requested for one specific back-edge PC, but the artifact
+// it produces decides for itself which PCs it will accept: `can_osr_enter`
+// refuses any PC whose `osr_dead_mask` is non-zero (a dead interpreter local
+// sharing a compiled location with a live one — state OSR cannot reconstruct).
+// Those two decisions are made by different parts of the pipeline, and they can
+// disagree: the compile succeeds and the resulting body then refuses the very
+// entry it was compiled for.
+//
+// Nothing memoised that disagreement, so the next trip over the same back-edge
+// ran the FULL x64 pipeline again, for the same PC, to the same conclusion —
+// forever. Measured on `org/h2/compress/CompressLZF.compress(Ljava/nio/
+// ByteBuffer;I[BI)I`: 256 compiles of `entry_pc=220` in ten operations of H2's
+// `TestFileSystem` `nioMemLZF:` case, zero OSR entries, zero compiled code
+// executed (2026-07-27). Same shape as the two waste loops this module already
+// memoises — RBC.2's 2,610 recompiles of `SecP521R1Curve$1.lookup` and RBC.4's
+// 35,923 re-run pipelines on `Nat.inc`.
+//
+// The rejection is a pure function of the compile, which is deterministic for a
+// given method, so it is permanent. It is keyed per (method, entry_pc) rather
+// than per method: a method's other back-edges are usually fine, and banning
+// all of them would cost real throughput.
+static OSR_ENTRY_REJECTS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn osr_entry_rejects() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>> {
+    OSR_ENTRY_REJECTS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+fn osr_reject_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
+    // Same sentinel-ClassId rationale as `is_jit_bail_listed`: this is a
+    // negative cache, so a cross-loader name collision only costs one method
+    // one OSR entry point.
+    compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    )
+}
+
+/// Whether a previous OSR compile for this method produced a body that refused
+/// to OSR-enter at `entry_pc`. Checked before re-running the OSR pipeline.
+pub fn is_osr_entry_rejected(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) -> bool {
+    osr_entry_rejects()
+        .read()
+        .contains(&(osr_reject_key(class_name, method_name, descriptor), entry_pc))
+}
+
+/// Record that compiling this method for `entry_pc` yields a body that cannot
+/// enter there, so the pipeline is never re-run for that PC.
+pub fn mark_osr_entry_rejected(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) {
+    osr_entry_rejects()
+        .write()
+        .insert((osr_reject_key(class_name, method_name, descriptor), entry_pc));
+}
+
+/// Diagnostic: number of (method, entry_pc) pairs currently OSR-reject-memoed.
+pub fn osr_entry_reject_count() -> usize {
+    osr_entry_rejects().read().len()
 }
 
 /// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
@@ -7528,7 +7635,7 @@ fn precise_exception_frame_sites_supported(
         // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
+            && !matches!(op, 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
         {
             return false;
         }

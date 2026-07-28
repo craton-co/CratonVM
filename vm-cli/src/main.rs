@@ -2463,14 +2463,12 @@ fn run() -> Result<()> {
             }
         }
     } else if args.nojit {
-        // Interpreter-only workloads can maintain a large cohort in rapid
-        // native/socket transitions. The legacy Generational collector's
-        // cooperative STW protocol can strand that cohort before the next
-        // bytecode poll (Tomcat's JNDI realm shutdown is a reproducer). G1
-        // owns the same workload without that transition deadlock. Keep an
-        // explicit collector choice authoritative; this is only the no-JIT
-        // default.
-        config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::G1;
+        // Keep interpreter-only runs on the same copying Generational path as
+        // the normal launcher default. The non-moving G1 reference path can
+        // retain stale reference slots across repeated application-context
+        // refreshes; explicit -XX:+UseG1GC remains authoritative for callers
+        // that intentionally select and validate G1.
+        config.gc_algorithm = cratonvm_vm::config::GcAlgorithm::Generational;
     }
 
     // G1 tuning knobs (§7 item 4). Parsed from the normalized `--XX:*` value

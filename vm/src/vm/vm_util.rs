@@ -759,7 +759,31 @@ fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
 /// fast-return state — `InitializationError` stays UNINITIALIZED so the fast path
 /// always falls through to the slow path which converts it to
 /// `NoClassDefFoundError`.
+/// `CRATONVM_DBG_CLINIT_FAIL=1` -- print the class name and a Rust backtrace
+/// the FIRST time a class is parked in `InitializationError`.
+///
+/// Every later use of that class raises a fresh `NoClassDefFoundError` from
+/// `ensure_class_initialized_shared`, and that is all a
+/// `CRATONVM_DBG_LINKAGE_BT` trace can show -- it names the consumer, never
+/// the original failure. Without this lever a "NoClassDefFoundError for a
+/// class that is plainly on the classpath" can only be chased by breakpoint.
+fn dbg_clinit_fail() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_CLINIT_FAIL").is_some())
+}
+
 fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassState) {
+    if matches!(new_state, ClassState::InitializationError) && dbg_clinit_fail() {
+        let name = shared
+            .classes
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("<class {class_id}>"));
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[DBG_CLINIT_FAIL] {name} -> InitializationError\n{bt}");
+    }
     {
         let mut cm = shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
@@ -1626,7 +1650,13 @@ fn initialize_class_shared(
                 // stamped-`Initialized` class. The failure then propagates per
                 // JVMS §5.5 below. Gated on `CRATONVM_STRICT_SWALLOWS=1` to keep
                 // the default lenient run quiet.
-                if lenient_clinit() && crate::runtime::env_cache::strict_swallows() {
+                // `CRATONVM_DBG_CLINIT_FAIL=1` names the exception here too --
+                // the class-name-only report at `finalize_class_init` says
+                // WHICH class died but never WHY, and the pre-existing
+                // strict-swallows report only fires in lenient mode.
+                if dbg_clinit_fail()
+                    || (lenient_clinit() && crate::runtime::env_cache::strict_swallows())
+                {
                     let exc_ty = match &e {
                         MethodCallFailed::ExceptionThrown(exc_ref) => {
                             let eid = shared.mem.heap.class_id_of(*exc_ref);
@@ -1641,7 +1671,7 @@ fn initialize_class_shared(
                         other => format!("{:?}", other),
                     };
                     eprintln!(
-                        "CRATONVM_LENIENT_CLINIT: NOT swallowing <clinit> failure (no recovery path / critical exception) — class={} exc={} — propagating per JVMS §5.5",
+                        "[DBG_CLINIT_FAIL] <clinit> failure NOT swallowed (no recovery path / critical exception) — class={} exc={} — propagating per JVMS §5.5",
                         class_name_for_jfr, exc_ty
                     );
                 }
@@ -4119,6 +4149,7 @@ mod tests {
                 code_source: None,
                 array_info: None,
                 init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                record_object_methods: std::sync::atomic::AtomicU8::new(0),
             });
             id
         };
@@ -4208,6 +4239,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         }
     }
 

@@ -338,7 +338,35 @@ pub struct MethodState {
     /// past whatever tier last actually succeeded. `should_compile` stops
     /// recommending further attempts once this saturates, mirroring the
     /// existing "3+ deopts" convention for `c2_bailout` above.
+    ///
+    /// Counts **compile attempts that ran and failed** only. A task the VM
+    /// declined on policy grounds never lands here — see [`Self::ineligible`].
     pub tier_fail_count: u32,
+    /// The VM declined to compile this method for a reason that cannot change
+    /// for the life of the process — the JIT skip list rejected it, or a
+    /// permanent OSR denial applies.
+    ///
+    /// This exists because the two outcomes used to be conflated. A policy
+    /// decline reported `success=false` exactly like a failed compile, so a
+    /// permanently-ineligible method was enqueued and declined **three times**
+    /// before `tier_fail_count` saturated and the tier gates gave up. Two of
+    /// those three round-trips were pure waste (queue traffic, a worker
+    /// wake-up and a skip-list evaluation each), and the hot interpreter path
+    /// kept paying tier-up bookkeeping until the ban finally landed.
+    ///
+    /// The worse cost was diagnostic. `hot_but_stuck_in_interpreter` reported
+    /// `tier_fail_count=3` identically for methods banned *by design*
+    /// (`org/hibernate/` wholesale, `org/h2/` via HIB-LONGTAIL.1, the
+    /// `AbstractQueuedSynchronizer` state family) and for methods whose
+    /// codegen genuinely broke. That is what made "1531 of 1642 hot methods
+    /// never compile" impossible to act on without re-deriving every entry by
+    /// hand — see
+    /// `docs/known-issues/hibernate/smoketests-concurrent-println-timeout-20260723.md`.
+    ///
+    /// Recording the decline once, under its own flag, ends the churn on the
+    /// first attempt and leaves `tier_fail_count` meaning only what its name
+    /// says.
+    pub ineligible: bool,
 }
 
 impl MethodState {
@@ -355,6 +383,7 @@ impl MethodState {
             c2_bailout: false,
             profile: MethodProfile::default(),
             tier_fail_count: 0,
+            ineligible: false,
         }
     }
 }
@@ -500,6 +529,7 @@ impl CompilerCore {
             if state.queued_for_compilation
                 || state.current_tier >= CompilationTier::C2
                 || state.c2_bailout
+                || state.ineligible
                 || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
             {
                 return;
@@ -559,6 +589,7 @@ impl CompilerCore {
         compile_time_ms: u64,
         success: bool,
         osr: bool,
+        declined_permanently: bool,
     ) {
         {
             let mut methods = self.methods.lock();
@@ -568,6 +599,14 @@ impl CompilerCore {
                         state.current_tier = tier;
                     }
                     state.tier_fail_count = 0;
+                } else if declined_permanently {
+                    // Policy verdict, not a compile failure: the skip list and
+                    // the OSR-denial set are pure functions of inputs that are
+                    // fixed once the method is loaded, so re-asking can only
+                    // produce the same answer. Record it once and stop; do NOT
+                    // spend `tier_fail_count`, which exists to bound genuinely
+                    // failing codegen. See `MethodState::ineligible`.
+                    state.ineligible = true;
                 } else {
                     state.tier_fail_count = state.tier_fail_count.saturating_add(1);
                 }
@@ -644,6 +683,38 @@ pub struct CompileOutcome {
     /// publish the worker loop enqueues a Low-priority C2 recompile whose
     /// publish REPLACES the C1 body in the jit cache.
     pub c2_upgrade_candidate: bool,
+    /// The attempt did not publish because the VM *declined* the method on
+    /// grounds that are fixed for the life of the process (skip list, OSR
+    /// denial) — as opposed to a compile that ran and failed.
+    ///
+    /// Set this and the tier manager records the decision once
+    /// ([`MethodState::ineligible`]) instead of spending the method's
+    /// `tier_fail_count` retry budget on a verdict that cannot change. Ignored
+    /// when `published` is true.
+    pub declined_permanently: bool,
+}
+
+impl CompileOutcome {
+    /// A compile that ran and failed — spends one retry.
+    pub fn failed(compile_time_ms: u64) -> Self {
+        Self {
+            compile_time_ms,
+            published: false,
+            c2_upgrade_candidate: false,
+            declined_permanently: false,
+        }
+    }
+
+    /// The VM refused the method on policy grounds — recorded once, never
+    /// retried, and not counted as a compile failure.
+    pub fn declined(compile_time_ms: u64) -> Self {
+        Self {
+            compile_time_ms,
+            published: false,
+            c2_upgrade_candidate: false,
+            declined_permanently: true,
+        }
+    }
 }
 
 /// A compile callback invoked on the background thread for each drained task.
@@ -762,10 +833,15 @@ pub fn dump_method_stats_to_stderr() {
     };
     let c1_threshold = DIAG_C1_THRESHOLD.load(Ordering::Relaxed);
     let mut snap = MethodPromotionSnapshot::default();
-    // (invocation_count, queued_for_compilation, tier_fail_count, name) for
-    // every Interpreter-tier method whose invocation_count already crossed
-    // c1_threshold — the smoking-gun set: these SHOULD have promoted.
-    let mut hot_but_stuck: Vec<(u64, bool, u32, String)> = Vec::new();
+    // (invocation_count, queued_for_compilation, tier_fail_count, ineligible,
+    // name) for every Interpreter-tier method whose invocation_count already
+    // crossed c1_threshold. Splitting `ineligible` out matters: a method the
+    // skip list refuses is stuck BY DESIGN and is not evidence of anything,
+    // whereas one with a non-zero `tier_fail_count` is a compiler failure.
+    // Reporting both as `tier_fail_count=3` is what made an earlier
+    // "1531 of 1642 hot methods never compile" reading unactionable.
+    let mut hot_but_stuck: Vec<(u64, bool, u32, bool, String)> = Vec::new();
+    let mut ineligible_by_policy: u64 = 0;
     {
         let methods = core.methods.lock();
         for state in methods.values() {
@@ -778,10 +854,14 @@ pub fn dump_method_stats_to_stderr() {
                 CompilationTier::Interpreter => {
                     snap.methods_still_interpreted += 1;
                     if state.invocation_count >= c1_threshold {
+                        if state.ineligible {
+                            ineligible_by_policy += 1;
+                        }
                         hot_but_stuck.push((
                             state.invocation_count,
                             state.queued_for_compilation,
                             state.tier_fail_count,
+                            state.ineligible,
                             format!(
                                 "{}.{}{}",
                                 state.method_key.class_name,
@@ -802,7 +882,7 @@ pub fn dump_method_stats_to_stderr() {
         "[cratonvm] JIT method stats: {} distinct methods tracked, {} ever invoked, {} total invocations \
          | still-interpreted={} c1={} full-profile={} c2={} \
          | compiles: c1={} c2={} osr={} deopts={} c2_bailouts={} total_compile_time_ms={} \
-         | c1_threshold={} hot_but_stuck_in_interpreter={}",
+         | c1_threshold={} hot_but_stuck_in_interpreter={} (of which ineligible-by-policy={}, compile-failures={})",
         snap.distinct_methods,
         snap.methods_ever_invoked,
         snap.total_invocations,
@@ -818,17 +898,51 @@ pub fn dump_method_stats_to_stderr() {
         stats.total_compile_time_ms.load(Ordering::Relaxed),
         c1_threshold,
         hot_but_stuck.len(),
+        ineligible_by_policy,
+        hot_but_stuck
+            .iter()
+            .filter(|(_, _, fail, inelig, _)| *fail > 0 && !*inelig)
+            .count(),
     );
     if !hot_but_stuck.is_empty() {
         hot_but_stuck.sort_by(|a, b| b.0.cmp(&a.0));
         eprintln!(
-            "[cratonvm] JIT method stats: top {} hot-but-stuck methods (invocations, queued, tier_fail_count, name):",
+            "[cratonvm] JIT method stats: top {} hot-but-stuck methods (invocations, queued, tier_fail_count, why, name):",
             hot_but_stuck.len().min(30)
         );
-        for (count, queued, fail, name) in hot_but_stuck.iter().take(30) {
+        for (count, queued, fail, inelig, name) in hot_but_stuck.iter().take(30) {
+            let why = if *inelig {
+                "ineligible-by-policy"
+            } else if *fail > 0 {
+                "compile-failed"
+            } else {
+                "not-yet-attempted"
+            };
             eprintln!(
-                "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name}"
+                "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {why:<20} {name}"
             );
+        }
+        // The compile failures are the only actionable entries here — a
+        // policy decline is stuck by design — but they are usually a tiny
+        // minority and get buried under the policy ones when the list is
+        // ranked by invocation count (measured on the Hibernate concurrency
+        // workload: 1513 policy declines vs 6 real failures, none of which
+        // appeared in the top 30). List them separately so the actionable set
+        // is never hidden by the expected one.
+        let failures: Vec<_> = hot_but_stuck
+            .iter()
+            .filter(|(_, _, fail, inelig, _)| *fail > 0 && !*inelig)
+            .collect();
+        if !failures.is_empty() {
+            eprintln!(
+                "[cratonvm] JIT method stats: {} hot method(s) whose COMPILE FAILED (not policy — these are bugs):",
+                failures.len()
+            );
+            for (count, queued, fail, _, name) in failures.iter().take(30) {
+                eprintln!(
+                    "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name}"
+                );
+            }
         }
     }
 }
@@ -1101,6 +1215,7 @@ impl TieredCompilationManager {
             // method (`TestResponsePerformance.doHomebrew`) kept getting
             // "bg-compile ... osr_bci=..." re-attempted every stride while
             // never completing even one 1M-iteration measurement pass.
+            || state.ineligible
             || state.tier_fail_count >= MAX_TIER_FAIL_RETRIES
         {
             return None;
@@ -1225,7 +1340,7 @@ impl TieredCompilationManager {
         compile_time_ms: u64,
     ) {
         self.core
-            .complete_task(key, tier, compile_time_ms, true, false);
+            .complete_task(key, tier, compile_time_ms, true, false, false);
     }
 
     // ── Deoptimization ───────────────────────────────────────────────────
@@ -1448,6 +1563,7 @@ impl TieredCompilationManager {
                 outcome.compile_time_ms,
                 outcome.published,
                 task.osr_bci.is_some(),
+                outcome.declined_permanently,
             );
             // C1→C2 supersede: a freshly-published C1-family body whose
             // method the VM judged IR-eligible gets a Low-priority C2
@@ -1532,6 +1648,11 @@ impl TieredCompilationManager {
         // code-cache-cap or in-flight class redefine — would be
         // re-recommended and re-enqueued on every single invocation
         // forever, since a failed attempt no longer advances `current_tier`.
+        // A policy decline is permanent by construction, so one is enough —
+        // unlike `tier_fail_count`, which deliberately allows retries.
+        if state.ineligible {
+            return None;
+        }
         if state.tier_fail_count >= MAX_TIER_FAIL_RETRIES {
             return None;
         }
@@ -2029,7 +2150,7 @@ mod tests {
         let key = test_key();
         mgr.on_method_invocation(&key); // create state
         mgr.core
-            .complete_task(&key, CompilationTier::C1, 10, false, false);
+            .complete_task(&key, CompilationTier::C1, 10, false, false, false);
         assert_eq!(
             mgr.current_tier(&key),
             CompilationTier::Interpreter,
@@ -2040,6 +2161,69 @@ mod tests {
             0,
             "a failed attempt must not count as a C1 compilation"
         );
+    }
+
+    // ── Policy declines are recorded once, not charged to the retry budget ──
+    //
+    // A method the VM refuses on policy grounds (skip list, OSR denial) used
+    // to report `success=false` exactly like a failed compile, so it was
+    // enqueued and declined three times before `tier_fail_count` saturated.
+    // Two of those round-trips were waste, and the resulting
+    // `tier_fail_count=3` was indistinguishable from genuinely broken codegen
+    // in `hot_but_stuck_in_interpreter`.
+
+    #[test]
+    fn permanent_decline_bans_on_first_attempt_without_spending_retries() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let key = test_key();
+
+        assert_eq!(mgr.on_method_invocation(&key), Some(CompilationTier::C1));
+        mgr.core
+            .complete_task(&key, CompilationTier::C1, 0, false, false, true);
+
+        {
+            let methods = mgr.core.methods.lock();
+            let state = &methods[&key];
+            assert!(state.ineligible, "a policy decline must be recorded");
+            assert_eq!(
+                state.tier_fail_count, 0,
+                "a policy decline must NOT spend the compile-failure retry budget"
+            );
+        }
+
+        // ONE decline is enough: no further invocation may re-enqueue it.
+        for _ in 0..10 {
+            assert_eq!(
+                mgr.on_method_invocation(&key),
+                None,
+                "an ineligible method must never be re-enqueued"
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_decline_does_not_ban_unrelated_methods() {
+        let policy = CompilationPolicy {
+            c1_threshold: 1,
+            ..CompilationPolicy::default()
+        };
+        let mgr = TieredCompilationManager::new(policy);
+        let declined = test_key();
+        let healthy = MethodKey::new("Other", "m", "()V");
+
+        assert_eq!(mgr.on_method_invocation(&declined), Some(CompilationTier::C1));
+        mgr.core
+            .complete_task(&declined, CompilationTier::C1, 0, false, false, true);
+
+        // The other method is untouched and still compiles normally.
+        assert_eq!(mgr.on_method_invocation(&healthy), Some(CompilationTier::C1));
+        mgr.core
+            .complete_task(&healthy, CompilationTier::C1, 1, true, false, false);
+        assert_eq!(mgr.current_tier(&healthy), CompilationTier::C1);
     }
 
     #[test]
@@ -2058,7 +2242,7 @@ mod tests {
         // reset, current_tier untouched).
         for i in 0..(MAX_TIER_FAIL_RETRIES - 1) {
             mgr.core
-                .complete_task(&key, CompilationTier::C1, 1, false, false);
+                .complete_task(&key, CompilationTier::C1, 1, false, false, false);
             assert_eq!(
                 mgr.on_method_invocation(&key),
                 Some(CompilationTier::C1),
@@ -2068,7 +2252,7 @@ mod tests {
         // One more failure reaches MAX_TIER_FAIL_RETRIES — should_compile
         // must now give up permanently.
         mgr.core
-            .complete_task(&key, CompilationTier::C1, 1, false, false);
+            .complete_task(&key, CompilationTier::C1, 1, false, false, false);
         assert_eq!(
             mgr.on_method_invocation(&key),
             None,
@@ -2087,9 +2271,9 @@ mod tests {
         let key = test_key();
         mgr.on_method_invocation(&key);
         mgr.core
-            .complete_task(&key, CompilationTier::C1, 1, false, false);
+            .complete_task(&key, CompilationTier::C1, 1, false, false, false);
         mgr.core
-            .complete_task(&key, CompilationTier::C1, 5, true, false);
+            .complete_task(&key, CompilationTier::C1, 5, true, false, false);
         assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
         let methods = mgr.core.methods.lock();
         assert_eq!(
@@ -2120,7 +2304,7 @@ mod tests {
         // The worker completes it successfully — artifact goes to the OSR
         // cache, `osr = true`.
         mgr.core
-            .complete_task(&key, task.target_tier, 3, true, true);
+            .complete_task(&key, task.target_tier, 3, true, true, false);
         assert_eq!(
             mgr.current_tier(&key),
             CompilationTier::Interpreter,
@@ -2135,7 +2319,7 @@ mod tests {
         );
         // And a successful method-entry completion advances the tier as usual.
         mgr.core
-            .complete_task(&key, CompilationTier::C1, 2, true, false);
+            .complete_task(&key, CompilationTier::C1, 2, true, false, false);
         assert_eq!(mgr.current_tier(&key), CompilationTier::C1);
     }
 
@@ -2628,6 +2812,7 @@ mod tests {
                     compile_time_ms: 7,
                     published: true,
                     c2_upgrade_candidate: false,
+                    declined_permanently: false,
                 }
             }))
             .expect("worker should start");
@@ -2726,6 +2911,7 @@ mod tests {
                     // Models the VM-side predicate: judged IR-eligible on the
                     // C1 pass; a C2 task never re-seeds an upgrade.
                     c2_upgrade_candidate: !tier_uses_optimized_backend(task.target_tier),
+                    declined_permanently: false,
                 }
             }))
             .expect("worker should start");
@@ -2801,6 +2987,7 @@ mod tests {
                     compile_time_ms: 3,
                     published: true,
                     c2_upgrade_candidate: false,
+                    declined_permanently: false,
                 }
             }))
             .expect("worker should start");
@@ -2922,6 +3109,7 @@ mod tests {
                     compile_time_ms: 4,
                     published: true,
                     c2_upgrade_candidate: false,
+                    declined_permanently: false,
                 }
             }))
             .expect("worker should start");

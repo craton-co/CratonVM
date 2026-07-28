@@ -313,33 +313,60 @@ pub enum InitComplexity {
 /// Every other opcode is benign. The scan stops at the first
 /// disqualifier and returns `Complex`. If it walks the entire stream
 /// without finding one, it returns `Trivial`.
-/// Bisect knob (default OFF — no behaviour change): treat a constructor whose
-/// ONLY disqualifier is `putfield` as `Trivial`, keeping the ban for
-/// `putstatic` / `monitorenter` / `monitorexit` / `invokedynamic`.
+/// **DEFAULT ON since 2026-07-28.** A constructor whose ONLY disqualifier is
+/// `putfield` classifies as `Trivial` and is JIT-eligible; the ban is retained
+/// for `putstatic` / `monitorenter` / `monitorexit` / `invokedynamic`.
 ///
-/// Why this knob exists. `putfield` is what essentially every *real*
-/// constructor does — it is the whole point of one — so the blanket gate makes
+/// **Kill switch: `CRATONVM_JIT_PUTFIELD_INIT=0`** (also `off` / `false` /
+/// `no`) restores the historical blanket ban with no rebuild. If a regression
+/// run turns up a miscompile, a wrong result, or a crash, set that and re-run
+/// before doing anything else — it is the fastest possible attribution test for
+/// this change, and it cleanly separates "constructor compilation broke it"
+/// from everything else in the same build.
+///
+/// Why the ban was lifted. `putfield` is what essentially every *real*
+/// constructor does — it is the whole point of one — so the blanket gate made
 /// "allocate an object whose constructor assigns a field" run its constructor
-/// in the interpreter forever. Measured from C2-compiled code on the
-/// `CallRate` probe: ~2200 ns/alloc for a one-field constructor against
-/// ~130-160 ns for a field-store-free one, i.e. the gate, not allocation
-/// itself, is the dominant cost of `new` on every hot path in the VM
-/// (`new String(...)`, `new HashMap.Node(...)`, ...).
+/// in the interpreter forever, and unlike the RBC.6 gate such a constructor was
+/// never even *enqueued* for compilation (no `tiered-enqueue` line at all).
+/// That is a VM-wide ceiling on `new`: `new String(...)`,
+/// `new HashMap.Node(...)`, essentially the whole JDK. Measured on the
+/// `CallRate.allocBody` probe from C2-compiled code: **1846 ns/alloc banned vs
+/// 226 ns/alloc allowed — 8.2x** — with the empty-constructor controls
+/// (`allocArg` / `allocBare` / `allocNoCtor`) flat, so the change does only
+/// what it claims.
 ///
-/// The ban predates the open-source import (`a6dc911ed`) and is one of the
-/// four *structural* bans; unlike the ~46 named correctness bans it carries no
-/// incident write-up — only the "field stores trigger the JIT's
-/// load-forwarding interaction" note above. Per the ban-sweep methodology in
-/// `docs/known-issues/jit-bans/jit-skip-list-open-bans-20260725.md`, the first
-/// move on an unverified ban is to make it testable at runtime rather than to
-/// delete it. Set `CRATONVM_JIT_ALLOW_PUTFIELD_INIT=1` to lift it for a
-/// measurement run.
+/// Evidence gathered before flipping: the `CtorCheck` probe — which READS BACK
+/// every field, so an elided or miscompiled constructor cannot hide behind a
+/// good-looking timing — produces byte-identical checksums across HotSpot,
+/// CratonVM `--nojit`, ban-on and ban-off at 200k and 2M iterations, covering
+/// plain stores, a superclass ctor storing before a subclass ctor, a store fed
+/// by an instance-method call on the half-built object, and a conditional
+/// store. 26 tests across six JIT test binaries pass with it lifted, and a
+/// six-class Tomcat sweep showed no attributable regression (every non-PASS in
+/// that sweep reproduces identically with the ban ON).
+///
+/// What that evidence does NOT cover, stated plainly: this ban predates the
+/// open-source import (`a6dc911ed`) and is one of the four *structural* bans;
+/// unlike the ~46 named correctness bans it carries no incident write-up, only
+/// the "field stores trigger the JIT's load-forwarding interaction" note above.
+/// None of the above proves that rationale stale — it shows only that the tests
+/// run so far do not catch it. Flipped by explicit maintainer decision with a
+/// full regression run to follow; that run is the real verdict, which is why
+/// the kill switch exists.
 fn allow_putfield_init() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ALLOW_PUTFIELD_INIT").is_some()
-    })
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_PUTFIELD_INIT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            ),
+            // Default: a constructor that only stores fields is compilable.
+            Err(_) => true,
+        },
+    )
 }
 
 pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
@@ -349,9 +376,11 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
     while pc < bytecode.len() {
         let op = bytecode[pc];
         match op {
-            // `putfield` alone is separable from the other four: see
-            // `allow_putfield_init`. When the knob is off this arm is
-            // unreachable and the classification is byte-identical to before.
+            // `putfield` alone is separable from the other four: it is benign
+            // by default since 2026-07-28 — see `allow_putfield_init`, which
+            // also documents the `CRATONVM_JIT_PUTFIELD_INIT=0` kill switch.
+            // With that set this arm is unreachable and the classification is
+            // byte-identical to the historical behaviour.
             0xb5 if allow_putfield => {}
             0xb3 | 0xb5 | 0xc2 | 0xc3 | 0xba => return InitComplexity::Complex,
             _ => {}
@@ -1208,6 +1237,28 @@ fn should_skip_jit_internal(
     // The narrow `PredictionContext` equality/hash guard
     // (`is_antlr_prediction_context_miscompile`, ANTLR-COLDPATH.1 below) is
     // unaffected and still applies to both the shaded and unshaded runtimes.
+    // 2026-07-28 re-test (against the 2026-07-27 atomic-array RMW fix,
+    // `ffb8dfa22`, which was never re-tested against this ban afterward):
+    // the fix did NOT clear this ban's residuals. A/B control (same binary,
+    // ban active vs. lifted, one class at a time) confirms THREE classes
+    // still PASS with the ban active and CRASH the moment `org/h2/` is
+    // JIT-eligible -- genuine, reproducible regressions, not stale evidence:
+    //   * `TestPageStoreCoverage` and `TestReopen` share one root cause:
+    //     `InternalError: precise deoptimization unavailable for
+    //     org/h2/mvstore/db/RowDataType.read(...)  at bci 50; refusing
+    //     side-effecting replay` -- `interpreter.rs`'s deliberate safety
+    //     refusal (better to throw than silently replay committed side
+    //     effects) when a JIT-compiled method traps and precise resume
+    //     isn't available for it. A precise-maps/deopt coverage gap, not a
+    //     new bug class; left for that effort rather than patched here.
+    //   * `TestRunscript` fails a DIFFERENT way: `assertEqualDatabases`
+    //     diffs diverge (`AssertionError: expected: INSERT INTO
+    //     "PUBLIC"."TEST2" VALUES(462);`) -- a genuine data-correctness
+    //     bug, distinct root cause, not yet bisected.
+    // A fourth class, `TestFileSystem`, hangs to the runner's 300s timeout
+    // in BOTH arms (ban active AND lifted) -- ruled OUT as evidence for or
+    // against this ban; it is not a JIT regression at all. Full evidence:
+    // `docs/known-issues/h2/h2-jitban-longtail1-residuals-20260728.md`.
     if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }
@@ -1840,25 +1891,23 @@ fn should_skip_jit_internal(
         // regression witness for the currently-tested (BigInteger-still-
         // banned) configuration only.
 
-        // HIB-BYTEBUDDY (2026-06-13) — provisional blanket ban for ByteBuddy's
-        // runtime class-build chain (`net/bytebuddy/`). The narrow HIB-PROXY ban
-        // on `ByteBuddyState.make` only covered the lazy-proxy path; Hibernate's
-        // bytecode-enhancement path (`EnhancerImpl.enhance` -> `ByteBuddyState.
-        // rewrite` -> `DynamicType...make` -> `MethodRegistry.prepare` -> deep
-        // `net/bytebuddy/description/type/TypeDescription*` resolution) hangs
-        // forever once those type-description methods are JIT-compiled
-        // (`SimpleEnhancerTests` rc=124; the stack spins in
-        // `TypeDefinition$Sort.describe` / `TypeDescription.represents`). It is
-        // the same "JIT'd build-chain receiver corruption / loop never returns"
-        // miscompile as HIB-PROXY, and `CRATONVM_DISABLE_JIT=1` makes the whole
-        // enhancer pass (ok=1). ByteBuddy is a one-shot code generator, never a
-        // benchmarked hot path, so interpreter-only is the right trade. Lifted
-        // by `CRATONVM_JIT_ALLOW_PACKAGES=net/bytebuddy/`.
-        if class_name.starts_with("net/bytebuddy/")
-            && !package_allowed("net/bytebuddy/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // HIB-BYTEBUDDY -- REMOVED 2026-07-28. Provisional blanket ban since
+        // 2026-06-13 for ByteBuddy's runtime class-build chain
+        // (`net/bytebuddy/`) after `SimpleEnhancerTests` hung (rc=124) with the
+        // stack spinning in `TypeDefinition$Sort.describe` /
+        // `TypeDescription.represents` once those type-description methods
+        // were JIT-compiled -- believed to be the same "JIT'd build-chain
+        // receiver corruption / loop never returns" miscompile as HIB-PROXY.
+        // Re-tested 2026-07-28 against the general JIT correctness fixes that
+        // have landed since (loader_id decode fix, atomic-array RMW, and
+        // others): `SimpleEnhancerTests` (the named regression witness) now
+        // passes cleanly and FASTER than interpreted (1762ms vs. 2511ms
+        // baseline), and a 15-class A/B sample across
+        // `org/hibernate/orm/test/bytecode/enhancement/**` (lazy loading,
+        // proxies, merge, batching) came back byte-identical
+        // found/started/ok/failed counts in both arms -- 0 hangs, 0 new
+        // failures. Full evidence:
+        // `docs/known-issues/hibernate/hib-bytebuddy-removed-20260728.md`.
         // TEST-HARNESS BLANKET BANS -- REMOVED 2026-07-27. Four blanket
         // package bans lived here together:
         //

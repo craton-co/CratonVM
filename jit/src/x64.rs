@@ -8357,6 +8357,9 @@ struct Compiler {
     /// local is dead" would discard the whole frame, so the snapshot builder
     /// falls back to "everything live" there.
     local_liveness_covered: Vec<bool>,
+    /// Debug-only: number of exception ranges modelled by the liveness /
+    /// interference analyses for this method (CRATONVM_DBG_EXCFRAME).
+    exception_ranges_dbg_len: usize,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -9425,6 +9428,7 @@ impl Compiler {
             local_kinds: Vec::new(),
             local_liveness: Vec::new(),
             local_liveness_covered: Vec::new(),
+            exception_ranges_dbg_len: 0,
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
@@ -9842,6 +9846,20 @@ impl Compiler {
             if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
                 let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
                 if live_here & (1u64 << i) == 0 {
+                    // `CRATONVM_DBG_EXCFRAME=1` reports every local DROPPED
+                    // from a snapshot. That is the actionable signal for this
+                    // whole bug class: a handler that reads a dropped local
+                    // sees 0 / null, silently and without a crash. If a value
+                    // you expect at a handler appears here, the liveness at
+                    // `bci` is not modelling the exception edge that reaches
+                    // it — see `regalloc::handler_live_mask`.
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+                        eprintln!(
+                            "[excframe] DROP local={i} at bci={bci} live_mask={live_here:#x} \
+                             precise={} handler_ranges={}",
+                            self.precise_exception_frames, self.exception_ranges_dbg_len,
+                        );
+                    }
                     locals.push(FrameValue::Undefined);
                     continue;
                 }
@@ -17056,6 +17074,12 @@ impl Compiler {
                     {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
+                        // Make a null receiver a real Java NPE before either
+                        // the inline store or a legacy helper can turn it into
+                        // a silent no-op. Protected sites retain their precise
+                        // exceptional frame for javac monitor cleanup.
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        self.emit_precise_null_check_field_store();
                         if type_tag == b'L' || type_tag == b'[' {
                             let compact_offset = site
                                 .compact_field_info
@@ -17846,6 +17870,33 @@ impl Compiler {
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
         self.null_check_store_stubs.push((action, patch_offset));
+    }
+
+    /// Null check for `putfield` inside a protected range whose handler needs
+    /// a precise frame. Unlike the generic array stub this records the frame
+    /// at the trapping bytecode, then routes the NPE through that frame so a
+    /// javac monitor-cleanup handler retains its synthetic monitor local.
+    fn emit_precise_null_check_field_store(&mut self) {
+        let bci = self.dbg_last_pc;
+        if !self.precise_exception_frames || !self.pc_is_protected(bci) {
+            self.emit_null_check_array_store(npe_action::NONE);
+            return;
+        }
+        if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {
+            let box_ptr = self.build_and_record_deopt_point(
+                bci,
+                crate::deopt::DeoptReason::PendingException,
+            );
+            self.exc_frame_box_ptr_by_bci.insert(bci, box_ptr);
+        }
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        self.buf.emit(&[0x0F, 0x84]); // JZ rel32 -> precise NPE stub
+        let patch_offset = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        // Reason 10 is a locally-detected pending NPE. The common reason-9
+        // path already has an exception from a helper; this one creates it in
+        // the out-of-line frame-deopt stub before the router consumes it.
+        self.deopt_stubs.push((patch_offset, bci, 10));
     }
 
     /// Round-11 HIGH-2: variant of `emit_null_check_array_store` that
@@ -18713,7 +18764,7 @@ impl Compiler {
             // indy-trap artifact (no helper there could resolve it). Repro:
             // scratch-min/IndyReplay.java (nested shape: 30000/30000 calls
             // corrupted side effects before these fixes, 0 after).
-            let frame_box_ptr = if crate::deopt_real_enabled() || matches!(reason, 8 | 9) {
+            let frame_box_ptr = if crate::deopt_real_enabled() || matches!(reason, 8 | 9 | 10) {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     // Step 6: String-intrinsic and call-site type-check guards
@@ -18731,7 +18782,7 @@ impl Compiler {
                     // `emit_post_invoke_exception_check`) and lives in its own
                     // map, because it is consumed by the interpreter's exception
                     // route rather than by any resume sink.
-                    9 => self.exc_frame_box_ptr_by_bci.get(&bci).copied(),
+                    9 | 10 => self.exc_frame_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
             } else {
@@ -18775,6 +18826,18 @@ impl Compiler {
                 for n in 0u8..16 {
                     // Cast: value to i32 (encoding immediate/displacement)
                     self.emit_movq_mem_rbp_from_xmm(base - 128 - (n as i32) * 8, n);
+                }
+                if reason == 10 {
+                    // A locally-detected putfield null has no helper return
+                    // value to carry its exception. Publish it after saving
+                    // the trapping registers, before materializing the
+                    // precise exceptional frame.
+                    #[cfg(target_os = "windows")]
+                    self.buf.emit_byte(0xB9); // MOV ECX, imm32
+                    #[cfg(not(target_os = "windows"))]
+                    self.buf.emit_byte(0xBF); // MOV EDI, imm32
+                    self.buf.emit(&(npe_action::NONE as u32).to_le_bytes());
+                    self.emit_call_absolute(self.helpers.jit_npe_with_action);
                 }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
                 //    arg1 = rbp (live, never clobbered until the epilogue),
@@ -29790,6 +29853,7 @@ pub fn compile_with_param_slots(
         );
         compiler.local_liveness = liveness;
         compiler.local_liveness_covered = covered;
+        compiler.exception_ranges_dbg_len = exception_ranges.len();
     }
 
     // Emit prologue
@@ -30043,28 +30107,88 @@ pub fn compile_with_param_slots(
         .enumerate()
         .filter(|(_, a)| a.is_some())
         .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // The mask must name the dead locals that are actually *hazardous*, not
+    // every dead local. `osr_enter` declines any entry whose mask is non-zero
+    // (a deliberate 2026-07-04 conservatism: the trampoline's skip-the-load
+    // avoided clobbering the live owner, but the resulting coalesced state
+    // transition was not proven safe -- see
+    // docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
+    // hazard that argument rests on is *sharing*: a dead local whose register
+    // is also some live local's home. A dead local that owns its register
+    // outright has no coalesced state to reconstruct -- nothing reads it before
+    // the loop redefines it -- so flagging it only costs OSR entries.
+    //
+    // The blanket form cost a lot of them. `org/h2/compress/CompressLZF.
+    // compress(Ljava/nio/ByteBuffer;I[BI)I` -- the single hottest method in
+    // H2's `TestFileSystem` `nioMemLZF:` case -- was refused at its main loop
+    // header (`entry_pc=220`, mask `0x201`: `this` and one temporary, neither
+    // sharing a register with anything live) and so never ran compiled at all
+    // (2026-07-27).
+    //
+    // Set CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1 to restore the old
+    // flag-every-dead-local behaviour.
+    let blanket_dead_mask =
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET").is_some();
+    let resident = reg_resident | xmm_resident;
+    // `local <-> home register` lookup, GPR and XMM kept apart: they are
+    // different register files and can never alias each other.
+    let gpr_home = |i: usize| osr_local_assignments.get(i).copied().flatten();
+    let xmm_home = |i: usize| osr_xmm_assignments.get(i).copied().flatten();
     let mut osr_dead_mask = vec![0u64; code_len + 1];
     for &(pc, live_in) in &compiler.osr_block_live_in {
-        if pc < osr_dead_mask.len() {
-            osr_dead_mask[pc] = (reg_resident | xmm_resident) & !live_in;
+        if pc >= osr_dead_mask.len() {
+            continue;
         }
+        let dead = resident & !live_in;
+        if blanket_dead_mask || dead == 0 {
+            osr_dead_mask[pc] = dead;
+            continue;
+        }
+        let live_resident = resident & live_in;
+        let mut hazardous = 0u64;
+        for i in 0..64 {
+            if (dead >> i) & 1 == 0 {
+                continue;
+            }
+            let (dg, dx) = (gpr_home(i), xmm_home(i));
+            for j in 0..64 {
+                if (live_resident >> j) & 1 == 0 {
+                    continue;
+                }
+                let shares = (dg.is_some() && dg == gpr_home(j))
+                    || (dx.is_some() && dx == xmm_home(j));
+                if shares {
+                    hazardous |= 1u64 << i;
+                    break;
+                }
+            }
+        }
+        osr_dead_mask[pc] = hazardous;
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_META").is_some() {
-        let masked: Vec<(usize, u64)> = compiler
-            .osr_block_live_in
-            .iter()
-            .filter_map(|&(pc, live_in)| {
-                let m = (reg_resident | xmm_resident) & !live_in;
-                if m != 0 {
-                    Some((pc, m))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !masked.is_empty() {
+        // Report the mask that is actually published, alongside the blanket
+        // "every dead register-resident local" set it is refined from, so the
+        // two can be compared directly. Printing a separately recomputed
+        // blanket value made this diagnostic silently disagree with the real
+        // metadata once the refinement landed.
+        let mut blanket: Vec<(usize, u64)> = Vec::new();
+        let mut published: Vec<(usize, u64)> = Vec::new();
+        for &(pc, live_in) in &compiler.osr_block_live_in {
+            let b = (reg_resident | xmm_resident) & !live_in;
+            if b != 0 {
+                blanket.push((pc, b));
+            }
+            let p = osr_dead_mask.get(pc).copied().unwrap_or(0);
+            if p != 0 {
+                published.push((pc, p));
+            }
+        }
+        if !blanket.is_empty() || !published.is_empty() {
             eprintln!(
-                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} masked_entries={masked:x?}"
+                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} \
+                 blanket_entries={blanket:x?} published_entries={published:x?} \
+                 unblocked={}",
+                blanket.len() - published.len()
             );
         }
     }

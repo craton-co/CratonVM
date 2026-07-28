@@ -183,10 +183,13 @@ fn parse_uri(uri: &str) -> Result<ParsedUri, String> {
     } else {
         return Err(format!("unsupported scheme in {uri}"));
     };
-    // Split authority from path/query.
-    let (authority, path_q) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // A query-only target has no explicit path, but HTTP origin-form still
+    // needs `/?query`; fragments never belong in an HTTP request target.
+    let (authority, path) = match rest.find(|c| matches!(c, '/' | '?' | '#')) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
+        Some(i) => (&rest[..i], "/".to_string()),
+        None => (rest, "/".to_string()),
     };
     let default_port: u16 = if scheme == "https" { 443 } else { 80 };
     let (host, port) = match authority.rfind(':') {
@@ -203,11 +206,6 @@ fn parse_uri(uri: &str) -> Result<ParsedUri, String> {
     if host.is_empty() {
         return Err(format!("empty host in {uri}"));
     }
-    let path = if path_q.is_empty() {
-        "/".to_string()
-    } else {
-        path_q.to_string()
-    };
     Ok(ParsedUri {
         scheme,
         host,
@@ -1907,6 +1905,19 @@ mod http_client_tests {
         let p = parse_uri("https://example.com").unwrap();
         assert_eq!(p.path, "/");
         assert_eq!(p.port, 443);
+    }
+
+    #[test]
+    fn test_parse_uri_query_only_and_fragment() {
+        let p = parse_uri("http://localhost:8080?trace=false&message=false").unwrap();
+        assert_eq!(p.host, "localhost");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.path, "/?trace=false&message=false");
+
+        let p = parse_uri("https://example.com:8443#client-only").unwrap();
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.port, 8443);
+        assert_eq!(p.path, "/");
     }
 
     #[test]

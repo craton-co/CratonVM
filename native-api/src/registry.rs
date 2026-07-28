@@ -1138,8 +1138,20 @@ pub trait NativeClassAccess {
     /// MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2)
     /// so they all dispatch to the same backend.
     ///
-    /// `loader_id == 0` means use the application loader; non-zero
-    /// values are user-defined loader namespaces.
+    /// `loader_id` is the flat wire encoding of a
+    /// [`cratonvm_types::ClassLoaderId`] — the same one
+    /// [`NativeContext::loader_id_of_class`] produces, so a loader id fetched
+    /// from an existing class can be handed straight back here to define a new
+    /// class in that *same* loader (which is exactly what the CGLIB
+    /// `@Configuration` enhancer does). Implementations MUST decode it with
+    /// `ClassLoaderId::from_native_id_or_default`: `1` is the extension
+    /// loader, `2` the application loader, anything `>= 3` a user-defined
+    /// namespace, and `0` means "unspecified — use the application loader"
+    /// (several callers pass a literal `0` for that). Decoding `2` as
+    /// `UserDefined(2)` puts the new class in a different runtime package from
+    /// its own superclass and silently breaks package-private override
+    /// detection — see
+    /// `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`.
     fn define_class_full(
         &mut self,
         name: &str,
@@ -1193,8 +1205,9 @@ pub trait NativeClassAccess {
     }
 
     /// WP2.4 — list all classes whose initiating loader was the
-    /// application loader (or, if `loader_id != 0`, the user-defined
-    /// loader with that id).
+    /// application loader (or, if `loader_id != 0`, the loader that
+    /// `loader_id` names under the same wire encoding
+    /// [`NativeContext::define_class_full`] documents).
     fn list_initiated_class_ids(&self, _loader_id: u32) -> Vec<ClassId> {
         Vec::new()
     }

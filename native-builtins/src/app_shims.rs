@@ -622,11 +622,20 @@ mod tests {
 
         for jdk_class in [
             "java/security/AccessControlContext",
-            "javax/naming/InitialContext",
             "javax/security/auth/Subject",
             "javax/security/auth/login/LoginContext",
             "javax/sql/DataSource",
         ] {
+            assert!(
+                registrations.iter().any(|(class, _, _)| class == jdk_class),
+                "core JDK bridge {jdk_class} disappeared with application packs disabled"
+            );
+        }
+        // Real-JDK InitialContext must retain its provider-selection bytecode;
+        // the in-memory naming bridge has only the synthetic JDK field layout.
+        #[cfg(feature = "synthetic-jdk")]
+        {
+            let jdk_class = "javax/naming/InitialContext";
             assert!(
                 registrations.iter().any(|(class, _, _)| class == jdk_class),
                 "core JDK bridge {jdk_class} disappeared with application packs disabled"

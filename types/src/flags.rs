@@ -464,39 +464,12 @@ pub enum BlockedAccessMode {
 /// # This is the flip
 ///
 /// `ARCHITECTURE.md` advertises a "generational semi-space collector (Cheney
-/// moving young gen)". Making that true is a **one-constant change here** —
-/// once, and only once, the codegen side reads [`GcFlags::moving_young`]
-/// instead of parsing `CRATONVM_MOVING_YOUNG` itself.
-///
-/// ## The remaining blocker (exact)
-///
-/// `jit/src/x64.rs::moving_young_enabled()` is
-/// `*G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())`.
-/// It decides whether the JIT emits the shadow-stack push/reload sequences at
-/// all, whether `collect_live_oop_homes` publishes the *complete* home set,
-/// and whether `OopMapEntry::moving_young_coverage_complete` can ever be true.
-/// Nothing outside that file can cause a rewritable root map to be emitted, so
-/// a collector that relocates while it is `false` relocates objects whose only
-/// home is a JIT register that nothing will ever rewrite.
-///
-/// Its body must become:
-///
-/// ```ignore
-/// pub fn moving_young_enabled() -> bool {
-///     cratonvm_types::flags().gc.moving_young
-/// }
-/// ```
-///
-/// (`cratonvm-jit` already depends on `cratonvm-types`.) After that, flipping
-/// this constant to `true` flips codegen, root gathering and the collector
-/// together, and no skew between them is representable.
-///
-/// Until then this stays `false`, because the three layers agree today only
-/// because all three parse the same variable the same way — and flipping any
-/// subset is heap corruption, not a risk of it.
+/// moving young gen)". The JIT, root gathering, and collector all now read
+/// [`GcFlags::moving_young`], so this single default switches them together.
+/// `CRATONVM_NO_MOVING_YOUNG` remains a compatibility opt-out.
 ///
 /// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
-pub const DEFAULT_MOVING_YOUNG: bool = false;
+pub const DEFAULT_MOVING_YOUNG: bool = true;
 
 /// Flags read by `cratonvm-gc` (and, for the shared ones, by `jit` and `vm`).
 ///
@@ -512,13 +485,8 @@ pub struct GcFlags {
     /// backwards-compatible opt-IN that becomes a no-op once the default
     /// flips. Not [`parse::present`] — see [`GcFlags::from_source`].
     ///
-    /// `DEFAULT_MOVING_YOUNG` is currently `false`, and the one remaining
-    /// reason is recorded in
-    /// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`:
-    /// `jit/src/x64.rs::moving_young_enabled` still reads
-    /// `CRATONVM_MOVING_YOUNG` from the environment directly instead of from
-    /// this field, so flipping the constant here would make the COLLECTOR
-    /// relocate while the CODEGEN emits no rewritable root map.
+    /// The shared flag is also consumed by JIT code generation, so moving
+    /// collection and rewritable root maps cannot be enabled independently.
     ///
     /// The former companion flag `CRATONVM_ALLOW_MOVING_YOUNG` is **gone**. It
     /// was a second opt-in that had to be set *in addition* to this one before
