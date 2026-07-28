@@ -274,5 +274,199 @@ ban those class names matched but left the test asserting they were still
 banned. Nothing in this branch touches JIT skip-list policy; the test was
 fixed independently on `dev` (renamed to
 `elasticsearch_vector_diskbbq_cluster_is_jit_eligible_after_es_cluster_removal`)
+and the merge of `origin/dev` @ `2cdc451fb` picked that up.
+
+## Post-merge re-verification (`origin/dev` @ `2cdc451fb`)
+
+Rebuilt and re-run after merging `origin/dev` into the branch:
+
+- Spring Boot 10-scenario battery: **10/10 scenarios, 95/95 checks, 0
+  divergences**.
+- `LookupForkDiag`: **11/11 app, 11/11 fork**.
+- `cargo test --release -p cratonvm-classloading --lib`: **637 passed, 0
+  failed**.
+- `cargo test --release -p cratonvm-types --lib`: **417 passed, 0 failed**
+  (3/3 runs). One run *inside a combined multi-package invocation* failed
+  `compact_value::tests::to_value_unchecked_degrade_increments_counter`
+  (expected 3 degradations, saw 4) — a pre-existing race on that test's
+  process-global counter, in code this branch does not touch.
+- `cargo test --release -p cratonvm-vm --lib`: **2429 passed, 0 failed** on a
+  clean run; two of three runs additionally tripped the pre-existing
+  `process_vm_publish_and_resolve` flake described under R4. With
+  `--skip runtime::lock_order` the suite is **2379 passed, 0 failed, 3/3**.
+
+### Second re-verification (`origin/dev` @ `16fe5ef60`)
+
+`dev` moved again before the merge landed, so everything was rebuilt and
+re-run once more: Spring Boot battery **10/10, 95/95, 0 divergences**;
+`LookupForkDiag` **11/11 app, 11/11 fork**; `cargo test --release`
+types **417/0**, classloading **638/0**, vm `--lib` **2428 passed, 2 failed**.
+
+Both vm failures are inherited from `dev`, in files this branch does not
+touch (`git diff HEAD origin/dev -- vm/src/jit/skip_list.rs` is empty):
+
+- `native::jni::tests::process_vm_publish_and_resolve` — the
+  enforcement-timing flake described under R4.
+- `jit::skip_list::tests::generated_proxy_class_is_jit_eligible_after_proxy_jitcall_1_removal`
+  — deterministic, and the same shape as the diskbbq test that failed during
+  the first re-verification: a JIT-ban removal landed on `dev` while its test
+  still asserts the old policy (here `$ProxyN` classes are expected to be
+  JIT-eligible but still return `Some(JdkDynamicProxyTrampoline)`).
+
+**Unrelated drive-by, needed to run any of the above:** a `dev` commit added
+`Class::record_object_methods` without updating six **test-only**
+`Class { .. }` literals, so `cargo test -p cratonvm-classloading` and
+`cargo test -p cratonvm-vm` did not compile at all (E0063). Added the field at
+all six (`classloading/src/verifier.rs` x2, `vm/src/vm/vm_util.rs` x2,
+`vm/src/vm/vm_exec.rs`, `vm/src/runtime/stackwalker.rs`), matching what the
+non-test constructors already do.
+  config mismatch unrelated to this fix). **Closed in the residual round —
+  see R4 below; the release run is now clean.**
+
+---
+
+## Residuals (2026-07-28)
+
+Four things the first round left behind. All four are fixed; the sections
+below record what each one actually was, since three of them were invisible
+to the suite that motivated the original fix.
+
+### R1 — the sibling-site cleanup regressed `Instrumentation.getInitiatedClasses`
+
+The "fixed the same way for consistency" pass above gave the four sibling
+sites a **strict** inverse (`0 => Bootstrap`) while `define_class_full` itself
+kept `0 => Application`. That is not a cosmetic inconsistency: the `u32`
+boundary carries *two* conventions at once, and `0` belongs to the second one.
+`native-api`'s trait doc has always said "`loader_id == 0` means use the
+application loader", and plenty of callers pass a literal `0` for exactly that
+(`native-builtins`'s hidden-class defines, the JBoss-module synthetic-`main`
+define, the Spring bootstrap subclass defines). One of the four re-pointed
+sites had a caller that *depended* on it:
+
+`vm/src/runtime/instrument.rs`'s `native_get_initiated_classes0`
+(`Instrumentation.getInitiatedClasses(ClassLoader)`) always passes `0` and
+documents, in a comment right above the call, that it wants the
+application-loader classes. After the cleanup it returned the **bootstrap**
+loader's classes instead — i.e. the JDK's own classes rather than the
+application's. Nothing in the Spring Boot suite calls it, so nothing caught it.
+
+### R2 — the same defect on the *caller* side, at three more define sites
+
+The first round fixed the **decode**. The mirror-image defect is a caller that
+hardcodes `loader_id = 0` where it should be passing the superclass's own
+loader — which is what `cce_enhance` was already (correctly) doing, and the
+only reason the decode bug was reachable at all. Three generated-subclass
+sites still hardcoded it:
+
+- `native-builtins/src/cglib_enhancer.rs`'s
+  `build_factory_bean_subclass_wrapper` (concrete-`FactoryBean` wrapper);
+- `native-builtins/src/spring_startup_bootstrap.rs`'s `@Lookup`
+  method-override subclass;
+- ...and its replaced-method override subclass.
+
+All three now pass `loader_id_of_class(<superclass>)`. This is a no-op
+whenever the bean class is app-loaded (id 2 decodes to `Application`), which
+is why it never showed up — but for a fork-loaded bean class the generated
+subclass landed in the application namespace while its superclass lived in the
+child loader's, i.e. the exact `same_runtime_package` mismatch this whole
+document is about.
+
+**Observable, not theoretical:** with
+`docs/known-issues/repros/cglib-loaderid-fix-20260727/{LookupForkDiag,Driver}.java`
+(see that directory's `README.md`), running the bean classes behind a child
+`URLClassLoader`:
+
+```
+CratonVM before: widgetUserClass=probe.Driver$WidgetUser$$SpringCGLIB$$LM0
+                 loader=jdk.internal.loader.ClassLoaders$AppClassLoader
+                 superLoader=java.net.URLClassLoader
+HotSpot:         widgetUserClass=probe.Driver$WidgetUser$$SpringCGLIB$$0
+                 loader=java.net.URLClassLoader
+                 superLoader=java.net.URLClassLoader
+```
+
+`fork.lookupSubclassSameLoader` FAILs on the pre-fix binary and PASSes after,
+with the app-loaded run (`LookupForkDiag app`) green throughout — 11/11 in both
+modes, matching HotSpot exactly.
+
+### R3 — the encode and the decode were still two hand-written tables
+
+Six copies of the same `0/1/2/else` match, in one file, with no test asserting
+they were inverses — which is precisely how they drifted in the first place.
+Both directions now live on `ClassLoaderId` itself
+(`types/src/class_id.rs`), next to each other and next to the reserved-id
+constants:
+
+- `to_native_id()` — the encode `loader_id_of_class` returns;
+- `from_native_id()` — the strict inverse (`0 => Bootstrap`);
+- `from_native_id_or_default()` — the boundary convention (`0 => Application`,
+  "caller did not specify");
+- `NATIVE_{BOOTSTRAP,EXTENSION,APPLICATION,FIRST_USER_DEFINED}` — the reserved
+  ids, so `allocate_loader_id`'s "must start at 3" invariant no longer repeats
+  a bare literal.
+
+All six `vm_exec.rs` sites now call the codec, and six unit tests pin it,
+including `application_never_decodes_to_a_user_defined_namespace` (the exact
+shape of the original bug) and `default_sentinel_decode_differs_from_strict_
+decode_only_at_zero`. `native-api`'s trait doc now states the encoding and
+names the decoder implementations must use.
+
+### R4 — the 18 `runtime::lock_order` `--release` failures
+
+Not caused by this fix, but re-triaged as "pre-existing noise" on every
+release test run, which is a cost this document should not keep paying.
+Cause: lock-order enforcement is unconditional under `debug_assertions` and
+**off by default** in release (opt-in via `CRATONVM_LOCK_ORDER_CHECK`), so
+`cargo test --release` silently stopped checking and all 15
+`#[should_panic(expected = "lock order violation")]` tests stopped panicking;
+`enforcement_active_in_debug_builds` additionally asserted outright that the
+runner *was* a debug build.
+
+Fixed by adding `tracking::force_enable_for_testing()` (a `#[doc(hidden)]`
+test hook that can only ever *enable* checking — flipping it on mid-process
+can cause a violation to be missed, never invented) and calling it from the
+tests that need the checker, plus rewriting the two gating tests to pin the
+real contract rather than the build profile. A release run now exercises the
+same code path a debug run does.
+
+**Consequence worth knowing about:** because release runs now enforce like
+debug runs, they also inherit debug's pre-existing flake in
+`native::jni::tests::process_vm_publish_and_resolve`, which asserts that
+dropping its own `Arc<SharedVm>` was the last strong reference. Isolated it
+passes 5/5; in a full parallel run it fails intermittently. This is **not**
+introduced here — it is enforcement-*timing*-sensitive, not code-sensitive:
+running this same release binary with `CRATONVM_LOCK_ORDER_CHECK=1` and
+`--skip runtime::lock_order` (so none of the changed tests execute) still
+fails it 2 of 4 runs, and a **debug** `cargo test -p cratonvm-vm --lib --
+--skip runtime::lock_order`, where enforcement has always been unconditional,
+fails it 2 of 6. Release runs were simply blind to it while enforcement was
+silently off — the same blind spot R4 is about.
+
+## Residual-round verification
+
+All on the Linux build host, worktree
+`/data/data/wt-cglib-loaderid-20260727` (branch
+`fix/cglib-loaderid-residuals-20260727`, from `dev` @ `d0a6c7987`), against a
+same-tree pre-change baseline binary built from that exact commit:
+
+| | baseline `d0a6c7987` | with residual fixes |
+|---|---|---|
+| Spring Boot 10-scenario battery | 10/10 scenarios, 95/95 checks, 0 divergences | **10/10, 95/95, 0 divergences** |
+| `CglibDiag` | `engineCtor=1`, both cars share the engine | unchanged |
+| `LookupForkDiag app` | 11/11 | **11/11** |
+| `LookupForkDiag fork` | 10/11 (`lookupSubclassSameLoader` FAIL) | **11/11** (== HotSpot) |
+| `cargo test --release -p cratonvm-types --lib` | — | **417 passed, 0 failed** |
+| `cargo test --release -p cratonvm-classloading --lib` | — | **637 passed, 0 failed** |
+| `cargo test --release -p cratonvm-vm --lib` | 2410 passed, 18 failed | **2428 passed, 1 failed** |
+
+The vm-lib delta is exactly the 18 `runtime::lock_order` tests moving from
+failed to passed (2410 + 18 = 2428). The one *deterministic* remaining failure,
+`jit::skip_list::tests::elasticsearch_vector_diskbbq_hang_cluster_stays_
+interpreted_by_default`, was **unrelated and pre-existing on `dev`**: commit
+`bae30dc3c` ("remove the blanket `org/elasticsearch/` JIT ban") deleted the
+ban those class names matched but left the test asserting they were still
+banned. Nothing in this branch touches JIT skip-list policy; the test was
+fixed independently on `dev` (renamed to
+`elasticsearch_vector_diskbbq_cluster_is_jit_eligible_after_es_cluster_removal`)
 and the merge of `origin/dev` @ `2cdc451fb` picked that up — see the
 post-merge re-verification below.

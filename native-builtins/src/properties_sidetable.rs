@@ -3957,6 +3957,7 @@ mod tests {
     fn unescape_backslash_n() {
         assert_eq!(unescape(r"\n"), "\n");
         assert_eq!(unescape(r"\t"), "\t");
+        assert_eq!(unescape(r"\f"), "\u{000c}");
         assert_eq!(unescape(r"\\"), "\\");
         assert_eq!(unescape(r"\:"), ":");
         assert_eq!(unescape(r"\="), "=");

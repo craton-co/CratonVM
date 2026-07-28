@@ -1,9 +1,28 @@
-# `core/spring-boot` 2026-07-23 rerun — uncategorized individual residuals
+# FIXED — `core/spring-boot` 2026-07-23 rerun — uncategorized individual residuals
 
-**Status: OPEN — found 2026-07-23. Each item below is an independent,
+**Status: FIXED 2026-07-28.** Each item below is an independent,
 distinct failure; they are bundled into one doc because each individual
 investigation stayed at hypothesis level (none pinned to a CratonVM
 file:line this session) rather than because they share a root cause.**
+
+## Superseding closure — FIXED 2026-07-28
+
+All eight affected classes now pass from fresh processes on the Windows
+Spring Boot fixture. CratonVM passes the complete list in both JIT and
+`--nojit` modes: **8/8 classes, 55 started tests, 0 failed, 0 aborted, and
+0 failed containers** in each mode. `ProcessInfoTests` has its expected
+single availability-dependent virtual-thread skip in both CratonVM modes
+and in the HotSpot control. The HotSpot JIT control also passes all eight
+classes (55 started tests, zero failures).
+
+The final apparent residual, `JavaLoggingSystemTests`, was not a VM
+failure. This host exports `LOG_FORMAT=json`, which Spring Boot's JUL
+formatter intentionally treats as an application override. That made both
+HotSpot and CratonVM fail the tests that assert Spring Boot's default
+formatter output. The suite runner now removes only that ambient override
+from each child process, preserving explicit Java system properties used by
+tests. Its `-AllModes` pathing JARs are also mode-local so concurrent JIT
+and no-JIT runs cannot race while replacing the same wrapper JAR.
 
 ## 1. `ApplicationHomeTests.whenSourceClassIsProvidedWithSpaceInItsPathThenApplicationHomeReflectsItsLocation()`
 

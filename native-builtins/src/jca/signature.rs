@@ -759,6 +759,13 @@ fn drive_real_mldsa(
 // ---------------------------------------------------------------------------
 
 fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Shared by all three `getInstance` overloads — see `check_named_provider_arg`.
+    crate::jca::provider_chain::check_named_provider_arg(
+        ctx,
+        args,
+        1,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
     let base = synthetic_base_offset(ctx, "java/security/Signature");
