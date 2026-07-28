@@ -10998,7 +10998,24 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // `DirectByteBuffer.address()` from `Util.getTemporaryDirectBuffer`
         // reaching `Net.read0`/`SocketDispatcher` is such a handle — route it
         // through the off-heap store. Real OS pointers fall through to raw.
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+        //
+        // Classified by the TAG BIT, not by `unsafe_arena_contains`. Two
+        // reasons, in order of importance:
+        //
+        //  1. Correctness. `contains` is a *liveness* test, so a tagged handle
+        //     whose arena had already been freed answered `false` and fell
+        //     through to the raw branch below, where a synthetic handle
+        //     (0x4000_0001_0000_0000-ish) is `copy_nonoverlapping`d as an OS
+        //     pointer. That is a SIGSEGV on exactly the use-after-free the
+        //     single-element `Unsafe.get*(long)` natives already refuse. The
+        //     tag test is true for freed handles too, so the copy is declined
+        //     and the caller raises the Java-visible error.
+        //  2. Cost. `contains` is an `RwLock` read plus a `BTreeMap` range
+        //     probe, and `unsafe_arena_copy_out` then repeats it. On the
+        //     `DirectByteBuffer` per-element path (see `dbb_get_abs` in
+        //     `native-io/src/direct_buffer.rs`) that is two locked map probes
+        //     per byte moved.
+        if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
         }
         // Reject null / negative handles. Returning `false` (not performing the
@@ -11026,7 +11043,8 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+        // Tag bit, not liveness — see `copy_from_native_memory` above for why.
+        if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
         }
         // Reject null / negative handles (failure is signalled by `false`; the
@@ -12072,6 +12090,76 @@ pub(super) fn convert_element_value(
 }
 
 // ---------------------------------------------------------------------------
+// CRATONVM_DBG_DISPATCH_TALLY — which callees reach the slow resolvers?
+// ---------------------------------------------------------------------------
+//
+// A CPU profile of a dispatch-bound workload is a flat tail of
+// `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
+// proves the VM is dispatching and says nothing about *what*, which is the
+// entire diagnosis: the `nioMemLZF:` residual in
+// `docs/known-issues/h2/h2-jitban-residuals-20260726.md` read as "a long
+// interpreter tail with no second hot spot to attack" for two revisions purely
+// because nobody had the callee histogram.
+//
+// Recorded at the two general resolvers that an inline-cache HIT is supposed
+// to bypass. A callee showing up here with a per-operation count in the tens
+// of thousands is a call site the IC is not serving, and that is actionable in
+// a way that a `slot_for_exact` percentage is not.
+//
+// Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
+// a `String` per call, so it is a diagnosis tool, not something to leave on.
+#[cold]
+pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
+    dispatch_tally::record(site, class_name, method_name, descriptor);
+}
+
+mod dispatch_tally {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DISPATCH_TALLY").is_some()
+        })
+    }
+
+    fn counts() -> &'static Mutex<HashMap<String, u64>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
+        if !enabled() {
+            return;
+        }
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        {
+            let mut guard = counts().lock().unwrap_or_else(|p| p.into_inner());
+            *guard
+                .entry(format!("{site} {class_name}.{method_name}{descriptor}"))
+                .or_insert(0) += 1;
+        }
+        let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % (1 << 20) == 0 {
+            dump(n);
+        }
+    }
+
+    pub(super) fn dump(total: u64) {
+        let guard = counts().lock().unwrap_or_else(|p| p.into_inner());
+        let mut rows: Vec<(u64, String)> = guard.iter().map(|(k, v)| (*v, k.clone())).collect();
+        drop(guard);
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        eprintln!("[dispatch-tally] total={total} distinct={}", rows.len());
+        for (count, key) in rows.into_iter().take(25) {
+            eprintln!("[dispatch-tally] {count:>12}  {key}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // invoke_or_native and helpers
 // ---------------------------------------------------------------------------
 
@@ -12084,6 +12172,7 @@ pub fn invoke_or_native(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
     // get(Class) dispatch entering the general resolver, with its dispatch
     // class and receiver identity, so the failing call's route is visible.
@@ -16024,6 +16113,12 @@ fn invoke_on_class_shared_inner(
     args: &[Value],
     no_retarget: bool,
 ) -> MethodCallResult {
+    dbg_dispatch_tally(
+        "invoke_on_class_shared_inner",
+        "",
+        method_name,
+        descriptor,
+    );
     if method_name != "<init>" && method_name != "<clinit>" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             let recv_cid = shared.mem.heap.class_id_of(recv);
