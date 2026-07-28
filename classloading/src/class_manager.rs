@@ -12923,10 +12923,6 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
-        out.push(mk_static(
-            "defaultThreadFactory",
-            "()Ljava/util/concurrent/ThreadFactory;",
-        ));
         out.extend([
             mk_static(
                 "newCachedThreadPool",
@@ -12937,14 +12933,6 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
             ),
         ]);
-    }
-    if name == "java/util/concurrent/ThreadFactory" {
-        out.push(ClassFileMethod {
-            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc("newThread"),
-            descriptor: cratonvm_types::intern_arc("(Ljava/lang/Runnable;)Ljava/lang/Thread;"),
-            attributes: vec![],
-        });
     }
     if name == "java/util/concurrent/ScheduledThreadPoolExecutor" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
