@@ -18129,7 +18129,8 @@ pub fn register_essential_natives_with_shims(
 
     // S111r17: `Class.getPackage()` real-JDK override. The JDK Java body of
     // `Class.getPackage()` delegates to `ClassLoader.definePackage(c)` →
-    // `getDefinedPackage(name)` (we override to null) → `getNamedPackage(
+    // `getDefinedPackage(name)` (we override — see
+    // `lang_class::i2_classloader_get_defined_package`) → `getNamedPackage(
     // name, module)` (we override) — but `getNamedPackage` doesn't have
     // access to the Class and so cannot populate
     // `implementationVersion` from the source jar's manifest. Result:

@@ -20,8 +20,9 @@ use crate::error::{LinkageError, MethodCallFailed, MethodCallResult, RuntimeErro
 use crate::memory::heap::{ArrayElementType, ObjectKind};
 use crate::native::io::FileDescriptorTable;
 use crate::native::registry::{
-    FieldMetadata, MethodMetadata, NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess,
-    NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess, NativeThreadBlocker, StackTraceEntry,
+    FieldMetadata, MethodMetadata, NativeClassAccess, NativeContext, NativeExceptionAccess,
+    NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    NativeThreadBlocker, StackTraceEntry,
 };
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::types::{jlong_bits_as_aligned_object_ptr, ObjectRef, Value};
@@ -2968,7 +2969,9 @@ impl<'a> NativeContextImpl<'a> {
         );
         if !fixup.is_empty() {
             // BUG-03 trace (gated): record that the blocked-wake remap ran for main.
-            if self.thread.thread_id.0 == 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
+            if self.thread.thread_id.0 == 0
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some()
+            {
                 let jto = self
                     .thread
                     .java_thread_obj
@@ -3292,12 +3295,11 @@ impl<'a> NativeContextImpl<'a> {
     /// missing or its constructor fails (e.g. synthetic-JDK runs where
     /// the inner class is absent).
     pub(crate) fn build_thread_field_holder(&mut self) -> Option<ObjectRef> {
-        let holder_class =
-            <Self as NativeClassAccess>::ensure_class_initialized(
-                self,
-                "java/lang/Thread$FieldHolder",
-            )
-                .ok()?;
+        let holder_class = <Self as NativeClassAccess>::ensure_class_initialized(
+            self,
+            "java/lang/Thread$FieldHolder",
+        )
+        .ok()?;
         let holder_num_fields = {
             let cm = self.shared.classes.class_manager.read();
             cm.class_store
@@ -4107,8 +4109,13 @@ impl<'a> NativeContextImpl<'a> {
         if name.starts_with("cratonvm/") {
             return None;
         }
-        let frame_classes: Vec<ClassId> =
-            self.thread.frames.iter().rev().map(|f| f.class_id).collect();
+        let frame_classes: Vec<ClassId> = self
+            .thread
+            .frames
+            .iter()
+            .rev()
+            .map(|f| f.class_id)
+            .collect();
         let dbg = crate::runtime::env_cache::dbg_stub_loader();
         for cid in frame_classes {
             if cratonvm_native_builtins::classloader::defining_loader_for(cid.as_u32()).is_none() {
@@ -4137,8 +4144,6 @@ impl<'a> NativeContextImpl<'a> {
 }
 
 impl<'a> NativeClassAccess for NativeContextImpl<'a> {
-
-
     fn load_class(&mut self, name: &str) -> MethodCallResult {
         // See `class_via_caller_loader_before_stub`: a name that would only
         // resolve to a fabricated synthetic stub must first be offered to the
@@ -4484,6 +4489,61 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .get_class(class_id)
             .map(|c| c.is_record())
             .unwrap_or(false)
+    }
+
+    fn object_method_fast_path(&self, class_id: ClassId) -> (u8, usize, usize) {
+        /// Bit 3 of the returned mask — identity `hashCode`/`equals`.
+        const IDENTITY_SEMANTICS: u8 = 1 << 3;
+        /// Bit 4 — `java.lang.String`.
+        const IS_STRING: u8 = 1 << 4;
+        /// Bit 5 — exactly `java.util.ArrayList`.
+        const IS_ARRAY_LIST: u8 = 1 << 5;
+        /// Superclass hops walked looking for `java.lang.Enum`. An enum
+        /// constant with a class body adds exactly one (its anonymous
+        /// subclass); the small bound keeps a corrupt hierarchy from looping.
+        const MAX_SUPER_HOPS: usize = 8;
+
+        let cm = self.shared.classes.class_manager.read();
+        let Some(class) = cm.get_class(class_id) else {
+            return (0, 0, 0);
+        };
+        let mut bits =
+            class.generated_record_object_methods() & !crate::classloading::RECORD_OBJ_COMPUTED;
+        if bits == 0 {
+            // Not a record with generated bodies. Three other shapes are worth
+            // a native fast path — all common as record components, and each
+            // otherwise costing a full name-based `invoke_virtual` per hash:
+            //
+            //   * `java.lang.String` — the caller uses the compact string
+            //     reader instead.
+            //   * exactly `java.util.ArrayList` — the caller walks the backing
+            //     array (`List.hashCode`/`equals` are contract-fixed).
+            //     Exactly, not a subclass: a subclass may override either, and
+            //     `java.util.Vector` has a different field layout entirely.
+            //   * an enum — JLS §8.9 declares both `Enum.hashCode` and
+            //     `Enum.equals` final and identity-based, so no subclass can
+            //     change them (Hibernate's `MutationKind`).
+            match &*class.name {
+                "java/lang/String" => bits |= IS_STRING,
+                "java/util/ArrayList" => bits |= IS_ARRAY_LIST,
+                _ => {
+                    let mut superclass = class.superclass;
+                    for _ in 0..MAX_SUPER_HOPS {
+                        let Some(id) = superclass else { break };
+                        let Some(parent) = cm.get_class(id) else { break };
+                        match &*parent.name {
+                            "java/lang/Enum" => {
+                                bits |= IDENTITY_SEMANTICS;
+                                break;
+                            }
+                            "java/lang/Object" => break,
+                            _ => superclass = parent.superclass,
+                        }
+                    }
+                }
+            }
+        }
+        (bits, class.first_field_index, class.record_components.len())
     }
 
     fn record_components(&self, class_id: ClassId) -> Vec<(String, String)> {
@@ -5712,8 +5772,6 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 }
 
 impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
-
-
     fn invoke(
         &mut self,
         class_name: &str,
@@ -5748,7 +5806,6 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
             args,
         )
     }
-
 
     fn invoke_special(
         &mut self,
@@ -6369,7 +6426,9 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
                         &method_descriptor,
                         &full_args,
                     ) {
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY")
+                            .is_some()
+                        {
                             eprintln!(
                                 "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
                                 class_name, method_name, method_descriptor
@@ -6734,8 +6793,6 @@ impl<'a> NativeInvokeAccess for NativeContextImpl<'a> {
 }
 
 impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
-
-
     fn new_object(&mut self, class_name: &str) -> MethodCallResult {
         let class_id = self.shared.load_class_concurrent(class_name)?;
         let num_fields = self
@@ -8123,7 +8180,9 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
             // per-allocation stack dump still fires every time.
             let dbg = {
                 static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                *DBG.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANONALLOC").is_ok())
+                *DBG.get_or_init(|| {
+                    cratonvm_types::flags::runtime_var("CRATONVM_DBG_ANONALLOC").is_ok()
+                })
             };
             if !dbg && num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
                 let cached = self.shared.classes.anon_class_cache[num_fields]
@@ -8603,8 +8662,6 @@ impl<'a> NativeHeapAccess for NativeContextImpl<'a> {
 }
 
 impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
-
-
     // -- Threading methods --
 
     fn thread_id(&self) -> u64 {
@@ -10433,8 +10490,6 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
 }
 
 impl<'a> NativeExceptionAccess for NativeContextImpl<'a> {
-
-
     fn capture_stack_trace(&mut self, _throwable_hash: i32) -> Vec<StackTraceEntry> {
         self.capture_current_stack_trace()
     }
@@ -10473,8 +10528,6 @@ impl<'a> NativeExceptionAccess for NativeContextImpl<'a> {
 }
 
 impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
-
-
     /// Phase 5: override the GPU dispatch escape hatch. Delegates
     /// to `crate::runtime::offload::dispatch_method_from_native`
     /// when the gpu-offload feature is on; otherwise returns None
@@ -10862,7 +10915,6 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
 }
 
 impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
-
     // See the `NativeContext::refresh_root_snapshot` doc comment
     // (native-api/src/registry.rs) for the full rationale — this closes the
     // "pinned a long-lived batch, then drove long re-entrant/JIT-heavy
@@ -11561,9 +11613,6 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 }
 
-
-
-
 // ---------------------------------------------------------------------------
 // Annotation helpers
 // ---------------------------------------------------------------------------
@@ -12254,6 +12303,87 @@ pub fn invoke_or_native(
 
     // peaceful-sammet — primitive-return functional-interface bridge.
     //
+    // NestedJarFile's multi-release resolution is driven by its package-local
+    // ManifestInfo helper. The helper's real bytecode reaches Attributes'
+    // map implementation, whose private JDK layout is not populated by the
+    // native manifest bridge. Route this one contract through the registered
+    // bridge before the generic virtual-call cache can retain that bytecode.
+    if effective_class == "org/springframework/boot/loader/jar/ManifestInfo"
+        && method_name == "isMultiRelease"
+        && descriptor == "()Z"
+    {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "org/springframework/boot/loader/jar/ManifestInfo",
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
+    if effective_class == "org/springframework/boot/loader/jar/NestedJarFile"
+        && method_name == "getJarEntry"
+        && descriptor == "(Ljava/lang/String;)Ljava/util/jar/JarEntry;"
+    {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "org/springframework/boot/loader/jar/NestedJarFile",
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
+    if effective_class == "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry"
+        && matches!(
+            (method_name, descriptor),
+            ("getRealName", "()Ljava/lang/String;")
+                | ("getCertificates", "()[Ljava/security/cert/Certificate;")
+                | ("getCodeSigners", "()[Ljava/security/CodeSigner;")
+        )
+    {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry",
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
+    if effective_class == "org/springframework/boot/loader/net/protocol/jar/UrlJarFile"
+        && method_name == "getEntry"
+        && descriptor == "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;"
+    {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "org/springframework/boot/loader/net/protocol/jar/UrlJarFile",
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
+    if effective_class == "org/springframework/boot/loader/zip/ZipContent$SignatureFiles"
+        && matches!(
+            (method_name, descriptor),
+            ("<clinit>", "()V") | ("bufferEndsWithSignatureSuffix", "()Z")
+        )
+    {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "org/springframework/boot/loader/zip/ZipContent$SignatureFiles",
+            method_name,
+            descriptor,
+        ) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
+    }
+
     // Spring/Eureka call `ToIntFunction.apply(Object)Object` on a receiver
     // whose actual class is `ToIntFunction` (a lambda proxy whose SAM is
     // `applyAsInt`). The JDK interface has no `apply` method, so naive
@@ -12419,6 +12549,7 @@ pub fn invoke_or_native(
                         | "java/util/concurrent/atomic/AtomicBoolean"
                         | "java/util/EnumSet"
                         | "java/time/Instant"
+                        | "java/time/ZonedDateTime"
                         | "java/util/StringJoiner"
                         | "java/io/FileInputStream"
                         | "java/lang/ref/Cleaner"
@@ -12953,7 +13084,15 @@ pub fn invoke_special_shared(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
-    invoke_special_shared_impl(shared, thread, None, class_name, method_name, descriptor, args)
+    invoke_special_shared_impl(
+        shared,
+        thread,
+        None,
+        class_name,
+        method_name,
+        descriptor,
+        args,
+    )
 }
 
 /// [`invoke_special_shared`] with the owning class ALREADY resolved.
@@ -15342,7 +15481,9 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
-    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() && method_name == "value" {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some()
+        && method_name == "value"
+    {
         let type_desc = match shared.mem.heap.get_field(proxy, 0) {
             Value::Object(Some(s)) => {
                 super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
@@ -16372,6 +16513,16 @@ fn invoke_on_class_shared_inner(
                                 (method_name, descriptor),
                                 ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
+                        // The real-JDK base implementation deliberately
+                        // throws UnsupportedOperationException. CratonVM's
+                        // FileSystemProvider bridge opens the corresponding
+                        // fd-backed FileChannel instead; without admitting it
+                        // here, FileChannel.open() on the default provider
+                        // never reaches the registered native.
+                        || (class_name == "java/nio/file/spi/FileSystemProvider"
+                            && method_name == "newFileChannel"
+                            && descriptor
+                                == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;")
                         // Legacy Mockito selector override (off by default —
                         // see `flags::mockito_legacy_selectors`): forced the
                         // reflection fallback instead of letting the real
@@ -17405,6 +17556,20 @@ fn invoke_on_class_shared_inner(
                                 || method_name == "toPath"
                                 || method_name == "getName"
                                 || method_name == "toURI"))
+                        || (class_name == "java/nio/file/Path"
+                            && method_name == "of"
+                            && descriptor == "(Ljava/net/URI;)Ljava/nio/file/Path;")
+                        || (class_name == "java/nio/file/FileSystems"
+                            && method_name == "newFileSystem")
+                        || (class_name == "java/nio/file/spi/FileSystemProvider"
+                            && method_name == "newFileSystem")
+                        || (class_name == "org/springframework/boot/loader/launch/Archive"
+                            && method_name == "create"
+                            && matches!(
+                                descriptor,
+                                "(Ljava/io/File;)Lorg/springframework/boot/loader/launch/Archive;"
+                                    | "(Ljava/lang/Class;)Lorg/springframework/boot/loader/launch/Archive;"
+                            ))
                         // Spring Boot 3.2 fat-jar launcher: JarFileArchive
                         // opens the fat-jar via `new JarFile(File)` and walks
                         // entries via `jarFile.stream() -> JarEntry`. The
@@ -17426,7 +17591,22 @@ fn invoke_on_class_shared_inner(
                                 | "size"
                                 | "close"
                                 | "getName"
+                                | "isMultiRelease"
                             ))
+                        || (class_name == "java/util/jar/Attributes$Name"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "(Ljava/lang/String;)V")
+                                    | ("toString", "()Ljava/lang/String;")
+                                    | ("equals", "(Ljava/lang/Object;)Z")
+                                    | ("hashCode", "()I")
+                            ))
+                        || (class_name == "java/util/jar/Attributes"
+                            && method_name == "containsKey"
+                            && descriptor == "(Ljava/lang/Object;)Z")
+                        || (class_name == "org/springframework/boot/loader/jar/ManifestInfo"
+                            && method_name == "isMultiRelease"
+                            && descriptor == "()Z")
                         || (class_name == "java/util/jar/Manifest"
                             && matches!(
                                 (method_name, descriptor),
@@ -17501,10 +17681,7 @@ fn invoke_on_class_shared_inner(
                         // URLClassLoader bytecode walks double-nested JAR URLs
                         // which CratonVM's real-JDK mode does not support.
                         // Force the native that delegates to ensure_class_initialized.
-                        || (matches!(class_name,
-                                "org/springframework/boot/loader/LaunchedURLClassLoader"
-                                | "org/springframework/boot/loader/launch/LaunchedClassLoader"
-                            )
+                        || (class_name == "org/springframework/boot/loader/LaunchedURLClassLoader"
                             && method_name == "loadClass")
                         // SB2 launcher's `getClassPathArchivesIterator()`
                         // returns an `ArrayList$Itr`. The downstream
@@ -18426,10 +18603,13 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/io/InputStreamReader"
                             && method_name == "close"
                             && descriptor == "()V")
-                        || (class_name == "java/lang/Runtime$Version"
-                            && ((method_name == "feature" && descriptor == "()I")
+                        || ((class_name == "java/lang/Runtime"
+                            && method_name == "version"
+                            && descriptor == "()Ljava/lang/Runtime$Version;")
+                            || (class_name == "java/lang/Runtime$Version"
+                                && ((method_name == "feature" && descriptor == "()I")
                                 || (method_name == "build"
-                                    && descriptor == "()Ljava/util/Optional;")))
+                                    && descriptor == "()Ljava/util/Optional;"))))
                         // SigProbe WP6.6: `javax.security.auth.x500.X500Principal`
                         // string / DER round-trip. JDK 25 routes through
                         // `sun.security.x509.X500Name` whose parser depends
@@ -18814,6 +18994,16 @@ fn invoke_on_class_shared_inner(
                             && method_name == "get"
                             && descriptor == "(Ljava/lang/String;)Ljava/lang/String;")
                         || crate::runtime::interpreter::is_file_channel_impl_open_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_input_stream_transfer_to_native_override(
+                            class_name,
+                            method_name,
+                            descriptor,
+                        )
+                        || crate::runtime::interpreter::is_zip_output_primitive_native_override(
                             class_name,
                             method_name,
                             descriptor,
@@ -19739,7 +19929,9 @@ fn invoke_on_class_shared_inner(
                 if let Some(result) =
                     object_serialization_hook_neutral_result(method_name, descriptor, args)
                 {
-                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_REFLECTION_FACTORY")
+                        .is_some()
+                    {
                         eprintln!(
                             "[rf-ser] neutral missing serialization hook {}.{}{} caller={}",
                             class_name,

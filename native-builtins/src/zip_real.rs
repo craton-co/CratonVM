@@ -146,28 +146,18 @@ fn read_byte_array(ctx: &dyn NativeContext, arr: ObjectRef, off: usize, len: usi
     let arr_len = ctx.array_length(arr);
     let end = (off + len).min(arr_len);
     let start = off.min(arr_len);
-    let mut out = Vec::with_capacity(end.saturating_sub(start));
-    for i in start..end {
-        match ctx.get_array_element(arr, i) {
-            Value::Int(v) => out.push(v as u8),
-            _ => out.push(0),
-        }
-    }
+    let mut out = vec![0u8; end.saturating_sub(start)];
+    let copied = ctx.read_byte_array_into(arr, start, &mut out);
+    out.truncate(copied);
     out
 }
 
 fn write_byte_array(ctx: &mut dyn NativeContext, arr: ObjectRef, off: usize, data: &[u8]) -> usize {
     let arr_len = ctx.array_length(arr);
-    let mut written = 0usize;
-    for (i, b) in data.iter().enumerate() {
-        let idx = off + i;
-        if idx >= arr_len {
-            break;
-        }
-        ctx.set_array_element(arr, idx, Value::Int(*b as i8 as i32));
-        written += 1;
-    }
-    written
+    let start = off.min(arr_len);
+    let len = data.len().min(arr_len.saturating_sub(start));
+    ctx.write_byte_array_from(arr, start, &data[..len]);
+    len
 }
 
 fn defl_effective_level(level_raw: i32) -> i32 {
@@ -389,7 +379,9 @@ fn infl_do_decompress(
     };
     let total_in_before = st.decomp.total_in();
     let total_out_before = st.decomp.total_out();
-    let status = st.decomp.decompress(input_data, output_buf, FlushDecompress::None);
+    let status = st
+        .decomp
+        .decompress(input_data, output_buf, FlushDecompress::None);
     let input_consumed = (st.decomp.total_in() - total_in_before) as u32;
     let output_consumed = (st.decomp.total_out() - total_out_before) as u32;
     let (finished, need_dict) = match status {
@@ -946,7 +938,16 @@ fn crc32_step(mut crc: u32, data: &[u8]) -> u32 {
 /// CRC-32/IEEE update matching the JDK `CRC32` contract: `crc` is the
 /// public value (initial 0), output is the new public value.
 fn crc32_update_public(public_crc: u32, data: &[u8]) -> u32 {
-    !crc32_step(!public_crc, data)
+    // `libz-sys` is already our deterministic zlib implementation for the
+    // Deflater/GZIP bridges. Its `crc32` API uses Java's public CRC
+    // representation (fresh state is zero) and its vectorized implementation
+    // avoids the old eight-shifts-per-byte path. The loader ZIP64 fixture
+    // checksums seven GiB of data, so that scalar loop consumed the complete
+    // 300-second class budget before the archive could be reopened.
+    //
+    // `data.len()` originates from a Java `int`, and is therefore within
+    // zlib's `uInt` range on every supported host.
+    unsafe { libz_sys::crc32(public_crc as _, data.as_ptr(), data.len() as libz_sys::uInt) as u32 }
 }
 
 fn crc32_update(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1105,10 +1106,13 @@ pub fn register_zip_real_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write;
 

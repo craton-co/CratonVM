@@ -26,9 +26,7 @@ pub static HIDDEN_CLASS_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOCAL_URL_CLASS_PATH_CACHE_LIMIT: usize = 64;
 
 fn local_url_class_path_cache(
-) -> &'static Mutex<
-    std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>,
-> {
+) -> &'static Mutex<std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>> {
     static INSTANCE: OnceLock<
         Mutex<std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>>,
     > = OnceLock::new();
@@ -316,8 +314,10 @@ pub fn forget_unloaded_class_mirrors(mirrors: &[ObjectRef]) {
     if mirrors.is_empty() {
         return;
     }
-    let addresses: std::collections::HashSet<usize> =
-        mirrors.iter().map(|mirror| mirror.as_ptr() as usize).collect();
+    let addresses: std::collections::HashSet<usize> = mirrors
+        .iter()
+        .map(|mirror| mirror.as_ptr() as usize)
+        .collect();
     class_data_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1684,7 +1684,10 @@ pub fn cl_load_class_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     cl_load_class(ctx, args)
 }
 
-pub(crate) fn classloader_parent(ctx: &mut dyn NativeContext, loader: ObjectRef) -> Option<ObjectRef> {
+pub(crate) fn classloader_parent(
+    ctx: &mut dyn NativeContext,
+    loader: ObjectRef,
+) -> Option<ObjectRef> {
     // The real named `parent` field is populated by name in exactly ONE
     // place (the bootstrap app loader's own construction, see
     // `alloc_classloader`) — every ordinary `ClassLoader`/`URLClassLoader`
@@ -2031,7 +2034,9 @@ fn cl_load_class_base_delegation_inner(
             1,
             &internal,
         );
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception));
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exception,
+        ));
     }
 
     // 2. Delegate to parent loader first (recursive parent-first delegation)
@@ -2790,8 +2795,7 @@ pub(crate) fn extract_pd_code_source_url(ctx: &dyn NativeContext, pd: ObjectRef)
                 ctx.get_field_by_name(loc, "protocol"),
                 ctx.get_field_by_name(loc, "file"),
             ) {
-                if let (Some(proto), Some(file)) = (ctx.read_string(proto), ctx.read_string(file))
-                {
+                if let (Some(proto), Some(file)) = (ctx.read_string(proto), ctx.read_string(file)) {
                     return Some(format!("{proto}:{file}"));
                 }
             }
@@ -4573,10 +4577,7 @@ fn new_url_from_spec(ctx: &mut dyn NativeContext, spec: &str) -> Option<ObjectRe
 /// resolves a manifest `Class-Path` for every receiver-local lookup, so
 /// returning its original pathing JAR here lets callers filter a different
 /// class path than the loader will subsequently search.
-fn expanded_manifest_urls(
-    ctx: &mut dyn NativeContext,
-    urls: ObjectRef,
-) -> Option<ObjectRef> {
+fn expanded_manifest_urls(ctx: &mut dyn NativeContext, urls: ObjectRef) -> Option<ObjectRef> {
     // `new_url_from_spec` below can collect; the source array is revisited
     // while discovering the manifest entries, so keep it visible to a moving
     // collector throughout that phase as well.
@@ -4736,12 +4737,7 @@ pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
         // recent JDK builds: the regular `getURLs()` and a package-private
         // `getURLs(boolean)` that includes/excludes the loaderless entries.
         r.register(cls, "getURLs", "()[Ljava/net/URL;", ucp_get_urls_empty);
-        r.register(
-            cls,
-            "getURLs",
-            "(Z)[Ljava/net/URL;",
-            ucp_get_urls_empty,
-        );
+        r.register(cls, "getURLs", "(Z)[Ljava/net/URL;", ucp_get_urls_empty);
         // `closeLoaders` — both signatures.
         r.register(
             cls,
@@ -5124,8 +5120,17 @@ pub fn builtin_classloader_find_resource_as_stream(
     resource_stream_for_last_string_arg(ctx, args)
 }
 
-fn cl_get_defined_package(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+/// Synthetic-JDK `ClassLoader.getDefinedPackage(String)`.
+///
+/// Delegates to the real-JDK implementation rather than answering an
+/// unconditional `null`: that stub is what made every package-name
+/// `SpringApplication` source fail as `IllegalArgumentException: Invalid
+/// source '<pkg>'` (`BeanDefinitionLoader.findPackage` returns exactly this
+/// probe's result), and there is no reason for the two boot modes to disagree.
+/// `getDefinedPackages`/`getPackages` below stay empty — see the note on
+/// `lang_class::i2_classloader_get_defined_packages`.
+fn cl_get_defined_package(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    crate::lang_class::i2_classloader_get_defined_package(ctx, args)
 }
 
 fn cl_get_defined_packages(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -5236,6 +5241,19 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
     // the `/!`-marker normalisation above keeps the jar-boundary detection on
     // the original encoded text.
     let p = crate::net_phase_e::uri_percent_decode(&p);
+    // A root archive URL ends in `!/` (for example
+    // `jar:file:src/test/resources/jars/app.jar!/`).  There is no virtual
+    // subdirectory to retain in that form: it denotes the archive's root.
+    // Leaving the marker in the filesystem token makes `ClassPath::new`
+    // probe the non-existent path `app.jar!/`, so a receiver-local
+    // URLClassLoader sees neither resources nor classes from its own JAR.
+    // Keep non-root `!/prefix/` specifications intact; those become a
+    // `NestedDirectory` classpath entry below.
+    let p = if p.ends_with("!/") && p.find("!/") == Some(p.len() - 2) {
+        p[..p.len() - 2].to_string()
+    } else {
+        p
+    };
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
     // extracted path is `/C:/dir/...` — a leading slash *before* the
     // drive letter. `PathBuf::from("/C:/...")` does not resolve on
@@ -5741,10 +5759,13 @@ fn empty_enumeration_impl(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// serving a stale one — no explicit invalidation needed. Unbounded but
 /// small in practice (one entry per distinct classpath actually seen in the
 /// process), consistent with `jar_contents_cached`'s existing precedent.
-fn cached_class_path_for_paths(paths: &[String]) -> std::sync::Arc<cratonvm_classloading::ClassPath> {
+fn cached_class_path_for_paths(
+    paths: &[String],
+) -> std::sync::Arc<cratonvm_classloading::ClassPath> {
     use std::sync::{Arc, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>>> =
-        OnceLock::new();
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(cp) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(paths) {
         return cp.clone();
@@ -5927,6 +5948,77 @@ fn fetch_http_resource(
         }
     }
     None
+}
+
+/// True when `loader` is a `URLClassLoader`-shaped loader whose constructor URL
+/// set we positively recorded (see [`record_ucl_urls`]) — i.e. its own URL view
+/// is authoritative, and an EMPTY view genuinely means "this loader owns
+/// nothing", not "we failed to observe its URLs".
+///
+/// The recorded set is either the synthetic-JDK `UCL_URLS_ARRAY` slot or the
+/// real-JDK `ucp` placeholder our constructor shim installs; the presence of
+/// EITHER is the proof. Same signal [`loader_local_resource_urls`] already
+/// trusts for receiver-local resource lookup, so a loader this returns `false`
+/// for is one whose local lookups are already going through the global path.
+///
+/// Requires an actual `java.net.URLClassLoader` (or subclass) receiver: those
+/// raw slot indices only mean "URLs" on that shape. Probing them on, say, a
+/// bare synthetic `java/lang/ClassLoader` reads an unrelated field — the same
+/// out-of-bounds-slot hazard `is_user_defined_loader` guards against.
+fn loader_has_recorded_url_set(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(loader);
+    let is_url_loader = ctx
+        .class_id_by_name("java/net/URLClassLoader")
+        .is_some_and(|ucl| cid == ucl || ctx.is_subclass(cid, ucl));
+    if !is_url_loader {
+        return false;
+    }
+    matches!(ctx.get_field(loader, UCL_URLS_ARRAY), Value::Object(Some(_)))
+        || matches!(ctx.get_field_by_name(loader, "ucp"), Value::Object(Some(_)))
+}
+
+/// Is a package with class files under `class_glob` (e.g.
+/// `com/example/pkg/*.class`) visible **to this specific loader**?
+///
+/// `ClassLoader.getDefinedPackage` is non-delegating in the JDK, so answering it
+/// from the VM-global classpath makes every loader — including a deliberately
+/// isolated one — claim every package on the process classpath. That is the
+/// loader-identity gap behind
+/// `docs/internal/fixed-suite-bugs/springboot/*-beandefinitionloader-package-scan-empty-FIXED.md`:
+/// `new URLClassLoader("empty", new URL[0], null).getDefinedPackage(p)` answered
+/// with a `Package` where HotSpot answers `null`.
+///
+/// Resolution order, deliberately failing back to the historical global answer
+/// whenever the receiver's own view is not knowable:
+/// 1. built-in loaders (bootstrap/platform/application) — they ARE the global
+///    classpath, so the global probe is the right one;
+/// 2. a loader with its own recorded URLs — probe exactly those (already
+///    pathing-jar aware via [`loader_local_resource_urls`]);
+/// 3. a loader with a positively-recorded but EMPTY URL set — nothing is
+///    visible, matching HotSpot;
+/// 4. anything else (a custom loader we have no URL view of) — global probe,
+///    i.e. unchanged from before this function existed.
+pub(crate) fn package_class_files_visible_to_loader(
+    ctx: &mut dyn NativeContext,
+    loader: Option<ObjectRef>,
+    class_glob: &str,
+) -> bool {
+    let Some(loader) = loader else {
+        return !ctx.find_all_resource_urls(class_glob).is_empty();
+    };
+    let is_builtin = ctx
+        .class_name_of_id(ctx.class_id_of_object(loader))
+        .is_some_and(|n| n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$"));
+    if is_builtin {
+        return !ctx.find_all_resource_urls(class_glob).is_empty();
+    }
+    if !loader_local_resource_urls(ctx, loader, class_glob).is_empty() {
+        return true;
+    }
+    if loader_has_recorded_url_set(ctx, loader) {
+        return false;
+    }
+    !ctx.find_all_resource_urls(class_glob).is_empty()
 }
 
 fn loader_local_resource_urls(
@@ -8810,10 +8902,13 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod classloader_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
     fn make_registry() -> NativeMethodRegistry {

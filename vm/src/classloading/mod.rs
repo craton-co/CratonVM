@@ -22,6 +22,7 @@ pub use cratonvm_classloading::{
     invokespecial_selection_start, jdk_superclass_lookup, jit_supersede_epoch,
     static_common_superclass_lookup, Class, ClassId, ClassLoaderId, ClassManager, ClassPath,
     ClassState, ClassStore, ManifestInfo, ModuleDescriptor, ModuleRegistry, RecordComponentInfo,
+    RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE, RECORD_OBJ_TO_STRING,
 };
 pub use cratonvm_classloading::{
     descriptor_from_module_attribute, package_of, JAVA_BASE, UNNAMED_MODULE,

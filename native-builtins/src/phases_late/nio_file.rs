@@ -1226,7 +1226,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let fs = p57_alloc_jrt_filesystem(ctx, &jh);
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            if let Some(jar) = p57_jar_uri_to_os_path(&text) {
+            if let Some((jar, _entry)) = p57_jar_uri_to_entry_path(&text) {
                 // Mount file-backed jar/zip URIs even when the archive does not
                 // exist yet. HotSpot's zipfs supports Map.of("create", "true");
                 // callers then populate it through Files.createDirectories/copy.
@@ -7124,9 +7124,12 @@ pub(crate) mod p57_win_path_tests {
     //! `sun.nio.fs.WindowsPath` exactly (cross-checked against JDK 25 via the
     //! `PVerify` repro). The parser accepts both `\` and the `/`-canonical
     //! internal form, so both spellings are exercised.
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{p57_win_is_absolute, p57_win_parent_of};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn is_absolute_matches_hotspot() {
@@ -7176,9 +7179,12 @@ pub(crate) mod p57_win_path_tests {
 pub(crate) mod p57_normalize_relativize_tests {
     //! `Path.normalize()` / `Path.relativize()` vs HotSpot (JDK 25, via the
     //! `PathDeep` repro). Helpers emit `/`-canonical internal form.
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{p57_normalize_path, p57_relativize};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn normalize_preserves_root_and_leading_dotdot() {
@@ -7552,7 +7558,12 @@ pub(crate) fn vfs_decode(p: &str) -> Option<(&'static str, String, String)> {
     let t_end = body.find(JARFS_SENTINEL)?;
     let tag = &body[..t_end];
     let rest = &body[t_end + JARFS_SENTINEL.len_utf8()..];
-    let c_end = rest.find(JARFS_SENTINEL)?;
+    // The container may itself be a jar-FS path when a `jar:nested:` URI
+    // mounts an archive stored inside another archive.  Its encoding therefore
+    // contains sentinel delimiters of its own; the final delimiter is the only
+    // boundary that unambiguously separates the outer container from this
+    // path's entry.
+    let c_end = rest.rfind(JARFS_SENTINEL)?;
     let container = rest[..c_end].to_string();
     let entry = rest[c_end + JARFS_SENTINEL.len_utf8()..].to_string();
     let tag: &'static str = match tag {
@@ -7613,11 +7624,26 @@ pub(crate) fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
     let key = (jar.to_string(), mtime, len);
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(&key) {
-        return cached.clone();
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return cached;
     }
-    let bytes = std::fs::read(jar).ok().map(Arc::new);
+    // A mounted nested archive uses a jarfs-encoded parent entry as its
+    // container. Resolve that entry through the parent archive instead of
+    // treating the sentinel representation as a host filesystem path.
+    let bytes = if let Some((parent, entry)) = jarfs_decode(jar) {
+        jarfs_read_entry(&parent, &entry).ok().map(Arc::new)
+    } else {
+        std::fs::read(jar).ok().map(Arc::new)
+    };
+    // Resolving a nested container recursively calls this function for its
+    // parent JAR. Do that work outside the cache mutex; holding it here would
+    // self-deadlock on every `jar:nested:` filesystem mount.
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     guard.retain(|(p, _, _), _| p != jar);
     guard.insert(key, bytes.clone());
     bytes
@@ -7654,9 +7680,13 @@ pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
     let key = (jar.to_string(), mtime, len);
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(&key) {
-        return cached.clone();
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return cached;
     }
     let built = (|| {
         let bytes = jar_bytes_cached(jar)?;
@@ -7712,6 +7742,10 @@ pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
             children,
         }))
     })();
+    // Building an index for a nested archive first reads the archive entry
+    // from its parent, which in turn indexes that parent.  Do not retain this
+    // cache lock across that recursive work.
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     guard.retain(|(p, _, _), _| p != jar);
     guard.insert(key, built.clone());
     built
@@ -8232,9 +8266,12 @@ pub(crate) fn jrtfs_list_class_binary_names(
 
 #[cfg(test)]
 pub(crate) mod jrtfs_javac_listing_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::jrtfs_list_class_binary_names;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::path::{Path, PathBuf};
 
     fn test_java_home() -> Option<PathBuf> {
@@ -8428,6 +8465,7 @@ pub(crate) fn p57_uri_is_opaque_file(text: &str) -> bool {
 pub(crate) fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
     let t = text.split("!/").next().unwrap_or(text);
     let t = t.strip_prefix("jar:").unwrap_or(t);
+    let t = t.strip_prefix("nested:").unwrap_or(t);
     let t = t
         .strip_prefix("file://")
         .or_else(|| t.strip_prefix("file:"))
@@ -8438,6 +8476,7 @@ pub(crate) fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
     } else {
         t
     };
+    let t = t.trim_end_matches('/');
     if t.is_empty() {
         None
     } else {
@@ -8451,9 +8490,34 @@ pub(crate) fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
 /// whereas `Path.of(URI)` must retain the entry portion for `Files.*` calls.
 pub(crate) fn p57_jar_uri_to_entry_path(text: &str) -> Option<(String, String)> {
     let rest = text.strip_prefix("jar:")?;
-    let (container, entry) = rest.split_once("!/")?;
-    let jar = p57_jar_uri_to_os_path(container)?;
-    Some((jar, entry.to_string()))
+    // Spring Boot's `jar:nested:` URI grammar places the level separator
+    // *before* the `!` (`outer.jar/!nested.jar!/entry`), whereas the regular
+    // JAR grammar uses `!/' (`outer.jar!/entry`). Normalize the nested form so
+    // the container walk below creates one virtual jar-FS layer per archive
+    // level instead of treating `outer.jar/!nested.jar` as a host file name.
+    let (rest, nested) = match rest.strip_prefix("nested:") {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    let normalized;
+    let rest = if nested {
+        normalized = rest.replace("/!", "!/");
+        normalized.as_str()
+    } else {
+        rest
+    };
+    let mut components = rest.split("!/");
+    let outer = components.next()?;
+    let mut container = p57_jar_uri_to_os_path(outer)?;
+    // `jar:nested:/outer.jar/` is the root URI used by the split-and-restore
+    // flow. It mounts the outer archive itself, so represent it with an empty
+    // entry rather than rejecting it as though every jar URI named a child.
+    let mut entry = components.next().unwrap_or("");
+    for component in components {
+        container = jarfs_encode(&container, entry);
+        entry = component;
+    }
+    Some((container, entry.to_string()))
 }
 
 /// Build a `java.io.IOException` runtime error from a Rust IO error — used so

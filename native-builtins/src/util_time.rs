@@ -408,6 +408,8 @@ pub(crate) fn register_time_natives(registry: &mut NativeMethodRegistry) {
     registry.register(inst, "equals", "(Ljava/lang/Object;)Z", native_inst_equals);
     registry.register(inst, "hashCode", "()I", native_inst_hash_code);
 
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+
     // --- Duration ---
     let dur = "java/time/Duration";
     registry.register(dur, "ofDays", "(J)Ljava/time/Duration;", native_dur_of_days);
@@ -2244,6 +2246,7 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
     );
 
     // --- ZonedDateTime ---
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let zdt = "java/time/ZonedDateTime";
     registry.register(
         zdt,
@@ -2351,7 +2354,6 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
         "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;",
         native_zdt_format,
     );
-
     // --- ZoneId ---
     let zid = "java/time/ZoneId";
     registry.register(
@@ -5832,10 +5834,13 @@ pub(crate) fn register_t25_natives(registry: &mut NativeMethodRegistry) {
 // ===========================================================================
 #[cfg(test)]
 mod t25_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // --- Clock ---
 

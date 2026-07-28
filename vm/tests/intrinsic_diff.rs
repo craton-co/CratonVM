@@ -533,3 +533,136 @@ fn arraycopy_exception_parity() {
         on_ac.len(),
     );
 }
+
+// ===========================================================================
+// Test 5 — record_object_methods_differential
+// ===========================================================================
+
+/// Records (JEP 395). `IntrinsicRecordDiff` exercises the generated
+/// `hashCode`/`equals` bodies over every component shape — primitives
+/// (including `NaN` / signed zero), `String` (Latin-1 and UTF-16), enums,
+/// nested records three levels deep, `null`s, arrays (identity semantics),
+/// collections, boxed types, a component-less record, and a record that
+/// hand-writes all three bodies — then drives 300 record keys through a
+/// `HashMap` and a megamorphic `equals`/`hashCode` call site.
+///
+/// With intrinsics ON those calls take `InterpIntrinsic::RecordHashCode` /
+/// `RecordEquals`; with `CRATONVM_DISABLE_INTRINSICS=1` they fall back to the
+/// `invokedynamic ObjectMethods.bootstrap` call-site path. Both must produce
+/// identical output — that is what makes installing the intrinsic safe.
+///
+/// The program never prints a raw `hashCode()`: the JLS leaves a record's hash
+/// value unspecified. It prints the observable consequences instead (equal
+/// objects hashing alike, `HashMap`/`HashSet` placement and lookup) plus
+/// `equals`/`toString`, which the JLS does specify.
+#[test]
+fn record_object_methods_differential() {
+    let on = match run_class("IntrinsicRecordDiff", false) {
+        Some(r) => r,
+        None => return, // prerequisite missing; skip (see module docs)
+    };
+    let off = match run_class("IntrinsicRecordDiff", true) {
+        Some(r) => r,
+        None => return,
+    };
+
+    for (label, run) in [("ON", &on), ("OFF", &off)] {
+        assert!(
+            run.stdout.contains("INTRINSIC_RECORD_DIFF_OK "),
+            "intrinsics-{label} run did not reach the INTRINSIC_RECORD_DIFF_OK \
+             marker.\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr,
+        );
+    }
+
+    if on.stdout != off.stdout {
+        let where_ = first_diff(&on.stdout, &off.stdout)
+            .map(|(n, x, y)| format!("first divergence at line {n}:\n  ON : {x}\n  OFF: {y}"))
+            .unwrap_or_else(|| "(divergence in line count / trailing content)".to_string());
+        panic!(
+            "RECORD INTRINSIC DIVERGENCE: stdout differs between intrinsics ON \
+             and OFF.\n{where_}\n\
+             The record hashCode/equals intrinsic is NOT behavior-identical to \
+             the invokedynamic ObjectMethods path.",
+        );
+    }
+
+    assert_eq!(
+        on.exit_code, off.exit_code,
+        "exit code diverged: ON={:?} OFF={:?}",
+        on.exit_code, off.exit_code,
+    );
+    assert!(
+        matches!(on.exit_code, Some(0) | None),
+        "IntrinsicRecordDiff exited nonzero ({:?}) despite printing the OK \
+         marker.\nstderr:\n{}",
+        on.exit_code,
+        on.stderr,
+    );
+
+    // Spot-check the invariants that would break loudest if the intrinsic
+    // mis-hashed or mis-compared, independent of the ON/OFF comparison above
+    // (both paths share the Rust implementation, so a bug in it would agree
+    // with itself).
+    for expected in [
+        // Equal records are equal, hash alike, and collapse to one bucket.
+        "r: node.same.equals=true",
+        "r: node.same.hashAgrees=true",
+        "r: node.same.setSize=1",
+        "r: node.same.mapGetX=second",
+        // A one-component-deep difference three records down is detected.
+        "r: node.deepDiff.equals=false",
+        "r: node.deepDiff.setSize=2",
+        // NaN equals NaN; +0.0 does not equal -0.0.
+        "r: prim.nan.equals=true",
+        "r: prim.signedZero.equals=false",
+        // `Long.hashCode` folds the high word: 1L<<32 and 1L must not collide
+        // into equality.
+        "r: prim.longHighWord.equals=false",
+        // Arrays keep identity semantics.
+        "r: arr.sameInstances.equals=true",
+        "r: arr.equalContent.equals=false",
+        // A record must never equal an array of that record type.
+        "r: arr.recordVsArray=false",
+        "r: arr.arrayVsRecord=false",
+        // Hand-written bodies are not diverted to the intrinsic.
+        "r: custom.hashIs4242=true",
+        "r: custom.equalsIgnoresB=true",
+        "r: custom.equalsChecksA=false",
+        "r: custom.toString=CUSTOM",
+        // Every one of 300 record keys round-trips through a HashMap.
+        "r: big.size=300",
+        "r: big.hits=300",
+        "r: big.misses=0",
+        "r: big.absent=null",
+        // toString stays on the invokedynamic path and keeps its format.
+        "r: node.toString=Node[group=Group[table=employee, kind=INSERT, \
+shape=Shape[table=employee, kind=INSERT, shapeHash=17], \
+ops=[op-0, op-1, op-2, op-3, op-4, op-5, op-6, op-7], pre=true, ordinal=3], \
+stableId=42]",
+        "r: null.toString=Nullable[s=null, o=null]",
+        "r: empty.toString=Empty[]",
+    ] {
+        assert!(
+            on.stdout.contains(expected),
+            "missing expected record observation: {expected:?}\nstdout:\n{}",
+            on.stdout,
+        );
+    }
+
+    let obs = observation_lines(&on.stdout).len();
+    assert!(
+        obs >= 300,
+        "expected the record differential program to emit many 'r:' \
+         observation lines; got only {obs}. stdout:\n{}",
+        on.stdout,
+    );
+
+    eprintln!(
+        "[intrinsic_diff] record_object_methods_differential: {obs} record \
+         observations identical with intrinsics ON vs OFF; exit codes match \
+         ({:?}).",
+        on.exit_code,
+    );
+}
