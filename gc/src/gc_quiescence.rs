@@ -405,11 +405,17 @@ pub mod incomplete_reason {
     /// A live compiled frame's spill band could not be bounded (no exact RBP or
     /// no recorded frame size), so "every oop is published" is unverifiable.
     pub const UNBOUNDED_FRAME_BAND: usize = 11;
+    /// The innermost RBP recorded for a chain entry belongs to a DEEPER frame
+    /// that was entered by a direct JIT->JIT call (the inline MIC/PIC cascade
+    /// or the hashed megamorphic stub), which pushes no guard. The entry's
+    /// `compiled_method` therefore does not describe the frame at that RBP, so
+    /// neither its coverage nor its oop slots can be resolved.
+    pub const FOREIGN_INNERMOST_RBP: usize = 12;
 
     /// One past the highest defined reason code. Sizes the per-reason counter
     /// array; a new variant must bump it (asserted by
     /// `every_incomplete_reason_has_a_label`).
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     /// Human-readable label for a reason code (for the fallback diagnostic).
     pub fn label(code: usize) -> &'static str {
@@ -426,6 +432,7 @@ pub mod incomplete_reason {
             XT_HELPER_WINDOW => "xt-helper-window-conservative-scan",
             UNPUBLISHED_FRAME_OOP => "compiled-frame-oop-not-published",
             UNBOUNDED_FRAME_BAND => "compiled-frame-band-unbounded",
+            FOREIGN_INNERMOST_RBP => "innermost-rbp-belongs-to-unguarded-callee",
             _ => "unknown",
         }
     }
@@ -443,6 +450,7 @@ pub mod incomplete_reason {
 // reason as every other counter in this module.
 #[cfg(not(test))]
 static MOVING_YOUNG_REASON_COUNTS: [AtomicUsize; incomplete_reason::COUNT] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),

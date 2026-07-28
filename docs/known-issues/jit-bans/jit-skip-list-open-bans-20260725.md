@@ -504,14 +504,13 @@ session" list above.
   on 3 runs each way. `FloatFieldBlockLoaderTests`, the single class that kept
   the ban alive on 2026-07-26 (38 baseline -> 41 lifted), is now 31 failures
   with the ban on AND 31 with it off. The +3 was the stale-compiled-entry defect
-  closed by `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`
+  closed by the retired `nodeconnections-retired-jit-code-jump-20260727` write-up
   (the callee-compile probe handed out an entry address whose artifact it had
   already released), which was also SIGSEGV-ing
   `cluster.NodeConnectionsServiceTests` in the same window.
   `FloatHierarchicalKMeansTests` goes the other way: it times out 3/3 at 900 s
   with the ban ON and completes in 43-58 s with it lifted, so the ban was
-  causing a hang there. Both prior docs moved to
-  `docs/internal/es-fragile-cluster-{confirmed-needed,no-fixture}-20260726.md`.
+  causing a hang there. Both prior ban docs are retired.
 - **Already moot, no action:** BC-ASN1.1 and FELIX.1 both live inside
   `is_known_miscompile`, gated behind `callee_saved_gpr_local_homes_enabled()`
   (defaults `false`) — dead in any default run already. NETTY.1's only

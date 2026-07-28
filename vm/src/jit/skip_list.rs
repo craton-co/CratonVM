@@ -1297,20 +1297,24 @@ fn should_skip_jit_internal(
         }
 
         // ES-FRAGILE-CLUSTER.1 (blanket `org/elasticsearch/`) -- REMOVED
-        // 2026-07-27. The ban's last re-verification
-        // (`docs/internal/es-fragile-cluster-confirmed-needed-20260726.md`)
+        // 2026-07-27. The ban's last re-verification (the retired
+        // `es-fragile-cluster-confirmed-needed-20260726` write-up)
         // kept it on the strength of a single class,
         // `index.mapper.blockloader.FloatFieldBlockLoaderTests`, which gained
         // 3 failures with the package allowed (38/120 -> 41/120) while the
         // other 17 classes in that spread sample were byte-identical. That
         // regression, and the `cluster.NodeConnectionsServiceTests` SIGSEGV
         // investigated in the same window, were both the ownerless
-        // inline-cache entry fixed in `vm/src/jit/helpers.rs` (see
-        // `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`):
-        // a MIC slot published a raw compiled entry with no
-        // `Arc<CompiledMethod>` keep-alive, so generated code kept calling a
-        // body the next tier-up `put` unmapped. Re-measured with that fix in
-        // place -- see the doc for the class-by-class tallies.
+        // stale-compiled-entry family fixed in `vm/src/jit/helpers.rs` and
+        // `vm/src/runtime/interpreter.rs`: `try_jit_compile_callee` handed out
+        // a bare compiled-entry address after releasing its
+        // `Arc<CompiledMethod>`, so a concurrent tier-up `JitCache::put` could
+        // unmap the body while generated code still called it. Re-measured
+        // with that fix in place: the 19-class spread sample and 3 runs each
+        // way of `TextFieldMapperTests` are identical ban-on vs ban-off,
+        // `FloatFieldBlockLoaderTests` is 31 failures both ways, and
+        // `FloatHierarchicalKMeansTests` hangs 3/3 with the ban ON but
+        // completes in ~50s with it lifted.
 
         // ES-HAMCREST.1 -- REMOVED 2026-07-26. Re-verified with a
         // standalone probe (`HamcrestProbe.java`, real hamcrest-core +
@@ -1324,7 +1328,8 @@ fn should_skip_jit_internal(
         // work appears to have already closed it). The broader
         // `org/elasticsearch/` blanket ban that used to sit immediately above
         // this one was removed 2026-07-27 against the real ES 9.6.0-SNAPSHOT
-        // fixture; see `docs/internal/es-fragile-cluster-confirmed-needed-20260726.md`.
+        // fixture (the retired `es-fragile-cluster-confirmed-needed-20260726`
+        // write-up).
         // `HamcrestProbe.java` is the regression witness for this entry only.
 
         // WILDFLY-CONTROLLER-JIT.1 (2026-07-13): the optimized
