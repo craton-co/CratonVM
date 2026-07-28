@@ -2853,6 +2853,56 @@ fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm) -> bool {
     true
 }
 
+/// Which header [`tlab_alloc_object_inner`] should stamp on the region it
+/// reserves. Everything else about the allocation — the TLAB fast path, the
+/// refill gate, the wedge breakers, the retire-before-replace protocol — is
+/// identical for both shapes, so arrays reuse this function rather than
+/// carrying a second, less-hardened copy of that machinery.
+#[derive(Clone, Copy)]
+enum TlabShape {
+    /// `num_fields` object slots.
+    Object { num_fields: usize },
+    /// `length` elements of `element_type`.
+    Array {
+        element_type: ArrayElementType,
+        length_u32: u32,
+    },
+}
+
+impl TlabShape {
+    /// Stamp the shape's header at `ptr`.
+    ///
+    /// SAFETY: the caller must have reserved at least `HEADER_SIZE` bytes at
+    /// `ptr`, 8-byte aligned and exclusively owned until the TLAB cursor is
+    /// committed.
+    #[inline(always)]
+    unsafe fn init_header(self, ptr: *mut u8, class_id: ClassId, hash: i32) {
+        match self {
+            // H1: mint a fresh non-zero identity hash at allocation time so
+            // the object header is never all-zero. This matches the slow-path
+            // allocators (`alloc_object`/`alloc_array`) and prevents the
+            // stale-pointer detector in `execute_invoke` from mis-flagging
+            // legitimate `new Object()` instances as stale memory.
+            TlabShape::Object { num_fields } => init_object_header(ptr, class_id, num_fields, hash),
+            TlabShape::Array {
+                element_type,
+                length_u32,
+            } => {
+                use cratonvm_gc::heap::{ObjectHeader, ObjectKind};
+                let header = ObjectHeader::new(
+                    class_id,
+                    ObjectKind::Array,
+                    element_type,
+                    hash,
+                    length_u32,
+                    length_u32,
+                );
+                std::ptr::write(ptr as *mut ObjectHeader, header);
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn tlab_alloc_object_inner(
     thread: &mut JvmThread,
@@ -2862,19 +2912,35 @@ fn tlab_alloc_object_inner(
     total_size: usize,
     refill_needs_young_room: bool,
 ) -> Option<ObjectRef> {
+    tlab_alloc_shaped_inner(
+        thread,
+        shared,
+        class_id,
+        TlabShape::Object { num_fields },
+        total_size,
+        refill_needs_young_room,
+    )
+}
+
+#[inline(always)]
+fn tlab_alloc_shaped_inner(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    class_id: ClassId,
+    shape: TlabShape,
+    total_size: usize,
+    refill_needs_young_room: bool,
+) -> Option<ObjectRef> {
     use std::sync::atomic::Ordering;
 
     // Fast path: bump-allocate from the current TLAB without taking
     // any lock. This is the steady-state path for ~99% of allocations
     // once the adaptive sizer has settled.
     if let Some(ptr) = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
-        // H1: mint a fresh non-zero identity hash at allocation time so
-        // the object header is never all-zero. This matches the slow-path
-        // allocators (`alloc_object`/`alloc_array`) and prevents the
-        // stale-pointer detector in `execute_invoke` from mis-flagging
-        // legitimate `new Object()` instances as stale memory.
         let hash = shared.mem.heap.next_identity_hash();
-        init_object_header(ptr, class_id, num_fields, hash);
+        // SAFETY: `alloc_initialized` reserved `total_size` (>= HEADER_SIZE)
+        // bytes at `ptr`, 8-byte aligned and privately owned until commit.
+        unsafe { shape.init_header(ptr, class_id, hash) };
     }) {
         shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
         // Truncation-checked: usize → u64 widening is loss-free on 64-bit
@@ -3039,7 +3105,9 @@ fn tlab_alloc_object_inner(
         if let Some(ptr) = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
             // H1: see fast-path comment above.
             let hash = shared.mem.heap.next_identity_hash();
-            init_object_header(ptr, class_id, num_fields, hash);
+            // SAFETY: same contract as the fast path — a freshly reserved,
+            // 8-byte-aligned, privately-owned `total_size` region.
+            unsafe { shape.init_header(ptr, class_id, hash) };
         }) {
             shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
@@ -3201,6 +3269,86 @@ fn maybe_dump_heap_on_oom(shared: &SharedVm, thread: &JvmThread) {
     }
 }
 
+/// TLAB hit-only fast path for array allocation — the array twin of
+/// [`tlab_alloc_object`], and the general-element-type twin of
+/// [`tlab_alloc_byte_array`].
+///
+/// Why this exists: object allocation has had a TLAB fast path for a long
+/// time, but *array* allocation never did — `gc_alloc_array` went straight to
+/// `heap.try_alloc_array`, and every young allocation there takes the single
+/// global `young_from` mutex and holds it across the bump, the `write_bytes`
+/// zeroing of the whole object, and the header `init`. Because the zeroing is
+/// inside the lock, the hold time grows with the allocation, so arrays
+/// serialise harder than objects do.
+///
+/// Measured on this box (`apps/hib-suite-runner/AllocScaleProbe.java`,
+/// aggregate throughput, 1 -> 4 threads):
+///
+/// | shape        | 1 thread | 4 threads | scaling |
+/// |--------------|---------:|----------:|--------:|
+/// | `new Object()` (TLAB) | 19.8 Mops/s | 41.4 Mops/s | 2.10x |
+/// | `new long[16]` (no TLAB) | 13.1 Mops/s | 11.9 Mops/s | **0.91x** |
+///
+/// HotSpot scales the same array shape ~27x over the same range. Array
+/// allocation was therefore capped at roughly one thread's worth of
+/// throughput no matter how many cores were available — which is why a
+/// 5-thread allocation-heavy workload (an ORM opening sessions and building
+/// `ArrayList`/`HashMap`/`StringBuilder` backing arrays) could not use them.
+///
+/// It shares [`tlab_alloc_shaped_inner`] with the object path, so it inherits
+/// that path's already-hardened refill gate, wedge breakers and
+/// retire-before-replace protocol verbatim rather than carrying a second copy
+/// of them. A hit-only first attempt is not enough on its own: a workload that
+/// allocates mostly arrays drains the TLAB and then misses back to the global
+/// lock on every subsequent allocation (measured — hit-only bought ~23% on one
+/// thread and moved multi-thread scaling not at all).
+///
+/// Zeroing: [`GenerationalHeap::refill_tlab`] zeroes the whole TLAB region
+/// when it is handed out, so the array body already reads back as Java's
+/// mandated default values and the initializer only has to write the header —
+/// the same contract [`tlab_alloc_byte_array`] relies on.
+fn tlab_alloc_array(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    class_id: ClassId,
+    element_type: ArrayElementType,
+    length: usize,
+) -> Option<ObjectRef> {
+    use cratonvm_gc::heap::{ObjectKind, HEADER_SIZE};
+    let length_u32 = u32::try_from(length).ok()?;
+    let data_size = cratonvm_gc::heap::array_data_size_checked(length, element_type)?;
+    let total_size = HEADER_SIZE.checked_add(data_size)?;
+    // Keep well clear of the humongous threshold: anything at or above the
+    // TLAB's per-allocation cap goes down the ordinary path, which owns the
+    // young-vs-old-gen routing decision.
+    if total_size > cratonvm_gc::tlab::tlab_max_alloc() {
+        return None;
+    }
+    let obj = tlab_alloc_shaped_inner(
+        thread,
+        shared,
+        class_id,
+        TlabShape::Array {
+            element_type,
+            length_u32,
+        },
+        total_size,
+        // Same value the interpreter's object path passes: the young-room
+        // pre-check is the JIT slow path's gate, not this one's.
+        false,
+    )?;
+    cratonvm_gc::a2dbg::record(
+        obj.as_ptr() as usize,
+        class_id.as_u32(),
+        ObjectKind::Array as u8,
+        element_type as u8,
+        length_u32,
+        length_u32,
+        total_size,
+    );
+    Some(obj)
+}
+
 /// Try to allocate an array, running GC and retrying on failure.
 fn gc_alloc_array(
     shared: &SharedVm,
@@ -3209,6 +3357,9 @@ fn gc_alloc_array(
     element_type: ArrayElementType,
     length: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
+    if let Some(arr) = tlab_alloc_array(thread, shared, class_id, element_type, length) {
+        return Ok(arr);
+    }
     if let Some(arr) = shared
         .mem
         .heap
