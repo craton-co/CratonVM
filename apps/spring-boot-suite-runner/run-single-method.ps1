@@ -6,6 +6,7 @@ param(
   [string]$Exe = 'C:\craton\CratonVM-pem-clientauth-decrypterror-20260720\target\release\cratonvm-pem-clientauth-decrypterror.exe',
   [string]$JdkHome = 'C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot',
   [string]$MaxHeap = '2g',
+  [int]$StackDumpTimeoutSec = 0,
   [switch]$NoJit,
   [string[]]$CratonArgs = @(),
   [hashtable]$ExtraEnv = @{}
@@ -61,13 +62,12 @@ $cp = ($entries -join $separator)
 $exePath = [System.IO.Path]::GetFullPath($Exe)
 if (-not (Test-Path $exePath)) { throw "CratonVM exe not found: $exePath" }
 
-$env:CRATONVM_REAL_NET_SOCKETS = '1'
-$env:CRATONVM_REAL_AQS = '1'
-$env:CRATONVM_DISABLE_DEFAULT_WATCHDOG = '1'
-$env:CRATONVM_ROOTSNAP_CACHE = '1'
+$env:CRATONVM_REAL = 'net-sockets,aqs'
+$env:CRATONVM_THREADS = '-default-watchdog'
+$env:CRATONVM_JIT = 'rootsnap-cache'
 foreach ($k in $ExtraEnv.Keys) { Set-Item -Path "env:$k" -Value $ExtraEnv[$k] }
 
-$args = @('--java-home', $JdkHome, '--Xmx', $MaxHeap, '--stack-dump-on-timeout', '0')
+$args = @('--java-home', $JdkHome, '--Xmx', $MaxHeap, '--stack-dump-on-timeout', $StackDumpTimeoutSec)
 if ($NoJit) { $args += '--nojit' }
 if ($CratonArgs.Count -gt 0) { $args += $CratonArgs }
 $args += @('-Dfile.encoding=UTF-8', '-Djava.awt.headless=true', '-cp', $cp, 'SbRunnerMethod', $ClassName, $Method)

@@ -1333,31 +1333,20 @@ pub(crate) fn native_runtime_free_memory(
     Ok(Some(Value::Long(32 * 1024 * 1024))) // 32 MB estimate
 }
 
-/// `Runtime.version()` returns a real initialized `Runtime$Version`.
+/// `Runtime.version()` returns a lightweight real-layout `Runtime$Version`.
 ///
-/// The old lightweight object only satisfied native `feature()`/`build()` calls.
-/// Real bytecode such as `Runtime$Version.toString()` reads the private final
-/// `version` list, so construct via the JDK parser instead of returning raw
-/// zeroed fields.
+/// Calling the JDK parser here routes every first `Runtime.version()` through
+/// the regex engine.  That engine is prohibitively slow in interpreted real-
+/// JDK mode and blocks signed-jar opening before any loader work begins.
+/// The companion `feature()`/`build()` bridges provide the observable VM
+/// metadata; callers which require an explicitly parsed version still use the
+/// JDK `Runtime.Version.parse(String)` contract directly.
 pub(crate) fn native_runtime_version(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let version = ctx
-        .get_system_property("java.version")
-        .or_else(|| ctx.get_system_property("java.specification.version"))
-        .unwrap_or_else(|| "25".to_string());
-    let version_obj = ctx.create_string(version.trim());
-    let pin = ctx.pin_native_root(version_obj);
-    let arg = Value::Object(Some(ctx.read_native_pin(pin, version_obj)));
-    let result = ctx.invoke(
-        "java/lang/Runtime$Version",
-        "parse",
-        "(Ljava/lang/String;)Ljava/lang/Runtime$Version;",
-        &[arg],
-    );
-    ctx.unpin_native_roots(pin);
-    result
+    let version = alloc_concurrent_synthetic(ctx, "java/lang/Runtime$Version", 4);
+    Ok(Some(Value::Object(Some(version))))
 }
 
 /// `Runtime.Version.feature()` вЂ” major Java specification version (e.g. 25).
@@ -3717,10 +3706,13 @@ pub(crate) fn native_perf_high_res_frequency(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod t2_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn t2_thread_sleep_millis_nanos_zero_is_noop() {
@@ -3764,10 +3756,13 @@ mod t2_tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod t19_n2_thread_sleep0_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// 0ms must return essentially immediately (no actual sleep).
     #[test]
@@ -3893,10 +3888,13 @@ mod t19_n2_thread_sleep0_tests {
 
 #[cfg(test)]
 mod t14_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // -----------------------------------------------------------------------
     // T14.1 вЂ” initPhase1
@@ -3985,10 +3983,13 @@ mod t14_tests {
 
 #[cfg(test)]
 mod t15_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // -----------------------------------------------------------------------
     // T15.1.5 вЂ” Finalizer.register
@@ -4177,11 +4178,14 @@ mod t15_tests {
 // simulate both deny (pre-arm an Err) and allow (default).
 #[cfg(test)]
 mod checkexec_security_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::security_manager::set_security_manager_for_test;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::error::{MethodCallFailed, RuntimeError, VmError};
 
     /// Helper: assert the failure is a SecurityException (regardless of

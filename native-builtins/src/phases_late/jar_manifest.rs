@@ -66,6 +66,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // A JarEntry is a ZipEntry, so use the single materializer for
+            // both APIs. This keeps central-directory comments and the
+            // real-JDK field layout identical for getEntry/getJarEntry.
+            let resolved = p59_jar_lookup_versioned_entry(ctx, this, &path, &entry_name)?;
+            if !matches!(resolved, Some(Value::Object(None))) {
+                return Ok(resolved);
+            }
             // Cached parse (O(1) per call; avoids re-parsing the central
             // directory on every lookup — see `jar_contents_cached`).
             if let Some(contents) = jar_contents_cached(&path) {
@@ -120,9 +127,39 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Object(None))),
             };
             let entry_name = match args.get(1) {
-                Some(Value::Object(Some(e))) => match ctx.get_field(*e, 0) {
+                Some(Value::Object(Some(e)))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(*e)).as_deref()
+                        == Some(
+                            "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry",
+                        ) =>
+                {
+                    let content_entry = match ctx.get_field_by_name(*e, "contentEntry") {
+                        Value::Object(Some(content_entry)) => content_entry,
+                        _ => return Ok(Some(Value::Object(None))),
+                    };
+                    match ctx.invoke_virtual(
+                        content_entry,
+                        "getName",
+                        "()Ljava/lang/String;",
+                        &[],
+                    )? {
+                        Some(Value::Object(Some(name))) => {
+                            ctx.read_string(name).unwrap_or_default()
+                        }
+                        _ => return Ok(Some(Value::Object(None))),
+                    }
+                }
+                Some(Value::Object(Some(e))) => match ctx.get_field_by_name(*e, "name") {
+                    // A Spring Boot NestedJarEntry keeps the physical entry
+                    // name in ZipEntry.name while overriding getName() with
+                    // the logical multi-release name. The backing JAR must
+                    // be read by that physical name. Compact native entries
+                    // have no named layout, so retain the slot-0 fallback.
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => return Ok(Some(Value::Object(None))),
+                    _ => match ctx.get_field(*e, 0) {
+                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                        _ => return Ok(Some(Value::Object(None))),
+                    },
                 },
                 _ => return Ok(Some(Value::Object(None))),
             };
@@ -143,9 +180,11 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
             let bais = ctx.read_native_pin(bais_pin, bais);
             ctx.unpin_native_roots(bais_pin);
-            for (i, &b) in bytes.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-            }
+            // Keep archive traversal linear in the archive bytes.  In
+            // particular, the signed-JAR parity test drains every bcprov
+            // entry; per-element NativeContext calls turn that into millions
+            // of VM crossings before ByteArrayInputStream can be returned.
+            ctx.write_byte_array_from(arr, 0, bytes.as_slice());
             ctx.set_field(bais, 0, Value::Object(Some(arr)));
             ctx.set_field(bais, 1, Value::Int(0));
             ctx.set_field(bais, 2, Value::Int(0));
@@ -163,6 +202,20 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             // JarUrl.create) see a populated synthetic JarEntry instead of
             // null.
             let this = obj_arg(args, 0)?;
+            // Virtual dispatch reaches this inherited JarFile bridge before
+            // NestedJarFile's bytecode override. Delegate from the bridge
+            // itself so the concrete receiver keeps its multi-release
+            // `NestedJarEntry` representation.
+            if ctx.class_name_of_id(ctx.class_id_of_object(this)).as_deref()
+                == Some("org/springframework/boot/loader/jar/NestedJarFile")
+            {
+                return ctx.invoke(
+                    "org/springframework/boot/loader/jar/NestedJarFile",
+                    "getNestedJarEntry",
+                    "(Ljava/lang/String;)Lorg/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry;",
+                    args,
+                );
+            }
             let entry_name = if let Some(Value::Object(Some(s))) = args.get(1) {
                 ctx.read_string(*s).unwrap_or_default()
             } else {
@@ -172,7 +225,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
-            Ok(Some(p59_jar_lookup_entry(ctx, &path, &entry_name)))
+            p59_jar_lookup_versioned_entry(ctx, this, &path, &entry_name)
         },
     );
     r.register(jf, "close", "()V", |ctx, args| {
@@ -186,6 +239,249 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     r.register(jf, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
+    });
+    // `register_p59_jar` runs after native-io's JarFile bridge and therefore
+    // owns construction. Keep the inherited ZipFile accessors in this same
+    // path: native-io's `size`/`getComment` use its side-table handle, while
+    // p59 construction stores the backing path directly on the object.
+    r.register(jf, "size", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let size = jar_contents_cached(&path)
+            .map(|contents| contents.order.len().min(i32::MAX as usize) as i32)
+            .unwrap_or(0);
+        Ok(Some(Value::Int(size)))
+    });
+    r.register(jf, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let comment = std::fs::File::open(path)
+            .ok()
+            .and_then(|file| zip::ZipArchive::new(file).ok())
+            .and_then(|archive| {
+                (!archive.comment().is_empty())
+                    .then(|| String::from_utf8_lossy(archive.comment()).into_owned())
+            });
+        Ok(Some(match comment {
+            Some(comment) => Value::Object(Some(ctx.create_string(&comment))),
+            None => Value::Object(None),
+        }))
+    });
+    // `ManifestInfo.isMultiRelease()` uses Attributes.containsKey(Name).
+    // Attributes' map is initialized by the existing side-table-aware native;
+    // calling the real bytecode here can instead observe an incomplete JDK
+    // HashMap layout and falsely report that `Multi-Release` is absent.
+    r.register(
+        "java/util/jar/Attributes",
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let map = match ctx.get_field(this, 0) {
+                Value::Object(Some(map)) => map,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            cratonvm_native_collections::native_map_contains_key_pub(
+                ctx,
+                &[Value::Object(Some(map)), key],
+            )
+        },
+    );
+    // Spring Boot's NestedJarEntry lazily copies optional central-directory
+    // comments into its ZipEntry superclass. JDK 25's bytecode dereferences a
+    // null comment during CEN validation in our compact/native setup; the JVM
+    // contract permits a null comment, so store it directly in the real layout.
+    r.register(
+        "java/util/zip/ZipEntry",
+        "setComment",
+        "(Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let comment = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "comment", comment);
+            if ctx.object_num_fields(this) <= 5 {
+                ctx.set_field(this, 4, comment);
+            }
+            Ok(None)
+        },
+    );
+    // Spring Boot's NestedJarFile asks its package-private ManifestInfo
+    // whether the nested archive is multi-release before resolving versioned
+    // entries. The manifest value bridge is reliable, whereas the real JDK
+    // Attributes.containsKey path can observe an incompatible map layout in
+    // this VM. Preserve the class's exact contract by querying the canonical
+    // `Multi-Release` value directly and accepting only `true` (case-free).
+    r.register(
+        "org/springframework/boot/loader/jar/ManifestInfo",
+        "isMultiRelease",
+        "()Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let manifest = match ctx.get_field(this, 0) {
+                Value::Object(Some(manifest)) => manifest,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let attributes = match ctx.invoke(
+                "java/util/jar/Manifest",
+                "getMainAttributes",
+                "()Ljava/util/jar/Attributes;",
+                &[Value::Object(Some(manifest))],
+            )? {
+                Some(Value::Object(Some(attributes))) => attributes,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let key = ctx.create_string("Multi-Release");
+            let value = ctx.invoke(
+                "java/util/jar/Attributes",
+                "getValue",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[Value::Object(Some(attributes)), Value::Object(Some(key))],
+            )?;
+            let is_multi_release = matches!(
+                value,
+                Some(Value::Object(Some(value)))
+                    if ctx.read_string(value).is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            );
+            Ok(Some(Value::Int(i32::from(is_multi_release))))
+        },
+    );
+    // The generic JarFile bridge owns the inherited public `getJarEntry`
+    // slot, but NestedJarFile has richer multi-release entry semantics. Route
+    // that one public dispatch to its private implementation rather than
+    // materializing a generic JarEntry: NestedJarEntry retains a logical name
+    // while its ZipEntry superclass stores the physical versioned name.
+    r.register(
+        "org/springframework/boot/loader/jar/NestedJarFile",
+        "getJarEntry",
+        "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
+        |ctx, args| {
+            ctx.invoke(
+                "org/springframework/boot/loader/jar/NestedJarFile",
+                "getNestedJarEntry",
+                "(Ljava/lang/String;)Lorg/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry;",
+                args,
+            )
+        },
+    );
+    r.register(
+        "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry",
+        "getRealName",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let content_entry = match ctx.get_field_by_name(this, "contentEntry") {
+                Value::Object(Some(content_entry)) => content_entry,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            ctx.invoke_virtual(content_entry, "getName", "()Ljava/lang/String;", &[])
+        },
+    );
+    // Trigger Spring's verifier so malformed nested archives retain its
+    // specified IllegalStateException, then expose the compact JarFile view
+    // (which deliberately has no JarVerifier state) on a successful check.
+    let nested_entry = "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry";
+    r.register(
+        nested_entry,
+        "getCertificates",
+        "()[Ljava/security/cert/Certificate;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let _ = ctx.invoke_virtual_bytecode_only(
+                this,
+                "getCertificates",
+                "()[Ljava/security/cert/Certificate;",
+                &[],
+            )?;
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    r.register(
+        nested_entry,
+        "getCodeSigners",
+        "()[Ljava/security/CodeSigner;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let _ = ctx.invoke_virtual_bytecode_only(
+                this,
+                "getCodeSigners",
+                "()[Ljava/security/CodeSigner;",
+                &[],
+            )?;
+            Ok(Some(Value::Object(None)))
+        },
+    );
+    // UrlJarFile overrides getEntry solely to attach its URL-aware manifest
+    // wrapper. Its `super.getEntry` must still use Craton's compact JarFile
+    // state rather than real ZipFile bytecode (which expects `res.zsrc`).
+    r.register(
+        "org/springframework/boot/loader/net/protocol/jar/UrlJarFile",
+        "getEntry",
+        "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let entry = ctx.invoke(
+                "java/util/jar/JarFile",
+                "getEntry",
+                "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;",
+                args,
+            )?;
+            let manifest = match ctx.get_field_by_name(this, "manifest") {
+                Value::Object(Some(manifest)) => manifest,
+                _ => return Ok(entry),
+            };
+            let entry = entry.unwrap_or(Value::Object(None));
+            ctx.invoke(
+                "org/springframework/boot/loader/net/protocol/jar/UrlJarEntry",
+                "of",
+                "(Ljava/util/zip/ZipEntry;Lorg/springframework/boot/loader/net/protocol/jar/UrlJarManifest;)Lorg/springframework/boot/loader/net/protocol/jar/UrlJarEntry;",
+                &[entry, Value::Object(Some(manifest))],
+            )
+        },
+    );
+    // ZipContent's signature-file detector only needs to recognize three
+    // fixed ASCII suffixes.  Its Java `<clinit>` builds that tiny table via a
+    // Stream.map(...).toList() pipeline; on the real JDK path that first
+    // stream initialization can spend minutes in charset/version-regex setup
+    // before a signed JAR is even opened.  Keep the detector's observable
+    // contract, but make the immutable table implicit and allocation-free.
+    let signature_files = "org/springframework/boot/loader/zip/ZipContent$SignatureFiles";
+    r.register(signature_files, "<clinit>", "()V", |_ctx, _args| Ok(None));
+    r.register(signature_files, "bufferEndsWithSignatureSuffix", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let buffer = match ctx.get_field_by_name(this, "buffer") {
+            Value::Object(Some(buffer)) => buffer,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let array = match ctx.invoke_virtual(buffer, "array", "()[B", &[])? {
+            Some(Value::Object(Some(array))) => array,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let len = ctx.array_length(array);
+        for suffix in [b".DSA".as_slice(), b".RSA".as_slice(), b".EC".as_slice()] {
+            if len < suffix.len() {
+                continue;
+            }
+            let start = len - suffix.len();
+            if suffix.iter().enumerate().all(|(index, byte)| {
+                matches!(ctx.get_array_element(array, start + index), Value::Int(value) if value as u8 == *byte)
+            }) {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+        Ok(Some(Value::Int(0)))
+    });
+    // Native-backed JarFiles do not initialize the real JDK's multi-release
+    // verifier state (`res`/`jv`). They expose physical central-directory
+    // entries, so the compact bridge deliberately has no version remapping.
+    r.register(jf, "isMultiRelease", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
     });
     // JarFile.stream() — Spring Boot 3 fat-jar launcher
     // (org.springframework.boot.loader.launch.JarFileArchive.getClassPathUrls)
@@ -212,9 +508,8 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     );
 
     // JarEntry extends ZipEntry. Two layouts coexist:
-    //   * the 4-field SYNTHETIC stub (name=0, size=1, compressedSize=2,
-    //     method=3) produced by `alloc_concurrent_synthetic(... "JarEntry", 4)`
-    //     on the synthetic JarFile path, and
+    //   * the 5-field SYNTHETIC stub (name=0, size=1, compressedSize=2,
+    //     method=3, comment=4) produced by the native JarFile path, and
     //   * the REAL-JDK layout (14 inherited ZipEntry fields + 3 JarEntry
     //     fields) produced by `new JarEntry(...)` running real bytecode.
     // These natives shadow the real JarEntry methods, so they MUST handle both
@@ -228,7 +523,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // real layout by field count and use the by-name accessors there.
     let je = "java/util/jar/JarEntry";
     fn je_is_real_layout(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
-        ctx.object_num_fields(this) > 4
+        ctx.object_num_fields(this) > 5
     }
     r.register(je, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -282,8 +577,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
     });
-    r.register(je, "getComment", "()Ljava/lang/String;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(je, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if je_is_real_layout(ctx, this) {
+            Ok(Some(ctx.get_field_by_name(this, "comment")))
+        } else {
+            Ok(Some(ctx.get_field(this, 4)))
+        }
     });
     r.register(je, "getSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -458,6 +758,68 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         "getClassPathUrls",
         "(Ljava/util/function/Predicate;Ljava/util/function/Predicate;)Ljava/util/Set;",
         p59_spring_boot_exploded_archive_get_class_path_urls,
+    );
+    // `Archive.create(File)` chooses the archive implementation from
+    // `File.isDirectory()`.  The real-JDK file bytecode can lose that fact for
+    // a code-source directory under CratonVM, which made exploded launcher
+    // tests run the JarFileArchive path against `build/classes/java/main`.
+    // Preserve the defining filesystem kind here, and retain the real
+    // JarFileArchive constructor for ordinary files.
+    r.register(
+        "org/springframework/boot/loader/launch/Archive",
+        "create",
+        "(Ljava/io/File;)Lorg/springframework/boot/loader/launch/Archive;",
+        |ctx, args| {
+            let file = obj_arg(args, 0)?;
+            let path = file_read_path(ctx, file);
+            if std::path::Path::new(&path).is_dir() {
+                let archive = alloc_concurrent_synthetic(
+                    ctx,
+                    "org/springframework/boot/loader/launch/ExplodedArchive",
+                    3,
+                );
+                ctx.set_field(archive, 0, Value::Object(Some(file)));
+                let root_uri_path = ctx.create_string(&path.replace('\\', "/"));
+                ctx.set_field(archive, 1, Value::Object(Some(root_uri_path)));
+                return Ok(Some(Value::Object(Some(archive))));
+            }
+            ctx.new_object_initialized(
+                "org/springframework/boot/loader/launch/JarFileArchive",
+                "(Ljava/io/File;)V",
+                &[Value::Object(Some(file))],
+            )
+        },
+    );
+    r.register(
+        "org/springframework/boot/loader/launch/Archive",
+        "create",
+        "(Ljava/lang/Class;)Lorg/springframework/boot/loader/launch/Archive;",
+        |ctx, _args| {
+            // ExecutableArchiveLauncher invokes this with Launcher.class. The
+            // classpath source is authoritative even when ProtectionDomain /
+            // Path.of URI conversion loses the directory kind.
+            let path = ctx
+                .find_class_source_path("org/springframework/boot/loader/launch/Launcher")
+                .unwrap_or_default();
+            let file = file_alloc(ctx, &path);
+            if std::path::Path::new(&path).is_dir() {
+                let archive = alloc_concurrent_synthetic(
+                    ctx,
+                    "org/springframework/boot/loader/launch/ExplodedArchive",
+                    3,
+                );
+                ctx.set_field(archive, 0, Value::Object(Some(file)));
+                let root_uri_path = ctx.create_string(&path.replace('\\', "/"));
+                ctx.set_field(archive, 1, Value::Object(Some(root_uri_path)));
+                Ok(Some(Value::Object(Some(archive))))
+            } else {
+                ctx.new_object_initialized(
+                    "org/springframework/boot/loader/launch/JarFileArchive",
+                    "(Ljava/io/File;)V",
+                    &[Value::Object(Some(file))],
+                )
+            }
+        },
     );
 
     // Spring Boot 3.2+ repackaged launcher: `ExecutableArchiveLauncher` overrides
@@ -723,19 +1085,6 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    // Spring Boot 3.2+/4's launcher must resolve through its recorded URLs,
-    // not the process-global `ensure_class_initialized` shortcut used by the
-    // legacy SB2 bridge above. Reuse the real-mode base delegation, including
-    // its post-parent URLClassLoader local lookup.
-    let luc3 = "org/springframework/boot/loader/launch/LaunchedClassLoader";
-    for descriptor in [
-        "(Ljava/lang/String;)Ljava/lang/Class;",
-        "(Ljava/lang/String;Z)Ljava/lang/Class;",
-    ] {
-        r.register(luc3, "loadClass", descriptor, |ctx, args| {
-            crate::classloader_real::cl_real_load_class_base_from_args(ctx, args)
-        });
-    }
     // ---------------------------------------------------------------------------
     // S111r21 — Spring's ClassUtils.forName(String, ClassLoader) native override.
     //
@@ -1128,6 +1477,7 @@ pub(crate) struct JarEntryRec {
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
+    pub(crate) comment: Option<String>,
     pub(crate) times: JarEntryTimes,
 }
 
@@ -1357,6 +1707,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         #[allow(deprecated)]
         let method = entry.compression().to_u16() as i32;
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+        let comment = (!entry.comment().is_empty()).then(|| entry.comment().to_owned());
         let mut times = p59_zip_entry_times(&entry);
         p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
         order.push(name.clone());
@@ -1367,6 +1718,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 csize,
                 method,
                 crc,
+                comment,
                 times,
             },
         );
@@ -1395,6 +1747,12 @@ pub(crate) fn jar_entry_bytes_cached(
     use std::sync::{Arc, Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>> =
         OnceLock::new();
+    // Keep the parsed central directory alive across distinct entries. The
+    // signed-JAR parity test drains every entry, so reopening ZipArchive per
+    // cache miss makes archive traversal quadratic in the entry count.
+    static ARCHIVES: OnceLock<
+        Mutex<std::collections::HashMap<String, Arc<Mutex<zip::ZipArchive<std::fs::File>>>>>,
+    > = OnceLock::new();
     if path.is_empty() || entry_name.is_empty() {
         return None;
     }
@@ -1405,12 +1763,34 @@ pub(crate) fn jar_entry_bytes_cached(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let key = format!("{path}\u{0}{mtime}\u{0}{entry_name}");
+    let archive_key = format!("{path}\u{0}{mtime}");
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(b) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Some(b.clone());
     }
-    let file = std::fs::File::open(path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let archives = ARCHIVES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    // Take the cache hit under a short, explicit guard scope. An `if let`
+    // condition keeps its temporary alive across the whole expression; on a
+    // miss the old form then attempted to lock this same non-reentrant mutex
+    // again in `else`, deadlocking the very first JarFile manifest read.
+    let cached_archive = {
+        let archives = archives.lock().unwrap_or_else(|e| e.into_inner());
+        archives.get(&archive_key).cloned()
+    };
+    let archive = if let Some(archive) = cached_archive {
+        archive.clone()
+    } else {
+        // Construct outside the registry lock: central-directory parsing can
+        // be costly and a concurrent first reader can safely race.
+        let file = std::fs::File::open(path).ok()?;
+        let opened = Arc::new(Mutex::new(zip::ZipArchive::new(file).ok()?));
+        let mut archives = archives.lock().unwrap_or_else(|e| e.into_inner());
+        archives
+            .entry(archive_key)
+            .or_insert_with(|| opened.clone())
+            .clone()
+    };
+    let mut archive = archive.lock().unwrap_or_else(|e| e.into_inner());
     let mut entry = archive.by_name(entry_name).ok()?;
     let mut buf = Vec::with_capacity(entry.size() as usize);
     entry.read_to_end(&mut buf).ok()?;
@@ -1447,17 +1827,31 @@ pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -
             Some(r) => r,
             None => continue,
         };
-        let (size, csize, method, crc, times) =
-            (rec.size, rec.csize, rec.method, rec.crc, rec.times);
-        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+        let (size, csize, method, crc, comment, times) = (
+            rec.size,
+            rec.csize,
+            rec.method,
+            rec.crc,
+            rec.comment.clone(),
+            rec.times,
+        );
+        let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
         let je_pin = ctx.pin_native_root(je);
+        let comment_s = comment.map(|comment| ctx.create_string(&comment));
+        let comment_pin = comment_s.map(|comment| ctx.pin_native_root(comment));
         let name_s = ctx.create_string(name);
         let je = ctx.read_native_pin(je_pin, je);
+        let comment_s = comment_s.zip(comment_pin).map(|(comment, pin)| {
+            let comment = ctx.read_native_pin(pin, comment);
+            ctx.unpin_native_roots(pin);
+            comment
+        });
         pins.push(je_pin);
         ctx.set_field(je, 0, Value::Object(Some(name_s)));
         ctx.set_field(je, 1, Value::Long(size));
         ctx.set_field(je, 2, Value::Long(csize));
         ctx.set_field(je, 3, Value::Int(method));
+        ctx.set_field(je, 4, Value::Object(comment_s));
         // Real-JDK mode: `ZipEntry.getSize()/getMethod()/getCompressedSize()/getCrc()`
         // read the REAL fields by their actual offset, not the synthetic slots
         // above (real order: name,xdostime,crc,size,csize,method,…). Tomcat's
@@ -1470,6 +1864,7 @@ pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -
         ctx.set_field_by_name(je, "csize", Value::Long(csize));
         ctx.set_field_by_name(je, "method", Value::Int(method));
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
+        ctx.set_field_by_name(je, "comment", Value::Object(comment_s));
         p59_set_jar_entry_times(ctx, je, times);
         out.push(Value::Object(Some(je)));
     }
@@ -1480,6 +1875,107 @@ pub(crate) fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -
         }
     }
     out
+}
+
+/// Resolve a JarFile lookup using the same multi-release entry selection as the
+/// JDK. A selected versioned entry needs a `JarFileEntry`: its inherited
+/// ZipEntry name stays physical while its `basename` is the caller's logical
+/// name, which is precisely the `getRealName`/`getName` split that callers use.
+fn p59_jar_lookup_versioned_entry(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path: &str,
+    entry_name: &str,
+) -> MethodCallResult {
+    let runtime_feature = match ctx.invoke(
+        "java/lang/Runtime",
+        "version",
+        "()Ljava/lang/Runtime$Version;",
+        &[],
+    )? {
+        Some(Value::Object(Some(version))) => {
+            match ctx.invoke_virtual(version, "feature", "()I", &[])? {
+                Some(Value::Int(feature)) => feature.max(8),
+                _ => 8,
+            }
+        }
+        _ => 8,
+    };
+    let physical_name = if !entry_name.starts_with("META-INF/")
+        && runtime_feature > 8
+        && p59_jar_is_multi_release(path)
+    {
+        jar_contents_cached(path).and_then(|contents| {
+            (9..=runtime_feature).rev().find_map(|version| {
+                let candidate = format!("META-INF/versions/{version}/{entry_name}");
+                contents
+                    .by_name
+                    .contains_key(&candidate)
+                    .then_some(candidate)
+            })
+        })
+    } else {
+        None
+    };
+    let physical_name = physical_name.as_deref().unwrap_or(entry_name);
+    let entry = p59_jar_lookup_entry(ctx, path, physical_name);
+    let Value::Object(Some(physical_entry)) = entry else {
+        return Ok(Some(entry));
+    };
+    if physical_name == entry_name {
+        return Ok(Some(Value::Object(Some(physical_entry))));
+    }
+
+    // Every allocation/re-entrant Java constructor below may move young
+    // objects. Pin and reread all three references before constructing the
+    // package-private JarFileEntry wrapper.
+    let this_pin = ctx.pin_native_root(this);
+    let entry_pin = ctx.pin_native_root(physical_entry);
+    let logical_name = ctx.create_string(entry_name);
+    let logical_pin = ctx.pin_native_root(logical_name);
+    let this = ctx.read_native_pin(this_pin, this);
+    let physical_entry = ctx.read_native_pin(entry_pin, physical_entry);
+    let logical_name = ctx.read_native_pin(logical_pin, logical_name);
+    let wrapped = ctx.new_object_initialized(
+        "java/util/jar/JarFile$JarFileEntry",
+        "(Ljava/util/jar/JarFile;Ljava/lang/String;Ljava/util/zip/ZipEntry;)V",
+        &[
+            Value::Object(Some(this)),
+            Value::Object(Some(logical_name)),
+            Value::Object(Some(physical_entry)),
+        ],
+    );
+    ctx.unpin_native_roots(logical_pin);
+    ctx.unpin_native_roots(entry_pin);
+    ctx.unpin_native_roots(this_pin);
+    match wrapped? {
+        Some(Value::Object(Some(wrapped))) => Ok(Some(Value::Object(Some(wrapped)))),
+        _ => Ok(Some(Value::Object(Some(physical_entry)))),
+    }
+}
+
+fn p59_jar_is_multi_release(path: &str) -> bool {
+    let Some(bytes) = jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF") else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(bytes.as_slice());
+    let mut line = String::new();
+    let mut matches_attribute = false;
+    for raw_line in text.lines() {
+        if raw_line.starts_with(' ') {
+            line.push_str(raw_line.trim_start());
+            continue;
+        }
+        if matches_attribute && line.trim().eq_ignore_ascii_case("Multi-Release: true") {
+            return true;
+        }
+        line.clear();
+        line.push_str(raw_line.trim_end_matches('\r'));
+        matches_attribute = line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("Multi-Release"));
+    }
+    matches_attribute && line.trim().eq_ignore_ascii_case("Multi-Release: true")
 }
 
 /// Look up a single entry by name in the JAR at `path`, returning a synthetic
@@ -1497,28 +1993,37 @@ pub(crate) fn p59_jar_lookup_entry(
         Some(c) => c,
         None => return Value::Object(None),
     };
-    let (name, size, csize, method, crc, times) = match contents.by_name.get(entry_name) {
+    let (name, size, csize, method, crc, comment, times) = match contents.by_name.get(entry_name) {
         Some(rec) => (
             entry_name.to_string(),
             rec.size,
             rec.csize,
             rec.method,
             rec.crc,
+            rec.comment.clone(),
             rec.times,
         ),
         None => return Value::Object(None),
     };
-    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 5);
     // Pin across the create_string below — a moving young GC there would
     // relocate the fresh entry (native stale-local family).
     let je_pin = ctx.pin_native_root(je);
+    let comment_s = comment.map(|comment| ctx.create_string(&comment));
+    let comment_pin = comment_s.map(|comment| ctx.pin_native_root(comment));
     let name_s = ctx.create_string(&name);
     let je = ctx.read_native_pin(je_pin, je);
+    let comment_s = comment_s.zip(comment_pin).map(|(comment, pin)| {
+        let comment = ctx.read_native_pin(pin, comment);
+        ctx.unpin_native_roots(pin);
+        comment
+    });
     ctx.unpin_native_roots(je_pin);
     ctx.set_field(je, 0, Value::Object(Some(name_s)));
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
     ctx.set_field(je, 3, Value::Int(method));
+    ctx.set_field(je, 4, Value::Object(comment_s));
     // Real-JDK mode: `ZipEntry.getSize()/getMethod()/getCompressedSize()/getCrc()`
     // run real bytecode reading the REAL fields by their actual offset, not the
     // synthetic slots above. Quarkus' RunnerClassLoader sizes its class-byte read
@@ -1529,6 +2034,7 @@ pub(crate) fn p59_jar_lookup_entry(
     ctx.set_field_by_name(je, "csize", Value::Long(csize));
     ctx.set_field_by_name(je, "method", Value::Int(method));
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
+    ctx.set_field_by_name(je, "comment", Value::Object(comment_s));
     p59_set_jar_entry_times(ctx, je, times);
     Value::Object(Some(je))
 }
@@ -1636,6 +2142,7 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
         );
     }
 
+    let this_pin = ctx.pin_native_root(this);
     let include_filter_pin = ctx.pin_native_root(include_filter);
     let mut urls: Vec<(ObjectRef, usize)> = Vec::new();
     let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
@@ -1667,24 +2174,32 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
             Some(Value::Int(value)) if value != 0
         );
         if include {
-            let jar_entry = ctx.read_native_pin(jar_entry_pin, jar_entry);
-            let name = match ctx.get_field_by_name(jar_entry, "name") {
-                Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
-                _ => String::new(),
-            };
-            if !name.is_empty() {
-                // The Spring Boot nested protocol represents a directory
-                // class root (for example `BOOT-INF/classes/`) differently
-                // from a nested archive. The local class resolver understands
-                // the former `jar:nested:` form; preserve the ordinary
-                // `jar:file:` spelling for nested JAR/ZIP entries.
-                let url_text = if name.ends_with('/') {
-                    format!("jar:nested:/{jar_uri_path}/!{name}!/")
-                } else {
-                    format!("jar:file:/{jar_uri_path}!/{name}!/")
-                };
-                let url = p59_alloc_url(ctx, &url_text);
+            let this = ctx.read_native_pin(this_pin, this);
+            let archive_entry = ctx.read_native_pin(archive_entry_pin, archive_entry);
+            let nested_url = ctx.invoke_special_bytecode_only(
+                "org/springframework/boot/loader/launch/JarFileArchive",
+                "getNestedJarUrl",
+                "(Lorg/springframework/boot/loader/launch/JarFileArchive$JarArchiveEntry;)Ljava/net/URL;",
+                &[Value::Object(Some(this)), Value::Object(Some(archive_entry))],
+            )?;
+            if let Some(Value::Object(Some(url))) = nested_url {
                 urls.push((url, ctx.pin_native_root(url)));
+            } else {
+                let jar_entry = ctx.read_native_pin(jar_entry_pin, jar_entry);
+                let name = match ctx.get_field_by_name(jar_entry, "name") {
+                    Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if !name.is_empty() {
+                    // The Spring Boot nested protocol represents a directory
+                    // class root (for example `BOOT-INF/classes/`) differently
+                    // from a nested archive. The local class resolver understands
+                    // the former `jar:nested:` form; preserve the ordinary
+                    // `jar:file:` spelling for nested JAR/ZIP entries.
+                    let url_text = format!("jar:nested:/{jar_uri_path}/!{name}!/");
+                    let url = p59_alloc_url(ctx, &url_text);
+                    urls.push((url, ctx.pin_native_root(url)));
+                }
             }
         }
         ctx.unpin_native_roots(archive_entry_pin);
@@ -1725,6 +2240,7 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
         ctx.unpin_native_roots(pin);
     }
     ctx.unpin_native_roots(include_filter_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -1902,30 +2418,52 @@ pub(crate) fn sb3_executable_archive_launcher_create_class_loader_collection(
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let cid = ctx.class_id_of_object(this);
-    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
-    let jar_path = ctx.find_class_source_path(&cn).unwrap_or_default();
-    if crate::nbflags().dbg_sbload {
-        eprintln!(
-            "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} jar_path={:?}",
-            cn, jar_path
-        );
-    }
+    let urls = obj_arg(args, 1)?;
+    let object_array = match ctx.invoke_virtual(urls, "toArray", "()[Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(arr))) => arr,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     // Pin across the URL scan / array alloc below — a moving young GC there
     // would relocate `this` and the collected URLs (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
-    let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
-    let pins = pin_object_values(ctx, &url_values);
+    let object_array_pin = ctx.pin_native_root(object_array);
+    let len = ctx.array_length(object_array);
+    let indexed_array = match ctx.get_field_by_name(this, "classPathIndex") {
+        Value::Object(Some(index)) => {
+            match ctx.invoke_virtual(index, "getUrls", "()Ljava/util/List;", &[])? {
+                Some(Value::Object(Some(list))) => {
+                    match ctx.invoke_virtual(list, "toArray", "()[Ljava/lang/Object;", &[])? {
+                        Some(Value::Object(Some(arr))) => Some(arr),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let indexed_array_pin = indexed_array.map(|arr| ctx.pin_native_root(arr));
+    let indexed_len = indexed_array.map(|arr| ctx.array_length(arr)).unwrap_or(0);
     let url_arr = ctx.new_array(
         cratonvm_types::ArrayElementType::Reference,
-        url_values.len(),
+        len + indexed_len,
     );
-    for (i, (v, p)) in url_values.iter().zip(&pins).enumerate() {
-        let v = read_pinned_object_value(ctx, *p, *v);
+    for i in 0..len {
+        let object_array = ctx.read_native_pin(object_array_pin, object_array);
+        let v = ctx.get_array_element(object_array, i);
         ctx.set_array_element(url_arr, i, v);
+    }
+    if let (Some(indexed_array), Some(indexed_array_pin)) = (indexed_array, indexed_array_pin) {
+        for i in 0..indexed_len {
+            let indexed_array = ctx.read_native_pin(indexed_array_pin, indexed_array);
+            let v = ctx.get_array_element(indexed_array, i);
+            ctx.set_array_element(url_arr, len + i, v);
+        }
+        ctx.unpin_native_roots(indexed_array_pin);
     }
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(object_array_pin);
     ctx.invoke_special(
         "org/springframework/boot/loader/launch/Launcher",
         "createClassLoader",
@@ -2302,8 +2840,10 @@ pub(crate) fn p59_jar_file_init(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = ctx.read_native_pin(this_pin, this);
     ctx.set_field(this, 0, slot0_val);
     ctx.set_field_by_name(this, "name", slot0_val);
-    // Try to read the real MANIFEST.MF
-    let manifest = p98_read_jar_manifest(ctx, &path);
+    // Keep signed entry sections lazy. Constructing a JarFile only needs main
+    // attributes; expanding thousands of signer entries here makes ordinary
+    // construction pathological in the interpreter.
+    let manifest = p98_read_jar_manifest_main(ctx, &path);
     let manifest_pin = match manifest {
         Value::Object(Some(m)) => Some((ctx.pin_native_root(m), m)),
         _ => None,
@@ -2362,7 +2902,8 @@ pub(crate) fn p59_jar_file_init_file(
     // Pin across the manifest parse below — a moving young GC there would
     // relocate `this` (native stale-local family).
     let this_pin = ctx.pin_native_root(this);
-    let manifest = p98_read_jar_manifest(ctx, &path);
+    // Keep signed entry sections lazy, as in the String constructor above.
+    let manifest = p98_read_jar_manifest_main(ctx, &path);
     let manifest_pin = match manifest {
         Value::Object(Some(m)) => Some((ctx.pin_native_root(m), m)),
         _ => None,
@@ -2432,6 +2973,21 @@ pub(crate) fn p59_jar_file_manifest(
 /// `jar_entry_bytes_cached` the `getInputStream` native uses so only the
 /// FIRST touch of a given (path, mtime) pays for the archive open.
 pub(crate) fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
+    p98_read_jar_manifest_impl(ctx, path, true)
+}
+
+/// Constructor variant of [`p98_read_jar_manifest`]. The main attributes are
+/// sufficient during JarFile construction; signed entry sections are expanded
+/// only when a caller asks for the full manifest.
+pub(crate) fn p98_read_jar_manifest_main(ctx: &mut dyn NativeContext, path: &str) -> Value {
+    p98_read_jar_manifest_impl(ctx, path, false)
+}
+
+fn p98_read_jar_manifest_impl(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+    include_entries: bool,
+) -> Value {
     if path.is_empty() {
         return Value::Object(None);
     }
@@ -2452,7 +3008,11 @@ pub(crate) fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> 
     // consistent with getValue/putValue/size/write (see
     // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
     // was wrong for the 1-field real layout and read back null/empty.
-    let parsed = match p59_parse_manifest_bytes(&manifest_bytes) {
+    let parsed = match if include_entries {
+        p59_parse_manifest_bytes(&manifest_bytes)
+    } else {
+        p59_parse_manifest_main_bytes(&manifest_bytes)
+    } {
         Ok(parsed) => parsed,
         Err(_) => return Value::Object(None),
     };
@@ -2490,34 +3050,36 @@ pub(crate) fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> 
             }
         },
     };
-    let entries_pin = ctx.pin_native_root(entries_map);
-    for (name, pairs) in &parsed.entries {
-        let entry_attrs = p59_manifest_new_attributes(ctx);
-        let entry_pin = ctx.pin_native_root(entry_attrs);
-        if p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs).is_err() {
-            ctx.unpin_native_roots(man_pin);
-            return Value::Object(None);
-        }
-        let name = ctx.create_string(name);
-        let name_pin = ctx.pin_native_root(name);
-        let entries_map = ctx.read_native_pin(entries_pin, entries_map);
-        let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
-        let name = ctx.read_native_pin(name_pin, name);
-        if ctx
-            .invoke(
-                "java/util/LinkedHashMap",
-                "put",
-                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-                &[
-                    Value::Object(Some(entries_map)),
-                    Value::Object(Some(name)),
-                    Value::Object(Some(entry_attrs)),
-                ],
-            )
-            .is_err()
-        {
-            ctx.unpin_native_roots(man_pin);
-            return Value::Object(None);
+    if include_entries {
+        let entries_pin = ctx.pin_native_root(entries_map);
+        for (name, pairs) in &parsed.entries {
+            let entry_attrs = p59_manifest_new_attributes(ctx);
+            let entry_pin = ctx.pin_native_root(entry_attrs);
+            if p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs).is_err() {
+                ctx.unpin_native_roots(man_pin);
+                return Value::Object(None);
+            }
+            let name = ctx.create_string(name);
+            let name_pin = ctx.pin_native_root(name);
+            let entries_map = ctx.read_native_pin(entries_pin, entries_map);
+            let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
+            let name = ctx.read_native_pin(name_pin, name);
+            if ctx
+                .invoke(
+                    "java/util/LinkedHashMap",
+                    "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[
+                        Value::Object(Some(entries_map)),
+                        Value::Object(Some(name)),
+                        Value::Object(Some(entry_attrs)),
+                    ],
+                )
+                .is_err()
+            {
+                ctx.unpin_native_roots(man_pin);
+                return Value::Object(None);
+            }
         }
     }
     let manifest = ctx.read_native_pin(man_pin, manifest);
@@ -2674,6 +3236,51 @@ pub(crate) fn p59_read_input_stream_fully(
     Ok(out)
 }
 
+/// Parse only a manifest's main section for JarFile construction.
+///
+/// The full parser is intentionally lazy: signed archives often carry a
+/// `Name:` section for every class, and a constructor only needs the main
+/// attributes (notably `Multi-Release`).
+fn p59_parse_manifest_main_bytes(data: &[u8]) -> Result<ParsedManifest, String> {
+    let text = String::from_utf8_lossy(data);
+    let mut logical: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        if raw.is_empty() {
+            break;
+        }
+        if let Some(continuation) = raw.strip_prefix(' ') {
+            let previous = logical
+                .last_mut()
+                .ok_or_else(|| "continuation line with no predecessor".to_string())?;
+            previous.push_str(continuation);
+        } else {
+            logical.push(raw.to_string());
+        }
+    }
+    let mut main = Vec::with_capacity(logical.len());
+    for line in logical {
+        let colon = line
+            .find(':')
+            .ok_or_else(|| format!("malformed manifest line: {line}"))?;
+        let key = line[..colon].trim().to_string();
+        if key.is_empty() {
+            return Err(format!("empty manifest key in line: {line}"));
+        }
+        let rest = &line[colon + 1..];
+        let value = rest
+            .strip_prefix(' ')
+            .unwrap_or(rest)
+            .trim_end()
+            .to_string();
+        main.push((key, value));
+    }
+    Ok(ParsedManifest {
+        main,
+        entries: Vec::new(),
+    })
+}
+
 /// Parse a MANIFEST.MF byte buffer into (main_attrs, Vec<(entry_name,
 /// entry_attrs)>). Handles CRLF/LF, continuation lines (leading space
 /// appends to previous value), blank-line section separators, trailing
@@ -2806,9 +3413,12 @@ pub(crate) struct ParsedManifest {
 
 #[cfg(test)]
 pub(crate) mod manifest_parser_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn parses_signed_jar_entry_sections_after_main_attributes() {
@@ -3061,10 +3671,13 @@ pub(crate) fn p59_attrs_populate_real(
 
 #[cfg(test)]
 pub(crate) mod t10_manifest_input_stream_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 
     /// Build a synthetic java/io/ByteArrayInputStream holding the given
@@ -3427,7 +4040,10 @@ pub(crate) mod t10_manifest_input_stream_tests {
 #[cfg(test)]
 pub(crate) mod zip_2x_api_tests {
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::{Cursor, Read, Write};
 
     /// Round-trip a two-entry ZIP through the 2.x writer + reader so a
@@ -3513,9 +4129,12 @@ pub(crate) mod zip_2x_api_tests {
 
 #[cfg(test)]
 pub(crate) mod bc_small_factors_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::{bc_has_any_small_factors, BC_SMALL_FACTOR_GROUPS};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn mag_le(mut v: u128) -> Vec<u32> {
         let mut w = Vec::new();

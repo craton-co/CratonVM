@@ -7888,9 +7888,12 @@ fn fjp_state_clear() {
 
 #[cfg(test)]
 mod fjp_gc_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn gc_hooks_scan_result_and_remap_key_and_result() {
@@ -18329,7 +18332,12 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         "(Z)V",
         native_noop_with_this,
     );
-    r.register(huc, "setUseCaches", "(Z)V", native_noop_with_this);
+    r.register(huc, "setUseCaches", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let use_caches = args.get(1).and_then(Value::as_int).unwrap_or(1);
+        ctx.set_field_by_name(this, "useCaches", Value::Int(use_caches));
+        Ok(None)
+    });
     r.register(
         huc,
         "setFixedLengthStreamingMode",
@@ -20307,10 +20315,13 @@ fn native_scanner_find_within_horizon_string_int(
 // ===========================================================================
 #[cfg(test)]
 mod t2_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

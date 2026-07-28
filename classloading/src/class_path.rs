@@ -1583,8 +1583,12 @@ impl ClassPath {
                 if path.exists() {
                     match read_archive_for_classpath(&path) {
                         Ok(data) => {
-                            if let Some(entry) =
-                                Self::build_nested_directory_from_jar(&path, data, &prefix)
+                            if let Some(entry) = Self::build_nested_jar_from_jar(
+                                &path,
+                                data.clone(),
+                                prefix.trim_end_matches('/'),
+                            )
+                            .or_else(|| Self::build_nested_directory_from_jar(&path, data, &prefix))
                             {
                                 entries.push(entry);
                             }
@@ -1795,8 +1799,12 @@ impl ClassPath {
                 if path.exists() {
                     match read_archive_for_classpath(&path) {
                         Ok(data) => {
-                            if let Some(entry) =
-                                Self::build_nested_directory_from_jar(&path, data, &prefix)
+                            if let Some(entry) = Self::build_nested_jar_from_jar(
+                                &path,
+                                data.clone(),
+                                prefix.trim_end_matches('/'),
+                            )
+                            .or_else(|| Self::build_nested_directory_from_jar(&path, data, &prefix))
                             {
                                 entries.push(entry);
                             }
@@ -2087,7 +2095,13 @@ impl ClassPath {
                 if pb.exists() {
                     match read_archive_for_classpath(&pb) {
                         Ok(data) => {
-                            match Self::build_nested_directory_from_jar(&pb, data, &prefix) {
+                            match Self::build_nested_jar_from_jar(
+                                &pb,
+                                data.clone(),
+                                prefix.trim_end_matches('/'),
+                            )
+                            .or_else(|| Self::build_nested_directory_from_jar(&pb, data, &prefix))
+                            {
                                 Some(entry) => {
                                     debug!(
                                         "Dynamic classpath: adding nested-dir {}!/{}",
@@ -2148,6 +2162,40 @@ impl ClassPath {
                 debug!("Dynamic classpath: skipping non-existent entry {expanded}");
             }
         }
+    }
+
+    /// Build a [`ClassPathEntry::NestedJar`] from an archive entry that is
+    /// itself a valid ZIP/JAR. This is the classpath form of Spring Boot's
+    /// `jar:nested:<outer>/!<inner.jar>!/` URL: the trailing marker denotes
+    /// the nested archive root, rather than a directory named `inner.jar`.
+    ///
+    /// Returning `None` for a non-archive entry lets the caller fall back to
+    /// the ordinary nested-directory treatment for `<outer>!/<prefix>/`.
+    fn build_nested_jar_from_jar(
+        path: &Path,
+        data: ArchiveBacking,
+        nested_path: &str,
+    ) -> Option<ClassPathEntry> {
+        if nested_path.is_empty() || !is_safe_entry_name(nested_path) {
+            return None;
+        }
+        let backing = data.clone();
+        let mut outer = ZipArchive::new(Cursor::new(data)).ok()?;
+        let nested_backing = ArchiveBacking::Shared(Self::find_shared_in_archive_locked(
+            &mut outer,
+            &backing,
+            nested_path,
+        )?);
+        let mut archive = ZipArchive::new(Cursor::new(nested_backing.clone())).ok()?;
+        let entry_index = Self::build_archive_entry_index(&mut archive);
+        Some(ClassPathEntry::NestedJar {
+            parent_jar: path.to_path_buf(),
+            nested_path: nested_path.to_string(),
+            archive: Mutex::new(archive),
+            backing: nested_backing,
+            entry_index,
+            signer_cache: OnceLock::new(),
+        })
     }
 
     /// Build a [`ClassPathEntry::NestedDirectory`] by extracting every entry
@@ -3891,13 +3939,13 @@ impl ClassPath {
                         for candidate in
                             Self::matching_resource_entry_names(entry_index.iter(), name)
                         {
-                            urls.push(format!("jar:file:{p}!/{nested_path}!/{candidate}"));
+                            urls.push(format!("jar:nested:{p}/!{nested_path}!/{candidate}"));
                         }
                         continue;
                     }
                     if Self::find_in_indexed_archive(archive, entry_index, name).is_some() {
                         let p = Self::nested_jar_url_path(parent_jar);
-                        urls.push(format!("jar:file:{p}!/{nested_path}!/{name}"));
+                        urls.push(format!("jar:nested:{p}/!{nested_path}!/{name}"));
                     }
                 }
                 ClassPathEntry::JmodFile {
@@ -5341,14 +5389,16 @@ mod tests {
     #[test]
     fn load_real_jdk_jmod() {
         // Skip this test if no JDK is available
-        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME").ok().or_else(|| {
-            let candidate = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
-            if candidate.exists() {
-                Some(candidate.to_string_lossy().into_owned())
-            } else {
-                None
-            }
-        });
+        let java_home = cratonvm_types::flags::runtime_var("JAVA_HOME")
+            .ok()
+            .or_else(|| {
+                let candidate = std::path::PathBuf::from("C:/Program Files/Java/jdk-25");
+                if candidate.exists() {
+                    Some(candidate.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            });
         let Some(java_home) = java_home else {
             eprintln!("Skipping load_real_jdk_jmod: no JAVA_HOME set");
             return;
