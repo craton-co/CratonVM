@@ -127,6 +127,16 @@ unrelated: `MockitoException: Mockito cannot mock this class:
 java.security.cert.X509Certificate` — a pre-existing CratonVM/Mockito gap, not
 a base64 defect.
 
+**Re-verified after merging `origin/dev` forward** (17 commits, including JIT
+and interpreter changes, up to `2cdc451fb`): rebuilt as
+`cratonvm-base64msg-postmerge.exe`; probe still byte-identical to HotSpot in
+both modes; `Base64ProtocolResolverTests`, `JksSslStoreBundleTests`,
+`PemContentTests`, `PemPrivateKeyParserTests`, `PemSslStoreBundleTests`,
+`PemCertificateParserTests`, `LoadedPemSslStoreTests`,
+`AppendableByteArrayTests` all green, `PemSslStoreTests` still exactly its 3
+pre-existing Mockito failures. The diff against `origin/dev` after the merge
+touches exactly the 8 files this fix owns — no silent merge loss.
+
 Rust unit tests added alongside the code (`base64_tests` in
 `native-builtins/src/lib.rs`), each expectation copied from the HotSpot probe
 output rather than derived: `decode_error_messages_match_real_jdk_wording`,
