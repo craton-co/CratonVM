@@ -4428,7 +4428,23 @@ fn build_factory_bean_subclass_wrapper(
                 skip_verification: true,
                 ..Default::default()
             };
-            match ctx.define_class_full(&new_name, &std::sync::Arc::new(bytes), 0, opts) {
+            // Define into the CONCRETE class's own loader, like `cce_enhance`
+            // above (see its `super_loader_id` comment and
+            // `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`):
+            // a generated subclass has to sit in its superclass's runtime
+            // package `(defining loader, package name)` or `same_runtime_package`
+            // refuses every package-private override it declares. Hardcoding
+            // the application loader only worked because the decode collapsed
+            // `Application` and `UserDefined(2)`; for a genuinely fork-loaded
+            // `FactoryBean` it put the wrapper in the wrong namespace outright.
+            // No-op for the common app-loaded case (id 2 -> `Application`).
+            let concrete_loader_id = ctx.loader_id_of_class(concrete_cid).max(0) as u32;
+            match ctx.define_class_full(
+                &new_name,
+                &std::sync::Arc::new(bytes),
+                concrete_loader_id,
+                opts,
+            ) {
                 Ok(_cid) => {
                     fb_subclass_cache()
                         .lock()

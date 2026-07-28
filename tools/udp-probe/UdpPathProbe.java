@@ -26,6 +26,24 @@ public class UdpPathProbe {
         } catch (Throwable t) {
             System.out.println("FAIL receive -> " + t);
         }
+        // The multicast surface is the one piece still implemented in
+        // datagram.rs. It must resolve the very same channel that open()/bind()
+        // created — that cross-module hand-off is exactly what the split
+        // registry used to break.
+        try (DatagramChannel m = DatagramChannel.open()) {
+            m.bind(new InetSocketAddress("0.0.0.0", 0));
+            java.net.InetAddress group = java.net.InetAddress.getByName("239.9.9.9");
+            java.net.NetworkInterface nif =
+                    java.net.NetworkInterface.getByInetAddress(
+                            java.net.InetAddress.getByName("127.0.0.1"));
+            java.nio.channels.MembershipKey key = m.join(group, nif);
+            System.out.println("OK   join valid=" + key.isValid());
+            key.drop();
+            System.out.println("OK   drop valid=" + key.isValid());
+        } catch (Throwable t) {
+            System.out.println("FAIL multicast -> " + t);
+        }
+
         a.close();
         b.close();
         System.out.println("DONE");

@@ -36,6 +36,25 @@ pub use cratonvm_types::lock_order::*;
 mod tests {
     use super::*;
 
+    /// Turn lock-order enforcement on for the tests that need the checker.
+    ///
+    /// Enforcement is unconditional in debug builds but **off by default in
+    /// release** (see `cratonvm_types::lock_order::tracking::enforced`), so
+    /// under `cargo test --release` every `#[should_panic(expected = "lock
+    /// order violation")]` test below stopped panicking and failed -- 18
+    /// failures that were pure build-config noise but had to be re-triaged as
+    /// "pre-existing" on every release run. Enabling it explicitly makes a
+    /// release run exercise the same path a debug run does. The call is
+    /// idempotent and can only ever *enable* checking, so debug behaviour is
+    /// unchanged.
+    fn require_enforcement() {
+        tracking::force_enable_for_testing();
+        assert!(
+            tracking::enforced(),
+            "lock-order enforcement must be active for this test"
+        );
+    }
+
     // -- LockLevel tests ----------------------------------------------------
 
     #[test]
@@ -130,6 +149,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn mutex_ascending_order_panics() {
+        require_enforcement();
         // Holding Heap (8) and then trying to acquire ClassManager (10) is the
         // forbidden inversion described in this module's doc comment.
         let a = OrderedMutex::new((), LockLevel::Heap);
@@ -141,6 +161,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn mutex_same_level_panics() {
+        require_enforcement();
         let a = OrderedMutex::new((), LockLevel::ThreadRegistry);
         let b = OrderedMutex::new((), LockLevel::ThreadRegistry);
         let _ga = a.lock().unwrap();
@@ -205,6 +226,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn rwlock_ascending_read_panics() {
+        require_enforcement();
         let a = OrderedRwLock::new((), LockLevel::Heap);
         let b = OrderedRwLock::new((), LockLevel::ClassManager);
         let _ga = a.read().unwrap();
@@ -214,6 +236,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn rwlock_ascending_write_panics() {
+        require_enforcement();
         let a = OrderedRwLock::new((), LockLevel::Monitors);
         let b = OrderedRwLock::new((), LockLevel::ClassManager);
         let _ga = a.write().unwrap();
@@ -223,6 +246,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn rwlock_same_level_panics() {
+        require_enforcement();
         let a = OrderedRwLock::new((), LockLevel::Monitors);
         let b = OrderedRwLock::new((), LockLevel::Monitors);
         let _ga = a.read().unwrap();
@@ -252,6 +276,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn mixed_mutex_then_rwlock_ascending_panics() {
+        require_enforcement();
         // The exact "Forbidden: monitor -> class manager" case from this module.
         let m = OrderedMutex::new((), LockLevel::Monitors);
         let rw = OrderedRwLock::new((), LockLevel::ClassManager);
@@ -425,6 +450,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn v11_two_monitor_level_registries_must_not_nest() {
+        require_enforcement();
         let monitors = OrderedMutex::new((), LockLevel::Monitors);
         let cas_locks = OrderedMutex::new((), LockLevel::Monitors);
         let _m = monitors.lock().unwrap();
@@ -449,6 +475,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn v11_monitors_then_classmanager_inverts() {
+        require_enforcement();
         let monitors = OrderedMutex::new((), LockLevel::Monitors);
         let class_manager = OrderedRwLock::new((), LockLevel::ClassManager);
         let _m = monitors.lock().unwrap();
@@ -465,22 +492,21 @@ mod tests {
 
     // -- Enforcement gating --------------------------------------------------
 
-    // The test runner is a debug build (`cfg!(debug_assertions)` is true), so
-    // enforcement is unconditionally active and the `#[should_panic]` tests
-    // above exercise the real checking path. This test pins that invariant: if
-    // someone ever runs the suite in release without setting the env var, the
-    // `enforced()`-gated paths would silently stop checking and most of the
-    // panic tests would fail loudly here first.
+    // Enforcement is unconditional in debug builds; in release it is off
+    // unless opted into. This test used to assert the runner WAS a debug build,
+    // which made it (and every `#[should_panic]` test above) fail under
+    // `cargo test --release` for no reason other than the build profile. Pin
+    // the real contract instead: debug always enforces, and `require_enforcement`
+    // brings a release runner up to the same footing.
     #[test]
     fn enforcement_active_in_debug_builds() {
-        assert!(
-            cfg!(debug_assertions),
-            "test runner is expected to be a debug build"
-        );
-        assert!(
-            tracking::enforced(),
-            "lock-order enforcement must be active in debug builds"
-        );
+        if cfg!(debug_assertions) {
+            assert!(
+                tracking::enforced(),
+                "lock-order enforcement must be active in debug builds"
+            );
+        }
+        require_enforcement();
     }
 
     // Acquiring then releasing must leave the per-thread held-set empty so a
@@ -591,6 +617,7 @@ mod tests {
     /// reentrant case (`interpreter.rs::resolve_method_ref`) and must not trip.
     #[test]
     fn pl_read_recursive_reentrant_ok() {
+        require_enforcement();
         let cm = OrderedPlRwLock::new(1_u8, LockLevel::ClassManager);
         let outer = cm.read();
         let inner = cm.read_recursive();
@@ -607,6 +634,7 @@ mod tests {
     /// drops — otherwise the tracker would forget a still-held L10 lock.
     #[test]
     fn pl_read_recursive_does_not_release_outer() {
+        require_enforcement();
         let cm = OrderedPlRwLock::new((), LockLevel::ClassManager);
         let _outer = cm.read();
         {
@@ -653,6 +681,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn pl_monitor_then_class_manager_inverts_across_families() {
+        require_enforcement();
         let monitors = OrderedMutex::new((), LockLevel::Monitors);
         let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
         let _m = monitors.lock().unwrap();
@@ -664,6 +693,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn pl_ref_processor_then_class_manager_inverts() {
+        require_enforcement();
         let ref_processor = OrderedPlMutex::new((), LockLevel::RefProcessor);
         let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
         let _rp = ref_processor.lock();
@@ -673,6 +703,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn pl_rwlock_same_level_panics() {
+        require_enforcement();
         let a = OrderedPlRwLock::new((), LockLevel::ClassManager);
         let b = OrderedPlRwLock::new((), LockLevel::ClassManager);
         let _ga = a.read();
@@ -682,6 +713,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn pl_mutex_ascending_panics() {
+        require_enforcement();
         let low = OrderedPlMutex::new((), LockLevel::Monitors);
         let high = OrderedPlMutex::new((), LockLevel::NativeMethods);
         let _l = low.lock();
@@ -693,6 +725,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn pl_read_recursive_under_lower_level_panics() {
+        require_enforcement();
         let monitors = OrderedMutex::new((), LockLevel::Monitors);
         let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
         let _m = monitors.lock().unwrap();
@@ -704,6 +737,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn level_scope_then_higher_lock_panics() {
+        require_enforcement();
         let _heap = enter_level(LockLevel::Heap);
         let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
         let _cm = class_manager.read(); // L10 under L8 => violation
@@ -712,17 +746,21 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn level_scope_ascending_panics() {
+        require_enforcement();
         let _monitors = enter_level(LockLevel::Monitors);
         let _heap = enter_level(LockLevel::Heap); // L8 under L6 => violation
     }
 
     #[test]
     fn enforcement_active_matches_debug_assertions() {
-        // The test runner is a debug build, so enforcement must be on and the
-        // public query must agree with the internal one.
+        // The public query must always agree with the internal one, and a debug
+        // runner must have enforcement on without anyone asking for it.
         assert_eq!(enforcement_active(), tracking::enforced());
         if cfg!(debug_assertions) {
             assert!(enforcement_active());
         }
+        // ... and once opted in, both agree it is on in release too.
+        require_enforcement();
+        assert!(enforcement_active());
     }
 }

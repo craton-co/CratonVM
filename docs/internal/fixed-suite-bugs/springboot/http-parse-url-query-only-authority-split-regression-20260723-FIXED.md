@@ -2,6 +2,21 @@
 
 **Status: OPEN — found 2026-07-23 (confirmed at source level; this is a regression of an already-"FIXED" doc, not a new bug)**
 
+## Resolution — 2026-07-28
+
+This regression is fixed and the document is retired from `docs/known-issues`.
+All active native HTTP request parsers now split authority at `/`, `?`, or `#`:
+`net_phase_e::http_parse_url`, `http_client::parse_uri`, and
+`http_url_connection::parse_url`. A query-only target is normalized to HTTP
+origin-form (`/?query`); a fragment is never sent on the wire.
+
+Focused native regressions passed 3/3. Using a fresh release artifact built
+from this change, `BasicErrorControllerIntegrationTests` passed 26/26 in JIT
+and 26/26 with `--nojit`, with zero failed, aborted, or skipped tests in both
+`SBRUNNER_RESULT` summaries.
+
+The status below is retained as the original discovery record.
+
 ## Symptom
 
 | Module | Class | Failures |

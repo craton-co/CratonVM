@@ -1,8 +1,15 @@
 # Possible cross-test-method state leakage within a single SbRunner process (pattern observation)
 
-**Status: OPEN — found 2026-07-23 (pattern-level hypothesis across 3 classes, not a single confirmed mechanism)**
+**Status: OPEN — found 2026-07-23 (pattern-level hypothesis across 2 remaining classes, not a single confirmed mechanism)**
 
 ## Symptom
+
+> **2026-07-28 update:** `DefaultLogbackConfigurationTests` is no longer
+> evidence for this open pattern. Its complete seven-test class passes in
+> fresh CratonVM JIT and `--nojit` processes, plus HotSpot. Its single-purpose
+> `Console.ttyStatus()` issue document has been retired under
+> `docs/internal/fixed-suite-bugs/springboot/`. The remaining two classes in
+> this hypothesis document have not been changed by that validation.
 
 Three unrelated-looking failures share the same *shape*: a value that a
 test explicitly sets (a system property, or an object's own state) right

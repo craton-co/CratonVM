@@ -183,9 +183,21 @@ So every `new` whose constructor stores a field runs that constructor in the
 interpreter, forever: `new String(…)`, `new HashMap.Node(…)`, essentially the
 whole JDK. This is a VM-wide ceiling on allocation, not a Tomcat issue.
 
-**Measured prize** (`CRATONVM_JIT_ALLOW_PUTFIELD_INIT=1`, a new default-OFF
-bisect knob that lifts the ban for `putfield` only, keeping it for the other
-three opcodes):
+**Status: the ban is now LIFTED BY DEFAULT** (2026-07-28, explicit maintainer
+decision, with a full regression run to follow). It applies to `putfield`-only
+constructors; `putstatic` / `monitorenter-exit` / `invokedynamic` constructors
+remain banned. **Kill switch — no rebuild needed:**
+
+```bash
+CRATONVM_JIT_PUTFIELD_INIT=0
+```
+
+restores the historical blanket ban. If a regression run turns up a
+miscompile, wrong result or crash, set that and re-run *before* anything else:
+it is the fastest attribution test for this change and separates it cleanly
+from everything else in the same binary.
+
+**Measured prize:**
 
 | probe | ban on (default) | ban lifted |
 |---|---|---|
@@ -212,8 +224,12 @@ all 3 non-PASS reproduce identically with the knob OFF.
 correctness bans it carries no incident write-up, only the one-line "field
 stores trigger the JIT's load-forwarding interaction". Nothing here proves that
 rationale stale — it proves only that six Tomcat classes and 26 JIT tests do
-not catch it. Before flipping the default, this needs a full-suite run
-(Tomcat + Spring Boot + Hibernate) **on a quiet host**; see the warning below.
+not catch it. The full-suite regression run (Tomcat + Spring Boot + Hibernate)
+**on a quiet host** is the real verdict and is still outstanding; the kill
+switch above exists precisely because of that. If it comes back clean, delete
+the `putfield` arm from `classify_init_complexity` outright and retire the
+knob; if it does not, the failing case is the incident write-up this ban never
+had — record it here.
 
 > **Warning to anyone measuring this.** `TestDefaultServlet` has a
 > **pre-existing flaky stack overflow** on `dev` under load — an unmodified
