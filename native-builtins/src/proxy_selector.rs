@@ -650,6 +650,20 @@ pub fn _anchor_strings() {
 const DEFAULT_PROXY_SELECTOR: &str = "sun/net/spi/DefaultProxySelector";
 const PROXY_SELECTOR: &str = "java/net/ProxySelector";
 
+/// The selector most recently installed through `ProxySelector.setDefault`,
+/// read back out of the real JDK's own `ProxySelector.theProxySelector` static
+/// field. `None` when nobody has installed one, when the caller installed
+/// `null` (the documented "restore the default" spelling), or when the field
+/// does not exist in the loaded layout.
+fn installed_default_selector(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name(PROXY_SELECTOR)?;
+    let idx = ctx.static_field_index_by_name(class_id, "theProxySelector")?;
+    match ctx.get_static_field(class_id, idx) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -665,18 +679,50 @@ pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;Ljava/net/SocketAddress;Ljava/io/IOException;)V",
         connect_failed,
     );
-    // The package-private internal init stub real-JDK runs at <clinit>.
+    // KEEP the no-op. `DefaultProxySelector.init()` is HotSpot's JNI
+    // field-ID cache plus platform proxy-config probe; this module reads the
+    // proxy configuration from system properties and environment variables on
+    // every `select` call instead, so there is nothing for an initializer to
+    // set up. The registration exists only so `<clinit>` does not die with
+    // UnsatisfiedLinkError.
     r.register(DEFAULT_PROXY_SELECTOR, "init", "()V", |_ctx, _args| {
         Ok(None)
     });
 
-    // Public ProxySelector — `getDefault` allocates a DefaultProxySelector
-    // and `setDefault` stashes it. We provide a stable singleton here.
+    // Public ProxySelector. `setDefault` used to be a constant no-op and
+    // `getDefault` allocated a fresh `DefaultProxySelector` on every call, so
+    // the pair was broken in two directions at once:
+    //
+    //   * A caller-installed selector was silently DISCARDED. Installing one
+    //     is the standard way an application (or a test) routes traffic
+    //     through a recording/blocking proxy — `ProxySelector.setDefault(new
+    //     ProxySelector() {…})`. Dropping it means the connection quietly goes
+    //     direct instead: the proxy never sees the request, and the failure
+    //     surfaces far from here as "the proxy recorded nothing".
+    //   * `ProxySelector.setDefault(null)` — the documented way to restore JDK
+    //     default behaviour, and what a well-behaved test's teardown calls —
+    //     was equally ignored, so a test could not even *un*install.
+    //   * `getDefault() == getDefault()` was false, and `getDefault() != x`
+    //     right after `setDefault(x)`. Both identities are relied on by
+    //     save/restore blocks (`var prev = getDefault(); … setDefault(prev)`).
+    //
+    // The installed selector lives in the real JDK's own
+    // `ProxySelector.theProxySelector` static field rather than a Rust static:
+    // a static field is already in the GC root set and is remapped by a moving
+    // collector for free, whereas a raw `ObjectRef` parked in a `OnceLock`
+    // would need bespoke scan/remap wiring in `vm/src/memory/{roots,gc}.rs`
+    // (see `t27_tls::gc_scan_default_ssl_context_root` for what that costs).
+    // If the field is absent (synthetic-JDK layout), the write no-ops and
+    // `getDefault` falls back to allocating the built-in selector — exactly
+    // the previous behaviour, so nothing regresses in that mode.
     r.register(
         PROXY_SELECTOR,
         "getDefault",
         "()Ljava/net/ProxySelector;",
         |ctx, _args| {
+            if let Some(installed) = installed_default_selector(ctx) {
+                return Ok(Some(Value::Object(Some(installed))));
+            }
             let ps = alloc_concurrent_synthetic(ctx, DEFAULT_PROXY_SELECTOR, 1);
             Ok(Some(Value::Object(Some(ps))))
         },
@@ -685,7 +731,16 @@ pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
         PROXY_SELECTOR,
         "setDefault",
         "(Ljava/net/ProxySelector;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // `null` is legal and means "restore the default", so the argument
+            // is stored as-is rather than being filtered to non-null.
+            let value = match args.first().copied() {
+                Some(v @ Value::Object(_)) => v,
+                _ => Value::Object(None),
+            };
+            ctx.set_static_field_by_name(PROXY_SELECTOR, "theProxySelector", value);
+            Ok(None)
+        },
     );
     // Real-JDK exposes a static select that delegates to getDefault().select().
     r.register(

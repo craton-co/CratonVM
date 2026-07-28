@@ -2324,12 +2324,12 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(
-        cu,
-        "frequency",
-        "(Ljava/util/Collection;Ljava/lang/Object;)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
+    // W2: an always-0 `Collections.frequency` used to be re-registered HERE,
+    // ~2100 lines after the real `native_collections_frequency` registration
+    // near the top of this same function. `NativeMethodRegistry::register` is
+    // last-write-wins, so this duplicate silently shadowed wave 1's real
+    // implementation and made every `Collections.frequency(...)` answer 0.
+    // Removed; the registration at the top of this function is the live one.
 
     // --- Wrapper-type <clinit>: set TYPE = primitive mirror ---
     // Java bytecode `int.class` compiles to `getstatic java/lang/Integer.TYPE`.
@@ -2876,6 +2876,10 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
         native_noop,
     );
+    // KEEP: HotSpot's `CDS.getRandomSeedForDumping()` returns 0 whenever the VM
+    // is not dumping a CDS archive, and CratonVM never dumps one. Callers
+    // (`ImageGenerator`, `System.identityHashCode` seeding) treat 0 as "no
+    // archive seed", which is the truth here.
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
@@ -3499,7 +3503,12 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // close()
+    // close() — KEEP. Every `Scanner` constructor above drains its source
+    // eagerly into the field-0 String and keeps no reference to the underlying
+    // stream/file/reader, so there is no handle left for `close()` to release.
+    // (Residual, not a stub: a closed Scanner still returns tokens instead of
+    // throwing IllegalStateException — that needs a "closed" slot the 3-field
+    // carrier does not have.)
     r.register(sc, "close", "()V", |_ctx, _args| Ok(None));
 
     // java.io.StringReader / StringWriter registrations used to live here,
@@ -6959,7 +6968,34 @@ const CAL_FIELD_MINUTE: usize = 4;
 const CAL_FIELD_SECOND: usize = 5;
 const CAL_FIELD_MILLIS: usize = 6;
 const CAL_FIELD_TIMEZONE: usize = 7;
-const CAL_NUM_FIELDS: usize = 8;
+/// W2: `setLenient`/`setFirstDayOfWeek` used to be no-ops. Both settings now
+/// live in slots appended after the original 8, so `alloc_calendar` does not
+/// have to initialise them: 0 means "never set" for both (see the two
+/// accessors' comments), which is exactly the JDK default in each case.
+const CAL_FIELD_STRICT: usize = 8;
+const CAL_FIELD_FIRST_DAY_OF_WEEK: usize = 9;
+const CAL_NUM_FIELDS: usize = 10;
+
+/// Width-guarded read of one of the two appended Calendar setting slots.
+///
+/// A receiver can be narrower than `CAL_NUM_FIELDS` — `vm.rs`'s
+/// `gregorian_calendar_leap_year` test allocates an 8-field carrier directly,
+/// and in real-JDK mode the receiver is a genuine `GregorianCalendar` whose
+/// layout is not ours at all — so a narrow object reads 0, which both callers
+/// treat as "unset / JDK default" rather than running off the end.
+fn cal_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> i32 {
+    if ctx.object_num_fields(this) > slot {
+        ctx.get_field(this, slot).as_int().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+fn cal_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: i32) {
+    if ctx.object_num_fields(this) > slot {
+        ctx.set_field(this, slot, Value::Int(v));
+    }
+}
 
 fn alloc_calendar(ctx: &mut dyn NativeContext) -> ObjectRef {
     let cal = alloc_concurrent_synthetic(ctx, "java/util/GregorianCalendar", CAL_NUM_FIELDS);
@@ -7279,8 +7315,17 @@ fn native_cal_compare_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn native_cal_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Pin across the allocation — a moving young GC there would relocate
+    // `this` before the copy loop below (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
     let clone = alloc_concurrent_synthetic(ctx, "java/util/GregorianCalendar", CAL_NUM_FIELDS);
-    for i in 0..CAL_NUM_FIELDS {
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    // W2: `CAL_NUM_FIELDS` grew from 8 to 10 (leniency + first-day-of-week),
+    // but the source may still be a narrower carrier, so bound the copy by the
+    // receiver's actual width rather than reading off its end.
+    let n = CAL_NUM_FIELDS.min(ctx.object_num_fields(this));
+    for i in 0..n {
         let v = ctx.get_field(this, i);
         ctx.set_field(clone, i, v);
     }
@@ -7350,6 +7395,37 @@ fn native_cal_get_actual_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     }
 }
 
+/// `Calendar.getActualMinimum(int)`.
+///
+/// W2: this used to answer a constant `1` for every field, which is wrong for
+/// most of them — `MONTH`'s minimum is 0 (JANUARY), every time-of-day field's
+/// is 0, and `DAY_OF_WEEK_IN_MONTH`'s is -1. A caller normalising a field to
+/// its legal range (`Math.max(v, cal.getActualMinimum(f))`) silently clamped
+/// January to February and midnight to 01:00.
+///
+/// The minima below are all field-independent for a Gregorian calendar, so
+/// unlike `getActualMaximum` this needs no receiver state. Field ids are the
+/// `java.util.Calendar` constants, matching `native_cal_get_actual_max`.
+fn native_cal_get_actual_min(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let field = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let min = match field {
+        1 => 1,  // YEAR
+        3 => 1,  // WEEK_OF_YEAR
+        5 => 1,  // DAY_OF_MONTH
+        6 => 1,  // DAY_OF_YEAR
+        7 => 1,  // DAY_OF_WEEK (SUNDAY)
+        8 => -1, // DAY_OF_WEEK_IN_MONTH
+        // ERA(0), MONTH(2), WEEK_OF_MONTH(4), AM_PM(9), HOUR(10),
+        // HOUR_OF_DAY(11), MINUTE(12), SECOND(13), MILLISECOND(14) and, for
+        // this UTC-based synthetic calendar, ZONE_OFFSET(15)/DST_OFFSET(16).
+        _ => 0,
+    };
+    Ok(Some(Value::Int(min)))
+}
+
 pub(crate) fn register_calendar_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -7398,20 +7474,37 @@ pub(crate) fn register_calendar_natives(r: &mut NativeMethodRegistry) {
     r.register(cal, "clone", "()Ljava/lang/Object;", native_cal_clone);
     r.register(cal, "clear", "()V", native_cal_clear);
     r.register(cal, "getActualMaximum", "(I)I", native_cal_get_actual_max);
-    r.register(cal, "getActualMinimum", "(I)I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    r.register(cal, "getActualMinimum", "(I)I", native_cal_get_actual_min);
+    // W2: `setLenient`/`setFirstDayOfWeek` were no-ops while their getters
+    // returned the hardcoded JDK defaults, so a caller that configured the
+    // calendar and read the setting back was told its own change had not
+    // happened. Both now round-trip through the two slots added at the end of
+    // the synthetic layout.
+    r.register(cal, "isLenient", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Slot stores "strict" so a zeroed/narrow carrier reads as the JDK
+        // default (lenient).
+        let strict = cal_get_slot(ctx, this, CAL_FIELD_STRICT);
+        Ok(Some(Value::Int(i32::from(strict == 0))))
     });
-    r.register(cal, "isLenient", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    r.register(cal, "setLenient", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let lenient = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+        cal_set_slot(ctx, this, CAL_FIELD_STRICT, i32::from(lenient == 0));
+        Ok(None)
     });
-    r.register(cal, "setLenient", "(Z)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(cal, "getFirstDayOfWeek", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // SUNDAY..SATURDAY are 1..7, so an unwritten slot (0) means "never
+        // set" and answers the JDK/US default, SUNDAY.
+        let d = cal_get_slot(ctx, this, CAL_FIELD_FIRST_DAY_OF_WEEK);
+        Ok(Some(Value::Int(if (1..=7).contains(&d) { d } else { 1 })))
     });
-    r.register(cal, "getFirstDayOfWeek", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    });
-    r.register(cal, "setFirstDayOfWeek", "(I)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(cal, "setFirstDayOfWeek", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let d = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+        cal_set_slot(ctx, this, CAL_FIELD_FIRST_DAY_OF_WEEK, d);
+        Ok(None)
     });
 
     let gc = "java/util/GregorianCalendar";
@@ -8096,6 +8189,15 @@ pub(crate) fn fjp_state() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FjpEntry {
     pub(crate) done: bool,
+    /// W2: real cancellation state. `cancel(Z)Z` used to be a constant
+    /// `false` on all six of ForkJoinTask/RecursiveTask/RecursiveAction's
+    /// registrations, so a caller was told cancellation had failed while
+    /// `isCancelled()` also said `false` and the task went on to run —
+    /// callers that poll `isCancelled()` after a `cancel()` spun forever.
+    /// A cancelled task is `done && cancelled`, which is exactly the real
+    /// `ForkJoinTask` invariant (`isDone()` is true for a cancelled task and
+    /// `isCompletedNormally()` is false).
+    pub(crate) cancelled: bool,
     pub(crate) result: Value,
 }
 
@@ -8103,6 +8205,7 @@ impl FjpEntry {
     pub(crate) fn new() -> Self {
         Self {
             done: false,
+            cancelled: false,
             result: Value::Object(None),
         }
     }
@@ -8124,9 +8227,19 @@ pub(crate) fn fjp_state_get(o: ObjectRef) -> (bool, Value) {
 }
 
 /// Mark the task done with the given result.
+///
+/// A cancelled task stays cancelled and keeps its null result: `cancel()`
+/// already completed it, and the real `ForkJoinTask` likewise ignores a later
+/// `complete()`/`setRawResult()` once the status word is DONE.
 pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
     let mut m = fjp_state().lock();
-    m.insert(fjp_key(o), FjpEntry { done: true, result });
+    {
+        let e = m.entry(fjp_key(o)).or_insert_with(FjpEntry::new);
+        if !e.cancelled {
+            e.done = true;
+            e.result = result;
+        }
+    }
     // Best-effort reap: if the table has grown beyond 4096 entries, drop
     // the oldest "done" half. With 1M-element FjpProbe at threshold 1000
     // we expect <2048 live tasks so this is rarely hit; it just bounds
@@ -8140,6 +8253,56 @@ pub(crate) fn fjp_state_set_done(o: ObjectRef, result: Value) {
         for k in drained {
             m.remove(&k);
         }
+    }
+}
+
+/// `ForkJoinTask.cancel(mayInterruptIfRunning)`.
+///
+/// Mirrors the real `ForkJoinTask.cancel` = `trySetCancelled()`: a task that
+/// has not completed becomes DONE+ABNORMAL and the call reports `true`; a task
+/// that already completed normally cannot be cancelled and reports `false`; a
+/// second `cancel()` on an already-cancelled task still reports `true`.
+///
+/// `mayInterruptIfRunning` is ignored, exactly as the real implementation does
+/// — ForkJoinTask never interrupts a running worker.
+pub(crate) fn fjp_state_cancel(o: ObjectRef) -> bool {
+    let mut m = fjp_state().lock();
+    let e = m.entry(fjp_key(o)).or_insert_with(FjpEntry::new);
+    if e.done {
+        return e.cancelled;
+    }
+    e.done = true;
+    e.cancelled = true;
+    e.result = Value::Object(None);
+    true
+}
+
+/// `(done, cancelled)` for the given task; `(false, false)` if never seen.
+pub(crate) fn fjp_state_flags(o: ObjectRef) -> (bool, bool) {
+    let m = fjp_state().lock();
+    match m.get(&fjp_key(o)) {
+        Some(e) => (e.done, e.cancelled),
+        None => (false, false),
+    }
+}
+
+/// `fjp_state_get` plus the spec'd `CancellationException` on a cancelled
+/// task. Used by `join()` / `get()` / `invoke()`, which the real JDK makes
+/// throw rather than hand back a value; `isDone()`/`isCancelled()`/
+/// `getRawResult()` deliberately keep the plain `fjp_state_get`.
+///
+/// `RuntimeError` has no dedicated `CancellationException` variant, so this
+/// raises `IllegalStateException` with the spec'd type name in the message —
+/// the same spec-faithful proxy `xnio_async::native_iof_get` already uses.
+pub(crate) fn fjp_state_get_checked(o: ObjectRef) -> Result<(bool, Value), MethodCallFailed> {
+    let m = fjp_state().lock();
+    match m.get(&fjp_key(o)) {
+        Some(e) if e.cancelled => Err(RuntimeError::IllegalStateException {
+            message: "java.util.concurrent.CancellationException: task was cancelled".to_string(),
+        }
+        .into()),
+        Some(e) => Ok((e.done, e.result)),
+        None => Ok((false, Value::Object(None))),
     }
 }
 
@@ -8284,24 +8447,51 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
+    // KEEP: `commonPool()` right above hands out a parallelism-1 pool that runs
+    // every task inline, so 1 is this VM's true common-pool parallelism, not a
+    // placeholder. (It is also the value HotSpot reports on a single-core host.)
     r.register(pool, "getCommonPoolParallelism", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
-    r.register(pool, "shutdown", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // W2: `shutdown()` was a no-op while `isShutdown()`/`isTerminated()` were
+    // constant `false`, so the standard drain loop
+    // `pool.shutdown(); while (!pool.isTerminated()) pool.awaitTermination(...)`
+    // never made progress — and `awaitTermination` right below it already
+    // returned `true`, so the two answers actively contradicted each other.
+    //
+    // This pool executes every task INLINE (see `invoke`/`submit` below), so
+    // there is never anything still running: "shut down" and "terminated"
+    // coincide, and one flag captures both. It lives in the `fjp_state` side
+    // table rather than an instance slot because the carrier has a single field
+    // (parallelism) and `commonPool` allocates it one field wide; the side
+    // table is also the only one of the two that the GC hook
+    // (`gc_update_forkjoin_refs`) already remaps. A pool is never also a task,
+    // so the key spaces cannot collide.
+    r.register(pool, "shutdown", "()V", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        fjp_state_set_done(this, Value::Object(None));
+        Ok(None)
     });
-    r.register(pool, "shutdownNow", "()Ljava/util/List;", |ctx, _args| {
+    r.register(pool, "shutdownNow", "()Ljava/util/List;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        fjp_state_set_done(this, Value::Object(None));
+        // Nothing is ever queued — tasks run inline — so the "tasks that never
+        // started" list is genuinely empty.
         let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 10);
         ctx.set_field(list, 0, Value::Object(Some(arr)));
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
-    r.register(pool, "isShutdown", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(pool, "isShutdown", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (shut, _) = fjp_state_flags(this);
+        Ok(Some(Value::Int(i32::from(shut))))
     });
-    r.register(pool, "isTerminated", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(pool, "isTerminated", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (shut, _) = fjp_state_flags(this);
+        Ok(Some(Value::Int(i32::from(shut))))
     });
     // invoke(ForkJoinTask) — call compute() on the task, return result.
     // WP4.3 fix: use the side-table for done/result so we don't redundantly
@@ -8349,6 +8539,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(runnable))))
         },
     );
+    // KEEP (all three): true by construction for an inline-execution pool.
+    // Every task runs on the CALLING thread inside `invoke`/`submit` and has
+    // already finished by the time any of these can be observed, so the pool
+    // owns exactly the one (borrowed) thread, has no task running in a worker,
+    // and never queues anything.
     r.register(pool, "getPoolSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -8358,11 +8553,21 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     r.register(pool, "getQueuedTaskCount", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
+    // W2: this returned a constant `true` ("the pool terminated within the
+    // timeout") even for a pool nobody had shut down, which now that
+    // `isTerminated()` is real would have made the two contradict each other.
+    // Answer the same flag: because every task runs inline, a shut-down pool
+    // is terminated the instant it is shut down, and a live pool never
+    // terminates no matter how long the caller waits.
     r.register(
         pool,
         "awaitTermination",
         "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |_ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (shut, _) = fjp_state_flags(this);
+            Ok(Some(Value::Int(i32::from(shut))))
+        },
     );
 
     // ForkJoinTask — done+result tracked in `fjp_state` side-table.
@@ -8383,7 +8588,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(fjt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8393,7 +8598,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(fjt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8403,7 +8608,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(fjt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8416,15 +8621,21 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(fjt, "isCancelled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(fjt, "isCancelled", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (_, cancelled) = fjp_state_flags(this);
+        Ok(Some(Value::Int(i32::from(cancelled))))
     });
     r.register(fjt, "isCompletedNormally", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get(this);
-        Ok(Some(Value::Int(if done { 1 } else { 0 })))
+        // A cancelled task IS done but did NOT complete normally.
+        let (done, cancelled) = fjp_state_flags(this);
+        Ok(Some(Value::Int(i32::from(done && !cancelled))))
     });
-    r.register(fjt, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(fjt, "cancel", "(Z)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+    });
     r.register(fjt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -8451,7 +8662,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(rt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8461,7 +8672,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(rt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8486,7 +8697,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(rt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8499,7 +8710,10 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(rt, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(rt, "cancel", "(Z)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+    });
     r.register(rt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -8511,6 +8725,10 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     // always Value::Object(None) since compute() returns void.
     // WP4.3 fix: switched off field-index access (broken in real-JDK mode).
     let ra = "java/util/concurrent/RecursiveAction";
+    // KEEP: genuinely empty. The real `RecursiveAction()` constructor has an
+    // empty body, and this model keeps all task state in the `fjp_state` side
+    // table, which starts empty for an unseen key — so there is nothing to
+    // initialise here.
     r.register(ra, "<init>", "()V", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -8526,7 +8744,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(ra, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get(this);
+        let (done, _) = fjp_state_get_checked(this)?;
         if !done {
             let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
@@ -8535,7 +8753,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(ra, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get(this);
+        let (done, _) = fjp_state_get_checked(this)?;
         if !done {
             let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
@@ -8547,7 +8765,13 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(ra, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(ra, "cancel", "(Z)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+    });
+    // KEEP: `RecursiveAction.getRawResult()` returns null in the real JDK too —
+    // the class exists precisely for tasks whose `compute()` is void, so there
+    // is no result to hand back. This constant is the spec.
     r.register(ra, "getRawResult", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -8708,7 +8932,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     );
     r.register(fjt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "fjt.join cached");
             return Ok(Some(cached));
@@ -8720,7 +8944,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     });
     r.register(fjt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8730,7 +8954,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     });
     r.register(fjt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8749,7 +8973,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let (done, cached) = fjp_state_get(this);
+            let (done, cached) = fjp_state_get_checked(this)?;
             if done {
                 return Ok(Some(cached));
             }
@@ -8765,13 +8989,19 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     });
     r.register(fjt, "isCompletedNormally", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get(this);
-        Ok(Some(Value::Int(if done { 1 } else { 0 })))
+        // A cancelled task IS done but did NOT complete normally.
+        let (done, cancelled) = fjp_state_flags(this);
+        Ok(Some(Value::Int(i32::from(done && !cancelled))))
     });
-    r.register(fjt, "isCancelled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(fjt, "isCancelled", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let (_, cancelled) = fjp_state_flags(this);
+        Ok(Some(Value::Int(i32::from(cancelled))))
     });
-    r.register(fjt, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(fjt, "cancel", "(Z)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+    });
     r.register(fjt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -8807,7 +9037,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     );
     r.register(rt, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), cached = ?cached, "rt.join cached");
             return Ok(Some(cached));
@@ -8819,7 +9049,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     });
     r.register(rt, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8829,7 +9059,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     });
     r.register(rt, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, cached) = fjp_state_get(this);
+        let (done, cached) = fjp_state_get_checked(this)?;
         if done {
             return Ok(Some(cached));
         }
@@ -8855,7 +9085,10 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(rt, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(rt, "cancel", "(Z)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+    });
     r.register(rt, "complete", "(Ljava/lang/Object;)V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let val = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -8877,7 +9110,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     );
     r.register(ra, "join", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get(this);
+        let (done, _) = fjp_state_get_checked(this)?;
         if !done {
             let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
@@ -8886,7 +9119,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
     });
     r.register(ra, "invoke", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let (done, _) = fjp_state_get(this);
+        let (done, _) = fjp_state_get_checked(this)?;
         if !done {
             let this = fjp_compute_void(ctx, this);
             fjp_state_set_done(this, Value::Object(None));
@@ -8898,7 +9131,13 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         let (done, _) = fjp_state_get(this);
         Ok(Some(Value::Int(if done { 1 } else { 0 })))
     });
-    r.register(ra, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(ra, "cancel", "(Z)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(i32::from(fjp_state_cancel(this)))))
+    });
+    // KEEP: `RecursiveAction.getRawResult()` returns null in the real JDK too —
+    // the class exists precisely for tasks whose `compute()` is void, so there
+    // is no result to hand back. This constant is the spec.
     r.register(ra, "getRawResult", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -9222,6 +9461,35 @@ pub(crate) fn initialize_real_scheduled_thread_pool_executor(
     result.map(|_| None)
 }
 
+/// Real `java.util.concurrent.ScheduledThreadPoolExecutor` field names behind
+/// the three shutdown/cancel policy accessor pairs (W2).
+const STPE_POLICY_CONTINUE_PERIODIC: &str = "continueExistingPeriodicTasksAfterShutdown";
+const STPE_POLICY_EXECUTE_DELAYED: &str = "executeExistingDelayedTasksAfterShutdown";
+const STPE_POLICY_REMOVE_ON_CANCEL: &str = "removeOnCancel";
+
+fn stpe_set_policy(ctx: &mut dyn NativeContext, args: &[Value], field: &str) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    ctx.set_field_by_name(this, field, Value::Int(i32::from(v != 0)));
+    Ok(None)
+}
+
+fn stpe_get_policy(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    field: &str,
+    default: i32,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // `get_field_by_name` answers `Value::Object(None)` for an unknown field,
+    // which is the synthetic carrier — fall back to the JDK default there.
+    let v = match ctx.get_field_by_name(this, field) {
+        Value::Int(v) => i32::from(v != 0),
+        _ => default,
+    };
+    Ok(Some(Value::Int(v)))
+}
+
 pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -9295,35 +9563,51 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
+    // W2: the three ScheduledThreadPoolExecutor policy setters were no-ops and
+    // the three getters returned constants. The constants happened to be the
+    // JDK defaults (false / true / false), so the pair looked right until a
+    // caller actually configured the executor: `setRemoveOnCancelPolicy(true)`
+    // followed by `getRemoveOnCancelPolicy()` still answered false, and a
+    // caller that verifies its own configuration (Spring's
+    // `ThreadPoolTaskScheduler#setRemoveOnCancelPolicy`, Micrometer's executor
+    // metrics binder) saw its setting silently dropped.
+    //
+    // `register_scheduled_executor_natives` runs from
+    // `register_essential_natives_with_shims`, i.e. in REAL-JDK mode too, so
+    // these natives shadow the real STPE bytecode. Route both directions
+    // through the real fields by name; the getters keep the JDK default when
+    // the field is absent, which is the synthetic-mode carrier (no real STPE
+    // class, so `set_field_by_name` is a documented no-op there and the
+    // synthetic executor stays at its defaults, exactly as before).
     r.register(
         ses,
         "setContinueExistingPeriodicTasksAfterShutdownPolicy",
         "(Z)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| stpe_set_policy(ctx, args, STPE_POLICY_CONTINUE_PERIODIC),
     );
     r.register(
         ses,
         "setExecuteExistingDelayedTasksAfterShutdownPolicy",
         "(Z)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| stpe_set_policy(ctx, args, STPE_POLICY_EXECUTE_DELAYED),
     );
-    r.register(ses, "setRemoveOnCancelPolicy", "(Z)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(ses, "setRemoveOnCancelPolicy", "(Z)V", |ctx, args| {
+        stpe_set_policy(ctx, args, STPE_POLICY_REMOVE_ON_CANCEL)
     });
     r.register(
         ses,
         "getContinueExistingPeriodicTasksAfterShutdownPolicy",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| stpe_get_policy(ctx, args, STPE_POLICY_CONTINUE_PERIODIC, 0),
     );
     r.register(
         ses,
         "getExecuteExistingDelayedTasksAfterShutdownPolicy",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| stpe_get_policy(ctx, args, STPE_POLICY_EXECUTE_DELAYED, 1),
     );
-    r.register(ses, "getRemoveOnCancelPolicy", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ses, "getRemoveOnCancelPolicy", "()Z", |ctx, args| {
+        stpe_get_policy(ctx, args, STPE_POLICY_REMOVE_ON_CANCEL, 0)
     });
     r.register(ses, "execute", "(Ljava/lang/Runnable;)V", |ctx, args| {
         if let Some(Value::Object(Some(task))) = args.get(1).copied() {
@@ -9424,9 +9708,30 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         Ok(Some(core_pool_size))
     });
     r.set_category(__core_getter_category);
-    r.register(ses, "getPoolSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // W2: `getPoolSize` answered a constant 0, so a caller checking "does this
+    // scheduler have any threads?" concluded it had none even right after
+    // `new ScheduledThreadPoolExecutor(8)`. Serve the real `poolSize` field
+    // where it exists and otherwise the configured core size, mirroring the
+    // `getCorePoolSize` bridge immediately above.
+    r.register(ses, "getPoolSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let n = match ctx.get_field_by_name(this, "poolSize") {
+            Value::Int(v) => Value::Int(v),
+            // Synthetic STPE objects have only the historical slot layout,
+            // whose slot 0 is the core pool size.
+            _ if ctx.object_num_fields(this) > 0 => ctx.get_field(this, 0),
+            _ => Value::Int(1),
+        };
+        Ok(Some(n))
     });
+    // KEEP (all three): these are honest for the carrier that can actually
+    // reach them. A REAL ScheduledThreadPoolExecutor never does — these three
+    // are declared on `ThreadPoolExecutor`, so the declaring-class lookup
+    // resolves to native-collections' `tp`-keyed registrations, which delegate
+    // to the genuine JDK bytecode via `invoke_special_bytecode_only`. The only
+    // receiver left here is the synthetic 2-slot carrier, whose `execute`
+    // runs each Runnable inline and returns, so at every observable moment it
+    // has zero active tasks and keeps no task counters at all.
     r.register(ses, "getActiveCount", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -9872,8 +10177,44 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(n);
         Ok(Some(Value::Object(Some(s))))
     });
-    r.register(c, "sleep", "(J)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // W2: `TimeUnit.sleep` used to return immediately. A no-op sleep is not a
+    // harmless speed-up — it is the classic cause of "works on my machine"
+    // flakiness in this tree, because every `SECONDS.sleep(1)` backoff,
+    // poll-loop pacer and rate limiter degenerates into a hot spin. Sleep for
+    // real, in the same 25ms slices `awaitTermination` above uses, so a GC
+    // safepoint is never blocked for longer than one slice.
+    r.register(c, "sleep", "(J)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let d = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
+        // A non-positive duration is a no-op in the real JDK too.
+        if d <= 0 {
+            return Ok(None);
+        }
+        let o = match ctx.get_field_by_name(this, "ordinal") {
+            Value::Int(v) => v,
+            _ => match ctx.get_field(this, 0) {
+                Value::Int(v) => v,
+                _ => 3,
+            },
+        };
+        let nanos = (d as i128) * (tu_nanos_per(o) as i128);
+        // Count down the remaining duration rather than comparing against a
+        // deadline `Instant`: `DAYS.sleep(Long.MAX_VALUE)` would overflow
+        // `Instant + Duration` and panic.
+        let mut remaining =
+            std::time::Duration::from_nanos(nanos.clamp(0, u64::MAX as i128) as u64);
+        while !remaining.is_zero() {
+            let chunk = remaining.min(std::time::Duration::from_millis(25));
+            ctx.begin_blocking_region();
+            std::thread::sleep(chunk);
+            ctx.end_blocking_region();
+            remaining -= chunk;
+        }
+        Ok(None)
     });
     r.set_category(__prev_cat);
 }
@@ -12552,6 +12893,22 @@ fn provider_registry_remove(name: &str) {
     }
 }
 
+/// W2: `java.security.Security` properties written by `setProperty`.
+///
+/// `Security.setProperty` used to be a no-op while `Security.getProperty`
+/// served a fixed four-entry table, so a caller that reconfigured the JCE
+/// (`Security.setProperty("keystore.type", "JKS")`, or any of the
+/// `crypto.policy` / `jdk.tls.*` knobs) read its own default straight back and
+/// concluded the change had been rejected. The real `Security` properties are
+/// process-global and survive for the life of the VM, so a process-global map
+/// is the right shape here.
+fn security_properties() -> &'static parking_lot::Mutex<std::collections::HashMap<String, String>> {
+    use std::sync::OnceLock;
+    static PROPS: OnceLock<parking_lot::Mutex<std::collections::HashMap<String, String>>> =
+        OnceLock::new();
+    PROPS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
 // ---------------------------------------------------------------------------
 // javax.crypto.Cipher — 6-field synthetic
 //   algorithm=0, mode=1, key=2, iv=3, accumulated=4, aad=5
@@ -12773,7 +13130,10 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, CIPHER_IV)))
     });
-    // Constants
+    // Constants — KEEP. These are `static final int` FIELD reads (note the "I"
+    // field descriptor, not a method descriptor), and 1/2/3/4 are the literal
+    // values `javax.crypto.Cipher` declares. A constant is the correct
+    // implementation of a constant.
     r.register(cipher, "ENCRYPT_MODE", "I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -12929,16 +13289,31 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    // init(SecureRandom) — leave keySize at its default, just no-op.
+    // init(SecureRandom) — W2: this was a no-op, which is not the same thing as
+    // "leave keySize at its default": after an earlier `init(256)` the field
+    // still held 256, so `kg.init(256); kg.init(random); kg.generateKey()`
+    // handed back a 256-bit key where the real JDK re-initialises the SPI and
+    // returns the provider default. Reset the size; the randomness argument is
+    // still ignored (generateKey() uses the VM's own CSPRNG).
     r.register(
         kg,
         "init",
         "(Ljava/security/SecureRandom;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(this, 1, Value::Int(128));
+            Ok(None)
+        },
     );
-    // init(AlgorithmParameterSpec) / init(AlgorithmParameterSpec, SecureRandom) —
-    // BC chooses keySize internally from the spec; we accept the call and
-    // leave field 1 alone. generateKey() will fall back to the 128-bit default.
+    // KEEP (both): init(AlgorithmParameterSpec[, SecureRandom]) accepts the
+    // call and leaves field 1 alone, so generateKey() falls back to the 128-bit
+    // default. This is deliberate, not an oversight: `AlgorithmParameterSpec`
+    // is an empty marker interface, so there is no provider-independent way to
+    // read a key size out of it, and the JCE contract lets a provider ignore
+    // parameters it does not recognise. Throwing
+    // `InvalidAlgorithmParameterException` instead would break the BouncyCastle
+    // clients that call this purely to pass a curve/nonce spec (see the
+    // Round-15 BcProbe note on `getInstance` above).
     r.register(
         kg,
         "init",
@@ -14507,6 +14882,13 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => return Ok(Some(Value::Object(None))),
             };
+            // W2: a value installed by `setProperty` wins over the built-in
+            // defaults below, exactly as it does in the real `Security`.
+            let stored = security_properties().lock().get(&prop_name).cloned();
+            if let Some(v) = stored {
+                let s = ctx.create_string(&v);
+                return Ok(Some(Value::Object(Some(s))));
+            }
             let val = match prop_name.as_str() {
                 "securerandom.source" => "file:/dev/urandom",
                 "keystore.type" => "PKCS12",
@@ -14518,12 +14900,36 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    // Security.setProperty(String, String)
+    // Security.setProperty(String, String) — W2: was a no-op, so every
+    // `setProperty`/`getProperty` round-trip reported that the write had not
+    // taken. Record it in the process-global map `getProperty` above consults.
     r.register(
         sec,
         "setProperty",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let key = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                // The real `Security.setProperty` NPEs on a null key.
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Security.setProperty: null key".to_string()),
+                    }
+                    .into())
+                }
+            };
+            let val = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Security.setProperty: null value".to_string()),
+                    }
+                    .into())
+                }
+            };
+            security_properties().lock().insert(key, val);
+            Ok(None)
+        },
     );
     // Security.getAlgorithms(String type) -> Set<String>
     r.register(
@@ -14981,6 +15387,19 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
     );
 
     // --- java.security.KeyPairGenerator — 1-field (algorithm=0) ---
+    // Argument check shared by both `KeyPairGenerator.initialize` overloads.
+    // `InvalidParameterException extends IllegalArgumentException`, which is
+    // the closest `RuntimeError` variant.
+    fn kpg_check_keysize(args: &[Value]) -> Result<(), MethodCallFailed> {
+        let keysize = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if keysize <= 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("Invalid key size: {keysize}"),
+            }
+            .into());
+        }
+        Ok(())
+    }
     let kpg = "java/security/KeyPairGenerator";
     r.register(
         kpg,
@@ -14993,14 +15412,28 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    r.register(kpg, "initialize", "(I)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // W2: both `initialize` overloads accepted anything silently. There is no
+    // public key-size GETTER on `KeyPairGenerator`, so the size itself is not
+    // observable and storing it would be dead state — but the ARGUMENT CHECK
+    // is observable, and the real JDK rejects a nonsensical size with
+    // `InvalidParameterException` (a subclass of `IllegalArgumentException`)
+    // rather than pretending to configure the generator. Validate, then accept.
+    //
+    // NOTE (out of scope for the stub sweep, but adjacent): `generateKeyPair`
+    // below still hands back zero-length public/private keys regardless of the
+    // size requested here.
+    r.register(kpg, "initialize", "(I)V", |_ctx, args| {
+        kpg_check_keysize(args)?;
+        Ok(None)
     });
     r.register(
         kpg,
         "initialize",
         "(ILjava/security/SecureRandom;)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |_ctx, args| {
+            kpg_check_keysize(args)?;
+            Ok(None)
+        },
     );
     r.register(
         kpg,
@@ -16047,8 +16480,22 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
-    r.register(sis, "close", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // W2: this was a no-op, so a caller that only ever closed the stream (the
+    // usual try-with-resources shape) never released the TcpStream: the entry
+    // stayed in `s2_registry` and the OS socket stayed open for the life of
+    // the VM. Closing a socket's stream closes the socket in the real JDK too,
+    // so mirror `java/net/Socket.close` here. The carrier is entirely ours —
+    // `java/net/SocketInputStream` is only ever allocated by
+    // `Socket.getInputStream` a few hundred lines above — so nothing outside
+    // this file can be surprised by the stronger semantics.
+    r.register(sis, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
+        if sid >= 0 {
+            s2_registry().lock().streams.remove(&sid);
+        }
+        ctx.set_field(this, SIO_STREAM_ID, Value::Int(-1));
+        Ok(None)
     });
 
     // ===== SocketOutputStream — real write to TcpStream =====
@@ -16141,8 +16588,25 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(None)))
     });
-    r.register(sos, "close", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // W2: same leak as `SocketInputStream.close` above, plus a data-loss risk —
+    // `close()` must flush first, or the last unflushed write is silently
+    // dropped.
+    r.register(sos, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = ctx.get_field(this, SIO_STREAM_ID).as_int().unwrap_or(-1);
+        if sid >= 0 {
+            let stream = {
+                let reg = s2_registry().lock();
+                reg.streams.get(&sid).cloned()
+            };
+            if let Some(stream) = stream {
+                let mut stream_ref = &*stream;
+                let _ = stream_ref.flush();
+            }
+            s2_registry().lock().streams.remove(&sid);
+        }
+        ctx.set_field(this, SIO_STREAM_ID, Value::Int(-1));
+        Ok(None)
     });
 
     // ===== java.net.ServerSocket — 4-field (port, backlog, closed, listener_id) =====
@@ -16366,6 +16830,12 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // KEEP. 0 means "infinite" for `ServerSocket.getSoTimeout`, and that is the
+    // truthful answer for this carrier: the `setSoTimeout` above is a
+    // documented no-op (`accept()` calls `s2_blocking_accept`, which has no
+    // timeout), so echoing back a stored value would tell the caller that
+    // `accept()` will time out when it never will. The real gap is
+    // `setSoTimeout`+`accept`, not this getter.
     r.register(ss, "getSoTimeout", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -17798,6 +18268,33 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
 // ---------------------------------------------------------------------------
 // java.util.logging extras: Handler, LogRecord, Formatter, LogManager
 // ---------------------------------------------------------------------------
+/// `java.util.logging.Handler.close()` / `.flush()` (W2).
+///
+/// Both are abstract on the real `Handler`, so this native is reached with a
+/// CONCRETE subclass as the receiver. Dispatch to that subclass's own bytecode;
+/// only a bare `java.util.logging.Handler` (which has no implementation
+/// anywhere) keeps the historical no-op.
+fn jul_handler_delegate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &'static str,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cid = ctx.class_id_of_object(this);
+    let is_bare_handler = match ctx.class_name_of_id(cid) {
+        Some(name) => name == "java/util/logging/Handler",
+        // Unknown class: keep the old no-op rather than risk an
+        // AbstractMethodError on a receiver we cannot identify.
+        None => true,
+    };
+    if is_bare_handler {
+        return Ok(None);
+    }
+    // `_bytecode_only` skips native lookup, so this cannot re-enter here.
+    ctx.invoke_virtual_bytecode_only(this, method, "()V", &[])?;
+    Ok(None)
+}
+
 pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -18061,11 +18558,25 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
-    r.register(handler, "close", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // W2: `Handler.close()`/`flush()` are ABSTRACT in the real JDK. An abstract
+    // method takes the `check_override` branch, which marks the site native
+    // regardless and caches by RECEIVER class, so these two no-ops did not just
+    // serve a bare synthetic `Handler` — they intercepted every concrete
+    // subclass that did not have its own native. `FileHandler.close()` then
+    // never flushed or released its file descriptor and `StreamHandler.flush()`
+    // never reached the stream, which is the same "stale JUL stub silently ate
+    // the output" shape the `ConsoleHandler`/`SimpleFormatter` removals a few
+    // lines below already document.
+    //
+    // Run the receiver's own bytecode instead. The only receiver that has none
+    // is a bare `java/util/logging/Handler` (abstract — javac will not let user
+    // code instantiate it; `logmanager.rs` allocates one directly in a test),
+    // so that exact class keeps the historical no-op.
+    r.register(handler, "close", "()V", |ctx, args| {
+        jul_handler_delegate(ctx, args, "close")
     });
-    r.register(handler, "flush", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(handler, "flush", "()V", |ctx, args| {
+        jul_handler_delegate(ctx, args, "flush")
     });
 
     // --- ConsoleHandler ---
@@ -18691,11 +19202,59 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // getErrorStream() — the 4xx/5xx response body. This used to be a constant
+    // `null`, which (like the timeout setters above) SHADOWED
+    // `http_url_connection.rs`'s real `huc_get_error_stream`, because
+    // `register_phase54_net_extras` runs after
+    // `register_http_url_connection_real`. Callers that read the error body to
+    // build a diagnostic (`RestTemplate` error handlers, `URLConnection`-based
+    // clients) got nothing at all on every failed request.
+    //
+    // The body is already in slot 6 of this file's 16-slot carrier (the one
+    // `net_phase_e::register_re4_url_http` allocates, whose HUC_* constants are
+    // identical to the layout documented at the top of this block), so serve it
+    // from there, mirroring the `getInputStream` registration ~200 lines above.
+    //
+    // Per the javadoc this must NOT initiate a connection: an unconnected
+    // carrier, a success status, or no buffered body all answer null.
     r.register(
         huc,
         "getErrorStream",
         "()Ljava/io/InputStream;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Layout guard: `java/net/HttpURLConnection` carries two synthetic
+            // layouts in this tree. In this file's 16-slot one, slot 2 is the
+            // response code (an Int); in `http_url_connection.rs`'s 12-slot one
+            // it is the request-method String. Anything that is not this layout
+            // keeps the previous `null` answer rather than misreading slots.
+            if ctx.object_num_fields(this) < 10 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let code = match ctx.get_field(this, 2) {
+                Value::Int(c) => c,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if ctx.get_field(this, 9).as_int().unwrap_or(0) == 0 || code < 400 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let body_arr = match ctx.get_field(this, 6) {
+                Value::Object(Some(a)) => a,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let len = ctx.array_length(body_arr) as i32;
+            // Pin the body across the stream allocation — a moving young GC
+            // there would relocate it (native stale-local family).
+            let body_pin = ctx.pin_native_root(body_arr);
+            let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let body_arr = ctx.read_native_pin(body_pin, body_arr);
+            ctx.unpin_native_roots(body_pin);
+            ctx.set_field(stream, 0, Value::Object(Some(body_arr))); // buf
+            ctx.set_field(stream, 1, Value::Int(0)); // pos
+            ctx.set_field(stream, 2, Value::Int(0)); // mark
+            ctx.set_field(stream, 3, Value::Int(len)); // count
+            Ok(Some(Value::Object(Some(stream))))
+        },
     );
     // More HUC instance setters — same shadowing story as the timeouts above.
     r.register(huc, "setInstanceFollowRedirects", "(Z)V", |ctx, args| {
@@ -18748,7 +19307,9 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         p54_huc_set_chunked_streaming_mode,
     );
 
-    // HTTP response code constants
+    // HTTP response code constants — KEEP. `static final int` FIELD reads (the
+    // "I" field descriptor), whose values are fixed by RFC 9110 and declared
+    // literally in `java.net.HttpURLConnection`.
     r.register(huc, "HTTP_OK", "I", |_ctx, _args| Ok(Some(Value::Int(200))));
     r.register(huc, "HTTP_CREATED", "I", |_ctx, _args| {
         Ok(Some(Value::Int(201)))
@@ -19282,7 +19843,8 @@ pub(crate) fn register_phase54_zip_stubs(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    // ZipEntry constants
+    // ZipEntry constants — KEEP. `static final int` FIELD reads; 0/8 are the
+    // PKZIP compression-method numbers `java.util.zip.ZipEntry` declares.
     r.register(ze, "STORED", "I", |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(ze, "DEFLATED", "I", |_ctx, _args| Ok(Some(Value::Int(8))));
 

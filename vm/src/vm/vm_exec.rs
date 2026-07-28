@@ -17862,6 +17862,22 @@ fn invoke_on_class_shared_inner(
                                     // parent-less synthetic Logger, so every
                                     // log call short-circuits to a no-op.
                                     | "isLoggable"
+                                    // Stub-removal wave 2 (2026-07-27): these
+                                    // four are backed by identity-hash side
+                                    // tables in `lib.rs`, not by the real
+                                    // Logger's own fields, so the native and
+                                    // the real bytecode read different state.
+                                    // Without an allow-list entry the native
+                                    // loses to concrete bytecode in real-JDK
+                                    // mode and the write is silently dropped:
+                                    // `setUseParentHandlers(false)` still read
+                                    // back `true`, and `setParent` disagreed
+                                    // with `getParent`. Each pair must be
+                                    // listed TOGETHER — allow-listing only one
+                                    // side reinstates the same disagreement in
+                                    // the opposite direction.
+                                    | "setUseParentHandlers" | "getUseParentHandlers"
+                                    | "setParent" | "getParent"
                             ))
                         || (class_name == "java/util/logging/LogRecord"
                             && matches!(method_name, "<init>" | "getLevel" | "getMessage"))

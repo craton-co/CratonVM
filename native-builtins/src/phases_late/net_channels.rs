@@ -640,10 +640,15 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(sk, "OP_READ", "I", |_ctx, _args| Ok(Some(Value::Int(1))));
-    r.register(sk, "OP_WRITE", "I", |_ctx, _args| Ok(Some(Value::Int(4))));
-    r.register(sk, "OP_CONNECT", "I", |_ctx, _args| Ok(Some(Value::Int(8))));
-    r.register(sk, "OP_ACCEPT", "I", |_ctx, _args| Ok(Some(Value::Int(16))));
+    // REMOVED (stub-removal wave 2): `SelectionKey.OP_READ/OP_WRITE/OP_CONNECT/
+    // OP_ACCEPT` were registered as *methods* with the FIELD descriptor "I".
+    // The registry is keyed on (class, method, descriptor) and every lookup
+    // comes from an invoke instruction, whose descriptor always starts with
+    // '('; javac emits `getstatic` for these `static final int` constants and
+    // there is no getstatic-to-native path. The four entries could therefore
+    // never be selected in either run mode — dead registrations, not stubs.
+    // (`native-io/src/lib.rs` separately registers them with a well-formed
+    // "()I" descriptor; that one is at least reachable by an explicit call.)
 
     let sac = "java/nio/channels/SelectableChannel";
     r.register(
@@ -773,7 +778,7 @@ pub(crate) fn p98_selector_select(ctx: &mut dyn NativeContext, args: &[Value]) -
 /// Blocking select: loops polling with 1ms sleeps until ready_count > 0 or wakeup flag is set.
 pub(crate) fn p98_blocking_select(
     ctx: &mut dyn NativeContext,
-    selector: ObjectRef,
+    mut selector: ObjectRef,
     timeout_ms: i64,
 ) -> MethodCallResult {
     // Clear wakeup flag at start
@@ -795,7 +800,19 @@ pub(crate) fn p98_blocking_select(
         if std::time::Instant::now() >= deadline {
             return Ok(Some(Value::Int(0)));
         }
+        // GC-safety: this is a poll loop that can run for the whole caller
+        // timeout (an event loop's `select(t)`). Without a blocking region the
+        // thread is neither at a safepoint nor GC-cooperative while it sleeps,
+        // so a stop-the-world collector waits out the full timeout behind it.
+        // `selector` is re-read through `end_blocking_region_refs` because a
+        // collection completing inside the sleep can relocate it.
+        ctx.begin_timed_blocking_region();
         std::thread::sleep(std::time::Duration::from_millis(1));
+        let mut refs = [Value::Object(Some(selector))];
+        ctx.end_blocking_region_refs(&mut refs);
+        if let Value::Object(Some(moved)) = refs[0] {
+            selector = moved;
+        }
     }
 }
 
@@ -1720,11 +1737,62 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         }
     });
+    // awaitTermination(timeout, unit) — the constant `true` here claimed the
+    // group had terminated even when `shutdown()` was never called, so a
+    // caller's "did my I/O drain?" check always passed. Report the real state
+    // (field 0 == 0 means shut down, same encoding `isTerminated` reads) and
+    // honour the timeout by polling for it.
+    //
+    // MAY BLOCK: bounded by the caller's own timeout, inside a timed blocking
+    // region so a stop-the-world GC does not queue up behind the wait.
     r.register(
         acg,
         "awaitTermination",
         "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            let mut this = obj_arg(args, 0)?;
+            let timeout = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                Some(Value::Int(v)) => *v as i64,
+                _ => 0,
+            };
+            // TimeUnit -> milliseconds via the unit's own bytecode; a failed
+            // upcall degrades to "treat the number as milliseconds", never to
+            // an unbounded wait.
+            let timeout_ms = match args.get(2) {
+                Some(Value::Object(Some(unit))) => {
+                    match ctx.invoke_virtual(*unit, "toMillis", "(J)J", &[Value::Long(timeout)]) {
+                        Ok(Some(Value::Long(ms))) => ms,
+                        _ => timeout,
+                    }
+                }
+                _ => timeout,
+            };
+            fn terminated(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+                ctx.object_num_fields(this) > 0 && ctx.get_field(this, 0).as_int().unwrap_or(1) == 0
+            }
+            if timeout_ms <= 0 || terminated(ctx, this) {
+                let done = terminated(ctx, this);
+                return Ok(Some(Value::Int(if done { 1 } else { 0 })));
+            }
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+            loop {
+                if terminated(ctx, this) {
+                    return Ok(Some(Value::Int(1)));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(Some(Value::Int(0)));
+                }
+                ctx.begin_timed_blocking_region();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                let mut refs = [Value::Object(Some(this))];
+                ctx.end_blocking_region_refs(&mut refs);
+                if let Value::Object(Some(moved)) = refs[0] {
+                    this = moved;
+                }
+            }
+        },
     );
 
     // =========================================================================
@@ -2270,27 +2338,52 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    r.register(wsl, "onText", "(Ljava/net/http/WebSocket;Ljava/lang/CharSequence;Z)Ljava/util/concurrent/CompletionStage;", |_ctx, _args| {
+    // onText / onBinary / onPing / onPong: the JDK defaults are
+    //     webSocket.request(1); return null;
+    // NOT `return null`. Returning null alone leaves the demand counter at the
+    // single unit `onOpen` handed out, so a listener that relies on the default
+    // for any one message type receives exactly one message and then stalls
+    // forever — a backpressure deadlock, not an error. Renew the demand here,
+    // through the WebSocket's own `request` native (which saturating-adds to
+    // P69_WS_DEMAND), exactly as `onOpen` above does. Errors from the upcall are
+    // dropped: the JDK default cannot fail, and a failure to renew demand must
+    // not become a second, different failure in the caller's message callback.
+    fn ws_listener_default_renew_demand(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+    ) -> MethodCallResult {
+        if let Some(Value::Object(Some(ws))) = args.get(1) {
+            let _ = ctx.invoke_virtual(*ws, "request", "(J)V", &[Value::Long(1)]);
+        }
         Ok(Some(Value::Object(None)))
-    });
+    }
+    r.register(
+        wsl,
+        "onText",
+        "(Ljava/net/http/WebSocket;Ljava/lang/CharSequence;Z)Ljava/util/concurrent/CompletionStage;",
+        ws_listener_default_renew_demand,
+    );
     r.register(
         wsl,
         "onBinary",
         "(Ljava/net/http/WebSocket;Ljava/nio/ByteBuffer;Z)Ljava/util/concurrent/CompletionStage;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        ws_listener_default_renew_demand,
     );
     r.register(
         wsl,
         "onPing",
         "(Ljava/net/http/WebSocket;Ljava/nio/ByteBuffer;)Ljava/util/concurrent/CompletionStage;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        ws_listener_default_renew_demand,
     );
     r.register(
         wsl,
         "onPong",
         "(Ljava/net/http/WebSocket;Ljava/nio/ByteBuffer;)Ljava/util/concurrent/CompletionStage;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        ws_listener_default_renew_demand,
     );
+    // KEEP: `Listener.onClose`'s JDK default really is `return null;` — it is
+    // the one message callback that does NOT renew demand (the connection is
+    // closing, so there is nothing left to request). The constant is the spec.
     r.register(
         wsl,
         "onClose",
@@ -2585,6 +2678,14 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Int(0)));
         Ok(None)
     });
+    // KEEP: the synthetic `DatagramPacket` is a 4-slot object
+    // (data/length/address/port) with no offset slot, and the
+    // `([BIILjava/net/InetAddress;I)V` constructor above deliberately drops its
+    // `offset` argument — every packet this surface builds genuinely starts at
+    // index 0, so 0 is the accurate answer for the object as constructed, not a
+    // placeholder. (The dropped constructor argument is the real defect and is
+    // reported separately; fixing it needs a fifth slot, which is a layout
+    // change shared with `class_manager`'s synthetic field table.)
     r.register(dp, "getOffset", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -2850,19 +2951,37 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Int(0)));
         Ok(None)
     });
+    // setReuseAddress / getReuseAddress were a discard-then-lie pair: the setter
+    // threw the flag away and the getter always answered `false`, so
+    // `s.setReuseAddress(true); s.getReuseAddress()` returned false. Both halves
+    // now go to the real socket — `fd_table` already exposes the setter, and the
+    // getter reads SO_REUSEADDR back through socket2 on a dup of the fd (dup'ing
+    // shares the option state; dropping the dup closes only the duplicate).
     r.register(ds, "setReuseAddress", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
         if fd_id >= 0 {
             let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-            let entries = ctx.fd_table();
-            // socket2 SockRef would need direct access; store as field for now
-            let _ = (entries, on); // Reuseaddr must be set before bind per spec — already bound
+            let _ = ctx.fd_table().udp_set_reuse_address(fd_id as u32, on);
         }
         Ok(None)
     });
-    r.register(ds, "getReuseAddress", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ds, "getReuseAddress", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd_id < 0 {
+            return Err(RuntimeError::IOException {
+                message: "getReuseAddress: socket is closed".into(),
+            }
+            .into());
+        }
+        let on = ctx
+            .fd_table()
+            .udp_try_clone(fd_id as u32)
+            .ok()
+            .and_then(|s| socket2::SockRef::from(&s).reuse_address().ok())
+            .unwrap_or(false);
+        Ok(Some(Value::Int(if on { 1 } else { 0 })))
     });
     r.register(ds, "connect", "(Ljava/net/InetAddress;I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2898,8 +3017,25 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(ds, "getBroadcast", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // `setBroadcast` above really does set SO_BROADCAST on the fd, so a constant
+    // `false` getter contradicted the setter that had just run. Read the option
+    // back off the socket (via a dup, which shares option state).
+    r.register(ds, "getBroadcast", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd_id < 0 {
+            return Err(RuntimeError::IOException {
+                message: "getBroadcast: socket is closed".into(),
+            }
+            .into());
+        }
+        let on = ctx
+            .fd_table()
+            .udp_try_clone(fd_id as u32)
+            .ok()
+            .and_then(|s| s.broadcast().ok())
+            .unwrap_or(false);
+        Ok(Some(Value::Int(if on { 1 } else { 0 })))
     });
 
     // MulticastSocket = 5-field (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
@@ -3172,6 +3308,98 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
 // =============================================================================
 // java.nio.channels.DatagramChannel — non-blocking UDP (JEP U6)
 // =============================================================================
+
+/// Read a `SocketOption`'s `name()` (`"SO_BROADCAST"`, `"SO_RCVBUF"`, …).
+///
+/// Real `StandardSocketOptions` members expose the name through a `name` field;
+/// the synthetic ones answer the `name()` accessor. Try the field first (no
+/// upcall, so no allocation and no safepoint) and fall back to the virtual call.
+fn dc_option_name(ctx: &mut dyn NativeContext, opt: Option<Value>) -> String {
+    let obj = match opt {
+        Some(Value::Object(Some(o))) => o,
+        _ => return String::new(),
+    };
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(obj, "name") {
+        if let Some(name) = ctx.read_string(s) {
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    match ctx.invoke_virtual(obj, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Unwrap a `SocketOption` payload, which arrives boxed (`Boolean`/`Integer`)
+/// because the setter is erased to `(SocketOption, Object)`.
+fn dc_option_int(ctx: &mut dyn NativeContext, value: Option<Value>) -> i32 {
+    match value {
+        Some(Value::Int(v)) => v,
+        Some(Value::Object(Some(b))) => {
+            // Both wrappers keep their scalar in slot 0 (real JDK `value`),
+            // so read it directly instead of paying for an upcall.
+            match ctx.get_field(b, 0).as_int() {
+                Some(v) => v,
+                None => match ctx.invoke_virtual(b, "intValue", "()I", &[]) {
+                    Ok(Some(Value::Int(v))) => v,
+                    _ => 0,
+                },
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Box a socket-option value as the type its `SocketOption<T>` declares.
+/// `getOption` is `<T> T`, so returning a raw `Value::Int` for an object-typed
+/// method coerces to null and the caller NPEs on the unbox.
+fn dc_box_option(ctx: &mut dyn NativeContext, name: &str, raw: i32) -> MethodCallResult {
+    if matches!(name, "SO_BROADCAST" | "SO_REUSEADDR" | "SO_REUSEPORT") {
+        ctx.invoke(
+            "java/lang/Boolean",
+            "valueOf",
+            "(Z)Ljava/lang/Boolean;",
+            &[Value::Int(if raw != 0 { 1 } else { 0 })],
+        )
+    } else {
+        ctx.invoke(
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(raw)],
+        )
+    }
+}
+
+/// Build a real `java.net.InetSocketAddress` (3-slot object over the JDK's
+/// `InetSocketAddressHolder`) for `ip:port`.
+///
+/// Every intermediate reference is pinned across the allocation that follows
+/// it — four allocations happen here and a moving young GC at any of them
+/// relocates the ones already built (native stale-local family).
+fn p72_alloc_inet_socket_address(ctx: &mut dyn NativeContext, ip: &str, port: i32) -> ObjectRef {
+    let host0 = ctx.create_string(ip);
+    let host_pin = ctx.pin_native_root(host0);
+    let addr0 = crate::net_phase_e::alloc_inet_address_external(ctx, ip, ip);
+    let addr_pin = ctx.pin_native_root(addr0);
+    let holder0 =
+        alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress$InetSocketAddressHolder", 3);
+    let holder_pin = ctx.pin_native_root(holder0);
+    let isa = alloc_concurrent_synthetic(ctx, "java/net/InetSocketAddress", 3);
+    let host = ctx.read_native_pin(host_pin, host0);
+    let addr = ctx.read_native_pin(addr_pin, addr0);
+    let holder = ctx.read_native_pin(holder_pin, holder0);
+    ctx.set_field(holder, 0, Value::Object(Some(host)));
+    ctx.set_field(holder, 1, Value::Object(Some(addr)));
+    ctx.set_field(holder, 2, Value::Int(port));
+    ctx.set_field(isa, 0, Value::Object(Some(holder)));
+    ctx.set_field(isa, 1, Value::Int(port));
+    ctx.set_field(isa, 2, Value::Object(Some(addr)));
+    ctx.unpin_native_roots(host_pin);
+    isa
+}
 
 pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -3698,29 +3926,120 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // getRemoteAddress() -> SocketAddress
+    // getRemoteAddress() -> SocketAddress. The constant null said "not
+    // connected" even right after a successful `connect()`, so a caller
+    // checking the peer before writing saw an unconnected channel forever.
+    // Read the real peer off the registry socket; null now genuinely means
+    // "not connected" (which is what the JDK returns in that case).
     r.register(
         dc,
         "getRemoteAddress",
         "()Ljava/net/SocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            if sid < 0 || ctx.get_field(this, 2).as_int().unwrap_or(0) == 0 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let peer = {
+                let reg = crate::servlet::s2_registry().lock();
+                reg.dgrams.get(&sid).and_then(|s| s.peer_addr().ok())
+            };
+            match peer {
+                Some(a) => Ok(Some(Value::Object(Some(p72_alloc_inet_socket_address(
+                    ctx,
+                    &a.ip().to_string(),
+                    a.port() as i32,
+                ))))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
 
-    // setOption / getOption stubs
+    // setOption / getOption — previously a discard-and-return-`this` setter
+    // paired with an always-null getter. A null from `getOption` is worse than
+    // wrong: `NetworkChannel.getOption` is declared `<T> T`, so the caller
+    // unboxes it and gets an NPE. Both halves now talk to the real UDP socket,
+    // and an option this surface does not model raises the exception the JDK
+    // spec names for that case instead of answering null.
     r.register(
         dc,
         "setOption",
         "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/DatagramChannel;",
-        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = dc_option_name(ctx, args.get(1).copied());
+            let value = dc_option_int(ctx, args.get(2).copied());
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            if sid >= 0 {
+                let reg = crate::servlet::s2_registry().lock();
+                if let Some(sock) = reg.dgrams.get(&sid) {
+                    let sr = socket2::SockRef::from(sock);
+                    let applied = match name.as_str() {
+                        "SO_BROADCAST" => sr.set_broadcast(value != 0),
+                        "SO_REUSEADDR" => sr.set_reuse_address(value != 0),
+                        "SO_SNDBUF" => sr.set_send_buffer_size(value.max(0) as usize),
+                        "SO_RCVBUF" => sr.set_recv_buffer_size(value.max(0) as usize),
+                        "IP_MULTICAST_TTL" | "IP_TTL" => sr.set_ttl(value.max(0) as u32),
+                        _ => {
+                            return Err(RuntimeError::UnsupportedOperationException {
+                                message: format!("DatagramChannel option not supported: {name}"),
+                            }
+                            .into())
+                        }
+                    };
+                    let _ = applied;
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
     r.register(
         dc,
         "getOption",
         "(Ljava/net/SocketOption;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = dc_option_name(ctx, args.get(1).copied());
+            let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+            let raw = {
+                let reg = crate::servlet::s2_registry().lock();
+                match reg.dgrams.get(&sid) {
+                    Some(sock) => {
+                        let sr = socket2::SockRef::from(sock);
+                        match name.as_str() {
+                            "SO_BROADCAST" => Some(sr.broadcast().map(i32::from).unwrap_or(0)),
+                            "SO_REUSEADDR" => Some(sr.reuse_address().map(i32::from).unwrap_or(0)),
+                            "SO_SNDBUF" => Some(sr.send_buffer_size().unwrap_or(0) as i32),
+                            "SO_RCVBUF" => Some(sr.recv_buffer_size().unwrap_or(0) as i32),
+                            "IP_MULTICAST_TTL" | "IP_TTL" => Some(sr.ttl().unwrap_or(0) as i32),
+                            _ => None,
+                        }
+                    }
+                    // Not bound yet: still answer the options we model, with the
+                    // JDK defaults, rather than null.
+                    None => match name.as_str() {
+                        "SO_BROADCAST" | "SO_REUSEADDR" => Some(0),
+                        "SO_SNDBUF" | "SO_RCVBUF" => Some(0),
+                        "IP_MULTICAST_TTL" | "IP_TTL" => Some(1),
+                        _ => None,
+                    },
+                }
+            };
+            match raw {
+                Some(v) => dc_box_option(ctx, &name, v),
+                None => Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("DatagramChannel option not supported: {name}"),
+                }
+                .into()),
+            }
+        },
     );
 
-    // validOps() -> int (SelectionKey.OP_READ | OP_WRITE = 1|4 = 5)
+    // KEEP: `DatagramChannel.validOps()` is specified to return exactly
+    // `SelectionKey.OP_READ | SelectionKey.OP_WRITE` (1 | 4 == 5) for every
+    // datagram channel — the constant IS the JDK implementation, which also
+    // returns a fixed 5.
     r.register(dc, "validOps", "()I", |_ctx, _args| Ok(Some(Value::Int(5))));
 
     // isBlocking() -> boolean
@@ -3791,6 +4110,60 @@ fn http_context_authenticator(ctx: &dyn NativeContext, hctx: ObjectRef) -> Optio
     handle.and_then(|h| ctx.resolve_global_root(h))
 }
 
+/// Generic (vm, identity-hash) -> global-root side table, used for the two
+/// `com.sun.net.httpserver` back-references the phase-72 synthetic layouts have
+/// no slot for: `HttpServer`'s executor and `HttpContext`'s owning server.
+///
+/// Same shape and the same GC contract as `http_context_authenticators` above:
+/// the stored value is a GLOBAL ROOT handle, not a raw `ObjectRef`, so a moving
+/// collector cannot leave the entry pointing at a vacated address.
+fn http_object_links(
+) -> &'static std::sync::Mutex<std::collections::HashMap<(u8, HttpContextKey), usize>> {
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u8, HttpContextKey), usize>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+const HTTP_LINK_EXECUTOR: u8 = 0;
+const HTTP_LINK_CONTEXT_SERVER: u8 = 1;
+
+fn http_link_set(
+    ctx: &mut dyn NativeContext,
+    kind: u8,
+    owner: ObjectRef,
+    target: Option<ObjectRef>,
+) {
+    let key = (kind, http_context_key(ctx, owner));
+    let handle = target
+        .map(|target| ctx.add_global_root(target))
+        .filter(|h| *h != 0);
+    let previous = {
+        let mut table = http_object_links()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match handle {
+            Some(h) => table.insert(key, h),
+            None => table.remove(&key),
+        }
+    };
+    // Nothing is handed back to Java here (unlike `setAuthenticator`), so the
+    // displaced root can and must be released.
+    if let Some(h) = previous {
+        ctx.remove_global_root(h);
+    }
+}
+
+fn http_link_get(ctx: &dyn NativeContext, kind: u8, owner: ObjectRef) -> Option<ObjectRef> {
+    let key = (kind, http_context_key(ctx, owner));
+    let handle = http_object_links()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied();
+    handle.and_then(|h| ctx.resolve_global_root(h))
+}
+
 pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3852,27 +4225,55 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             "createContext",
             "(Ljava/lang/String;)Lcom/sun/net/httpserver/HttpContext;",
             |ctx, args| {
+                let this = obj_arg(args, 0)?;
                 let path = args.get(1).copied().unwrap_or(Value::Object(None));
                 // Pin across the context alloc below — a moving young GC there
                 // would relocate it (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
                 let path_pin = pinned_object_value(ctx, path);
                 let hctx = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
                 let path = read_pinned_object_value(ctx, path_pin, path);
+                let this = ctx.read_native_pin(this_pin, this);
                 ctx.set_field(hctx, 0, path);
                 ctx.set_field(hctx, 1, Value::Object(None));
                 if let Some((h, _)) = path_pin {
                     ctx.unpin_native_roots(h);
                 }
+                // Record the owning server so `HttpContext.getServer()` can
+                // answer it (the 2-slot context layout has no room for it).
+                http_link_set(ctx, HTTP_LINK_CONTEXT_SERVER, hctx, Some(this));
+                ctx.unpin_native_roots(this_pin);
                 Ok(Some(Value::Object(Some(hctx))))
             },
         );
+        // set/getExecutor were a discard-then-null pair on this layout: the
+        // setter dropped the executor and the getter always answered null, so
+        // `server.setExecutor(pool); server.getExecutor()` returned null and a
+        // caller that dispatches through the returned executor NPEs. The
+        // phase-72 `HttpServer` is a 3-slot object (address/started/contexts)
+        // with no executor slot — unlike net_phase_e's 6-slot `HttpServerImpl`,
+        // whose real set/getExecutor stay in force for servers built by
+        // `HttpServer.create(addr, backlog)` — so bind the executor in the same
+        // rooted side table the authenticator uses.
         r.register(
             cls,
             "setExecutor",
             "(Ljava/util/concurrent/Executor;)V",
             |ctx, args| {
                 let this = obj_arg(args, 0)?;
-                let _ = (ctx, this);
+                if ctx.object_num_fields(this) > 1
+                    && ctx.get_field(this, 1).as_int().unwrap_or(0) != 0
+                {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "server already started".into(),
+                    }
+                    .into());
+                }
+                let exec = match args.get(1).copied() {
+                    Some(Value::Object(o)) => o,
+                    _ => None,
+                };
+                http_link_set(ctx, HTTP_LINK_EXECUTOR, this, exec);
                 Ok(None)
             },
         );
@@ -3880,7 +4281,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             cls,
             "getExecutor",
             "()Ljava/util/concurrent/Executor;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                Ok(Some(Value::Object(http_link_get(
+                    ctx,
+                    HTTP_LINK_EXECUTOR,
+                    this,
+                ))))
+            },
         );
         r.register(
             cls,
@@ -3892,6 +4300,16 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
+        // removeContext: `createContext(String)` above hands back a standalone
+        // 2-slot context and never files it anywhere, so on THIS layout there
+        // is genuinely nothing to unregister and the no-op is the whole
+        // operation. It is not a silent drop of live routing state — that lives
+        // in `net_phase_e::register_re10_http_server`, whose real
+        // `removeContext(String)` stays in force for servers created through
+        // `HttpServer.create(addr, backlog)` (its natives are aliased onto the
+        // concrete `sun/net/httpserver/HttpServerImpl` receiver those servers
+        // carry, and native dispatch keys on the receiver class, so these
+        // `com/sun/net/httpserver/HttpServer` entries never shadow them).
         r.register(
             cls,
             "removeContext",
@@ -3960,11 +4378,22 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(http_context_authenticator(ctx, this))))
         },
     );
+    // getServer() — the constant null broke the documented
+    // `context.getServer().getExecutor()` idiom (and any handler that walks
+    // back to its server) with an NPE. `createContext` above now records the
+    // owning server, so hand that back.
     r.register(
         hctx,
         "getServer",
         "()Lcom/sun/net/httpserver/HttpServer;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Object(http_link_get(
+                ctx,
+                HTTP_LINK_CONTEXT_SERVER,
+                this,
+            ))))
+        },
     );
     r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, _args| {
         let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
@@ -3986,6 +4415,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // OutputStreams and never wrote a response — that broke real-server probes.
     // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
+    // OPEN (left as a null constant, deliberately): the exchange object is
+    // built by `net_phase_e`'s dispatch loop, which records the request line,
+    // headers and body but never the accepted peer/local socket address — there
+    // is no state on this side to return, and manufacturing an address would be
+    // a worse answer than null (a caller logging or rate-limiting by peer would
+    // silently attribute every request to one fabricated host). Real fix needs
+    // the peer address captured in `parse_http_request`, which is out of this
+    // file. Reported as a residual rather than papered over.
     r.register(
         hex,
         "getLocalAddress",
@@ -3998,6 +4435,12 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetSocketAddress;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // KEEP: `getAttribute` returns null for any key never set, which is the
+    // JDK's own contract — and no `HttpExchange.setAttribute` native exists
+    // anywhere in the tree (grep `"setAttribute"`), so no key can ever have
+    // been set. Null is therefore the correct answer for every possible
+    // argument, not a placeholder. Should a `setAttribute` ever be added, this
+    // registration must be replaced at the same time.
     r.register(
         hex,
         "getAttribute",
@@ -4151,6 +4594,128 @@ pub(crate) fn p72_inet_from_socket_address(
     ))))
 }
 
+/// Half-close flags for the phase-72 `java.net.Socket` surface, keyed by the
+/// s2 stream id (a plain `i32` handle, so this table holds no heap references
+/// and needs no GC root). `(input_shutdown, output_shutdown)`.
+fn p72_socket_shutdowns() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, (bool, bool)>> {
+    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, (bool, bool)>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn p72_mark_shutdown(stream_id: i32, input: bool) {
+    if stream_id < 0 {
+        return;
+    }
+    let mut t = p72_socket_shutdowns().lock();
+    let e = t.entry(stream_id).or_insert((false, false));
+    if input {
+        e.0 = true;
+    } else {
+        e.1 = true;
+    }
+}
+
+fn p72_shutdown_state(stream_id: i32) -> (bool, bool) {
+    if stream_id < 0 {
+        return (false, false);
+    }
+    p72_socket_shutdowns()
+        .lock()
+        .get(&stream_id)
+        .copied()
+        .unwrap_or((false, false))
+}
+
+/// `(ip, port)` of a phase-72 `java.net.Socket`'s live s2 stream, or `None`
+/// when the socket has no stream (never connected / already closed).
+/// `local == true` reads the local end, `false` the peer.
+fn p72_socket_stream_addr(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    local: bool,
+) -> Option<(String, i32)> {
+    let stream_id = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+    if stream_id < 0 {
+        return None;
+    }
+    let reg = crate::servlet::s2_registry().lock();
+    let stream = reg.streams.get(&stream_id)?;
+    let addr = if local {
+        stream.local_addr().ok()?
+    } else {
+        stream.peer_addr().ok()?
+    };
+    Some((addr.ip().to_string(), addr.port() as i32))
+}
+
+/// Accept one connection on `this` ServerSocket's underlying `TcpListener` and
+/// populate `target_socket`'s stream slot. Shared by `ServerSocket.accept()`
+/// and the JDK-internal `implAccept` hook, so both agree on where the listener
+/// id lives (slot 3, written by this module's `bind`).
+///
+/// MAY BLOCK: waits for a peer, inside a blocking region.
+fn p72_impl_accept(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    target_socket: ObjectRef,
+) -> MethodCallResult {
+    use crate::servlet::{s2_alloc_stream, s2_registry};
+    let listener_id = ctx.get_field(this, 3).as_int().unwrap_or(-1); // SS_LISTENER_ID
+    if listener_id < 0 {
+        return Err(RuntimeError::IOException {
+            message: "ServerSocket not bound".into(),
+        }
+        .into());
+    }
+    // Clone the listener handle out under a SHORT lock, then release the
+    // s2_registry lock BEFORE the blocking accept() — holding it across a
+    // blocking accept() deadlocks every other synthetic-socket op
+    // process-wide (see the matching fix in net_phase_e::re2_accept_into).
+    let listener = {
+        let reg = s2_registry().lock();
+        reg.listeners
+            .get(&listener_id)
+            .ok_or_else(|| RuntimeError::IOException {
+                message: "Listener not found".into(),
+            })?
+            .try_clone()
+            .map_err(|e| RuntimeError::IOException {
+                message: format!("accept try_clone: {e}"),
+            })?
+    };
+    let _ = listener.set_nonblocking(false);
+    // GC-safety (STW blocking-region family): `accept()` waits for a peer with
+    // no upper bound. Outside a blocking region the thread is neither at a
+    // safepoint nor GC-cooperative, so a stop-the-world collection stalls the
+    // whole VM until a client happens to connect. `target_socket` is live
+    // across the wait and is re-read through the region's fixup, because a
+    // collection completing inside the wait relocates it.
+    ctx.begin_blocking_region();
+    let accepted = listener.accept();
+    let mut refs = [Value::Object(Some(target_socket))];
+    ctx.end_blocking_region_refs(&mut refs);
+    let target_socket = match refs[0] {
+        Value::Object(Some(moved)) => moved,
+        _ => target_socket,
+    };
+    let stream = match accepted {
+        Ok((stream, _addr)) => stream,
+        Err(e) => {
+            return Err(RuntimeError::IOException {
+                message: format!("accept failed: {e}"),
+            }
+            .into())
+        }
+    };
+    let stream_id = s2_alloc_stream(stream);
+    // Populate the target Socket's fields. Socket layout:
+    // host=0, port=1, localPort=2, closed=3, stream_id=4.
+    ctx.set_field(target_socket, 3, Value::Int(0)); // not closed
+    ctx.set_field(target_socket, 4, Value::Int(stream_id));
+    Ok(None)
+}
+
 pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket/ServerSocket
     // surface so real bytecode drives sun/nio/ch/Net. Third of three registrars
@@ -4179,8 +4744,47 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 2, Value::Int(0));
         Ok(None)
     });
-    r.register(ss, "accept", "()Ljava/net/Socket;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // accept() previously returned a constant null. That is the worst possible
+    // answer for a server loop: `while (true) handle(server.accept())` neither
+    // blocks nor fails — it spins at full speed handing out nulls, and the
+    // caller NPEs (or, with a null check, busy-loops forever). The real accept
+    // already existed as this module's `implAccept` hook; both now share
+    // `p72_impl_accept`, so `accept()` does what the JDK's own does — allocate
+    // the peer `Socket`, then delegate.
+    //
+    // This registration shadows `net_phase_e::register_re2_server_socket`'s real
+    // `accept` (phase 72 runs later), but the two are not interchangeable: this
+    // module's `bind` — which also wins — stores the listener id in slot 3,
+    // whereas re2's accept reads it from its own identity-keyed side table. So
+    // deleting this entry would have produced an accept that never finds the
+    // listener. Sharing one helper keeps bind and accept on one storage scheme.
+    //
+    // RESIDUAL: a channel-backed wrapper (from `ServerSocketChannel.socket()`,
+    // whose listener fd lives on the channel at slot 4 -> ssc slot 2, not in the
+    // s2 listener table) now raises `IOException: ServerSocket not bound`
+    // instead of returning null. That is an honest failure for a path that was
+    // already broken, not a new capability regression.
+    //
+    // MAY BLOCK: `p72_impl_accept` waits for a connection (blocking region
+    // inside).
+    r.register(ss, "accept", "()Ljava/net/Socket;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Socket layout: host=0, port=1, localPort=2, closed=3, stream_id=4.
+        let this_pin = ctx.pin_native_root(this);
+        let sock0 = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
+        let sock_pin = ctx.pin_native_root(sock0);
+        let this = ctx.read_native_pin(this_pin, this);
+        let sock = ctx.read_native_pin(sock_pin, sock0);
+        ctx.set_field(sock, 0, Value::Object(None));
+        ctx.set_field(sock, 1, Value::Int(0));
+        ctx.set_field(sock, 2, Value::Int(0));
+        ctx.set_field(sock, 3, Value::Int(0));
+        ctx.set_field(sock, 4, Value::Int(-1));
+        let result = p72_impl_accept(ctx, this, sock);
+        let sock = ctx.read_native_pin(sock_pin, sock);
+        ctx.unpin_native_roots(this_pin);
+        result?;
+        Ok(Some(Value::Object(Some(sock))))
     });
     r.register(ss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -4296,7 +4900,23 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(ss, "isBound", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    // isBound() reported `true` for every ServerSocket including a freshly
+    // constructed, never-bound one, so `if (!ss.isBound()) ss.bind(addr);`
+    // skipped the bind and the following accept had no listener. Report the
+    // real state, from the same two places this module's `bind` writes it: the
+    // channel back-ref's fd (slot 4 -> ssc slot 2) for a wrapper handed out by
+    // `ServerSocketChannel.socket()`, else the s2 listener id in slot 3.
+    r.register(ss, "isBound", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) >= 5 {
+            if let Value::Object(Some(ssc)) = ctx.get_field(this, 4) {
+                let fd = ctx.get_field(ssc, 2).as_int().unwrap_or(-1);
+                return Ok(Some(Value::Int(if fd >= 0 { 1 } else { 0 })));
+            }
+        }
+        let lid = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        Ok(Some(Value::Int(if lid >= 0 { 1 } else { 0 })))
+    });
     r.register(
         ss,
         "getInetAddress",
@@ -4394,19 +5014,23 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    r.register(ss, "getSoTimeout", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    // REMOVED (stub-removal wave 2): `ServerSocket.getSoTimeout()I` was a
+    // constant 0 registered here, and phase 72 runs after
+    // `net_phase_e::register_re2_server_socket` — so it silently replaced re2's
+    // REAL getter (`re2_accept_timeout_for(listener_id)`), the one that pairs
+    // with re2's `setSoTimeout` (this module registers no setter of its own).
+    // The result was a socket whose SO_TIMEOUT could be set and never read
+    // back: `ss.setSoTimeout(5000); ss.getSoTimeout()` answered 0, and any
+    // caller that restores a previous timeout around a call restored 0
+    // (= block forever) instead. Dropping this entry lets the matching pair
+    // win again.
+
     // ServerSocket setReuseAddress/setReceiveBufferSize: use real socket options
     // Note: ServerSocket doesn't always have a stream_id, so we track these as fields if needed
     // For now, these are kept as field-tracking stubs since ServerSocket doesn't expose
     // the underlying listener to socket2 in the same way as Socket.
     // Real implementations exist in phases_early.rs for Socket; ServerSocket is less critical.
     r.register(ss, "implAccept", "(Ljava/net/Socket;)V", |ctx, args| {
-        // Accept a connection on the underlying TcpListener and populate the given
-        // Socket object's stream_id field. This is the JDK-internal hook called by
-        // ServerSocket.accept() to delegate the actual blocking accept.
-        use crate::servlet::{s2_alloc_stream, s2_registry};
         let this = obj_arg(args, 0)?;
         let target_socket = match args.get(1) {
             Some(Value::Object(Some(s))) => *s,
@@ -4417,44 +5041,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                 .into())
             }
         };
-        let listener_id = ctx.get_field(this, 3).as_int().unwrap_or(-1); // SS_LISTENER_ID
-        if listener_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "ServerSocket not bound".into(),
-            }
-            .into());
-        }
-        // Clone the listener handle out under a SHORT lock, then release the
-        // s2_registry lock BEFORE the blocking accept() — holding it across a
-        // blocking accept() deadlocks every other synthetic-socket op
-        // process-wide (see the matching fix in net_phase_e::re2_accept_into).
-        let listener = {
-            let reg = s2_registry().lock();
-            reg.listeners
-                .get(&listener_id)
-                .ok_or_else(|| RuntimeError::IOException {
-                    message: "Listener not found".into(),
-                })?
-                .try_clone()
-                .map_err(|e| RuntimeError::IOException {
-                    message: format!("accept try_clone: {e}"),
-                })?
-        };
-        let _ = listener.set_nonblocking(false);
-        let stream = match listener.accept() {
-            Ok((stream, _addr)) => stream,
-            Err(e) => {
-                return Err(RuntimeError::IOException {
-                    message: format!("accept failed: {}", e),
-                }
-                .into())
-            }
-        };
-        let stream_id = s2_alloc_stream(stream);
-        // Populate the target Socket's fields. Socket layout: host=0, port=1, localPort=2, closed=3, stream_id=4
-        ctx.set_field(target_socket, 3, Value::Int(0)); // not closed
-        ctx.set_field(target_socket, 4, Value::Int(stream_id));
-        Ok(None)
+        p72_impl_accept(ctx, this, target_socket)
     });
 
     // Socket extras — add methods not registered in phase 53
@@ -4591,23 +5178,56 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    // getLocalAddress / getLocalSocketAddress / getRemoteSocketAddress all
+    // returned a constant null, and — because phase 72 runs after both
+    // `phases_early::register_phase53_socket_stubs` and
+    // `net_phase_e::register_re1_socket` — they REPLACED working
+    // implementations registered on the same keys. Everything that logs, keys a
+    // connection pool on, or rate-limits by peer address saw null for every
+    // connected socket. Answer from the live stream this module already tracks
+    // in slot 4; null now means "not connected", which is what the JDK returns
+    // for `getRemoteSocketAddress` on an unconnected socket.
     r.register(
         sock,
         "getLocalAddress",
         "()Ljava/net/InetAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match p72_socket_stream_addr(ctx, this, true) {
+                Some((ip, _)) => Ok(Some(Value::Object(Some(
+                    crate::net_phase_e::alloc_inet_address_external(ctx, &ip, &ip),
+                )))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(
         sock,
         "getLocalSocketAddress",
         "()Ljava/net/SocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match p72_socket_stream_addr(ctx, this, true) {
+                Some((ip, port)) => Ok(Some(Value::Object(Some(p72_alloc_inet_socket_address(
+                    ctx, &ip, port,
+                ))))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(
         sock,
         "getRemoteSocketAddress",
         "()Ljava/net/SocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match p72_socket_stream_addr(ctx, this, false) {
+                Some((ip, port)) => Ok(Some(Value::Object(Some(p72_alloc_inet_socket_address(
+                    ctx, &ip, port,
+                ))))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     let socket_adaptor_inet = "sun/nio/ch/SocketAdaptor";
     r.register(
@@ -4622,20 +5242,47 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetAddress;",
         |ctx, args| p72_socket_adaptor_address(ctx, args, true),
     );
-    r.register(sock, "isInputShutdown", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // isInputShutdown / isOutputShutdown answered a constant `false` even
+    // straight after `shutdownInput()`/`shutdownOutput()` below had really
+    // shut the stream down — the exact "half-closed socket reports itself
+    // open" shape that `net_phase_e` documents as a flaky-connection-closed
+    // bug. (Those two entries also replaced re1's side-table-backed getters,
+    // because phase 72 registers later.) Track the shutdowns this module
+    // performs, keyed by the s2 stream id, and OR in re1's side table so a
+    // socket shut down through the other path still answers correctly.
+    r.register(sock, "isInputShutdown", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+        let local = p72_shutdown_state(sid).0;
+        let side = crate::net_phase_e::sock_get(ctx, this).input_shutdown != 0;
+        Ok(Some(Value::Int(if local || side { 1 } else { 0 })))
     });
-    r.register(sock, "isOutputShutdown", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(sock, "isOutputShutdown", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+        let local = p72_shutdown_state(sid).1;
+        let side = crate::net_phase_e::sock_get(ctx, this).output_shutdown != 0;
+        Ok(Some(Value::Int(if local || side { 1 } else { 0 })))
     });
-    r.register(sock, "isBound", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // isBound() claimed every Socket was bound, including one that had never
+    // been connected or bound — so `if (!s.isBound()) s.bind(...)` never ran
+    // and callers that gate on it took the wrong branch. A Socket is bound once
+    // it has a live stream (slot 4, set by connect/implAccept) or an explicit
+    // local port from `bind` (slot 2).
+    r.register(sock, "isBound", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stream_id = ctx.get_field(this, 4).as_int().unwrap_or(-1);
+        let local_port = ctx.get_field(this, 2).as_int().unwrap_or(0);
+        let bound = stream_id >= 0 || local_port != 0;
+        Ok(Some(Value::Int(if bound { 1 } else { 0 })))
     });
     // Socket options (setReuseAddress, setSoLinger, set/getReceiveBufferSize,
     // set/getSendBufferSize, getTcpNoDelay, getKeepAlive, getInputStream, getOutputStream)
     // are registered with REAL implementations in phases_early.rs — not re-registered here.
 
-    // shutdownInput/shutdownOutput — use real TcpStream::shutdown
+    // shutdownInput/shutdownOutput — use real TcpStream::shutdown, and record
+    // the half-close so `isInputShutdown`/`isOutputShutdown` above can report
+    // it (the 5-slot Socket layout has no slot for the two flags).
     r.register(sock, "shutdownInput", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         use crate::servlet::s2_registry;
@@ -4646,6 +5293,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                 let _ = stream.shutdown(std::net::Shutdown::Read);
             }
         }
+        p72_mark_shutdown(stream_id, true);
         Ok(None)
     });
     r.register(sock, "shutdownOutput", "()V", |ctx, args| {
@@ -4658,6 +5306,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
                 let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         }
+        p72_mark_shutdown(stream_id, false);
         Ok(None)
     });
     // Socket option setters — apply to underlying stream via socket2 where possible.

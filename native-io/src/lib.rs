@@ -1537,6 +1537,60 @@ fn native_fis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(n as i32)))
 }
 
+/// `java.io.FileInputStream.length0()J` — the size of the open file.
+fn native_fis_length0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let len = fis_get_fd(ctx, this)
+        .and_then(|fd| ctx.fd_table().file_size(fd).ok())
+        .unwrap_or(0);
+    Ok(Some(Value::Long(len as i64)))
+}
+
+/// `java.io.FileInputStream.position0()J` — the current read offset.
+///
+/// Derived as `length - available`: the fd table's `available()` already
+/// accounts for both the bytes still buffered in the `BufReader` and the bytes
+/// left in the underlying file, so this is the LOGICAL position the Java layer
+/// expects (not the buffered reader's physical offset).
+fn native_fis_position0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let Some(fd) = fis_get_fd(ctx, this) else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let Ok(len) = ctx.fd_table().file_size(fd) else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let remaining = ctx.fd_table().available(fd).unwrap_or(0) as u64;
+    Ok(Some(Value::Long(len.saturating_sub(remaining) as i64)))
+}
+
+/// `java.io.FileInputStream.isRegularFile0(FileDescriptor)Z` — static, so
+/// `args[0]` is the descriptor rather than a receiver.
+fn native_fis_is_regular_file0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(fd_obj))) = args.first() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let fd_obj = *fd_obj;
+    let fd = match ctx.get_field_by_name(fd_obj, "fd") {
+        Value::Int(v) if v >= 0 => Some(v as FdId),
+        _ => match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => Some(v as FdId),
+            _ => None,
+        },
+    };
+    // `file_size` is only implemented for the file-backed fd-table entries;
+    // sockets, pipes, child streams and stdin all fail, which is exactly the
+    // "is this a regular file" question being asked.
+    let regular = fd.is_some_and(|fd| ctx.fd_table().file_size(fd).is_ok());
+    Ok(Some(Value::Int(i32::from(regular))))
+}
+
 /// Skip n bytes in the FileInputStream. Returns the actual number skipped.
 fn native_fis_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -4937,27 +4991,36 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_fis_available,
     );
+    // `length0`/`position0` both returned a hardcoded 0 — i.e. "this file is
+    // empty and we are at its start" for EVERY file. JDK 25's
+    // `FileInputStream.readAllBytes()`/`available()` size their reads from
+    // exactly these two, so the pair had to be worked around by lying about
+    // `isRegularFile0` as well (see below). Both are answerable from the
+    // fd table: `file_size` is the real length, and `available()` (already
+    // used by the `available0` native) is bytes-remaining, so
+    // `position = length - available`.
     registry.register(
         "java/io/FileInputStream",
         "length0",
         "()J",
-        |_ctx, _args| Ok(Some(Value::Long(0))),
+        native_fis_length0,
     );
     registry.register(
         "java/io/FileInputStream",
         "position0",
         "()J",
-        |_ctx, _args| Ok(Some(Value::Long(0))),
+        native_fis_position0,
     );
-    // Report "not a regular file" so the JDK `readAllBytes()` takes the
-    // generic streaming `InputStream.readAllBytes` loop (which calls our
-    // `readBytes` native) instead of the `length0()`-sized fast path —
-    // `length0` is a stub returning 0, which would otherwise read nothing.
+    // Previously hardcoded "not a regular file" so that `readAllBytes()`
+    // avoided the `length0()`-sized fast path, which the stub above would
+    // have sized at zero. With `length0`/`position0` real, this can report
+    // the truth: `file_size` only succeeds for fd-table entries that really
+    // are files (sockets/pipes/stdin fail), which is precisely the predicate.
     registry.register(
         "java/io/FileInputStream",
         "isRegularFile0",
         "(Ljava/io/FileDescriptor;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_fis_is_regular_file0,
     );
 
     // FileOutputStream: open0, write(I,Z), writeBytes
@@ -5082,6 +5145,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `SOCKADDR_IN6` values are fixed by the ws2def.h/ws2ipdef.h ABI and
     // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
     // 23 on Windows vs 10 on Linux).
+    //
+    // KEEP (all twelve `NativeSocketAddress` accessors below): each returns a
+    // compile-time platform ABI constant, which is exactly what the real JNI
+    // implementations do (`offsetof`/`sizeof` on `struct sockaddr_in*`). These
+    // are not stubbed values standing in for runtime state.
     use sockaddr_abi as sa;
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
@@ -7976,6 +8044,9 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         registry.register(sr, "close", "()V", native_sr_close);
         registry.register(sr, "skip", "(J)J", native_sr_skip);
         registry.register(sr, "reset", "()V", native_sr_reset);
+        // KEEP: real `StringReader` genuinely supports mark/reset (it is
+        // backed by an in-memory String), so `true` is the correct answer,
+        // not a placeholder — and `mark`/`reset` are implemented above.
         registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(1)))
         });
@@ -9765,6 +9836,12 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     // JDK 25 UnixFileSystem initializes this dispatcher during early real-JDK
     // filesystem setup. Return no optional capabilities so Java falls back to
     // portable paths instead of failing class initialization.
+    //
+    // KEEP: the return value is a CAPABILITY BITMASK (openat/futimes/birthtime
+    // /…), not a status code — `0` is the honest "none of these syscalls are
+    // available through this VM" answer, and the JDK's own
+    // `UnixNativeDispatcher` treats it exactly that way by taking its portable
+    // fallbacks. Claiming a capability we do not implement is what would break.
     registry.register(
         "sun/nio/fs/UnixNativeDispatcher",
         "init",
@@ -16982,9 +17059,30 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    // Receive timeout has no effect on a non-blocking channel; accept the call.
-    r.register(dc, "setSoTimeout", "(I)V", |_ctx, _args| Ok(None));
-    // IP ToS/DSCP — accepted but not applied (cosmetic socket tuning).
+    // Was accepted and discarded on the grounds that a non-blocking channel
+    // ignores SO_TIMEOUT — but this method is reached through
+    // `channel.socket()`, i.e. by callers using the BLOCKING DatagramSocket
+    // surface, where the timeout is the only thing stopping `receive()` from
+    // blocking forever. Apply it to the channel's UDP fd like the sibling
+    // buffer/reuse setters above.
+    r.register(dc, "setSoTimeout", "(I)V", |ctx, args| {
+        let this = obj_arg92(args, 0)?;
+        let millis = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as u64;
+        // JDK contract: 0 means "no timeout" (block indefinitely).
+        let timeout = if millis == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(millis))
+        };
+        if let Some(fd) = dc_fd(ctx, this) {
+            let _ = ctx.fd_table().udp_set_read_timeout(fd, timeout);
+        }
+        Ok(None)
+    });
+    // KEEP: IP ToS/DSCP. `DatagramSocket.setTrafficClass` is explicitly
+    // documented as advisory — "the underlying platform may ignore the value"
+    // — and there is no `udp_set_tos` on the fd table to apply it with, so
+    // accepting it is spec-legal rather than a silent failure.
     r.register(dc, "setTrafficClass", "(I)V", |_ctx, _args| Ok(None));
 
     // bind(SocketAddress)V — the void `DatagramSocket.bind`. Delegates to the
@@ -17401,7 +17499,9 @@ fn register_selector(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if valid { 1 } else { 0 })))
     });
 
-    // OP constants
+    // OP constants — KEEP: `SelectionKey.OP_READ`/`OP_WRITE`/`OP_CONNECT`/
+    // `OP_ACCEPT` are `static final int` values fixed by the NIO spec
+    // (1/4/8/16). Returning them is the correct implementation, not a stub.
     r.register(sk, "OP_READ", "()I", |_, _| Ok(Some(Value::Int(OP_READ))));
     r.register(sk, "OP_WRITE", "()I", |_, _| Ok(Some(Value::Int(OP_WRITE))));
     r.register(sk, "OP_CONNECT", "()I", |_, _| {

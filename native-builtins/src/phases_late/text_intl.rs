@@ -504,6 +504,15 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
+    // KEEP. `beginIndex == endIndex == 0` is the real JDK's "the requested
+    // field was not found in the formatted output" state, and it is what this
+    // carrier consistently reports: the 2-field layout has no beginIndex slot,
+    // and the `getEndIndex` sibling below reads slot 1, which `<init>` zeroes
+    // and no formatter in this tree ever updates. A caller doing
+    // `out.substring(fp.getBeginIndex(), fp.getEndIndex())` therefore gets the
+    // correct empty string. (Residual, not a stub: the `format(...,
+    // FieldPosition)` natives further down do not populate field positions at
+    // all — fixing that, not this getter, is what would make them non-zero.)
     r.register(fp, "getBeginIndex", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -1466,8 +1475,21 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
             &[Value::Object(Some(map)), Value::Object(Some(key))],
         )
     });
-    r.register(rb, "getLocale", "()Ljava/util/Locale;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // W2: this returned null, and `ResourceBundle.getLocale()` never returns
+    // null in the real JDK — so the idiomatic `bundle.getLocale().getLanguage()`
+    // (and every `new MessageFormat(pattern, bundle.getLocale())`) NPE'd on a
+    // bundle that had loaded perfectly well.
+    //
+    // Answer `Locale.ROOT`, which is not a guess but this implementation's
+    // actual state: `resource_bundle_get_bundle` above ignores the Locale
+    // argument entirely and loads one flat properties bundle with no
+    // candidate-locale negotiation, so what the caller is holding IS the base
+    // bundle, and the JDK gives a base bundle `Locale.ROOT`.
+    r.register(rb, "getLocale", "()Ljava/util/Locale;", |ctx, _args| {
+        // Same "empty language, empty country" ROOT locale
+        // `locale_resources.rs` builds for its own base-bundle path.
+        let root = crate::locale_alloc(ctx, "", "");
+        Ok(Some(Value::Object(Some(root))))
     });
     r.register(rb, "getKeys", "()Ljava/util/Enumeration;", |ctx, _args| {
         let e = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
@@ -2339,7 +2361,9 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(arr))))
     });
 
-    // Collator constants
+    // Collator constants — KEEP. `static final int` FIELD reads (the "I" field
+    // descriptor, not a method), and 0/1/2/3 are the literal strength values
+    // `java.text.Collator` declares.
     r.register(c, "PRIMARY", "I", |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(c, "SECONDARY", "I", |_ctx, _args| Ok(Some(Value::Int(1))));
     r.register(c, "TERTIARY", "I", |_ctx, _args| Ok(Some(Value::Int(2))));

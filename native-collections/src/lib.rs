@@ -41225,18 +41225,39 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let mut target = args.get(1).cloned().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Int(0))),
+    // Stub-removal wave 2 (2026-07-28): `al_state` only understands the
+    // ArrayList shape (field 0 = backing array, field 1 = size). EVERY other
+    // Collection — `Arrays.asList` (an `Arrays$ArrayList`), `HashSet`,
+    // `LinkedList`, any user Collection — fell into the `None` arm and
+    // reported frequency 0, i.e. "this element does not occur", for a
+    // collection full of matches. Measured against HotSpot 25:
+    // Arrays.asList 3 -> 0, HashSet 1 -> 0, LinkedList 2 -> 0.
+    // Drive the receiver's own `toArray()` instead; every Collection has one.
+    let (data, size) = match data {
+        Some(d) => (d, size),
+        None => {
+            let coll_pin = ctx.pin_native_root(coll);
+            let target_pin = pin_value(ctx, target);
+            let arr = ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])?;
+            target = read_pinned_elem(ctx, target_pin, target);
+            ctx.unpin_native_roots(coll_pin);
+            match arr {
+                Some(Value::Object(Some(a))) => {
+                    let n = ctx.array_length(a) as i32;
+                    (a, n)
+                }
+                _ => return Ok(Some(Value::Int(0))),
+            }
+        }
     };
     // Family-1 fix (cce0079): pinned scan (counts every match, so no
     // early-exit helper).
     let data_pin = ctx.pin_native_root(data);
     let th = pin_value(ctx, target);
     let mut data = data;
-    let mut target = target;
+
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
@@ -44839,6 +44860,16 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- ForkJoinPool.awaitQuiescence ---
+    //
+    // KEEP (W2 stub sweep). `true` means "the pool became quiescent within the
+    // timeout", and that is unconditionally the truth for CratonVM's
+    // ForkJoinPool: `phases_early`'s `register_forkjoin_natives` AND its
+    // real-JDK twin `register_real_jdk_forkjoin_essentials` both override
+    // `fork`/`invoke`/`submit`/`join` to run `compute()` INLINE on the calling
+    // thread, so no task is ever outstanding in a worker by the time any thread
+    // can observe the pool. It is consistent with the `getActiveThreadCount()
+    // == 0` / `getQueuedTaskCount() == 0` pair in that same file. Waiting or
+    // returning false here would only ever be a wait for nothing.
     let pool = "java/util/concurrent/ForkJoinPool";
     r.register(
         pool,

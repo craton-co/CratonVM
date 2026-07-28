@@ -559,6 +559,10 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     );
     r.register(INET4_IMPL, "isReachable0", "([BII[BI)Z", is_reachable0_impl);
     r.register(INET4_IMPL, "isReachable0", "([BII)Z", is_reachable0_impl);
+    // KEEP the no-op: HotSpot's `Inet4AddressImpl.init()` only caches JNI
+    // field/method IDs for the C side, which has no analogue here. It has no
+    // observable effect, and the registration exists purely so `<clinit>` does
+    // not die with UnsatisfiedLinkError. Same for every other `init()V` below.
     r.register(INET4_IMPL, "init", "()V", |_ctx, _args| Ok(None));
 
     // ---- Inet6AddressImpl ----

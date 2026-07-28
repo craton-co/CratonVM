@@ -638,6 +638,28 @@ fn xslt_exception(ctx: &mut dyn NativeContext, message: &str) -> MethodCallFaile
     .into()
 }
 
+/// A `javax.xml.xpath.XPathExpressionException` explaining that CratonVM's
+/// synthetic XML surface ships no XPath engine.
+///
+/// Built as the real class so `catch (XPathExpressionException)` matches; falls
+/// back to `IllegalStateException` when the class cannot be constructed (the
+/// same shape as `xslt_exception` above).
+fn xpath_unsupported(ctx: &mut dyn NativeContext, what: &str) -> MethodCallFailed {
+    let message = format!(
+        "{what}: CratonVM's synthetic javax.xml surface has no XPath engine \
+         (run without --synthetic-jdk to use the real JDK implementation)"
+    );
+    let detail = ctx.create_string(&message);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "javax/xml/xpath/XPathExpressionException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalStateException { message }.into()
+}
+
 /// Read a `()Ljava/lang/String;` DOM accessor; "" on null or failure.
 fn xslt_dom_str(ctx: &mut dyn NativeContext, node: ObjectRef, method: &str) -> String {
     match ctx.invoke_virtual(node, method, "()Ljava/lang/String;", &[]) {
@@ -1078,12 +1100,34 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
+    // The builder now carries the two configuration flags the factory holds
+    // (namespaceAware=0, validating=1) so `DocumentBuilder`'s own accessors
+    // below can answer truthfully instead of a flat `false`.
     r.register(
         dbf,
         "newDocumentBuilder",
         "()Ljavax/xml/parsers/DocumentBuilder;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilder", 0);
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Read the flags out as plain ints BEFORE the allocation below —
+            // `alloc_concurrent_synthetic` can move `this` (native stale-local
+            // family), and an i32 carries across a GC where an ObjectRef would
+            // not.
+            let ns = if ctx.object_num_fields(this) > 0 {
+                ctx.get_field(this, 0).as_int().unwrap_or(0)
+            } else {
+                0
+            };
+            let validating = if ctx.object_num_fields(this) > 1 {
+                ctx.get_field(this, 1).as_int().unwrap_or(0)
+            } else {
+                0
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilder", 2);
+            if ctx.object_num_fields(obj) > 1 {
+                ctx.set_field(obj, 0, Value::Int(ns));
+                ctx.set_field(obj, 1, Value::Int(validating));
+            }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1148,11 +1192,28 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(doc))))
         },
     );
-    r.register(db, "isNamespaceAware", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // These two used to be flat `false`, so a caller that had explicitly done
+    // `factory.setNamespaceAware(true)` was told its builder was
+    // namespace-unaware — the usual reaction is to fall back to a
+    // prefix-splitting code path on a document that was parsed for it.
+    // Report what the producing factory was configured with.
+    r.register(db, "isNamespaceAware", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let flag = if ctx.object_num_fields(this) > 0 {
+            ctx.get_field(this, 0).as_int().unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Some(Value::Int(i32::from(flag != 0))))
     });
-    r.register(db, "isValidating", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(db, "isValidating", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let flag = if ctx.object_num_fields(this) > 1 {
+            ctx.get_field(this, 1).as_int().unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Some(Value::Int(i32::from(flag != 0))))
     });
 
     // SAXParserFactory = 3-field (namespaceAware=0, validating=1, features=2 HashMap)
@@ -1238,12 +1299,24 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
+    // Carry the factory's namespaceAware flag into the parser (slot 0) so
+    // `SAXParser.isNamespaceAware()` below reports what was configured.
     r.register(
         spf,
         "newSAXParser",
         "()Ljavax/xml/parsers/SAXParser;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParser", 0);
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Plain int before the allocation — see `newDocumentBuilder`.
+            let ns = if ctx.object_num_fields(this) > 0 {
+                ctx.get_field(this, 0).as_int().unwrap_or(0)
+            } else {
+                0
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParser", 1);
+            if ctx.object_num_fields(obj) > 0 {
+                ctx.set_field(obj, 0, Value::Int(ns));
+            }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1296,8 +1369,14 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    r.register(sp, "isNamespaceAware", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(sp, "isNamespaceAware", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let flag = if ctx.object_num_fields(this) > 0 {
+            ctx.get_field(this, 0).as_int().unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Some(Value::Int(i32::from(flag != 0))))
     });
 
     // === DOM Node/Element/Document/Text/Attr/NodeList methods (G7) ===
@@ -1339,6 +1418,12 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(t))))
         },
     );
+    // The `getNodeType()` family below (Document/Element/Text/Comment/Attr)
+    // is constant BY DEFINITION — DOM Level 2 fixes one nodeType per node
+    // interface (Document=9, Element=1, Text=3, Comment=8, Attr=2), and each
+    // native is registered on exactly the class whose constant it returns.
+    // These are not stubs and must not be "implemented"; the constants ARE
+    // the specification.
     r.register(doc_cls, "getNodeType", "()S", |_ctx, _args| {
         Ok(Some(Value::Int(NODE_DOCUMENT)))
     });
@@ -1351,13 +1436,18 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // getElementById returns null, and that is the SPEC answer here rather
+    // than a shortcut: DOM Level 2 matches only attributes whose *declared
+    // type* is ID, which requires a DTD or schema. This parser is
+    // non-validating and processes no DTD, so no attribute is ever of type ID
+    // — exactly like Xerces' `CoreDocumentImpl`, whose identifier table stays
+    // empty for a DTD-less document. Matching any attribute literally spelled
+    // "id" would be a heuristic that DISAGREES with HotSpot.
     r.register(
         doc_cls,
         "getElementById",
         "(Ljava/lang/String;)Lorg/w3c/dom/Element;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None))) // simplified
-        },
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
     r.register(
         doc_cls,
@@ -1577,6 +1667,19 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     );
 
     // Node interface (registered on both Element and generic Node)
+    //
+    // `getNamespaceURI` / `getPrefix` return null, which is the DOM Level 2
+    // answer for a node created by a NAMESPACE-UNAWARE parse — and that is
+    // what this parser is: `xml_parse` records `xmlns` declarations as plain
+    // attributes and never builds a prefix→URI scope stack, so slot 0 holds
+    // the raw qualified name and there is no binding to resolve a prefix
+    // against. Reporting a prefix while `getNamespaceURI()` stayed null would
+    // put the (namespaceURI, localName, prefix) triple into a state the DOM
+    // spec does not allow, so the three accessors stay consistently
+    // namespace-unaware together. Making them real means teaching `xml_parse`
+    // lexical namespace scoping first (`xml_stax::NsScopes` is the model);
+    // tracked as an open residual in the wave-2 report, deliberately not
+    // attempted here because it also changes `getLocalName`.
     for cls in ["org/w3c/dom/Node", "org/w3c/dom/Element"] {
         r.register(
             cls,
@@ -1926,17 +2029,25 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         },
     );
     let xp = "javax/xml/xpath/XPath";
+    // There is no XPath engine behind these two. They used to answer `null`,
+    // which is indistinguishable from a legitimate "expression matched
+    // nothing" (for `evaluate`) and detonates as an NPE one call later at
+    // `compile(expr).evaluate(doc)` — with a stack that points at the caller
+    // rather than at the missing engine. Both methods declare `throws
+    // XPathExpressionException`, so raising it is spec-legal and tells the
+    // truth. NOTE: this converts calls that used to "succeed" with null into
+    // a checked exception; see the wave-2 report.
     r.register(
         xp,
         "evaluate",
         "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| Err(xpath_unsupported(ctx, "XPath.evaluate")),
     );
     r.register(
         xp,
         "compile",
         "(Ljava/lang/String;)Ljavax/xml/xpath/XPathExpression;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| Err(xpath_unsupported(ctx, "XPath.compile")),
     );
     r.set_category(__prev_cat);
 }

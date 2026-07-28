@@ -3978,6 +3978,117 @@ fn set_ssl_server_socket_state(
         .insert(gc_stable_objref_key(ctx, socket), state);
 }
 
+/// `listener_id` → the server identity its rustls `ServerConfig` was built
+/// from.
+///
+/// STUB-REMOVAL (wave 2): `SSLServerSocket.setNeedClientAuth`/
+/// `setWantClientAuth` were unconditional no-ops. A server that stood up an
+/// mTLS listener therefore accepted every anonymous client while believing a
+/// client certificate was mandatory — a silently disabled authentication
+/// check, the most dangerous shape a constant native can take. Honouring the
+/// call means rebuilding the listener's `ServerConfig` with a
+/// `WebPkiClientVerifier` (`build_server_config_single_cert_ex`), which needs
+/// the (cert, key) PEM the listener was originally built from — the
+/// `TlsServerListenerEntry` only keeps the finished config, so record the
+/// ingredients here at `createServerSocket` time.
+fn sss_listener_identities() -> &'static Mutex<HashMap<i32, RuntimeTlsIdentity>> {
+    static T: OnceLock<Mutex<HashMap<i32, RuntimeTlsIdentity>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-`SSLServerSocket` client-auth request as last set by
+/// `setNeedClientAuth`/`setWantClientAuth`, keyed by `gc_stable_objref_key`.
+/// Tuple is `(need, want)`, each 0/1; JSSE makes the two mutually exclusive.
+fn sss_client_auth_states() -> &'static Mutex<HashMap<u64, (i32, i32)>> {
+    static T: OnceLock<Mutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Non-destructive client-CA source for the rebuild above. Deliberately NOT
+/// `active_client_trust_roots()`: that one *takes* the thread-local selected
+/// context slot, which a later client handshake on the same thread still
+/// needs.
+fn sss_client_ca_pem() -> String {
+    let roots = selected_context_trust_roots().or_else(huc_default_trust_roots);
+    trust_roots_pem(roots.as_ref())
+}
+
+/// Apply a `setNeedClientAuth`/`setWantClientAuth` request to the live
+/// listener by rebuilding its `ServerConfig`.
+///
+/// Fails LOUDLY rather than silently when the request cannot be honoured: a
+/// caller that asked for mandatory client authentication and got no exception
+/// is entitled to assume it is in force. Turning client auth OFF is the state
+/// the listener was already built in, so that direction never throws.
+fn sss_apply_client_auth(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    need: bool,
+    want: bool,
+) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+    let key = gc_stable_objref_key(ctx, this);
+    if !need && !want {
+        sss_client_auth_states().lock().insert(key, (0, 0));
+        return Ok(None);
+    }
+    let listener_id = ssl_server_socket_state(ctx, this)
+        .map(|state| state.listener_id)
+        .unwrap_or_else(|| ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1));
+    if listener_id < 0 {
+        return Err(RuntimeError::IOException {
+            message: "SSLServerSocket is closed".into(),
+        }
+        .into());
+    }
+    let identity = sss_listener_identities()
+        .lock()
+        .get(&listener_id)
+        .cloned()
+        .ok_or_else(|| RuntimeError::IllegalStateException {
+            message: "client auth requested on a listener with no recorded TLS identity"
+                .to_string(),
+        })?;
+    let client_ca = match identity.client_ca_pem.as_deref() {
+        Some(ca) => ca.to_string(),
+        None => {
+            let pem = sss_client_ca_pem();
+            if pem.is_empty() {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "setNeedClientAuth(true) requires javax.net.ssl.trustStore"
+                        .to_string(),
+                }
+                .into());
+            }
+            pem
+        }
+    };
+    let config = build_server_config_single_cert_ex(
+        &identity.cert_pem,
+        &identity.key_pem,
+        &["h2", "http/1.1"],
+        need,
+        want,
+        Some(client_ca.as_str()),
+    )
+    .map_err(|message| RuntimeError::IOException { message })?;
+    {
+        let mut reg = sreg().lock();
+        match reg.listeners.get_mut(&listener_id) {
+            Some(entry) => entry.config = TlsServerConfig::Rustls(config),
+            None => {
+                return Err(RuntimeError::IOException {
+                    message: "SSLServerSocket is closed".into(),
+                }
+                .into());
+            }
+        }
+    }
+    sss_client_auth_states()
+        .lock()
+        .insert(key, (i32::from(need), i32::from(want)));
+    Ok(None)
+}
+
 // Server-side SSLSocket returned from accept(): reuses the existing
 // SSLSocket 6-field layout but field 2 (tls_id) references the rustls
 // server-streams table rather than the native-tls client table. The
@@ -4162,6 +4273,10 @@ fn create_ssl_server_socket(
         reg.listeners.insert(id, entry);
         id
     };
+    // Remember the ingredients so `setNeedClientAuth`/`setWantClientAuth` can
+    // rebuild this listener's config with a client verifier — see
+    // `sss_listener_identities`.
+    sss_listener_identities().lock().insert(id, identity);
 
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
     set_ssl_server_socket_state(
@@ -4309,6 +4424,11 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         let id = state.listener_id;
         if id >= 0 {
             rustls_listener_close(id);
+            // Drop the recorded identity with the listener it belongs to (see
+            // `sss_listener_identities`), so the table cannot grow without
+            // bound and a recycled listener id cannot inherit stale key
+            // material.
+            sss_listener_identities().lock().remove(&id);
             ctx.set_field(this, SSS_LISTENER_ID, Value::Int(-1));
         }
         set_ssl_server_socket_state(
@@ -4378,8 +4498,47 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // bind call is a no-op for our synthetic model.
         Ok(None)
     });
-    r.register(sss, "setNeedClientAuth", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(sss, "setWantClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    // STUB-REMOVAL (wave 2): both were `Ok(None)` no-ops — see
+    // `sss_listener_identities` for why a silently-ignored
+    // `setNeedClientAuth(true)` is the worst failure mode in this file. These
+    // now rebuild the listener's rustls `ServerConfig` with a real
+    // `WebPkiClientVerifier` (mandatory for `need`, `allow_unauthenticated`
+    // for `want`) and throw when that cannot be done, so a server never
+    // believes mTLS is enforced when it is not.
+    r.register(sss, "setNeedClientAuth", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        // JSSE: setNeedClientAuth(true) clears wantClientAuth.
+        sss_apply_client_auth(ctx, this, on, false)
+    });
+    r.register(sss, "setWantClientAuth", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        sss_apply_client_auth(ctx, this, false, on)
+    });
+    // Paired getters: `javax.net.ssl.SSLServerSocket` declares both abstract,
+    // so without a native an ordinary read-back throws AbstractMethodError.
+    // Now that the setters keep real state, report it.
+    r.register(sss, "getNeedClientAuth", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let need = sss_client_auth_states()
+            .lock()
+            .get(&key)
+            .map(|(need, _)| *need)
+            .unwrap_or(0);
+        Ok(Some(Value::Int(need)))
+    });
+    r.register(sss, "getWantClientAuth", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let want = sss_client_auth_states()
+            .lock()
+            .get(&key)
+            .map(|(_, want)| *want)
+            .unwrap_or(0);
+        Ok(Some(Value::Int(want)))
+    });
     // getEnabledProtocols/setEnabledProtocols — `javax.net.ssl.SSLServerSocket`
     // is a real, abstract JDK class; unlike `SSLSocket`/`SSLEngine` (whose
     // `cls_impl` natives cover these via the shared `with_engine` state),
@@ -4758,11 +4917,45 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // STUB-REMOVAL (wave 2): the two setters were `Ok(None)` no-ops and the two
+    // getters always minted a fresh default verifier, so a caller-installed
+    // `HostnameVerifier` was discarded and could not even be read back. That is
+    // a security-relevant drop in one direction — an application installing a
+    // verifier STRICTER than RFC 6125 endpoint identification had its extra
+    // check silently removed — and a plain fidelity bug in the other (a
+    // permissive verifier, the usual test shape, also vanished).
+    //
+    // Store the verifier in the REAL JDK fields (`HttpsURLConnection
+    // .defaultHostnameVerifier` static, `hostnameVerifier` instance) rather
+    // than a native side table: those are ordinary GC roots, so no new
+    // `ObjectRef`-holding static needs wiring into
+    // `gc_scan_tls_ctx_trust_manager_roots`. Both getters read them back and
+    // only fall back to the synthetic default when nothing was installed.
+    //
+    // RESIDUAL, deliberately not papered over: the stored verifier is NOT yet
+    // consulted during a request. This VM's HTTPS path
+    // (`http_url_connection::perform`) owns its rustls connection end to end
+    // and rustls performs RFC 6125 endpoint identification itself, so the
+    // DEFAULT verifier's job is already done — but a stricter app-supplied
+    // verifier is still not additionally applied. Making it run means calling
+    // it from `http_url_connection::perform`, which is outside this file.
+    fn hurl_default_verifier_field(
+        ctx: &dyn NativeContext,
+    ) -> Option<(cratonvm_types::ClassId, usize)> {
+        let cid = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection")?;
+        let idx = ctx.static_field_index_by_name(cid, "defaultHostnameVerifier")?;
+        Some((cid, idx))
+    }
     r.register(
         hurl,
         "getDefaultHostnameVerifier",
         "()Ljavax/net/ssl/HostnameVerifier;",
         |ctx, _args| {
+            if let Some((cid, idx)) = hurl_default_verifier_field(ctx) {
+                if let Value::Object(Some(v)) = ctx.get_static_field(cid, idx) {
+                    return Ok(Some(Value::Object(Some(v))));
+                }
+            }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -4771,19 +4964,68 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         hurl,
         "setDefaultHostnameVerifier",
         "(Ljavax/net/ssl/HostnameVerifier;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // Static method: slot 0 IS the verifier, not a receiver (same
+            // shape as `setDefaultSSLSocketFactory` above). Real JDK rejects
+            // null with IllegalArgumentException.
+            let verifier = match args.first() {
+                Some(Value::Object(Some(v))) => *v,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "no default HostnameVerifier specified".to_string(),
+                    }
+                    .into());
+                }
+            };
+            // Resolve the field in its own statement so the immutable
+            // reborrow of `ctx` is finished before the `&mut` write below.
+            let field = hurl_default_verifier_field(ctx);
+            if let Some((cid, idx)) = field {
+                ctx.set_static_field(cid, idx, Value::Object(Some(verifier)));
+            }
+            Ok(None)
+        },
     );
     r.register(
         hurl,
         "setHostnameVerifier",
         "(Ljavax/net/ssl/HostnameVerifier;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let connection = obj_arg(args, 0)?;
+            let verifier = match args.get(1) {
+                Some(Value::Object(Some(v))) => *v,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "no HostnameVerifier specified".to_string(),
+                    }
+                    .into());
+                }
+            };
+            ctx.set_field_by_name(
+                connection,
+                "hostnameVerifier",
+                Value::Object(Some(verifier)),
+            );
+            Ok(None)
+        },
     );
     r.register(
         hurl,
         "getHostnameVerifier",
         "()Ljavax/net/ssl/HostnameVerifier;",
-        |ctx, _args| {
+        |ctx, args| {
+            if let Ok(connection) = obj_arg(args, 0) {
+                if let Value::Object(Some(v)) =
+                    ctx.get_field_by_name(connection, "hostnameVerifier")
+                {
+                    return Ok(Some(Value::Object(Some(v))));
+                }
+            }
+            if let Some((cid, idx)) = hurl_default_verifier_field(ctx) {
+                if let Value::Object(Some(v)) = ctx.get_static_field(cid, idx) {
+                    return Ok(Some(Value::Object(Some(v))));
+                }
+            }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -7938,6 +8180,14 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if mode { 1 } else { 0 })))
     });
 
+    // KEEP (deliberate, audited wave 2): this pair is intentionally inert AND
+    // intentionally consistent — the setter accepts nothing and the getter
+    // reports "no selector installed", so a caller probing whether JDK-style
+    // ALPN callbacks are active gets a truthful "no" rather than being handed
+    // back a selector this VM would never invoke. ALPN itself is not disabled:
+    // rustls negotiates it from `SSLParameters` and
+    // `getApplicationProtocol()` returns the real result.
+    //
     // Netty configures JDK ALPN support through this concrete implementation
     // method. A rustls-backed engine is deliberately allocated without
     // SunJSSE's private `conContext` graph, so interpreting the real body
@@ -9661,6 +9911,8 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // KEEP (correct constants, audited wave 2 — these are protocol limits, not
+    // placeholders).
     // Buffer sizes are layout-independent JSSE constants. The real JDK returns
     // 16384 (max TLS plaintext record) for `getApplicationBufferSize` and 16709
     // (16384 + TLS record overhead: 5 header + 256 padding + 68 MAC/IV) for

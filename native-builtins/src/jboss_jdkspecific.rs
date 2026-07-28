@@ -820,6 +820,67 @@ fn native_system_module_reader_list(
     cratonvm_native_collections::make_stream_from_elements(ctx, &[])
 }
 
+/// Read a `java.lang.Module`'s name for the module registry.
+///
+/// Prefers the declared `name` field (the real-JDK `java.lang.Module`
+/// layout, where slot 0 is `layer`, not the name) and falls back to slot 0,
+/// which is where `build_module` above and `phases_late`'s synthetic
+/// `ModuleLayer.modules()` / `findModule` park it. An empty string means the
+/// unnamed module — the same sentinel `ModuleRegistry` uses.
+fn module_registry_name(ctx: &mut dyn NativeContext, module: ObjectRef) -> String {
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(module, "name") {
+        if let Some(name) = ctx.read_string(s) {
+            return name;
+        }
+    }
+    if let Value::Object(Some(s)) = ctx.get_field(module, 0) {
+        if let Some(name) = ctx.read_string(s) {
+            return name;
+        }
+    }
+    String::new()
+}
+
+/// `java.lang.Module.addExports0(Module from, String pkg, Module to)` —
+/// record the qualified dynamic export in CratonVM's `ModuleRegistry`.
+fn native_module_add_exports0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let from = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let pkg = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    let to = match args.get(2) {
+        Some(Value::Object(Some(o))) => module_registry_name(ctx, *o),
+        _ => String::new(),
+    };
+    let from_name = module_registry_name(ctx, from);
+    // The registry keys packages in internal (slash) form.
+    ctx.module_add_exports(&from_name, &pkg.replace('.', "/"), &to);
+    Ok(None)
+}
+
+/// `java.lang.Module.addExportsToAll0(Module from, String pkg)` and
+/// `addExportsToAllUnnamed0` — record an unqualified dynamic export.
+fn native_module_add_exports_to_all0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let from = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let pkg = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    let from_name = module_registry_name(ctx, from);
+    ctx.module_add_exports(&from_name, &pkg.replace('.', "/"), "");
+    Ok(None)
+}
+
 /// Install every JDKSpecific boot-path native this module owns.
 pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
@@ -888,33 +949,53 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/ModuleLayer;",
         native_module_get_layer,
     );
-    // VM-sync hook used by the real JDK Module/ModuleLayer constructors after
-    // they have already initialized the Java-side Module object. CratonVM's
-    // access/readability checks are backed by its own ModuleRegistry and the
-    // synthetic layer fields, so there is no extra VM module table to update.
+    // KEEP (deliberate no-op): `defineModule0` is the VM-sync hook the real
+    // JDK Module constructor calls AFTER it has already initialized the
+    // Java-side Module object. CratonVM's module table is populated by the
+    // class manager as classes are defined, not from this callback, so there
+    // is genuinely nothing to record here.
     registry.register(
         m,
         "defineModule0",
         "(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V",
         |_ctx, _args| Ok(None),
     );
+    // The three `addExports*0` hooks are NOT bookkeeping-free: they are the
+    // only place the VM learns about a dynamic export, and CratonVM's own
+    // `ModuleRegistry` (reached through `NativeContext::module_add_exports`,
+    // implemented in `vm_exec.rs`) is what
+    // `is_package_exported_{unqualified,to}` later consults on every
+    // reflective access check. Leaving them as no-ops — the state of this
+    // file until 2026-07-27 — silently dropped every `Module.addExports` /
+    // `--add-exports` edge, so an export that had been granted still failed
+    // the access check. The stale comment that used to sit above them
+    // ("there is no extra VM module table to update") was simply wrong.
     registry.register(
         m,
         "addExports0",
         "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
-        |_ctx, _args| Ok(None),
+        native_module_add_exports0,
     );
+    // Unqualified export (`exports pkg;`). `ModuleRegistry::add_exports`
+    // treats an empty target as "to all modules".
     registry.register(
         m,
         "addExportsToAll0",
         "(Ljava/lang/Module;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        native_module_add_exports_to_all0,
     );
+    // Export to the unnamed module (`--add-exports …=ALL-UNNAMED`). The
+    // unnamed module's registry name is the empty string
+    // (`classloading::module::UNNAMED_MODULE`), which `add_exports` already
+    // reads as the unqualified form — so this deliberately shares the
+    // `addExportsToAll0` implementation. That is a widening (we grant to all
+    // modules rather than only unnamed ones); the alternative, dropping the
+    // edge entirely, produced spurious IllegalAccessErrors.
     registry.register(
         m,
         "addExportsToAllUnnamed0",
         "(Ljava/lang/Module;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        native_module_add_exports_to_all0,
     );
     registry.register(
         "java/lang/module/ResolvedModule",
