@@ -34500,6 +34500,19 @@ fn compile_osr_artifact(
             if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
                 return None;
             }
+            // A previous compile for exactly this back-edge produced a body
+            // whose `osr_dead_mask` refuses entry there. That verdict is a pure
+            // function of a deterministic compile, so re-running the pipeline
+            // can only reach it again — 256 times over ten H2 `nioMemLZF:`
+            // operations before this memo existed. See `mark_osr_entry_rejected`.
+            if crate::jit::is_osr_entry_rejected(
+                &class_name,
+                &method_name,
+                &method_descriptor,
+                entry_pc,
+            ) {
+                return None;
+            }
             let code_len = code.len().saturating_sub(2); // padded_bytecode adds 2
             let scan = match crate::jit::x64::jit_scan(&code, code_len, &method_descriptor) {
                 Some(s) => s,
@@ -35416,6 +35429,26 @@ fn compile_osr_artifact(
         Some(c) => c,
         None => return None,
     };
+
+    // The compile succeeded but the body may still refuse to enter at the PC it
+    // was compiled for (non-zero `osr_dead_mask[entry_pc]`). Memo that so the
+    // next trip over this back-edge does not re-run the whole pipeline to the
+    // same conclusion; the artifact stays cached and other PCs are unaffected.
+    if !osr_reused && !compiled.can_osr_enter(entry_pc) {
+        crate::jit::mark_osr_entry_rejected(
+            &class_name,
+            &method_name,
+            &method_descriptor,
+            entry_pc,
+        );
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] OSR-reject {}.{}{} entry_pc={} (dead_mask non-zero; memoed)",
+                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+            );
+        }
+        return None;
+    }
 
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
