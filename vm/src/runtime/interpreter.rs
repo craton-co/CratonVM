@@ -10527,7 +10527,7 @@ fn execute_frame_from_index(
                     // 3 RwLocks + 2 hierarchy walks ran on EVERY virtual call and
                     // the inline cache was never consulted.)
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                        shared, thread, frame_idx, cp_index, saved_pc, false, false,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10551,7 +10551,7 @@ fn execute_frame_from_index(
                     // Miss path — VtableManager lock-free dispatch; a hit here
                     // populates invoke_cache for the next call.
                     match execute_invokevirtual_vtable_fast(
-                        shared, thread, frame_idx, cp_index, saved_pc,
+                        shared, thread, frame_idx, cp_index, saved_pc, false,
                     ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -10596,7 +10596,7 @@ fn execute_frame_from_index(
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, true,
+                        shared, thread, frame_idx, cp_index, saved_pc, true, false,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10716,7 +10716,7 @@ fn execute_frame_from_index(
                     // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
                     thread.frames[frame_idx].pc = saved_pc + 5;
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                        shared, thread, frame_idx, cp_index, saved_pc, false, true,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10743,7 +10743,7 @@ fn execute_frame_from_index(
                     // whether the call-site is invokevirtual or
                     // invokeinterface.
                     match execute_invokevirtual_vtable_fast(
-                        shared, thread, frame_idx, cp_index, saved_pc,
+                        shared, thread, frame_idx, cp_index, saved_pc, true,
                     ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -11975,10 +11975,41 @@ fn route_jit_signal_exception(
 /// receiving `maybeThrow`'s athrow at bci 13 — `handler_pc=None`, and its own
 /// `catch (Boom)` never ran (5,619 of 20,000 iterations).
 ///
-/// Accept the bci only when it indexes an `athrow` (0xbf) in THIS method's
+/// Accept the bci when it indexes an instruction boundary in THIS method's
 /// code. Anything else falls back to the "throw pc unknown" sentinel, which is
 /// the pre-RBC.6 behaviour: typed handlers still match by exception class, and
 /// only a narrow catch-all is skipped.
+///
+/// **The boundary test replaced a `code[pc] == 0xbf` (athrow) test.** That
+/// opcode test dated from when a local `athrow` was the ONLY site that stamped
+/// a bci. `66548471f` then widened the PRODUCER — `emit_exception_check_stub`
+/// now emits one pad per distinct throw-site bci, each calling
+/// `JitRuntimeHelpers::set_throw_bci`, across all 19
+/// `emit_post_invoke_exception_check` sites plus `emit_post_alloc_oom_check` —
+/// but left this consumer still asserting "must be a literal athrow". The two
+/// halves then disagreed about what `athrow_bci` means, and every stamped
+/// INVOKE bci was thrown away here.
+///
+/// The observable cost was the whole `finally` family coming back:
+/// `FinallyBalanceProbe`'s `guarded` stamps bci 9 (its `invokestatic work`),
+/// this function rejected it because `code[9] != 0xbf`,
+/// `find_jit_exception_handler` took its `pc_unknown` path, and that path
+/// deliberately skips a catch-all whose region does not span the whole method —
+/// which is exactly a javac `finally`. Result: `handler_pc=None`, the `finally`
+/// never ran, and `CallPathProbe` leaked on every dispatch route.
+///
+/// The foreign-bci filter that the opcode test used to provide is replaced by a
+/// STRICTLY BETTER one: the pc must fall inside one of this method's own
+/// protected ranges (plus be a real instruction boundary). `athrow_bci` carries
+/// no method identity, so a callee's stamp can still be standing here — see the
+/// range check below and `test_compiled_callee_catches_its_own_athrow`, which
+/// pins exactly that case. Do not weaken it to a boundary test alone: a foreign
+/// bci is usually a valid boundary in this method too.
+///
+/// (A compiled method that exits through a precise-frame deopt stub instead
+/// publishes an exceptional frame, and `route_jit_signal_exception` prefers
+/// that — it is method-checked by `deopt_frame_matches_method` — over this
+/// fallback entirely.)
 fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
     if athrow_bci < 0 {
         return usize::MAX;
@@ -11986,10 +12017,39 @@ fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize 
     let pc = athrow_bci as usize;
     // `cached.code` carries 2 bytes of speculative-read padding.
     let code_len = cached.code.len().saturating_sub(2);
-    if pc < code_len && cached.code[pc] == 0xbf {
-        pc
-    } else {
-        usize::MAX
+    if pc >= code_len {
+        return usize::MAX;
+    }
+    // The bci must land inside one of THIS method's protected ranges.
+    //
+    // This is what replaces the old opcode test as the foreign-bci filter, and
+    // it is a far better one. `JitSignals::athrow_bci` carries no method
+    // identity, so a callee's stamp can still be standing when this method's
+    // drain runs — `JitPreciseHandlerFrame.plainStep` (protected range [0,4))
+    // receives its callee `maybeThrow`'s athrow bci 13, and
+    // `test_compiled_callee_catches_its_own_athrow` exists for exactly that.
+    // 13 is a perfectly valid instruction boundary in `plainStep` too, so a
+    // boundary test alone accepts it; the range test rejects it and falls back
+    // to the pc-unknown sentinel, where a TYPED handler still matches by
+    // exception class and the `catch (Boom)` runs.
+    //
+    // Rejecting an out-of-range pc costs nothing even when the pc is genuine:
+    // `find_jit_exception_handler` would find no covering entry for it anyway,
+    // and the one case the pc-unknown path still honours — a catch-all spanning
+    // the whole method — covers every pc by definition, so honouring it there
+    // is correct.
+    let in_a_protected_range = cached.exception_table.iter().any(|e| {
+        // Widening: u16 -> usize (non-negative, fits)
+        pc >= e.start_pc as usize && pc < e.end_pc as usize
+    });
+    if !in_a_protected_range {
+        return usize::MAX;
+    }
+    // `verified_code` is the process-shared, cached decode already used by the
+    // compiler frontends, so this is a hash lookup rather than a re-decode.
+    match cratonvm_reader::verified_code(&cached.code[..code_len]) {
+        Ok(verified) if verified.is_instruction_start(pc) => pc,
+        _ => usize::MAX,
     }
 }
 
@@ -16754,6 +16814,7 @@ fn execute_instruction(
                 *index,
                 saved_pc,
                 is_special_invoke,
+                false,
             )? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
@@ -16860,7 +16921,7 @@ fn execute_instruction(
             // once a receiver's concrete class is known (see the
             // `execute_invokevirtual_vtable_fast` "miss path" comment in the
             // raw fast-dispatch loop, which already relies on this fact).
-            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false)?
+            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false, true)?
             {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
@@ -23075,10 +23136,22 @@ fn execute_invoke_kind(
         } else {
             None
         };
+    let receiver_interface_dispatch = (is_interface && !is_special)
+        .then_some(receiver_class_id)
+        .flatten()
+        .filter(|class_id| *class_id != ClassId::new(0))
+        .filter(|class_id| !shared.classes.lambda_proxies.read().contains_key(class_id));
     let dispatch_override: Option<ClassId> = if let Some((declaring_id, _)) =
         &private_virtual_target
     {
         Some(*declaring_id)
+    } else if let Some(receiver_id) = receiver_interface_dispatch {
+        // find_method_recursive performs the JVMS maximally-specific
+        // default-method selection only when it starts at the runtime
+        // receiver. Starting at the CP owner returns that interface's own
+        // default immediately and bypasses a covariant bridge declared by a
+        // subinterface implemented by the receiver.
+        Some(receiver_id)
     } else if let Some(interface_id) = loader_interface_override {
         Some(interface_id)
     } else if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
@@ -28279,7 +28352,6 @@ fn force_native_over_real_jdk_bytecode(
             class_name,
             "org/apache/maven/surefire/booter/ForkedBooter"
                 | "org/apache/tomcat/util/buf/CharChunk"
-                | "org/apache/tomcat/util/buf/AbstractChunk"
                 | "org/apache/catalina/connector/Response"
                 | "org/apache/tomcat/util/bcel/classfile/Constant"
         ))
@@ -28293,19 +28365,19 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Only `toString` is listed here, and only because it has a matching
+    // registration (`native_char_chunk_to_string`). This gate used to also
+    // claim `endsWith(String)`, `indexOf(char)` and
+    // `AbstractChunk.indexOf(String,III)`, none of which were ever
+    // registered — every consumer resolves the callback through
+    // `NativeMethodRegistry::find` and silently falls back to bytecode when
+    // it misses, so those three were pure dead config that read as "served
+    // by a native" to anyone auditing this list. If natives are added for
+    // them later, BOTH this gate and the `CharChunk` registrations in
+    // `native-builtins`' `register_essential_natives_with_shims` must be
+    // updated together.
     if class_name == "org/apache/tomcat/util/buf/CharChunk"
-        && matches!(
-            (method_name, method_descriptor),
-            ("toString", "()Ljava/lang/String;")
-                | ("endsWith", "(Ljava/lang/String;)Z")
-                | ("indexOf", "(C)I")
-        )
-    {
-        return true;
-    }
-    if class_name == "org/apache/tomcat/util/buf/AbstractChunk"
-        && method_name == "indexOf"
-        && method_descriptor == "(Ljava/lang/String;III)I"
+        && (method_name, method_descriptor) == ("toString", "()Ljava/lang/String;")
     {
         return true;
     }
@@ -40538,6 +40610,7 @@ fn execute_invokevirtual_vtable_fast(
     frame_idx: usize,
     cp_index: u16,
     site_pc: usize,
+    is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     dbg_invoke_stats_record(2);
     let caller_class_id = thread.frames[frame_idx].class_id;
@@ -41128,6 +41201,28 @@ fn execute_invokevirtual_vtable_fast(
         // dispatch would otherwise form an AB-BA deadlock.
         drop(guard);
 
+        // A vtable slot stores one erased (name, descriptor) target, but an
+        // invokeinterface call can require a more-specific interface default
+        // than the slot inherited from its CP owner. Validate that the slot
+        // agrees with receiver-rooted JVMS selection before dispatching it.
+        // In particular, a covariant bridge has the parent return descriptor,
+        // so starting resolution at the CP interface picks its own default and
+        // skips the subinterface bridge.
+        if is_interface {
+            let cm = shared.classes.class_manager.read();
+            let receiver_selected = crate::classloading::find_method_recursive(
+                receiver_class_id,
+                &method_name,
+                &method_descriptor,
+                &cm.class_store,
+            )
+            .map(|(_, declaring_id)| declaring_id);
+            drop(cm);
+            if receiver_selected != Some(cached.declaring_class_id) {
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+
         // JVMTI redefine guard — the VtableManager entry's `resolved_method`
         // is an immutable `Arc<CachedBytecodeMethod>` snapshot with NO
         // staleness tracking of its own (unlike `CachedInvokeTarget`, which
@@ -41479,6 +41574,7 @@ fn execute_invokevirtual_cached(
     cp_index: u16,
     site_pc: usize,
     is_special: bool,
+    is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
@@ -41877,6 +41973,30 @@ fn execute_invokevirtual_cached(
                             .unwrap_or(false);
                         drop(cm);
                         if is_ann_proxy {
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
+                    }
+
+                    // A cache entry created through a vtable slot is valid for
+                    // an interface site only when it is the same target that
+                    // receiver-rooted maximally-specific default resolution
+                    // selects. This prevents a parent-interface default from
+                    // remaining cached after it masked a covariant bridge on a
+                    // receiver subinterface.
+                    if is_interface {
+                        let cm = shared.classes.class_manager.read();
+                        let receiver_selected = crate::classloading::find_method_recursive(
+                            actual_class_id,
+                            &cached.method_name,
+                            &cached.method_descriptor,
+                            &cm.class_store,
+                        )
+                        .map(|(_, declaring_id)| declaring_id);
+                        drop(cm);
+                        if receiver_selected != Some(cached.declaring_class_id) {
+                            thread
+                                .invoke_cache
+                                .evict(caller_class_id, cp_index, is_special);
                             return Ok(CachedCallResult::CacheMiss);
                         }
                     }

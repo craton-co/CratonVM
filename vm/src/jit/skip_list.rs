@@ -1835,25 +1835,23 @@ fn should_skip_jit_internal(
         // regression witness for the currently-tested (BigInteger-still-
         // banned) configuration only.
 
-        // HIB-BYTEBUDDY (2026-06-13) — provisional blanket ban for ByteBuddy's
-        // runtime class-build chain (`net/bytebuddy/`). The narrow HIB-PROXY ban
-        // on `ByteBuddyState.make` only covered the lazy-proxy path; Hibernate's
-        // bytecode-enhancement path (`EnhancerImpl.enhance` -> `ByteBuddyState.
-        // rewrite` -> `DynamicType...make` -> `MethodRegistry.prepare` -> deep
-        // `net/bytebuddy/description/type/TypeDescription*` resolution) hangs
-        // forever once those type-description methods are JIT-compiled
-        // (`SimpleEnhancerTests` rc=124; the stack spins in
-        // `TypeDefinition$Sort.describe` / `TypeDescription.represents`). It is
-        // the same "JIT'd build-chain receiver corruption / loop never returns"
-        // miscompile as HIB-PROXY, and `CRATONVM_DISABLE_JIT=1` makes the whole
-        // enhancer pass (ok=1). ByteBuddy is a one-shot code generator, never a
-        // benchmarked hot path, so interpreter-only is the right trade. Lifted
-        // by `CRATONVM_JIT_ALLOW_PACKAGES=net/bytebuddy/`.
-        if class_name.starts_with("net/bytebuddy/")
-            && !package_allowed("net/bytebuddy/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // HIB-BYTEBUDDY -- REMOVED 2026-07-28. Provisional blanket ban since
+        // 2026-06-13 for ByteBuddy's runtime class-build chain
+        // (`net/bytebuddy/`) after `SimpleEnhancerTests` hung (rc=124) with the
+        // stack spinning in `TypeDefinition$Sort.describe` /
+        // `TypeDescription.represents` once those type-description methods
+        // were JIT-compiled -- believed to be the same "JIT'd build-chain
+        // receiver corruption / loop never returns" miscompile as HIB-PROXY.
+        // Re-tested 2026-07-28 against the general JIT correctness fixes that
+        // have landed since (loader_id decode fix, atomic-array RMW, and
+        // others): `SimpleEnhancerTests` (the named regression witness) now
+        // passes cleanly and FASTER than interpreted (1762ms vs. 2511ms
+        // baseline), and a 15-class A/B sample across
+        // `org/hibernate/orm/test/bytecode/enhancement/**` (lazy loading,
+        // proxies, merge, batching) came back byte-identical
+        // found/started/ok/failed counts in both arms -- 0 hangs, 0 new
+        // failures. Full evidence:
+        // `docs/known-issues/hibernate/hib-bytebuddy-removed-20260728.md`.
         // TEST-HARNESS BLANKET BANS -- REMOVED 2026-07-27. Four blanket
         // package bans lived here together:
         //
