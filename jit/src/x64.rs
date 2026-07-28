@@ -27395,6 +27395,40 @@ impl Compiler {
                                 //   JZ rel32 → .miss (patched at miss_off)
                                 self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
                                 let pic_null_miss_patch = self.buf.pos() - 4;
+                                // ARRAY-RECEIVER GUARD. `ObjectHeader.class_id` sits at offset 0 for objects AND for
+                                // arrays, and a reference array stores its
+                                // COMPONENT class id there — a `Foo[]` and a
+                                // `Foo` present the SAME 4-byte guard word. A
+                                // class-id-only guard therefore lets a site
+                                // warmed on a `Foo` receiver dispatch a later
+                                // `Foo[]` receiver straight into `Foo`'s own
+                                // method body, where the first `checkcast Foo`
+                                // throws `class [LFoo; cannot be cast to class
+                                // Foo`. (The helper never INSTALLS an entry for
+                                // an array receiver — `cacheable_receiver` is
+                                // false for `ObjectKind::Array` — so only the
+                                // consumption guard was ever wrong.)
+                                // `ObjectHeader.kind` (offset 4) separates the
+                                // two; anything that is not a plain object goes
+                                // to the miss path, which resolves on the real
+                                // receiver.
+                                //   CMP BYTE [recv_reg + OBJECT_KIND_OFFSET], Object
+                                // mod=01 (disp8) / reg=/7 (CMP imm8) / rm=recv.
+                                // `recv_reg & 7 != 4` is already asserted below
+                                // (mod=00 would need a SIB there), and mod=01
+                                // makes rm==5 an ordinary [reg+disp8].
+                                if recv_reg >= 8 {
+                                    self.buf.emit_byte(0x41); // REX.B
+                                }
+                                self.buf.emit(&[
+                                    0x80,
+                                    0x78 | (recv_reg & 7),
+                                    cratonvm_types::OBJECT_KIND_OFFSET as u8,
+                                    cratonvm_types::ObjectKind::Object as u8,
+                                ]);
+                                //   JNE rel32 → .miss
+                                self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
+                                let pic_kind_miss_patch = self.buf.pos() - 4;
                                 // MED (round-5 review): mod=00 encoding
                                 // reuses the low-3 bits of the register as
                                 // r/m, where r/m==4 (RSP/R12) means
@@ -27448,7 +27482,8 @@ impl Compiler {
                                 // Seeded with the receiver-null-check JZ
                                 // emitted above the cascade so it is patched
                                 // to the same shared `.miss` target.
-                                let mut miss_patches_rel32: Vec<usize> = vec![pic_null_miss_patch];
+                                let mut miss_patches_rel32: Vec<usize> =
+                                    vec![pic_null_miss_patch, pic_kind_miss_patch];
 
                                 for i in 0..crate::JIT_PIC_ENTRIES {
                                     slot_starts[i] = self.buf.pos();
@@ -27679,6 +27714,34 @@ impl Compiler {
                                 // marshalling blocks make the miss span larger
                                 // than rel8 for otherwise tiny callees.
                                 self.buf.emit(&[0x0F, 0x84, 0x00, 0x00, 0x00, 0x00]);
+                                mic_miss_patches32.push(self.buf.pos() - 4);
+
+                                // ARRAY-RECEIVER GUARD. `ObjectHeader.class_id` sits at offset 0 for objects AND for
+                                // arrays, and a reference array stores its
+                                // COMPONENT class id there — a `Foo[]` and a
+                                // `Foo` present the SAME 4-byte guard word. A
+                                // class-id-only guard therefore lets a site
+                                // warmed on a `Foo` receiver dispatch a later
+                                // `Foo[]` receiver straight into `Foo`'s own
+                                // method body, where the first `checkcast Foo`
+                                // throws `class [LFoo; cannot be cast to class
+                                // Foo`. (The helper never INSTALLS an entry for
+                                // an array receiver — `cacheable_receiver` is
+                                // false for `ObjectKind::Array` — so only the
+                                // consumption guard was ever wrong.)
+                                // `ObjectHeader.kind` (offset 4) separates the
+                                // two; anything that is not a plain object goes
+                                // to the miss path, which resolves on the real
+                                // receiver.
+                                //   CMP BYTE [RAX + OBJECT_KIND_OFFSET], Object
+                                self.buf.emit(&[
+                                    0x80,
+                                    0x78,
+                                    cratonvm_types::OBJECT_KIND_OFFSET as u8,
+                                    cratonvm_types::ObjectKind::Object as u8,
+                                ]);
+                                //   JNE rel32 → .miss
+                                self.buf.emit(&[0x0F, 0x85, 0x00, 0x00, 0x00, 0x00]);
                                 mic_miss_patches32.push(self.buf.pos() - 4);
 
                                 // MOV EAX, dword [RAX]  — load class_id (ObjectHeader+0).
@@ -29895,6 +29958,19 @@ pub fn compile_with_param_slots(
     // The emit hot path records the overflow instead of panicking — bail to
     // the interpreter here rather than returning a truncated, unsafe method.
     if compiler.buf.overflowed() {
+        // Name the method and the shortfall. A silent bail here is
+        // indistinguishable from "the JIT chose not to compile this", which is
+        // how a whole class of invoke-heavy methods came to stop being compiled
+        // unnoticed (`docs/internal/resolvabletype-equals-jit-...`): the only
+        // visible symptom was a flood of anonymous `try_patch_*: offset out of
+        // bounds` warnings with no method attached to any of them.
+        tracing::warn!(
+            method = method_key,
+            code_len = code_len,
+            capacity = compiler.buf.capacity(),
+            wanted = compiler.buf.wanted(),
+            "JIT compile bailed: code buffer estimate too small; method stays interpreted"
+        );
         return None;
     }
 

@@ -586,62 +586,6 @@ fn should_skip_jit_internal(
         return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
 
-    // SPRING-RT-EQUALS.1 (2026-07-27) — REGRESSION REPAIR, not a new ban.
-    //
-    // `654dfb918` ("retire the inert is_known_miscompile ban block") deleted
-    // ~189 (class, method) entries after finding the block's gate had drifted
-    // and concluding the list was inert. That held for most of it, but not
-    // here: the deleted list covered the `ConcurrentReferenceHashMap` lookup
-    // chain that reaches this method, and dropping it re-enabled a live
-    // miscompile of `ResolvableType.equals`.
-    //
-    // Symptom (~59 Spring Boot classes): `ResolvableType.forType` does
-    // `cache.get(key)` on a `ConcurrentReferenceHashMap` then
-    // `checkcast ResolvableType` (bytecode 61 -> 64). The lookup compares keys
-    // with `ResolvableType.equals`, whose compiled body confuses a
-    // `ResolvableType[]` with a `ResolvableType` element, so the map hands back
-    // the wrong object and the cast throws
-    //   `ClassCastException: class org.springframework.core.ResolvableType
-    //    cannot be cast to class org.springframework.core.ResolvableType`
-    //
-    // That message READS like a duplicate-class / loader-identity split and is
-    // NOT one. The receiver is an ARRAY (`kind=Array`,
-    // `arr_desc="[Lorg/springframework/core/ResolvableType;"`, component cid ==
-    // target cid), and `jit_checkcast` renders an array receiver by its
-    // COMPONENT name. The typecheck refusal is correct; the value reaching it
-    // is not. `jit_typecheck_resolve`'s own comment already warned this shape
-    // "made this look like a class-identity split for far longer than it should
-    // have" — it cost two wrong diagnoses again here, so the checkcast-fail
-    // trace in `vm/src/jit/helpers.rs` now prints kind + array descriptor.
-    //
-    // Isolation (one binary, no rebuilds), witness `ConditionalOnPropertyTests`
-    // (38 tests):
-    //   --nojit                                                     -> 38/38 pass
-    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/core           -> pass
-    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/util           -> pass
-    //   CRATONVM_JIT_BISECT_ONLY=<core>,<util>                      -> FAIL (minimal pair)
-    //   CRATONVM_JIT_BISECT_SKIP=ResolvableType.equals, full JIT    -> 38/38 pass
-    // Not heap/GC dependent (identical at --Xmx 512m and 8g) and not the
-    // pointer-keyed typecheck target cache (instrumented: zero stale hits).
-    //
-    // Scope: this ban is deliberately ONE method. An earlier revision of this
-    // fix banned the whole six-entry `ConcurrentReferenceHashMap` lookup chain
-    // (`get`/`getReference`/`getEntryIfAvailable` +
-    // `$Segment.{getReference,findInChain,restructureIfNecessary}`), which also
-    // works — but only because banning `findInChain` stops `equals` being
-    // INLINED into it. `equals` is the actual defective body: skipping it alone,
-    // with no chain ban at all, passes 38/38. Independently bisected to the same
-    // method by dev's `c7c0ac86e`. Banning one leaf method instead of a hot
-    // map-lookup chain keeps `ConcurrentReferenceHashMap` JIT-eligible.
-    //
-    // Still open as a codegen defect — see
-    // docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md.
-    // Remove this ban when the array-vs-element confusion in the lowerer is
-    // fixed, not before: verified load-bearing on dev at 70f1fddfc (removing it
-    // returns the witness class to 38/38 FAIL).
-    if class_name == "org/springframework/core/ResolvableType" && method_name == "equals" {
-        return Some(SkipReason::JavaUtilCollection);
-    }
 
     // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
     // in-process javac invocation per fixture. Once the real JDK's
@@ -2068,8 +2012,11 @@ fn should_skip_jit_internal(
         // gated by it at all; the affected class calls into
         // org/springframework/core/ResolvableType, already unbanned since
         // SPB.2's own removal), so it is not evidence for keeping SPB.4/.4b/.4c
-        // and is tracked as its own new finding:
-        // docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md.
+        // and is tracked as its own new finding. FIXED 2026-07-28 (an inline
+        // cache guarded a virtual call site by class id alone, so an ARRAY
+        // receiver whose header carries its COMPONENT class id was dispatched
+        // into the component's method body) — see
+        // docs/internal/resolvabletype-array-receiver-mic-guard-fixed-20260728.md.
         //
         // No longer reproduces on current dev at real-world JIT thresholds.
 

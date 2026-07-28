@@ -342,6 +342,12 @@ pub struct ExecutableBuffer {
     /// emit hot path records overflow here and the compile driver bails to
     /// the interpreter (returns `None`) after codegen.
     overflowed: bool,
+    /// Total bytes codegen ASKED to emit, counted whether or not the write
+    /// fit. `len` freezes at the first overflow, so it cannot answer "how big
+    /// should this buffer have been?" — and without that number an overflow
+    /// bail is indistinguishable from a method the JIT declined for any other
+    /// reason. See [`wanted`](Self::wanted).
+    wanted: usize,
 }
 
 // Safety: ExecutableBuffer is effectively a unique owned allocation, like Vec<u8>.
@@ -368,6 +374,7 @@ impl ExecutableBuffer {
             len: 0,
             capacity,
             overflowed: false,
+            wanted: 0,
         })
     }
 
@@ -385,6 +392,7 @@ impl ExecutableBuffer {
     /// bytes in past the gap left by the dropped instruction and produce a
     /// silently misaligned code stream.
     pub fn emit(&mut self, bytes: &[u8]) {
+        self.wanted += bytes.len();
         if self.overflowed || self.len + bytes.len() > self.capacity {
             self.overflowed = true;
             return;
@@ -416,6 +424,7 @@ impl ExecutableBuffer {
     /// already overflowed.
     #[inline]
     pub fn emit_byte(&mut self, b: u8) {
+        self.wanted += 1;
         if self.overflowed || self.len >= self.capacity {
             self.overflowed = true;
             return;
@@ -450,6 +459,15 @@ impl ExecutableBuffer {
     #[inline]
     pub fn pos(&self) -> usize {
         self.len
+    }
+
+    /// Total bytes codegen asked to emit, including writes dropped after an
+    /// overflow. On an overflowed buffer this is the capacity the compile
+    /// actually needed (a lower bound: a dropped write still advances it, and
+    /// `rewind_to` does not take bytes back off it).
+    #[inline]
+    pub fn wanted(&self) -> usize {
+        self.wanted
     }
 
     /// Rewind the write position back to a previously recorded `pos()`.
