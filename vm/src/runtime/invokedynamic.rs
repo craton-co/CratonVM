@@ -2519,84 +2519,24 @@ fn execute_record_object_method(
         RecordMethodKind::Equals => {
             let other = thread.frames[frame_idx].stack.pop()?;
             let this = thread.frames[frame_idx].stack.pop()?;
-
-            let result = match (&this, &other) {
-                (Value::Object(Some(a)), Value::Object(Some(b))) if a == b => Ok(1),
+            let result = match (this, other) {
                 (Value::Object(Some(a)), Value::Object(Some(b))) => {
-                    // Must be same class
-                    let a_cid = shared.mem.heap.class_id_of(*a);
-                    let b_cid = shared.mem.heap.class_id_of(*b);
-                    if a_cid != b_cid {
-                        Ok(0)
-                    } else {
-                        // Compare each component field. Reference components
-                        // must compare via their VIRTUAL equals (the JDK's
-                        // generated record equals calls Objects.equals per
-                        // component) — identity comparison broke e.g. JUnit 6's
-                        // record CompositeKey(namespace, key) in
-                        // NamespacedHierarchicalStore, so every store lookup
-                        // with an equal-but-distinct namespace missed. The
-                        // invokes can trigger a moving GC, so the record refs
-                        // are pinned and re-read per component.
-                        use cratonvm_native_api::NativeContext as _;
-                        let mut ctx = NativeContextImpl { shared, thread };
-                        let a_pin = ctx.pin_native_root(*a);
-                        let b_pin = ctx.pin_native_root(*b);
-                        let mut equal = Ok(1);
-                        for &fi in field_indices {
-                            let aa = ctx.read_native_pin(a_pin, *a);
-                            let bb = ctx.read_native_pin(b_pin, *b);
-                            let va = ctx.get_field(aa, fi);
-                            let vb = ctx.get_field(bb, fi);
-                            match values_equal_deep(&mut ctx, &va, &vb) {
-                                Ok(true) => continue,
-                                Ok(false) => {
-                                    equal = Ok(0);
-                                    break;
-                                }
-                                Err(e) => {
-                                    equal = Err(e);
-                                    break;
-                                }
-                            }
-                        }
-                        ctx.unpin_native_roots(a_pin);
-                        ctx.unpin_native_roots(b_pin);
-                        equal
-                    }
+                    let mut ctx = NativeContextImpl { shared, thread };
+                    i32::from(cratonvm_native_builtins::intrinsics::record::record_equals(
+                        &mut ctx, a, b,
+                    )?)
                 }
-                // this.equals(null) → false
-                _ => Ok(0),
+                // `x.equals(null)`, and a non-reference operand, are false.
+                _ => 0,
             };
-            let result = result?;
             thread.frames[frame_idx].stack.push(Value::Int(result))?;
         }
         RecordMethodKind::HashCode => {
             let this = thread.frames[frame_idx].stack.pop()?;
             let hash = match this {
                 Value::Object(Some(obj)) => {
-                    // Reference components must hash via their VIRTUAL
-                    // hashCode (the identity fallback made record hashes
-                    // unstable across equal instances — see the Equals arm).
-                    use cratonvm_native_api::NativeContext as _;
                     let mut ctx = NativeContextImpl { shared, thread };
-                    let obj_pin = ctx.pin_native_root(obj);
-                    let mut h: Result<i32, MethodCallFailed> = Ok(0);
-                    for &fi in field_indices {
-                        let cur = ctx.read_native_pin(obj_pin, obj);
-                        let v = ctx.get_field(cur, fi);
-                        match value_hash_deep(&mut ctx, &v) {
-                            Ok(vh) => {
-                                h = Ok(h.unwrap().wrapping_mul(31).wrapping_add(vh));
-                            }
-                            Err(e) => {
-                                h = Err(e);
-                                break;
-                            }
-                        }
-                    }
-                    ctx.unpin_native_roots(obj_pin);
-                    h?
+                    cratonvm_native_builtins::intrinsics::record::record_hash_code(&mut ctx, obj)?
                 }
                 _ => 0,
             };
@@ -2673,75 +2613,6 @@ fn execute_record_object_method(
     Ok(())
 }
 
-/// Compare two record component values like the JDK's generated record
-/// `equals` does: primitives by value (`Float.equals`/`Double.equals` bit
-/// semantics), references via `Objects.equals` — i.e. the component's
-/// VIRTUAL `equals`. The String content fast path avoids a Java invoke for
-/// the overwhelmingly common case.
-fn values_equal_deep(
-    ctx: &mut NativeContextImpl<'_>,
-    a: &Value,
-    b: &Value,
-) -> Result<bool, MethodCallFailed> {
-    match (a, b) {
-        (Value::Object(Some(x)), Value::Object(Some(y))) => {
-            if x == y {
-                return Ok(true);
-            }
-            let x_cid = ctx.shared.mem.heap.class_id_of(*x);
-            let x_name = ctx
-                .shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(x_cid)
-                .map(|c| c.name.clone());
-            if x_name.as_deref() == Some("java/lang/String") {
-                let xs = read_java_string(&ctx.shared.mem.heap, *x);
-                let ys = read_java_string(&ctx.shared.mem.heap, *y);
-                return Ok(xs == ys);
-            }
-            use cratonvm_native_api::NativeContext as _;
-            match ctx.invoke_virtual(
-                *x,
-                "equals",
-                "(Ljava/lang/Object;)Z",
-                &[Value::Object(Some(*y))],
-            )? {
-                Some(Value::Int(v)) => Ok(v != 0),
-                _ => Ok(false),
-            }
-        }
-        _ => Ok(values_equal(ctx.shared, a, b)),
-    }
-}
-
-/// Hash one record component like the JDK's generated record `hashCode`:
-/// primitives by their wrapper hash, references via the VIRTUAL `hashCode`.
-fn value_hash_deep(ctx: &mut NativeContextImpl<'_>, v: &Value) -> Result<i32, MethodCallFailed> {
-    match v {
-        Value::Object(Some(obj)) => {
-            let cid = ctx.shared.mem.heap.class_id_of(*obj);
-            let name = ctx
-                .shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(cid)
-                .map(|c| c.name.clone());
-            if name.as_deref() == Some("java/lang/String") {
-                return Ok(value_hash(ctx.shared, v));
-            }
-            use cratonvm_native_api::NativeContext as _;
-            match ctx.invoke_virtual(*obj, "hashCode", "()I", &[])? {
-                Some(Value::Int(h)) => Ok(h),
-                _ => Ok(0),
-            }
-        }
-        _ => Ok(value_hash(ctx.shared, v)),
-    }
-}
-
 /// Render one record component like the JDK's generated record `toString`:
 /// primitives via their textual form, references via the VIRTUAL `toString`
 /// (`String.valueOf`, i.e. `null` → "null", else `component.toString()`). The
@@ -2769,77 +2640,6 @@ fn value_to_string_deep(
         }
         // Primitives and the null reference: descriptor-aware textual form.
         _ => Ok(format_field_value(ctx.shared, v, descriptor)),
-    }
-}
-
-/// Compare two JVM values for equality (used by record equals).
-fn values_equal(shared: &SharedVm, a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x == y,
-        (Value::Long(x), Value::Long(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => {
-            // Float.equals semantics: NaN == NaN, +0 != -0
-            x.to_bits() == y.to_bits()
-        }
-        (Value::Double(x), Value::Double(y)) => {
-            // Double.equals semantics
-            x.to_bits() == y.to_bits()
-        }
-        (Value::Object(None), Value::Object(None)) => true,
-        (Value::Object(Some(x)), Value::Object(Some(y))) => {
-            if x == y {
-                return true;
-            }
-            // For String objects, compare by content
-            let x_cid = shared.mem.heap.class_id_of(*x);
-            let x_name = shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(x_cid)
-                .map(|c| c.name.clone());
-            if x_name.as_deref() == Some("java/lang/String") {
-                let xs = read_java_string(&shared.mem.heap, *x);
-                let ys = read_java_string(&shared.mem.heap, *y);
-                return xs == ys;
-            }
-            // For other objects, reference equality
-            false
-        }
-        _ => false,
-    }
-}
-
-/// Hash a JVM value (used by record hashCode).
-fn value_hash(shared: &SharedVm, v: &Value) -> i32 {
-    match v {
-        Value::Int(n) => *n,
-        Value::Long(n) => (*n ^ (*n >> 32)) as i32,
-        Value::Float(f) => f.to_bits() as i32,
-        Value::Double(d) => {
-            let bits = d.to_bits();
-            (bits ^ (bits >> 32)) as i32
-        }
-        Value::Object(Some(obj)) => {
-            // For strings, hash the content
-            let cid = shared.mem.heap.class_id_of(*obj);
-            let name = shared
-                .classes
-                .class_manager
-                .read()
-                .get_class(cid)
-                .map(|c| c.name.clone());
-            if name.as_deref() == Some("java/lang/String") {
-                if let Some(s) = read_java_string(&shared.mem.heap, *obj) {
-                    return s
-                        .bytes()
-                        .fold(0i32, |h, b| h.wrapping_mul(31).wrapping_add(b as i32));
-                }
-            }
-            obj.as_ptr() as i32
-        }
-        Value::Object(None) => 0,
-        _ => 0,
     }
 }
 

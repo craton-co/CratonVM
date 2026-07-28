@@ -2,12 +2,21 @@
 
 ## Open
 
-- [`action.queue` GRAPH-default proof tests — LEGACY compatibility trade-off](actionqueue-graph-default-tests-legacy-tradeoff-20260727.md)
-  (WON'T-FIX, expected) — `ActionQueueDefaultTest` and
-  `InsertOrderingReferenceSeveralDifferentSubclassTest` fail because
-  CratonVM intentionally defaults real-JDK `hibernate.flush.queue.type` to
-  `legacy` (commit `0e87935f2`, fixing the `CycleBreaker` DFS hang). Confirmed
-  by A/B repro: both pass clean with `-Dhibernate.flush.queue.type=graph`.
+- [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](actionqueue-graph-default-tests-legacy-tradeoff-20260727.md)
+  (OPEN; one of two root causes fixed) — real-JDK CratonVM defaults
+  `hibernate.flush.queue.type` to `legacy`, which gates **19 of the 25
+  `action.queue` classes**: 2 fail outright and 17 self-abort via
+  `Assumptions.abort("Skipping GRAPH test with non-GRAPH queue type")` (the
+  earlier WON'T-FIX doc reported only the 2). Root cause 1 — records
+  (`GroupNode`, `FlushOperationGroup`, `StatementShapeKey`) key the planner's
+  graph, and a record's `hashCode`/`equals` is a bare `invokedynamic` that the
+  x64 backend lowers to an unconditional deopt, so those bodies ran
+  interpreter-only (1576 ns vs HotSpot 0.9 ns) — is FIXED via
+  `InterpIntrinsic::{RecordHashCode,RecordEquals}` (3-5x). Root cause 2 is
+  OPEN and is the blocker: 1362 of 1463 hot methods in this workload never
+  JIT-compile at all (`tier_fail_count=3`, including 5-byte getters called
+  500k+ times), leaving the planner ~2400x off HotSpot. Same family as
+  tomcat doc 30. Removing the default today would fix 19 classes but hang 2.
 - [`bulkid.*MutationStrategy*Test` — `testInsertSelect` last-row duplicate](bulkid-mutationstrategy-insertselect-lastrow-duplicate-20260727.md)
   (OPEN, genuine bug) — 11 classes, all failing on the same shared
   temp-table `row_number()`-based multi-table `INSERT ... SELECT` machinery

@@ -32422,6 +32422,38 @@ fn invoke_cached_intrinsic(
 /// no heap allocation.
 const MAX_INTRINSIC_ARGS: usize = 8;
 
+/// Map a record's javac-generated `hashCode`/`equals` body to its interpreter
+/// intrinsic, or `None` for anything else.
+///
+/// These two cannot live in `intrinsics::lookup`'s static
+/// `(class, name, descriptor)` table: they apply to every record class in the
+/// program, and only when the body really is the generated
+/// `invokedynamic java.lang.runtime.ObjectMethods.bootstrap` shape — a record
+/// that hand-writes `hashCode` must keep its own code.
+/// [`Class::generated_record_object_methods`] performs (and memoises) that
+/// body-shape check.
+///
+/// `toString` is deliberately left on the ordinary `invokedynamic` path: it is
+/// not hot, and its formatting needs the component descriptors that the
+/// call-site data carries.
+fn record_object_intrinsic(
+    declaring: &crate::classloading::Class,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<cratonvm_native_api::InterpIntrinsic> {
+    use crate::classloading::{RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE};
+    let generated = declaring.generated_record_object_methods();
+    match (method_name, descriptor) {
+        ("hashCode", "()I") if generated & RECORD_OBJ_HASH_CODE != 0 => {
+            Some(cratonvm_native_api::InterpIntrinsic::RecordHashCode)
+        }
+        ("equals", "(Ljava/lang/Object;)Z") if generated & RECORD_OBJ_EQUALS != 0 => {
+            Some(cratonvm_native_api::InterpIntrinsic::RecordEquals)
+        }
+        _ => None,
+    }
+}
+
 /// Phase 3 — pop intrinsic call arguments into a caller-provided stack
 /// buffer using the parameter descriptors cached in the IC entry (split once
 /// at fill time). The steady-state cost is a stack pop per arg plus
@@ -39604,7 +39636,14 @@ fn execute_invokevirtual_vtable_fast(
                     &method_name,
                     &method_descriptor,
                 )
-                .is_some(),
+                .is_some()
+                    // Records (JEP 395): a generated `hashCode`/`equals` is an
+                    // intrinsic too, but it is not in the static table — see
+                    // `record_object_intrinsic`. Without this arm the vtable
+                    // fast path runs the `invokedynamic` body and the
+                    // intrinsic IC is never reached.
+                    || record_object_intrinsic(declaring_class, &method_name, &method_descriptor)
+                        .is_some(),
             )
         })
         .unwrap_or(false);
@@ -41798,6 +41837,14 @@ fn populate_virtual_invoke_cache(
                             &method_name,
                             &descriptor,
                         )
+                        .or_else(|| {
+                            // Records (JEP 395): `hashCode`/`equals` are not
+                            // keyed on a fixed class, so they cannot come from
+                            // the static table — see `record_object_intrinsic`.
+                            store.get(declaring_id).and_then(|declaring| {
+                                record_object_intrinsic(declaring, &method_name, &descriptor)
+                            })
+                        })
                     })
                     .flatten()
             };

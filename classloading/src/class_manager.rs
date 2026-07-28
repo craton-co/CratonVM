@@ -1774,6 +1774,7 @@ impl RedefineInvariantSnapshot {
             // expected behavior — NOT a redefine invariant. Excluded
             // from the snapshot.
             init_state: _,
+            record_object_methods: _,
         } = c;
         Self {
             id: *id,
@@ -2570,6 +2571,7 @@ impl ClassManager {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
         self.class_store.add(class);
         self.register_class_name(ClassLoaderId::Bootstrap, name, id);
@@ -4191,6 +4193,7 @@ impl ClassManager {
             code_source,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
 
         // Compute has_finalizer: true if this class or any ancestor
@@ -6511,6 +6514,7 @@ impl ClassManager {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
 
         debug!(
@@ -6739,6 +6743,7 @@ impl ClassManager {
             // (e.g. `Class.getComponentType` fast-path) actually reads it.
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
 
         debug!(
@@ -13168,6 +13173,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
 
         let child_fields = vec![make_field("a", false), make_field("b", false)];
@@ -13228,6 +13234,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
 
         // Parent: 1 own instance field + the 2 inherited from Grandparent.
@@ -13265,6 +13272,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
 
         // Child: 2 own instance fields. Expect `num_total_fields = 3 + 2 = 5`,
@@ -13357,6 +13365,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
 
         // Child: 1 own field, laid out right after Parent's (stale) 1-field
@@ -13395,6 +13404,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
 
         // Simulate "the real .class file was found": Parent grows from 1
@@ -13684,6 +13694,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_record());
@@ -13822,6 +13833,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.is_sealed());
@@ -13868,6 +13880,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.is_record());
@@ -13915,6 +13928,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         assert!(store.get(parent_id).unwrap().is_sealed());
 
@@ -13981,6 +13995,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let cls = store.get(id).unwrap();
         // java/lang/Object itself should NOT be considered as "declares_finalize"
@@ -14032,6 +14047,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let cls = store.get(id).unwrap();
         assert!(cls.declares_finalize());
@@ -14074,6 +14090,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let cls = store.get(id).unwrap();
         assert!(!cls.declares_finalize());
@@ -14399,6 +14416,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let entries = mgr.build_vtable_descriptors(id, superclass);
         mgr.vtable_descriptors.insert(id, entries);
@@ -14652,6 +14670,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
 
         let (entries, overrides) = mgr.build_vtable_descriptors_with_overrides(id, None);
@@ -14720,6 +14739,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let (_entries, overrides) =
             mgr.build_vtable_descriptors_with_overrides(sub_id, Some(super_id));
@@ -14797,6 +14817,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         let entries = mgr.build_vtable_descriptors(id, None);
         assert_eq!(entries.len(), 1);
