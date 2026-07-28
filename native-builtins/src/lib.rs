@@ -657,6 +657,103 @@ fn char_chunk_char_at(ctx: &dyn NativeContext, buff: ObjectRef, index: usize) ->
     ctx.get_array_element(buff, index).as_int().unwrap_or(0) as u16
 }
 
+/// Are the `org/apache/catalina/mapper/Mapper` native shadows registered?
+/// Default-ON; `CRATONVM_TOMCAT_MAPPER_NATIVES=0` runs Tomcat's own bytecode.
+/// See the registration site for why the switch exists.
+fn mapper_natives_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_TOMCAT_MAPPER_NATIVES") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Copy a `CharChunk`'s `[start, end)` characters out of the heap ONCE, using
+/// the bulk reader, so a caller that scans the same range repeatedly does not
+/// pay a `get_array_element` VM round trip per character per comparison.
+///
+/// Why this exists (tomcat doc 04, 2026-07-27): `Mapper.map` is served by a
+/// Rust shadow, and its binary searches used to run
+/// `char_chunk_parts` (3 `get_field_by_name`) + a per-character
+/// `get_array_element` for EVERY probe. `TestMapperPerformance` does 10^6
+/// `mapper.map()` calls against an absolute 5 s budget and measured 3.3 ms/1000
+/// (easiest hostname) to 7.9 ms/1000 (`iowejoiejfoiew`) — the latter blowing
+/// the budget — against HotSpot's 0.10/0.37. The chunk being searched is
+/// immutable for the duration of one search, so one bulk copy replaces all of
+/// it.
+///
+/// Returns `None` exactly when [`char_chunk_parts`] does (absent `buff`,
+/// inverted range), so callers keep their existing failure behaviour. A range
+/// running past the array end is truncated by `read_char_array_into`, and the
+/// snapshot is shortened to what was actually read — never zero-filled, which
+/// would compare as U+0000 characters that are not in the heap.
+fn char_chunk_snapshot_range(
+    ctx: &dyn NativeContext,
+    chunk: ObjectRef,
+    start: usize,
+    end: usize,
+) -> Option<Vec<u16>> {
+    let (buff, _, _) = char_chunk_parts(ctx, chunk)?;
+    let len = end.saturating_sub(start);
+    let mut out = vec![0u16; len];
+    let read = ctx.read_char_array_into(buff, start, &mut out);
+    out.truncate(read);
+    Some(out)
+}
+
+/// `mapper_compare_chunk_to_string` over an already-snapshotted range.
+///
+/// Byte-identical ordering to the chunk-reading version: compare UTF-16 code
+/// units up to the shorter length, then order by length. The name is consumed
+/// as an `encode_utf16()` iterator rather than collected, so a binary-search
+/// probe allocates nothing.
+fn compare_units_to_str(units: &[u16], name: &str, ignore_case: bool) -> i32 {
+    let mut name_units = name.encode_utf16();
+    for &actual in units.iter() {
+        let Some(expected) = name_units.next() else {
+            // The name ran out first: it is a strict prefix of the chunk.
+            return 1;
+        };
+        let (a, e) = if ignore_case {
+            (ascii_lower_char(actual), ascii_lower_char(expected))
+        } else {
+            (actual, expected)
+        };
+        if a > e {
+            return 1;
+        }
+        if a < e {
+            return -1;
+        }
+    }
+    // The chunk ran out (or both did). Longer name means the chunk sorts first.
+    if name_units.next().is_some() {
+        -1
+    } else {
+        0
+    }
+}
+
+/// `char_chunk_range_equals_string` over an already-snapshotted range.
+fn units_equal_str(units: &[u16], s: &str, ignore_case: bool) -> bool {
+    let mut it = s.encode_utf16();
+    for &actual in units {
+        let Some(expected) = it.next() else {
+            return false;
+        };
+        if ignore_case {
+            if ascii_lower_char(actual) != ascii_lower_char(expected) {
+                return false;
+            }
+        } else if actual != expected {
+            return false;
+        }
+    }
+    it.next().is_none()
+}
+
 fn char_chunk_nth_slash(
     ctx: &dyn NativeContext,
     buff: ObjectRef,
@@ -720,30 +817,9 @@ fn char_chunk_range_starts_with(
     true
 }
 
-fn char_chunk_range_equals_string(
-    ctx: &dyn NativeContext,
-    buff: ObjectRef,
-    start: usize,
-    end: usize,
-    s: &str,
-    ignore_case: bool,
-) -> bool {
-    let units: Vec<u16> = s.encode_utf16().collect();
-    if end.saturating_sub(start) != units.len() {
-        return false;
-    }
-    for (i, expected) in units.iter().enumerate() {
-        let actual = char_chunk_char_at(ctx, buff, start + i);
-        if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
-                return false;
-            }
-        } else if actual != *expected {
-            return false;
-        }
-    }
-    true
-}
+// `char_chunk_range_equals_string` was removed with its last caller
+// (`mapper_exact_find_chunk_range`) — see `units_equal_str`, which does the
+// same comparison against the range snapshot that caller already holds.
 
 fn mapping_match_static(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
     // `Mapper` can be reached before any Java bytecode has touched
@@ -1049,42 +1125,10 @@ fn mapper_map_element_name(ctx: &dyn NativeContext, elem: ObjectRef) -> String {
     }
 }
 
-fn mapper_compare_chunk_to_string(
-    ctx: &dyn NativeContext,
-    chunk: ObjectRef,
-    start: usize,
-    end: usize,
-    name: &str,
-    ignore_case: bool,
-) -> i32 {
-    let Some((buff, _, _)) = char_chunk_parts(ctx, chunk) else {
-        return if name.is_empty() { 0 } else { -1 };
-    };
-    let chunk_len = end.saturating_sub(start);
-    let units: Vec<u16> = name.encode_utf16().collect();
-    let limit = chunk_len.min(units.len());
-    for i in 0..limit {
-        let mut actual = char_chunk_char_at(ctx, buff, start + i);
-        let mut expected = units[i];
-        if ignore_case {
-            actual = ascii_lower_char(actual);
-            expected = ascii_lower_char(expected);
-        }
-        if actual > expected {
-            return 1;
-        }
-        if actual < expected {
-            return -1;
-        }
-    }
-    if units.len() > chunk_len {
-        -1
-    } else if units.len() < chunk_len {
-        1
-    } else {
-        0
-    }
-}
+// `mapper_compare_chunk_to_string` was removed with its last callers (the two
+// binary searches below) — `compare_units_to_str` is the same comparison
+// against the range snapshot they now take once per search instead of once per
+// probe.
 
 fn mapper_find_chunk_range(
     ctx: &dyn NativeContext,
@@ -1092,6 +1136,28 @@ fn mapper_find_chunk_range(
     chunk: ObjectRef,
     start: usize,
     end: usize,
+    ignore_case: bool,
+) -> i32 {
+    // Snapshot the searched range ONCE (see `char_chunk_snapshot_range`); the
+    // chunk cannot change under a binary search, and re-reading it per probe
+    // was the dominant cost of `Mapper.map` (tomcat doc 04).
+    match char_chunk_snapshot_range(ctx, chunk, start, end) {
+        Some(units) => mapper_find_units(ctx, arr, &units, ignore_case),
+        // `mapper_compare_chunk_to_string` treats an unreadable chunk as
+        // "less than any non-empty name", which makes the very first probe
+        // below return -1 unless element 0's name is empty. Preserve that.
+        None => mapper_find_units(ctx, arr, &[], ignore_case),
+    }
+}
+
+/// Binary search shared by [`mapper_find_chunk_range`] and its exact-match
+/// sibling, over a snapshotted key. Same probe sequence and same return
+/// convention as the original chunk-reading loop ("index of the greatest
+/// element `<=` key, or -1").
+fn mapper_find_units(
+    ctx: &dyn NativeContext,
+    arr: ObjectRef,
+    units: &[u16],
     ignore_case: bool,
 ) -> i32 {
     let len = ctx.array_length(arr);
@@ -1103,15 +1169,7 @@ fn mapper_find_chunk_range(
     let Value::Object(Some(first)) = ctx.get_array_element(arr, 0) else {
         return -1;
     };
-    if mapper_compare_chunk_to_string(
-        ctx,
-        chunk,
-        start,
-        end,
-        &mapper_map_element_name(ctx, first),
-        ignore_case,
-    ) < 0
-    {
+    if compare_units_to_str(units, &mapper_map_element_name(ctx, first), ignore_case) < 0 {
         return -1;
     }
     if high == 0 {
@@ -1122,14 +1180,7 @@ fn mapper_find_chunk_range(
         let Value::Object(Some(elem)) = ctx.get_array_element(arr, mid) else {
             return low as i32;
         };
-        let cmp = mapper_compare_chunk_to_string(
-            ctx,
-            chunk,
-            start,
-            end,
-            &mapper_map_element_name(ctx, elem),
-            ignore_case,
-        );
+        let cmp = compare_units_to_str(units, &mapper_map_element_name(ctx, elem), ignore_case);
         if cmp > 0 {
             low = mid;
         } else if cmp == 0 {
@@ -1141,14 +1192,7 @@ fn mapper_find_chunk_range(
             let Value::Object(Some(elem)) = ctx.get_array_element(arr, high) else {
                 return low as i32;
             };
-            let cmp = mapper_compare_chunk_to_string(
-                ctx,
-                chunk,
-                start,
-                end,
-                &mapper_map_element_name(ctx, elem),
-                ignore_case,
-            );
+            let cmp = compare_units_to_str(units, &mapper_map_element_name(ctx, elem), ignore_case);
             return if cmp < 0 { low as i32 } else { high as i32 };
         }
     }
@@ -1203,8 +1247,10 @@ fn mapper_exact_find_chunk_range(
     end: usize,
     ignore_case: bool,
 ) -> Option<ObjectRef> {
-    let (buff, _, _) = char_chunk_parts(ctx, chunk)?;
-    let idx = mapper_find_chunk_range(ctx, arr, chunk, start, end, ignore_case);
+    // One snapshot serves both the binary search and the final exact-equality
+    // check — the previous code re-read the chunk for each.
+    let units = char_chunk_snapshot_range(ctx, chunk, start, end)?;
+    let idx = mapper_find_units(ctx, arr, &units, ignore_case);
     if idx < 0 {
         return None;
     }
@@ -1212,14 +1258,7 @@ fn mapper_exact_find_chunk_range(
         Value::Object(Some(o)) => o,
         _ => return None,
     };
-    if char_chunk_range_equals_string(
-        ctx,
-        buff,
-        start,
-        end,
-        &mapper_map_element_name(ctx, elem),
-        ignore_case,
-    ) {
+    if units_equal_str(&units, &mapper_map_element_name(ctx, elem), ignore_case) {
         Some(elem)
     } else {
         None
@@ -9397,6 +9436,14 @@ pub fn register_essential_natives_with_shims(
         "()Ljava/lang/String;",
         native_message_bytes_to_string,
     );
+    // Tomcat request-mapping shadows. Opt out with
+    // `CRATONVM_TOMCAT_MAPPER_NATIVES=0` to run Tomcat's own `Mapper` bytecode
+    // instead — the shadows re-implement real, present Java code, so the
+    // bytecode path is the reference, and being able to A/B them is how
+    // `TestMapperPerformance` (an ABSOLUTE 5 s budget for 10^6 `map()` calls)
+    // gets attributed to the right side of the boundary. See known-issue
+    // tomcat/04.
+    if mapper_natives_enabled() {
     registry.register(
         "org/apache/catalina/mapper/Mapper",
         "find",
@@ -9463,6 +9510,7 @@ pub fn register_essential_natives_with_shims(
         "([Lorg/apache/catalina/mapper/Mapper$MappedWrapper;ILorg/apache/tomcat/util/buf/CharChunk;Lorg/apache/catalina/mapper/MappingData;)V",
         native_mapper_internal_map_wildcard_wrapper,
     );
+    } // end mapper_natives_enabled()
     registry.register(
         "java/io/FilterOutputStream",
         "<init>",
