@@ -308,12 +308,46 @@ pub enum InitComplexity {
 /// Every other opcode is benign. The scan stops at the first
 /// disqualifier and returns `Complex`. If it walks the entire stream
 /// without finding one, it returns `Trivial`.
+/// Bisect knob (default OFF — no behaviour change): treat a constructor whose
+/// ONLY disqualifier is `putfield` as `Trivial`, keeping the ban for
+/// `putstatic` / `monitorenter` / `monitorexit` / `invokedynamic`.
+///
+/// Why this knob exists. `putfield` is what essentially every *real*
+/// constructor does — it is the whole point of one — so the blanket gate makes
+/// "allocate an object whose constructor assigns a field" run its constructor
+/// in the interpreter forever. Measured from C2-compiled code on the
+/// `CallRate` probe: ~2200 ns/alloc for a one-field constructor against
+/// ~130-160 ns for a field-store-free one, i.e. the gate, not allocation
+/// itself, is the dominant cost of `new` on every hot path in the VM
+/// (`new String(...)`, `new HashMap.Node(...)`, ...).
+///
+/// The ban predates the open-source import (`a6dc911ed`) and is one of the
+/// four *structural* bans; unlike the ~46 named correctness bans it carries no
+/// incident write-up — only the "field stores trigger the JIT's
+/// load-forwarding interaction" note above. Per the ban-sweep methodology in
+/// `docs/known-issues/jit-bans/jit-skip-list-open-bans-20260725.md`, the first
+/// move on an unverified ban is to make it testable at runtime rather than to
+/// delete it. Set `CRATONVM_JIT_ALLOW_PUTFIELD_INIT=1` to lift it for a
+/// measurement run.
+fn allow_putfield_init() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ALLOW_PUTFIELD_INIT").is_some()
+    })
+}
+
 pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
     use std::cmp::min;
+    let allow_putfield = allow_putfield_init();
     let mut pc = 0usize;
     while pc < bytecode.len() {
         let op = bytecode[pc];
         match op {
+            // `putfield` alone is separable from the other four: see
+            // `allow_putfield_init`. When the knob is off this arm is
+            // unreachable and the classification is byte-identical to before.
+            0xb5 if allow_putfield => {}
             0xb3 | 0xb5 | 0xc2 | 0xc3 | 0xba => return InitComplexity::Complex,
             _ => {}
         }
