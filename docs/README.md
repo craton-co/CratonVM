@@ -102,7 +102,6 @@ compatibility work.
 - [Platform Support Matrix](book/src/reference/platform-support.md)
 - [JCK Engineering Status](jck-compliance.md)
 - [JavaFX Status](javafx-status.md)
-- [Divergence Log](known-gaps/divergence-log.md)
 
 CratonVM is not JCK-certified. See [legal.md](legal.md) for licensing and
 compliance terminology.

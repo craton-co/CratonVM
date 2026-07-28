@@ -3634,70 +3634,169 @@ pub(crate) fn native_string_replace_charseq(
     ))))
 }
 
-pub(crate) fn native_string_to_lower_case(
+/// Shared body of every `String.to{Lower,Upper}Case` native.
+///
+/// `locale` is the explicit `Locale` argument (`None` for the no-arg overloads,
+/// which the JDK defines as `toXxxCase(Locale.getDefault())`). Its language
+/// decides which of two paths runs:
+///
+/// * **Ordinary locales** keep the historical fast path: an in-place ASCII fold,
+///   or Rust's Unicode full mapping. That is byte-identical to HotSpot for the
+///   root locale — `ß → SS`, `ΣΣ → σς`, `İ → i̇` are all verified
+///   differentially.
+/// * **`tr`/`az`/`lt`** take [`crate::case_map`], the port of the JDK's
+///   `ConditionalSpecialCasing`.
+///
+/// `memoize` selects the per-receiver `ascii_case_string` cache, which only some
+/// of the registration sites used before they were unified here (see
+/// [`native_string_to_lower_case`] vs [`native_string_to_lower_case_uncached`]).
+/// The locale-dependent path never uses it: the cache is keyed by receiver +
+/// direction only, so `s.toLowerCase()` and `s.toLowerCase(TURKISH)` would share
+/// an entry and one would be served the other's answer.
+///
+/// An unchanged String returns the receiver itself, as `String.toLowerCase`
+/// does; a changed one is a fresh, uninterned String.
+fn string_case_impl(
     ctx: &mut dyn NativeContext,
-    args: &[Value],
+    this: cratonvm_types::ObjectRef,
+    locale: Option<cratonvm_types::ObjectRef>,
+    lowercase: bool,
+    memoize: bool,
 ) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    if let Some(result) = ctx.get_ascii_case_string_cached(this, false) {
-        return Ok(Some(Value::Object(Some(result))));
+    let lang = crate::locale_language_for_case_mapping(ctx, locale);
+    if crate::case_map::is_locale_dependent(&lang) {
+        let src = ctx.read_string(this).unwrap_or_default();
+        let mapped = if lowercase {
+            crate::case_map::to_lower_case(&src, &lang)
+        } else {
+            crate::case_map::to_upper_case(&src, &lang)
+        };
+        if mapped == src {
+            return Ok(Some(Value::Object(Some(this))));
+        }
+        return Ok(Some(Value::Object(Some(
+            ctx.create_string_uninterned_gc_safe(&mapped),
+        ))));
     }
-    let mut lower = ctx.read_string(this).unwrap_or_default();
-    let changed = if lower.is_ascii() {
-        let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
-        lower.make_ascii_lowercase();
+
+    if memoize {
+        if let Some(result) = ctx.get_ascii_case_string_cached(this, !lowercase) {
+            return Ok(Some(Value::Object(Some(result))));
+        }
+    }
+    let mut folded = ctx.read_string(this).unwrap_or_default();
+    let changed = if folded.is_ascii() {
+        let changed = folded.bytes().any(|byte| {
+            if lowercase {
+                byte.is_ascii_uppercase()
+            } else {
+                byte.is_ascii_lowercase()
+            }
+        });
+        if lowercase {
+            folded.make_ascii_lowercase();
+        } else {
+            folded.make_ascii_uppercase();
+        }
         changed
     } else {
-        let folded = lower.to_lowercase();
-        if folded == lower {
+        let mapped = if lowercase {
+            folded.to_lowercase()
+        } else {
+            folded.to_uppercase()
+        };
+        if mapped == folded {
             false
         } else {
-            lower = folded;
+            folded = mapped;
             true
         }
     };
-    let result = if changed {
-        ctx.create_ascii_case_string_cached(this, &lower, false)
-    } else {
+    let result = if !changed {
         this
+    } else if memoize {
+        ctx.create_ascii_case_string_cached(this, &folded, !lowercase)
+    } else {
+        ctx.create_string_uninterned_gc_safe(&folded)
     };
     Ok(Some(Value::Object(Some(result))))
 }
 
-pub(crate) fn native_string_to_upper_case(
+/// The `Locale` operand of a `to{Lower,Upper}Case(Locale)` native, if the call
+/// has one. A null (or absent) argument means "use the default locale".
+pub(crate) fn locale_arg(args: &[Value], index: usize) -> Option<cratonvm_types::ObjectRef> {
+    match args.get(index) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    }
+}
+
+fn string_case_native(
     ctx: &mut dyn NativeContext,
     args: &[Value],
+    lowercase: bool,
+    memoize: bool,
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    if let Some(result) = ctx.get_ascii_case_string_cached(this, true) {
-        return Ok(Some(Value::Object(Some(result))));
+    string_case_impl(ctx, this, locale_arg(args, 1), lowercase, memoize)
+}
+
+/// `String.toLowerCase()` / `toLowerCase(Locale)` **with** the per-receiver
+/// memo — the synthetic-JDK registration and the `StringLatin1` delegate, whose
+/// callers re-lowercase the same receiver in a loop.
+pub(crate) fn native_string_to_lower_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    string_case_native(ctx, args, true, true)
+}
+
+/// `String.toUpperCase()` / `toUpperCase(Locale)` **with** the per-receiver memo.
+pub(crate) fn native_string_to_upper_case(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    string_case_native(ctx, args, false, true)
+}
+
+/// `String.toLowerCase()` / `toLowerCase(Locale)` **without** the memo — the
+/// real-JDK essential set and the `phases_early` overloads, which each allocated
+/// a fresh String per call before they shared this implementation. Keeping them
+/// uncached means unifying the four sites changes only the locale handling.
+pub(crate) fn native_string_to_lower_case_uncached(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    string_case_native(ctx, args, true, false)
+}
+
+/// `String.toLowerCase(Locale)` for the JIT's thin direct-call helpers, which
+/// hold raw `ObjectRef`s rather than a `&[Value]`.
+///
+/// Same implementation (and same per-receiver memo) as the interpreted native —
+/// which is the point: the JIT helper used to carry its own copy of the mapping
+/// and ignore the `Locale`, so `s.toLowerCase(TURKISH)` returned the Turkish
+/// answer interpreted and the root answer once the caller tiered up.
+pub fn jit_string_to_lower_case(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    locale: Option<cratonvm_types::ObjectRef>,
+) -> Option<cratonvm_types::ObjectRef> {
+    match string_case_impl(ctx, this, locale, true, true) {
+        Ok(Some(Value::Object(Some(o)))) => Some(o),
+        _ => None,
     }
-    let mut upper = ctx.read_string(this).unwrap_or_default();
-    let changed = if upper.is_ascii() {
-        let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
-        upper.make_ascii_uppercase();
-        changed
-    } else {
-        let folded = upper.to_uppercase();
-        if folded == upper {
-            false
-        } else {
-            upper = folded;
-            true
-        }
-    };
-    let result = if changed {
-        ctx.create_ascii_case_string_cached(this, &upper, true)
-    } else {
-        this
-    };
-    Ok(Some(Value::Object(Some(result))))
+}
+
+/// `String.toUpperCase()` / `toUpperCase(Locale)` **without** the memo.
+pub(crate) fn native_string_to_upper_case_uncached(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    string_case_native(ctx, args, false, false)
 }
 
 pub(crate) fn native_string_is_empty(

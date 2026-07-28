@@ -4233,6 +4233,7 @@ fn native_wildfly_security_manager_get_property_privileged(
     }
 }
 
+pub mod case_map;
 pub mod lang_class;
 pub mod lang_string;
 // WP2.1: java.lang.reflect full coverage — supplements lang_class.rs with
@@ -8011,93 +8012,34 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Int(if a == b { 1 } else { 0 })))
         },
     );
+    // All four overloads share `lang_string::native_string_to_{lower,upper}_case`,
+    // which honours the `Locale` argument (`args[1]`, absent here for the no-arg
+    // forms → the default locale). Inlining the mapping here is what made
+    // `"TITLE".toLowerCase(Locale.forLanguageTag("tr"))` return `"title"` instead
+    // of HotSpot's `"tıtle"`.
     registry.register(
         "java/lang/String",
         "toLowerCase",
         "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut lower = ctx.read_string(this).unwrap_or_default();
-            let changed = if lower.is_ascii() {
-                let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
-                lower.make_ascii_lowercase();
-                changed
-            } else {
-                let folded = lower.to_lowercase();
-                if folded == lower { false } else { lower = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&lower) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_lower_case_uncached,
     );
     registry.register(
         "java/lang/String",
         "toUpperCase",
         "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut upper = ctx.read_string(this).unwrap_or_default();
-            let changed = if upper.is_ascii() {
-                let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
-                upper.make_ascii_uppercase();
-                changed
-            } else {
-                let folded = upper.to_uppercase();
-                if folded == upper { false } else { upper = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&upper) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_upper_case_uncached,
     );
     registry.register(
         "java/lang/String",
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut lower = ctx.read_string(this).unwrap_or_default();
-            let changed = if lower.is_ascii() {
-                let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
-                lower.make_ascii_lowercase();
-                changed
-            } else {
-                let folded = lower.to_lowercase();
-                if folded == lower { false } else { lower = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&lower) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_lower_case_uncached,
     );
     registry.register(
         "java/lang/String",
         "toUpperCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let mut upper = ctx.read_string(this).unwrap_or_default();
-            let changed = if upper.is_ascii() {
-                let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
-                upper.make_ascii_uppercase();
-                changed
-            } else {
-                let folded = upper.to_uppercase();
-                if folded == upper { false } else { upper = folded; true }
-            };
-            let out = if changed { ctx.create_string_uninterned_gc_safe(&upper) } else { this };
-            Ok(Some(Value::Object(Some(out))))
-        },
+        lang_string::native_string_to_upper_case_uncached,
     );
     // String.hashCode — use the layout-aware CACHING implementation (reads and
     // writes the JDK `hash` field) rather than recomputing from scratch on every
@@ -25337,6 +25279,69 @@ pub(crate) fn locale_data_set(obj: ObjectRef, lang: &str, country: &str, variant
 /// real-JDK-constructed Locale) — callers treat that as the root locale.
 pub(crate) fn locale_data_get(obj: ObjectRef) -> (String, String, String) {
     locale_data().lock().get(&obj).cloned().unwrap_or_default()
+}
+
+/// The ISO-639 language of `locale` (or of the default locale when `None`),
+/// normalised for [`case_map`].
+///
+/// A `java.util.Locale` reaches the String natives in one of three shapes, and
+/// all three have to be understood or `toLowerCase(Locale.forLanguageTag("tr"))`
+/// silently falls back to the root rules:
+///
+/// 1. one of *our* synthetic Locales — the language lives in a Rust side table
+///    (`locale_data`, or `locale_bootstrap`'s own for the cached default),
+///    because writing Strings into a real `Locale`'s instance slots would
+///    poison its real-JDK field layout (see [`locale_data`]);
+/// 2. a real-JDK `Locale` — the language is `baseLocale.language`;
+/// 3. absent (the no-arg `toLowerCase()`), which the JDK defines as
+///    `Locale.getDefault()`. Rather than *calling* `getDefault()` from inside a
+///    String native — it can allocate and run `<clinit>` — we read the
+///    `user.language` system property that seeds it, so `-Duser.language=tr`
+///    behaves as it does on HotSpot.
+pub(crate) fn locale_language_for_case_mapping(
+    ctx: &mut dyn NativeContext,
+    locale: Option<ObjectRef>,
+) -> std::borrow::Cow<'static, str> {
+    let Some(obj) = locale else {
+        return std::borrow::Cow::Borrowed(default_case_mapping_language(ctx));
+    };
+    let (lang, _, _) = locale_data_get(obj);
+    let raw = if !lang.is_empty() {
+        lang
+    } else if let Some(l) = locale_bootstrap::synthetic_language(obj) {
+        l
+    } else {
+        real_locale_language(ctx, obj)
+    };
+    std::borrow::Cow::Owned(case_map::normalize_language(&raw))
+}
+
+/// The default locale's language, resolved once.
+///
+/// `String.toLowerCase()` is one of the hottest natives in the VM; a
+/// system-property lookup plus two `String` allocations per call would be a
+/// visible regression there. The value cannot change during a run — our
+/// `Locale.getDefault()` hands back a fixed synthetic locale seeded from
+/// `user.language` — so it is resolved on first use and reused.
+fn default_case_mapping_language(ctx: &mut dyn NativeContext) -> &'static str {
+    static LANG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LANG.get_or_init(|| {
+        case_map::normalize_language(
+            &ctx.get_system_property("user.language")
+                .unwrap_or_else(|| "en".to_string()),
+        )
+    })
+    .as_str()
+}
+
+/// `baseLocale.language` of a real-JDK `Locale`, or the empty string.
+fn real_locale_language(ctx: &mut dyn NativeContext, locale: ObjectRef) -> String {
+    if let Value::Object(Some(base)) = ctx.get_field_by_name(locale, "baseLocale") {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(base, "language") {
+            return ctx.read_string(s).unwrap_or_default();
+        }
+    }
+    String::new()
 }
 
 /// GC root scan for all process-global Locale caches (this module's

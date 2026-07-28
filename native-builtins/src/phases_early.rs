@@ -1996,27 +1996,19 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     });
 
     // --- String.toUpperCase(Locale) / toLowerCase(Locale) ---
+    // Share the locale-aware implementation rather than folding with Rust's
+    // root-locale mapping and dropping `args[1]` on the floor (DIV-001).
     r.register(
         s,
         "toUpperCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let val = ctx.read_string(this).unwrap_or_default();
-            let s = ctx.create_string(&val.to_uppercase());
-            Ok(Some(Value::Object(Some(s))))
-        },
+        crate::lang_string::native_string_to_upper_case_uncached,
     );
     r.register(
         s,
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let val = ctx.read_string(this).unwrap_or_default();
-            let s = ctx.create_string(&val.to_lowercase());
-            Ok(Some(Value::Object(Some(s))))
-        },
+        crate::lang_string::native_string_to_lower_case_uncached,
     );
 
     // --- String.getBytes(String charsetName) ---
@@ -13189,6 +13181,15 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Cipher",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -15728,6 +15729,15 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Signature",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
             let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 4);
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(0));
@@ -20454,11 +20464,22 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
     // lookup and is disproportionately expensive under the moving collector.
     // Reuse the String-level implementation, which preserves the unchanged
     // receiver and alternates distinct cached results for changed ASCII input.
+    //
+    // The static signature is `(String this, byte[] value, Locale locale)`, so
+    // the receiver is `args[0]` and the locale `args[2]`; both are forwarded —
+    // passing only `args[..1]` made this (JIT-reachable) path root-locale-only.
     r.register(
         c,
         "toLowerCase",
         "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| native_string_to_lower_case(ctx, &args[..1]),
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let locale = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_string_to_lower_case(ctx, &[this, locale])
+        },
     );
 
     // static char getChar(byte[] val, int index)

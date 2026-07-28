@@ -460,6 +460,13 @@ pub mod helpful_npe {
     /// today's default-path shape) when the gate is off or no action was
     /// recorded — so the default path is byte-for-byte unchanged.
     pub fn jit_npe_message_gated(code: u8) -> Option<String> {
+        // An explicit `-XX:-ShowCodeDetailsInExceptionMessages` suppresses the
+        // message entirely, matching HotSpot — `helpful_npe_opcodes()` is true
+        // in that case (it means "handle this the HotSpot way"), so the
+        // suppression has to be checked first.
+        if crate::runtime::env_cache::helpful_npe_suppressed() {
+            return None;
+        }
         if !crate::runtime::env_cache::helpful_npe_opcodes() {
             return None;
         }
@@ -474,6 +481,22 @@ pub mod helpful_npe {
     #[derive(Clone, Copy)]
     struct Slot {
         producer_bci: Option<usize>,
+    }
+
+    /// A stack entry whose producer this analysis cannot name — either it was
+    /// pushed by a predecessor basic block (see [`simulate_to`]) or by an opcode
+    /// that yields no nameable source expression. Rendering stops here and the
+    /// caller emits HotSpot's action-only message.
+    const UNKNOWN_SLOT: Slot = Slot { producer_bci: None };
+
+    /// Pop one operand-stack entry, yielding [`UNKNOWN_SLOT`] once the block's
+    /// own simulated suffix is exhausted (the popped value came from a
+    /// predecessor block). Never fails: an underflow is *information* — "this
+    /// operand predates the block" — not a reason to abandon the whole
+    /// reconstruction. The surviving entries stay correctly aligned relative to
+    /// the top of the stack, which is how every caller indexes them.
+    fn pop_slot(stack: &mut Vec<Slot>) -> Slot {
+        stack.pop().unwrap_or(UNKNOWN_SLOT)
     }
 
     /// The absolute jump targets of a branch / switch at `pc`, or `None` for a
@@ -554,6 +577,19 @@ pub mod helpful_npe {
     /// reconstruction robust inside methods with `try/catch` / loops: the walk
     /// is straight-line within one block, so it never has to model the
     /// control-flow joins a linear from-entry walk would bail on.
+    ///
+    /// The returned vector is the **suffix** of the real operand stack that this
+    /// block itself produced. A block leader that is a control-flow *merge*
+    /// point (the join of a ternary, of a `&&`/`||` short-circuit, or of a
+    /// `switch` arm that leaves a value on the stack) starts with entries pushed
+    /// by its predecessor blocks, which this straight-line walk cannot see.
+    /// [`pop_slot`] models those as "consumed from below" rather than as a hard
+    /// bail, so indices measured **from the top** stay exact while anything
+    /// reaching below the block boundary just reports an unknown producer → the
+    /// caller's action-only message. Before that, `Type x = cond ? null : new …;
+    /// x.deref()` — whose merge-point leader is the `astore` — underflowed on
+    /// that very first pop and lost the `because "x" is null` clause HotSpot
+    /// prints.
     fn simulate_to(code: &[u8], target_bci: usize, resolver: &dyn CpResolver) -> Option<Vec<Slot>> {
         let mut stack: Vec<Slot> = Vec::new();
         let mut pc = block_start_for(code, target_bci);
@@ -610,7 +646,7 @@ pub mod helpful_npe {
         macro_rules! shape {
             ($pop:expr, $push:expr) => {{
                 for _ in 0..$pop {
-                    stack.pop()?;
+                    pop_slot(stack);
                 }
                 for _ in 0..$push {
                     stack.push(Slot {
@@ -646,12 +682,38 @@ pub mod helpful_npe {
             Anewarray(_) | Newarray(_) => shape!(1, 1),
             Nop => {}
             Dup => {
-                let top = *stack.last()?;
+                // A `dup` at a merge-point leader duplicates a value a
+                // predecessor block pushed: unknown, but still one stack entry.
+                let top = stack.last().copied().unwrap_or(UNKNOWN_SLOT);
                 stack.push(top);
             }
             Pop => {
-                stack.pop()?;
+                pop_slot(stack);
             }
+            // Arithmetic / conversion / comparison. None of these *produces* a
+            // nameable source expression (`describe_producer` returns `None` for
+            // them, so the message stays action-only if the null operand came
+            // from one), but they routinely sit in the prefix of the trapping
+            // statement's own block — `sink += a[0]` compiles to
+            // `getstatic; aload; iconst_0; iaload; iadd; putstatic` — so
+            // modelling their shape keeps the walk alive instead of abandoning
+            // the whole reconstruction at the `iadd`.
+            //
+            // Category-2 values occupy ONE entry in this model, so `ladd`
+            // (2 in / 1 out) and `lshl` (long + int in / long out) have the same
+            // shape as their `int` counterparts. The ambiguous stack-shufflers
+            // (`dup2`, `dup_x1`, `pop2`, `swap`, …) are deliberately left
+            // unmodelled: their entry count depends on the operand categories,
+            // and a mis-shaped stack would mis-attribute a producer — worse than
+            // no expression at all.
+            Iadd | Isub | Imul | Idiv | Irem | Iand | Ior | Ixor | Ishl | Ishr | Iushr | Ladd
+            | Lsub | Lmul | Ldiv | Lrem | Land | Lor | Lxor | Lshl | Lshr | Lushr | Fadd | Fsub
+            | Fmul | Fdiv | Frem | Dadd | Dsub | Dmul | Ddiv | Drem | Lcmp | Fcmpl | Fcmpg
+            | Dcmpl | Dcmpg => shape!(2, 1),
+            Ineg | Lneg | Fneg | Dneg | I2l | I2f | I2d | L2i | L2f | L2d | F2i | F2l | F2d
+            | D2i | D2l | D2f | I2b | I2c | I2s => shape!(1, 1),
+            // `iinc` mutates a local in place — no operand-stack effect.
+            Iinc { .. } => {}
             // Stores pop their value (cat-2 is one entry in this model). These
             // are extremely common in the prefix — `Type x = null; … x.deref()`
             // emits `astore`/`istore` between the producing const/load and the
@@ -1584,9 +1646,21 @@ pub fn throw_runtime_error(
         }
     }
     let (class_name, message) = match &error {
-        RuntimeError::NullPointerException { message } => {
-            ("java/lang/NullPointerException", message.as_deref())
-        }
+        RuntimeError::NullPointerException { message } => (
+            "java/lang/NullPointerException",
+            // Empty = the "no message" marker an implicit-dereference NPE
+            // carries when `-XX:-ShowCodeDetailsInExceptionMessages` is
+            // explicitly off (the throw sites must hand a `String` to
+            // `pop_object_ref_ctx_with`, so they cannot pass `None`
+            // themselves). HotSpot's `getMessage()` is null there. A
+            // *deliberate* empty NPE message is not produced anywhere
+            // Rust-side; a Java `new NullPointerException("")` never travels
+            // through `RuntimeError`.
+            match message.as_deref() {
+                Some("") => None,
+                other => other,
+            },
+        ),
         RuntimeError::ArithmeticException { message } => {
             ("java/lang/ArithmeticException", Some(message.as_str()))
         }
@@ -3256,6 +3330,112 @@ mod helpful_npe_tests {
         );
         assert_eq!(helpful_npe::jit_action_message(NONE), None);
         assert_eq!(helpful_npe::jit_action_message(250), None);
+    }
+
+    // -- Merge-point blocks (DIV-001..003 divergence-log closure) ----------
+    //
+    // A basic block whose leader is a control-flow *join* starts with operand
+    // entries its predecessors pushed. `simulate_to` cannot see them, and used
+    // to bail on the resulting underflow — costing the `because "<expr>"` clause
+    // for every `T x = cond ? a : b; x.deref()`, the single most common shape in
+    // real code. It now treats an underflow as "this operand predates the
+    // block", which keeps top-relative indices exact. Expectations below are the
+    // verbatim JDK 25 `getExtendedNPEMessage` output for the equivalent source
+    // (the `DivNpe2` differential probe).
+
+    const ILOAD_0: u8 = 0x1a;
+    const IFEQ: u8 = 0x99;
+    const GOTO: u8 = 0xa7;
+    const ACONST_NULL: u8 = 0x01;
+    const ASTORE_1: u8 = 0x4c;
+    const ALOAD_2: u8 = 0x2c;
+    const IADD: u8 = 0x60;
+    const POP: u8 = 0x57;
+
+    /// `Node n = flag ? null : other; n.value` — the trapping `getfield` sits in
+    /// the ternary's merge block, whose leader (`astore_1`) pops a value pushed
+    /// by both predecessor blocks.
+    #[test]
+    fn ternary_merge_block_still_names_the_local() {
+        // 0: iload_0
+        // 1: ifeq   -> 8
+        // 4: aconst_null
+        // 5: goto   -> 9
+        // 8: aload_2
+        // 9: astore_1        <- merge-point block leader
+        // 10: aload_1
+        // 11: getfield #1    <- trap
+        let mut code = vec![ILOAD_0, IFEQ];
+        code.extend_from_slice(&u16_be(7)); // relative to bci 1 -> 8
+        code.push(ACONST_NULL);
+        code.push(GOTO);
+        code.extend_from_slice(&u16_be(4)); // relative to bci 5 -> 9
+        code.push(ALOAD_2);
+        code.push(ASTORE_1);
+        code.push(ALOAD_1);
+        let trap_bci = code.len();
+        code.push(GETFIELD);
+        code.extend_from_slice(&u16_be(1));
+
+        let mut fields = HashMap::new();
+        fields.insert(1u16, field("Node", "value"));
+        let mut resolver = MockResolver::new_static(fields, HashMap::new());
+        resolver.locals.insert(1, "n".to_string());
+
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
+        assert_eq!(text(&expr), Some("n"));
+        assert_eq!(
+            helpful_npe::combine_opt(&helpful_npe::action_read_field("value"), expr.as_ref()),
+            "Cannot read field \"value\" because \"n\" is null"
+        );
+    }
+
+    /// `a[i + 1]` in a merge block: the index sub-expression puts a modelled
+    /// `iadd` in the prefix, and the array operand is still reachable at depth 1.
+    /// Before arithmetic was modelled the `iadd` alone abandoned the walk.
+    #[test]
+    fn arithmetic_prefix_does_not_abandon_the_walk() {
+        // 0: astore_1   <- merge-point leader, pops a predecessor value
+        // 1: aload_1
+        // 2: iload_0
+        // 3: iconst_1
+        // 4: iadd
+        // 5: iaload     <- trap; stack is [arr, idx]
+        const IALOAD: u8 = 0x2e;
+        let code = vec![ASTORE_1, ALOAD_1, ILOAD_0, ICONST_1, IADD, IALOAD];
+        let trap_bci = 5;
+
+        let mut resolver = MockResolver::new_static(HashMap::new(), HashMap::new());
+        resolver.locals.insert(1, "a".to_string());
+
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 1, &resolver);
+        assert_eq!(text(&expr), Some("a"));
+        assert_eq!(
+            helpful_npe::combine_opt(
+                &helpful_npe::action_array_load(helpful_npe::ArrayElemKind::Int),
+                expr.as_ref()
+            ),
+            "Cannot load from int array because \"a\" is null"
+        );
+    }
+
+    /// Tolerating the underflow must not *invent* an expression: an operand that
+    /// genuinely came from a predecessor block stays unknown, so the message
+    /// falls back to HotSpot's action-only shape rather than naming the wrong
+    /// value.
+    #[test]
+    fn operand_from_a_predecessor_block_stays_unnamed() {
+        // 0: astore_1   (consumes the merge value)
+        // 1: pop        (consumes a second predecessor value)
+        // 2: arraylength  <- trap on a third, which predates the block entirely
+        let code = vec![ASTORE_1, POP, ARRAYLENGTH];
+        let resolver = MockResolver::new_static(HashMap::new(), HashMap::new());
+        let expr = helpful_npe::null_expr_at_depth(&code, 2, 0, &resolver);
+        assert_eq!(text(&expr), None);
+        assert_eq!(
+            helpful_npe::combine_opt(&helpful_npe::action_array_length(), expr.as_ref()),
+            "Cannot read the array length"
+        );
     }
 
     /// Default path (gate off): the gated wrapper attaches no message, so a

@@ -730,8 +730,103 @@ impl Drop for ExecutableBuffer {
                 std::thread::current().id()
             );
         }
+        // Record the unmap BEFORE it happens, so a thread that faults inside
+        // this range can be told it was executing freed code (see
+        // `recent_code_free_covering`, which the crash handler prints). The
+        // active-execution count is what makes the report actionable: a
+        // non-zero value means the buffer was released while at least one
+        // thread was inside compiled code — which is precisely the bug the
+        // `defer_jit_owner` retirement queue above exists to prevent, so a
+        // non-zero value here means some release path is still bypassing it.
+        record_code_free(
+            self.ptr as usize,
+            self.capacity,
+            ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire),
+        );
+        if never_free_code_enabled() {
+            return;
+        }
         platform::free_executable(self.ptr, self.capacity);
     }
+}
+
+/// DIAG: `CRATONVM_JIT_NEVER_FREE_CODE=1` never unmaps an executable buffer,
+/// for ANY owner — unlike [`jit_leak_code_enabled`], which only defers the
+/// owners routed through [`defer_jit_owner`]. If a SIGSEGV vanishes under this
+/// flag but survives `CRATONVM_JIT_LEAK_CODE=1`, the use-after-free is on a
+/// release path the retirement queue does not cover. Leaks every retired body;
+/// diagnosis only, never a shipping mode.
+fn never_free_code_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_JIT_NEVER_FREE_CODE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Ring of the most recently unmapped executable buffers.
+///
+/// Exists so the crash handler can answer the one question a bare
+/// `SIGSEGV at pc=X, addr=X` cannot: was `X` inside a code buffer this process
+/// had just released? `lookup_jit_method_name` cannot — it answers from the
+/// range registry, which a *recycled* address also satisfies, and which is
+/// still populated when the fault is taken. Plain atomics, no locks and no
+/// allocation, so the lookup is safe from a signal handler.
+const RECENT_CODE_FREES: usize = 4096;
+static RECENT_FREE_BASE: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+static RECENT_FREE_LEN: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+static RECENT_FREE_ACTIVE: [std::sync::atomic::AtomicUsize; RECENT_CODE_FREES] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; RECENT_CODE_FREES];
+static RECENT_FREE_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn record_code_free(base: usize, len: usize, active_executions: usize) {
+    use std::sync::atomic::Ordering;
+    // DIAG (`CRATONVM_DBG_JIT_CODE_FREE=1`): name the release site. Executable
+    // buffers are unmapped a handful of times per process, so capturing a
+    // backtrace here is free in practice and it is the only way to tell WHICH
+    // owner dropped last — the crash it explains reports only an address.
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_CODE_FREE").is_some() {
+        eprintln!(
+            "[jit-code-free] base={base:#x} len={len:#x} active_jit_executions={active_executions}\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
+    let i = RECENT_FREE_SEQ.fetch_add(1, Ordering::Relaxed) % RECENT_CODE_FREES;
+    // Publish base last: a reader that sees a non-zero base sees the matching
+    // length and count, and a torn slot reads as "empty" rather than as a wrong
+    // range.
+    RECENT_FREE_BASE[i].store(0, Ordering::Relaxed);
+    RECENT_FREE_LEN[i].store(len, Ordering::Relaxed);
+    RECENT_FREE_ACTIVE[i].store(active_executions, Ordering::Relaxed);
+    RECENT_FREE_BASE[i].store(base, Ordering::Release);
+}
+
+/// Total executable buffers unmapped by this process. Async-signal-safe.
+pub fn code_frees_total() -> usize {
+    RECENT_FREE_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Was `addr` inside one of the last [`RECENT_CODE_FREES`] executable buffers
+/// this process unmapped? Returns `(base, len, active_jit_executions_at_free)`.
+///
+/// Async-signal-safe: atomic loads only.
+pub fn recent_code_free_covering(addr: usize) -> Option<(usize, usize, usize)> {
+    use std::sync::atomic::Ordering;
+    for i in 0..RECENT_CODE_FREES {
+        let base = RECENT_FREE_BASE[i].load(Ordering::Acquire);
+        if base == 0 {
+            continue;
+        }
+        let len = RECENT_FREE_LEN[i].load(Ordering::Relaxed);
+        if addr >= base && addr < base.saturating_add(len) {
+            return Some((base, len, RECENT_FREE_ACTIVE[i].load(Ordering::Relaxed)));
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -13348,6 +13443,79 @@ mod tests {
         assert!(
             lookup_jit_code_range(old_entry).is_none(),
             "the replaced artifact must unregister after its last Arc is released"
+        );
+        if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
+            unregister_jit_code_range(new_cm.entry_ptr() as usize);
+        }
+    }
+
+    /// A thread executing compiled code holds NO `Arc` — only a return address
+    /// on its stack. So a tier-up `put` that displaces the body it is running
+    /// would drop the last strong reference and `munmap` the mapping out from
+    /// under it (`SIGSEGV at pc=X, addr=X`, the PC landing in a hole between
+    /// core-dump segments, ~10% of runs under load). `put` therefore hands the
+    /// superseded artifact to [`defer_jit_owner`], which holds it until
+    /// `ACTIVE_JIT_EXECUTIONS` reaches zero.
+    #[test]
+    fn replaced_body_survives_until_jit_execution_is_quiescent() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("RetireWhileRunningClass");
+        let method: Arc<str> = Arc::from("m");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(1);
+
+        let mut old_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        old_buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(old_buf),
+        );
+        let old = cache
+            .get(&class, &method, &desc, cid)
+            .expect("old compiled method");
+        let old_entry = old.entry_ptr() as usize;
+        register_jit_code_range(old_entry, old.code_len(), Arc::as_ptr(&old) as usize);
+        // Release the reader: the shard snapshot is now the ONLY strong owner,
+        // exactly as it is for a body that is merely being executed.
+        drop(old);
+        assert!(lookup_jit_code_range(old_entry).is_some());
+
+        jit_execution_enter();
+        let mut new_buf = ExecutableBuffer::new(64).expect("alloc failed");
+        new_buf.emit(&[0xC3]); // RET
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(new_buf),
+        );
+        assert!(
+            lookup_jit_code_range(old_entry).is_some(),
+            "a tier-up must not release the body a thread is executing"
+        );
+        jit_execution_leave();
+
+        // `ACTIVE_JIT_EXECUTIONS` is process-global and this suite runs tests in
+        // parallel, so a sibling test's execution epoch can hold the drain off
+        // for a moment. Poll (each probe re-runs the quiescence check) instead
+        // of asserting on the first observation.
+        let mut released = false;
+        for _ in 0..500 {
+            if lookup_jit_code_range(old_entry).is_none() {
+                released = true;
+                break;
+            }
+            jit_execution_enter();
+            jit_execution_leave();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            released,
+            "the retired body must be released once JIT execution is quiescent"
         );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
             unregister_jit_code_range(new_cm.entry_ptr() as usize);
