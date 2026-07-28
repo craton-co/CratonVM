@@ -17,11 +17,18 @@ two things the previous revision left open are now closed:
   objection.
 
 **Residual 4 is root-caused** and is no longer "a flat interpreter tail with no
-second hot spot to attack". The 8,600x is one shape of cost in one filesystem
-prefix, plus a JIT compile-cache livelock. Half of it is fixed; the other half
-is named precisely enough to be a bounded project instead of a mystery.
+second hot spot to attack". It is two separable things. One — a JIT that
+recompiled the same OSR entry 701 times in 20 operations and executed none of
+it — is **fixed**. The other is the actual gap, and it is one specific
+combination, not a general slowness: LZF over a `ByteBuffer` moves one byte per
+`DirectByteBuffer.get(int)` call, and the same LZF over a `byte[]` is 12x
+against HotSpot where the `ByteBuffer` version is 1,130x. That one is **not**
+fixed here; it is a change to the VM's hottest dispatch path and it is now
+scoped precisely enough to be a bounded project rather than a mystery.
 
-The ban itself **stays**.
+The ban itself **stays**. So do JASPER-JDT.2 and .3 — though the direct
+re-confirmation the previous revision claimed for `parser/` does not reproduce
+in 40 runs, which is recorded below rather than acted on.
 
 None of the closed residuals was an H2 bug.
 
@@ -232,21 +239,26 @@ Measurements below are from `LzfProbe`, a standalone replica of
 `testConcurrent` (see *Reproducing*) that reports ms per 100 operations, so the
 loop can be measured in seconds instead of against a 25-minute cap.
 
-**It is not the spin lock.** Running the writer alone, with no reader thread and
-therefore no contention at all, still costs 42,860 ms per 100 operations against
-HotSpot's 7–13 ms.
+**It is not the spin lock.** Running the writer alone — no reader thread, so no
+contention on the `compareAndSet` lock at all — still costs 43–50 s per 100
+operations (the spread is host load; this box carried other sessions
+throughout). Adding the reader back roughly doubles the wall clock, which is
+what a second thread doing the same work costs, not what lock contention costs.
 
-**It is not LZF, and it is not interpretation in general.** The same probe on
-the same data through the *uncompressed* sibling prefix is 7.5 ms per 100
-operations — HotSpot speed. And the `byte[]`-backed compressed prefix,
-`memLZF:`, which runs the identical `CompressLZF` code, is 1.93 ms/op against
-HotSpot's 0.06 — a 32x interpreter ratio, entirely ordinary.
+**It is not LZF, it is not `ByteBuffer`, and it is not interpretation in
+general.** All four prefixes, same session, same configuration (writer only,
+100 operations, `org/h2/` ban in place, host load ~13):
 
-| prefix (writer only, 100 ops) | HotSpot | CratonVM |
-|---|---|---|
-| `nioMemFS:` (no compression) | ~7 ms | 7.5 ms |
-| `memLZF:` (LZF over `byte[]`) | ~6 ms | ~193 ms |
-| `nioMemLZF:1:` (LZF over `ByteBuffer`) | 7–13 ms | 42,860 ms |
+| prefix | backing | compressed | HotSpot | CratonVM | ratio |
+|---|---|---|---|---|---|
+| `memFS:1:` | `byte[]` | no | 1.9 ms | 7.6 ms | 4x |
+| `nioMemFS:1:` | `ByteBuffer` | no | 2.6 ms | 11.6 ms | 4.5x |
+| `memLZF:1:` | `byte[]` | yes | 3.7 ms | 44.7 ms | 12x |
+| `nioMemLZF:1:` | `ByteBuffer` | yes | 44.0 ms | 49,705 ms | **1,130x** |
+
+Read down the table: `ByteBuffer` alone costs 4.5x (fine), LZF alone costs 12x
+(fine, ordinary interpreter territory), and the two *together* cost 1,130x. The
+cost is not in either ingredient; it is in one specific combination.
 
 **What it actually is:** `FileNioMemData` stores its pages as
 `ByteBuffer.allocateDirect`, so it calls the `CompressLZF.compress(ByteBuffer,
@@ -255,8 +267,12 @@ byte at a time through `DirectByteBuffer.get(int)` / `put(int, byte)`**. A 64 KB
 page is ~65,000 of those per pass and each one is a full interpreted
 `invokevirtual` into a JDK method — roughly half a microsecond end-to-end. Two
 to four page passes per operation is ~250 KB of per-byte traffic, which is the
-428 ms. `memLZF:` runs the same algorithm over a `byte[]`, where the same loop
-is `baload`/`bastore`, and is 200x faster for it.
+~0.5 s. `memLZF:` runs the same algorithm over a `byte[]`, where the same loop
+is `baload`/`bastore` — no call at all — and is ~1,100x faster for it. That is
+also why the *uncompressed* `nioMemFS:` prefix is fine: it moves whole pages
+with bulk `ByteBuffer` operations, one call per page instead of one per byte.
+The `ByteBuffer` abstraction is not the problem; per-element access through it
+is.
 
 The profile is consistent with that and only reads as "flat" if you do not know
 what is being called: `NativeMethodRegistry::slot_for_exact` 14.4%,
@@ -313,8 +329,41 @@ that from a livelock into a single wasted compile.
 
 ## Where the ban stands — it STAYS
 
-Same-binary 218-class A/B from the previous revision, with the dispatch fix in
-place throughout:
+### This revision's own 218-class run
+
+The fixes above were gated on a full 218-class run with the ban in place
+(`154 PASS / 18 FAIL / 46 HANG`) against the previous revision's matching arm
+(`166 / 21 / 31`). The host carried a load average of 28–33 on 16 cores for the
+whole run — from other sessions, not this one — so the raw totals are not
+comparable and were not treated as such. The per-class diff gives 12 apparent
+regressions; **every one was chased down and none is real**:
+
+| apparent regression | verdict |
+|---|---|
+| `TestMvccMultiThreaded2`, `TestPageStoreCoverage`, `TestReopen` (PASS→FAIL) | PASS on **both** binaries when re-run in isolation |
+| `TestKillRestart` (PASS→HANG) | 4/4 PASS on **both** binaries, alternating arms |
+| `TestNestedJoins`, `TestCompress`, `TestStringCache` (PASS→HANG) | PASS on both in the targeted re-run |
+| `TestIndex`, `TestLimit`, `TestIntPerfectHash` (PASS→HANG) | HANG on **both** |
+| `TestFuzzOptimizations` (PASS→HANG) | FAIL on **both** |
+| `TestRunscript` (PASS→HANG) | flaky on **both** — see below |
+
+`TestRunscript` is worth recording separately, because the previous revision
+listed it as one of three CRASHes and as a class that "regressed again". Over 8
+alternating rounds per arm it is `3 PASS / 2 FAIL / 3 HANG` on this revision's
+binary and `5 PASS / 1 FAIL / 2 HANG` on the pre-fix one, with the **same**
+failure on both (`AssertionError: expected: GRANT "TESTROLE" TO`) and a runtime
+of 250–300 s against a 300 s cap. It is a pre-existing flaky, borderline class,
+and any single-run verdict about it — in either direction — is noise.
+
+**The lesson the previous revision recorded is worth restating:** it warned
+"run comparison arms one at a time" after three concurrent suites produced two
+false regressions. That is necessary but not sufficient on this host, where the
+load that matters is other people's. Alternate the two binaries round by round
+over the same class, and print the counts.
+
+### The previous revision's A/B
+
+Same-binary 218-class A/B, with the dispatch fix in place throughout:
 
 | arm | PASS | FAIL | HANG | CRASH |
 |---|---|---|---|---|
@@ -364,13 +413,68 @@ reproduced the defect whatever its state. Same shadowing shape this module
 already annotates for other removed bans, just hidden behind a flag instead of
 behind another rule.
 
-Both are restored. `parser/` is directly re-confirmed by the bisection above.
+Both are restored. Both **stay** restored — but the direct re-confirmation the
+previous revision claimed for `parser/` does not reproduce, and that is recorded
+here rather than quietly dropped.
+
+### Re-measured 2026-07-27, and it does not reproduce
+
+`jakarta.el.TestOptionalELResolverInJsp`, the failure this restore rests on,
+with `org/eclipse/jdt/internal/compiler/parser/` JIT-eligible and the virtual
+direct-entry path ON (its shipped default):
+
+| binary | runs | PASS | FAIL |
+|---|---|---|---|
+| this revision | 20 | 20 | 0 |
+| pre-fix `dev` (`017bc3734`) | 20 | 20 | 0 |
+
+40 runs, no `ClassCastException`, no `JasperException`. The control matters more
+than the counts, and it is clean: `CRATONVM_DBG_JIT_COMPILED` counts **0**
+compiled `org/eclipse/jdt/internal/compiler/parser/` methods with the ban
+active and **166** with it lifted, so these runs really did execute compiled
+parser code. This is not the shadowed-verification mistake this section
+documents — that is exactly what was checked for.
+
+`ast/` (JASPER-JDT.3) was the half the previous revision restored without any
+measurement at all, so its own repro has now been run under the flag too:
+`TestFormAuthenticatorA` with `org/eclipse/jdt/internal/compiler/ast/`
+JIT-eligible is **3/3 PASS** (and 3/3 with the ban active). Three runs, not
+twenty — an attempt to extend it to the 20-run bar ran on a host that had
+climbed to load 46 on 16 cores and hit the harness timeout, which is evidence
+about the host, not about a `ClassCastException`. So `ast/` is no longer
+restored on argument alone, but three clean runs is well short of what removing
+it would need.
+
+Both binaries being clean rules out "this revision fixed it". The most likely
+remaining explanation is the merge itself: the previous revision measured on its
+own branch, and `017bc3734` is where that branch met several concurrent
+sessions' work. A fix landing in one of those would close this without anyone
+attributing it — the "two fixes that each work may not have been tried
+together" hazard, in its benign direction.
+
+**The bans stay anyway, and this is deliberate.** A null result over 20 runs
+does not overturn a positive one: the previous revision did not merely observe a
+failure, it *bisected* it — denying `parser/` restored PASS while denying
+`ast/`, `lookup/` and `util/` did not. That is evidence of causation, and a
+nondeterministic defect that stops reproducing is the single most common way a
+JIT ban gets removed and then has to be restored. This module already carries
+two such round trips.
+
+**What the next session needs to decide it** (and what this one deliberately did
+not do unilaterally): re-run the previous revision's own bisection, not just the
+class. If denying `parser/` no longer changes anything *because nothing fails*,
+then the ban has no repro at all and can be removed on that basis. If the
+failure reappears at any run count, it stays and this table becomes the record
+of how flaky it is. Either way the 20-run bar applies, with the direct-entry
+path on.
 
 **The rule this leaves behind:** any ban whose mechanism is compiled-to-compiled
 virtual dispatch must be re-verified with
 `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` **on**, or it verifies
 nothing. That flag was default-OFF for the entire period in which the
-2026-07-25/26 ban sweep did its removals.
+2026-07-25/26 ban sweep did its removals. And the check is cheap: count
+`CRATONVM_DBG_JIT_COMPILED` lines for the banned package in both arms before
+believing either.
 
 (This section appeared twice, verbatim, in the previous revision. Deduplicated.)
 

@@ -1208,6 +1208,43 @@ fn should_skip_jit_internal(
         // (`TestFormAuthenticatorA`) has not been re-run under the flag, and its
         // removal evidence is void for exactly the same reason, so leaving it
         // out would be asserting something no measurement supports.
+        //
+        // RE-MEASURED 2026-07-27 (second pass). Both bans STAY, but the "directly
+        // re-confirmed" claim above does NOT reproduce, and the missing `ast/`
+        // measurement has now been taken:
+        //
+        //   TestOptionalELResolverInJsp, `parser/` JIT-eligible, direct-entry ON:
+        //     20/20 PASS on that day's binary AND 20/20 PASS on the pre-fix dev
+        //     it branched from (017bc3734). 40 runs, no ClassCastException.
+        //   TestFormAuthenticatorA, `ast/` JIT-eligible, direct-entry ON:
+        //     3/3 PASS (and 3/3 with the ban active). Three runs, not twenty --
+        //     extending it hit the harness timeout on a host at load 46/16
+        //     cores, which says nothing about a ClassCastException. `ast/` is
+        //     therefore no longer restored on argument alone, but three clean
+        //     runs is far short of a removal.
+        //
+        // The control was checked, because a lift that does not lift proves
+        // nothing (the exact trap this comment block is about):
+        // `CRATONVM_DBG_JIT_COMPILED` counts 0 compiled
+        // `org/eclipse/jdt/internal/compiler/parser/` methods with the ban
+        // active and 166 with `CRATONVM_JIT_ALLOW_PACKAGES` set, so those runs
+        // really did execute compiled parser code.
+        //
+        // Both binaries clean rules out "the second pass fixed it"; the likely
+        // explanation is 017bc3734 itself, where the restoring branch met
+        // several concurrent sessions' work.
+        //
+        // They stay anyway. A null result over 20 runs does not overturn a
+        // positive one, and the restore rests on a BISECTION (denying `parser/`
+        // restored PASS while denying `ast/`/`lookup/`/`util/` did not), which
+        // is evidence of causation. Removing a JIT ban because a
+        // nondeterministic defect stopped reproducing is how this module
+        // acquired two restore round trips already.
+        //
+        // To decide it properly, re-run that bisection rather than the class:
+        // if denying `parser/` no longer changes anything BECAUSE nothing
+        // fails, the ban has no repro and can go. See
+        // docs/known-issues/h2/h2-jitban-residuals-20260726.md.
         for prefix in [
             "org/eclipse/jdt/internal/compiler/ast/",
             "org/eclipse/jdt/internal/compiler/parser/",
