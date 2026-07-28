@@ -2010,6 +2010,41 @@ fn install_signal_handlers() {
             }
         }
 
+        // Was the faulting PC inside a code buffer this process had already
+        // unmapped? `lookup_jit_method_name` above cannot say — it answers from
+        // the range registry, which a *recycled* address also satisfies. This
+        // ring is written at `munmap` time and needs no allocation or lock, so
+        // it is safe here, and it carries the one number that turns "SIGSEGV in
+        // JIT code" into a diagnosis: how many threads were executing compiled
+        // code when the buffer was released.
+        {
+            let mut rbuf = [0u8; 16];
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  code_frees_total=0x");
+            let n = hex_into_buf(&mut rbuf, cratonvm_jit::code_frees_total() as u64);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+            if let Some((base, len, active)) =
+                cratonvm_jit::recent_code_free_covering(fault_pc as usize)
+            {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  fault pc is inside a RECENTLY FREED code buffer: base=0x",
+                );
+                let n = hex_into_buf(&mut rbuf, base as u64);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" len=0x");
+                let n = hex_into_buf(&mut rbuf, len as u64);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b" active_jit_executions_at_free=0x",
+                );
+                let n = hex_into_buf(&mut rbuf, active as u64);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+            }
+        }
+
         // ── Write a minimal hs_err_pid file via raw open/write/close ──────
         //
         // We intentionally write a SHORT marker file rather than the full
