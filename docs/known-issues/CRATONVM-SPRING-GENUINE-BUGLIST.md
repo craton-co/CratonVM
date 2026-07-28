@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **8 residual classes** (was 19 at the start of this session, 57 the session before, 127 the one before that). Eleven VM bugs closed here; every one has a standalone HotSpot-vs-CratonVM probe. |
+| **Status** | OPEN — **9 residual classes** (was 19 at the start of this session, 57 the session before, 127 the one before that). Thirteen VM bugs closed here; every one has a standalone HotSpot-vs-CratonVM probe. |
 | **Captured** | 2026-07-27 (third session), branch `fix/spring-buglist-final-20260727` merged into `origin/dev` at `1f538bf76`, Azure host `20.83.144.174`, real JDK 25, worktree `/data/data/wt-sprbuglist-20260727`, binaries `localbin/cratonvm-sprfinal-v*.bin`. Every number below was measured with the class run **in isolation** (`apps/spring-suite-runner/onea.sh <fqcn>`), not from a sharded batch — the shared host runs at load 25–100 and batch runs emit spurious FAIL/TIMEOUT rows. |
 | **History** | Everything before this session is archived in [`../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md`](../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md). Its conclusions are superseded by the entries below wherever the two disagree. |
 
@@ -19,6 +19,7 @@
 | `test.web.servlet.assertj.MockMvcTesterIntegrationTests` | 72/74 | **74/74** |
 | `util.SerializationUtilsTests` | 8/9 | **9/9** |
 | `web.reactive.function.client.DefaultWebClientTests` | 24/25 | **25/25** |
+| `test.context.aot.TestContextAotGeneratorIntegrationTests` | 2/4 | **4/4** |
 | `context.annotation.ConfigurationClassEnhancerTests` | 3/5 | **4/5** — the residual `withPublicClass` fails identically on HotSpot in this checkout (fixture artifact, see below) |
 
 ### The eleven fixes
@@ -110,6 +111,32 @@
     disagreed. `print` still deliberately does not flush.
     `probes/PwFlushProbe.java`.
 
+12. **An annotation array VALUE's component was resolved loader-blind.** The
+    scalar `Enum`/`Class` arms already went through the declaring class's
+    loader; the array arm did not, so under classloader isolation the array's
+    component came from the app loader while the attribute's declared return
+    type came from the fork.
+
+13. **`Class.isInstance` disagreed with `Class.isAssignableFrom`.** `isInstance`
+    resolved `mirror_class_id(this)` first and early-returned false when that
+    missed — before reaching its own array-aware branch. `isAssignableFrom` has
+    the same branch and always ran it first, needing no ClassId. The lookup
+    misses for an array mirror handed out by `Method.getReturnType()` under a
+    custom loader, because CratonVM mints a **fresh array mirror per request**
+    instead of caching one per component class (`probes/ForkArr2Probe.java`
+    shows three distinct identity hashes for one component where HotSpot shows
+    one). Spring's `ClassUtils.isAssignableValue` calls `isInstance`, so
+    `AnnotationTypeMapping.adapt` rejected an annotation's enum-array value
+    with the self-contradictory *"should be compatible with `RequestMethod[]`
+    but a `RequestMethod[]` value was returned"*. Moving the array branch above
+    the ClassId resolution took
+    `test.context.aot.TestContextAotGeneratorIntegrationTests` **2/4 → 4/4**
+    (it SIGSEGV'd before this session). The mirror proliferation itself is a
+    real but separate divergence — `arrayClass == arrayClass` is still false
+    across a loader boundary where HotSpot says true; nothing in the suite
+    depends on it, and fixing it means touching `synthesize_array_class`'s
+    audited `loader_id == Bootstrap` invariant.
+
 Plus **`ProcessHandle.Info.command()`** now reports this VM's own executable
 instead of an empty `Optional` (the standard "find my JVM and spawn a child"
 idiom raised `NoSuchElementException`), which is what took
@@ -121,7 +148,7 @@ the last two bugs slow to find: `CRATONVM_DBG_LINKAGE_BT=1` now also fires at
 `linkage_throwable`), and `CRATONVM_DBG_STUB_BT` also covers
 `ensure_synthetic_class`.
 
-## What is left (8 classes)
+## What is left (9 classes)
 
 Verified in isolation against `cratonvm-sprfinal-v15.bin` (branch merged to
 `origin/dev` `1f538bf76`).
@@ -133,25 +160,10 @@ Verified in isolation against `cratonvm-sprfinal-v15.bin` (branch merged to
 | `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | 0/2 | Both are JUnit-parallel-execution × Spring `ApplicationEvents`. `rejectTestsInParallelWithInstancePerClassAndRecordApplicationEvents` runs a nested `EngineTestKit` engine with `CONCURRENT` mode and expects exactly one FAILED event; CratonVM produces zero, i.e. the guard Spring is supposed to trip never fires — most likely because the nested engine is not actually executing concurrently |
 | `web.reactive.result.view.FragmentViewResolutionResultHandlerTests` | 2/6 | All four failures are the `FluxSubscribeOn` variants; the two non-flux ones pass. `renderFragmentStream` alone: HotSpot passes, CratonVM times out on the 60 s `block(...)`, identically with `--nojit`. Reactor's schedulers themselves are fine (`probes/BoundedElasticProbe.java` — `parallel`/`single`/`boundedElastic` all match HotSpot), so the hang is in the SSE render path executed on the elastic worker, not in the scheduler. **Was 5/6 in the previous session's baseline and was already 2/6 in this session's pre-fix baseline — a regression from `origin/dev` drift, not from these fixes** |
 | `web.reactive.function.client.WebClientIntegrationTests` | 165/170 | Four `VerifySubscriber timed out` across the Reactor-Netty / JDK / Jetty parameterisations. Needs a re-measure on a quiet host before being treated as a VM defect — the host ran at load 25–100 throughout |
-| `test.context.aot.AotIntegrationTests` | 1/4 (2 skipped) | `endToEndTestsForBeanOverrides`: `IllegalArgumentException: Unable to adapt value of type ContextConfiguration[] to …` — the same array-class-identity family as the row below, so expect both to close together |
-| `test.context.aot.TestContextAotGeneratorIntegrationTests` | 2/4 | **Root-caused; half-fixed.** Both failures end in `IllegalStateException: Attribute 'method' in annotation …RequestMapping should be compatible with …RequestMethod[] but a …RequestMethod[] value was returned` — two same-named-but-different `RequestMethod[]` array classes. Half of it is fixed (`11bc9045d`): the annotation array VALUE's COMPONENT was resolved loader-blind and now goes through the declaring loader like the scalar `Enum`/`Class` arms already did, so both components are now the same class. What remains is that the two ARRAY MIRRORS are still distinct objects, and `Class.isInstance`'s array branch (`array_is_assignable`, purely name-based, so `[LX; == [LX;` should be true) still answers false — so `mirror_class_name` is evidently not returning the array descriptor for at least one of the two mirrors even though `Class.getName()` does. **Next step: instrument `native_class_is_instance`'s array branch to print `mirror_class_name(this)` vs `array_descriptor_for(target)`; `probes/ForkArrProbe.java` is a 40-line repro that needs no Spring.** Was a SIGSEGV before this session |
+| `test.context.aot.AotIntegrationTests` | 1/4 (1 fail, 2 skipped) | **Not a hang — the 1500 s ceiling was simply too low.** Re-measured at 3600 s: it completes. The array-identity `IllegalArgumentException` that used to end it at ~589 s is gone; what is left is `endToEndTestsForBeanOverrides`, which drives 175 test classes through a forked loader and reports `MultipleFailuresError` with **8** sub-failures — four bare `AssertionFailedError`s and four `BeanCreationException: Could not inject field …MockitoSpyBeanAndSpring…`. That is the same bean-override family the archived history tracks (13 failures at follow-up 10, Family A fixed at follow-up 11), now down to 8. Give it a ceiling above 1500 s or it reports a spurious TIMEOUT |
 | `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | measured: no `RESULT` line at a 1500 s ceiling |
-
-Two more that were on the list are **not** CratonVM bugs and need no further work:
-
-- `context.annotation.ConfigurationClassEnhancerTests.withPublicClass` — fails
-  identically on HotSpot in this checkout (`apps/spring-suite-runner/hs.sh`).
-- `aot.nativex.FileNativeConfigurationWriterTests` — fixture artifact, see the
-  archived history.
-
-The last two were re-measured after the table above was first written, so they
-belong in it — the count of 8 already includes them:
-
-- `beans.factory.aot.BeanRegistrationsAotContributionTests` — TIMEOUT, no
-  `RESULT` line at a 1500 s ceiling. This is the separately tracked
-  ~227×-vs-HotSpot interpreter throughput defect; it SIGSEGV'd under batch load
-  earlier the same day, so treat a crash there as a symptom of the same
-  slowness, not a second bug.
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | no `RESULT` line at a 1500 s ceiling. The separately tracked ~227×-vs-HotSpot interpreter throughput defect; it SIGSEGV'd under batch load the same day, so treat a crash there as a symptom of that slowness rather than a second bug |
+| `web.reactive.result.method.annotata second bug.
 - `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`
   — LOADERR after 948 s: `NoClassDefFoundError:
   org/junit/platform/commons/util/ExceptionUtils`, a core JUnit-Platform class

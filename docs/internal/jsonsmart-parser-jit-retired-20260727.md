@@ -153,7 +153,7 @@ are compiled on the promise of a precise exceptional frame. The frames drop
 live values (an unrelated object appears where a live one was), so the gate is
 closed again by default. Full evidence, including the liveness bug fixed
 underneath it, is in
-`docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+`docs/internal/jit-precise-handler-frame-drops-live-locals-20260727.md` (closed 2026-07-28).
 
 Disposition is unchanged: the corruption was in shared JIT frame
 reconstruction, not in `net/minidev/json/parser/` — re-banning the package

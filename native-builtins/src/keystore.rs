@@ -1084,8 +1084,9 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
 /// `KeyStore` type the caller declared (the keycloak truststore round-trip
 /// stores as "PKCS12" but is detected/loaded by content). Mirrors `load_jks`'s
 /// record layout exactly. Trusted certs are written as tag-2 entries; private
-/// keys as tag-1 with the (plaintext) key bytes — `load_jks` keeps them as-is
-/// when JKS key-recovery doesn't apply.
+/// keys as tag-1 wrapped in Sun's `KeyProtector` `EncryptedPrivateKeyInfo`
+/// envelope (see `jks_protect_key`), which is the exact inverse of the
+/// `jks_recover_key` call `load_jks` makes on the way back in.
 pub(crate) fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
     let cert_type: &[u8] = b"X.509";
     let mut body: Vec<u8> = Vec::new();
@@ -1121,12 +1122,40 @@ pub(crate) fn write_jks(store: &LoadedKeyStore, password: &[u8]) -> Vec<u8> {
                 body.extend_from_slice(cert_der);
             }
             EntryKind::PrivateKey { key_der, chain } => {
+                // Re-apply Sun's KeyProtector envelope. `load_jks` stores the
+                // DECRYPTED PKCS#8 (see its tag-1 arm), so writing `key_der`
+                // straight out — the previous behaviour — put an UNPROTECTED
+                // private key on disk in a file the caller had just supplied a
+                // password for, and produced a file no real JDK could read.
+                // Two pass-through cases stay byte-identical to before:
+                //   * an entry whose key never decrypted (wrong/absent key
+                //     password) still holds the ORIGINAL envelope — re-wrapping
+                //     it would double-encrypt;
+                //   * an entropy failure, where refusing to write anything at
+                //     all would lose the entry; that path keeps the old
+                //     behaviour and warns loudly rather than emitting a
+                //     predictable-salt envelope.
+                let protected: Vec<u8> = if is_jks_encrypted_private_key(key_der) {
+                    key_der.clone()
+                } else {
+                    match jks_protect_key(key_der, password) {
+                        Some(wrapped) => wrapped,
+                        None => {
+                            tracing::warn!(
+                                target: "keystore",
+                                alias = %alias,
+                                "OS entropy unavailable; JKS private key written UNPROTECTED"
+                            );
+                            key_der.clone()
+                        }
+                    }
+                };
                 body.extend_from_slice(&1u32.to_be_bytes()); // tag = PrivateKeyEntry
                 body.extend_from_slice(&(ab.len() as u16).to_be_bytes());
                 body.extend_from_slice(ab);
                 body.extend_from_slice(&(entry.creation_time_ms as u64).to_be_bytes());
-                body.extend_from_slice(&(key_der.len() as u32).to_be_bytes());
-                body.extend_from_slice(key_der);
+                body.extend_from_slice(&(protected.len() as u32).to_be_bytes());
+                body.extend_from_slice(&protected);
                 body.extend_from_slice(&(chain.len() as u32).to_be_bytes());
                 for c in chain {
                     body.extend_from_slice(&(cert_type.len() as u16).to_be_bytes());
@@ -1271,6 +1300,103 @@ fn jks_recover_key(epki_der: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(plain)
+}
+
+/// DER length prefix for `n` content bytes (short form under 128, else the
+/// minimal long form). Only lengths up to 2^24-1 occur here (a private key is
+/// a few kilobytes at most).
+fn der_len_bytes(n: usize) -> Vec<u8> {
+    if n < 0x80 {
+        vec![n as u8]
+    } else if n <= 0xFF {
+        vec![0x81, n as u8]
+    } else if n <= 0xFFFF {
+        vec![0x82, (n >> 8) as u8, n as u8]
+    } else {
+        vec![0x83, (n >> 16) as u8, (n >> 8) as u8, n as u8]
+    }
+}
+
+/// `AlgorithmIdentifier { 1.3.6.1.4.1.42.2.17.1.1, NULL }` — Sun's frozen
+/// JDK-1.2 `KeyProtector` algorithm id, the only one a JKS `PrivateKeyEntry`
+/// ever carries. Written out verbatim; `der_extract_epki_octets` (the read
+/// side) skips the whole SEQUENCE, and a real JDK's `AlgorithmId.parse`
+/// accepts the explicit NULL parameters.
+const JKS_KEY_PROTECTOR_ALG_ID: [u8; 16] = [
+    0x30, 0x0E, 0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x2A, 0x02, 0x11, 0x01, 0x01, 0x05, 0x00,
+];
+
+/// Wrap a plaintext PKCS#8 private key in Sun's JKS `KeyProtector` envelope —
+/// the exact inverse of [`jks_recover_key`].
+///
+/// STUB-REMOVAL (wave 2) / wave-1 follow-up: `write_jks` used to emit the
+/// PLAINTEXT PKCS#8 bytes where the format (and every real JDK reading the
+/// file) requires an `EncryptedPrivateKeyInfo`. Two consequences, both bad:
+/// a keystore CratonVM wrote could not be read back by a real JDK at all, and
+/// — far worse — `KeyStore.store()` silently wrote unprotected private keys to
+/// disk for a caller who had just supplied a password precisely to prevent
+/// that.
+///
+/// Envelope: `SEQUENCE { AlgorithmIdentifier, OCTET STRING }` where the octets
+/// are `salt(20) || (plainPkcs8 XOR keystream) || SHA1(passwdUtf16be ||
+/// plainPkcs8)` and the keystream is `Wi = SHA1(passwdUtf16be || W(i-1))` with
+/// `W0 = salt`.
+///
+/// Returns `None` when the OS entropy source is unavailable, so the caller can
+/// decide what to do rather than fall back to a predictable salt.
+///
+/// KNOWN LIMITATION (documented, not silently papered over): JKS permits a
+/// per-entry key password distinct from the store password, but a loaded
+/// `KeyStoreEntry` does not carry one — `load_jks` decrypts with whatever
+/// password it was given and keeps only the plaintext. `write_jks` therefore
+/// protects every key with the STORE password, which is correct for the
+/// overwhelmingly common (and every fixture's) case where the two are equal,
+/// and changes the key password to the store password otherwise.
+fn jks_protect_key(plain_pkcs8: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>> {
+    use sha1::{Digest, Sha1};
+    let mut salt = [0u8; 20];
+    if !crate::securerandom::os_random_bytes(&mut salt) {
+        return None;
+    }
+    let pw = jks_passwd_utf16be(password_bytes);
+
+    let mut xor_key: Vec<u8> = Vec::with_capacity(plain_pkcs8.len() + 20);
+    let mut digest: Vec<u8> = salt.to_vec();
+    while xor_key.len() < plain_pkcs8.len() {
+        let mut h = Sha1::new();
+        h.update(&pw);
+        h.update(&digest);
+        digest = h.finalize().to_vec();
+        xor_key.extend_from_slice(&digest);
+    }
+    let cipher: Vec<u8> = plain_pkcs8
+        .iter()
+        .zip(xor_key.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+
+    let mut hc = Sha1::new();
+    hc.update(&pw);
+    hc.update(plain_pkcs8);
+    let check = hc.finalize();
+
+    let mut protected = Vec::with_capacity(20 + cipher.len() + 20);
+    protected.extend_from_slice(&salt);
+    protected.extend_from_slice(&cipher);
+    protected.extend_from_slice(&check);
+
+    let mut octet = Vec::with_capacity(protected.len() + 5);
+    octet.push(0x04);
+    octet.extend_from_slice(&der_len_bytes(protected.len()));
+    octet.extend_from_slice(&protected);
+
+    let content_len = JKS_KEY_PROTECTOR_ALG_ID.len() + octet.len();
+    let mut out = Vec::with_capacity(content_len + 5);
+    out.push(0x30);
+    out.extend_from_slice(&der_len_bytes(content_len));
+    out.extend_from_slice(&JKS_KEY_PROTECTOR_ALG_ID);
+    out.extend_from_slice(&octet);
+    Some(out)
 }
 
 /// Whether a JKS key entry is still wrapped in Sun's KeyProtector envelope.

@@ -4486,6 +4486,61 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .unwrap_or(false)
     }
 
+    fn object_method_fast_path(&self, class_id: ClassId) -> (u8, usize, usize) {
+        /// Bit 3 of the returned mask — identity `hashCode`/`equals`.
+        const IDENTITY_SEMANTICS: u8 = 1 << 3;
+        /// Bit 4 — `java.lang.String`.
+        const IS_STRING: u8 = 1 << 4;
+        /// Bit 5 — exactly `java.util.ArrayList`.
+        const IS_ARRAY_LIST: u8 = 1 << 5;
+        /// Superclass hops walked looking for `java.lang.Enum`. An enum
+        /// constant with a class body adds exactly one (its anonymous
+        /// subclass); the small bound keeps a corrupt hierarchy from looping.
+        const MAX_SUPER_HOPS: usize = 8;
+
+        let cm = self.shared.classes.class_manager.read();
+        let Some(class) = cm.get_class(class_id) else {
+            return (0, 0, 0);
+        };
+        let mut bits =
+            class.generated_record_object_methods() & !crate::classloading::RECORD_OBJ_COMPUTED;
+        if bits == 0 {
+            // Not a record with generated bodies. Three other shapes are worth
+            // a native fast path — all common as record components, and each
+            // otherwise costing a full name-based `invoke_virtual` per hash:
+            //
+            //   * `java.lang.String` — the caller uses the compact string
+            //     reader instead.
+            //   * exactly `java.util.ArrayList` — the caller walks the backing
+            //     array (`List.hashCode`/`equals` are contract-fixed).
+            //     Exactly, not a subclass: a subclass may override either, and
+            //     `java.util.Vector` has a different field layout entirely.
+            //   * an enum — JLS §8.9 declares both `Enum.hashCode` and
+            //     `Enum.equals` final and identity-based, so no subclass can
+            //     change them (Hibernate's `MutationKind`).
+            match &*class.name {
+                "java/lang/String" => bits |= IS_STRING,
+                "java/util/ArrayList" => bits |= IS_ARRAY_LIST,
+                _ => {
+                    let mut superclass = class.superclass;
+                    for _ in 0..MAX_SUPER_HOPS {
+                        let Some(id) = superclass else { break };
+                        let Some(parent) = cm.get_class(id) else { break };
+                        match &*parent.name {
+                            "java/lang/Enum" => {
+                                bits |= IDENTITY_SEMANTICS;
+                                break;
+                            }
+                            "java/lang/Object" => break,
+                            _ => superclass = parent.superclass,
+                        }
+                    }
+                }
+            }
+        }
+        (bits, class.first_field_index, class.record_components.len())
+    }
+
     fn record_components(&self, class_id: ClassId) -> Vec<(String, String)> {
         self.shared
             .classes
@@ -17862,6 +17917,22 @@ fn invoke_on_class_shared_inner(
                                     // parent-less synthetic Logger, so every
                                     // log call short-circuits to a no-op.
                                     | "isLoggable"
+                                    // Stub-removal wave 2 (2026-07-27): these
+                                    // four are backed by identity-hash side
+                                    // tables in `lib.rs`, not by the real
+                                    // Logger's own fields, so the native and
+                                    // the real bytecode read different state.
+                                    // Without an allow-list entry the native
+                                    // loses to concrete bytecode in real-JDK
+                                    // mode and the write is silently dropped:
+                                    // `setUseParentHandlers(false)` still read
+                                    // back `true`, and `setParent` disagreed
+                                    // with `getParent`. Each pair must be
+                                    // listed TOGETHER — allow-listing only one
+                                    // side reinstates the same disagreement in
+                                    // the opposite direction.
+                                    | "setUseParentHandlers" | "getUseParentHandlers"
+                                    | "setParent" | "getParent"
                             ))
                         || (class_name == "java/util/logging/LogRecord"
                             && matches!(method_name, "<init>" | "getLevel" | "getMessage"))

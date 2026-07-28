@@ -782,6 +782,20 @@ fn huc_real_perform(
                 e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
             ))
         }
+        // A caller-installed `HostnameVerifier` rejected the peer. Real JSSE
+        // raises `SSLPeerUnverifiedException` here (from
+        // `HttpsClient.checkURLSpoofing`), not `SSLHandshakeException` — the
+        // handshake itself succeeded; it is the identity that was refused.
+        // Both extend `SSLException`/`IOException`, so a caller catching
+        // either supertype is unaffected, but code that catches the precise
+        // type (the shape a pinning test asserts on) needs this distinction.
+        Err(ref e) if e.starts_with(TLS_PEER_UNVERIFIED_SENTINEL) => {
+            Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLPeerUnverifiedException",
+                e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
+            ))
+        }
         // A refused TCP connect (see `CONNECT_REFUSED_SENTINEL`'s doc) must
         // reach Java as `ConnectException`, not a generic IOException — real
         // code catches it specifically (see the type's own doc).
@@ -1264,6 +1278,17 @@ const READ_TIMEOUT_SENTINEL: &str = "__cratonvm_read_timeout__";
 /// folding it into the generic "-1" contract used for other connection
 /// failures (e.g. a malformed-but-present HTTP response).
 const TLS_HANDSHAKE_FAILURE_SENTINEL: &str = "__cratonvm_tls_handshake_failure__: ";
+
+/// Prefix on an error string returned by [`perform`] when a caller-installed
+/// `HostnameVerifier` REJECTED the peer (returned `false`, threw, or returned
+/// a non-boolean). Deliberately distinct from
+/// [`TLS_HANDSHAKE_FAILURE_SENTINEL`] for two reasons: the exception type
+/// differs (real JSSE's `HttpsClient.checkURLSpoofing` raises
+/// `SSLPeerUnverifiedException`, not `SSLHandshakeException`), and
+/// `perform_with_retry` must NOT retry this — a verifier's verdict on the same
+/// certificate is deterministic, so retrying would just run the app's verifier
+/// a second time and fail identically.
+const TLS_PEER_UNVERIFIED_SENTINEL: &str = "__cratonvm_tls_peer_unverified__: ";
 
 /// Prefix on an error string returned by [`perform`] when its TCP connect
 /// phase failed with `ConnectionRefused` specifically. `huc_real_perform`
@@ -1784,6 +1809,152 @@ fn try_pooled_request(
     read_response_with_prefix(stream, head, probe[..n].to_vec())
 }
 
+/// The `HostnameVerifier` in force for `connection`: its own instance field
+/// first, then the process-wide `HttpsURLConnection.defaultHostnameVerifier`.
+/// This mirrors real JSSE's precedence exactly, and reads the same two REAL
+/// JDK fields `t27_tls`'s `set{,Default}HostnameVerifier` natives write, so
+/// the setter and this call site cannot drift apart.
+fn huc_hostname_verifier(
+    ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    if let Some(connection) = connection {
+        if let Value::Object(Some(v)) = ctx.get_field_by_name(connection, "hostnameVerifier") {
+            return Some(v);
+        }
+    }
+    let cid = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection")?;
+    let idx = ctx.static_field_index_by_name(cid, "defaultHostnameVerifier")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Run the caller-installed `HostnameVerifier` against the completed
+/// handshake, immediately after the `TrustManager` check and before a single
+/// request byte is written — the same point real JSSE runs it.
+///
+/// WHY THIS EXISTS. `setHostnameVerifier`/`setDefaultHostnameVerifier` store
+/// the verifier (see `t27_tls`), but nothing consulted it, so an application
+/// that installed one had its check silently dropped. That is NOT a hole in
+/// ordinary TLS — rustls performs RFC 6125 endpoint identification itself
+/// during the handshake above, so the DEFAULT verifier's job is already done
+/// by the time we get here. The gap is an app-supplied verifier that is
+/// STRICTER than the default: certificate pinning, a CN/SAN allow-list, a
+/// corporate policy check. Such an app believed it had pinned and had not.
+///
+/// NO DOUBLE-VERIFY. The VM's own default verifier is an instance of the bare
+/// `javax/net/ssl/HostnameVerifier` interface (see the interface-level `verify`
+/// native in `t27_tls`, which short-circuits `true` for exactly that shape).
+/// Recognising it here and returning early keeps the ordinary HTTPS path
+/// allocation-free and means rustls's identity check is never re-run — only a
+/// genuinely app-supplied concrete verifier causes any work. A permissive
+/// app verifier (`(h, s) -> true`, the usual test shape) cannot WEAKEN
+/// anything either: rustls has already validated, and this runs strictly in
+/// addition to it, never instead of it.
+///
+/// FAIL CLOSED. A verifier that throws, or returns something that is not a
+/// boolean `true`, is treated as a rejection. `perform` returns
+/// `Result<_, String>` and cannot carry a pending Java exception, so the throw
+/// cannot be propagated verbatim; the alternative — swallowing it and
+/// proceeding — would turn a broken pinning check into a silent pass, which is
+/// the exact failure mode this whole change exists to remove. Same choice, and
+/// the same reasoning, as `run_client_trust_check_for_chain`'s `map_err` at
+/// the TrustManager gate a few lines above the call site.
+fn huc_verify_hostname(
+    ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
+    host: &str,
+    protocol: &str,
+    cipher: &str,
+    peer_chain_der: Vec<Vec<u8>>,
+) -> Result<(), String> {
+    let Some(verifier0) = huc_hostname_verifier(ctx, connection) else {
+        return Ok(());
+    };
+    let verifier_cid = ctx.class_id_of_object(verifier0);
+    match ctx.class_name_of_id(verifier_cid).as_deref() {
+        // The VM's own default verifier (bare-interface instance), or a
+        // receiver whose class cannot be named: rustls already did this job.
+        Some("javax/net/ssl/HostnameVerifier") | None => return Ok(()),
+        Some(_) => {}
+    }
+
+    // GC: `verifier0` is a raw ObjectRef that must survive four allocations
+    // and then an arbitrary-Java call, and each allocated argument must
+    // survive the allocations that follow it. Pin every one and re-read the
+    // forwarded address before each use. A single `unpin_native_roots` of the
+    // FIRST base releases the whole batch (it truncates the pin stack), so
+    // every exit below goes through it.
+    let verifier_pin = ctx.pin_native_root(verifier0);
+    let host_s0 = ctx.create_string(host);
+    let host_pin = ctx.pin_native_root(host_s0);
+    let proto_s0 = ctx.create_string(protocol);
+    let proto_pin = ctx.pin_native_root(proto_s0);
+    let cipher_s0 = ctx.create_string(cipher);
+    let cipher_pin = ctx.pin_native_root(cipher_s0);
+    // The 3-field client `SSLSession` shape (`new13_alloc_ssl_session`'s), so
+    // the layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
+    // read it correctly: `getProtocol`/`getCipherSuite` from these slots,
+    // `getPeerCertificates` from the side table populated just below. A
+    // pinning verifier calls exactly that pair.
+    let session0 = alloc_concurrent_synthetic(
+        ctx,
+        "javax/net/ssl/SSLSession",
+        crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
+    );
+    let session_pin = ctx.pin_native_root(session0);
+
+    let proto_s = ctx.read_native_pin(proto_pin, proto_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_PROTO,
+        Value::Object(Some(proto_s)),
+    );
+    let cipher_s = ctx.read_native_pin(cipher_pin, cipher_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
+        Value::Object(Some(cipher_s)),
+    );
+    // -1: this connection owns its rustls state inside `perform` and is never
+    // registered in the `servlet` TLS id space, so there is no id to record.
+    // Every accessor that would consult it already tolerates a miss.
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_TLSID,
+        Value::Int(-1),
+    );
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_client_peer_chain(ctx, session, peer_chain_der);
+
+    let verifier = ctx.read_native_pin(verifier_pin, verifier0);
+    let host_s = ctx.read_native_pin(host_pin, host_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    let outcome = ctx.invoke_virtual(
+        verifier,
+        "verify",
+        "(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z",
+        &[Value::Object(Some(host_s)), Value::Object(Some(session))],
+    );
+    ctx.unpin_native_roots(verifier_pin);
+
+    match outcome {
+        Ok(Some(v)) if v.as_int().unwrap_or(0) != 0 => Ok(()),
+        Ok(_) => Err(format!(
+            "{TLS_PEER_UNVERIFIED_SENTINEL}Certificate for <{host}> does not match the \
+             installed HostnameVerifier"
+        )),
+        Err(_) => Err(format!(
+            "{TLS_PEER_UNVERIFIED_SENTINEL}the installed HostnameVerifier threw while \
+             verifying <{host}>; treating the peer as unverified"
+        )),
+    }
+}
+
 fn perform(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
@@ -2046,6 +2217,42 @@ fn perform(
                              certificate chain"
                         )
                     })?;
+            }
+            // Hostname verification, at real JSSE's ordering: after the trust
+            // check, before the request is written. See `huc_verify_hostname`
+            // for why this is additive to (never a replacement for) rustls's
+            // own RFC 6125 endpoint identification, and why the ordinary path
+            // — no app verifier installed — costs nothing here.
+            //
+            // The chain is re-read from the connection rather than reusing the
+            // `peer_chain` above: that binding only exists inside the
+            // TrustManager branch, which is skipped entirely when no custom
+            // TrustManager is configured — the common case, and precisely the
+            // one where an app is most likely to be pinning with a verifier
+            // instead.
+            {
+                let peer_chain_der: Vec<Vec<u8>> = stream
+                    .conn
+                    .peer_certificates()
+                    .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                    .unwrap_or_default();
+                let protocol = match stream.conn.protocol_version() {
+                    Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+                    _ => "TLSv1.3",
+                };
+                let cipher = stream
+                    .conn
+                    .negotiated_cipher_suite()
+                    .map(|cs| format!("{:?}", cs.suite()))
+                    .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".to_string());
+                huc_verify_hostname(
+                    ctx,
+                    connection,
+                    &parsed.host,
+                    protocol,
+                    &cipher,
+                    peer_chain_der,
+                )?;
             }
             // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.3 client
             // finishes its own side of the handshake before the server has
@@ -2642,6 +2849,17 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
                 ctx,
                 "javax/net/ssl/SSLHandshakeException",
                 e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
+            ));
+        }
+        // See the matching arm in `huc_real_perform`: a `HostnameVerifier`
+        // rejection is `SSLPeerUnverifiedException`, not a handshake failure.
+        // Registered on this path too so `HttpURLConnection.connect()` and
+        // `getInputStream()`/`getResponseCode()` agree on the exception type.
+        Err(ref e) if e.starts_with(TLS_PEER_UNVERIFIED_SENTINEL) => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLPeerUnverifiedException",
+                e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
             ));
         }
         Err(e) => return Err(ioex(format!("HttpURLConnection.connect failed: {e}"))),
@@ -3564,7 +3782,15 @@ fn huc_get_instance_follow_redirects(
 }
 
 fn huc_using_proxy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Always false — we don't honor proxies in the legacy path yet.
+    // KEEP the constant `false`. This is not a stub standing in for an
+    // unimplemented lookup: `perform`/`connect_plain` dial the origin host
+    // directly and consult no `ProxySelector`, so "this connection is going
+    // through a proxy" is genuinely false for every connection this class
+    // makes. Returning true — or consulting `proxy_selector.rs` and reporting
+    // what a proxy-aware client WOULD have done — would be the lie, and
+    // callers branch on this to decide whether to send an absolute-form
+    // request line or `Proxy-Authorization`. If the legacy path ever learns
+    // to honour proxies, this must start reading the connection's own state.
     Ok(Some(Value::Int(0)))
 }
 
@@ -4046,12 +4272,14 @@ mod http_url_connection_tests {
             response_body: b"a".to_vec(),
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         let id2 = reg.allocate(ConnState {
             status: 404,
             response_body: b"b".to_vec(),
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         assert_ne!(id1, id2);
         assert_eq!(reg.get(id1).unwrap().status, 200);
@@ -4066,6 +4294,7 @@ mod http_url_connection_tests {
             response_body: vec![],
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         assert!(reg.get(id).is_some());
         reg.remove(id);
@@ -4141,6 +4370,7 @@ mod http_url_connection_tests {
             response_body: vec![],
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         ctx.set_field(this, HUC_CONN_ID, Value::Int(id));
         ctx.set_field(this, HUC_CONNECTED, Value::Int(1));

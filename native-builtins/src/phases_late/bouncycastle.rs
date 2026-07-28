@@ -6594,6 +6594,12 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // KEEP (genuinely empty): BouncyCastle's own `AESEngine()` no-arg
+    // constructor has an empty body — the key schedule is built lazily by
+    // `init`/`generateWorkingKey` (registered below), not at construction. The
+    // native exists only so `newInstance()`'s `alloc_object` + the real
+    // `MultiBlockCipher` call path do not have to run interpreted bytecode for
+    // a method that does nothing; it shadows nothing of substance.
     r.register(aes, "<init>", "()V", |_ctx, _args| Ok(None));
     r.register(
         aes,

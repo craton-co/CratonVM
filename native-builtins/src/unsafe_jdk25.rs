@@ -24,24 +24,37 @@ use crate::{unsafe_obj, unsafe_offset};
 // ---------------------------------------------------------------------------
 
 /// `Unsafe.addressSize0()` — returns the size of a native pointer in bytes.
-/// We model a 64-bit VM, so this is always 8.
+/// Derived from the host pointer width instead of a hard-coded 8, so it agrees
+/// with `unsafe_natives_ext::native_unsafe_address_size` and stays correct on a
+/// 32-bit build.
 fn native_unsafe_address_size0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(8)))
+    Ok(Some(Value::Int(std::mem::size_of::<usize>() as i32)))
 }
 
 /// `Unsafe.isBigEndian0()` — returns whether the platform is big-endian.
-/// x86-64 and ARM64 (in standard mode) are little-endian.
+///
+/// Read from the compile target rather than hard-coded to little-endian.
+/// `ByteBuffer`/`VarHandle` byte-order handling and `ScopedMemoryAccess`'s
+/// unaligned accessors branch on this, so a wrong answer silently byte-swaps
+/// every multi-byte off-heap read on a big-endian host.
 fn native_unsafe_is_big_endian0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+    Ok(Some(Value::Int(i32::from(cfg!(target_endian = "big")))))
 }
 
 /// `Unsafe.unalignedAccess0()` — returns whether unaligned memory access is
-/// supported. x86-64 supports unaligned access natively.
+/// supported. True on x86/x86-64 and on AArch64 (which permits unaligned
+/// accesses to normal memory); conservatively false elsewhere, which only
+/// costs a slower byte-at-a-time path in the JDK callers.
 fn native_unsafe_unaligned_access0(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(1)))
+    let unaligned = cfg!(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64"
+    ));
+    Ok(Some(Value::Int(i32::from(unaligned))))
 }
 
 /// `Unsafe.loadLoadFence()` — ensures that loads before the fence are not

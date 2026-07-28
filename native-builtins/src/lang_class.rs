@@ -2544,12 +2544,17 @@ pub(crate) fn native_class_is_instance(
         Some(Value::Object(None)) => return Ok(Some(Value::Int(0))),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let this_class_id = match mirror_class_id(ctx, this) {
-        Some(id) => id,
-        None => return Ok(Some(Value::Int(0))),
-    };
-    let target_class_id = ctx.class_id_of_object(target);
-
+    // The array-aware branch runs BEFORE any ClassId resolution, mirroring
+    // `native_class_is_assignable_from` below (which always did). It is a
+    // purely name/descriptor-based check that does not need `this`'s ClassId --
+    // and `mirror_class_id` MISSES for an array mirror handed out by
+    // `Method.getReturnType()` under a custom loader, so resolving it first
+    // made `isInstance` bail with `false` while `isAssignableFrom` answered
+    // `true` for the very same pair. Spring's `AnnotationTypeMapping.adapt`
+    // calls `type.isInstance(value)` and rejected an annotation's enum-array
+    // value with the self-contradictory "should be compatible with
+    // RequestMethod[] but a RequestMethod[] value was returned"
+    // (`test.context.aot.*`). `probes/ForkArr2Probe.java`.
     // S111r17 вЂ” Array-aware isInstance.  Heap-stored `class_id_of` for an
     // array returns the COMPONENT class id (e.g. `java/lang/Class` for a
     // `Class[]` array), NOT the synthetic `[Lcomponent;` array class id.
@@ -2573,6 +2578,11 @@ pub(crate) fn native_class_is_instance(
         // is a non-array Class вЂ” those reduce to assignable-to-Object
         // via `array_is_assignable` already, so this is just defensive).
     }
+    let this_class_id = match mirror_class_id(ctx, this) {
+        Some(id) => id,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let target_class_id = ctx.class_id_of_object(target);
 
     // Annotation proxy special case: our `create_annotation_proxy` allocates
     // objects of class `java/lang/annotation/AnnotationProxy`, not of the

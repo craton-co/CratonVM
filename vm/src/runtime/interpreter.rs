@@ -7182,6 +7182,18 @@ pub fn execute(
                             // exception and fall through to the interpreter, which will push a
                             // frame and route through the exception table.
                             if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+                                // This legacy sink routes the exception against a
+                                // freshly pushed, method-entry frame rather than
+                                // through `route_jit_signal_exception`, so a frame
+                                // naming THIS method can never be used here — drop it
+                                // rather than leave it for a later invocation to
+                                // mis-claim. A callee's frame is left alone: its
+                                // exception is still in flight.
+                                drop_own_exceptional_frame(
+                                    &class_name_str,
+                                    method_name,
+                                    method_descriptor,
+                                );
                                 // Stash the exception in a variable visible to the interpreter
                                 // loop that runs below (after frame push).
                                 jit_early_exception = Some(exc);
@@ -11888,7 +11900,7 @@ fn route_jit_signal_exception(
     exc: ObjectRef,
     fallback_locals: &[Value],
 ) -> Result<CachedCallResult, MethodCallFailed> {
-    let precise = match cratonvm_jit::deopt::take_last_deopt() {
+    let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
         Some(rframe)
             if deopt_frame_matches_method(
                 &rframe,
@@ -11903,16 +11915,32 @@ fn route_jit_signal_exception(
             };
             Some((bci, locals))
         }
-        Some(rframe) => {
-            cratonvm_jit::deopt::restash_last_deopt(rframe);
-            None
-        }
+        // A foreign exceptional frame is DROPPED, not re-stashed. Unlike an
+        // ordinary deopt frame — whose owner is still on the stack waiting to
+        // resume — an exceptional frame's owner is always the compiled body that
+        // just unwound to produce this exception, so if it does not name the
+        // method being drained here, its owner is gone and nobody can ever claim
+        // it. Re-stashing left it to be picked up by a LATER exception in the
+        // same method, which would then route with a stale bci and stale
+        // (possibly collected) object pointers.
+        Some(_foreign) => None,
         None => None,
     };
     let (throw_pc, locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, locals.as_slice()),
         None => (fallback_throw_pc, fallback_locals),
     };
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_signal_exception {}.{}{} precise_bci={:?} fallback_throw_pc={} chosen={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            precise.as_ref().map(|(b, _)| *b as i64),
+            fallback_throw_pc as i64,
+            throw_pc as i64,
+        );
+    }
     route_jit_exception_through_method(
         shared,
         thread,
@@ -11924,32 +11952,69 @@ fn route_jit_signal_exception(
     )
 }
 
+/// Interpret `sig.athrow_bci` as a throw pc for `cached`, or `usize::MAX`.
+///
+/// The signal carries no method identity (see `JitSignals::athrow_bci`), so an
+/// exception athrown by a compiled callee and propagated outward arrives here
+/// still carrying the CALLEE's bci. Range-checking this method's exception
+/// table against a foreign pc silently skips its handler: measured on
+/// `JitPreciseHandlerFrame.plainStep`, whose protected range is [0,4),
+/// receiving `maybeThrow`'s athrow at bci 13 — `handler_pc=None`, and its own
+/// `catch (Boom)` never ran (5,619 of 20,000 iterations).
+///
+/// Accept the bci only when it indexes an `athrow` (0xbf) in THIS method's
+/// code. Anything else falls back to the "throw pc unknown" sentinel, which is
+/// the pre-RBC.6 behaviour: typed handlers still match by exception class, and
+/// only a narrow catch-all is skipped.
+fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
+    if athrow_bci < 0 {
+        return usize::MAX;
+    }
+    let pc = athrow_bci as usize;
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = cached.code.len().saturating_sub(2);
+    if pc < code_len && cached.code[pc] == 0xbf {
+        pc
+    } else {
+        usize::MAX
+    }
+}
+
+/// Drop a stashed pending-exception frame, but ONLY if it names this method.
+///
+/// The sinks that call this handle a JIT-raised exception without going through
+/// `route_jit_signal_exception`, so a frame naming THEIR method can never be
+/// used and would otherwise linger for a later invocation to mis-claim. A frame
+/// naming a *callee*, though, is still in flight: an OSR bail re-stashes the
+/// exception and a later drain routes it through that callee's own table, which
+/// is precisely where the frame belongs. Dropping it there made a compiled
+/// callee's handler read its non-parameter locals as null.
+fn drop_own_exceptional_frame(class_name: &str, method_name: &str, descriptor: &str) {
+    if let Some(frame) = cratonvm_jit::deopt::take_exceptional_frame() {
+        if !deopt_frame_matches_method(&frame, class_name, method_name, descriptor) {
+            cratonvm_jit::deopt::restash_exceptional_frame(frame);
+        }
+    }
+}
+
 /// Search the cached exception table and construct the interpreter handler
 /// frame from the locals selected by `route_jit_signal_exception`.
-fn route_jit_exception_through_method(
+/// Find the exception-table entry of `cached` that catches `exc` thrown at
+/// `throw_pc`, returning its handler pc.
+///
+/// Extracted from `route_jit_exception_through_method` so the JIT-to-JIT
+/// dispatch path (`vm/src/jit/helpers.rs::route_implicit_exc_through_callee`)
+/// can run a compiled callee's own handler without re-executing the callee
+/// from its entry — see `run_jit_callee_handler`.
+pub(crate) fn find_jit_exception_handler(
     shared: &SharedVm,
-    thread: &mut JvmThread,
-    caller_frame_idx: usize,
     cached: &Arc<CachedBytecodeMethod>,
     throw_pc: usize,
     exc: ObjectRef,
-    incoming_args: &[Value],
-) -> Result<CachedCallResult, MethodCallFailed> {
-    if crate::jit::helpers::rbc6_dbg() {
-        eprintln!(
-            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
-            cached.class_name,
-            cached.method_name,
-            cached.method_descriptor,
-            throw_pc as i64,
-            cached.exception_table.len(),
-        );
-    }
-    // Fast path: no exception table at all — propagate.
+) -> Option<usize> {
     if cached.exception_table.is_empty() {
-        return Err(MethodCallFailed::ExceptionThrown(exc));
+        return None;
     }
-
     let pc_unknown = throw_pc == usize::MAX;
     // `cached.code` is padded with 2 trailing bytes for speculative reads;
     // the real bytecode length is `len() - 2`. Used to recognise a catch-all
@@ -12028,6 +12093,100 @@ fn route_jit_exception_through_method(
         }
     }
     drop(cm_guard);
+    handler_pc
+}
+
+/// Run a compiled callee's own exception handler in the interpreter, resuming
+/// AT the handler rather than re-executing the method from its entry.
+///
+/// The JIT-to-JIT dispatch path used to answer a compiled callee's escaping
+/// exception with `bail_to_interpreter`, i.e. a full re-run. That is only
+/// sound for a callee whose pre-throw prefix has no observable side effects —
+/// which a `try { counter++; mayThrow(); } finally { counter--; }` plainly
+/// does not: the compiled attempt already ran `counter++` and skipped the
+/// `finally`, and the re-run then adds a second balanced pass, leaking one
+/// count per throw. `FinallyShapeProbe`/`CallPathProbe` are the witnesses
+/// (`docs/known-issues/repros/jitban-remaining-20260726/`).
+///
+/// Resuming at the handler keeps the compiled prefix's single execution and
+/// runs only the cleanup the compiled body skipped. Locals are the callee's
+/// incoming arguments, which is the same verifier-consistent state
+/// `route_jit_exception_through_method` uses and is sound for exactly the same
+/// reason: a compiled method whose handler reads a local first assigned inside
+/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+///
+/// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
+/// caller to propagate the exception unchanged.
+pub(crate) fn run_jit_callee_handler(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: usize,
+    exc: ObjectRef,
+    incoming_args: &[Value],
+) -> Option<MethodCallResult> {
+    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    thread.refill_pools_from_shared(
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
+        cached.declaring_class_id,
+        cached.class_name.clone(),
+        cached.method_name.clone(),
+        cached.method_descriptor.clone(),
+        cached.source_file.clone(),
+        cached.code.clone(),
+        cached.exception_table.clone(),
+        cached.max_stack,
+        cached.max_locals,
+        incoming_args,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    // Same GC-safety ordering as `route_jit_exception_through_method`: the
+    // exception oop must live in a scanned frame slot before anything that can
+    // allocate runs.
+    if frame.stack.push(Value::Object(Some(exc))).is_err() {
+        return None;
+    }
+    frame.pc = handler_pc;
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={}",
+            cached.class_name, cached.method_name, cached.method_descriptor, throw_pc, handler_pc,
+        );
+    }
+    Some(execute_prebuilt_frame(shared, thread, frame))
+}
+
+fn route_jit_exception_through_method(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    caller_frame_idx: usize,
+    cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: usize,
+    exc: ObjectRef,
+    incoming_args: &[Value],
+) -> Result<CachedCallResult, MethodCallFailed> {
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc as i64,
+            cached.exception_table.len(),
+        );
+    }
+    // Fast path: no exception table at all — propagate.
+    if cached.exception_table.is_empty() {
+        return Err(MethodCallFailed::ExceptionThrown(exc));
+    }
+
+    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc);
 
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
@@ -27894,6 +28053,20 @@ fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
+    // entries in a segmented native layout, so the real JDK `writeObject`
+    // (which walks the always-null `table`) serialised every CHM as empty and
+    // the real `readObject` rebuilt a `table` our natives never read. Both are
+    // reached through `ObjectStreamClass.invokeWriteObject`/`invokeReadObject`,
+    // i.e. reflective `Method.invoke` -- a path with no bytecode PC to key an
+    // invoke-cache entry on, so it consults this gate directly. Kept separate
+    // from the Map cluster above because HashMap/LinkedHashMap/Hashtable have
+    // no such natives and must keep running their real bodies.
+    if class_name == "java/util/concurrent/ConcurrentHashMap"
+        && matches!(method_name, "writeObject" | "readObject")
+    {
+        return true;
+    }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
     // allow-list. JarFile inherits these operations from ZipFile, so a
     // subclass `super.close()` resolves to the real ZipFile bytecode after
@@ -32723,6 +32896,38 @@ fn invoke_cached_intrinsic(
 /// no heap allocation.
 const MAX_INTRINSIC_ARGS: usize = 8;
 
+/// Map a record's javac-generated `hashCode`/`equals` body to its interpreter
+/// intrinsic, or `None` for anything else.
+///
+/// These two cannot live in `intrinsics::lookup`'s static
+/// `(class, name, descriptor)` table: they apply to every record class in the
+/// program, and only when the body really is the generated
+/// `invokedynamic java.lang.runtime.ObjectMethods.bootstrap` shape — a record
+/// that hand-writes `hashCode` must keep its own code.
+/// [`Class::generated_record_object_methods`] performs (and memoises) that
+/// body-shape check.
+///
+/// `toString` is deliberately left on the ordinary `invokedynamic` path: it is
+/// not hot, and its formatting needs the component descriptors that the
+/// call-site data carries.
+fn record_object_intrinsic(
+    declaring: &crate::classloading::Class,
+    method_name: &str,
+    descriptor: &str,
+) -> Option<cratonvm_native_api::InterpIntrinsic> {
+    use crate::classloading::{RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE};
+    let generated = declaring.generated_record_object_methods();
+    match (method_name, descriptor) {
+        ("hashCode", "()I") if generated & RECORD_OBJ_HASH_CODE != 0 => {
+            Some(cratonvm_native_api::InterpIntrinsic::RecordHashCode)
+        }
+        ("equals", "(Ljava/lang/Object;)Z") if generated & RECORD_OBJ_EQUALS != 0 => {
+            Some(cratonvm_native_api::InterpIntrinsic::RecordEquals)
+        }
+        _ => None,
+    }
+}
+
 /// Phase 3 — pop intrinsic call arguments into a caller-provided stack
 /// buffer using the parameter descriptors cached in the IC entry (split once
 /// at fill time). The steady-state cost is a stack pop per arg plus
@@ -33813,6 +34018,52 @@ mod dynamic_dispatch_slot_tests {
     }
 }
 
+/// `CRATONVM_DBG_JITC` diagnostic: name the cache state that forced an OSR
+/// recompile — `no-cached-artifact` (the one legitimate case),
+/// `cached-not-via-osr`, or `cached-cannot-enter-at-pc`.
+///
+/// The last one is the interesting one: a PUBLISHED `compiled_via_osr` artifact
+/// that cannot be entered at `entry_pc` will never become enterable
+/// (`osr_pc_to_native[entry_pc]` is a pure function of the bytecode and the
+/// entry pc — the codegen writes `-1` for a pc strictly inside a LICM-hoisted
+/// loop body), so every recompile rebuilds it byte for byte. Measured on the
+/// `CallRate.allocPutOld` probe: 200 full C2 pipelines per 200 000 iterations,
+/// 199 of them this case, with the loop interpreted throughout.
+///
+/// `#[inline(never)]` + `#[cold]` keep the formatting temporaries of a
+/// debug-only path out of `compile_osr_artifact`'s frame. That caller is ~1100
+/// lines and runs on the mutator stack, and a frame reservation is
+/// unconditional even for a branch that never executes without the env var —
+/// so this is worth keeping out of line on principle, cheaply.
+///
+/// (Honesty note for the next reader: this was briefly *suspected* of causing
+/// a `main-vm` stack overflow in `TestDefaultServlet`. It does not. That crash
+/// reproduces on binaries with no diagnostic and no OSR change at all — it is
+/// a pre-existing flaky, load-dependent overflow on `dev`, seen once in four
+/// runs of an unmodified baseline binary on a heavily loaded host. Do not read
+/// these attributes as fixing anything.)
+#[inline(never)]
+#[cold]
+fn dbg_osr_recompile_reason(
+    cached_osr: Option<&crate::jit::CompiledMethod>,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    entry_pc: usize,
+) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_none() {
+        return;
+    }
+    let why = match cached_osr {
+        None => "no-cached-artifact",
+        Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
+        Some(_) => "cached-cannot-enter-at-pc",
+    };
+    eprintln!(
+        "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+    );
+}
+
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -33957,20 +34208,22 @@ fn compile_osr_artifact(
     // reuse kicks in.
     let osr_reused =
         matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
-    // DBG: name WHY a cached artifact was not reused. A cached
-    // `compiled_via_osr` artifact that cannot enter at `entry_pc` means the
-    // recompile below is guaranteed to produce the same un-enterable result
-    // (same bytecode, same entry pc), i.e. a pure-waste recompile loop —
-    // distinguishing that from "no artifact yet" or "artifact came from the
-    // invocation path" is the whole diagnosis.
-    if !osr_reused && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-        let why = match &cached_osr {
-            None => "no-cached-artifact",
-            Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
-            Some(_) => "cached-cannot-enter-at-pc",
-        };
-        eprintln!(
-            "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+    // DBG: name WHY a cached artifact was not reused — see
+    // `dbg_osr_recompile_reason`. MUST stay an `#[inline(never)]` call: this
+    // function runs on the mutator's stack and is already ~1100 lines, and
+    // `main-vm`'s remaining headroom here is thin enough that inlining even a
+    // cold `eprintln!`'s formatting temporaries into this frame overflowed the
+    // stack outright (`TestDefaultServlet`/`TestStandardWrapper`/`TestTomcat`
+    // all died with "thread 'main-vm' has overflowed its stack"; the same
+    // binaries pass with the diagnostic out of line). The branch never
+    // executes without the env var, but the frame reservation is unconditional.
+    if !osr_reused {
+        dbg_osr_recompile_reason(
+            cached_osr.as_deref(),
+            &class_name,
+            &method_name,
+            &method_descriptor,
+            entry_pc,
         );
     }
     let compiled = if osr_reused {
@@ -35067,6 +35320,12 @@ fn try_osr(
             );
         }
         crate::jit::helpers::stash_jit_pending_exception(exc);
+        // OSR is same-frame replacement: the interpreter keeps executing THIS
+        // frame, so a frame naming the OSR'd method itself can never be used and
+        // is dropped. A frame naming a CALLEE the OSR'd code invoked is a
+        // different matter — the exception is only re-stashed here and the
+        // callee's own drain routes it later, so that frame must survive.
+        drop_own_exceptional_frame(&class_name_arc, &method_name_arc, &descriptor_arc);
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
@@ -37581,6 +37840,131 @@ fn try_jit_compile_callee_slow(
     // intrinsics (see `resolve_string_field_layout`).
     let string_layout_resolver = || resolve_string_field_layout(shared);
 
+    // Direct JIT-to-JIT calls, LOOKUP-ONLY (tomcat doc 04, 2026-07-27).
+    //
+    // This argument used to be `None` ("no recursive callee compilation"),
+    // which is what the tiered BACKGROUND worker compiles every hot method
+    // with. `None` does not merely decline to compile a callee eagerly — it
+    // means `jit/src/lib.rs` plans NO `direct_calls` at all, so every
+    // `invokestatic`/`invokespecial` in a background-compiled body falls
+    // through to the generic `jit_invoke_dispatch` helper round trip, on
+    // every call, forever. Measured on `apps/tomcat-suite-runner/probes/
+    // CallCostProbe.java` (marginal cost of one extra invoke inside a
+    // compiled loop, same binary, same run):
+    //
+    //     invokestatic, background-compiled body  ~196 ns
+    //     invokestatic, mutator-compiled body     ~5-9 ns   (CRATONVM_BG_COMPILE=0)
+    //     invokestatic, HotSpot                   ~0.5 ns
+    //
+    // i.e. ~30x on the single most common call form in ordinary Java, on the
+    // path that compiles almost everything. Deploy-heavy Tomcat classes are
+    // exactly this shape (reflection, class loading, Digester), which is the
+    // residual "interpreter throughput x method count" wall doc 04 describes.
+    //
+    // The stated reason for `None` was recursion: `try_jit_upgrade_with_gate`'s
+    // `callee_compiler` will COMPILE an unseen callee inline, and doing that
+    // from the compile worker would nest compiles. This resolver keeps that
+    // property by never compiling anything — it answers only from
+    // `jit_cache`, so a callee that is already compiled (the overwhelmingly
+    // common case once a workload is warm; the tiered manager compiles leaves
+    // before their callers because leaves reach the invocation threshold
+    // first) gets a raw `CALL`, and anything else stays on dispatch exactly
+    // as before.
+    //
+    // Every refusal gate of the mutator-side `callee_compiler` is mirrored
+    // here, in the same order; each `None` is correctness-safe because it
+    // just leaves the site on the checked dispatch helper:
+    //   * FJP subclass blocklist (RFJP.1)
+    //   * Rust native shadow (S111r15)
+    //   * BUG-H: callee declaring its own exception table — a raw CALL would
+    //     let an implicit AIOOBE/NPE escape the callee's own `catch`
+    //   * `synchronized` callee (no monitor pairing across a raw CALL)
+    //   * JVMS 5.5: a `static` callee whose declaring class is not yet
+    //     initialized (the direct CALL bypasses every init check)
+    //   * an artifact carrying an unconditional invokedynamic trap
+    let direct_callee_lookup =
+        |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
+            macro_rules! dc_no {
+                ($why:expr) => {{
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] bg-direct-call DECLINED {callee_class}.{callee_method}{callee_desc}: {}",
+                            $why
+                        );
+                    }
+                    return None;
+                }};
+            }
+            if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
+                dc_no!("fjp-blocklist");
+            }
+            if shared
+                .natives
+                .native_methods
+                .find(callee_class, callee_method, callee_desc)
+                .is_some()
+            {
+                dc_no!("native-shadow");
+            }
+            let callee_class_id = {
+                let cm = shared.classes.class_manager.read();
+                let Some(callee_cid) =
+                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
+                else {
+                    dc_no!("callee-class-not-found");
+                };
+                let store = cm.class_store();
+                let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
+                    callee_cid,
+                    callee_method,
+                    callee_desc,
+                    store,
+                ) else {
+                    dc_no!("callee-method-not-found");
+                };
+                if method.is_synchronized() {
+                    dc_no!("synchronized");
+                }
+                if method
+                    .code()
+                    .map_or(true, |c| !c.exception_table.is_empty())
+                {
+                    dc_no!("callee-exception-table");
+                }
+                if method.is_static()
+                    && !store
+                        .get(declaring_id)
+                        .map(crate::vm::is_class_initialized_fast)
+                        .unwrap_or(false)
+                {
+                    dc_no!("declaring-class-not-initialized");
+                }
+                callee_cid
+            };
+            let callee_class_arc: Arc<str> = Arc::from(callee_class);
+            let callee_method_arc: Arc<str> = Arc::from(callee_method);
+            let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
+            let jit_cache = shared.jit.jit_cache.read();
+            let Some(compiled) = jit_cache.get(
+                &callee_class_arc,
+                &callee_method_arc,
+                &callee_desc_arc,
+                callee_class_id,
+            ) else {
+                dc_no!("callee-not-yet-compiled");
+            };
+            if compiled.has_indy_trap {
+                dc_no!("indy-trap");
+            }
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] bg-direct-call BOUND {callee_class}.{callee_method}{callee_desc}"
+                );
+            }
+            // Cast: object/code pointer to integer address
+            Some((compiled.entry_ptr() as usize, compiled.needs_context()))
+        };
+
     let compile_start = std::time::Instant::now();
     crate::jit::set_self_call_identity_stable(self_call_identity_stable(
         shared,
@@ -37593,7 +37977,9 @@ fn try_jit_compile_callee_slow(
         Some(&static_field_resolver),
         Some(&invoke_resolver),
         Some(&invokespecial_owner_resolver),
-        None, // no recursive callee compilation
+        // Lookup-only: binds an ALREADY-compiled callee to a raw CALL, never
+        // compiles one (see `direct_callee_lookup` above).
+        Some(&direct_callee_lookup),
         Some(&new_resolver),
         Some(&ldc_resolver),
         Some(&ldc2w_resolver),
@@ -38884,11 +39270,7 @@ fn execute_jit_call(
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-            let throw_pc = if sig.athrow_bci >= 0 {
-                sig.athrow_bci as usize
-            } else {
-                usize::MAX
-            };
+            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
                 thread,
@@ -39349,11 +39731,7 @@ fn execute_jit_call_decoded(
             // RBC.6 correctness fix — see the identical comment at
             // `execute_jit_call`'s sibling call site: use the athrow's own
             // known bci when available instead of always `usize::MAX`.
-            let throw_pc = if sig.athrow_bci >= 0 {
-                sig.athrow_bci as usize
-            } else {
-                usize::MAX
-            };
+            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )
@@ -39921,7 +40299,14 @@ fn execute_invokevirtual_vtable_fast(
                     &method_name,
                     &method_descriptor,
                 )
-                .is_some(),
+                .is_some()
+                    // Records (JEP 395): a generated `hashCode`/`equals` is an
+                    // intrinsic too, but it is not in the static table — see
+                    // `record_object_intrinsic`. Without this arm the vtable
+                    // fast path runs the `invokedynamic` body and the
+                    // intrinsic IC is never reached.
+                    || record_object_intrinsic(declaring_class, &method_name, &method_descriptor)
+                        .is_some(),
             )
         })
         .unwrap_or(false);
@@ -42115,6 +42500,14 @@ fn populate_virtual_invoke_cache(
                             &method_name,
                             &descriptor,
                         )
+                        .or_else(|| {
+                            // Records (JEP 395): `hashCode`/`equals` are not
+                            // keyed on a fixed class, so they cannot come from
+                            // the static table — see `record_object_intrinsic`.
+                            store.get(declaring_id).and_then(|declaring| {
+                                record_object_intrinsic(declaring, &method_name, &descriptor)
+                            })
+                        })
                     })
                     .flatten()
             };
