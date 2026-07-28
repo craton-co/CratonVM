@@ -1124,6 +1124,32 @@ pub(crate) fn nret_find(addr: usize) -> Vec<(usize, usize, String)> {
     })
 }
 
+/// Finalizable roots every collection must seed, whichever path runs it.
+///
+/// Two disjoint sets, both of which the collector would otherwise miss:
+///
+///   * `ref_processor.finalizer_referent_addresses()` — registered
+///     finalizables not yet claimed. Only the `System.gc` path used to pass
+///     these; the ordinary allocation-driven collections below passed `&[]`.
+///   * `finalizer_thread.pending_addresses()` — objects already claimed and
+///     queued, waiting for `finalize()` to actually run. `mark_finalizer_enqueued`
+///     deliberately drops these from the first list, so nothing else roots
+///     them, yet the queue keeps only a raw address. `run_finalizers` also
+///     bails out early whenever a JIT borrow is live, which routinely leaves
+///     entries queued across several collections — a wide window in which a
+///     non-moving young sweep frees the object and leaves the queue pointing
+///     at reclaimed memory (SEGV in `run_finalizers`' `class_id_of`).
+fn finalizable_roots(shared: &SharedVm) -> Vec<usize> {
+    let mut addrs = {
+        let rp = shared.mem.ref_processor.lock();
+        rp.finalizer_referent_addresses()
+    };
+    addrs.extend(shared.mem.finalizer_thread.pending_addresses());
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
 pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
@@ -1186,11 +1212,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result =
-                shared
-                    .mem
-                    .heap
-                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let fin_roots = finalizable_roots(shared);
+            let result = shared
+                .mem
+                .heap
+                .collect_garbage_with_finalizers(
+                    &stw,
+                    &mut roots,
+                    &fin_roots,
+                    &shared.threads.monitors,
+                )
+                .0;
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
@@ -1388,11 +1420,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
                 weakref_null_referents_pre_gc(shared);
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-                let result =
-                    shared
-                        .mem
-                        .heap
-                        .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+                let fin_roots = finalizable_roots(shared);
+                let result = shared
+                    .mem
+                    .heap
+                    .collect_garbage_with_finalizers(
+                        &stw,
+                        &mut roots,
+                        &fin_roots,
+                        &shared.threads.monitors,
+                    )
+                    .0;
                 process_references_after_gc(shared, &result.pointer_map);
 
                 // Update shared VM state (statics, string pool, etc.)
@@ -1514,10 +1552,17 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+        let fin_roots = finalizable_roots(shared);
         let result = shared
             .mem
             .heap
-            .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            .collect_garbage_with_finalizers(
+                &stw,
+                &mut roots,
+                &fin_roots,
+                &shared.threads.monitors,
+            )
+            .0;
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(&result.pointer_map);
@@ -1566,11 +1611,17 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                                     // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result =
-                shared
-                    .mem
-                    .heap
-                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let fin_roots = finalizable_roots(shared);
+            let result = shared
+                .mem
+                .heap
+                .collect_garbage_with_finalizers(
+                    &stw,
+                    &mut roots,
+                    &fin_roots,
+                    &shared.threads.monitors,
+                )
+                .0;
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: remap the ec_watch corruption-watch table across this
@@ -1719,10 +1770,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     mtroots_dump_initiator(shared, thread, 1);
 
     // Snapshot finalizable object addresses so the GC can resurrect dead ones
-    let fin_addrs: Vec<usize> = {
-        let rp = shared.mem.ref_processor.lock();
-        rp.finalizer_referent_addresses()
-    };
+    let fin_addrs: Vec<usize> = finalizable_roots(shared);
 
     let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
@@ -6983,6 +7031,18 @@ pub fn execute(
                             // exception and fall through to the interpreter, which will push a
                             // frame and route through the exception table.
                             if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+                                // This legacy sink routes the exception against a
+                                // freshly pushed, method-entry frame rather than
+                                // through `route_jit_signal_exception`, so a frame
+                                // naming THIS method can never be used here — drop it
+                                // rather than leave it for a later invocation to
+                                // mis-claim. A callee's frame is left alone: its
+                                // exception is still in flight.
+                                drop_own_exceptional_frame(
+                                    &class_name_str,
+                                    method_name,
+                                    method_descriptor,
+                                );
                                 // Stash the exception in a variable visible to the interpreter
                                 // loop that runs below (after frame push).
                                 jit_early_exception = Some(exc);
@@ -7925,12 +7985,19 @@ pub(crate) fn try_osr_with_backoff(
                 f.class_id,
             )
         };
-        let reusable = {
+        // Three-way classification, not two. `reusable` is the enter-now case;
+        // `published_but_unenterable` is a PUBLISHED OSR artifact that cannot be
+        // entered at THIS pc, which is a permanent property, not a
+        // still-compiling one (see the rejection arm below).
+        let (reusable, published_but_unenterable) = {
             let jc = shared.jit.jit_cache.read();
-            matches!(
-                jc.get_osr(&cn, &mn, &md, frame_class_id),
-                Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
-            )
+            match jc.get_osr(&cn, &mn, &md, frame_class_id) {
+                Some(c) if c.compiled_via_osr => {
+                    let ok = c.can_osr_enter(entry_pc);
+                    (ok, !ok)
+                }
+                _ => (false, false),
+            }
         };
         if !reusable {
             // Not compiled yet: ensure the worker is running, request an OSR
@@ -7938,7 +8005,32 @@ pub(crate) fn try_osr_with_backoff(
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            if crate::jit::tiered::is_osr_denied(&key) {
+            // An artifact this same path already published, which reports
+            // `can_osr_enter(entry_pc) == false`, will report that forever:
+            // `osr_pc_to_native[entry_pc]` is a pure function of the bytecode
+            // and the entry pc (the codegen writes `-1` for a pc strictly
+            // inside a LICM-hoisted loop body, whose pre-header an OSR entry
+            // would skip). Recompiling reproduces it byte for byte — the OSR
+            // path passes empty branch/unroll hint maps, so nothing profile-
+            // dependent can change the outcome; a class redefinition, the one
+            // thing that would, replaces the cached artifact and re-evaluates
+            // this check naturally.
+            //
+            // Treating it as "background compile pending" instead —
+            // `record_osr_background_pending()` resets `backward_count` without
+            // consuming the bounded per-pc rejection budget — made the loop
+            // re-request a compile every `osr_threshold` back-edges forever.
+            // Measured on the `CallRate.allocPutOld` probe: 200 full C2
+            // pipelines for 200 000 iterations (one per 1 000), 199 of them
+            // producing the identical un-enterable artifact, with the loop
+            // interpreted throughout. Route it to the existing bounded
+            // exponential-backoff schedule instead, which is already keyed
+            // per-pc, so other loop headers in the same method keep their OSR
+            // eligibility (unlike `mark_osr_denied`, which is method-wide).
+            //
+            // Strictly a waste-elimination change: it removes compiles, never
+            // adds compiled execution. The loop runs interpreted either way.
+            if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
                 thread.frames[*frame_idx].record_osr_rejection(entry_pc);
                 return OsrBackoffOutcome::Skip;
             }
@@ -11657,7 +11749,7 @@ fn route_jit_signal_exception(
     exc: ObjectRef,
     fallback_locals: &[Value],
 ) -> Result<CachedCallResult, MethodCallFailed> {
-    let precise = match cratonvm_jit::deopt::take_last_deopt() {
+    let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
         Some(rframe)
             if deopt_frame_matches_method(
                 &rframe,
@@ -11672,16 +11764,32 @@ fn route_jit_signal_exception(
             };
             Some((bci, locals))
         }
-        Some(rframe) => {
-            cratonvm_jit::deopt::restash_last_deopt(rframe);
-            None
-        }
+        // A foreign exceptional frame is DROPPED, not re-stashed. Unlike an
+        // ordinary deopt frame — whose owner is still on the stack waiting to
+        // resume — an exceptional frame's owner is always the compiled body that
+        // just unwound to produce this exception, so if it does not name the
+        // method being drained here, its owner is gone and nobody can ever claim
+        // it. Re-stashing left it to be picked up by a LATER exception in the
+        // same method, which would then route with a stale bci and stale
+        // (possibly collected) object pointers.
+        Some(_foreign) => None,
         None => None,
     };
     let (throw_pc, locals) = match precise.as_ref() {
         Some((bci, locals)) => (*bci, locals.as_slice()),
         None => (fallback_throw_pc, fallback_locals),
     };
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_signal_exception {}.{}{} precise_bci={:?} fallback_throw_pc={} chosen={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            precise.as_ref().map(|(b, _)| *b as i64),
+            fallback_throw_pc as i64,
+            throw_pc as i64,
+        );
+    }
     route_jit_exception_through_method(
         shared,
         thread,
@@ -11693,32 +11801,69 @@ fn route_jit_signal_exception(
     )
 }
 
+/// Interpret `sig.athrow_bci` as a throw pc for `cached`, or `usize::MAX`.
+///
+/// The signal carries no method identity (see `JitSignals::athrow_bci`), so an
+/// exception athrown by a compiled callee and propagated outward arrives here
+/// still carrying the CALLEE's bci. Range-checking this method's exception
+/// table against a foreign pc silently skips its handler: measured on
+/// `JitPreciseHandlerFrame.plainStep`, whose protected range is [0,4),
+/// receiving `maybeThrow`'s athrow at bci 13 — `handler_pc=None`, and its own
+/// `catch (Boom)` never ran (5,619 of 20,000 iterations).
+///
+/// Accept the bci only when it indexes an `athrow` (0xbf) in THIS method's
+/// code. Anything else falls back to the "throw pc unknown" sentinel, which is
+/// the pre-RBC.6 behaviour: typed handlers still match by exception class, and
+/// only a narrow catch-all is skipped.
+fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
+    if athrow_bci < 0 {
+        return usize::MAX;
+    }
+    let pc = athrow_bci as usize;
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = cached.code.len().saturating_sub(2);
+    if pc < code_len && cached.code[pc] == 0xbf {
+        pc
+    } else {
+        usize::MAX
+    }
+}
+
+/// Drop a stashed pending-exception frame, but ONLY if it names this method.
+///
+/// The sinks that call this handle a JIT-raised exception without going through
+/// `route_jit_signal_exception`, so a frame naming THEIR method can never be
+/// used and would otherwise linger for a later invocation to mis-claim. A frame
+/// naming a *callee*, though, is still in flight: an OSR bail re-stashes the
+/// exception and a later drain routes it through that callee's own table, which
+/// is precisely where the frame belongs. Dropping it there made a compiled
+/// callee's handler read its non-parameter locals as null.
+fn drop_own_exceptional_frame(class_name: &str, method_name: &str, descriptor: &str) {
+    if let Some(frame) = cratonvm_jit::deopt::take_exceptional_frame() {
+        if !deopt_frame_matches_method(&frame, class_name, method_name, descriptor) {
+            cratonvm_jit::deopt::restash_exceptional_frame(frame);
+        }
+    }
+}
+
 /// Search the cached exception table and construct the interpreter handler
 /// frame from the locals selected by `route_jit_signal_exception`.
-fn route_jit_exception_through_method(
+/// Find the exception-table entry of `cached` that catches `exc` thrown at
+/// `throw_pc`, returning its handler pc.
+///
+/// Extracted from `route_jit_exception_through_method` so the JIT-to-JIT
+/// dispatch path (`vm/src/jit/helpers.rs::route_implicit_exc_through_callee`)
+/// can run a compiled callee's own handler without re-executing the callee
+/// from its entry — see `run_jit_callee_handler`.
+pub(crate) fn find_jit_exception_handler(
     shared: &SharedVm,
-    thread: &mut JvmThread,
-    caller_frame_idx: usize,
     cached: &Arc<CachedBytecodeMethod>,
     throw_pc: usize,
     exc: ObjectRef,
-    incoming_args: &[Value],
-) -> Result<CachedCallResult, MethodCallFailed> {
-    if crate::jit::helpers::rbc6_dbg() {
-        eprintln!(
-            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
-            cached.class_name,
-            cached.method_name,
-            cached.method_descriptor,
-            throw_pc as i64,
-            cached.exception_table.len(),
-        );
-    }
-    // Fast path: no exception table at all — propagate.
+) -> Option<usize> {
     if cached.exception_table.is_empty() {
-        return Err(MethodCallFailed::ExceptionThrown(exc));
+        return None;
     }
-
     let pc_unknown = throw_pc == usize::MAX;
     // `cached.code` is padded with 2 trailing bytes for speculative reads;
     // the real bytecode length is `len() - 2`. Used to recognise a catch-all
@@ -11797,6 +11942,100 @@ fn route_jit_exception_through_method(
         }
     }
     drop(cm_guard);
+    handler_pc
+}
+
+/// Run a compiled callee's own exception handler in the interpreter, resuming
+/// AT the handler rather than re-executing the method from its entry.
+///
+/// The JIT-to-JIT dispatch path used to answer a compiled callee's escaping
+/// exception with `bail_to_interpreter`, i.e. a full re-run. That is only
+/// sound for a callee whose pre-throw prefix has no observable side effects —
+/// which a `try { counter++; mayThrow(); } finally { counter--; }` plainly
+/// does not: the compiled attempt already ran `counter++` and skipped the
+/// `finally`, and the re-run then adds a second balanced pass, leaking one
+/// count per throw. `FinallyShapeProbe`/`CallPathProbe` are the witnesses
+/// (`docs/known-issues/repros/jitban-remaining-20260726/`).
+///
+/// Resuming at the handler keeps the compiled prefix's single execution and
+/// runs only the cleanup the compiled body skipped. Locals are the callee's
+/// incoming arguments, which is the same verifier-consistent state
+/// `route_jit_exception_through_method` uses and is sound for exactly the same
+/// reason: a compiled method whose handler reads a local first assigned inside
+/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+///
+/// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
+/// caller to propagate the exception unchanged.
+pub(crate) fn run_jit_callee_handler(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: usize,
+    exc: ObjectRef,
+    incoming_args: &[Value],
+) -> Option<MethodCallResult> {
+    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    thread.refill_pools_from_shared(
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
+        cached.declaring_class_id,
+        cached.class_name.clone(),
+        cached.method_name.clone(),
+        cached.method_descriptor.clone(),
+        cached.source_file.clone(),
+        cached.code.clone(),
+        cached.exception_table.clone(),
+        cached.max_stack,
+        cached.max_locals,
+        incoming_args,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    // Same GC-safety ordering as `route_jit_exception_through_method`: the
+    // exception oop must live in a scanned frame slot before anything that can
+    // allocate runs.
+    if frame.stack.push(Value::Object(Some(exc))).is_err() {
+        return None;
+    }
+    frame.pc = handler_pc;
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={}",
+            cached.class_name, cached.method_name, cached.method_descriptor, throw_pc, handler_pc,
+        );
+    }
+    Some(execute_prebuilt_frame(shared, thread, frame))
+}
+
+fn route_jit_exception_through_method(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    caller_frame_idx: usize,
+    cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: usize,
+    exc: ObjectRef,
+    incoming_args: &[Value],
+) -> Result<CachedCallResult, MethodCallFailed> {
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc as i64,
+            cached.exception_table.len(),
+        );
+    }
+    // Fast path: no exception table at all — propagate.
+    if cached.exception_table.is_empty() {
+        return Err(MethodCallFailed::ExceptionThrown(exc));
+    }
+
+    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc);
 
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
@@ -27079,6 +27318,68 @@ pub(crate) fn is_ffm_memory_layout_native_override(
         )
 }
 
+/// FFM `java.lang.foreign.Arena` — the interface-native exemption that pairs
+/// with `force_ffm_memory_segment_interface_native` (vm/src/vm/vm_exec.rs).
+///
+/// `Arena.ofConfined()/ofAuto()/ofShared()/global()` are STATIC interface
+/// methods, so their registered natives always run (the interface skip only
+/// covers instance methods) and hand back a synthetic receiver stamped with
+/// the literal interface class name `java/lang/foreign/Arena`
+/// (native-builtins/src/phases_late/foreign_ffm.rs `p67_new_arena`, which also
+/// gives the arena the session that `scope()` hands out and `close()` closes).
+/// Every lifecycle method on that receiver is a NON-STATIC method whose
+/// declaring class is an interface — exactly the shape both dispatch guards
+/// skip — so `scope()`/`close()`/`allocate(…)` would resolve to the interface's
+/// own declaration (abstract in a real JDK image, a stub body under
+/// `--synthetic-jdk`) instead of the natives that own the arena's lifetime.
+/// `MemorySegment.scope` is already force-routed for precisely this reason;
+/// without this twin the two disagree and `arena.scope() != segment.scope()`.
+///
+/// Only triples that actually have a registration are listed: `scope`, `close`,
+/// the four `allocate` overloads and `allocateFrom`/`allocateUtf8String`
+/// (foreign_ffm.rs `register_p67_foreign_memory` + panama.rs
+/// `register_pe_arena`/`register_pe2_string_marshaling`). `allocateArray` has
+/// no native behind it on any class and is deliberately absent — forcing a name
+/// with no registration would only cost a fruitless registry probe.
+///
+/// A REAL `jdk.internal.foreign.ArenaImpl` receiver is unaffected: it declares
+/// `scope()`, `close()` and `allocate(long, long)` concretely, so dispatch
+/// resolves with `jdk/internal/foreign/ArenaImpl` as the declaring class and
+/// never matches this predicate. (The session natives these bodies call do have
+/// a real-receiver escape — `p67_session_delegate`'s
+/// `invoke_virtual_bytecode_only` — but this predicate never needs it, because
+/// a real `ArenaImpl` is not routed here in the first place.)
+pub(crate) fn is_ffm_arena_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/foreign/Arena"
+        && matches!(
+            (method_name, descriptor),
+            ("scope", "()Ljava/lang/foreign/MemorySegment$Scope;")
+                | ("close", "()V")
+                | ("allocate", "(J)Ljava/lang/foreign/MemorySegment;")
+                | ("allocate", "(JJ)Ljava/lang/foreign/MemorySegment;")
+                | (
+                    "allocate",
+                    "(Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocate",
+                    "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocateFrom",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocateUtf8String",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;"
+                )
+        )
+}
+
 pub(crate) fn is_file_channel_impl_open_native_override(
     class_name: &str,
     method_name: &str,
@@ -27599,6 +27900,20 @@ fn force_native_over_real_jdk_bytecode(
             | "keys"
             | "elements"
     ) {
+        return true;
+    }
+    // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
+    // entries in a segmented native layout, so the real JDK `writeObject`
+    // (which walks the always-null `table`) serialised every CHM as empty and
+    // the real `readObject` rebuilt a `table` our natives never read. Both are
+    // reached through `ObjectStreamClass.invokeWriteObject`/`invokeReadObject`,
+    // i.e. reflective `Method.invoke` -- a path with no bytecode PC to key an
+    // invoke-cache entry on, so it consults this gate directly. Kept separate
+    // from the Map cluster above because HashMap/LinkedHashMap/Hashtable have
+    // no such natives and must keep running their real bodies.
+    if class_name == "java/util/concurrent/ConcurrentHashMap"
+        && matches!(method_name, "writeObject" | "readObject")
+    {
         return true;
     }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
@@ -29265,6 +29580,14 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_ffm_memory_layout_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // FFM Arena lifecycle. Reaching it from here is what wires the exemption
+    // into `try_stackless_invoke`'s step-6 interface guard (via
+    // `should_force_registered_native_over_bytecode`), so that path agrees with
+    // the explicit `force_ffm_arena_interface_native` term in
+    // `invoke_on_class_shared`. See `is_ffm_arena_native_override`.
+    if is_ffm_arena_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
@@ -33544,6 +33867,52 @@ mod dynamic_dispatch_slot_tests {
     }
 }
 
+/// `CRATONVM_DBG_JITC` diagnostic: name the cache state that forced an OSR
+/// recompile — `no-cached-artifact` (the one legitimate case),
+/// `cached-not-via-osr`, or `cached-cannot-enter-at-pc`.
+///
+/// The last one is the interesting one: a PUBLISHED `compiled_via_osr` artifact
+/// that cannot be entered at `entry_pc` will never become enterable
+/// (`osr_pc_to_native[entry_pc]` is a pure function of the bytecode and the
+/// entry pc — the codegen writes `-1` for a pc strictly inside a LICM-hoisted
+/// loop body), so every recompile rebuilds it byte for byte. Measured on the
+/// `CallRate.allocPutOld` probe: 200 full C2 pipelines per 200 000 iterations,
+/// 199 of them this case, with the loop interpreted throughout.
+///
+/// `#[inline(never)]` + `#[cold]` keep the formatting temporaries of a
+/// debug-only path out of `compile_osr_artifact`'s frame. That caller is ~1100
+/// lines and runs on the mutator stack, and a frame reservation is
+/// unconditional even for a branch that never executes without the env var —
+/// so this is worth keeping out of line on principle, cheaply.
+///
+/// (Honesty note for the next reader: this was briefly *suspected* of causing
+/// a `main-vm` stack overflow in `TestDefaultServlet`. It does not. That crash
+/// reproduces on binaries with no diagnostic and no OSR change at all — it is
+/// a pre-existing flaky, load-dependent overflow on `dev`, seen once in four
+/// runs of an unmodified baseline binary on a heavily loaded host. Do not read
+/// these attributes as fixing anything.)
+#[inline(never)]
+#[cold]
+fn dbg_osr_recompile_reason(
+    cached_osr: Option<&crate::jit::CompiledMethod>,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    entry_pc: usize,
+) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_none() {
+        return;
+    }
+    let why = match cached_osr {
+        None => "no-cached-artifact",
+        Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
+        Some(_) => "cached-cannot-enter-at-pc",
+    };
+    eprintln!(
+        "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+    );
+}
+
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -33688,6 +34057,24 @@ fn compile_osr_artifact(
     // reuse kicks in.
     let osr_reused =
         matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
+    // DBG: name WHY a cached artifact was not reused — see
+    // `dbg_osr_recompile_reason`. MUST stay an `#[inline(never)]` call: this
+    // function runs on the mutator's stack and is already ~1100 lines, and
+    // `main-vm`'s remaining headroom here is thin enough that inlining even a
+    // cold `eprintln!`'s formatting temporaries into this frame overflowed the
+    // stack outright (`TestDefaultServlet`/`TestStandardWrapper`/`TestTomcat`
+    // all died with "thread 'main-vm' has overflowed its stack"; the same
+    // binaries pass with the diagnostic out of line). The branch never
+    // executes without the env var, but the frame reservation is unconditional.
+    if !osr_reused {
+        dbg_osr_recompile_reason(
+            cached_osr.as_deref(),
+            &class_name,
+            &method_name,
+            &method_descriptor,
+            entry_pc,
+        );
+    }
     let compiled = if osr_reused {
         cached_osr
     } else {
@@ -34782,6 +35169,12 @@ fn try_osr(
             );
         }
         crate::jit::helpers::stash_jit_pending_exception(exc);
+        // OSR is same-frame replacement: the interpreter keeps executing THIS
+        // frame, so a frame naming the OSR'd method itself can never be used and
+        // is dropped. A frame naming a CALLEE the OSR'd code invoked is a
+        // different matter — the exception is only re-stashed here and the
+        // callee's own drain routes it later, so that frame must survive.
+        drop_own_exceptional_frame(&class_name_arc, &method_name_arc, &descriptor_arc);
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
@@ -37296,6 +37689,131 @@ fn try_jit_compile_callee_slow(
     // intrinsics (see `resolve_string_field_layout`).
     let string_layout_resolver = || resolve_string_field_layout(shared);
 
+    // Direct JIT-to-JIT calls, LOOKUP-ONLY (tomcat doc 04, 2026-07-27).
+    //
+    // This argument used to be `None` ("no recursive callee compilation"),
+    // which is what the tiered BACKGROUND worker compiles every hot method
+    // with. `None` does not merely decline to compile a callee eagerly — it
+    // means `jit/src/lib.rs` plans NO `direct_calls` at all, so every
+    // `invokestatic`/`invokespecial` in a background-compiled body falls
+    // through to the generic `jit_invoke_dispatch` helper round trip, on
+    // every call, forever. Measured on `apps/tomcat-suite-runner/probes/
+    // CallCostProbe.java` (marginal cost of one extra invoke inside a
+    // compiled loop, same binary, same run):
+    //
+    //     invokestatic, background-compiled body  ~196 ns
+    //     invokestatic, mutator-compiled body     ~5-9 ns   (CRATONVM_BG_COMPILE=0)
+    //     invokestatic, HotSpot                   ~0.5 ns
+    //
+    // i.e. ~30x on the single most common call form in ordinary Java, on the
+    // path that compiles almost everything. Deploy-heavy Tomcat classes are
+    // exactly this shape (reflection, class loading, Digester), which is the
+    // residual "interpreter throughput x method count" wall doc 04 describes.
+    //
+    // The stated reason for `None` was recursion: `try_jit_upgrade_with_gate`'s
+    // `callee_compiler` will COMPILE an unseen callee inline, and doing that
+    // from the compile worker would nest compiles. This resolver keeps that
+    // property by never compiling anything — it answers only from
+    // `jit_cache`, so a callee that is already compiled (the overwhelmingly
+    // common case once a workload is warm; the tiered manager compiles leaves
+    // before their callers because leaves reach the invocation threshold
+    // first) gets a raw `CALL`, and anything else stays on dispatch exactly
+    // as before.
+    //
+    // Every refusal gate of the mutator-side `callee_compiler` is mirrored
+    // here, in the same order; each `None` is correctness-safe because it
+    // just leaves the site on the checked dispatch helper:
+    //   * FJP subclass blocklist (RFJP.1)
+    //   * Rust native shadow (S111r15)
+    //   * BUG-H: callee declaring its own exception table — a raw CALL would
+    //     let an implicit AIOOBE/NPE escape the callee's own `catch`
+    //   * `synchronized` callee (no monitor pairing across a raw CALL)
+    //   * JVMS 5.5: a `static` callee whose declaring class is not yet
+    //     initialized (the direct CALL bypasses every init check)
+    //   * an artifact carrying an unconditional invokedynamic trap
+    let direct_callee_lookup =
+        |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
+            macro_rules! dc_no {
+                ($why:expr) => {{
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] bg-direct-call DECLINED {callee_class}.{callee_method}{callee_desc}: {}",
+                            $why
+                        );
+                    }
+                    return None;
+                }};
+            }
+            if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
+                dc_no!("fjp-blocklist");
+            }
+            if shared
+                .natives
+                .native_methods
+                .find(callee_class, callee_method, callee_desc)
+                .is_some()
+            {
+                dc_no!("native-shadow");
+            }
+            let callee_class_id = {
+                let cm = shared.classes.class_manager.read();
+                let Some(callee_cid) =
+                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
+                else {
+                    dc_no!("callee-class-not-found");
+                };
+                let store = cm.class_store();
+                let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
+                    callee_cid,
+                    callee_method,
+                    callee_desc,
+                    store,
+                ) else {
+                    dc_no!("callee-method-not-found");
+                };
+                if method.is_synchronized() {
+                    dc_no!("synchronized");
+                }
+                if method
+                    .code()
+                    .map_or(true, |c| !c.exception_table.is_empty())
+                {
+                    dc_no!("callee-exception-table");
+                }
+                if method.is_static()
+                    && !store
+                        .get(declaring_id)
+                        .map(crate::vm::is_class_initialized_fast)
+                        .unwrap_or(false)
+                {
+                    dc_no!("declaring-class-not-initialized");
+                }
+                callee_cid
+            };
+            let callee_class_arc: Arc<str> = Arc::from(callee_class);
+            let callee_method_arc: Arc<str> = Arc::from(callee_method);
+            let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
+            let jit_cache = shared.jit.jit_cache.read();
+            let Some(compiled) = jit_cache.get(
+                &callee_class_arc,
+                &callee_method_arc,
+                &callee_desc_arc,
+                callee_class_id,
+            ) else {
+                dc_no!("callee-not-yet-compiled");
+            };
+            if compiled.has_indy_trap {
+                dc_no!("indy-trap");
+            }
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] bg-direct-call BOUND {callee_class}.{callee_method}{callee_desc}"
+                );
+            }
+            // Cast: object/code pointer to integer address
+            Some((compiled.entry_ptr() as usize, compiled.needs_context()))
+        };
+
     let compile_start = std::time::Instant::now();
     crate::jit::set_self_call_identity_stable(self_call_identity_stable(
         shared,
@@ -37308,7 +37826,9 @@ fn try_jit_compile_callee_slow(
         Some(&static_field_resolver),
         Some(&invoke_resolver),
         Some(&invokespecial_owner_resolver),
-        None, // no recursive callee compilation
+        // Lookup-only: binds an ALREADY-compiled callee to a raw CALL, never
+        // compiles one (see `direct_callee_lookup` above).
+        Some(&direct_callee_lookup),
         Some(&new_resolver),
         Some(&ldc_resolver),
         Some(&ldc2w_resolver),
@@ -38599,11 +39119,7 @@ fn execute_jit_call(
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-            let throw_pc = if sig.athrow_bci >= 0 {
-                sig.athrow_bci as usize
-            } else {
-                usize::MAX
-            };
+            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
                 thread,
@@ -39064,11 +39580,7 @@ fn execute_jit_call_decoded(
             // RBC.6 correctness fix — see the identical comment at
             // `execute_jit_call`'s sibling call site: use the athrow's own
             // known bci when available instead of always `usize::MAX`.
-            let throw_pc = if sig.athrow_bci >= 0 {
-                sig.athrow_bci as usize
-            } else {
-                usize::MAX
-            };
+            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )
@@ -44124,6 +44636,60 @@ mod tests {
             "java/lang/foreign/Linker",
             "find",
             descriptor
+        ));
+    }
+
+    #[test]
+    fn ffm_arena_force_native_covers_lifecycle() {
+        let arena = "java/lang/foreign/Arena";
+        for (name, descriptor) in [
+            ("scope", "()Ljava/lang/foreign/MemorySegment$Scope;"),
+            ("close", "()V"),
+            ("allocate", "(J)Ljava/lang/foreign/MemorySegment;"),
+            ("allocate", "(JJ)Ljava/lang/foreign/MemorySegment;"),
+            (
+                "allocate",
+                "(Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocate",
+                "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocateFrom",
+                "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocateUtf8String",
+                "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+            ),
+        ] {
+            assert!(
+                is_ffm_arena_native_override(arena, name, descriptor),
+                "Arena.{name}{descriptor} must be exempt from the interface instance-method skip"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(arena, name, descriptor),
+                "step-6 dispatch must force the Arena.{name}{descriptor} native"
+            );
+        }
+        // No native is registered for these, so they must NOT be force-routed.
+        assert!(!is_ffm_arena_native_override(
+            arena,
+            "allocateArray",
+            "(Ljava/lang/foreign/MemoryLayout;J)Ljava/lang/foreign/MemorySegment;"
+        ));
+        // A real `ArenaImpl` declares scope/close/allocate concretely, so it
+        // resolves under its own name and must never match.
+        assert!(!is_ffm_arena_native_override(
+            "jdk/internal/foreign/ArenaImpl",
+            "close",
+            "()V"
+        ));
+        assert!(!is_ffm_arena_native_override(
+            "jdk/internal/foreign/ArenaImpl",
+            "allocate",
+            "(JJ)Ljava/lang/foreign/MemorySegment;"
         ));
     }
 

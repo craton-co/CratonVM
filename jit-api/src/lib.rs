@@ -794,6 +794,18 @@ pub struct JitRuntimeHelpers {
     pub jit_card_old_base: usize,
     /// Exclusive old-generation end covered by `jit_card_table_addr`.
     pub jit_card_old_end: usize,
+    /// `extern "C" fn(bci: i64)` — stamp the *currently executing compiled
+    /// method's own* throw-site bci onto the pending-exception signal.
+    ///
+    /// Emitted on the cold side of every post-invoke exception check
+    /// (`jit/src/x64.rs::emit_exception_check_stubs`). Without it the signal
+    /// still carries the bci that the *callee's* compiled `athrow` lowering
+    /// stashed, and the interpreter range-checks that foreign pc against THIS
+    /// method's exception table — silently dropping a `finally` (a catch-all
+    /// entry cannot be rescued by the type check the way a typed handler can).
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    pub set_throw_bci: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -952,6 +964,7 @@ helper_fields! {
     (jit_card_table_addr,             FieldKind::Offset),
     (jit_card_old_base,               FieldKind::Offset),
     (jit_card_old_end,                FieldKind::Offset),
+    (set_throw_bci,                  FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -977,7 +990,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 56,
+    JitRuntimeHelpers::NUM_FIELDS == 57,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -1362,6 +1375,7 @@ mod tests {
             jit_card_table_addr: 0x1170,
             jit_card_old_base: 0x1178,
             jit_card_old_end: 0x1180,
+            set_throw_bci: 0x1188,
         }
     }
 
@@ -1590,6 +1604,7 @@ mod tests {
             jit_card_table_addr: 0,
             jit_card_old_base: 0,
             jit_card_old_end: 0,
+            set_throw_bci: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -2043,6 +2058,11 @@ mod tests {
                 55,
                 "jit_card_old_end",
                 std::mem::offset_of!(JitRuntimeHelpers, jit_card_old_end),
+            ),
+            (
+                56,
+                "set_throw_bci",
+                std::mem::offset_of!(JitRuntimeHelpers, set_throw_bci),
             ),
         ];
 

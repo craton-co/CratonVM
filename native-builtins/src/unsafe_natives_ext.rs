@@ -21,6 +21,42 @@ pub(crate) fn unsafe_offset_is_heap_slot(
     offset < ctx.object_num_fields(obj) && offset < 64
 }
 
+/// `Unsafe.pageSize()` — the host OS virtual-memory page size.
+///
+/// Was a hard-coded `4096`. That is right on x86-64 Linux/Windows but wrong on
+/// an Apple-silicon host (16 KiB) and on Linux/aarch64 kernels built with 16 K
+/// or 64 K pages, where callers that size a buffer from `pageSize()` (Netty's
+/// `PlatformDependent`, LMAX Disruptor padding, `DirectByteBuffer` alignment)
+/// would under-align. `sysconf(_SC_PAGESIZE)` is the same source HotSpot uses.
+/// Windows has no `sysconf`; its page size is 4 KiB on every architecture the
+/// VM builds for, so the constant stays there and is documented as such.
+pub(crate) fn native_unsafe_page_size(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    #[cfg(unix)]
+    let size: i32 = {
+        // `sysconf` returns -1 on failure; fall back to the 4 KiB default.
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        i32::try_from(raw).ok().filter(|n| *n > 0).unwrap_or(4096)
+    };
+    #[cfg(not(unix))]
+    let size: i32 = 4096;
+    Ok(Some(Value::Int(size)))
+}
+
+/// `Unsafe.addressSize()` — the width of a native pointer in bytes.
+///
+/// Derived from the host pointer width rather than hard-coded to 8, so it
+/// agrees with `jdk/internal/misc/Unsafe.addressSize0()` (unsafe_jdk25.rs) and
+/// stays correct if the VM is ever built for a 32-bit target.
+pub(crate) fn native_unsafe_address_size(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(std::mem::size_of::<usize>() as i32)))
+}
+
 pub(crate) fn native_unsafe_ensure_class_initialized(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -306,6 +342,10 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let u = "sun/misc/Unsafe";
+    // `registerNatives` only asks the VM to bind this class's JNI entry points.
+    // CratonVM binds them at registry-build time, so there is nothing left to
+    // do — an empty body is what HotSpot's own `Unsafe_RegisterNatives` amounts
+    // to once the table is already populated.
     r.register(u, "registerNatives", "()V", native_noop);
     r.register(u, "<clinit>", "()V", |ctx, _args| {
         let class_name = "sun/misc/Unsafe";
@@ -689,17 +729,14 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;JJB)V",
         native_unsafe_set_memory,
     );
-    // pageSize
-    r.register(u, "pageSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(4096)))
-    });
-    // addressSize
-    r.register(u, "addressSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(8)))
-    });
+    // pageSize / addressSize — queried from the host rather than hard-coded.
+    r.register(u, "pageSize", "()I", native_unsafe_page_size);
+    r.register(u, "addressSize", "()I", native_unsafe_address_size);
 
     // Also register under jdk/internal/misc/Unsafe (the modern API, same implementations)
     let u2 = "jdk/internal/misc/Unsafe";
+    // Same as the `sun/misc/Unsafe` entry above: JNI binding is done at
+    // registry-build time, so the method genuinely has no work to do.
     r.register(u2, "registerNatives", "()V", native_noop);
     r.register(u2, "<clinit>", "()V", |ctx, _args| {
         let class_name = "jdk/internal/misc/Unsafe";
@@ -1079,12 +1116,8 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
         unsafe_natives::native_unsafe_copy_memory_consolidated,
     );
-    r.register(u2, "pageSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(4096)))
-    });
-    r.register(u2, "addressSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(8)))
-    });
+    r.register(u2, "pageSize", "()I", native_unsafe_page_size);
+    r.register(u2, "addressSize", "()I", native_unsafe_address_size);
 
     // --- Remaining Unsafe methods (Phase 44) ---
 
@@ -1097,7 +1130,7 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(JJ)J",
         native_unsafe_allocate_memory_realloc,
     );
-    r.register(u, "freeMemory", "(J)V", native_noop_with_this);
+    r.register(u, "freeMemory", "(J)V", native_unsafe_free_memory_ext);
     r.register(u2, "allocateMemory0", "(J)J", native_unsafe_allocate_memory);
     r.register(
         u2,
@@ -1105,32 +1138,33 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(JJ)J",
         native_unsafe_allocate_memory_realloc,
     );
-    r.register(u2, "freeMemory0", "(J)V", native_noop_with_this);
+    r.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory_ext);
 
-    // monitorEnter / monitorExit — manual synchronization
+    // monitorEnter / monitorExit — manual synchronization. These take the
+    // VM's real monitor, not a no-op: see `native_unsafe_monitor_enter`.
     r.register(
         u,
         "monitorEnter",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_enter,
     );
     r.register(
         u,
         "monitorExit",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_exit,
     );
     r.register(
         u2,
         "monitorEnter",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_enter,
     );
     r.register(
         u2,
         "monitorExit",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_exit,
     );
 
     // throwException — throws a checked exception without declaring it
@@ -1147,7 +1181,19 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_unsafe_throw_exception,
     );
 
-    // shouldBeInitialized — check if class needs initialization
+    // shouldBeInitialized(Class) — "is this class still uninitialized?".
+    //
+    // KEPT as a constant `false`, deliberately: `NativeContext` exposes no
+    // initialization-state query (only `ensure_class_initialized`, which acts
+    // rather than reports), so there is nothing truthful to read. `false` is
+    // the correct answer on the dominant JDK call path —
+    // `DirectMethodHandle$EnsureInitialized.computeValue` calls
+    // `ensureClassInitialized(type)` (our real implementation) and only THEN
+    // asks `shouldBeInitialized(type)`; by that point the class genuinely is
+    // initialized. Answering `true` there would make the JDK conclude it is
+    // executing inside `<clinit>` and pin the `<clinit>` barrier on the method
+    // handle for the process lifetime. Revisit if a real
+    // `is_class_initialized` query is ever added to the native API.
     r.register(
         u,
         "shouldBeInitialized",
@@ -1161,18 +1207,26 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
 
-    // staticFieldBase — returns base object for static field access
+    // staticFieldBase — returns the declaring class's mirror, which is what the
+    // matching `staticFieldOffset` above encodes against.
+    //
+    // These two used to be always-null closures. In essential-natives mode that
+    // was invisible (`unsafe_natives::register_unsafe_wp1_2` runs later and
+    // re-registers the real impl), but synthetic mode calls THIS function a
+    // second time from `register_synthetic_overrides` — i.e. AFTER wp1.2 — so
+    // the null closure won and every `staticFieldBase(Field)` in synthetic mode
+    // returned null. Point both at the real implementation instead.
     r.register(
         u,
         "staticFieldBase",
         "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        unsafe_natives::native_unsafe_static_field_base,
     );
     r.register(
         u2,
         "staticFieldBase",
         "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        unsafe_natives::native_unsafe_static_field_base,
     );
 
     // ensureClassInitialized — trigger class initialization
@@ -1191,7 +1245,19 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
 
     // defineClass — define a class from byte array (delegate to ClassLoader)
     // jdk.internal.misc.CDS: CratonVM does not support HotSpot CDS archives.
-    // Return disabled for all query natives and no-op archive hooks.
+    // Class Data Sharing is an OPTIONAL HotSpot feature, and every native
+    // below is spec-correct for a VM that does not offer it — a stock HotSpot
+    // run with `-Xshare:off` answers exactly the same way. The three
+    // `is*0()Z` queries report "not dumping / not sharing"; the archive hooks
+    // (`logLambdaFormInvoker`, `initializeFromArchive`, `defineArchivedModules`,
+    // `dumpClassList`, `dumpDynamicArchive`) have nothing to record or write
+    // because no archive exists, and every caller in `java.base` is written to
+    // tolerate that. These are therefore permanent KEEPs, not unimplemented
+    // stubs. NOTE: identical registration sets also exist in `lib.rs`
+    // (register_essential_natives_with_shims) and
+    // `phases_early.rs::register_core_stdlib_extras`, both of which run AFTER
+    // this one in their respective registration worlds — see the duplication
+    // note in the stub-removal report.
     let cds_cls = "jdk/internal/misc/CDS";
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
@@ -1214,6 +1280,10 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
         native_noop,
     );
+    // `getRandomSeedForDumping()` feeds the CDS archive's identity-hash
+    // randomisation. With no archive ever produced there is nothing to seed;
+    // HotSpot itself returns 0 here unless `-Xshare:dump` is active. Part of
+    // the permanent-KEEP CDS set documented above.
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
@@ -1230,8 +1300,15 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_noop,
     );
 
-    r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
-    r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // defineClass / defineClass0 — real `define_class_full`-routed impl. These
+    // were always-null closures whose only saving grace was that
+    // `unsafe_natives::register_unsafe_define_class` runs last on both the
+    // essential and the synthetic path and overwrote them. Registering the real
+    // function here removes that ordering dependency: ByteBuddy's class
+    // injection no longer silently gets `null` back if a future registrar lands
+    // after this one.
+    r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", unsafe_natives::native_unsafe_define_class);
+    r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", unsafe_natives::native_unsafe_define_class);
 
     // defineAnonymousClass — legacy API for defining hidden classes (used by old Lambda/invoke)
     // Signature: defineAnonymousClass(Class<?> hostClass, byte[] data, Object[] cpPatches) -> Class<?>
@@ -3803,6 +3880,75 @@ pub(crate) fn native_unsafe_allocate_memory(
     // Allocate a byte array on the managed heap to simulate off-heap memory
     let arr = ctx.new_ref_array(ClassId::new(0), size.max(1));
     Ok(Some(Value::Long(arr.as_ptr() as i64)))
+}
+
+/// `Unsafe.freeMemory(long)` / `freeMemory0(long)` — release an off-heap block.
+///
+/// This was `native_noop_with_this`, i.e. every block handed out by
+/// `allocateMemory` stayed live for the lifetime of the process. All off-heap
+/// addressing in this VM is consolidated onto the arena store (see the V5
+/// SECURITY FIX note in `unsafe_natives.rs`): `unsafe_arena_free` removes the
+/// whole `[base, base+len)` entry from the store's `BTreeMap`, and that map IS
+/// the bookkeeping table — dropping the entry both releases the bytes and
+/// makes every later access to the address fail the liveness check, which is
+/// what turns a use-after-free into an `IllegalArgumentException` instead of a
+/// silent read of recycled memory.
+///
+/// `freeMemory(0)` is a no-op by contract (`Unsafe` mirrors C `free(NULL)`),
+/// and an address the arena never handed out — e.g. a real
+/// `ByteBuffer.allocateDirect` pointer, which does not carry the arena tag —
+/// is left alone rather than reported as an error, matching the consolidated
+/// `unsafe_natives::native_unsafe_free_memory` handler.
+pub(crate) fn native_unsafe_free_memory_ext(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] is the `Unsafe` receiver; args[1] is the address.
+    let addr = match args.get(1) {
+        Some(Value::Long(a)) => *a,
+        Some(Value::Int(a)) => *a as i64,
+        _ => return Ok(None),
+    };
+    if addr == 0 {
+        return Ok(None);
+    }
+    unsafe_arena_free(addr);
+    Ok(None)
+}
+
+/// `Unsafe.monitorEnter(Object)` — acquire the argument's monitor.
+///
+/// This was `native_noop_with_this`, which meant a caller that locks through
+/// `Unsafe` rather than the `monitorenter` bytecode got NO mutual exclusion:
+/// every thread "acquired" the monitor simultaneously and the critical section
+/// ran concurrently. CratonVM already has a working monitor implementation —
+/// `NativeThreadAccess::monitor_enter`/`monitor_exit`, the same pair that backs
+/// `java/lang/Object.wait`/`notify`/`notifyAll` — so route to it.
+///
+/// A null argument is an NPE in HotSpot; `obj_arg` produces exactly that.
+/// Plain `monitor_enter` (not `monitor_enter_gc_safe`) is correct here: the
+/// receiver is not touched after the acquire, so a relocation during a blocked
+/// enter cannot leave a stale reference behind.
+pub(crate) fn native_unsafe_monitor_enter(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] is the `Unsafe` receiver; args[1] is the object to lock.
+    let obj = obj_arg(args, 1)?;
+    ctx.monitor_enter(obj);
+    Ok(None)
+}
+
+/// `Unsafe.monitorExit(Object)` — release the argument's monitor.
+/// Counterpart of [`native_unsafe_monitor_enter`]; see its doc for why the
+/// previous no-op was a correctness bug.
+pub(crate) fn native_unsafe_monitor_exit(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let obj = obj_arg(args, 1)?;
+    ctx.monitor_exit(obj);
+    Ok(None)
 }
 
 /// Unsafe.reallocateMemory(long, long) — simulate reallocation.

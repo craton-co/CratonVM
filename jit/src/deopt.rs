@@ -56,6 +56,19 @@ pub enum DeoptReason {
     /// through to the count-based default, exactly like `UncommonTrap`
     /// (see `docs/feature-designs/deopt-osr.md`, scaffolding).
     OsrExit,
+    /// A Java exception is pending in a compiled method whose handler reads
+    /// non-parameter locals (the RBC.6 precise-handler-frame relaxation).
+    ///
+    /// The frame this reason stamps exists for exactly ONE purpose: to hand the
+    /// interpreter the throwing bci and the live locals so the exception can be
+    /// routed through that method's own exception table. It is **not** a resume
+    /// point — its `bci` names the throwing instruction (not a successor to
+    /// continue at) and its operand stack is the post-pop state of the call that
+    /// threw. Resuming it as an ordinary deopt executes the instruction after a
+    /// call that never returned, with the result missing from the stack. That is
+    /// why such a frame is stashed separately ([`take_exceptional_frame`]) and
+    /// never lands in `LAST_DEOPT`.
+    PendingException,
 }
 
 /// What the runtime should do after a deopt.
@@ -549,6 +562,13 @@ impl DeoptimizationLog {
             }
             // Transfer to interpreter is a soft deopt — just reinterpret.
             DeoptReason::TransferToInterpreter => {
+                return DeoptAction::Reinterpret;
+            }
+            // A caught Java exception is ordinary control flow, not a failed
+            // speculation: recompiling changes nothing and blacklisting the
+            // method for throwing would permanently interpret every hot
+            // try/catch. Never escalate.
+            DeoptReason::PendingException => {
                 return DeoptAction::Reinterpret;
             }
             // OSR-exit is a real, EXPECTED control-flow event -- "a running
@@ -1271,6 +1291,46 @@ pub fn take_last_deopt() -> Option<ReconstructedFrame> {
     LAST_DEOPT.with(|c| c.borrow_mut().take())
 }
 
+thread_local! {
+    /// The frame published by a [`DeoptReason::PendingException`] stub — a
+    /// method whose pending Java exception must be routed through its own
+    /// exception table with precise locals.
+    ///
+    /// Deliberately NOT `LAST_DEOPT`: every consumer of that stash treats it as
+    /// "resume this method at `bci`", which for an exceptional frame executes
+    /// past a call that never returned. Keeping it separate also keeps
+    /// `has_last_deopt()` (which `jit_dispatch_threw` consults to disambiguate a
+    /// legitimate `Long.MIN_VALUE` return) blind to it, so an exceptional frame
+    /// nobody claims cannot make an unrelated later call site bail.
+    static LAST_EXCEPTIONAL: std::cell::RefCell<Option<ReconstructedFrame>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take (and clear) the pending-exception frame, if one was published by the
+/// compiled method that just returned the deopt sentinel.
+pub fn take_exceptional_frame() -> Option<ReconstructedFrame> {
+    LAST_EXCEPTIONAL.with(|c| c.borrow_mut().take())
+}
+
+/// Put a taken pending-exception frame back (the take-inspect-restash pattern,
+/// for a sink that discovers the frame is not its own to drop).
+pub fn restash_exceptional_frame(frame: ReconstructedFrame) {
+    LAST_EXCEPTIONAL.with(|c| *c.borrow_mut() = Some(frame));
+}
+
+/// Drop any pending-exception frame.
+///
+/// Used by the dispatch helper when it decides to re-execute a callee in the
+/// interpreter: the re-run regenerates and routes the exception itself, so the
+/// frame the abandoned compiled attempt published is stale. Sinks that merely
+/// pass an exception along must NOT call this — see
+/// `interpreter::drop_own_exceptional_frame`.
+pub fn clear_exceptional_frame() {
+    LAST_EXCEPTIONAL.with(|c| {
+        let _ = c.borrow_mut().take();
+    });
+}
+
 /// Peek (without clearing) whether a deopt frame is currently stashed.
 ///
 /// Used by the VM's post-invoke sentinel-disambiguation helper
@@ -1417,6 +1477,17 @@ pub extern "C" fn x64_deopt_entry(
     let point = unsafe { &*point };
     let regs = unsafe { &*regs };
     let frame = reconstruct_frame_from_machine_state(point, regs, rbp);
+    if point.reason == DeoptReason::PendingException {
+        // Exceptional frames get their own stash — see `LAST_EXCEPTIONAL`.
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            eprintln!(
+                "[cratonvm-deopt] x64 exceptional frame at throw bci={} locals={:?}",
+                point.bci, frame.locals,
+            );
+        }
+        LAST_EXCEPTIONAL.with(|c| *c.borrow_mut() = Some(frame));
+        return i64::MIN;
+    }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
         // Resume-side trace: confirms the frame-deopt trampoline fired and at
         // which bci/reason (deopt-osr Step 8 OSR-exit shows reason=OsrExit), with

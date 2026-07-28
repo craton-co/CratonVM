@@ -565,6 +565,14 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
+    // A `Security.setProperty` override wins over the seeded default, and
+    // makes a key that has no default answerable at all (real
+    // `Security.getProperty` is backed by a mutable Properties, not a fixed
+    // table). See `security_property_overrides`.
+    if let Some(v) = security_property_overrides().lock().get(&key).cloned() {
+        let s = ctx.create_string(&v);
+        return Ok(Some(Value::Object(Some(s))));
+    }
     let val = match key.as_str() {
         "securerandom.source" => "file:/dev/urandom",
         "keystore.type" => "PKCS12",
@@ -576,9 +584,50 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(s))))
 }
 
-fn security_set_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // No-op — the seeded list above is fixed; mutating it would require
-    // a Properties-backed store which is out of scope for WP6.1.
+/// Process-wide overrides written by `Security.setProperty`.
+///
+/// Stub-removal wave 2 (2026-07-27): `security_set_property` used to be a
+/// no-op and `security_get_property` answered from a fixed four-entry table,
+/// so `Security.setProperty("keystore.type", "JKS")` was silently discarded
+/// and the very next `getProperty` still reported `PKCS12`. That is live in
+/// the DEFAULT (real-JDK) build — `register_jca_natives` is reached from
+/// `register_essential_natives_with_shims` — and it is what makes real
+/// `KeyStore.getDefaultType()` bytecode unconfigurable, since that method is
+/// specified as `Security.getProperty("keystore.type")`.
+///
+/// `phases_early::security_properties()` is the same idea but is registered
+/// only from `register_synthetic_overrides`; the two are never both
+/// authoritative (phases_early registers later, so it wins under
+/// `--synthetic-jdk`; only this one exists in the default build).
+fn security_property_overrides(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, String>> {
+    static OVERRIDES: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    OVERRIDES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn security_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Real `Security.setProperty` NPEs on a null key or value.
+    let key = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("key can't be null".to_string()),
+            }
+            .into())
+        }
+    };
+    let val = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("datum can't be null".to_string()),
+            }
+            .into())
+        }
+    };
+    security_property_overrides().lock().insert(key, val);
     Ok(None)
 }
 
@@ -2717,6 +2766,11 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         provider_get_property,
     );
+    // KEEP (correct constant, not a stub): this reports a CAPABILITY, not a
+    // security decision — nothing is bypassed by answering it. CratonVM has no
+    // JFR security-event subsystem, so "security logging is off" is the true
+    // answer, and the real JDK returns the same `false` whenever the JFR
+    // security events are not enabled.
     // jdk.internal.event.EventHelper.isLoggingSecurity() — JFR security-event
     // logging gate. Its real body dereferences the static `JUJA`
     // (`SharedSecrets.getJavaUtilJarAccess()`), which is null in our VM, so it

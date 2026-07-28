@@ -80,6 +80,10 @@ pub mod file_channel;
 pub mod socket_channel;
 // Real non-blocking TCP connect with a pollable OS fd (ES-HANG-02 residual 1).
 pub mod nb_connect;
+// AF_UNIX stream sockets backing `*.open(StandardProtocolFamily.UNIX)` — the
+// `unixDomainSocketPath` connector shape (Tomcat `NioEndpoint`). Used by
+// `socket_channel`.
+pub mod uds;
 // WP3.2 — AsynchronousSocketChannel / AsynchronousServerSocketChannel + AsynchronousChannelGroup.
 pub mod async_socket;
 // Task #16 — SSRF outbound-policy hook + configurable connect timeout shared
@@ -1535,6 +1539,60 @@ fn native_fis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let n = ctx.fd_table().available(fd).unwrap_or(0);
     Ok(Some(Value::Int(n as i32)))
+}
+
+/// `java.io.FileInputStream.length0()J` — the size of the open file.
+fn native_fis_length0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let len = fis_get_fd(ctx, this)
+        .and_then(|fd| ctx.fd_table().file_size(fd).ok())
+        .unwrap_or(0);
+    Ok(Some(Value::Long(len as i64)))
+}
+
+/// `java.io.FileInputStream.position0()J` — the current read offset.
+///
+/// Derived as `length - available`: the fd table's `available()` already
+/// accounts for both the bytes still buffered in the `BufReader` and the bytes
+/// left in the underlying file, so this is the LOGICAL position the Java layer
+/// expects (not the buffered reader's physical offset).
+fn native_fis_position0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let Some(fd) = fis_get_fd(ctx, this) else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let Ok(len) = ctx.fd_table().file_size(fd) else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let remaining = ctx.fd_table().available(fd).unwrap_or(0) as u64;
+    Ok(Some(Value::Long(len.saturating_sub(remaining) as i64)))
+}
+
+/// `java.io.FileInputStream.isRegularFile0(FileDescriptor)Z` — static, so
+/// `args[0]` is the descriptor rather than a receiver.
+fn native_fis_is_regular_file0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(fd_obj))) = args.first() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let fd_obj = *fd_obj;
+    let fd = match ctx.get_field_by_name(fd_obj, "fd") {
+        Value::Int(v) if v >= 0 => Some(v as FdId),
+        _ => match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => Some(v as FdId),
+            _ => None,
+        },
+    };
+    // `file_size` is only implemented for the file-backed fd-table entries;
+    // sockets, pipes, child streams and stdin all fail, which is exactly the
+    // "is this a regular file" question being asked.
+    let regular = fd.is_some_and(|fd| ctx.fd_table().file_size(fd).is_ok());
+    Ok(Some(Value::Int(i32::from(regular))))
 }
 
 /// Skip n bytes in the FileInputStream. Returns the actual number skipped.
@@ -4904,6 +4962,9 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
 
     // --- JDK 25 real bytecode uses different method names for I/O natives ---
     // FileInputStream: open0, read0, readBytes, skip0, available0 etc.
+    // `initIDs` only caches jfieldIDs for HotSpot's own JNI code; CratonVM
+    // resolves fields by name, so there is nothing to cache and an empty body
+    // is the spec-correct implementation.
     registry.register("java/io/FileInputStream", "initIDs", "()V", native_noop);
     registry.register(
         "java/io/FileInputStream",
@@ -4934,30 +4995,41 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "()I",
         native_fis_available,
     );
+    // `length0`/`position0` both returned a hardcoded 0 — i.e. "this file is
+    // empty and we are at its start" for EVERY file. JDK 25's
+    // `FileInputStream.readAllBytes()`/`available()` size their reads from
+    // exactly these two, so the pair had to be worked around by lying about
+    // `isRegularFile0` as well (see below). Both are answerable from the
+    // fd table: `file_size` is the real length, and `available()` (already
+    // used by the `available0` native) is bytes-remaining, so
+    // `position = length - available`.
     registry.register(
         "java/io/FileInputStream",
         "length0",
         "()J",
-        |_ctx, _args| Ok(Some(Value::Long(0))),
+        native_fis_length0,
     );
     registry.register(
         "java/io/FileInputStream",
         "position0",
         "()J",
-        |_ctx, _args| Ok(Some(Value::Long(0))),
+        native_fis_position0,
     );
-    // Report "not a regular file" so the JDK `readAllBytes()` takes the
-    // generic streaming `InputStream.readAllBytes` loop (which calls our
-    // `readBytes` native) instead of the `length0()`-sized fast path —
-    // `length0` is a stub returning 0, which would otherwise read nothing.
+    // Previously hardcoded "not a regular file" so that `readAllBytes()`
+    // avoided the `length0()`-sized fast path, which the stub above would
+    // have sized at zero. With `length0`/`position0` real, this can report
+    // the truth: `file_size` only succeeds for fd-table entries that really
+    // are files (sockets/pipes/stdin fail), which is precisely the predicate.
     registry.register(
         "java/io/FileInputStream",
         "isRegularFile0",
         "(Ljava/io/FileDescriptor;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_fis_is_regular_file0,
     );
 
     // FileOutputStream: open0, write(I,Z), writeBytes
+    // Same as `FileInputStream.initIDs` above — jfieldID caching only, which
+    // CratonVM's by-name field resolution does not need.
     registry.register("java/io/FileOutputStream", "initIDs", "()V", native_noop);
     registry.register(
         "java/io/FileOutputStream",
@@ -5077,6 +5149,11 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // `SOCKADDR_IN6` values are fixed by the ws2def.h/ws2ipdef.h ABI and
     // are provided as literals in `sockaddr_abi` below (note AF_INET6 is
     // 23 on Windows vs 10 on Linux).
+    //
+    // KEEP (all twelve `NativeSocketAddress` accessors below): each returns a
+    // compile-time platform ABI constant, which is exactly what the real JNI
+    // implementations do (`offsetof`/`sizeof` on `struct sockaddr_in*`). These
+    // are not stubbed values standing in for runtime state.
     use sockaddr_abi as sa;
     registry.register(
         "sun/nio/ch/NativeSocketAddress",
@@ -7903,6 +7980,18 @@ fn sr_state() -> &'static Mutex<HashMap<i32, SrState>> {
     SR_STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// What `ensureOpen()` throws in every `java.io` reader: the exact
+/// `IOException("Stream closed")` the JDK raises when a `read`/`ready`/`skip`/
+/// `reset` arrives after `close()`. Shared by the `StringReader` and
+/// `CharArrayReader` natives, which each detect "closed" from their own
+/// dropped state (a missing `SR_STATE` entry / a null `buf` slot).
+fn ioe_stream_closed() -> MethodCallFailed {
+    RuntimeError::IOException {
+        message: "Stream closed".to_string(),
+    }
+    .into()
+}
+
 // The synthetic StringWriter layout stores the content `char[]` at slot 0 and
 // the logical length at slot 1. The REAL `java.io.StringWriter` field layout is
 // `Writer.lock` (slot 0, `Ljava/lang/Object;`) + `StringWriter.buf` (slot 1,
@@ -7956,9 +8045,12 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         registry.register(sr, "read", "()I", native_sr_read);
         registry.register(sr, "read", "([CII)I", native_sr_read_chars);
         registry.register(sr, "ready", "()Z", native_sr_ready);
-        registry.register(sr, "close", "()V", native_noop_void);
+        registry.register(sr, "close", "()V", native_sr_close);
         registry.register(sr, "skip", "(J)J", native_sr_skip);
         registry.register(sr, "reset", "()V", native_sr_reset);
+        // KEEP: real `StringReader` genuinely supports mark/reset (it is
+        // backed by an in-memory String), so `true` is the correct answer,
+        // not a placeholder — and `mark`/`reset` are implemented above.
         registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(1)))
         });
@@ -8022,9 +8114,12 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     // real `Reader.read()I` and `Reader.read(CharBuffer)` are concrete bytecode
     // that delegate to the subclass's `read([CII)I`, so they run correctly
     // without a native. Keep the synthetic base-Reader natives under
-    // `synthetic-jdk` only. `Reader.close()` stays a no-op universally (the
-    // real default is a no-op anyway and some synthetic readers rely on it).
-    registry.register("java/io/Reader", "close", "()V", native_noop_void);
+    // `synthetic-jdk` only. `Reader.close()` stays registered universally, but
+    // is no longer a no-op — see `native_reader_close` for why it is reachable
+    // (synthetic stub subclasses) and what it now does. The older comment here
+    // claimed "the real default is a no-op anyway"; that is wrong,
+    // `java.io.Reader.close()` is ABSTRACT.
+    registry.register("java/io/Reader", "close", "()V", native_reader_close);
     #[cfg(feature = "synthetic-jdk")]
     {
         registry.register("java/io/Reader", "read", "()I", native_sr_read);
@@ -8043,11 +8138,23 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     // assumed the StringWriter `char[]`+`count` layout and so corrupted slot 0/1 of
     // every OTHER Writer subclass — keep it under `synthetic-jdk` only (same
     // base-class hazard the `Reader.read` migration above fixed).
+    //
+    // `Writer.flush()V` / `Writer.close()V` used to be no-ops in this same
+    // block. They are gone: both are ABSTRACT in the real JDK (so unreachable
+    // in real-JDK mode — a concrete Writer must declare them, and the override
+    // lookup stops at the receiver's own method), and in synthetic mode the
+    // hierarchy walk can never get past an intermediate. Only `BufferedWriter`,
+    // `OutputStreamWriter`, `PrintWriter`, `StringWriter` and `FileWriter` have
+    // a stub superclass chain reaching `java/io/Writer` at all (`jdk_superclass`
+    // in classloading/src/class_manager.rs; `CharArrayWriter`/`PipedWriter`/
+    // `FilterWriter` extend `java/lang/Object` there), and every one of those
+    // registers its own `close`/`flush` — `FileWriter` inherits them from
+    // `OutputStreamWriter` one hop below `Writer`. So the two entries were dead
+    // in both modes. `write(I)V` stays: it is CONCRETE bytecode in the real JDK
+    // and is a genuine synthetic stand-in.
     #[cfg(feature = "synthetic-jdk")]
     {
         registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
-        registry.register("java/io/Writer", "flush", "()V", native_noop_void);
-        registry.register("java/io/Writer", "close", "()V", native_noop_void);
     }
     registry.set_category(__prev_cat);
 }
@@ -8192,7 +8299,7 @@ fn native_sr_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let mut table = sr_state().lock();
     let state = match table.get_mut(&key) {
         Some(s) => s,
-        None => return Ok(Some(Value::Int(-1))),
+        None => return Err(ioe_stream_closed()),
     };
     if state.pos >= state.units.len() {
         return Ok(Some(Value::Int(-1)));
@@ -8224,7 +8331,7 @@ fn native_sr_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         let mut table = sr_state().lock();
         let state = match table.get_mut(&key) {
             Some(s) => s,
-            None => return Ok(Some(Value::Int(-1))),
+            None => return Err(ioe_stream_closed()),
         };
         if state.pos >= state.units.len() {
             return Ok(Some(Value::Int(-1)));
@@ -8247,11 +8354,10 @@ fn native_sr_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = ctx.identity_hash_code(this);
-    let ready = sr_state()
-        .lock()
-        .get(&key)
-        .map(|s| s.pos < s.units.len())
-        .unwrap_or(false);
+    let ready = match sr_state().lock().get(&key) {
+        Some(s) => s.pos < s.units.len(),
+        None => return Err(ioe_stream_closed()),
+    };
     Ok(Some(Value::Int(if ready { 1 } else { 0 })))
 }
 
@@ -8268,7 +8374,7 @@ fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let mut table = sr_state().lock();
     let state = match table.get_mut(&key) {
         Some(s) => s,
-        None => return Ok(Some(Value::Long(0))),
+        None => return Err(ioe_stream_closed()),
     };
     let remaining = (state.units.len() - state.pos) as i64;
     let skip = n.clamp(0, remaining);
@@ -8282,8 +8388,66 @@ fn native_sr_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         _ => return Ok(None),
     };
     let key = ctx.identity_hash_code(this);
-    if let Some(state) = sr_state().lock().get_mut(&key) {
-        state.pos = 0;
+    match sr_state().lock().get_mut(&key) {
+        Some(state) => state.pos = 0,
+        None => return Err(ioe_stream_closed()),
+    }
+    Ok(None)
+}
+
+/// `StringReader.close()` — the real one drops its source, after which
+/// `ensureOpen()` makes every `read`/`ready`/`skip`/`reset` throw
+/// `IOException("Stream closed")`. The no-op that used to be registered here
+/// left the reader fully readable AND leaked the decoded content: `SR_STATE` is
+/// keyed by identity hash and nothing else ever evicts from it, so every
+/// StringReader ever built kept its `Vec<u16>` alive for the whole process.
+/// Removing the entry does both jobs at once — the storage goes, and the
+/// now-missing entry is exactly what the accessors read as "closed".
+///
+/// A missing entry can only mean "closed": `<init>(String)` is registered
+/// unconditionally and is the only constructor `java.io.StringReader` has, so
+/// every instance gets an entry before any read can happen, and this is the only
+/// thing that ever removes one. A tombstone would have defeated the point — the
+/// table is keyed by identity hash and nothing else evicts from it, so the entry
+/// has to actually go.
+///
+/// Idempotent: a second `close()` finds nothing to remove and returns quietly.
+fn native_sr_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let key = ctx.identity_hash_code(this);
+    sr_state().lock().remove(&key);
+    Ok(None)
+}
+
+/// `java.io.Reader.close()` is ABSTRACT in the real JDK, so this can never fire
+/// for real bytecode: a concrete Reader has to declare `close` itself, and the
+/// native-override lookup stops at the receiver's own method (and, failing
+/// that, at the first ancestor that has bytecode for it). It IS reachable in
+/// synthetic mode — a synthetic stub class declares no methods at all, so the
+/// superclass walk runs to whatever `jdk_superclass` gave it, and
+/// `BufferedReader` / `InputStreamReader` / `FileReader` all chain through
+/// `java/io/Reader` there. Both of those stub layouts park the wrapped source in
+/// a field named `in` (`synthetic_stub_fields`, classloading/src/
+/// class_manager.rs), so do what every java.io decorator's `close` does and
+/// close what is being wrapped, instead of dropping it on the floor. A reader
+/// with no `in` field owns nothing downstream and correctly does nothing.
+/// Clearing the field keeps `close()` idempotent.
+fn native_reader_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Value::Object(Some(inner)) = ctx.get_field_by_name(this, "in") {
+        // Clear BEFORE dispatching. The nested `close()` runs arbitrary Java, so
+        // a moving young GC there can relocate `this` and leave a write made
+        // afterwards pointing at a stale address (native stale-local family).
+        // Clearing first also keeps `close()` idempotent when the nested call
+        // throws.
+        ctx.set_field_by_name(this, "in", Value::Object(None));
+        let _ = ctx.invoke_virtual(inner, "close", "()V", &[]);
     }
     Ok(None)
 }
@@ -9676,6 +9840,12 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
     // JDK 25 UnixFileSystem initializes this dispatcher during early real-JDK
     // filesystem setup. Return no optional capabilities so Java falls back to
     // portable paths instead of failing class initialization.
+    //
+    // KEEP: the return value is a CAPABILITY BITMASK (openat/futimes/birthtime
+    // /…), not a status code — `0` is the honest "none of these syscalls are
+    // available through this VM" answer, and the JDK's own
+    // `UnixNativeDispatcher` treats it exactly that way by taking its portable
+    // fallbacks. Claiming a capability we do not implement is what would break.
     registry.register(
         "sun/nio/fs/UnixNativeDispatcher",
         "init",
@@ -10947,7 +11117,7 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
         registry.register(car, "<init>", "([CII)V", native_car_init_off);
         registry.register(car, "read", "()I", native_car_read);
         registry.register(car, "ready", "()Z", native_car_ready);
-        registry.register(car, "close", "()V", native_noop_void);
+        registry.register(car, "close", "()V", native_car_close);
     }
 
     // CharArrayWriter: the synthetic 2-field carrier (buf=0, count=1) shadowed
@@ -11003,7 +11173,24 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
         );
         registry.register(lnr, "getLineNumber", "()I", native_lnr_get_line_number);
         registry.register(lnr, "setLineNumber", "(I)V", native_lnr_set_line_number);
-        registry.register(lnr, "close", "()V", native_noop_void);
+        // Real `LineNumberReader` inherits `BufferedReader.close()`, which
+        // closes the Reader it wraps. The no-op that used to sit here leaked
+        // that Reader (and any file handle behind it) for the process lifetime.
+        // Slot 0 is `in` per the synthetic layout above; clearing it afterwards
+        // keeps `close()` idempotent.
+        registry.register(lnr, "close", "()V", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            if let Value::Object(Some(inner)) = ctx.get_field(this, 0) {
+                // Clear before dispatching — the nested `close()` can trigger a
+                // moving GC that relocates `this`, stranding a later write.
+                ctx.set_field(this, 0, Value::Object(None));
+                let _ = ctx.invoke_virtual(inner, "close", "()V", &[]);
+            }
+            Ok(None)
+        });
     }
     registry.set_category(__prev_cat);
 }
@@ -11401,10 +11588,35 @@ fn native_car_init_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(None)
 }
 
+/// `CharArrayReader.close()` — the real one nulls `buf`, and `ensureOpen()`
+/// then makes every subsequent `read`/`ready` throw. Null the synthetic slot 0
+/// (which also releases the backing `char[]`, the only resource this reader
+/// holds) and zero the cursor; `native_car_read`/`native_car_ready` read a null
+/// buffer as "closed" and throw. Idempotent — a second close finds slot 0
+/// already null.
+fn native_car_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    ctx.set_field(this, CAR_FIELD_BUF, Value::Object(None));
+    ctx.set_field(this, CAR_FIELD_POS, Value::Int(0));
+    ctx.set_field(this, CAR_FIELD_COUNT, Value::Int(0));
+    Ok(None)
+}
+
 fn native_car_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(-1))),
+    };
+    // `ensureOpen()`: a null `buf` means `close()` ran. Checked BEFORE the
+    // cursor so a closed reader throws instead of quietly reporting EOF, which
+    // is what distinguishes it from a merely exhausted one (buf still present,
+    // `pos >= count`).
+    let buf = match ctx.get_field(this, CAR_FIELD_BUF) {
+        Value::Object(Some(o)) => o,
+        _ => return Err(ioe_stream_closed()),
     };
     let pos = match ctx.get_field(this, CAR_FIELD_POS) {
         Value::Int(v) => v as usize,
@@ -11417,10 +11629,6 @@ fn native_car_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if pos >= count {
         return Ok(Some(Value::Int(-1)));
     }
-    let buf = match ctx.get_field(this, CAR_FIELD_BUF) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(-1))),
-    };
     let ch = match ctx.get_array_element(buf, pos) {
         Value::Int(v) => v,
         _ => -1,
@@ -11434,6 +11642,10 @@ fn native_car_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Same `ensureOpen()` check as `native_car_read`.
+    if !matches!(ctx.get_field(this, CAR_FIELD_BUF), Value::Object(Some(_))) {
+        return Err(ioe_stream_closed());
+    }
     let pos = match ctx.get_field(this, CAR_FIELD_POS) {
         Value::Int(v) => v,
         _ => 0,
@@ -16851,9 +17063,30 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    // Receive timeout has no effect on a non-blocking channel; accept the call.
-    r.register(dc, "setSoTimeout", "(I)V", |_ctx, _args| Ok(None));
-    // IP ToS/DSCP — accepted but not applied (cosmetic socket tuning).
+    // Was accepted and discarded on the grounds that a non-blocking channel
+    // ignores SO_TIMEOUT — but this method is reached through
+    // `channel.socket()`, i.e. by callers using the BLOCKING DatagramSocket
+    // surface, where the timeout is the only thing stopping `receive()` from
+    // blocking forever. Apply it to the channel's UDP fd like the sibling
+    // buffer/reuse setters above.
+    r.register(dc, "setSoTimeout", "(I)V", |ctx, args| {
+        let this = obj_arg92(args, 0)?;
+        let millis = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as u64;
+        // JDK contract: 0 means "no timeout" (block indefinitely).
+        let timeout = if millis == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(millis))
+        };
+        if let Some(fd) = dc_fd(ctx, this) {
+            let _ = ctx.fd_table().udp_set_read_timeout(fd, timeout);
+        }
+        Ok(None)
+    });
+    // KEEP: IP ToS/DSCP. `DatagramSocket.setTrafficClass` is explicitly
+    // documented as advisory — "the underlying platform may ignore the value"
+    // — and there is no `udp_set_tos` on the fd table to apply it with, so
+    // accepting it is spec-legal rather than a silent failure.
     r.register(dc, "setTrafficClass", "(I)V", |_ctx, _args| Ok(None));
 
     // bind(SocketAddress)V — the void `DatagramSocket.bind`. Delegates to the
@@ -17270,7 +17503,9 @@ fn register_selector(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if valid { 1 } else { 0 })))
     });
 
-    // OP constants
+    // OP constants — KEEP: `SelectionKey.OP_READ`/`OP_WRITE`/`OP_CONNECT`/
+    // `OP_ACCEPT` are `static final int` values fixed by the NIO spec
+    // (1/4/8/16). Returning them is the correct implementation, not a stub.
     r.register(sk, "OP_READ", "()I", |_, _| Ok(Some(Value::Int(OP_READ))));
     r.register(sk, "OP_WRITE", "()I", |_, _| Ok(Some(Value::Int(OP_WRITE))));
     r.register(sk, "OP_CONNECT", "()I", |_, _| {

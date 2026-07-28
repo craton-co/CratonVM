@@ -460,7 +460,12 @@ mod tests {
     #[test]
     fn t85_4_shim_generator_skips_existing() {
         let mut r = NativeMethodRegistry::new();
-        // Register one method manually
+        // Register one method manually. This constant no-op is a TEST FIXTURE
+        // standing in for "some already-registered handler" — the assertion
+        // below is that the shim generator does not replace it. It is not a
+        // production `Thread.stop` implementation (that is
+        // `deprecated_lang::native_thread_stop`, which really does deliver the
+        // throwable to the target thread).
         r.register("java/lang/Thread", "stop", "()V", |_ctx, _args| Ok(None));
         let count_before = r.len();
 

@@ -637,6 +637,47 @@ fn native_get_cds_metrics(ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(obj))))
 }
 
+// --- sun/management/CDSMetrics ---
+
+/// `sun/management/CDSMetrics.<init>()V`.
+///
+/// This is NOT one of the trivial constructors: the five accessor natives
+/// registered next to it read the synthetic slots directly
+/// (`getTotalClassesInArchive` → 0, `getClassesLoadedFromArchive` → 1,
+/// `getArchiveSizeBytes` → 2, `getArchiveLoadTimeMs` → 3, `getArchivePath`
+/// → 4). The previous no-op left every slot at its default, so an instance
+/// built with `new` reported `getArchivePath() == null` instead of the
+/// documented "no archive" value, while one obtained from
+/// `ManagementFactoryHelper.getCDSMetrics()` (which goes through
+/// `alloc_cds_metrics_obj`) reported `""`. Seed the same disabled-CDS state
+/// here so the two construction paths are indistinguishable.
+fn native_cds_metrics_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if ctx.object_num_fields(this) < 5 {
+        // Not the 5-slot synthetic layout the accessors above assume — leave a
+        // foreign-shaped receiver alone rather than scribbling on its slots.
+        return Ok(None);
+    }
+    let metrics = CdsMetrics::disabled();
+    // `create_string` allocates, which can relocate `this`: pin first, read the
+    // forwarded reference back afterwards (the discipline documented on
+    // `NativeHeapAccess::pin_native_root`).
+    let pin = ctx.pin_native_root(this);
+    let path_obj = ctx.create_string(&metrics.archive_path);
+    let this = ctx.read_native_pin(pin, this);
+    ctx.set_field(this, 0, Value::Int(metrics.total_classes_in_archive as i32));
+    ctx.set_field(
+        this,
+        1,
+        Value::Int(metrics.classes_loaded_from_archive as i32),
+    );
+    ctx.set_field(this, 2, Value::Long(metrics.archive_size_bytes as i64));
+    ctx.set_field(this, 3, Value::Long(metrics.archive_load_time_ms as i64));
+    ctx.set_field(this, 4, Value::Object(Some(path_obj)));
+    ctx.unpin_native_roots(pin);
+    Ok(None)
+}
+
 // --- java/lang/ClassLoader ---
 
 fn native_get_cds_archive_path(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -734,6 +775,11 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
     // -- sun/management/ManagementFactoryHelper --
     {
         let cls = "sun/management/ManagementFactoryHelper";
+        // Pure static-holder: in the JDK this class is `final` with a private
+        // constructor and only static factory/accessor members, and the single
+        // native we register on it (`getCDSMetrics`) is static too. There is no
+        // instance state for a no-arg constructor to establish, so an empty
+        // body is the real implementation, not a stub. KEEP.
         r.register(cls, "<init>", "()V", native_noop_with_this);
         r.register(
             cls,
@@ -746,7 +792,10 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
     // -- sun/management/CDSMetrics (accessor stubs) --
     {
         let cls = "sun/management/CDSMetrics";
-        r.register(cls, "<init>", "()V", native_noop_with_this);
+        // Real constructor — the accessors below read slots 0..4, so the
+        // instance must start in the disabled-CDS state. See
+        // `native_cds_metrics_init`.
+        r.register(cls, "<init>", "()V", native_cds_metrics_init);
         r.register(cls, "getTotalClassesInArchive", "()I", |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 0)))
@@ -788,6 +837,10 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
     // -- sun/misc/VM --
     {
         let cls = "sun/misc/VM";
+        // Pure static-holder: `sun.misc.VM` exposes only static members (the
+        // two natives registered below, `isBooted` and `savedProps`, are both
+        // static and read process-wide state, never instance slots). A no-arg
+        // constructor genuinely has nothing to do. KEEP.
         r.register(cls, "<init>", "()V", native_noop_with_this);
         r.register(cls, "isBooted", "()Z", native_vm_is_booted);
         r.register(
@@ -801,6 +854,9 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
     // -- jdk/internal/misc/CDS --
     {
         let cls = "jdk/internal/misc/CDS";
+        // Pure static-holder: every `jdk.internal.misc.CDS` member — and every
+        // native registered on it below — is static, and the class carries no
+        // instance fields for a constructor to initialize. KEEP.
         r.register(cls, "<init>", "()V", native_noop_with_this);
         r.register(
             cls,

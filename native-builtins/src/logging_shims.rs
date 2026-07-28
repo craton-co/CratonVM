@@ -416,6 +416,54 @@ pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: Obj
     }
 }
 
+/// GC-safe side table for `java.util.logging.Logger`'s parent link, keyed by
+/// `identity_hash_code` — same pattern, and the same reason, as
+/// `jul_logger_handlers_table`: real-JDK 25 keeps the parent inside
+/// `Logger$ConfigurationData` (reachable from slot 0 / `config`), while the
+/// flat synthetic loggers our `getLogger` natives mint hold their name there,
+/// so no raw slot index is safe for both shapes.
+fn jul_logger_parents_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn jul_logger_parent_get(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(logger);
+    let handle = *jul_logger_parents_table().lock().unwrap().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_logger_parent_set(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    parent: Option<ObjectRef>,
+) {
+    // Drop the previous parent root first: re-parenting must not leak the old
+    // logger as a permanent global root.
+    let key = ctx.identity_hash_code(logger);
+    if let Some(handle) = jul_logger_parents_table().lock().unwrap().remove(&key) {
+        ctx.remove_global_root(handle);
+    }
+    let Some(parent) = parent else {
+        return;
+    };
+    // Adding a global root may grow the root table and collect. The logger is
+    // keyed immediately afterward, so retain it across that allocation
+    // (mirrors `jul_logger_handlers_set`).
+    let logger_pin = ctx.pin_native_root(logger);
+    let handle = ctx.add_global_root(parent);
+    let logger = ctx.read_native_pin(logger_pin, logger);
+    let key = ctx.identity_hash_code(logger);
+    jul_logger_parents_table()
+        .lock()
+        .unwrap()
+        .insert(key, handle);
+    ctx.unpin_native_roots(logger_pin);
+}
+
 /// GC-safe side table for Logger filters. Real JDK loggers keep a Filter in
 /// `Logger$ConfigurationData`, while our compact loggers do not have that
 /// shape; sharing neither raw layout is safe.
@@ -1750,45 +1798,51 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // BasicMDCAdapter no-op surface — the adapter the binder above returns.
-    // Our MDC stubs implement put/get/... directly so these don't fire on
-    // user paths, but newer SLF4J façades sometimes route through the
-    // adapter; keeping these no-ops avoids surprise NSME later.
+    // BasicMDCAdapter — the adapter the binder above returns, and (in SLF4J
+    // 2.x) the object EVERY `org.slf4j.MDC` call is routed through.
+    //
+    // These were constant no-ops / constant nulls, justified as "our MDC stubs
+    // implement put/get directly so these don't fire on user paths". They do
+    // fire, and as constants they made the adapter contradict the façade
+    // sharing its own storage: a `put` was discarded and the matching `get`
+    // answered null for the key just written, so `%X{...}`/`%mdc` converters
+    // and correlation-id filters always saw an empty diagnostic context.
+    // Route them at the same thread-local map the `org/slf4j/MDC` natives use
+    // (`mdc_*` helpers), with an argument offset of 1 for the receiver. Note
+    // the adapter instance handed out above is `alloc_concurrent_synthetic`'d
+    // with zero fields, so real `BasicMDCAdapter` bytecode could not service
+    // these calls either — its `inheritableThreadLocal` is null.
+    let mdc_adapter = "org/slf4j/helpers/BasicMDCAdapter";
     registry.register(
-        "org/slf4j/helpers/BasicMDCAdapter",
+        mdc_adapter,
         "put",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| mdc_put_at(ctx, args, 1),
     );
     registry.register(
-        "org/slf4j/helpers/BasicMDCAdapter",
+        mdc_adapter,
         "get",
         "(Ljava/lang/String;)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| mdc_get_at(ctx, args, 1),
     );
     registry.register(
-        "org/slf4j/helpers/BasicMDCAdapter",
+        mdc_adapter,
         "remove",
         "(Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| mdc_remove_at(ctx, args, 1),
     );
+    registry.register(mdc_adapter, "clear", "()V", mdc_clear);
     registry.register(
-        "org/slf4j/helpers/BasicMDCAdapter",
-        "clear",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "org/slf4j/helpers/BasicMDCAdapter",
+        mdc_adapter,
         "getCopyOfContextMap",
         "()Ljava/util/Map;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        mdc_copy_of_context_map,
     );
     registry.register(
-        "org/slf4j/helpers/BasicMDCAdapter",
+        mdc_adapter,
         "setContextMap",
         "(Ljava/util/Map;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| mdc_set_context_map_at(ctx, args, 1),
     );
 
     // SB2-NPE: Spring Boot 2.x fat-jars hit
@@ -1858,14 +1912,30 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // live. Spring's commons-logging and SLF4J adapters guard their warning
     // paths with these checks; returning false here silently erased records
     // instead of delivering them to the Java console stream.
-    fn slf4j_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(Some(Value::Int(0)))
+    //
+    // TRACE/DEBUG answer from `slf4j_threshold` (INFO by default) instead of a
+    // hardcoded `false`, so the property that admits TRACE/DEBUG records also
+    // opens the guards callers check before building them — otherwise the
+    // emitters below would never be reached and the filter would be inert.
+    fn slf4j_trace_on(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(if slf4j_threshold(ctx) <= SLF4J_TRACE {
+            1
+        } else {
+            0
+        })))
+    }
+    fn slf4j_debug_on(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(if slf4j_threshold(ctx) <= SLF4J_DEBUG {
+            1
+        } else {
+            0
+        })))
     }
     fn slf4j_enabled(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(1)))
     }
-    registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_trace_on);
+    registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_debug_on);
     registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_enabled);
     registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_enabled);
     registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_enabled);
@@ -1879,13 +1949,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/Logger",
         "isTraceEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_trace_on,
     );
     registry.register(
         "org/slf4j/Logger",
         "isDebugEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_debug_on,
     );
     registry.register(
         "org/slf4j/Logger",
@@ -1942,9 +2012,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // observable console output. The full Logback pipeline is not available
     // on every supported classpath, but Spring's OutputCaptureExtension must
     // see INFO/WARN/ERROR records exactly as it sees direct System.out writes.
-    fn slf4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
+    //
+    // TRACE/DEBUG go through the same `slf4j_log_msg` formatter as the levels
+    // above them, behind `slf4j_threshold`: at the default INFO threshold the
+    // record is dropped by the filter (matching `isTraceEnabled`/
+    // `isDebugEnabled` above), and lowering the threshold actually delivers it.
+    // This registration runs after `register_slf4j_natives`' own trace/debug
+    // block (last-registration-wins), so it is the one that decides.
     let lg = "org/slf4j/Logger";
     for sig in [
         "(Ljava/lang/String;)V",
@@ -1953,8 +2027,8 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
     ] {
-        registry.register(lg, "trace", sig, slf4j_noop);
-        registry.register(lg, "debug", sig, slf4j_noop);
+        registry.register(lg, "trace", sig, slf4j_trace_msg);
+        registry.register(lg, "debug", sig, slf4j_debug_msg);
         registry.register(lg, "info", sig, slf4j_log_msg);
         registry.register(lg, "warn", sig, slf4j_log_msg);
         registry.register(lg, "error", sig, slf4j_log_msg);
@@ -1996,11 +2070,20 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // `getLogger` overrides here and every `ch/qos/logback/classic/Logger`
     // no-op below so real Logback bytecode drives logger creation,
     // appender attachment, and the whole `filterAndLog` → appender chain.
-    let lb_ctx = "ch/qos/logback/classic/LoggerContext";
-    registry.register(lb_ctx, "getName", "()Ljava/lang/String;", |ctx, _| {
-        Ok(Some(Value::Object(Some(ctx.create_string("default")))))
-    });
-    registry.register(lb_ctx, "setName", "(Ljava/lang/String;)V", |_, _| Ok(None));
+    // FIXED 2026-07-27 (wave-2 inline-constant stub removal): `getName()`
+    // (constant `"default"`) and `setName(String)` (no-op) were the last two
+    // survivors of the synthetic-`LoggerContext` era documented above. With
+    // `<init>`, `reset`, `start`, `stop` and `getLogger` all back on real
+    // bytecode, these two were a pure contradiction of the object they sat on:
+    // real `ContextBase.<init>` already names the context `"default"`, so the
+    // constant added nothing, while `setName` swallowed every rename —
+    // `<contextName>` in a logback.xml, Spring Boot's
+    // `LoggingSystemProperties`, and the `%contextName` pattern converter all
+    // silently kept reporting `"default"`, and `ContextBase`'s own
+    // "already given a name" `IllegalStateException` could never fire. Real
+    // `ContextBase.getName`/`setName` are a plain field read/write over state
+    // the real constructor now initialises. Guarded by
+    // `logback_context_construction_and_state_are_not_native_overridden`.
     // FIX (loggingapplicationlistenertests-logbacklogsystemtests-reset-noop):
     // `start`/`stop`/`reset`/`isStarted` were STILL natively stubbed here
     // from the same pre-fix era the `getLogger` comment above documents —
@@ -2121,27 +2204,27 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     });
 
     // Logging methods: trace, debug, info, warn, error
-    // trace(String) — instance method; SLF4J TRACE level is below the
-    // default threshold so trace() intentionally discards its arguments.
-    // NEW-6: documented with the _with_this form so the intent is clear.
-    registry.register(lg, "trace", "(Ljava/lang/String;)V", native_noop_with_this);
+    // trace(String) — same formatter as debug() below, gated on
+    // `slf4j_threshold` (TRACE sits below the default INFO threshold, so the
+    // filter drops the record instead of the native silently discarding it).
+    registry.register(lg, "trace", "(Ljava/lang/String;)V", slf4j_trace_msg);
     registry.register(
         lg,
         "trace",
         "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
     registry.register(
         lg,
         "trace",
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
     registry.register(
         lg,
         "trace",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
 
     // debug(String)
@@ -2287,140 +2370,36 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if level <= 4 { 1 } else { 0 })))
     });
 
-    // MDC (Mapped Diagnostic Context) — backed by thread-local HashMap
+    // MDC (Mapped Diagnostic Context) — backed by thread-local HashMap.
+    // The bodies live in the `mdc_*` helpers below so the
+    // `org.slf4j.helpers.BasicMDCAdapter` instance methods (registered in
+    // `register_slf4j_binder_stubs_pub`) can share the SAME thread-local map
+    // instead of being no-ops that silently disagree with this façade.
     let mdc = "org/slf4j/MDC";
     registry.register(
         mdc,
         "put",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        |ctx, args| {
-            let key = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => return Ok(None),
-            };
-            let value = match args.get(1) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => return Ok(None),
-            };
-            MDC_MAP.with(|m| m.borrow_mut().insert(key, value));
-            Ok(None)
-        },
+        |ctx, args| mdc_put_at(ctx, args, 0),
     );
     registry.register(
         mdc,
         "get",
         "(Ljava/lang/String;)Ljava/lang/String;",
-        |ctx, args| {
-            let key = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            let value = MDC_MAP.with(|m| m.borrow().get(&key).cloned());
-            match value {
-                Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
-                None => Ok(Some(Value::Object(None))),
-            }
-        },
+        |ctx, args| mdc_get_at(ctx, args, 0),
     );
     registry.register(mdc, "remove", "(Ljava/lang/String;)V", |ctx, args| {
-        let key = match args.first() {
-            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-            _ => return Ok(None),
-        };
-        MDC_MAP.with(|m| m.borrow_mut().remove(&key));
-        Ok(None)
+        mdc_remove_at(ctx, args, 0)
     });
-    registry.register(mdc, "clear", "()V", |_ctx, _args| {
-        MDC_MAP.with(|m| m.borrow_mut().clear());
-        Ok(None)
-    });
+    registry.register(mdc, "clear", "()V", mdc_clear);
     registry.register(
         mdc,
         "getCopyOfContextMap",
         "()Ljava/util/Map;",
-        |ctx, _args| {
-            // Snapshot the thread-local MDC map into a fresh HashMap.
-            let snapshot: Vec<(String, String)> = MDC_MAP.with(|m| {
-                m.borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            });
-            if snapshot.is_empty() {
-                return Ok(Some(Value::Object(None)));
-            }
-            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-            cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
-            for (k, v) in snapshot {
-                let key_obj = ctx.create_string(&k);
-                let val_obj = ctx.create_string(&v);
-                cratonvm_native_collections::native_map_put_pub(
-                    ctx,
-                    &[
-                        Value::Object(Some(map)),
-                        Value::Object(Some(key_obj)),
-                        Value::Object(Some(val_obj)),
-                    ],
-                )
-                .ok();
-            }
-            Ok(Some(Value::Object(Some(map))))
-        },
+        mdc_copy_of_context_map,
     );
     registry.register(mdc, "setContextMap", "(Ljava/util/Map;)V", |ctx, args| {
-        // Replace the thread-local MDC map with the entries from the provided Map.
-        // Step 1: clear current MDC.
-        MDC_MAP.with(|m| m.borrow_mut().clear());
-        // Step 2: if arg is non-null, iterate keys and copy entries.
-        let map = match args.first() {
-            Some(Value::Object(Some(m))) => *m,
-            _ => return Ok(None),
-        };
-        // Get key set
-        let key_set = match cratonvm_native_collections::native_map_key_set_pub(
-            ctx,
-            &[Value::Object(Some(map))],
-        ) {
-            Ok(Some(Value::Object(Some(s)))) => s,
-            _ => return Ok(None),
-        };
-        // Convert set to array via toArray (HashSet has 1-field backing array structure).
-        // Iterate the set's backing storage instead by getting size first.
-        let size_val =
-            cratonvm_native_collections::native_map_size_pub(ctx, &[Value::Object(Some(map))]);
-        let size = match size_val {
-            Ok(Some(Value::Int(n))) => n,
-            _ => 0,
-        };
-        if size == 0 {
-            return Ok(None);
-        }
-        // The key_set is a HashSet — convert to array by trying its toArray method.
-        let arr_result = ctx.invoke_virtual(key_set, "toArray", "()[Ljava/lang/Object;", &[]);
-        let arr = match arr_result {
-            Ok(Some(Value::Object(Some(a)))) => a,
-            _ => return Ok(None),
-        };
-        let arr_len = ctx.array_length(arr);
-        for i in 0..arr_len {
-            let key_val = ctx.get_array_element(arr, i);
-            let key_obj = match key_val {
-                Value::Object(Some(o)) => o,
-                _ => continue,
-            };
-            let key_str = ctx.read_string(key_obj).unwrap_or_default();
-            // Get value via map.get(key)
-            let val_result = cratonvm_native_collections::native_map_get_pub(
-                ctx,
-                &[Value::Object(Some(map)), Value::Object(Some(key_obj))],
-            );
-            let val_str = match val_result {
-                Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v).unwrap_or_default(),
-                _ => String::new(),
-            };
-            MDC_MAP.with(|m| m.borrow_mut().insert(key_str, val_str));
-        }
-        Ok(None)
+        mdc_set_context_map_at(ctx, args, 0)
     });
 
     // Marker — Spring Boot sometimes uses markers
@@ -2701,18 +2680,15 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     register_log4j_stacklocator_bridge(registry);
 
     let log4j_lg = "org/apache/logging/log4j/Logger";
-    // Log4j2 trace — instance method, below default threshold. NEW-6.
-    registry.register(
-        log4j_lg,
-        "trace",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
+    // Log4j2 trace — same formatter as the debug/info/warn/error
+    // registrations below, behind `slf4j_threshold` (INFO by default, so a
+    // TRACE record is dropped by the filter rather than by the native).
+    registry.register(log4j_lg, "trace", "(Ljava/lang/String;)V", slf4j_trace_msg);
     registry.register(
         log4j_lg,
         "trace",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
     registry.register(log4j_lg, "debug", "(Ljava/lang/String;)V", slf4j_log_msg);
     registry.register(
@@ -2753,9 +2729,24 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    registry.register(log4j_lg, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
+    // Same threshold source as the `trace` registration above, so the guard
+    // callers check and the emitter they guard cannot disagree.
+    registry.register(log4j_lg, "isTraceEnabled", "()Z", |ctx, _| {
+        Ok(Some(Value::Int(if slf4j_threshold(ctx) <= SLF4J_TRACE {
+            1
+        } else {
+            0
+        })))
     });
+    // Constant `true` here is the CORRECT guard for these emitters, not a
+    // convenience: `debug`/`info`/`warn`/`error` above are all bound to
+    // `slf4j_log_msg`, which applies no threshold and always publishes. A
+    // threshold-derived `false` would tell callers a record would be dropped
+    // that the very next line then prints — precisely the guard/emitter
+    // disagreement this pass exists to remove. (The Log4j `debug` binding is
+    // therefore ungated where the SLF4J `debug` binding is gated; that
+    // asymmetry is deliberate-by-omission and is reported as an open item, but
+    // it must be changed on BOTH sides at once or not at all.)
     registry.register(log4j_lg, "isDebugEnabled", "()Z", |_, _| {
         Ok(Some(Value::Int(1)))
     });
@@ -2784,6 +2775,152 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     // above `register_slf4j_binder_stubs_pub`'s (removed) `getLogger`
     // overrides. Real Logback bytecode now owns `LoggerContext.getLogger`
     // and every `ch/qos/logback/classic/Logger` instance method.
+}
+
+// ---------------------------------------------------------------------------
+// SLF4J MDC — one implementation, two surfaces
+// ---------------------------------------------------------------------------
+//
+// `org.slf4j.MDC` (static façade) and `org.slf4j.helpers.BasicMDCAdapter`
+// (instance) are the two entry points SLF4J callers reach, and SLF4J 2.x routes
+// EVERY façade call through the adapter. The adapter's methods used to be
+// registered as constant no-ops / constant nulls "because our MDC stubs
+// implement put/get directly" — but that made the pair contradict itself: a
+// `put` through the adapter was discarded and the matching `get` answered null
+// for a key that had just been written, so `%X{...}` / `%mdc` pattern
+// converters and every correlation-id filter saw an empty context.
+//
+// The adapter instance the binder hands out is allocated by
+// `alloc_concurrent_synthetic` with zero fields (no `<init>` runs), so its real
+// `inheritableThreadLocal` field is null and real `BasicMDCAdapter` bytecode
+// cannot service these calls either — the natives must stay, and they must be
+// real. `off` is the index of the first REAL argument: 0 for the static façade,
+// 1 for the adapter, whose `args[0]` is the receiver.
+
+fn mdc_put_at(ctx: &mut dyn NativeContext, args: &[Value], off: usize) -> MethodCallResult {
+    let key = match args.get(off) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    let value = match args.get(off + 1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    MDC_MAP.with(|m| m.borrow_mut().insert(key, value));
+    Ok(None)
+}
+
+fn mdc_get_at(ctx: &mut dyn NativeContext, args: &[Value], off: usize) -> MethodCallResult {
+    let key = match args.get(off) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let value = MDC_MAP.with(|m| m.borrow().get(&key).cloned());
+    match value {
+        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn mdc_remove_at(ctx: &mut dyn NativeContext, args: &[Value], off: usize) -> MethodCallResult {
+    let key = match args.get(off) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(None),
+    };
+    MDC_MAP.with(|m| m.borrow_mut().remove(&key));
+    Ok(None)
+}
+
+fn mdc_clear(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    MDC_MAP.with(|m| m.borrow_mut().clear());
+    Ok(None)
+}
+
+fn mdc_copy_of_context_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Snapshot the thread-local MDC map into a fresh HashMap.
+    let snapshot: Vec<(String, String)> = MDC_MAP.with(|m| {
+        m.borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    });
+    if snapshot.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    for (k, v) in snapshot {
+        let key_obj = ctx.create_string(&k);
+        let val_obj = ctx.create_string(&v);
+        cratonvm_native_collections::native_map_put_pub(
+            ctx,
+            &[
+                Value::Object(Some(map)),
+                Value::Object(Some(key_obj)),
+                Value::Object(Some(val_obj)),
+            ],
+        )
+        .ok();
+    }
+    Ok(Some(Value::Object(Some(map))))
+}
+
+fn mdc_set_context_map_at(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    off: usize,
+) -> MethodCallResult {
+    // Replace the thread-local MDC map with the entries from the provided Map.
+    // Step 1: clear current MDC.
+    MDC_MAP.with(|m| m.borrow_mut().clear());
+    // Step 2: if arg is non-null, iterate keys and copy entries.
+    let map = match args.get(off) {
+        Some(Value::Object(Some(m))) => *m,
+        _ => return Ok(None),
+    };
+    // Get key set
+    let key_set =
+        match cratonvm_native_collections::native_map_key_set_pub(ctx, &[Value::Object(Some(map))])
+        {
+            Ok(Some(Value::Object(Some(s)))) => s,
+            _ => return Ok(None),
+        };
+    // Convert set to array via toArray (HashSet has 1-field backing array structure).
+    // Iterate the set's backing storage instead by getting size first.
+    let size_val = cratonvm_native_collections::native_map_size_pub(ctx, &[Value::Object(Some(map))]);
+    let size = match size_val {
+        Ok(Some(Value::Int(n))) => n,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(None);
+    }
+    // The key_set is a HashSet — convert to array by trying its toArray method.
+    let arr_result = ctx.invoke_virtual(key_set, "toArray", "()[Ljava/lang/Object;", &[]);
+    let arr = match arr_result {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return Ok(None),
+    };
+    let arr_len = ctx.array_length(arr);
+    for i in 0..arr_len {
+        let key_val = ctx.get_array_element(arr, i);
+        let key_obj = match key_val {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let key_str = ctx.read_string(key_obj).unwrap_or_default();
+        // Get value via map.get(key)
+        let val_result = cratonvm_native_collections::native_map_get_pub(
+            ctx,
+            &[Value::Object(Some(map)), Value::Object(Some(key_obj))],
+        );
+        let val_str = match val_result {
+            Ok(Some(Value::Object(Some(v)))) => ctx.read_string(v).unwrap_or_default(),
+            _ => String::new(),
+        };
+        MDC_MAP.with(|m| m.borrow_mut().insert(key_str, val_str));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2830,6 +2967,21 @@ mod logback_construction_registration_tests {
             ("ch/qos/logback/classic/LoggerContext", "stop", "()V"),
             ("ch/qos/logback/classic/LoggerContext", "start", "()V"),
             ("ch/qos/logback/classic/LoggerContext", "isStarted", "()Z"),
+            // FIXED 2026-07-27 (wave-2 inline-constant stub removal):
+            // `getName()` returned a constant `"default"` and `setName` was a
+            // no-op, so `<contextName>`, Spring Boot's
+            // `LoggingSystemProperties` and `%contextName` could never observe
+            // a renamed context. Real `ContextBase` owns both.
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "getName",
+                "()Ljava/lang/String;",
+            ),
+            (
+                "ch/qos/logback/classic/LoggerContext",
+                "setName",
+                "(Ljava/lang/String;)V",
+            ),
             // FIXED 2026-07-17 (conditionevaluationreport-capturedoutput-empty-cluster):
             // LoggerContext.getLogger used to fabricate a throwaway synthetic
             // Logger, and every Logger/Log instance method below was a
@@ -2891,6 +3043,68 @@ mod logback_construction_registration_tests {
             );
         }
     }
+}
+
+/// SLF4J level codes, as stored in the shim `Logger`'s `SLF4J_LEVEL` slot and
+/// as compared by the `is*Enabled` natives: 0=TRACE … 4=ERROR, 5=OFF.
+const SLF4J_TRACE: i32 = 0;
+const SLF4J_DEBUG: i32 = 1;
+const SLF4J_INFO: i32 = 2;
+const SLF4J_WARN: i32 = 3;
+const SLF4J_ERROR: i32 = 4;
+const SLF4J_OFF: i32 = 5;
+
+/// Process-wide threshold below which the SLF4J/Log4j shims drop a record.
+///
+/// The shims advertise INFO by default — that is exactly what their
+/// `is*Enabled` natives answer — and slf4j-simple's own
+/// `org.slf4j.simpleLogger.defaultLogLevel` property moves it. Consulting the
+/// property here is what makes TRACE/DEBUG suppression a *filter* decision
+/// rather than a hardcoded discard in the `trace`/`debug` natives: with
+/// `-Dorg.slf4j.simpleLogger.defaultLogLevel=trace` a TRACE record now reaches
+/// the same formatter and console sink every other level uses.
+///
+/// The per-logger level slot is deliberately NOT consulted: an
+/// allocated-but-never-stamped slot decodes as `Value::Int(0)` (an all-zero
+/// `Value` cell is `Int(0)`, i.e. indistinguishable from an explicit TRACE),
+/// and a receiver that reached these interface natives from a real Logback
+/// logger carries an unrelated field there. The `is*Enabled` natives that own
+/// the per-logger slot keep reading it as before.
+fn slf4j_threshold(ctx: &mut dyn NativeContext) -> i32 {
+    match ctx.get_system_property("org.slf4j.simpleLogger.defaultLogLevel") {
+        Some(level) => match level.trim().to_ascii_lowercase().as_str() {
+            "trace" | "all" | "finest" => SLF4J_TRACE,
+            "debug" | "fine" => SLF4J_DEBUG,
+            "warn" | "warning" => SLF4J_WARN,
+            "error" | "severe" | "fatal" => SLF4J_ERROR,
+            "off" | "none" => SLF4J_OFF,
+            // "info" and anything unparseable: slf4j-simple's own default.
+            _ => SLF4J_INFO,
+        },
+        None => SLF4J_INFO,
+    }
+}
+
+/// `trace(...)` for the SLF4J and Log4j2 shim loggers: the same formatter the
+/// neighbouring `debug(...)` registrations use (`{}` parameter substitution
+/// included), one level lower, delivered only when the threshold filter admits
+/// TRACE.
+fn slf4j_trace_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if slf4j_threshold(ctx) > SLF4J_TRACE {
+        return Ok(None);
+    }
+    slf4j_log_msg(ctx, args)
+}
+
+/// `debug(...)` routed through the same threshold filter as `slf4j_trace_msg`.
+/// Below the default INFO threshold, so this stays quiet unless the property
+/// lowers it — but the record is now dropped by the filter, not by a native
+/// that silently discards its arguments.
+fn slf4j_debug_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if slf4j_threshold(ctx) > SLF4J_DEBUG {
+        return Ok(None);
+    }
+    slf4j_log_msg(ctx, args)
 }
 
 fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

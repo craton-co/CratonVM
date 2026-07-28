@@ -1276,7 +1276,30 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     })?;
     let table_filter_class = ctx.class_id_by_name("org/h2/table/TableFilter");
-    if table_filter_class.is_some_and(|class_id| ctx.class_id_of_object(resolver) == class_id) {
+    if !table_filter_class.is_some_and(|class_id| ctx.class_id_of_object(resolver) == class_id) {
+        // Resolver shapes other than `TableFilter` are not what this fast path
+        // exists for, and some of them (`SelectListColumnResolver`) DO carry
+        // the group/window state the prologue below is about. Run H2's own
+        // method for them rather than a partial re-implementation.
+        return h2_expression_column_get_value_bytecode(ctx, args);
+    }
+    // GROUPED / WINDOWED queries: H2's real `getValue` consults
+    // `select.getGroupDataIfCurrent(false).getCurrentGroupExprData(this)`
+    // BEFORE it ever asks the resolver, because for those queries the
+    // resolver's live row is NOT the row being emitted -- `Select.gatherGroup`
+    // has already scanned the source to completion, so `TableFilter.current`
+    // is pinned at the LAST scanned row while `processGroupResult` replays the
+    // buffered per-row values. Reading the resolver directly therefore gave
+    // every output row of a windowed query the last source row's value (the
+    // `bulkid` `INSERT ... SELECT ... row_number() over()` corruption), and a
+    // one-group shift for `GROUP BY`. `groupData` is non-null only while such
+    // a query is executing, so the ordinary non-grouped path is unaffected.
+    if let Some(select) = h2_object_field(ctx, resolver, "select") {
+        if h2_object_field(ctx, select, "groupData").is_some() {
+            return h2_expression_column_get_value_bytecode(ctx, args);
+        }
+    }
+    {
         let column_id = h2_int_field(ctx, column, "columnId");
         // `current` (TableFilter.next()'s lazily-fetched FULL row, populated
         // by the real getValue(Column) bytecode below on first need -- see
@@ -1354,6 +1377,22 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
         "getValue",
         "(Lorg/h2/table/Column;)Lorg/h2/value/Value;",
         &[Value::Object(Some(column))],
+    )
+}
+
+/// Run H2's own `ExpressionColumn.getValue` bytecode.
+///
+/// `invoke_special_bytecode_only` (not `invoke_virtual_bytecode_only`) so the
+/// call cannot re-enter the native override that is delegating to it.
+fn h2_expression_column_get_value_bytecode(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_special_bytecode_only(
+        "org/h2/expression/ExpressionColumn",
+        "getValue",
+        "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+        args,
     )
 }
 

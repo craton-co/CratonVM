@@ -6594,6 +6594,12 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // KEEP (genuinely empty): BouncyCastle's own `AESEngine()` no-arg
+    // constructor has an empty body — the key schedule is built lazily by
+    // `init`/`generateWorkingKey` (registered below), not at construction. The
+    // native exists only so `newInstance()`'s `alloc_object` + the real
+    // `MultiBlockCipher` call path do not have to run interpreted bytecode for
+    // a method that does nothing; it shadows nothing of substance.
     r.register(aes, "<init>", "()V", |_ctx, _args| Ok(None));
     r.register(
         aes,
@@ -6701,6 +6707,15 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         "org/bouncycastle/crypto/engines/AESLightEngine",
         "org/bouncycastle/crypto/engines/AESFastEngine",
     ] {
+        // Verified trivial constructor. BouncyCastle's block ciphers carry all
+        // their state in fields that `init(boolean, CipherParameters)` writes —
+        // here `bc_aes_native_init` (registered a few lines below for this same
+        // class) sets `ROUNDS`, `WorkingKey`, `forEncryption` and `s`. The
+        // no-arg constructor itself declares no field initializers and only
+        // chains to `Object.<init>`, and `bc_aes_native_process_block` refuses
+        // to run on an object whose `WorkingKey` is still unset
+        // ("AES engine not initialised"), so the real initialiser is provably
+        // on the use path and an empty constructor body loses nothing. KEEP.
         r.register(aes_impl, "<init>", "()V", native_noop);
         r.register(aes_impl, "encryptBlock", desc, bc_aes_native_encrypt_block);
         r.register(aes_impl, "decryptBlock", desc, bc_aes_native_decrypt_block);

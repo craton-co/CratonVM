@@ -2188,6 +2188,13 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         registry: &mut NativeMethodRegistry,
         class_name: &'static str,
     ) {
+        // KEEP (constants, justified): `getAnnotation`/`getDeclaredAnnotation`
+        // return null when the requested annotation is ABSENT — that is the
+        // spec'd answer, not a stub. CratonVM's synthetic TypeVariable /
+        // AnnotatedType carriers hold no annotation data at all, so "absent" is
+        // true for every query, and the sibling `getAnnotations` /
+        // `getDeclaredAnnotations` below return a matching EMPTY array (never
+        // null), so the pair is self-consistent for a caller that checks both.
         registry.register(
             class_name,
             "getAnnotation",

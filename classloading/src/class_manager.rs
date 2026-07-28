@@ -166,7 +166,10 @@ fn loaded_class_for_requesting_loader(
 /// metadata paths. It must never be used where an initiating class/loader is
 /// available: ambiguity is information loss, not permission to choose the
 /// first map entry.
-#[inline]
+/// Kept as the executable specification of what `ClassManager::
+/// name_definitions` must answer: `unique_definition_index_matches_linear_scan`
+/// asserts the O(1) index agrees with this scan. Production reads the index.
+#[cfg(test)]
 fn unique_loaded_class(map: &LoadedClassesMap, name: &str) -> Option<ClassId> {
     let mut found = None;
     for ((_, stored_name), &id) in map {
@@ -181,9 +184,132 @@ fn unique_loaded_class(map: &LoadedClassesMap, name: &str) -> Option<ClassId> {
     found
 }
 
+/// Drop one reference to `(name -> id)` from the name index, retiring the id
+/// (and then the name) once nothing points at it any more.
+fn release_name_definition(
+    index: &mut FxHashMap<Arc<str>, FxHashMap<ClassId, u32>>,
+    name: &str,
+    id: ClassId,
+) {
+    let Some(ids) = index.get_mut(name) else {
+        return;
+    };
+    if let Some(count) = ids.get_mut(&id) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            ids.remove(&id);
+        }
+    }
+    if ids.is_empty() {
+        index.remove(name);
+    }
+}
+
 #[cfg(test)]
 mod loader_lookup_tests {
     use super::*;
+
+    /// The O(1) `name_definitions` index must answer exactly what the linear
+    /// `unique_loaded_class` scan it replaced answers -- including after
+    /// redefinition (same key, new id) and multi-loader aliasing (two keys,
+    /// same id, which still reads as unique).
+    #[test]
+    fn unique_definition_index_matches_linear_scan() {
+        // Mirrors ClassManager::{loaded_classes_insert, loaded_classes_remove}
+        // and rebuild_name_definitions against a bare map.
+        #[derive(Default)]
+        struct Harness {
+            map: LoadedClassesMap,
+            index: FxHashMap<Arc<str>, FxHashMap<ClassId, u32>>,
+        }
+        impl Harness {
+            fn insert(&mut self, loader: ClassLoaderId, name: &str, id: u32) {
+                let name: Arc<str> = Arc::from(name);
+                let id = ClassId::new(id);
+                if let Some(old) = self.map.insert((loader, Arc::clone(&name)), id) {
+                    release_name_definition(&mut self.index, &name, old);
+                }
+                *self
+                    .index
+                    .entry(name)
+                    .or_default()
+                    .entry(id)
+                    .or_insert(0) += 1;
+            }
+            fn remove(&mut self, loader: ClassLoaderId, name: &str) {
+                let name: Arc<str> = Arc::from(name);
+                if let Some(old) = self.map.remove(&(loader, Arc::clone(&name))) {
+                    release_name_definition(&mut self.index, &name, old);
+                }
+            }
+            fn unique_via_index(&self, name: &str) -> Option<ClassId> {
+                let ids = self.index.get(name)?;
+                let mut distinct = ids.keys();
+                let id = *distinct.next()?;
+                distinct.next().is_none().then_some(id)
+            }
+            fn rebuilt(&self) -> FxHashMap<Arc<str>, FxHashMap<ClassId, u32>> {
+                let mut index: FxHashMap<Arc<str>, FxHashMap<ClassId, u32>> = FxHashMap::default();
+                for ((_, name), &id) in self.map.iter() {
+                    *index
+                        .entry(Arc::clone(name))
+                        .or_default()
+                        .entry(id)
+                        .or_insert(0) += 1;
+                }
+                index
+            }
+            fn check(&self, names: &[&str]) {
+                for name in names {
+                    assert_eq!(
+                        self.unique_via_index(name),
+                        unique_loaded_class(&self.map, name),
+                        "index disagrees with the linear scan for {name}"
+                    );
+                }
+                assert_eq!(self.index, self.rebuilt(), "incremental index drifted");
+            }
+        }
+
+        let names = ["p/X", "p/Y", "p/Z", "p/Absent"];
+        let mut h = Harness::default();
+        h.check(&names);
+
+        // One definition -> unique.
+        h.insert(ClassLoaderId::Bootstrap, "p/X", 1);
+        h.check(&names);
+
+        // Two loaders, SAME id (delegation alias) -> still unique.
+        h.insert(ClassLoaderId::Application, "p/X", 1);
+        h.check(&names);
+
+        // Two loaders, DIFFERENT ids -> ambiguous, must answer None.
+        h.insert(ClassLoaderId::UserDefined(7), "p/X", 2);
+        assert_eq!(h.unique_via_index("p/X"), None);
+        h.check(&names);
+
+        // Dropping the odd one out restores uniqueness.
+        h.remove(ClassLoaderId::UserDefined(7), "p/X");
+        assert_eq!(h.unique_via_index("p/X"), Some(ClassId::new(1)));
+        h.check(&names);
+
+        // Redefinition: same key, new id. The displaced id must not linger.
+        h.insert(ClassLoaderId::Bootstrap, "p/X", 3);
+        h.insert(ClassLoaderId::Application, "p/X", 3);
+        assert_eq!(h.unique_via_index("p/X"), Some(ClassId::new(3)));
+        h.check(&names);
+
+        // Independent name, then full removal -> name retired from the index.
+        h.insert(ClassLoaderId::Bootstrap, "p/Y", 4);
+        h.check(&names);
+        h.remove(ClassLoaderId::Bootstrap, "p/Y");
+        assert!(!h.index.contains_key("p/Y"));
+        h.check(&names);
+
+        // Removing a key that was never inserted is a no-op.
+        h.remove(ClassLoaderId::Extension, "p/Z");
+        h.check(&names);
+    }
 
     fn definitions(entries: &[(ClassLoaderId, &str, u32)]) -> LoadedClassesMap {
         entries
@@ -1631,6 +1757,32 @@ pub struct ClassManager {
     /// (typically ≤10 in real apps; Spring Boot devtools peaks ~3).
     user_loaders: FxHashSet<ClassLoaderId>,
 
+    /// Secondary index over [`Self::loaded_classes`]: class NAME -> the
+    /// distinct `ClassId`s defined under that name by ANY loader, each with
+    /// the number of `(loader, name)` map entries that point at it.
+    ///
+    /// Exists solely so [`Self::find_unique_class_by_name`] can answer
+    /// "exactly one class carries this name" in O(1). It used to run
+    /// `unique_loaded_class`, a full linear scan of `loaded_classes` with a
+    /// string compare per entry, for every call. On any class-heavy workload
+    /// that dominated the entire VM: a `perf` profile of a Jython module parse
+    /// (the SSE variants of Spring's
+    /// `FragmentViewResolutionResultHandlerTests`) put
+    /// `find_unique_class_by_name` at **55% of all CPU samples**, with the
+    /// `memcmp` it drives another 3.8% -- the parse took 154 s where HotSpot
+    /// needed 0.28 s. The JIT's own callers memoize their answers, but
+    /// `try_compile_direct_dispatcher` deliberately does NOT cache a miss (a
+    /// not-yet-loaded class can load later), so every unresolvable name paid a
+    /// fresh whole-map scan.
+    ///
+    /// Maintained incrementally by `loaded_classes_insert` /
+    /// `loaded_classes_remove`, which are the ONLY writers of
+    /// `loaded_classes`, and rebuilt wholesale by the (rare) loader-unload
+    /// `retain`. The refcount is what makes redefinition and multi-loader
+    /// aliasing exact: two loaders may legitimately map the same name to the
+    /// same `ClassId`, and that must still read as unique.
+    name_definitions: FxHashMap<Arc<str>, FxHashMap<ClassId, u32>>,
+
     /// Round 5 audit fix (HIGH): per-class initialization state for the
     /// AtomicU8 fast path. Values: 0 = UNINITIALIZED (or any pre-init state),
     /// 1 = IN_PROGRESS, 2 = INITIALIZED. The VM calls
@@ -1997,6 +2149,7 @@ impl ClassManager {
             extension,
             application,
             loaded_classes: hashbrown::HashMap::with_capacity_and_hasher(256, Default::default()),
+            name_definitions: FxHashMap::default(),
             module_registry,
             class_bytes_cache: FxHashMap::with_capacity_and_hasher(128, Default::default()),
             class_bytes_cache_fifo: std::collections::VecDeque::with_capacity(128),
@@ -4317,7 +4470,7 @@ impl ClassManager {
         // define hits it once.
         let key = (loader_id, Arc::clone(&class.name));
         if options.allow_redefine {
-            if let Some(old_id) = self.loaded_classes.remove(&key) {
+            if let Some(old_id) = self.loaded_classes_remove(&key) {
                 debug!(
                     class = %class.name,
                     old_id = %old_id,
@@ -4326,7 +4479,7 @@ impl ClassManager {
                 );
             }
         }
-        self.loaded_classes.insert(key, id);
+        self.loaded_classes_insert(key, id);
         // Round 5 audit fix (HIGH): mirror user-defined loader ids into
         // the `user_loaders` set so `find_class_by_name` can probe them
         // without re-walking every entry in `loaded_classes` per call.
@@ -4759,6 +4912,9 @@ impl ClassManager {
         // Remove both defining and initiating-name aliases that point into the
         // dead loader's class set.
         self.loaded_classes.retain(|_, id| !ids.contains(id));
+        // Removal here is by ClassId set, not by key, so there is no
+        // per-entry hook to decrement the name index through.
+        self.rebuild_name_definitions();
         self.user_loaders.remove(&loader_id);
 
         self.vtable_descriptors.retain(|id, _| !ids.contains(id));
@@ -6224,20 +6380,89 @@ impl ClassManager {
     /// genuinely carry no initiating loader; runtime resolution should use
     /// [`Self::find_class_by_name_for_class`] instead.
     pub fn find_unique_class_by_name(&self, name: &str) -> Option<ClassId> {
-        let slash = if name.contains('.') && !name.contains('/') {
-            name.replace('.', "/")
-        } else {
+        // An already-internal name with no separator to translate is the
+        // overwhelmingly common case and both probe keys collapse onto it, so
+        // take it without allocating either `String`.
+        if !name.contains('.') && !name.contains('/') {
+            return self.unique_visible_definition(name);
+        }
+        let slash = if name.contains('/') {
             name.to_string()
+        } else {
+            name.replace('.', "/")
         };
         let dot = slash.replace('/', ".");
         for key in [&slash, &dot] {
-            if let Some(id) = unique_loaded_class(&self.loaded_classes, key) {
-                if self.get_class(id).is_some_and(|class| !class.hidden) {
-                    return Some(id);
-                }
+            if let Some(id) = self.unique_visible_definition(key) {
+                return Some(id);
             }
         }
         None
+    }
+
+    /// The one `ClassId` defined under `name`, or `None` when zero or more
+    /// than one distinct class carries it (ambiguity is information loss, not
+    /// permission to pick the first entry) or when the single match is hidden.
+    ///
+    /// O(1) against [`Self::name_definitions`]; see that field for why the
+    /// linear scan this replaced mattered so much.
+    fn unique_visible_definition(&self, name: &str) -> Option<ClassId> {
+        let ids = self.name_definitions.get(name)?;
+        let mut distinct = ids.keys();
+        let id = *distinct.next()?;
+        if distinct.next().is_some() {
+            return None;
+        }
+        self.get_class(id)
+            .is_some_and(|class| !class.hidden)
+            .then_some(id)
+    }
+
+    /// Sole writer of `loaded_classes` inserts -- keeps `name_definitions` in
+    /// step. Returns the displaced `ClassId`, exactly like `HashMap::insert`.
+    fn loaded_classes_insert(
+        &mut self,
+        key: (ClassLoaderId, Arc<str>),
+        id: ClassId,
+    ) -> Option<ClassId> {
+        let name = Arc::clone(&key.1);
+        let displaced = self.loaded_classes.insert(key, id);
+        if let Some(old) = displaced {
+            release_name_definition(&mut self.name_definitions, &name, old);
+        }
+        *self
+            .name_definitions
+            .entry(name)
+            .or_default()
+            .entry(id)
+            .or_insert(0) += 1;
+        displaced
+    }
+
+    /// Sole writer of `loaded_classes` removals -- keeps `name_definitions` in
+    /// step.
+    fn loaded_classes_remove(&mut self, key: &(ClassLoaderId, Arc<str>)) -> Option<ClassId> {
+        let removed = self.loaded_classes.remove(key);
+        if let Some(old) = removed {
+            release_name_definition(&mut self.name_definitions, &key.1, old);
+        }
+        removed
+    }
+
+    /// Recompute `name_definitions` from scratch. Only the loader-unload path
+    /// needs this (it removes by `ClassId` set rather than by key, so there is
+    /// no per-entry hook to decrement through); that path runs at most once
+    /// per discarded class loader.
+    fn rebuild_name_definitions(&mut self) {
+        let mut index: FxHashMap<Arc<str>, FxHashMap<ClassId, u32>> = FxHashMap::default();
+        for ((_, name), &id) in self.loaded_classes.iter() {
+            *index
+                .entry(Arc::clone(name))
+                .or_default()
+                .entry(id)
+                .or_insert(0) += 1;
+        }
+        self.name_definitions = index;
     }
 
     /// Find a class by name within a specific loader's namespace, with delegation
@@ -6357,7 +6582,7 @@ impl ClassManager {
         // collision-unsafe `name_to_id` shadow map; that map is gone now
         // and `loaded_classes` is the only index.
         let name_arc = cratonvm_types::intern_arc(name);
-        self.loaded_classes.insert((loader_id, name_arc), id);
+        self.loaded_classes_insert((loader_id, name_arc), id);
         // Round 5 audit fix (HIGH): keep `user_loaders` in sync — see
         // `define_class_with_options` for the rationale (avoid the
         // O(entries) walk in `find_class_by_name`).
@@ -6552,7 +6777,7 @@ impl ClassManager {
             class.name,
         );
         let key = (ClassLoaderId::Bootstrap, Arc::clone(&class.name));
-        self.loaded_classes.insert(key, id);
+        self.loaded_classes_insert(key, id);
         self.class_store.add(class);
 
         // Deferred interface resolution: now that this class is registered,
@@ -6774,7 +6999,7 @@ impl ClassManager {
             class.name,
         );
         let key = (ClassLoaderId::Bootstrap, Arc::clone(&class.name));
-        self.loaded_classes.insert(key, id);
+        self.loaded_classes_insert(key, id);
         self.class_store.add(class);
 
         Ok(id)

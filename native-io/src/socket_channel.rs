@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 fn ipc_dbg_enabled() -> bool {
@@ -67,7 +67,19 @@ fn ipc_dbg(msg: impl AsRef<str>) {
 /// A live socket. We separate stream and listener variants because
 /// non-blocking semantics differ (accept vs read/write).
 pub enum TcpHandle {
-    Stream(TcpStream),
+    /// A live connection. Held behind an `Arc` so the read/write natives can
+    /// clone the handle out of the map and **release the registry lock before
+    /// the syscall**. A blocking-mode channel parks inside `read()`/`write()`
+    /// for an unbounded time; holding the read lock across that stalls every
+    /// later `tcp_register`/`tcp_remove` process-wide, because `parking_lot`'s
+    /// `RwLock` parks new readers behind a waiting writer. A client and a
+    /// server living in one VM then deadlock outright — Tomcat's
+    /// `TestXxxEndpoint.testUnixDomainSocket` does exactly that: the test
+    /// thread blocks in `SocketChannel.read` waiting for the response while
+    /// the endpoint's acceptor thread is registering the socket it accepted.
+    /// (`net.rs`'s `NetSocketHandle::Stream` is `Arc<TcpStream>` for the same
+    /// reason.)
+    Stream(Arc<TcpStream>),
     /// A client socket after `SocketChannel.bind()` but before `connect()`.
     /// Retaining the actual OS descriptor is essential: the later connect
     /// must keep Hazelcast's requested outbound port instead of silently
@@ -88,6 +100,14 @@ pub enum TcpHandle {
     /// selector drives `finishConnect()` so Java observes an asynchronous
     /// connect failure rather than a synchronous `connect()` throw.
     ConnectFailed(TcpStream, std::io::Error),
+    /// A bound + listening AF_UNIX socket — `ServerSocketChannel.open(UNIX)`
+    /// followed by `bind(UnixDomainSocketAddress)`, i.e. Tomcat's
+    /// `unixDomainSocketPath` connector. It needs its own variant because
+    /// `accept()` has to decode a `sockaddr_un`, which `std`'s `TcpListener`
+    /// cannot do. The *accepted* connections are ordinary `Stream` entries —
+    /// see `uds.rs` for why an AF_UNIX connection can be carried by a
+    /// `TcpStream`.
+    UnixListener(crate::uds::UdsListener),
     /// Closed but kept in the map so callers see -1 / -1 idempotently.
     Closed,
 }
@@ -113,6 +133,14 @@ pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
         Some(TcpHandle::Connecting(s)) | Some(TcpHandle::ConnectFailed(s, _)) => {
             s.try_clone().ok().map(TcpHandleClone::Stream)
         }
+        // AF_UNIX listener: hand the selector the raw OS handle rather than a
+        // duplicate. It is only ever *polled*, never owned, and `sc_close`
+        // calls `deregister_fd_everywhere(id)` BEFORE dropping the registry
+        // entry that closes the socket — so the selector can never be left
+        // polling a handle the OS has recycled.
+        Some(TcpHandle::UnixListener(l)) => {
+            Some(TcpHandleClone::UnixListenerRaw(l.raw() as i64))
+        }
         _ => None,
     }
 }
@@ -120,6 +148,8 @@ pub(crate) fn tcp_clone_for_selector(id: i32) -> Option<TcpHandleClone> {
 pub(crate) enum TcpHandleClone {
     Listener(TcpListener),
     Stream(TcpStream),
+    /// Non-owning raw OS handle of an AF_UNIX listener (see above).
+    UnixListenerRaw(i64),
 }
 
 /// Verdict from probing a registry-resident connecting socket for non-blocking
@@ -216,7 +246,7 @@ fn tcp_take_bound(id: i32) -> Option<TcpStream> {
 
 fn tcp_replace_connect_state(id: i32, stream: TcpStream, connected: bool, blocking: bool) {
     let handle = if connected {
-        TcpHandle::Stream(stream)
+        TcpHandle::Stream(Arc::new(stream))
     } else {
         TcpHandle::Connecting(stream)
     };
@@ -276,6 +306,25 @@ fn lingering_channel_close(_id: i32, stream: &TcpStream) {
 fn ioex(msg: impl Into<String>) -> MethodCallFailed {
     RuntimeError::IOException {
         message: msg.into(),
+    }
+    .into()
+}
+
+/// Gated Unix-domain-socket tracing. Shares `CRATONVM_DBG_SC_READ` with the
+/// other socket-channel diagnostics in this file: the UDS bind/accept/connect
+/// path is only ever interesting alongside the read/write trace.
+fn uds_dbg(args: std::fmt::Arguments<'_>) {
+    if io_flags().dbg_sc_read {
+        eprintln!("[UDS] {args}");
+    }
+}
+
+/// Thrown when a caller asks for a Unix-domain socket on a platform where
+/// this build has no AF_UNIX support. Matches the JDK, which raises
+/// `UnsupportedOperationException` from `ServerSocketChannel.open(UNIX)`.
+fn unsupported_uds() -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: "Unix domain sockets are not supported on this platform".into(),
     }
     .into()
 }
@@ -404,6 +453,8 @@ fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) {
 ///   field 4 = local port (i32, 0=unset)
 ///   field 5 = remote address text (String or null)
 ///   field 6 = remote port (i32, 0=unset)
+///   field 7 = protocol family (0=INET/INET6, 1=UNIX)
+///   field 8 = Unix-domain socket path (String or null; both ends' address)
 const F_OPEN: usize = 0;
 const F_BLOCKING: usize = 1;
 const F_REG_ID: usize = 2;
@@ -411,7 +462,12 @@ const F_CONNECTED: usize = 3;
 const F_LOCAL_PORT: usize = 4;
 const F_REMOTE: usize = 5;
 const F_REMOTE_PORT: usize = 6;
-const N_FIELDS: usize = 7;
+const F_FAMILY: usize = 7;
+const F_UDS_PATH: usize = 8;
+const N_FIELDS: usize = 9;
+
+/// `F_FAMILY` value for a `StandardProtocolFamily.UNIX` channel.
+const FAMILY_UNIX: i32 = 1;
 
 // ---------------------------------------------------------------------------
 // Synthetic channel state — identity-hash side-table
@@ -545,6 +601,25 @@ fn cf_remote(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String, i32)> {
     Some((host, port))
 }
 
+/// Read a `Syn::S` slot (`F_REMOTE` / `F_UDS_PATH`) as a Rust String.
+fn cf_get_str(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Option<String> {
+    if idx >= N_FIELDS {
+        return None;
+    }
+    let key = ctx.identity_hash_code(obj);
+    let table = chan_fields().read();
+    let state = table.get(&key)?.iter().find(|state| state.object == obj)?;
+    match &state.fields[idx] {
+        Syn::S(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// True when this channel was opened with `StandardProtocolFamily.UNIX`.
+fn is_unix_family(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    matches!(cf_get(ctx, obj, F_FAMILY), Value::Int(FAMILY_UNIX))
+}
+
 pub fn gc_scan_channel_roots(roots: &mut Vec<ObjectRef>) {
     let table = chan_fields().read();
     for bucket in table.values() {
@@ -581,6 +656,79 @@ fn read_blocking_flag(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 // ---------------------------------------------------------------------------
 // SocketAddress decoding
 // ---------------------------------------------------------------------------
+
+/// The JDK class name of a Unix-domain socket address.
+const UNIX_DOMAIN_SOCKET_ADDRESS: &str = "java/net/UnixDomainSocketAddress";
+
+/// If `sa` is a `java.net.UnixDomainSocketAddress`, return its path as text.
+///
+/// The class is matched by name rather than by `instanceof` because the
+/// address may arrive from any classloader's view of `java.base`; the path is
+/// then read through the public `getPath()` / `Path.toString()` accessors so
+/// we never depend on the JDK's private field layout.
+pub(crate) fn decode_unix_socket_address(
+    ctx: &mut dyn NativeContext,
+    sa: ObjectRef,
+) -> Result<Option<String>, MethodCallFailed> {
+    let class_id = ctx.class_id_of_object(sa);
+    let Some(name) = ctx.class_name_of_id(class_id) else {
+        return Ok(None);
+    };
+    if name.replace('.', "/") != UNIX_DOMAIN_SOCKET_ADDRESS {
+        return Ok(None);
+    }
+    // Past this point the caller definitely asked for a Unix-domain socket, so
+    // a failure to read the path is an error rather than a reason to fall
+    // through to the INET decoder (which would report a misleading
+    // "unresolved address"). This is the shape a synthetic-JDK run hits, where
+    // `java.net.UnixDomainSocketAddress` is a fabricated stub with no real
+    // `getPath()`.
+    let path = match ctx.invoke_virtual(sa, "getPath", "()Ljava/nio/file/Path;", &[]) {
+        Ok(Some(Value::Object(Some(p)))) => p,
+        _ => return Err(unsupported_uds()),
+    };
+    match ctx.invoke_virtual(path, "toString", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => match ctx.read_string(s) {
+            Some(text) => Ok(Some(text)),
+            None => Err(unsupported_uds()),
+        },
+        _ => Err(unsupported_uds()),
+    }
+}
+
+/// Build a `java.net.UnixDomainSocketAddress` for `path`, for the
+/// `getLocalAddress()` / `getRemoteAddress()` accessors of a UDS channel.
+/// Returns `null` if the class is unavailable (e.g. a pre-16 class library).
+fn new_unix_socket_address(ctx: &mut dyn NativeContext, path: &str) -> MethodCallResult {
+    let text = ctx.create_string(path);
+    match ctx.invoke(
+        UNIX_DOMAIN_SOCKET_ADDRESS,
+        "of",
+        "(Ljava/lang/String;)Ljava/net/UnixDomainSocketAddress;",
+        &[Value::Object(Some(text))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Decode a `java.net.ProtocolFamily` argument into an `F_FAMILY` value.
+/// Anything other than `StandardProtocolFamily.UNIX` (including a null or
+/// unreadable argument) maps to the INET default.
+fn decode_protocol_family(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> i32 {
+    let Some(fam) = obj_or_none(args, idx) else {
+        return 0;
+    };
+    let name = match ctx.invoke_virtual(fam, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    };
+    if name.as_deref() == Some("UNIX") {
+        FAMILY_UNIX
+    } else {
+        0
+    }
+}
 
 /// Try to read a socket address out of a Java `InetSocketAddress`-shaped
 /// object. The synthetic layout is `(host:String, port:int)`. Real-JDK
@@ -835,6 +983,11 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
 /// `SocketChannel.open()` — allocate a fresh client channel. We don't bind
 /// or connect yet; that happens on `connect`.
 fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    sc_open_family_value(ctx, 0)
+}
+
+/// Shared body of `SocketChannel.open()` / `open(ProtocolFamily)`.
+fn sc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
     init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
@@ -844,7 +997,19 @@ fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     cf_set(ctx, ch, F_LOCAL_PORT, Value::Int(0));
     cf_set(ctx, ch, F_REMOTE, Value::Object(None));
     cf_set(ctx, ch, F_REMOTE_PORT, Value::Int(0));
+    cf_set(ctx, ch, F_FAMILY, Value::Int(family));
     Ok(Some(Value::Object(Some(ch))))
+}
+
+/// `SocketChannel.open(ProtocolFamily)` (JDK 16+). Only the family is
+/// remembered here — an AF_UNIX socket is created by `connect()`, exactly as
+/// the INET path defers its socket to `connect()`.
+fn sc_open_family(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let family = decode_protocol_family(ctx, args, 0);
+    if family == FAMILY_UNIX && !crate::uds::is_supported() {
+        return Err(unsupported_uds());
+    }
+    sc_open_family_value(ctx, family)
 }
 
 /// `SocketChannel.open(SocketAddress)` — open and immediately connect.
@@ -890,7 +1055,13 @@ fn sc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 fn ssc_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) => {
-            let bound = cf_get(ctx, o, F_LOCAL_PORT).as_int().unwrap_or(0) > 0;
+            // A Unix-domain listener has no port at all, so "bound" is
+            // "a listener id has been registered" for that family instead.
+            let bound = if is_unix_family(ctx, o) {
+                read_reg_id(ctx, o).is_some()
+            } else {
+                cf_get(ctx, o, F_LOCAL_PORT).as_int().unwrap_or(0) > 0
+            };
             Ok(Some(Value::Int(if bound { 1 } else { 0 })))
         }
         _ => Ok(Some(Value::Int(0))),
@@ -981,6 +1152,7 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let res = match map.get(&id) {
             Some(TcpHandle::Stream(s)) => s.set_nonblocking(!blocking),
             Some(TcpHandle::Listener(l)) => l.set_nonblocking(!blocking),
+            Some(TcpHandle::UnixListener(l)) => l.set_nonblocking(!blocking),
             _ => Ok(()),
         };
         drop(map);
@@ -1085,6 +1257,18 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
+    // A Unix-domain channel has no `java.net.Socket` view: the real
+    // `SocketChannelImpl.socket()` throws `UnsupportedOperationException` for
+    // any non-INET family, and a `SocketAdaptor` built over one would hand out
+    // `InetSocketAddress`-shaped answers that do not exist. Tomcat guards its
+    // own `socket()` calls on `getUnixDomainSocketPath() == null`; match the
+    // JDK so anything that does not guard fails the same way it would there.
+    if is_unix_family(ctx, this) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Not supported".into(),
+        }
+        .into());
+    }
     // Mirror the real `SocketChannelImpl.socket()` → `SocketAdaptor.create(this)`:
     // the adaptor is a proper `java.net.Socket` subclass whose option getters
     // (`getKeepAlive`/`getTcpNoDelay`/…), `connect`, `getInputStream`/
@@ -1130,12 +1314,98 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(sock))))
 }
 
-/// No-op override for `java.net.Socket` option setters. The `Socket` returned
-/// by `SocketChannel.socket()` is a bare adapter with no real `SocketImpl`, so
-/// the real setter bytecode would call `getImpl()` and NPE. These options are
-/// best-effort (the channel carries the live socket), so swallow them. When
-/// `CRATONVM_REAL_NET_SOCKETS` is set the central registry filter drops every
-/// `java/net/Socket` registration, so the real java.net path is used instead.
+/// `java.net.Socket` option setters, for the `Socket` handed out by
+/// `SocketChannel.socket()`.
+///
+/// These used to be a blanket constant `Ok(None)`. The intent was narrow — the
+/// bare-adapter `Socket` (the `SocketAdaptor.create` fallback in [`sc_socket`])
+/// has no real `SocketImpl`, so the real setter bytecode would go through
+/// `getImpl()` — but the registry is keyed on the CLASS NAME, so the no-op
+/// caught EVERY `java.net.Socket` in the VM, and `register_io_natives` runs
+/// after `register_essential_natives_with_shims` (see `vm/src/vm/vm_init.rs`),
+/// so last-writer-wins handed it the slot for all of them.
+/// `socket.setTcpNoDelay(true)` was therefore discarded process-wide while the
+/// matching getters in `net_phase_e` reported the socket's true (unset) state.
+///
+/// Now: when the receiver is one of THIS module's channel-backed sockets the
+/// option is applied for real and recorded in `tcp_option_state`, so
+/// `setTcpNoDelay(true)` / `getTcpNoDelay()` round-trips through
+/// [`sc_get_option`]. Anything else is left alone — see
+/// [`socket_opt_apply`]'s note on the plain-`Socket` case.
+fn socket_opt_apply(ctx: &mut dyn NativeContext, args: &[Value], name: &str) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let id = match read_reg_id(ctx, this) {
+        Some(id) => id,
+        // Plain `java.net.Socket`: its live `TcpStream` lives in
+        // `cratonvm-native-builtins` (`servlet::s2_registry`, written by
+        // `net_phase_e`'s `Socket.connect`/`ServerSocket.accept`), which this
+        // crate cannot reach — `native-builtins` depends on `native-io`, not
+        // the other way round. Accepting and ignoring is still strictly better
+        // than dropping the registration: without one, real `Socket` bytecode
+        // runs `getImpl()` on a null `impl`, takes `createImpl(true)` and
+        // manufactures a throwaway OS socket to apply the option to, leaking an
+        // fd per call (the same defect `net_phase_e` just fixed on the getter
+        // side). The registration loop below no longer shadows a real setter if
+        // an earlier registrar provided one, so this arm disappears for any key
+        // that gets a proper implementation.
+        None => return Ok(None),
+    };
+    let val = socket_option_value(ctx, args.get(1).copied().unwrap_or(Value::Int(0)));
+    tcp_option_state()
+        .write()
+        .insert((id, name.to_string()), val);
+    let map = tcp_registry().read();
+    // `Stream` holds an `Arc<TcpStream>` and `Bound` a plain `TcpStream`, so
+    // the two cannot share an or-pattern binding — reborrow each to `&TcpStream`.
+    let stream: Option<&TcpStream> = match map.get(&id) {
+        Some(TcpHandle::Stream(s)) => Some(s.as_ref()),
+        Some(TcpHandle::Bound(s)) => Some(s),
+        _ => None,
+    };
+    if let Some(s) = stream {
+        if let Err(e) = apply_option(s, name, val) {
+            return Err(map_err(&format!("setOption({name})"), e));
+        }
+    }
+    Ok(None)
+}
+
+fn socket_opt_set_rcvbuf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_RCVBUF")
+}
+
+fn socket_opt_set_sndbuf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_SNDBUF")
+}
+
+fn socket_opt_set_keepalive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_KEEPALIVE")
+}
+
+fn socket_opt_set_reuseaddr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_REUSEADDR")
+}
+
+fn socket_opt_set_nodelay(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "TCP_NODELAY")
+}
+
+fn socket_opt_set_oobinline(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_OOBINLINE")
+}
+
+fn socket_opt_set_linger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `setSoLinger(boolean on, int linger)` — arg 1 is the flag, which is what
+    // `apply_option`/`read_option` key on.
+    socket_opt_apply(ctx, args, "SO_LINGER")
+}
+
+/// `setPerformancePreferences(int,int,int)` is advisory in the JDK too — the
+/// spec says an implementation is free to ignore the hint entirely, and HotSpot
+/// ignores it for a connected socket. The no-op IS the behaviour, not a stub.
 fn socket_opt_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
@@ -1149,6 +1419,12 @@ fn sc_remote_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_unix_family(ctx, this) {
+        // Both ends of a UDS connection report the server's path: the client
+        // socket is unnamed, which is exactly what the JDK surfaces too.
+        let path = cf_get_str(ctx, this, F_UDS_PATH).unwrap_or_default();
+        return new_unix_socket_address(ctx, &path);
+    }
     if let Some((host, port)) = cf_remote(ctx, this) {
         if port > 0 {
             return new_resolved_inet_socket_address(ctx, &host, port);
@@ -1164,6 +1440,10 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_unix_family(ctx, this) {
+        let path = cf_get_str(ctx, this, F_UDS_PATH).unwrap_or_default();
+        return new_unix_socket_address(ctx, &path);
+    }
     let id = match read_reg_id(ctx, this) {
         Some(i) => i,
         None => return Ok(Some(Value::Object(None))),
@@ -1171,7 +1451,8 @@ fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let local = {
         let map = tcp_registry().read();
         match map.get(&id) {
-            Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) => s.local_addr().ok(),
+            Some(TcpHandle::Stream(s)) => s.local_addr().ok(),
+            Some(TcpHandle::Bound(s)) => s.local_addr().ok(),
             _ => None,
         }
     };
@@ -1190,6 +1471,19 @@ fn sc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let sa = obj_or_none(args, 1).ok_or_else(|| ioex("bind: null SocketAddress"))?;
     if read_reg_id(ctx, this).is_some() {
         return Err(ioex("bind: channel is already bound or connected"));
+    }
+    // Binding the *client* end of a Unix-domain connection to an explicit path
+    // (giving the socket a name of its own) is a JDK capability nothing in the
+    // supported workloads uses, and the INET decoder below would mangle the
+    // address into a bogus host:port. Reject it plainly instead. An unnamed
+    // client socket — the normal case, and what `connect()` produces — needs
+    // no bind at all.
+    if decode_unix_socket_address(ctx, sa)?.is_some() {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Binding a Unix domain SocketChannel to an explicit path is not supported"
+                .into(),
+        }
+        .into());
     }
     let (host, port) = decode_socket_address(ctx, sa)?;
     let bind_text = if host.is_empty() {
@@ -1391,12 +1685,58 @@ fn connect_target_host(host: String) -> String {
     }
 }
 
+/// `SocketChannel.connect(UnixDomainSocketAddress)`.
+///
+/// A UDS connect is resolved entirely by the local kernel: it either succeeds
+/// or is refused immediately, with no handshake to wait for. So there is no
+/// "connection pending" state to model here — the JDK's own `connect0` for
+/// AF_UNIX likewise returns 1 (completed) in every non-error case — and this
+/// returns `true` unconditionally on success, in blocking and non-blocking
+/// mode alike.
+fn sc_connect_unix(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path: &str,
+) -> Result<bool, MethodCallFailed> {
+    if !crate::uds::is_supported() {
+        return Err(unsupported_uds());
+    }
+    if read_reg_id(ctx, this).is_some() {
+        return Err(ioex("connect: channel is already connected or connecting"));
+    }
+    ipc_dbg(format!("connect unix path={path}"));
+    uds_dbg(format_args!("connect path={path}"));
+    // The connect() syscall itself can block briefly on a busy listen backlog,
+    // and touches no Java heap — bracket it like the INET blocking path so a
+    // concurrent stop-the-world pause never waits on this thread.
+    ctx.begin_blocking_region();
+    let connected = crate::uds::connect(path);
+    ctx.end_blocking_region();
+    let stream = connected.map_err(|e| map_err(path, e))?;
+
+    let blocking = read_blocking_flag(ctx, this);
+    stream
+        .set_nonblocking(!blocking)
+        .map_err(|e| map_err("set_nonblocking", e))?;
+    let id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
+    tcp_blocking_state().write().insert(id, blocking);
+    cf_set(ctx, this, F_REG_ID, Value::Int(id));
+    cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+    cf_set(ctx, this, F_FAMILY, Value::Int(FAMILY_UNIX));
+    let path_str = ctx.create_string(path);
+    cf_set(ctx, this, F_UDS_PATH, Value::Object(Some(path_str)));
+    Ok(true)
+}
+
 fn sc_connect_inner(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     sa: ObjectRef,
     allow_block: bool,
 ) -> Result<bool, MethodCallFailed> {
+    if let Some(path) = decode_unix_socket_address(ctx, sa)? {
+        return sc_connect_unix(ctx, this, &path);
+    }
     let (host, port) = decode_socket_address(ctx, sa)?;
     let host = connect_target_host(host);
     let target = format!("{host}:{port}");
@@ -1447,7 +1787,7 @@ fn sc_connect_inner(
                 .map_err(|e| map_err("set_nonblocking", e))?;
         }
         let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-        let id = tcp_register(TcpHandle::Stream(stream));
+        let id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
         tcp_blocking_state().write().insert(id, blocking);
         cf_set(ctx, this, F_REG_ID, Value::Int(id));
         cf_set(ctx, this, F_CONNECTED, Value::Int(1));
@@ -1504,7 +1844,7 @@ fn sc_connect_inner(
         match crate::nb_connect::start(addr) {
             Ok(crate::nb_connect::StartConnect::Connected(stream)) => {
                 let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-                let id = tcp_register(TcpHandle::Stream(stream));
+                let id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
                 tcp_blocking_state().write().insert(id, false);
                 cf_set(ctx, this, F_REG_ID, Value::Int(id));
                 cf_set(ctx, this, F_CONNECTED, Value::Int(1));
@@ -1681,7 +2021,7 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             let mut map = tcp_registry().write();
             match map.remove(&id) {
                 Some(TcpHandle::Connecting(stream)) => {
-                    map.insert(id, TcpHandle::Stream(stream));
+                    map.insert(id, TcpHandle::Stream(Arc::new(stream)));
                     drop(map);
                     cf_set(ctx, this, F_CONNECTED, Value::Int(1));
                     cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
@@ -1724,6 +2064,35 @@ fn fnv1a64(data: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// What one of the I/O natives should operate on, resolved with the registry
+/// lock held only for the lookup itself.
+///
+/// See `TcpHandle::Stream`: the syscall must run with the lock released, so
+/// the live socket is handed back as a cheap `Arc` clone rather than a borrow
+/// into the map.
+enum StreamTarget {
+    /// The live connection; the registry lock is no longer held.
+    Ready(Arc<TcpStream>),
+    /// A non-blocking connect is still in flight — report "no progress".
+    Connecting,
+    /// The connect already failed — surface it as the operation's error.
+    Failed(std::io::Error),
+    /// Closed, a listener, or an unknown id.
+    Unavailable,
+}
+
+fn resolve_stream(id: i32) -> StreamTarget {
+    let map = tcp_registry().read();
+    match map.get(&id) {
+        Some(TcpHandle::Stream(s)) => StreamTarget::Ready(Arc::clone(s)),
+        Some(TcpHandle::Connecting(_)) => StreamTarget::Connecting,
+        Some(TcpHandle::ConnectFailed(_, error)) => {
+            StreamTarget::Failed(std::io::Error::new(error.kind(), error.to_string()))
+        }
+        _ => StreamTarget::Unavailable,
+    }
 }
 
 fn try_read_nb(stream: &TcpStream, buf: &mut [u8]) -> Result<Option<i32>, std::io::Error> {
@@ -1797,32 +2166,26 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // so a concurrent STW pause never waits on a thread parked here. Same
     // pattern as `re1_socket_read_stream` in `net_phase_e.rs`.
     ctx.begin_blocking_region();
-    let read_result = {
-        let map = tcp_registry().read();
-        match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => {
-                let r = try_read_nb(s, &mut buf).map_err(|e| map_err("read", e));
-                ctx.end_blocking_region();
-                r
-            }
-            Some(TcpHandle::Connecting(_)) => {
-                ctx.end_blocking_region();
-                ctx.unpin_native_roots(bb_pin);
-                return Ok(Some(Value::Int(0)));
-            }
-            Some(TcpHandle::ConnectFailed(_, error)) => {
-                ctx.end_blocking_region();
-                ctx.unpin_native_roots(bb_pin);
-                return Err(map_err(
-                    "read",
-                    std::io::Error::new(error.kind(), error.to_string()),
-                ));
-            }
-            _ => {
-                ctx.end_blocking_region();
-                ctx.unpin_native_roots(bb_pin);
-                return Err(ioex("read: channel not a stream"));
-            }
+    let read_result = match resolve_stream(id) {
+        StreamTarget::Ready(s) => {
+            let r = try_read_nb(&s, &mut buf).map_err(|e| map_err("read", e));
+            ctx.end_blocking_region();
+            r
+        }
+        StreamTarget::Connecting => {
+            ctx.end_blocking_region();
+            ctx.unpin_native_roots(bb_pin);
+            return Ok(Some(Value::Int(0)));
+        }
+        StreamTarget::Failed(error) => {
+            ctx.end_blocking_region();
+            ctx.unpin_native_roots(bb_pin);
+            return Err(map_err("read", error));
+        }
+        StreamTarget::Unavailable => {
+            ctx.end_blocking_region();
+            ctx.unpin_native_roots(bb_pin);
+            return Err(ioex("read: channel not a stream"));
         }
     };
 
@@ -1965,32 +2328,26 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // `try_write_nb`'s `s.write()` (e.g. a full socket send buffer with a
     // slow/stalled peer), so bracket it unconditionally.
     ctx.begin_blocking_region();
-    let write_result = {
-        let map = tcp_registry().read();
-        match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => {
-                let r = try_write_nb(s, &data).map_err(|e| map_err("write", e));
-                ctx.end_blocking_region();
-                r
-            }
-            Some(TcpHandle::Connecting(_)) => {
-                ctx.end_blocking_region();
-                ctx.unpin_native_roots(bb_pin);
-                return Ok(Some(Value::Int(0)));
-            }
-            Some(TcpHandle::ConnectFailed(_, error)) => {
-                ctx.end_blocking_region();
-                ctx.unpin_native_roots(bb_pin);
-                return Err(map_err(
-                    "write",
-                    std::io::Error::new(error.kind(), error.to_string()),
-                ));
-            }
-            _ => {
-                ctx.end_blocking_region();
-                ctx.unpin_native_roots(bb_pin);
-                return Err(ioex("write: channel not a stream"));
-            }
+    let write_result = match resolve_stream(id) {
+        StreamTarget::Ready(s) => {
+            let r = try_write_nb(&s, &data).map_err(|e| map_err("write", e));
+            ctx.end_blocking_region();
+            r
+        }
+        StreamTarget::Connecting => {
+            ctx.end_blocking_region();
+            ctx.unpin_native_roots(bb_pin);
+            return Ok(Some(Value::Int(0)));
+        }
+        StreamTarget::Failed(error) => {
+            ctx.end_blocking_region();
+            ctx.unpin_native_roots(bb_pin);
+            return Err(map_err("write", error));
+        }
+        StreamTarget::Unavailable => {
+            ctx.end_blocking_region();
+            ctx.unpin_native_roots(bb_pin);
+            return Err(ioex("write: channel not a stream"));
         }
     };
 
@@ -2107,38 +2464,32 @@ fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // I/O while a concurrent moving collection waits for it to reach a
     // safepoint; that is the remaining transport-pressure hole in this path.
     ctx.begin_blocking_region();
-    let write_result = {
-        let map = tcp_registry().read();
-        match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => {
-                let r = try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e));
-                ctx.end_blocking_region();
-                r
+    let write_result = match resolve_stream(id) {
+        StreamTarget::Ready(s) => {
+            let r = try_write_nb(&s, &data).map_err(|e| map_err("write(gathering)", e));
+            ctx.end_blocking_region();
+            r
+        }
+        StreamTarget::Connecting => {
+            ctx.end_blocking_region();
+            for (pin, _, _) in &chunks {
+                ctx.unpin_native_roots(*pin);
             }
-            Some(TcpHandle::Connecting(_)) => {
-                ctx.end_blocking_region();
-                for (pin, _, _) in &chunks {
-                    ctx.unpin_native_roots(*pin);
-                }
-                return Ok(Some(Value::Long(0)));
+            return Ok(Some(Value::Long(0)));
+        }
+        StreamTarget::Failed(error) => {
+            ctx.end_blocking_region();
+            for (pin, _, _) in &chunks {
+                ctx.unpin_native_roots(*pin);
             }
-            Some(TcpHandle::ConnectFailed(_, error)) => {
-                ctx.end_blocking_region();
-                for (pin, _, _) in &chunks {
-                    ctx.unpin_native_roots(*pin);
-                }
-                return Err(map_err(
-                    "write(gathering)",
-                    std::io::Error::new(error.kind(), error.to_string()),
-                ));
+            return Err(map_err("write(gathering)", error));
+        }
+        StreamTarget::Unavailable => {
+            ctx.end_blocking_region();
+            for (pin, _, _) in &chunks {
+                ctx.unpin_native_roots(*pin);
             }
-            _ => {
-                ctx.end_blocking_region();
-                for (pin, _, _) in &chunks {
-                    ctx.unpin_native_roots(*pin);
-                }
-                return Err(ioex("write(gathering): channel not a stream"));
-            }
+            return Err(ioex("write(gathering): channel not a stream"));
         }
     };
     let n_opt = match write_result {
@@ -2238,38 +2589,32 @@ fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // relocate them) — same protocol as `sc_write_gathering`.
     let pins: Vec<_> = targets.iter().map(|bb| ctx.pin_native_root(*bb)).collect();
     ctx.begin_blocking_region();
-    let read_result = {
-        let map = tcp_registry().read();
-        match map.get(&id) {
-            Some(TcpHandle::Stream(s)) => {
-                let r = try_read_nb(s, &mut buf).map_err(|e| map_err("read(scattering)", e));
-                ctx.end_blocking_region();
-                r
+    let read_result = match resolve_stream(id) {
+        StreamTarget::Ready(s) => {
+            let r = try_read_nb(&s, &mut buf).map_err(|e| map_err("read(scattering)", e));
+            ctx.end_blocking_region();
+            r
+        }
+        StreamTarget::Connecting => {
+            ctx.end_blocking_region();
+            for pin in pins {
+                ctx.unpin_native_roots(pin);
             }
-            Some(TcpHandle::Connecting(_)) => {
-                ctx.end_blocking_region();
-                for pin in pins {
-                    ctx.unpin_native_roots(pin);
-                }
-                return Ok(Some(Value::Long(0)));
+            return Ok(Some(Value::Long(0)));
+        }
+        StreamTarget::Failed(error) => {
+            ctx.end_blocking_region();
+            for pin in pins {
+                ctx.unpin_native_roots(pin);
             }
-            Some(TcpHandle::ConnectFailed(_, error)) => {
-                ctx.end_blocking_region();
-                for pin in pins {
-                    ctx.unpin_native_roots(pin);
-                }
-                return Err(map_err(
-                    "read(scattering)",
-                    std::io::Error::new(error.kind(), error.to_string()),
-                ));
+            return Err(map_err("read(scattering)", error));
+        }
+        StreamTarget::Unavailable => {
+            ctx.end_blocking_region();
+            for pin in pins {
+                ctx.unpin_native_roots(pin);
             }
-            _ => {
-                ctx.end_blocking_region();
-                for pin in pins {
-                    ctx.unpin_native_roots(pin);
-                }
-                return Err(ioex("read(scattering): channel not a stream"));
-            }
+            return Err(ioex("read(scattering): channel not a stream"));
         }
     };
     let n_opt = match read_result {
@@ -2405,7 +2750,12 @@ fn sc_set_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             .write()
             .insert((id, opt_name.clone()), val);
         let map = tcp_registry().read();
-        if let Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) = map.get(&id) {
+        let stream: Option<&TcpStream> = match map.get(&id) {
+            Some(TcpHandle::Stream(s)) => Some(s),
+            Some(TcpHandle::Bound(s)) => Some(s),
+            _ => None,
+        };
+        if let Some(s) = stream {
             if let Err(e) = apply_option(s, &opt_name, val) {
                 return Err(map_err(&format!("setOption({opt_name})"), e));
             }
@@ -2441,9 +2791,8 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         } else {
             let map = tcp_registry().read();
             match map.get(&id) {
-                Some(TcpHandle::Stream(s)) | Some(TcpHandle::Bound(s)) => {
-                    read_option(s, &opt_name).unwrap_or(0)
-                }
+                Some(TcpHandle::Stream(s)) => read_option(s, &opt_name).unwrap_or(0),
+                Some(TcpHandle::Bound(s)) => read_option(s, &opt_name).unwrap_or(0),
                 _ => 0,
             }
         }
@@ -2562,6 +2911,11 @@ pub(crate) fn supported_socket_options_pub(ctx: &mut dyn NativeContext) -> Metho
 // ---------------------------------------------------------------------------
 
 fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    ssc_open_family_value(ctx, 0)
+}
+
+/// Shared body of `ServerSocketChannel.open()` / `open(ProtocolFamily)`.
+fn ssc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", N_FIELDS);
     init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
@@ -2571,7 +2925,54 @@ fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     cf_set(ctx, ch, F_LOCAL_PORT, Value::Int(0));
     cf_set(ctx, ch, F_REMOTE, Value::Object(None));
     cf_set(ctx, ch, F_REMOTE_PORT, Value::Int(0));
+    cf_set(ctx, ch, F_FAMILY, Value::Int(family));
     Ok(Some(Value::Object(Some(ch))))
+}
+
+/// `ServerSocketChannel.open(ProtocolFamily)` (JDK 16+). This is the entry
+/// point Tomcat's `NioEndpoint.initServerSocket()` takes for a connector
+/// configured with `unixDomainSocketPath`. Only the family is recorded; the
+/// AF_UNIX socket itself is created by `bind()`, mirroring the INET path.
+fn ssc_open_family(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let family = decode_protocol_family(ctx, args, 0);
+    if family == FAMILY_UNIX && !crate::uds::is_supported() {
+        return Err(unsupported_uds());
+    }
+    ssc_open_family_value(ctx, family)
+}
+
+/// `ServerSocketChannel.bind(UnixDomainSocketAddress, backlog)`.
+fn ssc_bind_unix(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    path: &str,
+    backlog: i32,
+) -> MethodCallResult {
+    if !crate::uds::is_supported() {
+        return Err(unsupported_uds());
+    }
+    let listener = crate::uds::UdsListener::bind(path, backlog).map_err(|e| map_err(path, e))?;
+    uds_dbg(format_args!(
+        "bind path={path} backlog={backlog} raw={:#x}",
+        listener.raw() as u64
+    ));
+    let blocking = read_blocking_flag(ctx, this);
+    if !blocking {
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| map_err("set_nonblocking listener", e))?;
+    }
+    let id = tcp_register(TcpHandle::UnixListener(listener));
+    tcp_blocking_state().write().insert(id, blocking);
+
+    cf_set(ctx, this, F_REG_ID, Value::Int(id));
+    cf_set(ctx, this, F_FAMILY, Value::Int(FAMILY_UNIX));
+    // A Unix-domain listener has no port; `ssc_is_bound` special-cases the
+    // family so leaving F_LOCAL_PORT at 0 is correct, and it keeps
+    // `NioEndpoint.getLocalPort()` reporting -1 as it does on HotSpot.
+    let path_str = ctx.create_string(path);
+    cf_set(ctx, this, F_UDS_PATH, Value::Object(Some(path_str)));
+    Ok(Some(Value::Object(Some(this))))
 }
 
 /// Read the already-resolved numeric IP out of an `InetSocketAddress`
@@ -2651,8 +3052,13 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("bind: null SocketAddress")),
     };
-    // arg[2] is the backlog — std::net::TcpListener picks its own.
-    let _backlog = int_arg(args, 2).max(0);
+    // arg[2] is the backlog — std::net::TcpListener picks its own, but the
+    // AF_UNIX path issues `listen()` itself and does honour it.
+    let backlog = int_arg(args, 2).max(0);
+
+    if let Some(path) = decode_unix_socket_address(ctx, sa)? {
+        return ssc_bind_unix(ctx, this, &path, backlog);
+    }
 
     let (host, port) = decode_socket_address(ctx, sa)?;
     // Prefer the numeric address the JDK already resolved into this
@@ -2692,6 +3098,18 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let id = read_reg_id(ctx, this).ok_or_else(|| ioex("accept: server channel not bound"))?;
     let blocking = read_blocking_flag(ctx, this);
+
+    let is_unix_listener = matches!(
+        tcp_registry().read().get(&id),
+        Some(TcpHandle::UnixListener(_))
+    );
+    uds_dbg(format_args!(
+        "ssc_accept id={id:#x} unix_listener={is_unix_listener} family_unix={}",
+        is_unix_family(ctx, this)
+    ));
+    if is_unix_listener {
+        return ssc_accept_unix(ctx, this, id, blocking);
+    }
 
     // Wave 3 Task C: the selector loop pre-drains pending accepts when
     // OP_ACCEPT fires (see `kernel_select_*` in nio_selector.rs); pull
@@ -2774,7 +3192,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let _ = stream.set_nonblocking(!blocking);
 
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-    let new_id = tcp_register(TcpHandle::Stream(stream));
+    let new_id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
     tcp_blocking_state().write().insert(new_id, blocking);
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
@@ -2792,6 +3210,120 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let host_str = ctx.create_string(&peer.ip().to_string());
     cf_set(ctx, child, F_REMOTE, Value::Object(Some(host_str)));
     cf_set(ctx, child, F_REMOTE_PORT, Value::Int(peer.port() as i32));
+
+    Ok(Some(Value::Object(Some(child))))
+}
+
+/// Close-aware `accept()` on an AF_UNIX listener.
+///
+/// The socket is flipped non-blocking and polled, exactly like
+/// `accept_close_aware` does for TCP: a blocking `accept()` would have to be
+/// issued while holding the registry lock (an `UdsListener` cannot be
+/// `try_clone`d out of the map the way a `TcpListener` can), which would
+/// deadlock against the `close()` that is supposed to wake it. Polling keeps
+/// each lock acquisition to a single non-blocking syscall and lets `close()`
+/// — which removes the registry entry — end the wait promptly.
+fn uds_accept_close_aware(
+    id: i32,
+    blocking: bool,
+) -> std::io::Result<Option<(TcpStream, String)>> {
+    loop {
+        let attempt = {
+            let map = tcp_registry().read();
+            match map.get(&id) {
+                Some(TcpHandle::UnixListener(l)) => {
+                    l.set_nonblocking(true)?;
+                    l.accept()
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::Interrupted,
+                        "server channel closed",
+                    ))
+                }
+            }
+        };
+        match attempt {
+            Ok(pair) => return Ok(Some(pair)),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if !blocking {
+                    return Ok(None);
+                }
+                std::thread::sleep(ACCEPT_CLOSE_POLL);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `ServerSocketChannel.accept()` for a Unix-domain listener. Mirrors the TCP
+/// branch of `ssc_accept`, minus the selector pre-drain (which only ever
+/// stashes `TcpStream`s from INET listeners) and the peer host/port, which do
+/// not exist for AF_UNIX — the child channel carries the server's path as its
+/// address instead, matching what the JDK reports.
+fn ssc_accept_unix(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    id: i32,
+    blocking: bool,
+) -> MethodCallResult {
+    // Bracket the wait in a GC-blocking region for the same reason the TCP
+    // path does: an idle acceptor parks here for an unbounded time and
+    // reaches no interpreter safepoint, so a concurrent stop-the-world pause
+    // would otherwise wait on it forever.
+    uds_dbg(format_args!("accept enter id={id:#x} blocking={blocking}"));
+    let res = if blocking {
+        ctx.begin_blocking_region();
+        let res = uds_accept_close_aware(id, true);
+        ctx.end_blocking_region();
+        res
+    } else {
+        uds_accept_close_aware(id, false)
+    };
+    let accepted = match res {
+        Ok(pair) => pair,
+        Err(e) => {
+            uds_dbg(format_args!("accept id={id:#x} error={e}"));
+            return Err(map_err("accept", e));
+        }
+    };
+    uds_dbg(format_args!(
+        "accept id={id:#x} -> {}",
+        match &accepted {
+            Some((_, peer)) => format!("connection peer=\"{peer}\""),
+            None => "none (would block)".to_string(),
+        }
+    ));
+    let Some((stream, _peer)) = accepted else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // Inherit the parent channel's blocking mode, like the TCP path.
+    let _ = stream.set_nonblocking(!blocking);
+
+    let new_id = tcp_register(TcpHandle::Stream(Arc::new(stream)));
+    tcp_blocking_state().write().insert(new_id, blocking);
+
+    // The accepted socket's own name is unnamed on both Windows and Linux;
+    // report the listener's path, which is the address the JDK surfaces from
+    // `getLocalAddress()`/`getRemoteAddress()` on an accepted UDS channel.
+    let path = cf_get_str(ctx, this, F_UDS_PATH).unwrap_or_default();
+
+    let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
+    init_channel_locks(ctx, child);
+    cf_set(ctx, child, F_OPEN, Value::Int(1));
+    cf_set(
+        ctx,
+        child,
+        F_BLOCKING,
+        Value::Int(if blocking { 1 } else { 0 }),
+    );
+    cf_set(ctx, child, F_REG_ID, Value::Int(new_id));
+    cf_set(ctx, child, F_CONNECTED, Value::Int(1));
+    cf_set(ctx, child, F_LOCAL_PORT, Value::Int(0));
+    cf_set(ctx, child, F_FAMILY, Value::Int(FAMILY_UNIX));
+    let path_str = ctx.create_string(&path);
+    cf_set(ctx, child, F_UDS_PATH, Value::Object(Some(path_str)));
 
     Ok(Some(Value::Object(Some(child))))
 }
@@ -2848,6 +3380,20 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "()Ljava/nio/channels/SocketChannel;",
             sc_open,
         );
+        // JDK 16+ family-aware provider factories — the route
+        // `ServerSocketChannel.open(StandardProtocolFamily.UNIX)` takes.
+        r.register(
+            prov,
+            "openServerSocketChannel",
+            "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/ServerSocketChannel;",
+            ssc_open_family,
+        );
+        r.register(
+            prov,
+            "openSocketChannel",
+            "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/SocketChannel;",
+            sc_open_family,
+        );
     }
 
     // -- SocketChannel factory + lifecycle --
@@ -2858,6 +3404,16 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "open",
             "(Ljava/net/SocketAddress;)Ljava/nio/channels/SocketChannel;",
             sc_open_connected,
+        );
+        // JDK 16+: `open(ProtocolFamily)` — Unix-domain sockets. Without this
+        // the call falls through to real JDK bytecode, which builds a genuine
+        // `sun.nio.ch.SocketChannelImpl` that none of CratonVM's channel
+        // natives (read/write/selector registration) can drive.
+        r.register(
+            c,
+            "open",
+            "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/SocketChannel;",
+            sc_open_family,
         );
         r.register(c, "isOpen", "()Z", sc_is_open);
         r.register(c, "isBlocking", "()Z", sc_is_blocking);
@@ -3004,6 +3560,17 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "()Ljava/nio/channels/ServerSocketChannel;",
             ssc_open,
         );
+        // JDK 16+: `open(ProtocolFamily)` — Unix-domain sockets. This is what
+        // `NioEndpoint.initServerSocket()` calls for a connector configured
+        // with `unixDomainSocketPath`; without it the call falls through to
+        // real JDK bytecode, whose `ServerSocketChannelImpl` is not a channel
+        // any of CratonVM's channel natives can drive.
+        r.register(
+            c,
+            "open",
+            "(Ljava/net/ProtocolFamily;)Ljava/nio/channels/ServerSocketChannel;",
+            ssc_open_family,
+        );
         r.register(c, "socket", "()Ljava/net/ServerSocket;", ssc_socket);
         r.register(c, "isOpen", "()Z", sc_is_open);
         r.register(c, "isBlocking", "()Z", sc_is_blocking);
@@ -3136,17 +3703,31 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // owns its own setSoTimeout implementation, so do not shadow the base
     // Socket setter: ordinary sockets must apply SO_RCVTIMEO to their stream.
     let client_socket = "java/net/Socket";
-    for (m, d) in [
-        ("setReceiveBufferSize", "(I)V"),
-        ("setSendBufferSize", "(I)V"),
-        ("setKeepAlive", "(Z)V"),
-        ("setReuseAddress", "(Z)V"),
-        ("setTcpNoDelay", "(Z)V"),
-        ("setOOBInline", "(Z)V"),
-        ("setSoLinger", "(ZI)V"),
-        ("setPerformancePreferences", "(III)V"),
+    for (m, d, cb) in [
+        (
+            "setReceiveBufferSize",
+            "(I)V",
+            socket_opt_set_rcvbuf as cratonvm_native_api::registry::NativeCallback,
+        ),
+        ("setSendBufferSize", "(I)V", socket_opt_set_sndbuf),
+        ("setKeepAlive", "(Z)V", socket_opt_set_keepalive),
+        ("setReuseAddress", "(Z)V", socket_opt_set_reuseaddr),
+        ("setTcpNoDelay", "(Z)V", socket_opt_set_nodelay),
+        ("setOOBInline", "(Z)V", socket_opt_set_oobinline),
+        ("setSoLinger", "(ZI)V", socket_opt_set_linger),
+        ("setPerformancePreferences", "(III)V", socket_opt_noop),
     ] {
-        r.register(client_socket, m, d, socket_opt_noop);
+        // Do NOT shadow a real implementation an earlier registrar already
+        // installed for this key. This block runs late (`register_io_natives`
+        // is called after `register_essential_natives_with_shims`), so without
+        // this guard it silently replaced, for every `java.net.Socket` in the
+        // VM, whatever real setter phases_early/net_phase_e had provided —
+        // last-writer-wins. The channel-adaptor case that these handlers exist
+        // for only ever needs them when nobody else claimed the key.
+        if r.find(client_socket, m, d).is_some() {
+            continue;
+        }
+        r.register(client_socket, m, d, cb);
     }
     r.set_category(__prev_cat);
 }
@@ -3284,6 +3865,14 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
+    // As in `sc_socket`: a Unix-domain listener has no `java.net.ServerSocket`
+    // view, and the real `ServerSocketChannelImpl.socket()` throws here too.
+    if is_unix_family(ctx, this) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "Not supported".into(),
+        }
+        .into());
+    }
     if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
         if let Value::Object(Some(cached)) = ctx.get_field(this, SSC_SOCKET_CACHE) {
             return Ok(Some(Value::Object(Some(cached))));
@@ -3351,6 +3940,15 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
+    if is_unix_family(ctx, this) {
+        // Tomcat's `NioEndpoint.getLocalAddress()` is `instanceof
+        // InetSocketAddress`-guarded, so returning the UDS address here
+        // correctly leaves `Connector.getLocalPort()` at -1, as on HotSpot.
+        let Some(path) = cf_get_str(ctx, this, F_UDS_PATH) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        return new_unix_socket_address(ctx, &path);
+    }
     let port = cf_get(ctx, this, F_LOCAL_PORT).as_int().unwrap_or(0);
     let id = cf_get(ctx, this, F_REG_ID).as_int().unwrap_or(-1);
     if id < 0 || port <= 0 {

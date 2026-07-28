@@ -1334,9 +1334,20 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
     #[cfg(feature = "synthetic-jdk")]
     {
         // -------------------------------------------------------------------------
-        // java.io.InputStream.close() — no-op
+        // java.io.InputStream.close() — spec-correct no-op: the base class body
+        // in java.base is literally empty (`public void close() throws
+        // IOException {}`); every stream that owns a handle overrides it, and an
+        // override resolves to the subclass, not here.
         // -------------------------------------------------------------------------
         r.register("java/io/InputStream", "close", "()V", native_noop_with_this);
+        // KEEP (deliberate constant), audited 2026-07-27. `InputStream.read()`
+        // is abstract in java.base — a native on it is only ever reached by a
+        // synthetic-mode subclass that supplies no `read()` of its own, i.e.
+        // a stream with no source. EOF is the only answer that does not
+        // fabricate data. It is NOT the answer for a stream that does have a
+        // source: every such class (ByteArrayInputStream, the
+        // getResourceAsStream product, FileInputStream) registers its own
+        // `read` and that override wins.
         r.register("java/io/InputStream", "read", "()I", |_ctx, _args| {
             Ok(Some(Value::Int(-1))) // EOF
         });
@@ -1378,14 +1389,45 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        r.register(
-            "java/io/InputStreamReader",
-            "close",
-            "()V",
-            native_noop_with_this,
-        );
-        r.register("java/io/InputStreamReader", "read", "()I", |_ctx, _args| {
-            Ok(Some(Value::Int(-1)))
+        // `InputStreamReader.close()` is NOT an empty base-class body: the real
+        // one closes its StreamDecoder, which closes the wrapped InputStream.
+        // The three synthetic `<init>`s above park that stream in slot 0, so
+        // propagate the close to it — a no-op here held the underlying stream
+        // (and its OS handle) open for the rest of the process. Clearing the
+        // slot keeps `close()` idempotent, as the contract requires; it happens
+        // BEFORE the nested dispatch because that call runs arbitrary Java and a
+        // moving young GC there would relocate `this`, stranding a write made
+        // afterwards (native stale-local family).
+        r.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+                ctx.set_field(this, 0, Value::Object(None));
+                let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            }
+            Ok(None)
+        });
+        // `read()` has to consume from the stream those three `<init>`s parked
+        // in slot 0, exactly as `close()` above propagates to it. The constant
+        // `-1` this replaced reported permanent EOF, so in synthetic mode
+        // every `new InputStreamReader(in).read()` — and every BufferedReader
+        // layered on one — saw an empty stream rather than the resource's
+        // bytes.
+        //
+        // This is a byte-for-char passthrough: exact for US-ASCII and
+        // ISO-8859-1, and it splits a multi-byte UTF-8 sequence into separate
+        // chars. That is a known approximation of the real StreamDecoder, and
+        // still strictly better than claiming EOF. The default (real-JDK)
+        // build never reaches this code — see the RDR-MIGRATION note above.
+        r.register("java/io/InputStreamReader", "read", "()I", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Value::Object(Some(stream)) = ctx.get_field(this, 0) else {
+                // No source, or already closed (close() nulls slot 0).
+                return Ok(Some(Value::Int(-1)));
+            };
+            match ctx.invoke_virtual(stream, "read", "()I", &[])? {
+                Some(Value::Int(b)) => Ok(Some(Value::Int(b))),
+                _ => Ok(Some(Value::Int(-1))),
+            }
         });
 
         // Real-JDK BufferedReader methods retain their bytecode implementation.
@@ -1741,7 +1783,14 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         crate::classloader::cl_get_resource_as_stream_essential,
     );
 
-    // URLClassLoader.close() — no-op
+    // URLClassLoader.close() — nothing to release. Real `close()` shuts the
+    // JarFiles that URLClassPath keeps open, but this synthetic loader opens
+    // none: `<init>`/`addURL` hand the paths to `ctx.register_dynamic_classpath`
+    // and keep only the URL[] and parent refs. The remaining half of the
+    // contract (a closed loader must stop serving new classes/resources) needs a
+    // VM-side way to retract a dynamic-classpath entry, which does not exist —
+    // so post-close loads still succeed here. Left as-is deliberately rather
+    // than faked; see the stub-removal report.
     r.register(ucl, "close", "()V", native_noop_with_this);
 
     // =========================================================================
@@ -5254,6 +5303,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(cls, "array", "()[I", |ctx, args| {
             Ok(Some(Value::Object(s2_bb_arr(ctx, obj_arg(args, 0)?))))
         });
+        // KEEP (deliberate constants) — audited 2026-07-27. Every receiver
+        // reaching these is a view buffer produced by `s2_view_buf_fn!` and
+        // backed by the int[] that `s2_bb_arr` (just above) hands out, so
+        // `isDirect() == false` is a fact about the layout, not a
+        // placeholder: a direct buffer would have no accessible backing
+        // array. `isReadOnly() == false` is exact for the same reason —
+        // `asReadOnlyBuffer` is unimplemented for these classes (see the note
+        // immediately below), so no read-only view of one can exist yet.
+        // Whoever implements it must replace this with a real flag read
+        // rather than leave the constant standing.
         r.register(cls, "isDirect", "()Z", |_, _| Ok(Some(Value::Int(0))));
         r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
     }

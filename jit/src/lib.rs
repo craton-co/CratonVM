@@ -7401,37 +7401,60 @@ fn local_handler_reads_unsafe_local(
 
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///
-/// **Default OFF (2026-07-27).** The relaxation (added by `83e078aa5`) compiles
-/// methods whose exception handler reads a local beyond the incoming
-/// parameters, on the promise that every throwing site in the protected range
-/// publishes a precise exceptional frame. Measured against that promise, the
-/// handoff still loses live values:
+/// The relaxation compiles a method whose exception handler (or code reachable
+/// from it) reads a local beyond the incoming parameters, on the promise that
+/// every throwing site in its protected ranges publishes a precise exceptional
+/// frame instead of the params-only reconstruction
+/// `route_jit_exception_through_method` can do on its own. Without it, ordinary
+/// `try`/`catch` methods stay interpreted forever — `JSONValue.toJSONString`,
+/// `org.apache.tomcat.util.buf.CharsetCache.getCharset` (~15us interpreted vs
+/// ~2us compiled), `StringCache.toString`.
 ///
-/// | build (json-smart round-trip probe, `-Xmx64m`, 200k ops/run) | first error |
-/// |---|---|
-/// | dev before `83e078aa5` | none |
-/// | dev at/after `83e078aa5` | iteration 400-5,000 |
-/// | same, with this gate closed | none |
+/// **Default OFF between 2026-07-27 and 2026-07-28**, because a json-smart
+/// round-trip probe (`docs/known-issues/repros/jsonsmart/`, `-Xmx64m`) crashed
+/// or corrupted within ~20,000 iterations whenever it was open. Four defects
+/// were behind that, all fixed; keep them in mind before changing anything
+/// here:
 ///
-/// The failures are lost-object failures, not exception-handling failures: a
-/// re-parse returns one of the document's own keys, or a
-/// `ClassCastException: java.lang.Object cannot be cast to JSONArray` — an
-/// unrelated object standing where a live one used to be, i.e. a value dropped
-/// from a reconstructed frame (and with it, from the GC's view of that frame).
-/// One input to that has been fixed separately (the liveness scan behind the
-/// snapshot had no exception edges — see
-/// `regalloc::live_locals_per_pc_with_handlers`), but the shape survives it, so
-/// the admission stays closed until the handoff itself is proven.
+/// 1. `remap_active_jit_frames` (vm) walked the JIT rbp chain and passed the
+///    *unvalidated* parent link to a helper that dereferences
+///    `[parent_rbp - sp_id_slot_off]` and rewrites every oop-map slot. A zero
+///    link faulted; a garbage one rewrote arbitrary stack. This was the actual
+///    json-smart failure and is not specific to this gate — the gate only made
+///    the chain deep enough to walk. 3 SIGSEGVs in 4 probe runs before, 0 in 10
+///    after.
+/// 2. The exceptional frame was keyed on the throwing invoke's SUCCESSOR bci,
+///    but its consumer uses that bci as the THROW pc for the handler's
+///    `[start_pc, end_pc)` test — and javac routinely ends a protected range
+///    exactly at that successor, so the exception escaped its own catch block.
+/// 3. The frame was stashed in `LAST_DEOPT`, where every other consumer treats
+///    a stash as "resume this method at `bci`" — which for an exceptional frame
+///    executes past a call that never returned. It has its own stash now
+///    (`deopt::take_exceptional_frame`) and its own `DeoptReason`.
+/// 4. Register allocation and `regalloc::plan_safepoint_publication` both built
+///    their liveness from a CFG with no exception edges, which is only sound
+///    while this gate refuses the population that reads handler-only locals.
+///    Both now model the handler ranges for this population.
 ///
-/// Set `CRATONVM_JIT_PRECISE_HANDLER_FRAMES=1` to re-open it while working on
-/// it. Repro: `docs/known-issues/repros/jsonsmart/JsonSmartProbeWarmed.java`
-/// under `-Xmx64m`; writeup:
-/// `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+/// Regression fixture: `vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java`
+/// (three shapes, each returning a mismatch count that must be 0).
+/// `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES` restores the params-only refusal.
 fn precise_handler_frames_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_PRECISE_HANDLER_FRAMES").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES").is_none()
+    })
+}
+
+/// Opt-out for the STUB-S8 fix: when set, a method declaring an exception table
+/// is refused by the optimizing tier exactly as it was before that fix, so the
+/// same binary can be measured with and without the change.
+fn exc_table_c2_disabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_EXC_TABLE_C2").is_some()
     })
 }
 
@@ -7857,16 +7880,37 @@ fn try_compile_inner(
     // keeps the historical IR-first behaviour.
     if optimize
         && ir::ir_compatible(&scan)
-        // STUB-S8: the IR builder has no exception-table-aware codegen — a
-        // handler entry isn't a registered merge target, so the builder walks
-        // over handler bytecode with stale `self.ctrl`/`self.locals`/`self.stack`
-        // state left over from wherever the linear PC walk last was. An
-        // implicit-throw-only method (try/catch with no `athrow` of its own)
-        // slips past the `scan.has_athrow` bail above and produces orphaned
-        // nodes referencing `NO_NODE` (a popped-empty-stack or
-        // never-assigned-local sentinel) that the scheduler/lowerer still
-        // visit, panicking in `ir_lower::slot_of` on a `u32::MAX` index.
-        && cached.exception_table.is_empty()
+        // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
+        // tier used to refuse EVERY method with a `try`/`catch`, which is an
+        // enormous population of ordinary Java and cost ~7x on each of them
+        // (measured: a clone of Tomcat's `CharsetCache.getCharset` at 8252
+        // ns/op, 1094 with only the try/catch deleted). The stated reason was
+        // that the IR builder walked handler bytecode with stale
+        // `ctrl`/`locals`/`stack` and emitted orphan nodes referencing
+        // `NO_NODE` that panicked `ir_lower::slot_of`. `IrBuilder::build` now
+        // skips handler bodies outright (they are unreachable in a compiled
+        // frame — see the STUB-S8 comment there), so the orphans cannot arise
+        // and the table itself is no longer disqualifying.
+        //
+        // What still is: `precise_exception_frames`. When RBC.6 fires (a
+        // handler reads a non-parameter local) the single-pass backend keeps
+        // its promise by publishing a reason-9 frame at every throwing site, so
+        // the interpreter RESUMES mid-method with that local intact. The IR
+        // lowerer has no equivalent — its post-call check jumps to the shared
+        // sentinel bail — so such a method must stay on the single-pass
+        // backend or its handler would observe null/0. Methods below that line
+        // (handler reads only parameters, or no handler local at all) exit
+        // exceptionally through the identical `i64::MIN` sentinel + epilogue
+        // protocol in both tiers, so moving them to C2 changes code quality
+        // only. Lifting the precise-frame case too is the natural follow-up.
+        //
+        // `CRATONVM_JIT_NO_EXC_TABLE_C2=1` restores the old blanket exclusion.
+        // It exists so one binary can be A/B'd against its own pre-change
+        // behaviour — the only rigorous control, since comparing against a
+        // separately built branch confounds this change with everything else
+        // that landed — and as an escape hatch if a workload ever regresses.
+        && !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
+        && !precise_exception_frames
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it
@@ -8227,6 +8271,12 @@ fn try_compile_inner(
                         if let Some((entry, callee_needs_ctx)) = direct_target {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
                             ir_direct_callee_entries.push(entry);
+                        } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                            .is_some()
+                        {
+                            eprintln!(
+                                "[cratonvm-jitc] ir-direct-call MISSED {cn}.{mn}{desc} @pc={pc} ir_direct={ir_direct} static={is_static} special={is_special}"
+                            );
                         }
                         // IR inline caches (jit-inlining-and-ir-calls). A
                         // virtual / interface site is NOT statically bound, so
@@ -8939,6 +8989,13 @@ fn try_compile_inner(
                                 ));
                                 inline_sites.insert(pc, site);
                                 planned_inline = true;
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                    .is_some()
+                                {
+                                    eprintln!(
+                                        "[cratonvm-jitc] inline-planned {class_name}.{method_name}{descriptor} @pc={pc}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -9097,6 +9154,64 @@ fn try_compile_inner(
                             },
                         ));
                         continue;
+                    }
+                } else if direct_jit_callee_calls_enabled {
+                    // INLINE-BAIL FALLBACK (tomcat doc 04, 2026-07-27).
+                    //
+                    // A site planned for inlining used to get NO direct call,
+                    // because the whole direct-call ladder sits inside
+                    // `!planned_inline`. The codegen tries `try_emit_inline`
+                    // first and ROLLS BACK on any unsupported bytecode
+                    // (`x64.rs` 0xb8 arm), and its fall-through order is
+                    // direct_calls → invoke_info — so a bailed inline landed on
+                    // the generic `jit_invoke_dispatch` helper, the SLOWEST of
+                    // the three options, for the life of the compiled body.
+                    //
+                    // That is not a corner case: `try_jit_compile_callee_slow`
+                    // (the tiered BACKGROUND worker, which compiles nearly
+                    // every hot method) always passes an inline resolver, while
+                    // the mutator path gates its own on the default-OFF
+                    // `CRATONVM_JIT_MAIN_INLINE`. So background-compiled bodies
+                    // planned inlining for every small static/special callee
+                    // and, whenever codegen declined it, paid ~196 ns per call
+                    // instead of the ~5 ns a raw CALL costs (measured with
+                    // `apps/tomcat-suite-runner/probes/CallCostProbe.java`,
+                    // same binary, `CRATONVM_BG_COMPILE=0` as the control).
+                    //
+                    // Planning a direct call ALONGSIDE the inline site costs
+                    // nothing when the inline succeeds (codegen checks
+                    // `inline_sites` first and `continue`s), and turns the bail
+                    // into a raw CALL instead of a helper round trip. No
+                    // `continue` here, so the RBC.3 `JitInvokeInfo` fallback is
+                    // still registered below as the last resort.
+                    if let Some(compiler) = callee_compiler.as_ref() {
+                        if let Some((entry, callee_needs_ctx)) =
+                            compiler(&class_name, &method_name, &descriptor)
+                        {
+                            if jit_direct_call_requires_dispatch(
+                                &class_name,
+                                &method_name,
+                                &descriptor,
+                            ) {
+                                needs_heap = true;
+                                mark_current_jit_compile_method_recursive_cycle();
+                            } else {
+                                if callee_needs_ctx {
+                                    needs_heap = true;
+                                }
+                                direct_callee_entries.push(entry);
+                                direct_calls.push((
+                                    pc,
+                                    JitDirectCall {
+                                        entry,
+                                        needs_context: callee_needs_ctx,
+                                        num_params,
+                                        return_type: ret_type,
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                            }
+                        }
                     }
                 } // end !planned_inline (RBC.3)
             }

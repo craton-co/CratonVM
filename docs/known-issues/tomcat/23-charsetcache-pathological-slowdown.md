@@ -160,7 +160,9 @@ even when the class times out.
 
 Distinct from the general interpreter/JIT throughput ceiling in
 `../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md` and
-`04-embedded-server-throughput-wall-OPEN.md`.
+`../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md`
+(retired 2026-07-27; its deploy residual is now
+`31-synchronized-code-never-jit-compiled.md`).
 Those are roughly-uniform overhead versus HotSpot. This is a specific method
 being refused compilation outright, plus a set of now-fixed hot-path defects.
 
@@ -271,3 +273,51 @@ document.
 
 Reproduce the measurement with the `LazyIsolate` probe shape above; the d5/d9
 "delete the try/catch, change nothing else" control is what makes it airtight.
+
+## Correction 2026-07-28 — the C2 exclusion is real, but it is NOT what d8/d9 measured
+
+The section above identified the optimizing tier's blanket refusal of
+exception-table methods (`cached.exception_table.is_empty()` in
+`try_compile_inner`) and attributed the measured d8-vs-d9 gap to it. **The
+exclusion was real and is now fixed; the attribution was wrong.**
+
+What the fix changed (jit/src/ir.rs, jit/src/lib.rs, reader/src/verified_code.rs):
+the IR builder now skips handler bodies — they are unreachable in a compiled
+frame, because a JIT frame never enters its own handler — so an exception table
+no longer disqualifies a method from the optimizing tier. Verified: a
+`try`/`catch` method reaches the IR backend (`try_catch_param_only_handler_uses_ir`),
+and the same method emits **401 bytes via C2 vs 482 via single-pass** with the
+new `CRATONVM_JIT_NO_EXC_TABLE_C2` opt-out flipped.
+
+Why it does not explain the d8/d9 gap. Measured A/B on ONE binary with that
+flag, which is the only rigorous control:
+
+| | fix ON | fix OFF | compiled size |
+|---|---|---|---|
+| d8 (`try`) | ~4200 ns/op | ~4200 ns/op | `len=1954` both |
+| d9 (no `try`) | ~610 ns/op | ~610 ns/op | `len=1949` |
+
+d8's code is byte-for-byte the same size with the fix on and off: it never
+reached the optimizing tier either way (`ir_compatible` holds it off — it is
+call-heavy — not the exception table). And the two bodies compile to within five
+bytes of each other while running 7x apart, which rules out code quality as the
+cause on its own.
+
+The actual cause of the 7x is caller-side and is written up separately:
+[a callee that declares an exception table is barred from the inline-cache fast
+path](../jit-bans/exception-table-callee-barred-from-inline-cache-20260728.md).
+Every call to such a method pays the full dispatch helper instead of the inline
+cascade, because the helper is the only place that can route a pending exception
+through the callee's own table.
+
+**Methodological note on how the wrong attribution happened.** The 2026-07-27
+numbers were taken by comparing two separately built binaries. The comparison
+binary turned out to be a feature branch **260 commits behind dev**, so the
+measurement confounded the try/catch variable with 260 commits of unrelated JIT
+work — visible in hindsight because d9, which has no `try`/`catch` at all and
+therefore cannot be affected by any exception-table gate, also moved by 12x
+between the two binaries. Always A/B a single binary against itself behind a
+flag; if a control that *cannot* move does move, the comparison is invalid.
+
+**Consequence for this document:** `timeLazy` is still expected to fail, and the
+reason is now the inline-cache ban, not the tier. Doc 23 stays OPEN.

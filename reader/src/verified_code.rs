@@ -65,6 +65,34 @@ impl VerifiedCode {
         self.instruction_at(pc).is_some()
     }
 
+    /// The **normal** (non-exceptional) control-flow successors of the
+    /// instruction at `pc`: its branch/switch targets plus the fall-through,
+    /// where the opcode has one.
+    ///
+    /// Deliberately excludes exception edges. A caller that walks from pc 0
+    /// with only these edges therefore visits exactly the instructions the
+    /// method can reach *without* throwing — i.e. everything except the bodies
+    /// of its `catch`/`finally` handlers. That is the reachability the
+    /// compiler frontends want, because a JIT frame never enters its own
+    /// handler: an exception makes the compiled body return the `i64::MIN`
+    /// sentinel and the runtime re-runs (or resumes) the method in the
+    /// interpreter, which is what actually consults the exception table.
+    ///
+    /// Returns an empty vec for a pc that is not an instruction boundary.
+    pub fn successors(&self, pc: usize) -> Vec<usize> {
+        let Some(decoded) = self.instruction_at(pc) else {
+            return Vec::new();
+        };
+        // Already validated by `decode`, which rejects any out-of-range or
+        // mid-instruction target, so the error arm is unreachable here.
+        let mut out = instruction_targets(&decoded.instruction, pc, self.code.len())
+            .unwrap_or_default();
+        if falls_through(&decoded.instruction) && (decoded.next_pc as usize) < self.code.len() {
+            out.push(decoded.next_pc as usize);
+        }
+        out
+    }
+
     fn decode(code: &[u8]) -> Result<Self, ClassReaderError> {
         if code.len() > u16::MAX as usize {
             return Err(ClassReaderError::InvalidClassData {
@@ -248,6 +276,32 @@ fn instruction_targets(
         .into_iter()
         .map(|offset| checked_target(pc, offset, code_len))
         .collect()
+}
+
+/// Does control fall out of this instruction into the textually next one?
+///
+/// False exactly for the unconditional transfers: `goto`/`goto_w`, the two
+/// switches, every `*return`, `athrow`, and `ret` (whose successor is the
+/// dynamic `jsr` return address, not the next pc — modelling it as a
+/// fall-through would be wrong, and conservatively dropping it only makes
+/// reachability smaller, never larger).
+fn falls_through(instruction: &Instruction) -> bool {
+    use Instruction::*;
+    !matches!(
+        instruction,
+        Goto(_)
+            | GotoW(_)
+            | Tableswitch(_)
+            | Lookupswitch(_)
+            | Ireturn
+            | Lreturn
+            | Freturn
+            | Dreturn
+            | Areturn
+            | Return
+            | Athrow
+            | Ret(_)
+    )
 }
 
 fn is_conditional(instruction: &Instruction) -> bool {

@@ -127,8 +127,22 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // close()
-    r.register(ic, "close", "()V", |_ctx, _args| Ok(None));
+    // close() — STUB-REMOVAL (wave 2): was an unconditional no-op. This
+    // `InitialContext` keeps its whole binding store in its OWN fields (slot 0
+    // = bindings map, slot 1 = environment), so `close()` genuinely has
+    // something to release; doing nothing leaked the map (and every bound
+    // object graph hanging off it) for the lifetime of the context object.
+    // `Context.close()` is specified as "releases this context's resources
+    // immediately" and "invoking any other method on a closed context is not
+    // allowed", so dropping the store is faithful: a subsequent `lookup`
+    // reports name-not-found rather than silently serving stale bindings.
+    // Idempotent — closing twice just clears already-null fields.
+    r.register(ic, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Object(None));
+        ctx.set_field(this, 1, Value::Object(None));
+        Ok(None)
+    });
 
     // getEnvironment() -> Hashtable
     r.register(
@@ -611,7 +625,21 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
             Ok(Some(event))
         },
     );
-    r.register(xer, "close", "()V", |_ctx, _args| Ok(None));
+    // STUB-REMOVAL (wave 2): was an unconditional no-op. `XMLEventReader.close()`
+    // is specified as "frees any resources associated with this Reader" — for
+    // this array-backed reader that is the materialised event array in slot 0,
+    // which a no-op pinned for the object's whole lifetime (an entire parsed
+    // document per reader). Release it and zero the count so a post-close
+    // `hasNext()` answers false and `nextEvent()` raises the same
+    // "No more events" XMLStreamException it already raises at end of input,
+    // instead of continuing to serve events from a closed reader.
+    r.register(xer, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Object(None));
+        ctx.set_field(this, 1, Value::Int(0));
+        ctx.set_field(this, 2, Value::Int(0));
+        Ok(None)
+    });
 
     // --- XMLStreamReader ---
     let xsr = "javax/xml/stream/XMLStreamReader";
@@ -681,7 +709,19 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(ctx.get_field(event, 2))) // text field
     });
-    r.register(xsr, "close", "()V", |_ctx, _args| Ok(None));
+    // STUB-REMOVAL (wave 2): same reasoning as the `XMLEventReader.close()`
+    // sibling above — release the materialised event array and zero the
+    // counters so the reader reports end-of-input after close instead of
+    // continuing to serve events (and holding the whole parsed document
+    // alive).
+    r.register(xsr, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Object(None));
+        ctx.set_field(this, 1, Value::Int(0));
+        ctx.set_field(this, 2, Value::Int(0));
+        ctx.set_field(this, 3, Value::Int(0));
+        Ok(None)
+    });
 
     // --- XMLEvent types ---
     // Event object: 0=type(int), 1=name(String), 2=text(String)
@@ -1594,16 +1634,37 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(result))))
     });
 
-    // StandardJavaFileManager.close()
+    // StandardJavaFileManager.close() — STUB-REMOVAL (wave 2): was an
+    // unconditional no-op, so a closed file manager stayed indistinguishable
+    // from an open one. `JavaFileManager.close()` is specified as "a file
+    // manager that has been closed will throw IllegalStateException on
+    // subsequent use", and code that relies on that (a try-with-resources
+    // block asserting the manager is unusable afterwards) saw no difference at
+    // all. Record the closed flag in slot 1 (set to 0 at construction by
+    // `getStandardFileManager` above) and enforce it below. `close()` itself is
+    // idempotent, as the spec requires.
     let sfm = "javax/tools/StandardJavaFileManager";
-    r.register(sfm, "close", "()V", |_ctx, _args| Ok(None));
+    r.register(sfm, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 1, Value::Int(1));
+        Ok(None)
+    });
 
     // StandardJavaFileManager.getJavaFileObjectsFromStrings(Iterable) -> Iterable
     r.register(
         sfm,
         "getJavaFileObjectsFromStrings",
         "(Ljava/lang/Iterable;)Ljava/lang/Iterable;",
-        |ctx, _args| {
+        |ctx, args| {
+            // See `close()` above: use after close is an IllegalStateException,
+            // not a silently-empty result.
+            let this = obj_arg(args, 0)?;
+            if ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "file manager is closed".to_string(),
+                }
+                .into());
+            }
             // Return an empty list; file objects require JDK filesystem integration
             let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
             let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
@@ -1633,7 +1694,16 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         "eval",
         "(Ljava/lang/String;)Ljava/util/List;",
         |ctx, args| {
-            let _this = obj_arg(args, 0)?;
+            let this = obj_arg(args, 0)?;
+            // See `close()` below: real `JShell.eval` on a closed instance
+            // throws IllegalStateException("Closed"); slot 0 (the history list)
+            // is nulled by close, so its absence is the closed marker.
+            if matches!(ctx.get_field(this, 0), Value::Object(None)) {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "Closed".to_string(),
+                }
+                .into());
+            }
             let source = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -1659,7 +1729,17 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(jshell, "close", "()V", |_ctx, _args| Ok(None));
+    // STUB-REMOVAL (wave 2): was an unconditional no-op, so a "closed" JShell
+    // kept evaluating snippets and kept its whole history list reachable. Real
+    // `JShell.close()` shuts the instance down and every later `eval` throws
+    // IllegalStateException. Release the history (slot 0) and reset the
+    // counter; `eval` above treats a null history as closed. Idempotent.
+    r.register(jshell, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Object(None));
+        ctx.set_field(this, 1, Value::Int(0));
+        Ok(None)
+    });
 
     // SnippetEvent accessors
     let se = "jdk/jshell/SnippetEvent";

@@ -22969,18 +22969,44 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(None),
     };
     let ois_cls = "java/io/ObjectInputStream";
+    // Pin BEFORE the first GC-capable call: `defaultReadObject` already
+    // replays this map's own serialized fields, so it allocates and can
+    // collect just like the per-entry `readObject`s below.
+    let this_pin = ctx.pin_native_root(this);
+    let ois_pin = ctx.pin_native_root(ois);
+    let mut this = this;
+    let mut ois = ois;
     ctx.invoke(
         ois_cls,
         "defaultReadObject",
         "()V",
         &[Value::Object(Some(ois))],
     )?;
+    ois = ctx.read_native_pin(ois_pin, ois);
     // buckets (ignored — capacity is recomputed from size)
     let _ = ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])?;
+    ois = ctx.read_native_pin(ois_pin, ois);
     let n = match ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])? {
         Some(Value::Int(v)) => v,
         _ => 0,
     };
+    ois = ctx.read_native_pin(ois_pin, ois);
+    this = ctx.read_native_pin(this_pin, this);
+    // GC-safety: each `readObject` below replays an arbitrary nested object
+    // graph, so it allocates and can collect. `this` and `ois` were captured
+    // into bare Rust locals at entry and are invisible to the collector's root
+    // scan; a collection that relocates them — the "non-moving" young sweep
+    // still SELECTIVELY PROMOTES survivors into old gen — leaves both locals
+    // addressing reclaimed young memory.
+    //
+    // Both stale locals were observed crashing
+    // `TestGroupChannelSenderConnections`: a stale `ois` is passed as the
+    // receiver of the NEXT `readObject`, and the interpreter's getfield
+    // receiver barrier then faults reading a reclaimed header
+    // (`VmHeap::load_and_forward`); a stale `this` faults in
+    // `native_map_put_evict`'s `object_num_fields`. Pin both across the whole
+    // replay and re-read after every GC-capable call. `key` has to survive the
+    // second `readObject` too, so it is pinned across it.
     for _ in 0..n {
         let key = ctx
             .invoke(
@@ -22990,6 +23016,8 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 &[Value::Object(Some(ois))],
             )?
             .unwrap_or(Value::Object(None));
+        ois = ctx.read_native_pin(ois_pin, ois);
+        let key_pin = pin_value(ctx, key);
         let value = ctx
             .invoke(
                 ois_cls,
@@ -22998,6 +23026,9 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 &[Value::Object(Some(ois))],
             )?
             .unwrap_or(Value::Object(None));
+        ois = ctx.read_native_pin(ois_pin, ois);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        this = ctx.read_native_pin(this_pin, this);
         // evict=false mirrors HotSpot's `HashMap.readObject`, which calls
         // `putVal(hash, key, value, false, false)`: the trailing `evict=false`
         // suppresses `afterNodeInsertion`'s `removeEldestEntry` callback while
@@ -23009,7 +23040,17 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // `NullPointerException: Cannot invoke
         // "...removeEldestEntry(...)" because "this.this$0" is null`.
         native_map_put_evict(ctx, &[Value::Object(Some(this)), key, value], false)?;
+        // `native_map_put_evict` itself runs bytecode (hashCode/equals on the
+        // key, plus table growth), so refresh the pinned receiver once more
+        // before the next iteration reuses it.
+        this = ctx.read_native_pin(this_pin, this);
+        ois = ctx.read_native_pin(ois_pin, ois);
+        if key_pin != usize::MAX {
+            ctx.unpin_native_roots(key_pin);
+        }
     }
+    ctx.unpin_native_roots(ois_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -36166,6 +36207,174 @@ fn chm_init_segments(
     // segments array length, which is always a power of two.
 }
 
+/// `ConcurrentHashMap.writeObject(ObjectOutputStream)`.
+///
+/// CratonVM keeps a `ConcurrentHashMap`'s entries in the segmented native
+/// layout rooted at `CHM_FIELD_SEGMENTS`, NOT in the real JDK's `table` field
+/// (which stays null for the object's whole life). The JDK's own
+/// `writeObject` walks `table` with a `Traverser`, so it found nothing and
+/// serialised EVERY `ConcurrentHashMap` as EMPTY -- `deser(ser(chm)).size()`
+/// was 0 for a two-entry map, while `HashMap` (whose natives do maintain the
+/// real bucket layout) round-tripped fine.
+///
+/// Real-world fallout: Spring's `PersistenceAnnotationBeanPostProcessor`
+/// tracks extended `EntityManager`s to close in a
+/// `ConcurrentHashMap<Object, EntityManager>`. Serialising a `SimpleMapScope`
+/// carries that post-processor along; after deserialisation the map came back
+/// empty, so `postProcessBeforeDestruction` found no EM to close and
+/// `PersistenceInjectionTests.publicExtendedPersistenceContextSetterWith\
+/// Serialization` failed on `assertThat(DummyInvocationHandler.closed).isTrue()`.
+///
+/// This emits the JDK's serial form byte-for-byte compatibly: the three
+/// `serialPersistentFields` (`segments`, `segmentShift`, `segmentMask`),
+/// then alternating key/value objects, then two nulls as the terminator.
+/// `segments` is written as null -- the JDK writes a freshly built,
+/// entry-free `Segment[16]` there purely for pre-Java-8 stream compatibility
+/// and its own `readObject` discards the value without dereferencing it, so a
+/// null is accepted by both HotSpot's reader and ours.
+fn native_chm_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let stream_pin = ctx.pin_native_root(stream);
+
+    let result = (|| -> MethodCallResult {
+        // --- serialPersistentFields, in the JDK's declaration order.
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        let put_field = match ctx.invoke_virtual(
+            stream,
+            "putFields",
+            "()Ljava/io/ObjectOutputStream$PutField;",
+            &[],
+        )? {
+            Some(Value::Object(Some(pf))) => pf,
+            _ => return Ok(None),
+        };
+        let pf_pin = ctx.pin_native_root(put_field);
+        for (name, value) in [
+            ("segments", Value::Object(None)),
+            // DEFAULT_CONCURRENCY_LEVEL is 16 => ssize 16, sshift 4.
+            ("segmentShift", Value::Int(32 - 4)),
+            ("segmentMask", Value::Int(16 - 1)),
+        ] {
+            let name_obj = ctx.create_string(name);
+            let put_field = ctx.read_native_pin(pf_pin, put_field);
+            let desc = if matches!(value, Value::Int(_)) {
+                "(Ljava/lang/String;I)V"
+            } else {
+                "(Ljava/lang/String;Ljava/lang/Object;)V"
+            };
+            ctx.invoke_virtual(
+                put_field,
+                "put",
+                desc,
+                &[Value::Object(Some(name_obj)), value],
+            )?;
+        }
+        ctx.unpin_native_roots(pf_pin);
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        ctx.invoke_virtual(stream, "writeFields", "()V", &[])?;
+
+        // --- key/value pairs, then the two-null terminator.
+        let this = ctx.read_native_pin(this_pin, this);
+        let entries = collect_entries_any(ctx, this);
+        let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+        let (_, flat_pins) = pin_value_slice(ctx, &flat);
+        for i in 0..flat.len() {
+            let v = read_pinned_elem(ctx, flat_pins[i], flat[i]);
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            ctx.invoke_virtual(stream, "writeObject", "(Ljava/lang/Object;)V", &[v])?;
+        }
+        for _ in 0..2 {
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            ctx.invoke_virtual(
+                stream,
+                "writeObject",
+                "(Ljava/lang/Object;)V",
+                &[Value::Object(None)],
+            )?;
+        }
+        Ok(None)
+    })();
+
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `ConcurrentHashMap.readObject(ObjectInputStream)` -- the read side of
+/// [`native_chm_write_object`].
+///
+/// The JDK body rebuilds the real `table`, which our `get`/`size`/`entrySet`
+/// natives never look at, so even a correctly written stream would have
+/// deserialised to a map that reads as empty. Read the same wire form and
+/// funnel every pair through the segmented native layout instead.
+///
+/// The stream allocates the instance without running any `<init>`, so the
+/// segments array is absent on entry and has to be built before the first
+/// `put` (`chm_segment_for` would otherwise answer `None` and silently drop
+/// every entry).
+fn native_chm_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let stream_pin = ctx.pin_native_root(stream);
+
+    let result = (|| -> MethodCallResult {
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        ctx.invoke_virtual(stream, "defaultReadObject", "()V", &[])?;
+
+        let this = ctx.read_native_pin(this_pin, this);
+        if !matches!(
+            ctx.get_field(this, CHM_FIELD_SEGMENTS),
+            Value::Object(Some(_))
+        ) {
+            chm_init_segments(
+                ctx,
+                this,
+                CHM_DEFAULT_INIT_SEGMENTS,
+                CHM_DEFAULT_SEGMENT_CAP,
+            );
+        }
+
+        loop {
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            let key = match ctx.invoke_virtual(stream, "readObject", "()Ljava/lang/Object;", &[])? {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => break,
+            };
+            let key_pin = pin_value(ctx, key);
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            let val = match ctx.invoke_virtual(stream, "readObject", "()Ljava/lang/Object;", &[])? {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => {
+                    ctx.unpin_native_roots(key_pin);
+                    break;
+                }
+            };
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let this = ctx.read_native_pin(this_pin, this);
+            native_chm_put(ctx, &[Value::Object(Some(this)), key, val])?;
+            ctx.unpin_native_roots(key_pin);
+        }
+        Ok(None)
+    })();
+
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -36176,6 +36385,27 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "<init>", "(I)V", native_chm_init_capacity);
     r.register(c, "<init>", "(IFI)V", native_chm_init_full);
     r.register(c, "<init>", "(Ljava/util/Map;)V", native_chm_init_from_map);
+
+    // Java serialization -- the real JDK bodies walk/rebuild the `table`
+    // field that CratonVM's segmented layout never populates, so a CHM
+    // round-tripped through ObjectOutputStream came back EMPTY. See
+    // `native_chm_write_object`. Both are private and reached through
+    // `ObjectStreamClass.invokeWriteObject`/`invokeReadObject`'s reflective
+    // `Method.invoke`, so they also need the
+    // `force_native_over_real_jdk_bytecode` entry (interpreter.rs) to beat
+    // the real bytecode.
+    r.register(
+        c,
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
+        native_chm_write_object,
+    );
+    r.register(
+        c,
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+        native_chm_read_object,
+    );
 
     // Core operations — segmented
     r.register(c, "size", "()I", native_chm_size);
@@ -41225,18 +41455,39 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let mut target = args.get(1).cloned().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Int(0))),
+    // Stub-removal wave 2 (2026-07-28): `al_state` only understands the
+    // ArrayList shape (field 0 = backing array, field 1 = size). EVERY other
+    // Collection — `Arrays.asList` (an `Arrays$ArrayList`), `HashSet`,
+    // `LinkedList`, any user Collection — fell into the `None` arm and
+    // reported frequency 0, i.e. "this element does not occur", for a
+    // collection full of matches. Measured against HotSpot 25:
+    // Arrays.asList 3 -> 0, HashSet 1 -> 0, LinkedList 2 -> 0.
+    // Drive the receiver's own `toArray()` instead; every Collection has one.
+    let (data, size) = match data {
+        Some(d) => (d, size),
+        None => {
+            let coll_pin = ctx.pin_native_root(coll);
+            let target_pin = pin_value(ctx, target);
+            let arr = ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])?;
+            target = read_pinned_elem(ctx, target_pin, target);
+            ctx.unpin_native_roots(coll_pin);
+            match arr {
+                Some(Value::Object(Some(a))) => {
+                    let n = ctx.array_length(a) as i32;
+                    (a, n)
+                }
+                _ => return Ok(Some(Value::Int(0))),
+            }
+        }
     };
     // Family-1 fix (cce0079): pinned scan (counts every match, so no
     // early-exit helper).
     let data_pin = ctx.pin_native_root(data);
     let th = pin_value(ctx, target);
     let mut data = data;
-    let mut target = target;
+
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
@@ -44839,6 +45090,16 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- ForkJoinPool.awaitQuiescence ---
+    //
+    // KEEP (W2 stub sweep). `true` means "the pool became quiescent within the
+    // timeout", and that is unconditionally the truth for CratonVM's
+    // ForkJoinPool: `phases_early`'s `register_forkjoin_natives` AND its
+    // real-JDK twin `register_real_jdk_forkjoin_essentials` both override
+    // `fork`/`invoke`/`submit`/`join` to run `compute()` INLINE on the calling
+    // thread, so no task is ever outstanding in a worker by the time any thread
+    // can observe the pool. It is consistent with the `getActiveThreadCount()
+    // == 0` / `getQueuedTaskCount() == 0` pair in that same file. Waiting or
+    // returning false here would only ever be a wait for nothing.
     let pool = "java/util/concurrent/ForkJoinPool";
     r.register(
         pool,

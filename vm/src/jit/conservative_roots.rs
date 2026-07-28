@@ -1119,6 +1119,42 @@ fn moving_young_frame_live_hi(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> 
     (hi > 0).then_some(hi)
 }
 
+/// Whether `exact_rbp` recorded for a chain entry actually belongs to a
+/// DEEPER, unguarded compiled frame rather than to the entry's own method.
+///
+/// A chain entry is pushed at a Rust/interpreter -> JIT boundary, so the frame
+/// it describes was called from non-JIT code and its return address does NOT
+/// point into compiled code. Every compiled prologue, however, publishes its
+/// own RBP into the innermost-RBP mirror, which is flushed into the top chain
+/// entry before every GC walk — and two generated-code paths reach a compiled
+/// callee with no guard at all: the inline MIC/PIC cascade and the hashed
+/// megamorphic stub (`runtime_lowering::emit_hashed_vtable_stub`, which is not
+/// gated by `direct_jit_callee_calls_enabled()`). After such a call the entry
+/// still names the boundary method while `exact_rbp` names the callee's frame.
+///
+/// Detect it by the frame's own return address: if `[exact_rbp + 8]` points
+/// into registered JIT code, the frame was entered FROM compiled code and this
+/// entry cannot describe it. Using the entry's `compiled_method` for that RBP
+/// would validate coverage against a safepoint id read out of an unrelated
+/// frame slot and then rewrite `[rbp - off]` for the wrong method's oop map,
+/// leaving the callee's real oops unrelocated across an evacuation.
+///
+/// The outward RBP-chain walk is unaffected: it resolves every ancestor from
+/// its return address, which is correct regardless.
+fn chain_entry_rbp_is_foreign(exact_rbp: usize, entry_sp: usize, scanner_sp: usize) -> bool {
+    if exact_rbp == 0 || exact_rbp & 0x7 != 0 {
+        return false;
+    }
+    if exact_rbp < scanner_sp || exact_rbp.saturating_add(16) > entry_sp {
+        return false;
+    }
+    // SAFETY: aligned read of the saved return address inside this thread's own
+    // live JIT stack band, bounded by `scanner_sp` / `entry_sp` exactly as the
+    // neighbouring chain walks do.
+    let ret_addr = unsafe { ((exact_rbp + 8) as *const usize).read() };
+    cratonvm_jit::lookup_jit_code_range(ret_addr).is_some()
+}
+
 fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledMethod) -> bool {
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
@@ -1585,7 +1621,22 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 complete = false;
                 continue;
             }
-            if !moving_young_frame_coverage_complete(exact_rbp, cm) {
+            if chain_entry_rbp_is_foreign(exact_rbp, entry.entry_sp, scanner_sp) {
+                // The recorded RBP is a deeper frame reached by a direct
+                // JIT->JIT call that pushed no guard, so `cm` does not describe
+                // it and nothing here can. Relocating would strand that frame's
+                // oops; take the non-moving sweep for this cycle instead.
+                if dbg {
+                    eprintln!(
+                        "[moving-young-coverage] incomplete: innermost rbp=0x{:x} belongs to an unguarded JIT callee",
+                        exact_rbp
+                    );
+                }
+                cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                    cratonvm_gc::gc_quiescence::incomplete_reason::FOREIGN_INNERMOST_RBP,
+                );
+                complete = false;
+            } else if !moving_young_frame_coverage_complete(exact_rbp, cm) {
                 if dbg {
                     eprintln!(
                         "[moving-young-coverage] incomplete: active frame map at rbp=0x{:x}",
@@ -1613,6 +1664,22 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 // `remap_active_jit_frames`.
                 let parent_rbp = unsafe { (child_rbp as *const usize).read() };
                 let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                // A link read out of the stack is NOT yet a frame base. Both
+                // helpers below dereference `[parent_rbp - sp_id_slot_off]`
+                // (and `remap_one_jit_frame` WRITES every slot its oop map
+                // names), so the link must be validated BEFORE it is used, not
+                // after: a zero/garbage word faulted at `0 - sp_id_slot_off`
+                // while walking a json-smart chain. Same order and same
+                // predicate as the other rbp-chain walks in this file
+                // (`scan_active_oop_map_at_rbp`'s walk and the two conservative
+                // band walks).
+                if parent_rbp <= child_rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp < scanner_sp
+                    || parent_rbp >= entry.entry_sp
+                {
+                    break;
+                }
                 let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
                     break;
                 };
@@ -1629,9 +1696,6 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                         cratonvm_gc::gc_quiescence::incomplete_reason::PARENT_FRAME_MAP,
                     );
                     complete = false;
-                }
-                if parent_rbp <= child_rbp {
-                    break;
                 }
                 child_rbp = parent_rbp;
             }
@@ -2331,6 +2395,13 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                 && info.exact_rbp & 0x7 == 0
                 && info.exact_rbp >= scanner_sp
                 && info.exact_rbp < entry_sp
+                // See `chain_entry_rbp_is_foreign`: after an unguarded
+                // JIT->JIT direct call this RBP is the CALLEE's frame, which
+                // `info.compiled_method` does not describe. The coverage check
+                // refuses to move in that case, so this is belt-and-braces —
+                // but remapping a frame with another method's oop map is the
+                // exact corruption being fixed, so never do it.
+                && !chain_entry_rbp_is_foreign(info.exact_rbp, entry_sp, scanner_sp)
             {
                 // SAFETY: `info.compiled_method` came from the live chain entry
                 // and is kept alive by the JIT cache while the frame is active.
@@ -2385,6 +2456,22 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                 // + 8]` the return address into the caller.
                 let parent_rbp = unsafe { (child_rbp as *const usize).read() };
                 let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                // A link read out of the stack is NOT yet a frame base. Both
+                // helpers below dereference `[parent_rbp - sp_id_slot_off]`
+                // (and `remap_one_jit_frame` WRITES every slot its oop map
+                // names), so the link must be validated BEFORE it is used, not
+                // after: a zero/garbage word faulted at `0 - sp_id_slot_off`
+                // while walking a json-smart chain. Same order and same
+                // predicate as the other rbp-chain walks in this file
+                // (`scan_active_oop_map_at_rbp`'s walk and the two conservative
+                // band walks).
+                if parent_rbp <= child_rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp < scanner_sp
+                    || parent_rbp >= entry_sp
+                {
+                    break;
+                }
                 // Resolve the PARENT frame's CompiledMethod from the return
                 // address that points into it.
                 match cratonvm_jit::lookup_jit_code_range(ret_addr) {
@@ -2403,9 +2490,6 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                         dbg_examined.set(dbg_examined.get() + examined);
                     }
                     None => break, // parent is the interpreter / Rust boundary
-                }
-                if parent_rbp <= child_rbp {
-                    break; // stack must ascend (grows downward); else garbage
                 }
                 child_rbp = parent_rbp;
             }
@@ -2638,7 +2722,20 @@ fn scan_one_frame_precise(info: PreciseFrameInfo, heap: &VmHeap, out: &mut Vec<O
         && info.exact_rbp >= scanner_sp
         && info.exact_rbp < info.frame_base
     {
-        scan_active_oop_map_at_rbp(info.exact_rbp, cm, heap, out);
+        // `cm` describes the frame this chain entry was pushed for. It does NOT
+        // describe `exact_rbp` when an unguarded JIT->JIT direct call has since
+        // published a deeper frame base there (see
+        // `chain_entry_rbp_is_foreign`); reading a safepoint id out of that
+        // frame at this method's offset and publishing this method's slot list
+        // would leave the callee's real oops unmarked, and the non-moving sweep
+        // then reclaims them while they are live. The parent walk below is
+        // unaffected: it resolves every ancestor from its own return address,
+        // so the true caller is still scanned precisely, and
+        // `scan_compiled_frame_bands` covers the unidentified frame
+        // conservatively.
+        if !chain_entry_rbp_is_foreign(info.exact_rbp, info.frame_base, scanner_sp) {
+            scan_active_oop_map_at_rbp(info.exact_rbp, cm, heap, out);
+        }
 
         let mut child_rbp = info.exact_rbp;
         let mut guard = 0usize;
@@ -2709,22 +2806,33 @@ fn scan_compiled_frame_bands(
         return false;
     }
 
-    // The innermost frame is the method retained by the entry guard. Parent
-    // frames are identified through the child frame's return address.
+    // The innermost frame is the method retained by the entry guard — UNLESS an
+    // unguarded JIT->JIT direct call published a deeper frame base into
+    // `exact_rbp`, in which case that method is unknown here and its frame size
+    // must not be taken from the entry's method. Bound its band by the
+    // scanner's own SP instead: the collector runs beneath that frame, so
+    // `[scanner_sp, rbp)` covers all of it and nothing above it. Parent frames
+    // are identified through the child frame's return address either way.
     let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
+    let mut innermost_is_foreign = chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp);
     let mut frames = 0usize;
     while frames < 4096 {
         frames += 1;
-        let frame_size = cm.osr_frame_size;
-        if frame_size <= 0 {
-            return false;
+        if innermost_is_foreign {
+            innermost_is_foreign = false;
+            scan_one_frame(scanner_sp, rbp, heap, out);
+        } else {
+            let frame_size = cm.osr_frame_size;
+            if frame_size <= 0 {
+                return false;
+            }
+            let frame_size = frame_size as usize;
+            const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+            if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+                return false;
+            }
+            scan_one_frame(rbp - frame_size, rbp, heap, out);
         }
-        let frame_size = frame_size as usize;
-        const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
-        if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
-            return false;
-        }
-        scan_one_frame(rbp - frame_size, rbp, heap, out);
 
         // `[rbp]` and `[rbp + 8]` hold the saved caller RBP and return PC.
         // A non-JIT parent ends the successful walk: it has no JIT spill band.

@@ -1660,7 +1660,16 @@ fn http2_client_orchestrator_register(r: &mut NativeMethodRegistry) {
 
 fn http1_exchange_register(r: &mut NativeMethodRegistry) {
     let cls = "jdk/internal/net/http/Http1Exchange";
-    r.register(cls, "<init>", "()V", |_ctx, _args| Ok(None));
+    // The only slot this surface uses is 0 (the request bytes stashed by
+    // `writeRequest` below). Initialise it explicitly, the way the sibling
+    // `Http1HeaderParser.<init>` does, instead of relying on the allocator
+    // having zeroed it — an empty constructor body here was indistinguishable
+    // from a forgotten one.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Object(None));
+        Ok(None)
+    });
     r.register(cls, "writeRequest", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Simply stash the bytes on the exchange (field 0) so test code

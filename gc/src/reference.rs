@@ -1348,6 +1348,24 @@ impl FinalizerThread {
         self.finalization_queue.lock().len()
     }
 
+    /// Addresses of every object still waiting for its `finalize()` to run.
+    ///
+    /// These MUST be handed to the collector as finalizable roots. Once
+    /// `ReferenceProcessor::mark_finalizer_enqueued` flags an entry,
+    /// `finalizer_referent_addresses` stops reporting it (that flag exists to
+    /// stop the resurrection channel re-enqueuing the same object on every
+    /// later cycle), so from that moment the only thing still referring to the
+    /// object is this queue — and it holds a *raw address*, which no marker
+    /// can see. `update_after_gc` already covers a moving collection, but a
+    /// non-moving young mark-sweep just frees the now-unreachable object and
+    /// leaves the queued address dangling; `run_finalizers` then dereferences
+    /// it (`heap.class_id_of`) and faults. Keeping them alive is what JLS
+    /// §12.6 requires anyway: `finalize()` runs *on* the object and may even
+    /// resurrect it.
+    pub fn pending_addresses(&self) -> Vec<usize> {
+        self.finalization_queue.lock().iter().copied().collect()
+    }
+
     pub fn dropped_count(&self) -> usize {
         self.dropped_count.load(Ordering::Relaxed)
     }
