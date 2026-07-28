@@ -100,8 +100,12 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 // is compiled-to-compiled virtual dispatch could not reproduce during a
 // default-OFF run, because the dispatch it guards was inert. JASPER-JDT.2/.3
 // (`org/eclipse/jdt/internal/compiler/parser/` and `ast/`) were removed on
-// 2026-07-26 on exactly such runs and had to be restored -- see their entry in
-// `skip_list.rs`. Re-verify any similar removal with this ON.
+// 2026-07-26 on exactly such runs and had to be restored on 2026-07-27, when
+// turning this on brought the miscompile straight back. They were only removed
+// for good on 2026-07-28, after the defect behind them was root-caused (the
+// LICM / speculative pre-header bypass fixed in `613b10f4c`) and re-measured
+// with this ON -- see their entry in `skip_list.rs`. Re-verify any similar
+// removal with this ON.
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -687,6 +691,17 @@ fn set_jit_pending_exception_with_bci(exc: ObjectRef, bci: i64) {
 /// newly-precise case.
 pub(crate) fn stash_jit_pending_exception(exc: ObjectRef) {
     set_jit_pending_exception(exc);
+}
+
+/// Forget the `athrow` bci carried by the pending exception, keeping the
+/// exception itself.
+///
+/// Called when a dispatch helper hands a CALLEE's pending exception back to its
+/// compiled caller: from that point the bci names a method that is no longer on
+/// the stack, and the caller's drain would range-check its own exception table
+/// against it. See `JitSignals::athrow_bci`.
+pub(crate) fn clear_jit_athrow_bci() {
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
 }
 
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
@@ -1454,6 +1469,90 @@ unsafe fn virtual_dispatch_class(
 ///
 /// SAFETY: `vm` must be a live `SharedVm`; `info` must point to a valid
 /// `JitInvokeInfo` whose name fields are live `&str`s.
+/// Resolve the callee named by `info` to a `CachedBytecodeMethod`, so its own
+/// exception table can be consulted and its handler run without re-executing
+/// the method. Mirrors `try_resume_trapped_callee`'s resolution recipe.
+///
+/// SAFETY: same contract as `callee_has_exception_table`.
+unsafe fn resolve_callee_cached(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>> {
+    let cm = vm.classes.class_manager.read();
+    let class_id = if info.declaring_class_id == 0 {
+        cm.find_bootstrap_class_by_name(info.class_name)
+    } else {
+        cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id))
+    }?;
+    let store = cm.class_store();
+    let (method, declaring_id) =
+        crate::classloading::find_method_recursive(class_id, info.method_name, info.descriptor, store)?;
+    let code_attr = method.code()?;
+    if code_attr.exception_table.is_empty() || method.is_synchronized() {
+        return None;
+    }
+    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+    let num_params = crate::runtime::interpreter::count_method_params(info.descriptor);
+    Some(std::sync::Arc::new(
+        crate::classloading::resolution::CachedBytecodeMethod {
+            declaring_class_id: declaring_id,
+            class_name: std::sync::Arc::from(declaring_class_name),
+            method_name: std::sync::Arc::from(info.method_name),
+            method_descriptor: std::sync::Arc::from(info.descriptor),
+            source_file: store
+                .get(declaring_id)
+                .and_then(|c| c.source_file.as_deref())
+                .map(std::sync::Arc::from),
+            code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+            exception_table: std::sync::Arc::from(code_attr.exception_table.as_slice()),
+            max_stack: code_attr.max_stack,
+            max_locals: code_attr.max_locals,
+            num_params: num_params as u16,
+            is_synchronized: method.is_synchronized(),
+            is_static: method.is_static(),
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        },
+    ))
+}
+
+/// Run the compiled callee's own handler for an exception that escaped it,
+/// resuming AT the handler instead of re-running the method from entry.
+///
+/// Returns `Some(rc)` when a handler covering the throw site was found and the
+/// resumed frame completed; `None` leaves the caller's existing behaviour
+/// (propagate, or the conservative whole-method re-run) untouched. The
+/// exception is only consumed on the `Some` path.
+///
+/// SAFETY: same contract as `route_implicit_exc_through_callee`.
+unsafe fn try_run_callee_handler(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    exc: cratonvm_types::ObjectRef,
+    throw_pc: usize,
+) -> Option<i64> {
+    let cached = resolve_callee_cached(vm, info)?;
+    let args = decode_dispatch_values(vm, info, args_slice);
+    let res = crate::runtime::interpreter::run_jit_callee_handler(
+        vm, thread, &cached, throw_pc, exc, &args,
+    )?;
+    Some(match res {
+        Ok(Some(Value::Int(v))) => v as i64,
+        Ok(Some(Value::Long(v))) => v,
+        Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+        Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+        Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+        Ok(Some(Value::Object(None))) | Ok(None) => 0,
+        Ok(_) => 0,
+        Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+    })
+}
+
 unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> bool {
     let cm = vm.classes.class_manager.read();
     let class_id = if info.declaring_class_id == 0 {
@@ -1545,6 +1644,12 @@ unsafe fn route_implicit_exc_through_callee(
     if rc != i64::MIN {
         return rc;
     }
+    // The callee has returned. Any `athrow` bci the pending exception carries is
+    // ITS bci, and every path out of here either re-runs the callee interpreted
+    // (which regenerates the exception) or hands the sentinel to the compiled
+    // CALLER, whose drain would treat that bci as its own. See
+    // `clear_jit_athrow_bci`.
+    clear_jit_athrow_bci();
     if rbc6_dbg() {
         eprintln!(
             "[rbc6-dbg] route_implicit_exc_through_callee ENTER {}.{}{} has_last_deopt={} pending_exc={} pending_npe_or_aioobe_unread=?",
@@ -1611,7 +1716,41 @@ unsafe fn route_implicit_exc_through_callee(
         // stale stashed copy is dropped first to avoid a double-drain.
         if jit_pending_exception_is_set() && callee_has_exception_table(vm, info) {
             if let Some((thread, _guard)) = jit_thread_mut() {
+                // FIRST: resume the callee AT its own handler. The re-run below
+                // double-executes everything the compiled attempt already did
+                // before the throw -- for `try { n++; mayThrow(); } finally
+                // { n--; }` that is one leaked increment per throw, because the
+                // compiled body ran `n++` and skipped the `finally`, and the
+                // re-run then adds its own balanced pass. Witnessed by
+                // `CallPathProbe`/`FinallyShapeProbe`
+                // (docs/known-issues/repros/jitban-remaining-20260726/).
+                let signals = take_all_jit_signals();
+                if let Some(exc) = signals.exception {
+                    let throw_pc = if signals.athrow_bci >= 0 {
+                        signals.athrow_bci as usize
+                    } else {
+                        usize::MAX
+                    };
+                    if let Some(v) =
+                        try_run_callee_handler(vm, thread, info, args_slice, exc, throw_pc)
+                    {
+                        return v;
+                    }
+                    // No handler covers this throw site -- restore the signal
+                    // exactly as it was found and fall through.
+                    if throw_pc == usize::MAX {
+                        set_jit_pending_exception(exc);
+                    } else {
+                        set_jit_pending_exception_with_bci(exc, throw_pc as i64);
+                    }
+                }
                 let _ = take_jit_pending_exception();
+                // The callee is about to be re-executed from its entry in the
+                // interpreter, which regenerates and routes the exception
+                // itself. Any exceptional frame its compiled body published
+                // describes the abandoned attempt — drop it with the stashed
+                // exception rather than leave it to be mis-claimed.
+                cratonvm_jit::deopt::clear_exceptional_frame();
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
                 if rbc6_dbg() {
                     eprintln!(
@@ -1630,6 +1769,9 @@ unsafe fn route_implicit_exc_through_callee(
     // Re-execute the callee in the interpreter so the implicit exception routes
     // through the callee's own exception table.
     if let Some((thread, _guard)) = jit_thread_mut() {
+        // Same reasoning as the general-exception arm above: the re-run replaces
+        // the abandoned compiled attempt, so its exceptional frame is stale.
+        cratonvm_jit::deopt::clear_exceptional_frame();
         let bail_args = decode_dispatch_values(vm, info, args_slice);
         return bail_to_interpreter(vm, thread, info, &bail_args);
     }
@@ -4251,13 +4393,120 @@ pub unsafe extern "C" fn jit_putstatic_object(
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    /// Last resolved JIT type-check target on this mutator. Compiled loops
-    /// repeatedly execute the same checkcast/instanceof site, whose class-name
+    /// Resolved JIT type-check targets on this mutator. Compiled loops
+    /// repeatedly execute the same checkcast/instanceof sites, whose class-name
     /// bytes live in the immutable JIT string table. Class IDs are stable for
     /// a VM, so `(vm, ptr, len)` is a complete cache key.
+    ///
+    /// This holds SEVERAL entries, not one. It used to be a single `Cell`, and
+    /// because the key is the class-name *pointer*, two distinct type-check
+    /// sites — even two `checkcast`s to the very same class, which get separate
+    /// string-table entries — evicted each other on every iteration. Every
+    /// execution then missed and re-ran `find_unique_class_by_name`, which
+    /// allocates two host `String`s (`to_string()` plus a `'/'`→`'.'`
+    /// `replace`) before it even looks anything up. Measured: in a loop whose
+    /// body holds one type-check site the site costs ~64ns, and a second site
+    /// in the same body costs ~1750ns *each* — a 27x cliff that any
+    /// `instanceof` ladder or twice-casting method falls off. A short linear
+    /// scan cannot thrash that way.
     static JIT_TYPECHECK_TARGET_CACHE:
-        std::cell::Cell<Option<(usize, usize, usize, u32)>> =
-        const { std::cell::Cell::new(None) };
+        std::cell::RefCell<Vec<(usize, usize, usize, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// Memoized *positive* answers from `ClassManager::is_subclass_of` for the
+    /// JIT type-check path, keyed by `(vm, child_class_id, parent_class_id)`.
+    ///
+    /// `is_subclass_of` is not cheap: it takes the process-wide
+    /// `class_manager` read lock, allocates an `FxHashSet` visited set, and
+    /// then DFS-walks the superclass chain *and* every transitively implemented
+    /// interface. `jit_typecheck_resolve` calls it on every `checkcast` /
+    /// `instanceof` whose receiver class is not *identical* to the target —
+    /// i.e. on every genuinely polymorphic type check, which is the common
+    /// case. A compiled loop doing `checkcast` on the result of a map lookup
+    /// (`(Charset) cache.get(name)`, the shape
+    /// `org.apache.tomcat.util.buf.CharsetCache.getCharset` has) therefore paid
+    /// a lock acquisition, a heap allocation and a hierarchy walk per
+    /// iteration. With several mutator threads in that loop the contended read
+    /// lock dominated everything else.
+    ///
+    /// Only `true` answers are memoized, and that is deliberate. A class's
+    /// superclass and interface lists are fixed when it is defined, so once a
+    /// subtype relation holds it holds for the life of the `SharedVm` — a
+    /// cached `true` can never go stale. A `false`, in contrast, can be
+    /// observed while the hierarchy is still being populated (a supertype not
+    /// yet in the class store makes that DFS branch stop early), so caching it
+    /// could pin a wrong answer; those keep paying the full walk exactly as
+    /// before. The cache is also bypassed entirely while any class redefine is
+    /// in flight, matching `jit_hashmap_receiver_is_exact`.
+    static JIT_SUBTYPE_POSITIVE_CACHE:
+        std::cell::RefCell<Vec<(usize, u32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Entry cap for [`JIT_SUBTYPE_POSITIVE_CACHE`]. Scanned linearly (the same
+/// shape `jit_hashmap_string_node_cache` uses) rather than direct-mapped: a
+/// direct-mapped table silently collides two hot pairs into one slot, and a
+/// loop alternating between them then misses *every* time — measured at a 40%
+/// miss rate over just five distinct receiver classes. A linear scan over this
+/// many `(usize, u32, u32)` entries cannot collide and is a handful of
+/// compares.
+const JIT_SUBTYPE_CACHE_CAP: usize = 32;
+
+/// Entry cap for [`JIT_TYPECHECK_TARGET_CACHE`]. One entry per distinct
+/// type-check *site* reached on this thread; 64 covers a long `instanceof`
+/// ladder plus the sites around it.
+const JIT_TYPECHECK_TARGET_CACHE_CAP: usize = 64;
+
+/// Record `(site key) -> resolved target class id`, evicting the oldest entry
+/// once the cache is full.
+fn jit_typecheck_target_cache_put(cache_key: (usize, usize, usize), target: ClassId) {
+    JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = (cache_key.0, cache_key.1, cache_key.2, target.as_u32());
+        if let Some(slot) = cache.iter_mut().find(|(vm, ptr, len, _)| {
+            *vm == cache_key.0 && *ptr == cache_key.1 && *len == cache_key.2
+        }) {
+            *slot = entry;
+            return;
+        }
+        if cache.len() >= JIT_TYPECHECK_TARGET_CACHE_CAP {
+            cache.remove(0);
+        }
+        cache.push(entry);
+    });
+}
+
+/// `ClassManager::is_subclass_of` with the positive-answer memo described on
+/// [`JIT_SUBTYPE_POSITIVE_CACHE`]. Behaviour-identical to calling
+/// `is_subclass_of` directly: a hit can only ever replace a call that would
+/// have returned `true` with `true`.
+fn jit_is_subclass_of_cached(vm: &SharedVm, child: ClassId, parent: ClassId) -> bool {
+    let vm_key = vm as *const SharedVm as usize;
+    let key = (vm_key, child.as_u32(), parent.as_u32());
+    let redefined = crate::classloading::any_class_redefined();
+    if !redefined {
+        let hit =
+            JIT_SUBTYPE_POSITIVE_CACHE.with(|cache| cache.borrow().iter().any(|e| *e == key));
+        if hit {
+            return true;
+        }
+    }
+    let is_subclass = {
+        vm.classes
+            .class_manager
+            .read()
+            .is_subclass_of(child, parent)
+    };
+    if is_subclass && !redefined {
+        JIT_SUBTYPE_POSITIVE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() >= JIT_SUBTYPE_CACHE_CAP {
+                cache.remove(0);
+            }
+            cache.push(key);
+        });
+    }
+    is_subclass
 }
 
 /// Common type-check resolution shared by `jit_checkcast` and `jit_instanceof`.
@@ -4372,11 +4621,12 @@ unsafe fn jit_typecheck_resolve(
     );
     let cached_target = JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
         cache
-            .get()
-            .and_then(|(cached_vm, cached_ptr, cached_len, raw)| {
-                (cached_vm == cache_key.0 && cached_ptr == cache_key.1 && cached_len == cache_key.2)
-                    .then(|| ClassId::new(raw))
+            .borrow()
+            .iter()
+            .find(|(cached_vm, cached_ptr, cached_len, _)| {
+                *cached_vm == cache_key.0 && *cached_ptr == cache_key.1 && *cached_len == cache_key.2
             })
+            .map(|(_, _, _, raw)| ClassId::new(*raw))
     });
     let target_class_id_opt = if cached_target.is_some() {
         cached_target
@@ -4387,14 +4637,7 @@ unsafe fn jit_typecheck_resolve(
             .read()
             .find_unique_class_by_name(class_name);
         if let Some(target) = resolved {
-            JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((
-                    cache_key.0,
-                    cache_key.1,
-                    cache_key.2,
-                    target.as_u32(),
-                )))
-            });
+            jit_typecheck_target_cache_put(cache_key, target);
         }
         resolved
     };
@@ -4402,12 +4645,7 @@ unsafe fn jit_typecheck_resolve(
         if obj_class_id == target_class_id {
             return true;
         }
-        let is_subclass = vm
-            .classes
-            .class_manager
-            .read()
-            .is_subclass_of(obj_class_id, target_class_id);
-        if is_subclass {
+        if jit_is_subclass_of_cached(vm, obj_class_id, target_class_id) {
             return true;
         }
         // Lambda proxy fallback uses the *already-resolved* target id.
@@ -4469,23 +4707,11 @@ unsafe fn jit_typecheck_resolve(
             thread_ref.native_pin_roots.truncate(idx);
         }
         if let Ok(target_class_id) = load_result {
-            JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
-                cache.set(Some((
-                    cache_key.0,
-                    cache_key.1,
-                    cache_key.2,
-                    target_class_id.as_u32(),
-                )))
-            });
+            jit_typecheck_target_cache_put(cache_key, target_class_id);
             if obj_class_id == target_class_id {
                 return true;
             }
-            let is_subclass = vm
-                .classes
-                .class_manager
-                .read()
-                .is_subclass_of(obj_class_id, target_class_id);
-            if is_subclass {
+            if jit_is_subclass_of_cached(vm, obj_class_id, target_class_id) {
                 return true;
             }
             if crate::runtime::interpreter::lambda_proxy_satisfies_public(
@@ -4646,6 +4872,15 @@ pub unsafe extern "C" fn jit_checkcast(
         obj_ref.as_ptr() as i64
     } else {
         if cv_trace_enabled() {
+            // The receiver's OBJECT KIND disambiguates this failure: for a
+            // reference array the header stores the *component* class id, and
+            // the message below renders it by the component name — so a
+            // genuine `T[]` → `T` refusal prints as "X cannot be cast to X"
+            // and reads like a class-identity split. Print kind + array
+            // descriptor so the two are separable (see SPRING-CRHM.1 in
+            // `vm/src/jit/skip_list.rs`, where exactly that cost hours).
+            let kind = vm.mem.heap.kind_of(obj_ref);
+            let arr_desc = crate::runtime::interpreter::array_descriptor_of(vm, obj_ref);
             let cm = vm.classes.class_manager.read();
             let obj_cls_name = cm
                 .get_class(obj_class_id)
@@ -4653,8 +4888,10 @@ pub unsafe extern "C" fn jit_checkcast(
                 .unwrap_or_else(|| "<none>".into());
             let target_cid = cm.find_unique_class_by_name(class_name);
             eprintln!(
-                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
+                "[cv-checkcast-fail] typecheck REFUSED: obj={:#x} kind={:?} arr_desc={:?} obj_cid={} obj_cls={} target_name={} target_cid={:?}",
                 obj_ptr,
+                kind,
+                arr_desc,
                 obj_class_id.as_u32(),
                 obj_cls_name,
                 class_name,
@@ -4925,6 +5162,34 @@ pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
 // either 0 or the heap pointer the JIT popped from the operand stack;
 // no dereference happens here — it is only wrapped and stored in a TLS.
 // `bci` is a bare immediate (no pointer semantics).
+/// Stamp the *currently executing compiled method's own* throw-site bci onto
+/// the pending-exception signal.
+///
+/// Called from the cold side of `emit_post_invoke_exception_check`, i.e. when
+/// a dispatched callee has thrown and this method is about to return the
+/// `i64::MIN` sentinel. Without it, `JitSignals::athrow_bci` still holds the
+/// bci that the CALLEE's own compiled `athrow` lowering stashed — a pc in a
+/// different method entirely. `execute_jit_call` then hands that foreign pc to
+/// `route_jit_exception_through_method` as this method's throw site, and the
+/// `[start_pc, end_pc)` range check rejects the method's own handler.
+///
+/// The observable symptom is a silently skipped `finally`: a catch-all entry
+/// is the one handler shape that cannot be rescued by the type check, so it is
+/// dropped whenever the callee's bci happens to fall outside the protected
+/// region (and spuriously honoured when it happens to fall inside). Witness:
+/// `docs/known-issues/repros/jitban-remaining-20260726/FinallyBalanceProbe.java`
+/// — `try { n++; thrower(); } finally { n--; }` leaked one count per throw
+/// under JIT and zero under `--nojit` / HotSpot.
+///
+/// Setting the bci unconditionally is safe: the sentinel is also returned for
+/// plain deopts with no exception pending, and `take_all_jit_signals` resets
+/// the field to `-1` on every drain, while `set_jit_pending_exception` resets
+/// it whenever a *new* exception is stashed.
+#[no_mangle]
+pub unsafe extern "C" fn jit_set_throw_bci(bci: i64) {
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(bci));
+}
+
 pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -5311,6 +5576,14 @@ fn handle_jit_dispatch_error(
         MethodCallFailed::InternalError(VmError::ClassFile(ClassFileError::ClassNotFound {
             ref class_name,
         })) => {
+            // `CRATONVM_DBG_LINKAGE_BT=1` -- the third place a
+            // `NoClassDefFoundError` reaches Java (see the matching hooks in
+            // `runtime::exceptions`). Only the Rust backtrace names the JIT
+            // dispatch site that could not resolve the class.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_LINKAGE_BT").is_some() {
+                let bt = std::backtrace::Backtrace::force_capture();
+                eprintln!("[DBG_LINKAGE_BT] jit NoClassDefFoundError {class_name}\n{bt}");
+            }
             if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
                 vm,
                 thread,
@@ -5679,7 +5952,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         *count == crate::runtime::env_cache::jit_invocation_threshold()
                     });
                     if should_compile {
-                        if let Some((entry, needs_context)) =
+                        if let Some((_callee_pin, entry, needs_context)) =
                             crate::runtime::interpreter::try_jit_compile_callee(
                                 vm,
                                 &target.class_name,
@@ -5688,16 +5961,25 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                 true,
                             )
                         {
-                            VIRTUAL_DISPATCH_CACHE.with(|dc| {
-                                dc.borrow_mut().insert(
-                                    key,
-                                    DispatchCache {
-                                        entry,
-                                        needs_context,
-                                        _owner: cratonvm_jit::pin_jit_entry(entry),
-                                    },
-                                );
-                            });
+                            // `_callee_pin` keeps the callee mapped across the
+                            // cache publication and the direct call below.
+                            // Only publish a raw entry we can keep alive:
+                            // `_owner` is the sole keep-alive for this
+                            // thread-local pointer, so caching with `None`
+                            // would let a later tier-up `put` unmap the body
+                            // under it.
+                            if let Some(owner) = cratonvm_jit::pin_jit_entry(entry) {
+                                VIRTUAL_DISPATCH_CACHE.with(|dc| {
+                                    dc.borrow_mut().insert(
+                                        key,
+                                        DispatchCache {
+                                            entry,
+                                            needs_context,
+                                            _owner: Some(owner),
+                                        },
+                                    );
+                                });
+                            }
                             if let Some(rc) = try_call_compiled_entry_reentrant(
                                 entry,
                                 needs_context,
@@ -5850,23 +6132,27 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         });
     if should_compile {
         // Try to compile the callee and cache it
-        if let Some((entry, needs_ctx)) = try_compile_callee(vm, info) {
+        if let Some((_callee_pin, entry, needs_ctx)) = try_compile_callee(vm, info) {
             if crate::runtime::env_cache::jit_dispatch_dbg() {
                 eprintln!(
                     "[JIT_DISPATCH_ARM/compile] {}.{} entry=0x{:x}",
                     info.class_name, info.method_name, entry,
                 );
             }
-            DISPATCH_CACHE.with(|dc| {
-                dc.borrow_mut().insert(
-                    info_key,
-                    DispatchCache {
-                        entry,
-                        needs_context: needs_ctx,
-                        _owner: cratonvm_jit::pin_jit_entry(entry),
-                    },
-                );
-            });
+            // See the virtual-dispatch sibling above: an unowned raw entry
+            // must not be cached.
+            if let Some(owner) = cratonvm_jit::pin_jit_entry(entry) {
+                DISPATCH_CACHE.with(|dc| {
+                    dc.borrow_mut().insert(
+                        info_key,
+                        DispatchCache {
+                            entry,
+                            needs_context: needs_ctx,
+                            _owner: Some(owner),
+                        },
+                    );
+                });
+            }
             // SAFETY: entry was just produced by try_compile_callee, which returns a validated
             // JIT entry pointer. CRIT round-5 fix: bail explicitly to the interpreter on
             // >ARG_REGS args via `bail_to_interpreter` (matches the MIC fast-path).
@@ -6214,9 +6500,15 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
 // SAFETY: Caller must ensure vm is a valid SharedVm reference and info points to a live
 // JitInvokeInfo. Delegates to try_jit_compile_callee which accesses the class manager
 // and JIT compiler; no raw pointer dereferences occur within this function itself.
-unsafe fn try_compile_callee(vm: &SharedVm, info: &JitInvokeInfo) -> Option<(usize, bool)> {
+#[allow(clippy::type_complexity)]
+unsafe fn try_compile_callee(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     use crate::runtime::interpreter::try_jit_compile_callee;
-    // JIT-dispatch callee compile — optimized (C2-equivalent) tier.
+    // JIT-dispatch callee compile — optimized (C2-equivalent) tier. The
+    // artifact comes back with the entry so the caller can keep it mapped for
+    // as long as it calls or caches that address.
     try_jit_compile_callee(vm, info.class_name, info.method_name, info.descriptor, true)
 }
 
@@ -7419,13 +7711,15 @@ unsafe fn try_fast_lambda_int_to_double_apply(
         Err(_) => return Ok(None),
     };
     let box_args = [value.to_bits() as i64];
-    if let Some((entry, needs_context)) = crate::runtime::interpreter::try_jit_compile_callee(
-        vm,
-        "java/lang/Double",
-        "valueOf",
-        "(D)Ljava/lang/Double;",
-        true,
-    ) {
+    if let Some((_callee_pin, entry, needs_context)) =
+        crate::runtime::interpreter::try_jit_compile_callee(
+            vm,
+            "java/lang/Double",
+            "valueOf",
+            "(D)Ljava/lang/Double;",
+            true,
+        )
+    {
         if let Some(boxed) =
             try_call_compiled_entry_reentrant(entry, needs_context, vm_ptr, &box_args)
         {
@@ -8010,7 +8304,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // machine-code cascade would bypass it. Keep dispatch on the
         // `invoke_or_native` path so the exception routes through the callee's
         // own table.
-        if let Some((entry_ptr, needs_ctx)) = compile_res {
+        if let Some((_callee_pin, entry_ptr, needs_ctx)) = compile_res {
+            // `_callee_pin` holds the callee artifact across the publications
+            // below: `update`/`install` take their own keep-alive by resolving
+            // the entry, and that resolution can only succeed while the
+            // artifact is alive.
             // jit-invokedynamic-groovy-regression fix: also never publish an
             // artifact containing an unconditional invokedynamic trap — the
             // inline MIC/PIC cascade would machine-CALL it, letting the trap's
@@ -8019,10 +8317,25 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             if !mic_callee_has_exception_table(vm, receiver_class_id, info)
                 && !compiled_entry_has_indy_trap(vm, &class_name, info.method_name, info.descriptor)
             {
-                mic.cached_entry_ptr
-                    .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
-                mic.cached_needs_context
-                    .store(needs_ctx, std::sync::atomic::Ordering::Release);
+                // Publish through `update`, never with a raw store: `update` is
+                // the only writer that also resolves and RETAINS the callee's
+                // `Arc<CompiledMethod>` in the slot's `compiled_owner`.
+                //
+                // Until 2026-07-27 this branch stored `cached_entry_ptr`
+                // directly, so a slot reached through the "class cached, target
+                // unresolved" shape (what `prepopulate` seeds and what
+                // `clear_compiled_entry` leaves behind after every
+                // invalidation) ended up holding a RAW entry pointer with no
+                // keep-alive. The next tier-up `put` for that callee replaced
+                // its shard snapshot, dropped the last `Arc`, and `munmap`ped
+                // the body — while the inline `MOV R11,[mic+8]; CALL R11`
+                // cascade emitted by `jit/src/x64.rs` still called it. That is
+                // the ElasticSearch `NodeConnectionsServiceTests` SIGSEGV
+                // (`rip == r11 ==` first byte of a retired code mapping) and,
+                // once the address was recycled by a later allocation, the
+                // json-smart "re-parse returned another method's result"
+                // corruption.
+                mic.update(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
                 // CRIT-1 — also populate the co-allocated PIC so the
                 // inline 4-way cascade in `jit/src/x64.rs` hits on the
                 // next invocation. Without this the cascade's empty
@@ -8140,9 +8453,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             true,
         )
     };
-    let (entry_ptr, needs_ctx) = match compile_res {
-        Some((ptr, nc)) => (ptr as u64, nc),
-        None => (0, false),
+    // `_callee_pin` must outlive the `mic.update` / `pic.install` below — see
+    // the matching note in the cache-hit branch.
+    let (_callee_pin, entry_ptr, needs_ctx) = match compile_res {
+        Some((pin, ptr, nc)) => (Some(pin), ptr as u64, nc),
+        None => (None, 0, false),
     };
 
     // BUG-H: never publish a direct compiled entry for a callee that declares a
@@ -8487,6 +8802,7 @@ impl DeoptimizationController {
                 cratonvm_jit::deopt::DeoptReason::NotCompiled => "NotCompiled",
                 cratonvm_jit::deopt::DeoptReason::UnreachedCode => "UnreachedCode",
                 cratonvm_jit::deopt::DeoptReason::OsrExit => "OsrExit",
+                cratonvm_jit::deopt::DeoptReason::PendingException => "PendingException",
             };
             let action_static: &'static str = match action {
                 cratonvm_jit::deopt::DeoptAction::Reinterpret => "Reinterpret",
@@ -10126,6 +10442,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         shadow_stack_offset_in_thread: JvmThread::shadow_stack_offset(),
         // RBC.6 — athrow lowering: stash pending exception + sentinel.
         throw_exception: jit_throw_exception as *const () as usize,
+        set_throw_bci: jit_set_throw_bci as *const () as usize,
         // JEP 358 (helpful NPE), inline-codegen path — per-action null-check
         // failure stub target. Sets the pending NPE *with* its JEP-358 action
         // code so the interpreter drain can attach the right action-only

@@ -1053,6 +1053,28 @@ pub(crate) fn native_class_get_primitive_class(
     };
 
     let name = ctx.read_string(name_obj).unwrap_or_default();
+    // Only the nine primitive type names have a primitive mirror. This native
+    // backs BOTH `Class.getPrimitiveClass` (which the JDK only ever calls with
+    // a real primitive name) and JDK 25's `Class.forPrimitiveName(String)`,
+    // whose contract is to return **null** for anything else.
+    //
+    // `ObjectInputStream.resolveClass` is exactly that caller:
+    //   try { return Class.forName(name, false, latestUserDefinedLoader()); }
+    //   catch (ClassNotFoundException ex) {
+    //       Class<?> cl = Class.forPrimitiveName(name);
+    //       if (cl != null) return cl; else throw ex;
+    //   }
+    // Fabricating a primitive mirror for an arbitrary name therefore turned
+    // every genuinely-missing stream class into a bogus resolved class:
+    // deserializing an unknown type reported `InvalidClassException` instead
+    // of the `ClassNotFoundException` HotSpot raises
+    // (`util.SerializationUtilsTests.deserializeUndefined`).
+    if !matches!(
+        name.as_str(),
+        "boolean" | "byte" | "char" | "short" | "int" | "long" | "float" | "double" | "void"
+    ) {
+        return Ok(Some(Value::Object(None)));
+    }
     let mirror = ctx.primitive_class_mirror(&name);
     Ok(Some(Value::Object(Some(mirror))))
 }
@@ -2278,6 +2300,7 @@ pub(crate) fn native_class_for_name(
                     // class (CNFE/NCDFE), and for any other failure type the
                     // raw exception is more informative than a synthesized
                     // CNFE(dotted_name). Matches HotSpot's behaviour.
+                    s111_dbg!("[S111-DBG] loadClass({}) threw, propagating", dotted_name);
                     return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
                         exc_ref,
                     ));
@@ -2521,12 +2544,17 @@ pub(crate) fn native_class_is_instance(
         Some(Value::Object(None)) => return Ok(Some(Value::Int(0))),
         _ => return Ok(Some(Value::Int(0))),
     };
-    let this_class_id = match mirror_class_id(ctx, this) {
-        Some(id) => id,
-        None => return Ok(Some(Value::Int(0))),
-    };
-    let target_class_id = ctx.class_id_of_object(target);
-
+    // The array-aware branch runs BEFORE any ClassId resolution, mirroring
+    // `native_class_is_assignable_from` below (which always did). It is a
+    // purely name/descriptor-based check that does not need `this`'s ClassId --
+    // and `mirror_class_id` MISSES for an array mirror handed out by
+    // `Method.getReturnType()` under a custom loader, so resolving it first
+    // made `isInstance` bail with `false` while `isAssignableFrom` answered
+    // `true` for the very same pair. Spring's `AnnotationTypeMapping.adapt`
+    // calls `type.isInstance(value)` and rejected an annotation's enum-array
+    // value with the self-contradictory "should be compatible with
+    // RequestMethod[] but a RequestMethod[] value was returned"
+    // (`test.context.aot.*`). `probes/ForkArr2Probe.java`.
     // S111r17 вЂ” Array-aware isInstance.  Heap-stored `class_id_of` for an
     // array returns the COMPONENT class id (e.g. `java/lang/Class` for a
     // `Class[]` array), NOT the synthetic `[Lcomponent;` array class id.
@@ -2550,6 +2578,11 @@ pub(crate) fn native_class_is_instance(
         // is a non-array Class вЂ” those reduce to assignable-to-Object
         // via `array_is_assignable` already, so this is just defensive).
     }
+    let this_class_id = match mirror_class_id(ctx, this) {
+        Some(id) => id,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let target_class_id = ctx.class_id_of_object(target);
 
     // Annotation proxy special case: our `create_annotation_proxy` allocates
     // objects of class `java/lang/annotation/AnnotationProxy`, not of the
@@ -11900,8 +11933,24 @@ pub(crate) fn annotation_element_to_java_typed(
                 }
                 _ => "java/lang/Object".to_string(),
             };
-            let comp_cid = ctx
-                .class_id_by_name(&comp_name_owned)
+            // Resolve the COMPONENT through the declaring class's loader first,
+            // exactly as the scalar `Enum` and `Class` arms above already do.
+            // `class_id_by_name` is the loader-blind global lookup, so under
+            // classloader isolation the array's component came from the app
+            // loader while the attribute's declared return type came from the
+            // fork -- and Spring's `AnnotationTypeMapping.adapt` rejected the
+            // value with the self-contradictory "should be compatible with
+            // RequestMethod[] but a RequestMethod[] value was returned"
+            // (`test.context.aot.TestContextAotGeneratorIntegrationTests`,
+            // `test.context.aot.AotIntegrationTests`). `probes/ForkArrProbe.java`.
+            let comp_cid = container_loader
+                .and_then(|loader| {
+                    match resolve_annotation_class_via_loader(ctx, loader, &comp_name_owned) {
+                        Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                        Err(_) => None,
+                    }
+                })
+                .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
                     let _ = ctx.load_class(&comp_name_owned);
                     ctx.class_id_by_name(&comp_name_owned)
@@ -12082,16 +12131,48 @@ fn annotation_type_loadable(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
 ) -> bool {
-    match annotation_desc_to_class_name(&ann.type_descriptor) {
-        Some(name) => {
-            if ctx.class_id_by_name(name).is_some() {
-                return true;
-            }
-            let _ = ctx.load_class(name);
-            ctx.class_id_by_name(name).is_some()
+    annotation_type_loadable_near(ctx, ann, None)
+}
+
+/// Is this annotation's TYPE resolvable, as seen from `declaring_class_id`?
+///
+/// `class_id_by_name` is `find_unique_class_by_name`: it deliberately answers
+/// `None` when a name is AMBIGUOUS, i.e. defined by more than one loader. Under
+/// classloader isolation (Spring's `@CompileWithForkedClassLoader` fork
+/// re-defines the whole framework, including the annotation types themselves)
+/// that makes every annotation on a member of a re-defined class look
+/// unloadable, so `getDeclaredAnnotations()` silently returned an EMPTY array
+/// while `getAnnotation(X)` -- which never consults this filter -- kept working.
+/// Spring's `MergedAnnotations.from(field)` goes through
+/// `getDeclaredAnnotations()`, so `@Autowired` detection found nothing and
+/// `AutowiredAnnotationBeanPostProcessor.processAheadOfTime` returned null for
+/// every forked test (`beans.factory.annotation
+/// .AutowiredAnnotationBeanRegistrationAotContributionTests`, 13 of 14 methods).
+///
+/// Resolve relative to the declaring class first (`class_id_by_name_near`,
+/// the same relation `create_annotation_proxy` uses to pick the proxy's
+/// annotation type), and only fall back to the global unique-name lookup.
+fn annotation_type_loadable_near(
+    ctx: &mut dyn NativeContext,
+    ann: &cratonvm_native_api::AnnotationData,
+    declaring_class_id: Option<ClassId>,
+) -> bool {
+    let Some(name) = annotation_desc_to_class_name(&ann.type_descriptor) else {
+        return false;
+    };
+    if let Some(near) = declaring_class_id {
+        if ctx.class_id_by_name_near(name, near).is_some() {
+            return true;
         }
-        None => false,
     }
+    if ctx.class_id_by_name(name).is_some() {
+        return true;
+    }
+    let _ = ctx.load_class(name);
+    if ctx.class_id_by_name(name).is_some() {
+        return true;
+    }
+    declaring_class_id.is_some_and(|near| ctx.class_id_by_name_near(name, near).is_some())
 }
 
 fn build_annotation_array(
@@ -12118,7 +12199,7 @@ fn build_annotation_array_for(
     let comp = annotation_component_class_id(ctx);
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
-        .filter(|a| annotation_type_loadable(ctx, a))
+        .filter(|a| annotation_type_loadable_near(ctx, a, declaring_class_id))
         .collect();
     let container_loader =
         declaring_class_id.and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
@@ -12139,7 +12220,7 @@ fn build_class_annotation_array(
     // Omit annotations whose type isn't loadable вЂ” see `annotation_type_loadable`.
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
-        .filter(|a| annotation_type_loadable(ctx, a))
+        .filter(|a| annotation_type_loadable_near(ctx, a, Some(queried_class_id)))
         .collect();
     // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
@@ -12159,7 +12240,7 @@ fn build_method_annotation_array(
 ) -> ObjectRef {
     let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
         .iter()
-        .filter(|a| annotation_type_loadable(ctx, a))
+        .filter(|a| annotation_type_loadable_near(ctx, a, Some(declaring_class_id)))
         .collect();
     let component = annotation_component_class_id(ctx);
     build_mirror_array_comp(ctx, component, resolvable.len(), |ctx, i| {
@@ -14744,6 +14825,46 @@ pub(crate) fn native_class_get_package(
         // yields a Package with `getName().equals("")`).
         Arc::from("")
     };
+    // HotSpot interns exactly one `Package` per (defining loader, package
+    // name): `Foo.class.getPackage() == Bar.class.getPackage()` for two classes
+    // in the same package, and it is the same object
+    // `ClassLoader.getDefinedPackage(name)` hands back. Share
+    // `defined_package_memo` with the ClassLoader-side builder so both hold.
+    //
+    // A memo entry is FULLY BUILT (`rich`) once this function has populated it.
+    // `getDefinedPackage` can get there first, though, and it can only
+    // synthesise the thin name+module+NULL_VERSION_INFO shape — so on a thin
+    // hit we ENRICH that very object in place (same `java/lang/Package`
+    // 12-field synthetic layout) rather than allocating a second one, which
+    // would either lose this class's manifest attributes or break identity.
+    // A rich hit is returned untouched: HotSpot likewise never re-derives a
+    // Package once defined, so a same-package class from a different jar does
+    // not overwrite the first definer's manifest attributes.
+    let pkg_ns = class_id.map_or(0u32, |cid| package_memo_ns_of_class(ctx, cid));
+    let memo_key = (pkg_ns, pkg_name.to_string());
+    let memo_hit = defined_package_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&memo_key)
+        .copied();
+    // Carry the HANDLE, not the ObjectRef, across the manifest reads below:
+    // those can allocate, and a moving collection would leave a resolved
+    // `ObjectRef` stale. A global ref is remapped, so re-resolving it
+    // immediately before use is always safe.
+    let reuse_handle = match memo_hit {
+        Some((handle, rich)) => {
+            if rich {
+                if let Some(pkg) = ctx.resolve_global_root(handle) {
+                    return Ok(Some(Value::Object(Some(pkg))));
+                }
+                None
+            } else {
+                Some(handle)
+            }
+        }
+        None => None,
+    };
+
     // Read manifest attributes (best-effort).
     let (impl_title, impl_version, spec_title, spec_version, spec_vendor, impl_vendor) =
         if let Some(class_id) = mirror_class_id(ctx, this) {
@@ -14758,7 +14879,10 @@ pub(crate) fn native_class_get_package(
         } else {
             (None, None, None, None, None, None)
         };
-    let pkg = alloc_concurrent_synthetic(ctx, "java/lang/Package", 12);
+    let pkg = match reuse_handle.and_then(|h| ctx.resolve_global_root(h)) {
+        Some(pkg) => pkg,
+        None => alloc_concurrent_synthetic(ctx, "java/lang/Package", 12),
+    };
     let pkg_pin = ctx.pin_native_root(pkg);
     // Slot 0: name (synthetic-mode layout used by `getPackageName`/`getName`
     // shims pre-real-class-load). Also happens to be `NamedPackage.name`'s
@@ -14849,6 +14973,18 @@ pub(crate) fn native_class_get_package(
     }
     let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.unpin_native_roots(pkg_pin);
+    // Publish (or promote to `rich`) so the next `getPackage()` /
+    // `getDefinedPackage()` for this package returns this same object. When we
+    // upgraded an existing thin entry in place, keep its handle — registering a
+    // second global ref for the same object would leak one per package.
+    let handle = match reuse_handle {
+        Some(handle) => handle,
+        None => ctx.add_global_root(pkg),
+    };
+    defined_package_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(memo_key, (handle, true));
     Ok(Some(Value::Object(Some(pkg))))
 }
 
@@ -14877,19 +15013,72 @@ pub(crate) fn native_class_get_package(
 // JDK object shape so `postDefineClass` and `Class.getPackage()` keep working
 // without depending on `packages` being non-null.
 
-/// `ClassLoader.getDefinedPackage(String name) -> Package` вЂ” returns null
-/// (no package is defined on this classloader). JDK semantics: returning
-/// null is correct when the classloader has not previously defined a
-/// package by that name. ByteBuddy's `Resolver$ForModuleSystem.accept`
-/// already null-checks the result, so returning null is a clean exit.
+/// Per-(loader-namespace-id, package-name) memo of the one `java.lang.Package`
+/// object this VM hands out — shared by [`native_class_get_package`]
+/// (`Class.getPackage()`) and [`i2_classloader_get_defined_package`]
+/// (`ClassLoader.getDefinedPackage`), which the JDK guarantees return the same
+/// instance.
+///
+/// Value is `(global-root handle, rich)`. `rich` is `false` for the thin
+/// name+module+`NULL_VERSION_INFO` shape the ClassLoader side can build with no
+/// class mirror to read a manifest from, and `true` once `Class.getPackage()`
+/// has populated the manifest attributes / `packageInfo` on it. A thin entry is
+/// upgraded in place, never replaced, so identity survives the upgrade.
+///
+/// Stores JNI-global-ref HANDLES (`NativeContext::add_global_root`), never raw
+/// `ObjectRef`s: the table outlives any number of collections, and a global ref
+/// is the one root form the GC both keeps alive and remaps.
+///
+/// Two bugs this fixes, both measured against HotSpot on the
+/// `BeanDefinitionLoaderTests` classpath:
+/// * `cl.getDefinedPackage(p) == cl.getDefinedPackage(p)` was `false`, and
+///   `c.getPackage() == cl.getDefinedPackage(c.getPackageName())` was `false` —
+///   a fresh `Package` was synthesised per call. The JDK returns one identity
+///   per (loader, package), and code that keys an `IdentityHashMap` on a
+///   `Package`, or compares with `==`, silently diverged.
+/// * `getDefinedPackages()` returned an empty array while
+///   `getDefinedPackage(name)` returned non-null for the same loader — a
+///   self-contradictory pair.
+fn defined_package_memo() -> &'static Mutex<HashMap<(u32, String), (usize, bool)>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<(u32, String), (usize, bool)>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Memo namespace for a **class**, on the same scale
+/// `classloader::loader_namespace_id` uses for a **loader object**.
+///
+/// The two VM-side numberings differ at the low end and MUST be reconciled or
+/// the two entry points key the same package differently and never share an
+/// identity: `NativeContext::loader_id_of_class` reports
+/// bootstrap/extension/application as `0`/`1`/`2`, whereas
+/// `loader_namespace_id` collapses every built-in loader to `0` and only hands
+/// out `allocate_loader_id` values (`>= 3`) for user-defined loaders — the very
+/// pool `ClassLoaderId::UserDefined` draws from, so ids at that end already
+/// agree.
+fn package_memo_ns_of_class(ctx: &dyn NativeContext, class_id: ClassId) -> u32 {
+    match ctx.loader_id_of_class(class_id) {
+        id if id >= 3 => id as u32,
+        _ => 0,
+    }
+}
+
+/// `ClassLoader.getDefinedPackage(String name) -> Package`.
+///
+/// Avoids the real-JDK `ClassLoader.packages` map (it can be uninitialised for
+/// a user-created loader — the original I2/ByteBuddy blocker) and instead
+/// derives the answer from class files visible **to the receiving loader**,
+/// memoising one `Package` identity per (loader namespace, package name).
+///
+/// Returning null unconditionally, as this once did, violates the application
+/// loader's contract: Spring Boot's `BeanDefinitionLoader` uses this probe both
+/// to distinguish a package directory from an XML resource
+/// (`isLoadCandidate`) and as the sole result of `findPackage`, so an
+/// always-null answer turned every package-name `SpringApplication` source into
+/// `IllegalArgumentException: Invalid source '<pkg>'`.
 pub(crate) fn i2_classloader_get_defined_package(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Avoid the real-JDK `ClassLoader.packages` map: it can be uninitialised
-    // for a user-created loader.  Returning null unconditionally, however,
-    // violates the application loader's contract. Spring Boot uses this
-    // probe to distinguish a package directory from an XML resource.
     let package_name = match args.get(1) {
         Some(Value::Object(Some(name))) => ctx.read_string(*name).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
@@ -14897,20 +15086,87 @@ pub(crate) fn i2_classloader_get_defined_package(
     if package_name.is_empty() || package_name.contains('/') {
         return Ok(Some(Value::Object(None)));
     }
+    let loader = match args.first() {
+        Some(Value::Object(Some(l))) => Some(*l),
+        _ => None,
+    };
+    let ns = loader.map_or(0, |l| crate::classloader::loader_namespace_id(ctx, l));
+
+    let cached = defined_package_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(ns, package_name.clone()))
+        .copied();
+    if let Some((handle, _rich)) = cached {
+        if let Some(pkg) = ctx.resolve_global_root(handle) {
+            return Ok(Some(Value::Object(Some(pkg))));
+        }
+        // A collected global ref should be impossible, but never hand back a
+        // stale ObjectRef — fall through and re-synthesise.
+        defined_package_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(ns, package_name.clone()));
+    }
 
     // A class file immediately below the package path is a conservative,
     // classpath-backed proof that the package exists. It avoids synthesising
-    // packages for arbitrary names or resource-only directories.
+    // packages for arbitrary names or resource-only directories. The probe is
+    // scoped to the receiver because `getDefinedPackage` does NOT delegate —
+    // see `package_class_files_visible_to_loader`.
     let class_glob = format!("{}/*.class", package_name.replace('.', "/"));
-    if ctx.find_all_resource_urls(&class_glob).is_empty() {
+    if !crate::classloader::package_class_files_visible_to_loader(ctx, loader, &class_glob) {
         return Ok(Some(Value::Object(None)));
     }
     let package = i2_alloc_synthetic_package(ctx, &package_name);
+    let handle = ctx.add_global_root(package);
+    defined_package_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((ns, package_name), (handle, false));
     Ok(Some(Value::Object(Some(package))))
 }
 
-/// `ClassLoader.getDefinedPackages() -> Package[]` вЂ” returns an empty array.
+/// `ClassLoader.getDefinedPackages() -> Package[]` — the packages this loader
+/// has actually answered `getDefinedPackage` for, so the two agree.
+///
+/// Note this is deliberately NOT wired to `ClassLoader.getPackages()`, which
+/// stays an empty array: that override exists to stop the real JDK's
+/// stream-pipeline bytecode leaking a `ReferencePipeline$Head` into a caller's
+/// `Package[]` local (jboss-modules' `ConcurrentClassLoader.<clinit>`), a
+/// separate concern from this method's own contract.
 pub(crate) fn i2_classloader_get_defined_packages(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let ns = match args.first() {
+        Some(Value::Object(Some(l))) => crate::classloader::loader_namespace_id(ctx, *l),
+        _ => 0,
+    };
+    let handles: Vec<usize> = defined_package_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|((entry_ns, _), _)| *entry_ns == ns)
+        .map(|(_, (handle, _rich))| *handle)
+        .collect();
+    let packages: Vec<ObjectRef> = handles
+        .into_iter()
+        .filter_map(|h| ctx.resolve_global_root(h))
+        .collect();
+    // `new_array` can allocate and therefore move; the elements are global
+    // roots, so re-resolving is unnecessary, but the array itself must be
+    // filled only after it exists.
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, packages.len());
+    for (i, pkg) in packages.into_iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(pkg)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// `ClassLoader.getPackages() -> Package[]` — unconditionally empty; see the
+/// note on [`i2_classloader_get_defined_packages`].
+pub(crate) fn i2_classloader_get_packages_empty(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
@@ -15223,23 +15479,26 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
     // pipeline leaks a `ReferencePipeline$Head` into the caller's local
     // typed as `Package[]`, NPE-ing on arraylength inside
     // `org/jboss/modules/ConcurrentClassLoader.<clinit>` (WildFly 39 boot).
-    // Override with empty array (same shape as `getDefinedPackages`).
+    // Override with an empty array. NOTE: this must stay
+    // `i2_classloader_get_packages_empty`, NOT `getDefinedPackages` — the
+    // latter now reports the packages the loader has actually handed out, and
+    // the WildFly boot path needs this one to stay unconditionally empty.
     r.register(
         cl,
         "getPackages",
         "()[Ljava/lang/Package;",
-        i2_classloader_get_defined_packages,
+        i2_classloader_get_packages_empty,
     );
     // `Package.getPackages()` is static and delegates to
     // `ClassLoader.getClassLoader(Reflection.getCallerClass()).getPackages()`.
     // Override here as well so direct callers (the WildFly boot path) get an
     // empty array even if the static delegation pulls a different ClassLoader
-    // mirror.
+    // mirror. Static: arg 0 is NOT a receiver, so it must not be read as one.
     r.register(
         "java/lang/Package",
         "getPackages",
         "()[Ljava/lang/Package;",
-        i2_classloader_get_defined_packages,
+        i2_classloader_get_packages_empty,
     );
     // `Package.equals(Object)` -- real JDK has NO override (inherits identity
     // `Object.equals`), which is correct there because HotSpot INTERNS one
@@ -15793,6 +16052,20 @@ pub(crate) fn native_class_get_class_loader(
         // class never spuriously reports a null loader.
         if !ctx.is_class_synthetic_stub(&class_name) {
             return Ok(Some(Value::Object(None)));
+        }
+    }
+    // A class registered under a USER-DEFINED loader namespace (id >= 3)
+    // belongs to that loader, even when no explicit `register_defining_loader`
+    // ran for it -- natives that define straight into a namespace
+    // (`define_class_full`, e.g. the config-class enhancer) never touch that
+    // side table. Falling through to the app-loader singleton below made
+    // `enhance(reloadedConfigClass, customLoader).getClassLoader()` report the
+    // app loader (`context.annotation.ConfigurationClassEnhancerTests
+    // .enhanceReloadedClass`).
+    if loader_type >= 3 {
+        if let Some(loader) = crate::classloader::loader_object_for_namespace_id(loader_type as u32)
+        {
+            return Ok(Some(Value::Object(Some(loader))));
         }
     }
     if loader_type == 1 {
@@ -21260,12 +21533,17 @@ Implementation-Title: opensaml-core-api\r\n\
     }
 
     #[test]
-    fn i2_classloader_get_defined_package_returns_null() {
-        // I2: getDefinedPackage(name) MUST return null without touching
-        // the (potentially null) `packages` field. ByteBuddy's
+    fn i2_classloader_get_defined_package_returns_null_without_class_files() {
+        // I2: getDefinedPackage(name) MUST answer without touching the
+        // (potentially null) `packages` field. ByteBuddy's
         // `Resolver$ForModuleSystem.accept` and the JDK's `postDefineClass`
         // both null-check the result, so returning null is a clean exit
         // rather than NPE-ing on `packages.get(name)`.
+        //
+        // With no classpath behind the context, no package has class files
+        // under it, so null is also the substantively correct answer — the
+        // implementation only synthesises a `Package` when it can see
+        // `<pkg>/*.class`.
         let mut ctx = mock_ctx();
         let name = ctx.create_string("java.lang");
         let r = i2_classloader_get_defined_package(
@@ -21276,6 +21554,79 @@ Implementation-Title: opensaml-core-api\r\n\
         match r {
             Some(Value::Object(None)) => {} // null вЂ” correct
             other => panic!("I2: getDefinedPackage MUST return null (was {other:?})",),
+        }
+    }
+
+    #[test]
+    fn i2_classloader_get_defined_package_rejects_malformed_names() {
+        // An empty name, or a slash-separated resource path mistaken for a
+        // package name, must never synthesise a Package.
+        let mut ctx = mock_ctx();
+        for bad in ["", "org/springframework/boot"] {
+            let name = ctx.create_string(bad);
+            let r = i2_classloader_get_defined_package(
+                &mut ctx,
+                &[Value::Object(None), Value::Object(Some(name))],
+            )
+            .expect("i2_classloader_get_defined_package must succeed");
+            assert!(
+                matches!(r, Some(Value::Object(None))),
+                "getDefinedPackage({bad:?}) must be null, was {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn i2_classloader_get_defined_package_memo_is_identity_stable() {
+        // HotSpot interns one Package per (loader, name): repeated
+        // getDefinedPackage calls return the SAME object. The memo below is
+        // what provides that; exercise it directly, since the mock context has
+        // no classpath to drive the synthesis path.
+        let mut ctx = mock_ctx();
+        let pkg = i2_alloc_synthetic_package(&mut ctx, "com.example.memo");
+        let handle = ctx.add_global_root(pkg);
+        defined_package_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, "com.example.memo".to_string()), (handle, false));
+
+        let name = ctx.create_string("com.example.memo");
+        let first = i2_classloader_get_defined_package(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(name))],
+        )
+        .expect("first getDefinedPackage must succeed");
+        let name = ctx.create_string("com.example.memo");
+        let second = i2_classloader_get_defined_package(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(name))],
+        )
+        .expect("second getDefinedPackage must succeed");
+        match (first, second) {
+            (Some(Value::Object(Some(a))), Some(Value::Object(Some(b)))) => {
+                assert_eq!(a, b, "getDefinedPackage must be identity-stable");
+                assert_eq!(a, pkg, "must hand back the memoised Package");
+            }
+            other => panic!("expected two non-null Packages, was {other:?}"),
+        }
+
+        defined_package_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(0, "com.example.memo".to_string()));
+    }
+
+    #[test]
+    fn i2_classloader_get_packages_stays_empty() {
+        // `ClassLoader.getPackages()` must stay unconditionally empty even
+        // though `getDefinedPackages()` no longer is — jboss-modules'
+        // `ConcurrentClassLoader.<clinit>` depends on it.
+        let mut ctx = mock_ctx();
+        let r = i2_classloader_get_packages_empty(&mut ctx, &[Value::Object(None)])
+            .expect("getPackages must succeed");
+        match r {
+            Some(Value::Object(Some(arr))) => assert_eq!(ctx.array_length(arr), 0),
+            other => panic!("getPackages must return an empty array, was {other:?}"),
         }
     }
 

@@ -1082,6 +1082,56 @@ pub(crate) fn kmf_tmf_no_such_algorithm(
     .into()
 }
 
+/// Per-`javax/net/ssl/SSLSocket` client-authentication and role state, keyed by
+/// `identity_hash_code` (stable across a moving collection, and the same keying
+/// `kmf_keystore_id_by_identity` above uses).
+///
+/// STUB-REMOVAL (wave 2): `setNeedClientAuth`/`setWantClientAuth` were
+/// unconditional no-ops and `getNeedClientAuth`/`getWantClientAuth`/
+/// `getUseClientMode` returned a hard-coded `false`. A server that configured
+/// mTLS on an accepted `SSLSocket` therefore read back "client auth off" — a
+/// silently-disabled security check, and a value that contradicted the caller's
+/// own immediately-preceding setter. There is no independent handshake to
+/// re-drive at this level (a socket handed to `setNeedClientAuth` after
+/// `accept()` has already completed its handshake; the enforcing path is
+/// `SSLServerSocket.setNeedClientAuth`, which rebuilds the listener's
+/// `ServerConfig` — see `t27_tls::register_sslserversocket`), so this table
+/// records the caller's request faithfully and the getters report it.
+///
+/// Tuple is `(use_client_mode, need_client_auth, want_client_auth)`, each 0/1.
+fn ssl_sock_auth_state() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, (i32, i32, i32)>>
+{
+    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, (i32, i32, i32)>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn ssl_sock_auth_get(ctx: &dyn NativeContext, this: ObjectRef) -> (i32, i32, i32) {
+    let ih = ctx.identity_hash_code(this);
+    ssl_sock_auth_state()
+        .lock()
+        .get(&ih)
+        .copied()
+        // Default for a socket whose setters were never called: exactly what
+        // the three constant natives returned before this change (all false).
+        // Deliberately NOT "client mode on": an `SSLServerSocket.accept()`
+        // socket is in SERVER mode and never calls `setUseClientMode`, so
+        // defaulting to `true` would flip an answer that used to be right.
+        // Only a caller that actually invoked a setter sees a different value.
+        .unwrap_or((0, 0, 0))
+}
+
+fn ssl_sock_auth_update<F: FnOnce(&mut (i32, i32, i32))>(
+    ctx: &dyn NativeContext,
+    this: ObjectRef,
+    f: F,
+) {
+    let ih = ctx.identity_hash_code(this);
+    let mut table = ssl_sock_auth_state().lock();
+    let entry = table.entry(ih).or_insert((0, 0, 0));
+    f(entry);
+}
+
 pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1793,22 +1843,50 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
             crate::t27_tls::set_pending_layered_socket_client_mode(pending_id, use_client);
         }
+        // Record the role regardless of whether a pending entry existed, so
+        // `getUseClientMode()` reports what the caller actually asked for
+        // rather than the hard-coded `false` it used to return.
+        ssl_sock_auth_update(ctx, this, |s| s.0 = i32::from(use_client));
         Ok(None)
     });
-    r.register(ssl_sock, "getUseClientMode", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ssl_sock, "getUseClientMode", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ssl_sock_auth_get(ctx, this).0)))
     });
-    r.register(ssl_sock, "setNeedClientAuth", "(Z)V", |_ctx, _args| {
+    // STUB-REMOVAL (wave 2): these four were constant no-ops / constant `false`.
+    // See `ssl_sock_auth_state` for why the request is recorded here and where
+    // the enforcing rebuild actually happens (`SSLServerSocket`). JSSE's
+    // documented exclusivity — `setNeedClientAuth(true)` clears `want`, and
+    // vice versa — is honoured, matching the `SSLEngine` sibling below.
+    r.register(ssl_sock, "setNeedClientAuth", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        ssl_sock_auth_update(ctx, this, |s| {
+            s.1 = i32::from(v != 0);
+            if v != 0 {
+                s.2 = 0;
+            }
+        });
         Ok(None)
     });
-    r.register(ssl_sock, "getNeedClientAuth", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ssl_sock, "getNeedClientAuth", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ssl_sock_auth_get(ctx, this).1)))
     });
-    r.register(ssl_sock, "setWantClientAuth", "(Z)V", |_ctx, _args| {
+    r.register(ssl_sock, "setWantClientAuth", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        ssl_sock_auth_update(ctx, this, |s| {
+            s.2 = i32::from(v != 0);
+            if v != 0 {
+                s.1 = 0;
+            }
+        });
         Ok(None)
     });
-    r.register(ssl_sock, "getWantClientAuth", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ssl_sock, "getWantClientAuth", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ssl_sock_auth_get(ctx, this).2)))
     });
     // getApplicationProtocol/getHandshakeApplicationProtocol — the real
     // `javax.net.ssl.SSLSocket` base class's own body for these (unlike most
@@ -1989,23 +2067,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // `setEnabledCipherSuites` call — this synthetic socket has no
     // set-side storage, so `set*` below are accepted but not persisted).
     fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> ObjectRef {
-        let suites = [
-            "TLS_AES_128_GCM_SHA256",
-            "TLS_AES_256_GCM_SHA384",
-            "TLS_CHACHA20_POLY1305_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-            // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-            // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
-            "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
-            "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
-        ];
+        // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
+        let suites = crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES;
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
         for (i, &s) in suites.iter().enumerate() {
             let so = ctx.create_string(s);
@@ -2106,11 +2169,45 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    // STUB-REMOVAL (wave 2): this was an unconditional no-op, so a caller
+    // narrowing a socket to a single TLS version got no enforcement at all —
+    // the security-relevant direction (an app disabling TLS 1.0/1.1, or pinning
+    // 1.3) was silently discarded. `net_phase_e` registers the same
+    // (class, method, descriptor) LATER and therefore wins in the real-JDK
+    // build (see its own doc comment at `setEnabledProtocols`), but in
+    // `--synthetic-jdk` mode `register_synthetic_overrides` runs AFTER
+    // `register_essential_natives`, so THIS registration is the live one and
+    // the restriction vanished. Mirror the `setEnabledCipherSuites` sibling
+    // above: a socket from `createSocket(Socket wrapped, ...)` handshakes
+    // lazily, so a restriction set beforehand still counts. A socket that has
+    // already handshaked keeps the accept-and-discard behaviour (its version
+    // is settled and rustls does not renegotiate).
     r.register(
         ssl_sock,
         "setEnabledProtocols",
         "([Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let tls_id = new13_resolve_tls_id(ctx, this);
+            if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
+                && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
+            {
+                let mut protocols: Vec<String> = Vec::new();
+                if let Some(Value::Object(Some(arr))) = args.get(1) {
+                    let len = ctx.array_length(*arr);
+                    for i in 0..len {
+                        if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                            if let Some(name) = ctx.read_string(s) {
+                                protocols.push(name);
+                            }
+                        }
+                    }
+                }
+                let pending_id = tls_id - crate::servlet::PENDING_LAYERED_SOCK_ID_BASE;
+                crate::t27_tls::set_pending_layered_socket_protocols(pending_id, protocols);
+            }
+            Ok(None)
+        },
     );
     r.register(
         ssl_sock,
@@ -2122,12 +2219,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // if one hasn't run yet — this socket may still be pending (see
             // `createSocket(Socket wrapped, ...)`'s doc comment).
             let fd_id = ensure_layered_handshake_started(ctx, this)?;
-            if crate::nbflags().dbg_tls_sock {
+            if crate::nbflags().dbg_tls_sock || crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
-                    "[dbg-tls-sock] thread={:?} getInputStream sock={:?} tls_id={}",
-                    std::thread::current().id(),
-                    this,
-                    fd_id
+                    "[dbg-tls-auth] SSLSocket.getInputStream sock={:?} tls_id={}",
+                    this, fd_id
                 );
             }
             // Return an InputStream that reads from the TLS fd
@@ -2136,6 +2231,32 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Preserve the TLS id in the identity-keyed socket side table too.
             crate::net_phase_e::sock_set_for_create(ctx, is, 0, fd_id);
             ctx.set_field(is, 0, Value::Int(fd_id));
+            // INVESTIGATED AND REVERTED (tls-handshake-enforcement-gap, doc
+            // 21 — `TestSsl.testPost`): wrapping this in a real
+            // `java.io.BufferedInputStream`, so that a single-byte `read()`
+            // becomes bytecode over a Java `byte[]` instead of a native call.
+            // That is the shape real JSSE's `SSLSocketImpl$AppInputStream`
+            // has, and `testPost` reads 16 MiB one byte at a time on each of
+            // 8 threads (~134 million reads), so it looked like the obvious
+            // win. Measured: it made things WORSE — 368 s unwrapped vs >700 s
+            // (test timeout) wrapped.
+            //
+            // Why, from a `--stack-dump-on-timeout=120` capture: all 8 client
+            // threads sit in `BufferedInputStream.read`/`fill`/`getBufIfOpen`
+            // with `blocked=false` and a DIFFERENT pc in each dump — real
+            // progress, just too slow — while the Tomcat exec threads block in
+            // `doWrite` waiting for them to drain. JDK 25's
+            // `BufferedInputStream.read()` takes its `InternalLock` (or
+            // `synchronized`) on EVERY call, so per byte it costs an AQS
+            // lock/unlock plus interpreted bytecode, which on this VM is
+            // dearer than the one native call it replaces.
+            //
+            // The per-byte cost here is the Java->native transition itself,
+            // not the work behind it: a native-side readahead
+            // (`servlet::s2_tls_fill_readahead`) removes the rustls and
+            // registry work from every byte and only bought ~15%. Closing the
+            // rest needs cheaper native dispatch, which is the pre-existing
+            // throughput-wall work, not a TLS fix.
             Ok(Some(Value::Object(Some(is))))
         },
     );
@@ -2249,16 +2370,63 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(ssl_sock, "getSoTimeout", "()I", |_ctx, _args| {
+    // STUB-REMOVAL (wave 2): `getSoTimeout` returned a hard-coded 0 ("no
+    // timeout") and `setSoTimeout` validated its argument then threw it away,
+    // so a caller that configured a read timeout and read it back was told the
+    // socket blocks forever — and the underlying `TcpStream` really did. Apply
+    // the timeout to the live stream (exactly what `net_phase_e`'s
+    // `java/net/Socket.setSoTimeout` does for the plain-socket case, which this
+    // more-specific `SSLSocket` registration intercepts ahead of) and report
+    // back what is actually configured.
+    r.register(ssl_sock, "getSoTimeout", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let configured = crate::net_phase_e::sock_get(ctx, this).read_timeout_ms;
+        if configured != 0 {
+            return Ok(Some(Value::Int(configured)));
+        }
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if tls_id >= 0 {
+            let reg = crate::servlet::s2_registry().lock();
+            let timeout = if let Some(stream) = reg.streams.get(&tls_id) {
+                stream.read_timeout().ok().flatten()
+            } else if let Some(raw) = reg.tls_streams.get(&tls_id).and_then(|e| e.raw.as_ref()) {
+                raw.read_timeout().ok().flatten()
+            } else {
+                None
+            };
+            if let Some(d) = timeout {
+                return Ok(Some(Value::Int(d.as_millis() as i32)));
+            }
+        }
         Ok(Some(Value::Int(0)))
     });
     r.register(ssl_sock, "setSoTimeout", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
         let timeout = args.get(1).and_then(Value::as_int).unwrap_or(0);
         if timeout < 0 {
             return Err(RuntimeError::IllegalArgumentException {
                 message: format!("negative SO_TIMEOUT: {timeout}"),
             }
             .into());
+        }
+        let tls_id = new13_resolve_tls_id(ctx, this);
+        if tls_id >= 0 {
+            let d = if timeout == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(timeout as u64))
+            };
+            let reg = crate::servlet::s2_registry().lock();
+            let applied = if let Some(stream) = reg.streams.get(&tls_id) {
+                stream.set_read_timeout(d)
+            } else if let Some(raw) = reg.tls_streams.get(&tls_id).and_then(|e| e.raw.as_ref()) {
+                raw.set_read_timeout(d)
+            } else {
+                Ok(())
+            };
+            applied.map_err(|e| RuntimeError::IOException {
+                message: format!("setSoTimeout failed: {e}"),
+            })?;
         }
         Ok(None)
     });
@@ -2302,8 +2470,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             )
         },
     );
-    r.register(ssl_sock, "getLocalPort", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // STUB-REMOVAL (wave 2): was a hard-coded 0. `net_phase_e`'s socket side
+    // table records the real bound local port at create/connect time
+    // (`sock_set_for_create_with_local_port`); read it, and only fall back to 0
+    // (the JDK's "not bound" answer) when nothing was recorded.
+    r.register(ssl_sock, "getLocalPort", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(
+            crate::net_phase_e::sock_get(ctx, this).local_port,
+        )))
     });
     r.register(
         ssl_sock,
@@ -2344,25 +2519,40 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
-        let mut buf = [0u8; 1];
+        // FIX (tls-handshake-enforcement-gap, doc 21 — TestSsl hang): serve
+        // from the shared plaintext readahead when possible. Reading a single
+        // byte through the full native path (blocking-region bracket +
+        // registry lock + per-call rustls plumbing) costs microseconds, and a
+        // caller that reads a multi-megabyte body a byte at a time —
+        // `TestSsl.testPost` reads 16 MiB per thread on 8 threads, ~134
+        // million calls — turned that into minutes. Real JSSE serves these
+        // out of a plain Java `byte[]`. See `servlet::s2_tls_fill_readahead`
+        // for why the buffer is keyed by stream id.
+        if let Some(b) = crate::servlet::s2_tls_pop_buffered_byte(tls_id) {
+            return Ok(Some(Value::Int(b as i32)));
+        }
         // STW-COOPERATION (tomcatservletwebserverfactorytests-stw-takeover-hang):
-        // `s2_tls_read`/`s2_tls_write` do a genuine OS-level blocking socket
-        // operation. Without the blocked-region bracket this thread stays
-        // counted as a cooperative mutator that can never reach a safepoint
-        // poll, so a concurrent STW (GC / cross-thread JIT takeover) waits on
-        // it forever — and the bytes it waits for are produced by a peer
-        // thread in this same process (Tomcat's NioEndpoint SocketProcessor)
-        // which DOES stop at the barrier: a mutual deadlock, observed as
-        // `rounds=64 pending=1 taken=0` repeating with no further progress.
-        // Same bug shape as the `net_phase_e` HttpClient and S2 selector
-        // fixes; see `docs/internal/fixed-suite-bugs/keycloak/
+        // the refill does a genuine OS-level blocking socket operation.
+        // Without the blocked-region bracket this thread stays counted as a
+        // cooperative mutator that can never reach a safepoint poll, so a
+        // concurrent STW (GC / cross-thread JIT takeover) waits on it forever
+        // — and the bytes it waits for are produced by a peer thread in this
+        // same process (Tomcat's NioEndpoint SocketProcessor) which DOES stop
+        // at the barrier: a mutual deadlock, observed as `rounds=64 pending=1
+        // taken=0` repeating with no further progress. Same bug shape as the
+        // `net_phase_e` HttpClient and S2 selector fixes; see
+        // `docs/internal/fixed-suite-bugs/keycloak/
         // keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`.
         ctx.begin_blocking_region();
-        let read_result = crate::servlet::s2_tls_read(tls_id, &mut buf);
+        let filled = crate::servlet::s2_tls_fill_readahead(tls_id);
         ctx.end_blocking_region();
-        match read_result {
+        match filled {
             Ok(0) => Ok(Some(Value::Int(-1))),
-            Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
+            Ok(_) => Ok(Some(Value::Int(
+                crate::servlet::s2_tls_pop_buffered_byte(tls_id)
+                    .map(|b| b as i32)
+                    .unwrap_or(-1),
+            ))),
             Err(e) => Err(RuntimeError::IOException {
                 message: e.to_string(),
             }
@@ -2427,13 +2617,53 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             .into()),
         }
     });
-    r.register(ssl_is, "available", "()I", |_ctx, _args| {
+    r.register(ssl_is, "available", "()I", |ctx, args| {
         // native-tls does not expose a non-blocking peek, so match the
         // reference JDK behaviour of reporting 0 bytes readable without
-        // blocking.
-        Ok(Some(Value::Int(0)))
+        // blocking — EXCEPT for plaintext already pulled off the socket into
+        // this stream's readahead (see `servlet::s2_tls_fill_readahead`),
+        // which is readable without blocking by definition and must be
+        // reported, or a caller that loops on `available()` would stall on
+        // bytes it has effectively already received.
+        let this = obj_arg(args, 0)?;
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        if tls_id < 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        Ok(Some(Value::Int(
+            crate::servlet::s2_tls_buffered_len(tls_id) as i32,
+        )))
     });
-    r.register(ssl_is, "close", "()V", |_ctx, _args| Ok(None));
+    // STUB-REMOVAL (wave 2): `close()` on either of the two TLS socket streams
+    // was an unconditional no-op, so `sslSocket.getInputStream().close()` (and
+    // the output-stream sibling) left the TLS session and its OS socket open —
+    // one leaked fd and one live TLS connection per caller that closes the
+    // stream instead of the socket. The JDK contract for a socket's own streams
+    // is the opposite: "Closing the returned InputStream will close the
+    // associated socket" (`java.net.Socket.getInputStream`). Mirror
+    // `SSLSocket.close()` above: shut the TLS stream down (which flushes
+    // close_notify), stamp the id field to -1 so a second close is a no-op and
+    // any later read reports EOF rather than reusing a recycled id, and keep
+    // `net_phase_e`'s side table in sync.
+    fn ssl_stream_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        if tls_id >= 0 {
+            let _ = crate::servlet::s2_tls_close(tls_id);
+            ctx.set_field(this, 0, Value::Int(-1));
+        }
+        crate::net_phase_e::sock_mark_closed_for_upcall(ctx, this);
+        Ok(None)
+    }
+    r.register(ssl_is, "close", "()V", ssl_stream_close);
 
     // NEW-13: SSLSocketOutputStream — writes to `s2_registry` TLS stream.
     let ssl_os = "javax/net/ssl/SSLSocketOutputStream";
@@ -2549,8 +2779,16 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // KEEP (genuinely empty): every `write` above hands its bytes straight to
+    // `servlet::s2_tls_write`, which drives the underlying `TlsStream` and its
+    // `TcpStream` synchronously — there is no Java- or Rust-side buffer between
+    // the caller and the socket, so there is nothing for `flush()` to push.
+    // Real `SSLSocketImpl$AppOutputStream.flush()` is likewise a no-op once the
+    // record has been written.
     r.register(ssl_os, "flush", "()V", |_ctx, _args| Ok(None));
-    r.register(ssl_os, "close", "()V", |_ctx, _args| Ok(None));
+    // See `ssl_stream_close` above — closing a socket's stream closes the
+    // socket.
+    r.register(ssl_os, "close", "()V", ssl_stream_close);
 
     // NEW-13: SSLSession methods are now backed by the s2_registry TLS id
     // stored at NEW13_SESS_TLSID. Each accessor falls back to the session's
@@ -3200,11 +3438,29 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // STUB-REMOVAL (wave 2): this used to return normally without doing
+    // anything, which is the worst possible answer — the caller believes its
+    // key material was accepted, `getKeyManagers()` then hands back a manager
+    // with no identity, and the client certificate is silently never presented.
+    // The real `SunX509` / `NewSunX509` `KeyManagerFactorySpi.engineInit
+    // (ManagerFactoryParameters)` throws `InvalidAlgorithmParameterException`
+    // for every parameter type it does not understand (SunX509 understands
+    // none; NewSunX509 understands only `KeyStoreBuilderParameters`), and this
+    // implementation understands none either — the KeyStore overload above is
+    // the only supported initialisation path. Fail honestly so the caller sees
+    // the same exception the reference JDK raises instead of a mute downgrade.
     r.register(
         kmf,
         "init",
         "(Ljavax/net/ssl/ManagerFactoryParameters;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, _args| {
+            Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/InvalidAlgorithmParameterException",
+                "KeyManagerFactory.init(ManagerFactoryParameters) is not supported; \
+                 use init(KeyStore, char[])",
+            ))
+        },
     );
     r.register(
         kmf,
@@ -3994,6 +4250,105 @@ pub(crate) fn basic_der_extract_names(data: &[u8]) -> Option<(String, String)> {
 // java.security.cert — X509Certificate, CertificateFactory, CertPath
 // =============================================================================
 
+/// Recover the DER encoding backing a synthetic `java/security/cert/
+/// X509Certificate` mirror.
+///
+/// Two shapes exist and both are in active use:
+///   * 4-field mirror (`keystore::make_x509_mirror`'s fallback,
+///     `t27_tls::register_accepted_issuers`, `phases_early`'s getCertificate
+///     path) — slot 3 holds the raw DER as a `byte[]`;
+///   * 3-field mirror plus a `crypto_impl` cert-store id in slot 2, which only
+///     resolves under the `legacy-synthetic-crypto` feature.
+///
+/// Returns `None` when neither is present, so callers can raise the exception
+/// their contract requires rather than inventing an empty/valid-looking answer.
+pub(crate) fn x509_mirror_der(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Vec<u8>> {
+    if ctx.object_num_fields(this) > 3 {
+        if let Value::Object(Some(der_arr)) = ctx.get_field(this, 3) {
+            let len = ctx.array_length(der_arr);
+            if len > 0 {
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    if let Value::Int(b) = ctx.get_array_element(der_arr, i) {
+                        out.push(b as u8);
+                    }
+                }
+                if !out.is_empty() {
+                    return Some(out);
+                }
+            }
+        }
+    }
+    #[cfg(feature = "legacy-synthetic-crypto")]
+    {
+        let cert_id = match ctx.get_field(this, 2) {
+            Value::Long(id) => id as u64,
+            Value::Int(id) if id > 0 => id as u64,
+            _ => 0,
+        };
+        if cert_id != 0 {
+            if let Some(parsed) = crypto_impl::cert_get(cert_id) {
+                if !parsed.encoded.is_empty() {
+                    return Some(parsed.encoded.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Shared body for both `X509Certificate.checkValidity` overloads.
+///
+/// STUB-REMOVAL (wave 2): in the default build both overloads were
+/// unconditional no-ops — a void "check" method that never throws is a
+/// hard-coded PASS, so an expired or not-yet-valid certificate was certified as
+/// currently valid. Parse the mirror's own DER and enforce RFC 5280 §4.1.2.5
+/// for real, throwing the exact subclasses the JDK specifies
+/// (`CertificateExpiredException` / `CertificateNotYetValidException`, both
+/// `CertificateException`s) so a caller's existing catch blocks match.
+///
+/// `at_secs` is the instant to evaluate against, in seconds since the epoch.
+/// A certificate whose DER cannot be recovered or parsed CANNOT be attested to,
+/// so it throws `CertificateException` rather than passing silently.
+fn x509_check_validity_at(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    at_secs: i64,
+) -> MethodCallResult {
+    let Some(der) = x509_mirror_der(ctx, this) else {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/cert/CertificateException",
+            "certificate validity cannot be checked: no encoded form available",
+        ));
+    };
+    let parsed = match crate::x509_manager::parse_certificate(&der) {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/security/cert/CertificateException",
+                "certificate validity cannot be checked: malformed certificate",
+            ));
+        }
+    };
+    if at_secs < parsed.not_before_secs {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/cert/CertificateNotYetValidException",
+            "NotBefore is in the future",
+        ));
+    }
+    if at_secs > parsed.not_after_secs {
+        return Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/cert/CertificateExpiredException",
+            "NotAfter has already passed",
+        ));
+    }
+    Ok(None)
+}
+
 pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -4256,9 +4611,21 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(Some(arr))));
             }
         }
-        let _ = args; // suppress unused warning
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        Ok(Some(Value::Object(Some(arr))))
+        // STUB-REMOVAL (wave 2): the tail used to hand back a ZERO-LENGTH
+        // byte[]. An empty encoding is indistinguishable from "no certificate"
+        // to every consumer (rustls answers it with `BadEncoding`, a pin/hash
+        // check silently compares nothing), so a certificate object with no
+        // recoverable DER must raise the exception its contract specifies
+        // rather than fabricate one. Same treatment as the `X509Certificate`
+        // override below.
+        let this = obj_arg(args, 0)?;
+        let nfields = ctx.object_num_fields(this);
+        let message = format!("certificate has no encoded form ({nfields} fields)");
+        Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/cert/CertificateEncodingException",
+            &message,
+        ))
     });
     r.register(
         cert,
@@ -4488,25 +4855,34 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("X.509");
         Ok(Some(Value::Object(Some(s))))
     });
+    // STUB-REMOVAL (wave 2): in the DEFAULT build (no `legacy-synthetic-crypto`)
+    // this returned an EMPTY byte[] for every certificate. That is not a
+    // harmless placeholder: `getEncoded()` is how a caller obtains the DER it
+    // then hashes, pins, re-parses or feeds to a trust store, so an empty array
+    // turns a real certificate into "no certificate" without any error —
+    // rustls answers a zero-length chain with `BadEncoding`, and wave 1 had to
+    // work around this from `keystore.rs`. The synthetic X.509 mirror
+    // (`keystore::make_x509_mirror`'s fallback, `t27_tls::
+    // register_accepted_issuers`, `phases_early`'s getCertificate path) stashes
+    // the real DER in slot 3; read it, exactly as the `Certificate.getEncoded`
+    // sibling above already does. `x509_mirror_der` is the shared reader.
     r.register(x509, "getEncoded", "()[B", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) {
-                Value::Long(id) => id as u64,
-                _ => 0,
-            };
-            if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let arr =
-                    ctx.new_array(cratonvm_types::ArrayElementType::Byte, parsed.encoded.len());
-                for (i, &b) in parsed.encoded.iter().enumerate() {
-                    ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
-                }
-                return Ok(Some(Value::Object(Some(arr))));
+        let this = obj_arg(args, 0)?;
+        if let Some(der) = x509_mirror_der(ctx, this) {
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, der.len());
+            for (i, &b) in der.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
+            return Ok(Some(Value::Object(Some(arr))));
         }
-        let _ = args;
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        Ok(Some(Value::Object(Some(arr))))
+        // No DER anywhere on this object. Real `X509Certificate.getEncoded()`
+        // throws `CertificateEncodingException` rather than handing back an
+        // empty array that the caller would mistake for a valid encoding.
+        Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/security/cert/CertificateEncodingException",
+            "certificate has no encoded form",
+        ))
     });
     r.register(
         x509,
@@ -4567,56 +4943,45 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // STUB-REMOVAL (wave 2): both overloads were hard-coded PASSES in the
+    // default build (the whole body was `#[cfg(feature =
+    // "legacy-synthetic-crypto")]`-gated, leaving `Ok(None)`). See
+    // `x509_check_validity_at` for the enforcement and the exception contract.
     r.register(x509, "checkValidity", "()V", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) {
-                Value::Long(id) => id as u64,
-                _ => 0,
-            };
-            if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-                if !parsed.is_valid_at(now) {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: "Certificate not valid at current time".into(),
-                    }
-                    .into());
-                }
-            }
-        }
-        let _ = (ctx, args);
-        Ok(None)
+        let this = obj_arg(args, 0)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        x509_check_validity_at(ctx, this, now)
     });
     r.register(x509, "checkValidity", "(Ljava/util/Date;)V", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        if let Some(Value::Object(Some(this))) = args.get(0) {
-            let cert_id = match ctx.get_field(*this, 2) {
-                Value::Long(id) => id as u64,
-                _ => 0,
-            };
-            if let Some(parsed) = crypto_impl::cert_get(cert_id) {
-                // Extract time from Date object (field 0 = millis)
-                let millis = if let Some(Value::Object(Some(date))) = args.get(1) {
-                    match ctx.get_field(*date, 0) {
-                        Value::Long(ms) => ms / 1000,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-                if millis > 0 && !parsed.is_valid_at(millis) {
-                    return Err(RuntimeError::IllegalArgumentException {
-                        message: "Certificate not valid at specified time".into(),
+        let this = obj_arg(args, 0)?;
+        let date = obj_arg(args, 1)?;
+        // `Date.getTime()` is a real virtual call that can allocate/safepoint,
+        // so `this` must be pinned across it (the synthetic 1-field Date shape
+        // is not the only one that reaches here — a real `java.util.Date`
+        // keeps its millis in `fastTime`, which no fixed slot index finds).
+        let pin = ctx.pin_native_root(this);
+        let date_pin = ctx.pin_native_root(date);
+        let called = ctx.invoke_virtual(date, "getTime", "()J", &[]);
+        let this = ctx.read_native_pin(pin, this);
+        let date = ctx.read_native_pin(date_pin, date);
+        ctx.unpin_native_roots(pin);
+        let millis = match called? {
+            Some(Value::Long(ms)) => ms,
+            // Unreadable instant: fall back to the synthetic Date's slot 0.
+            _ => match ctx.get_field(date, 0) {
+                Value::Long(ms) => ms,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("checkValidity: date has no time value".into()),
                     }
                     .into());
                 }
-            }
-        }
-        let _ = (ctx, args);
-        Ok(None)
+            },
+        };
+        x509_check_validity_at(ctx, this, millis.div_euclid(1000))
     });
 
     // getSignature() -> byte[] (on X509Certificate)

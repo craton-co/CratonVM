@@ -27,7 +27,7 @@
 //! No stubs: every code path performs real I/O against the network or rejects
 //! the call with a typed `IOException`. We never fabricate canned 200s.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -50,6 +50,39 @@ thread_local! {
     /// (post-redirect-follow) response by the time `huc_real_perform` reads
     /// it back out into `RealResult::reason`.
     static LAST_REASON_PHRASE: RefCell<String> = RefCell::new(String::new());
+
+    /// Whether the response body most recently read on this thread was
+    /// TRUNCATED — the peer closed the connection part-way through a chunked
+    /// body/chunk header, or short of the advertised `Content-Length`.
+    ///
+    /// This used to be reported as a hard `Err` from `read_chunked`, which
+    /// **discarded every byte already received**. Real JDK semantics are the
+    /// opposite: `getResponseCode()` succeeds (the head arrived intact),
+    /// `getInputStream()` hands out the bytes that DID arrive, and only the
+    /// read that runs past the truncation point throws `IOException`
+    /// ("Premature EOF"). Tomcat's `TestGenerator.testBug56581` depends on
+    /// exactly that: `bug56581.jsp` writes 1000 lines, commits the response,
+    /// then throws, so `ErrorReportValve` aborts the connection mid-body — the
+    /// test asserts on the 1000 lines the client did receive AND on the
+    /// resulting `IOException`. Discarding the body made `ByteChunk.toString()`
+    /// return `null` and the assertion NPE.
+    ///
+    /// Same rationale as `LAST_REASON_PHRASE` above for why this is a
+    /// thread-local side channel rather than a 4th tuple element: every
+    /// blocking HTTP call is performed serially on the calling Java thread, so
+    /// "most recently read on this thread" is exactly "the response this
+    /// thread just read".
+    static LAST_RESPONSE_TRUNCATED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Mark the response currently being read on this thread as truncated.
+fn mark_response_truncated() {
+    LAST_RESPONSE_TRUNCATED.with(|t| t.set(true));
+}
+
+/// Read and clear the truncation flag for the response just read.
+fn take_response_truncated() -> bool {
+    LAST_RESPONSE_TRUNCATED.with(|t| t.replace(false))
 }
 
 use rustls::pki_types::ServerName;
@@ -94,6 +127,9 @@ struct ConnState {
     /// Once `getInputStream` has been called and the bytes drained, we keep
     /// the body here so subsequent `read()` calls return the same data.
     body_consumed: bool,
+    /// The peer aborted before the body was complete — see
+    /// `LAST_RESPONSE_TRUNCATED` and `make_response_input_stream`.
+    truncated: bool,
 }
 
 struct ConnRegistry {
@@ -157,6 +193,10 @@ struct RealResult {
     /// Empty for the synthetic timeout-sentinel result, in which case
     /// `huc_get_response_message` falls back to the hardcoded table.
     reason: String,
+    /// The peer aborted before the body was complete (see
+    /// `LAST_RESPONSE_TRUNCATED`). `body` holds the bytes that DID arrive;
+    /// the stream handed to Java replays them and then throws `IOException`.
+    truncated: bool,
 }
 
 fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
@@ -592,6 +632,7 @@ fn huc_real_perform(
                             headers,
                             body,
                             reason,
+                            truncated: take_response_truncated(),
                         },
                     );
                 }
@@ -606,6 +647,7 @@ fn huc_real_perform(
                             headers: Vec::new(),
                             body: Vec::new(),
                             reason: String::new(),
+                            truncated: false,
                         },
                     );
                 }
@@ -652,8 +694,8 @@ fn huc_real_perform(
             Ok(p) => p,
             Err(_) => return Ok(-1),
         };
-        let established_https_stream = if parsed.scheme == "https" {
-            huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
+        let tls_restrictions = if parsed.scheme == "https" {
+            huc_client_tls_restrictions(ctx, &parsed.host, parsed.port)?
         } else {
             None
         };
@@ -666,7 +708,7 @@ fn huc_real_perform(
             &body,
             connect_to,
             read_to,
-            established_https_stream,
+            tls_restrictions.as_ref(),
         );
         match resp {
             Ok((status, headers, resp_body))
@@ -703,6 +745,7 @@ fn huc_real_perform(
                         headers,
                         body,
                         reason,
+                        truncated: take_response_truncated(),
                     },
                 );
             }
@@ -721,6 +764,7 @@ fn huc_real_perform(
                         headers: Vec::new(),
                         body: Vec::new(),
                         reason: String::new(),
+                        truncated: false,
                     },
                 );
             }
@@ -736,6 +780,20 @@ fn huc_real_perform(
                 ctx,
                 "javax/net/ssl/SSLHandshakeException",
                 e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
+            ))
+        }
+        // A caller-installed `HostnameVerifier` rejected the peer. Real JSSE
+        // raises `SSLPeerUnverifiedException` here (from
+        // `HttpsClient.checkURLSpoofing`), not `SSLHandshakeException` — the
+        // handshake itself succeeded; it is the identity that was refused.
+        // Both extend `SSLException`/`IOException`, so a caller catching
+        // either supertype is unaffected, but code that catches the precise
+        // type (the shape a pinning test asserts on) needs this distinction.
+        Err(ref e) if e.starts_with(TLS_PEER_UNVERIFIED_SENTINEL) => {
+            Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLPeerUnverifiedException",
+                e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
             ))
         }
         // A refused TCP connect (see `CONNECT_REFUSED_SENTINEL`'s doc) must
@@ -758,6 +816,75 @@ fn huc_real_body(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
         .ok()
         .and_then(|t| t.get(&key).map(|r| r.body.clone()))
         .unwrap_or_default()
+}
+
+/// Whether the cached response for a real-JDK connection was truncated by the
+/// peer (see `LAST_RESPONSE_TRUNCATED`).
+fn huc_real_truncated(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    real_results()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| r.truncated))
+        .unwrap_or(false)
+}
+
+/// Build the `InputStream` handed to Java for a response body.
+///
+/// For a complete response this is just a `ByteArrayInputStream` over `body`.
+/// For a TRUNCATED response (peer aborted mid-body) it is a
+/// `SequenceInputStream(ByteArrayInputStream(body), <a stream whose first read
+/// throws IOException>)`, so a Java reader sees exactly what HotSpot shows it:
+/// the bytes that arrived, followed by an `IOException` at the point the data
+/// stopped — rather than an empty body (what discarding the partial body gave)
+/// or a silent clean EOF (what returning it without the error would give).
+///
+/// The trailing "always throws" stream is an **unconnected**
+/// `java.io.PipedInputStream`: a real JDK class, constructed with no side
+/// effects, whose every `read` overload immediately throws
+/// `IOException("Pipe not connected")`. Using a real `InputStream` subclass
+/// (rather than a CratonVM synthetic) matters because callers wrap the result
+/// in `BufferedInputStream`/`InputStreamReader`, which are typed against
+/// `java.io.InputStream`.
+fn make_response_input_stream(
+    ctx: &mut dyn NativeContext,
+    body: &[u8],
+    truncated: bool,
+) -> MethodCallResult {
+    let head = make_byte_array_input_stream(ctx, body);
+    if !truncated {
+        return Ok(Some(head));
+    }
+    let Value::Object(Some(head_ref)) = head else {
+        return Ok(Some(head));
+    };
+    // `head` must survive the two constructor up-calls below, both of which can
+    // allocate and therefore relocate it under the moving collector — pin it and
+    // read the forwarded reference back afterwards.
+    let pin = ctx.pin_native_root(head_ref);
+    let tail = ctx.new_object_initialized("java/io/PipedInputStream", "()V", &[]);
+    let out = match tail {
+        Ok(Some(Value::Object(Some(tail_ref)))) => {
+            // BOTH operands have to survive the `SequenceInputStream`
+            // allocation, so pin the tail too before re-reading either.
+            let tail_pin = ctx.pin_native_root(tail_ref);
+            let head_now = Value::Object(Some(ctx.read_native_pin(pin, head_ref)));
+            let tail_now = Value::Object(Some(ctx.read_native_pin(tail_pin, tail_ref)));
+            match ctx.new_object_initialized(
+                "java/io/SequenceInputStream",
+                "(Ljava/io/InputStream;Ljava/io/InputStream;)V",
+                &[head_now, tail_now],
+            ) {
+                Ok(Some(seq @ Value::Object(Some(_)))) => Ok(Some(seq)),
+                // Could not wrap — hand back the partial body on its own rather
+                // than losing it.
+                _ => Ok(Some(Value::Object(Some(ctx.read_native_pin(pin, head_ref))))),
+            }
+        }
+        _ => Ok(Some(Value::Object(Some(ctx.read_native_pin(pin, head_ref))))),
+    };
+    ctx.unpin_native_roots(pin);
+    out
 }
 
 /// Cached response headers for a real-JDK connection (empty if not performed).
@@ -1152,6 +1279,17 @@ const READ_TIMEOUT_SENTINEL: &str = "__cratonvm_read_timeout__";
 /// failures (e.g. a malformed-but-present HTTP response).
 const TLS_HANDSHAKE_FAILURE_SENTINEL: &str = "__cratonvm_tls_handshake_failure__: ";
 
+/// Prefix on an error string returned by [`perform`] when a caller-installed
+/// `HostnameVerifier` REJECTED the peer (returned `false`, threw, or returned
+/// a non-boolean). Deliberately distinct from
+/// [`TLS_HANDSHAKE_FAILURE_SENTINEL`] for two reasons: the exception type
+/// differs (real JSSE's `HttpsClient.checkURLSpoofing` raises
+/// `SSLPeerUnverifiedException`, not `SSLHandshakeException`), and
+/// `perform_with_retry` must NOT retry this — a verifier's verdict on the same
+/// certificate is deterministic, so retrying would just run the app's verifier
+/// a second time and fail identically.
+const TLS_PEER_UNVERIFIED_SENTINEL: &str = "__cratonvm_tls_peer_unverified__: ";
+
 /// Prefix on an error string returned by [`perform`] when its TCP connect
 /// phase failed with `ConnectionRefused` specifically. `huc_real_perform`
 /// recognises this and raises `java.net.ConnectException` (real-JDK
@@ -1224,6 +1362,9 @@ fn read_response_with_prefix<S: Read>(
     head: bool,
     prefix: Vec<u8>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
+    // Fresh response: clear any truncation flag left by an earlier one on this
+    // thread (e.g. the first leg of a redirect chain).
+    LAST_RESPONSE_TRUNCATED.with(|t| t.set(false));
     let mut buf = prefix;
     let mut tmp = [0u8; 8192];
     let head_end = match find_subslice(&buf, b"\r\n\r\n") {
@@ -1308,6 +1449,10 @@ fn read_response_with_prefix<S: Read>(
         while body_buf.len() < target {
             let n = read_eof_tolerant(stream, &mut tmp).map_err(|e| format!("body read: {e}"))?;
             if n == 0 {
+                // Peer closed before delivering the advertised Content-Length.
+                // Keep what arrived; the caller surfaces the shortfall as an
+                // IOException at the END of the stream, as HotSpot does.
+                mark_response_truncated();
                 break;
             }
             body_buf.extend_from_slice(&tmp[..n]);
@@ -1341,7 +1486,12 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             let n =
                 read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("chunked size", e))?;
             if n == 0 {
-                return Err("chunked: socket closed mid-header".into());
+                // Connection aborted between chunks. Return the chunks that
+                // DID arrive (see `LAST_RESPONSE_TRUNCATED`) instead of
+                // discarding the whole body — the caller replays them to the
+                // Java reader and then throws, matching HotSpot.
+                mark_response_truncated();
+                return Ok(out);
             }
             prefix.extend_from_slice(&tmp[..n]);
         };
@@ -1359,7 +1509,11 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             let n =
                 read_eof_tolerant(stream, &mut tmp).map_err(|e| read_io_err("chunked body", e))?;
             if n == 0 {
-                return Err("chunked: socket closed mid-body".into());
+                // Aborted part-way through a chunk: keep the complete chunks
+                // already decoded plus whatever of this one arrived.
+                mark_response_truncated();
+                out.extend_from_slice(&prefix[..prefix.len().min(size)]);
+                return Ok(out);
             }
             prefix.extend_from_slice(&tmp[..n]);
         }
@@ -1371,146 +1525,112 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
     }
 }
 
-/// FIX (client-cipher-restriction): a thin `Read`/`Write` adapter over a
-/// rustls client stream id already registered in `t27_tls`'s server registry
-/// (`s2_tls_read`/`s2_tls_write` dispatch on `id >= RUSTLS_SOCK_ID_BASE`,
-/// which is exactly the id shape `SSLSocketFactory.createSocket`/
-/// `SSLSocket.setEnabledCipherSuites` (net_phase_e.rs) produce). Lets
-/// `perform` drive its existing request-write / `read_response` logic over a
-/// connection established by a real up-call to a caller-installed
-/// `SSLSocketFactory`, instead of only over its own locally-owned
-/// `StreamOwned`.
-struct RustlsIdStream(i32);
+/// The client-side TLS policy a caller-installed `SSLSocketFactory` would
+/// impose on this request: `(enabled cipher suites, enabled protocols)`,
+/// each empty when that dimension is unrestricted.
+pub(crate) type ClientTlsRestrictions = (Vec<String>, Vec<String>);
 
-impl Read for RustlsIdStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        crate::servlet::s2_tls_read(self.0, buf)
-    }
-}
-
-impl Write for RustlsIdStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        crate::servlet::s2_tls_write(self.0, buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// FIX (client-cipher-restriction): if a real (non-placeholder) default
-/// `SSLSocketFactory` is currently installed via
-/// `HttpsURLConnection.setDefaultSSLSocketFactory`, up-call its real
-/// `createSocket(host, port)` — genuine Java bytecode, so any override (e.g.
-/// Tomcat's `TesterSupport.ClientSSLSocketFactory`, which applies
-/// `setEnabledCipherSuites` right after creating the socket) actually runs —
-/// and return the resulting socket's backing stream id for `perform` to use.
+/// FIX (tls-handshake-enforcement-gap, doc 21): discover the TLS restrictions
+/// the currently-installed default `SSLSocketFactory` applies, by up-calling
+/// its real `createSocket(host, port)` in PROBE mode (see
+/// `net_phase_e::set_huc_factory_probe_mode`).
 ///
-/// Reads the real JDK static field directly (`HttpsURLConnection
-/// .defaultSSLSocketFactory`) rather than caching the factory at
-/// `setDefaultSSLSocketFactory` call time: that setter is real (non-native)
-/// JDK bytecode that the interpreter's native-override-priority rules let
-/// win over any registered native, so a native `setDefaultSSLSocketFactory`
-/// override never actually fires — reading the field it populates avoids
-/// depending on a call that doesn't happen.
+/// Why a probe rather than using the up-called socket directly: real JSSE
+/// runs every `HttpsURLConnection` request over the installed factory's
+/// socket, but CratonVM's native `HttpURLConnection` owns its own rustls
+/// connection, and only THAT connection has the full client feature set —
+/// synchronous Java `KeyManager.chooseClientAlias` consultation for mTLS,
+/// the captured per-`SSLContext` trust roots, and the shared TLS-ticket
+/// cache. Handing `perform` a socket built by `SSLSocketFactory.createSocket`
+/// (which has none of those) silently traded a correct connection for an
+/// enforced restriction. Probing gets both: the factory's own Java code runs
+/// for real — so `setEnabledCipherSuites`/`setEnabledProtocols` overrides
+/// like Tomcat's `TesterSupport.ClientSSLSocketFactory` really are observed —
+/// while the single actual connection stays `perform`'s own.
 ///
-/// Returns `Ok(None)` (falls through to `perform`'s own internal connection)
-/// when no factory is installed, the installed factory is CratonVM's own
+/// It also removes the reason the previous up-call had to be narrowed to
+/// almost nothing: in probe mode `createSocket` performs NO TCP connect and
+/// NO handshake, so the re-entrant `invoke_virtual` can no longer reach the
+/// class-loading/vtable-install lock-ordering deadlock that a nested
+/// blocking connect once exposed (see this function's history in
+/// `docs/internal/fixed-suite-bugs/tls-ocsp-clientcert-validation-not-enforced-FIXED.md`).
+/// The old gate — "only up-call when the factory has a private `ciphers`
+/// field holding at least one rustls-mappable suite name" — was both
+/// test-helper-specific and, since the factory was never published to
+/// `HttpsURLConnection.defaultSSLSocketFactory` at all (see
+/// `t27_tls::publish_default_ssl_socket_factory`), unreachable in practice.
+///
+/// Returns `Ok(None)` — meaning `perform` connects exactly as before — when
+/// no factory is installed, when the installed factory is CratonVM's own
 /// synthetic placeholder (`SSLContext.getSocketFactory()`'s bare return
-/// value), or the factory has no active cipher restriction to apply (see
-/// below) — the common case for every caller that doesn't restrict cipher
-/// suites, which must see the same fast internal path as before this fix.
-///
-/// FIX (client-cipher-restriction, narrowed scope): an earlier version of
-/// this up-called unconditionally whenever ANY real factory subclass was
-/// installed — every one of the ~15 other Tomcat SSL test files that call
-/// `TesterSupport.configureClientSsl()` installs the exact same
-/// `ClientSSLSocketFactory` wrapper, even though only the cipher-restriction
-/// tests actually need real Java semantics for `createSocket`. Routing all
-/// of them through a real, re-entrant `invoke_virtual` up-call (instead of
-/// `perform`'s previously-exclusive internal connect) exposed at least one
-/// unrelated, pre-existing classloading/vtable-install lock-ordering
-/// deadlock (confirmed via gdb on `TestClientCert`'s first test — the
-/// baseline binary runs it cleanly) plus extra failures on
-/// `TestSSLHostConfigCompat` — regressions in VM-core locking code well
-/// outside this fix's scope to safely diagnose or repair. Narrowing the
-/// trigger to "the factory actually has a pending cipher restriction"
-/// confines the up-call — and everything it can newly expose — to exactly
-/// the 2 tests that need it (`TestSSLHostConfigCipher`'s TLS 1.3 cases),
-/// leaving every other caller on the untouched, previously-working path.
-/// `ciphers` is a real, private `String[]` field declared directly on
-/// Tomcat's `TesterSupport.ClientSSLSocketFactory` (set by
-/// `setCipher(String[])`, always called before
-/// `HttpsURLConnection.setDefaultSSLSocketFactory` in every existing
-/// caller) — reading it by name is test-helper-specific, not a general JSSE
-/// mechanism, but the general mechanism (a real `SSLSocketFactory` has no
-/// standard way to expose "sockets from me will restrict ciphers" before a
-/// socket is actually created) doesn't exist, and the up-call's regression
-/// risk is too broad to accept for callers that don't need it.
-///
-/// FIX (client-cipher-restriction, narrowed further): a non-null `ciphers`
-/// alone still wasn't narrow enough — `TestSSLHostConfigCompat`'s
-/// `testHost*With*Client` cases call `setCipher` directly with classic TLS
-/// 1.2 `TLS_DHE_RSA_*` names (same family as `TestSSLHostConfigCipher`'s
-/// unfixable DHE case — see `any_cipher_mappable`'s doc). Since rustls can't
-/// represent those suites in any crypto provider, `SSLSocket
-/// .setEnabledCipherSuites` already no-ops for them (nothing to enforce), so
-/// up-calling for these callers only pays the up-call's risk with zero
-/// enforcement benefit — it can't do anything a non-up-called connection
-/// couldn't already do. Checking mappability here, before deciding to
-/// up-call at all (not just inside the eventual `setEnabledCipherSuites`
-/// call), keeps DHE-restricted callers on the untouched original path.
-fn huc_upcall_create_socket_if_custom_factory(
+/// value, which has no Java code to run), or when the probe came back with
+/// no restriction at all.
+fn huc_client_tls_restrictions(
     ctx: &mut dyn NativeContext,
     host: &str,
     port: u16,
-) -> Result<Option<i32>, MethodCallFailed> {
-    let Some(cid) = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection") else {
-        return Ok(None);
-    };
-    let Some(idx) = ctx.static_field_index_by_name(cid, "defaultSSLSocketFactory") else {
-        return Ok(None);
-    };
-    let factory = match ctx.get_static_field(cid, idx) {
-        Value::Object(Some(f)) => f,
-        _ => return Ok(None),
-    };
-    let factory_class_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(factory))
-        .unwrap_or_default();
-    if factory_class_name == "javax/net/ssl/SSLSocketFactory" {
-        return Ok(None);
-    }
-    let ciphers_arr = match ctx.get_field_by_name(factory, "ciphers") {
-        Value::Object(Some(arr)) => arr,
-        _ => return Ok(None),
-    };
-    let mut ciphers: Vec<String> = Vec::new();
-    let len = ctx.array_length(ciphers_arr);
-    for i in 0..len {
-        if let Value::Object(Some(s)) = ctx.get_array_element(ciphers_arr, i) {
-            if let Some(t) = ctx.read_string(s) {
-                ciphers.push(t);
-            }
+) -> Result<Option<ClientTlsRestrictions>, MethodCallFailed> {
+    let dbg = crate::nbflags().dbg_tls_auth_ok;
+    // Read the factory from the GC-rooted native slot, NOT from the real JDK
+    // static field: writing that field does not stick on this VM (measured —
+    // see `t27_tls::huc_default_factory_slot`), which silently disabled this
+    // whole mechanism.
+    let Some(factory) = crate::t27_tls::huc_default_ssl_socket_factory() else {
+        if dbg {
+            eprintln!("[dbg-tls-auth] huc_client_tls_restrictions: no default factory installed");
         }
+        return Ok(None);
+    };
+    // Our own placeholder carrier has no overriding Java bytecode to run, so
+    // probing it can only ever come back empty. Compare by `ClassId` rather
+    // than by name: `alloc_concurrent_synthetic` documents that
+    // `class_name_of_id` can misreport an interface-like synthetic class
+    // (`SSLSocketFactory` is abstract) as `java/lang/Object`.
+    let placeholder_cid = ctx.class_id_by_name("javax/net/ssl/SSLSocketFactory");
+    let factory_cid = ctx.class_id_of_object(factory);
+    if dbg {
+        eprintln!(
+            "[dbg-tls-auth] huc_client_tls_restrictions: factory class={:?} placeholder={}",
+            ctx.class_name_of_id(factory_cid),
+            placeholder_cid == Some(factory_cid)
+        );
     }
-    if !crate::t27_tls::any_cipher_mappable(&ciphers) {
+    if placeholder_cid == Some(factory_cid) {
+        return Ok(None);
+    }
+    if ctx
+        .class_name_of_id(factory_cid)
+        .is_none_or(|n| n == "java/lang/Object" || n == "javax/net/ssl/SSLSocketFactory")
+    {
         return Ok(None);
     }
     let host_obj = ctx.create_string(host);
-    let socket = match ctx.invoke_virtual(
+    crate::net_phase_e::set_huc_factory_probe_mode(true);
+    let created = ctx.invoke_virtual(
         factory,
         "createSocket",
         "(Ljava/lang/String;I)Ljava/net/Socket;",
         &[Value::Object(Some(host_obj)), Value::Int(port as i32)],
-    )? {
+    );
+    crate::net_phase_e::set_huc_factory_probe_mode(false);
+    let socket = match created? {
         Some(Value::Object(Some(s))) => s,
         _ => return Ok(None),
     };
-    let stream_id = crate::net_phase_e::sock_stream_id_for_upcall(ctx, socket);
-    if stream_id < 0 {
+    let Some((ciphers, protocols)) = crate::net_phase_e::take_probe_restrictions(ctx, socket)
+    else {
+        return Ok(None);
+    };
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] huc_client_tls_restrictions host={host} -> ciphers={ciphers:?} \
+             protocols={protocols:?}"
+        );
+    }
+    if ciphers.is_empty() && protocols.is_empty() {
         return Ok(None);
     }
-    Ok(Some(stream_id))
+    Ok(Some((ciphers, protocols)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1689,6 +1809,152 @@ fn try_pooled_request(
     read_response_with_prefix(stream, head, probe[..n].to_vec())
 }
 
+/// The `HostnameVerifier` in force for `connection`: its own instance field
+/// first, then the process-wide `HttpsURLConnection.defaultHostnameVerifier`.
+/// This mirrors real JSSE's precedence exactly, and reads the same two REAL
+/// JDK fields `t27_tls`'s `set{,Default}HostnameVerifier` natives write, so
+/// the setter and this call site cannot drift apart.
+fn huc_hostname_verifier(
+    ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    if let Some(connection) = connection {
+        if let Value::Object(Some(v)) = ctx.get_field_by_name(connection, "hostnameVerifier") {
+            return Some(v);
+        }
+    }
+    let cid = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection")?;
+    let idx = ctx.static_field_index_by_name(cid, "defaultHostnameVerifier")?;
+    match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(v)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Run the caller-installed `HostnameVerifier` against the completed
+/// handshake, immediately after the `TrustManager` check and before a single
+/// request byte is written — the same point real JSSE runs it.
+///
+/// WHY THIS EXISTS. `setHostnameVerifier`/`setDefaultHostnameVerifier` store
+/// the verifier (see `t27_tls`), but nothing consulted it, so an application
+/// that installed one had its check silently dropped. That is NOT a hole in
+/// ordinary TLS — rustls performs RFC 6125 endpoint identification itself
+/// during the handshake above, so the DEFAULT verifier's job is already done
+/// by the time we get here. The gap is an app-supplied verifier that is
+/// STRICTER than the default: certificate pinning, a CN/SAN allow-list, a
+/// corporate policy check. Such an app believed it had pinned and had not.
+///
+/// NO DOUBLE-VERIFY. The VM's own default verifier is an instance of the bare
+/// `javax/net/ssl/HostnameVerifier` interface (see the interface-level `verify`
+/// native in `t27_tls`, which short-circuits `true` for exactly that shape).
+/// Recognising it here and returning early keeps the ordinary HTTPS path
+/// allocation-free and means rustls's identity check is never re-run — only a
+/// genuinely app-supplied concrete verifier causes any work. A permissive
+/// app verifier (`(h, s) -> true`, the usual test shape) cannot WEAKEN
+/// anything either: rustls has already validated, and this runs strictly in
+/// addition to it, never instead of it.
+///
+/// FAIL CLOSED. A verifier that throws, or returns something that is not a
+/// boolean `true`, is treated as a rejection. `perform` returns
+/// `Result<_, String>` and cannot carry a pending Java exception, so the throw
+/// cannot be propagated verbatim; the alternative — swallowing it and
+/// proceeding — would turn a broken pinning check into a silent pass, which is
+/// the exact failure mode this whole change exists to remove. Same choice, and
+/// the same reasoning, as `run_client_trust_check_for_chain`'s `map_err` at
+/// the TrustManager gate a few lines above the call site.
+fn huc_verify_hostname(
+    ctx: &mut dyn NativeContext,
+    connection: Option<ObjectRef>,
+    host: &str,
+    protocol: &str,
+    cipher: &str,
+    peer_chain_der: Vec<Vec<u8>>,
+) -> Result<(), String> {
+    let Some(verifier0) = huc_hostname_verifier(ctx, connection) else {
+        return Ok(());
+    };
+    let verifier_cid = ctx.class_id_of_object(verifier0);
+    match ctx.class_name_of_id(verifier_cid).as_deref() {
+        // The VM's own default verifier (bare-interface instance), or a
+        // receiver whose class cannot be named: rustls already did this job.
+        Some("javax/net/ssl/HostnameVerifier") | None => return Ok(()),
+        Some(_) => {}
+    }
+
+    // GC: `verifier0` is a raw ObjectRef that must survive four allocations
+    // and then an arbitrary-Java call, and each allocated argument must
+    // survive the allocations that follow it. Pin every one and re-read the
+    // forwarded address before each use. A single `unpin_native_roots` of the
+    // FIRST base releases the whole batch (it truncates the pin stack), so
+    // every exit below goes through it.
+    let verifier_pin = ctx.pin_native_root(verifier0);
+    let host_s0 = ctx.create_string(host);
+    let host_pin = ctx.pin_native_root(host_s0);
+    let proto_s0 = ctx.create_string(protocol);
+    let proto_pin = ctx.pin_native_root(proto_s0);
+    let cipher_s0 = ctx.create_string(cipher);
+    let cipher_pin = ctx.pin_native_root(cipher_s0);
+    // The 3-field client `SSLSession` shape (`new13_alloc_ssl_session`'s), so
+    // the layout-aware real-mode accessors in `t27_tls::register_ssl_session_real`
+    // read it correctly: `getProtocol`/`getCipherSuite` from these slots,
+    // `getPeerCertificates` from the side table populated just below. A
+    // pinning verifier calls exactly that pair.
+    let session0 = alloc_concurrent_synthetic(
+        ctx,
+        "javax/net/ssl/SSLSession",
+        crate::phases_late::ssl_security::NEW13_SSL_SESS_FIELDS,
+    );
+    let session_pin = ctx.pin_native_root(session0);
+
+    let proto_s = ctx.read_native_pin(proto_pin, proto_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_PROTO,
+        Value::Object(Some(proto_s)),
+    );
+    let cipher_s = ctx.read_native_pin(cipher_pin, cipher_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_CIPHER,
+        Value::Object(Some(cipher_s)),
+    );
+    // -1: this connection owns its rustls state inside `perform` and is never
+    // registered in the `servlet` TLS id space, so there is no id to record.
+    // Every accessor that would consult it already tolerates a miss.
+    ctx.set_field(
+        session,
+        crate::phases_late::ssl_security::NEW13_SESS_TLSID,
+        Value::Int(-1),
+    );
+    let session = ctx.read_native_pin(session_pin, session0);
+    crate::t27_tls::record_client_peer_chain(ctx, session, peer_chain_der);
+
+    let verifier = ctx.read_native_pin(verifier_pin, verifier0);
+    let host_s = ctx.read_native_pin(host_pin, host_s0);
+    let session = ctx.read_native_pin(session_pin, session0);
+    let outcome = ctx.invoke_virtual(
+        verifier,
+        "verify",
+        "(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z",
+        &[Value::Object(Some(host_s)), Value::Object(Some(session))],
+    );
+    ctx.unpin_native_roots(verifier_pin);
+
+    match outcome {
+        Ok(Some(v)) if v.as_int().unwrap_or(0) != 0 => Ok(()),
+        Ok(_) => Err(format!(
+            "{TLS_PEER_UNVERIFIED_SENTINEL}Certificate for <{host}> does not match the \
+             installed HostnameVerifier"
+        )),
+        Err(_) => Err(format!(
+            "{TLS_PEER_UNVERIFIED_SENTINEL}the installed HostnameVerifier threw while \
+             verifying <{host}>; treating the peer as unverified"
+        )),
+    }
+}
+
 fn perform(
     ctx: &mut dyn NativeContext,
     connection: Option<ObjectRef>,
@@ -1698,7 +1964,7 @@ fn perform(
     body: &[u8],
     connect_timeout: Duration,
     read_timeout: Duration,
-    established_https_stream_id: Option<i32>,
+    tls_restrictions: Option<&ClientTlsRestrictions>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let head = method.eq_ignore_ascii_case("HEAD");
     let req = build_request(method, parsed, headers, body);
@@ -1708,8 +1974,7 @@ fn perform(
     // peek, write, or the bounded first-read — is treated exactly like a
     // pool miss, falling straight through to the ordinary fresh-connect path
     // below with no error surfaced to the caller.
-    let poolable_key = (established_https_stream_id.is_none() && parsed.scheme == "http")
-        .then(|| (parsed.host.clone(), parsed.port));
+    let poolable_key = (parsed.scheme == "http").then(|| (parsed.host.clone(), parsed.port));
     if let Some((host, port)) = &poolable_key {
         if let Some(mut pooled) = pool_take(host, *port) {
             ctx.begin_blocking_region();
@@ -1727,29 +1992,6 @@ fn perform(
         }
     }
 
-    // FIX (client-cipher-restriction): when the caller up-called a real,
-    // caller-installed SSLSocketFactory's createSocket (see
-    // `huc_upcall_create_socket_if_custom_factory`), that socket's handshake
-    // already ran for real — including any `SSLSocket.setEnabledCipherSuites`
-    // restriction the factory's `createSocket` override applied via its own
-    // real bytecode (which `perform`'s own internal connect below never sees,
-    // since it never touches Java-visible objects). Use that connection
-    // directly instead of opening a second one.
-    if let Some(stream_id) = established_https_stream_id {
-        let mut stream = RustlsIdStream(stream_id);
-        // Same blocking-region gap as the plain-HTTP branch below: a real OS
-        // write+read over an already-established connection, no Java-heap
-        // touch in this closure, so a plain begin/end bracket (no ref
-        // re-sync needed) is enough to keep it out of the STW mutator count.
-        ctx.begin_blocking_region();
-        let result = (|| -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
-            stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
-            stream.flush().map_err(|e| format!("flush: {e}"))?;
-            read_response(&mut stream, head)
-        })();
-        ctx.end_blocking_region();
-        return result;
-    }
     let addr = format!("{}:{}", parsed.host, parsed.port);
     let mut last_err: Option<String> = None;
     let mut tcp: Option<TcpStream> = None;
@@ -1842,6 +2084,49 @@ fn perform(
             })
             .or_else(crate::t27_tls::huc_default_client_config)
             .unwrap_or_else(shared_legacy_config);
+        // FIX (tls-handshake-enforcement-gap, doc 21): apply the cipher/
+        // protocol policy the installed `SSLSocketFactory` imposes (probed in
+        // `huc_client_tls_restrictions`). Rebuilt from the SAME captured
+        // ingredients the cached config was built from — client identity,
+        // `KeyManager` context key, trust-manager context key — so narrowing
+        // the handshake never costs mTLS or custom-trust behaviour. Only the
+        // TLS-ticket cache is given up (a fresh `ClientConfig` owns a fresh
+        // session store), which is why this is done ONLY when a restriction
+        // is actually in force.
+        let cfg = match tls_restrictions {
+            Some((ciphers, protocols)) => {
+                match crate::t27_tls::build_engine_client_config_with_identity_ciphers(
+                    &["http/1.1"],
+                    crate::t27_tls::huc_default_client_identity()
+                        .as_ref()
+                        .map(|(c, k)| (c.as_str(), k.as_str())),
+                    crate::t27_tls::huc_default_key_managers_ctx_key(),
+                    crate::t27_tls::huc_default_trust_managers_ctx_key(),
+                    ciphers,
+                    protocols,
+                ) {
+                    Ok(restricted) => restricted,
+                    // Falling back to the unrestricted config here silently
+                    // turns "this handshake must fail" into "this handshake
+                    // succeeded", so make the reason visible rather than
+                    // leaving a mystery pass.
+                    Err(e) => {
+                        if crate::nbflags().dbg_tls_auth_ok {
+                            eprintln!(
+                                "[dbg-tls-auth] perform: restricted client config FAILED \
+                                 (ciphers={ciphers:?} protocols={protocols:?}): {e} — falling \
+                                 back to the unrestricted config"
+                            );
+                        }
+                        cfg
+                    }
+                }
+            }
+            None => cfg,
+        };
+        // Match JSSE's SNI policy for this host — see
+        // `t27_tls::jsse_would_send_sni`.
+        let cfg = crate::t27_tls::client_config_for_host(cfg, &parsed.host);
         let server_name = ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("bad server name {}: {e}", parsed.host))?;
         let conn = ClientConnection::new(cfg, server_name)
@@ -1933,8 +2218,65 @@ fn perform(
                         )
                     })?;
             }
-            stream.write_all(&req).map_err(|e| format!("write: {e}"))?;
-            stream.flush().map_err(|e| format!("flush: {e}"))?;
+            // Hostname verification, at real JSSE's ordering: after the trust
+            // check, before the request is written. See `huc_verify_hostname`
+            // for why this is additive to (never a replacement for) rustls's
+            // own RFC 6125 endpoint identification, and why the ordinary path
+            // — no app verifier installed — costs nothing here.
+            //
+            // The chain is re-read from the connection rather than reusing the
+            // `peer_chain` above: that binding only exists inside the
+            // TrustManager branch, which is skipped entirely when no custom
+            // TrustManager is configured — the common case, and precisely the
+            // one where an app is most likely to be pinning with a verifier
+            // instead.
+            {
+                let peer_chain_der: Vec<Vec<u8>> = stream
+                    .conn
+                    .peer_certificates()
+                    .map(|certs| certs.iter().map(|cert| cert.as_ref().to_vec()).collect())
+                    .unwrap_or_default();
+                let protocol = match stream.conn.protocol_version() {
+                    Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2",
+                    _ => "TLSv1.3",
+                };
+                let cipher = stream
+                    .conn
+                    .negotiated_cipher_suite()
+                    .map(|cs| format!("{:?}", cs.suite()))
+                    .unwrap_or_else(|| "TLS_AES_256_GCM_SHA384".to_string());
+                huc_verify_hostname(
+                    ctx,
+                    connection,
+                    &parsed.host,
+                    protocol,
+                    &cipher,
+                    peer_chain_der,
+                )?;
+            }
+            // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.3 client
+            // finishes its own side of the handshake before the server has
+            // accepted it, so a server that rejects (e.g. a REQUIRED client
+            // certificate that was not presented) sends its alert and closes
+            // while we are already past `is_handshaking()`. That surfaces
+            // here as a failing FIRST write/flush — before a single request
+            // byte has been acknowledged, let alone a response byte read —
+            // and was reported as a bare `IOException`. Real JSSE raises
+            // `SSLHandshakeException`; `TestSslHandshakeFailure
+            // .testMissingClientCertificate` asserts exactly that type. Only
+            // this first write is reclassified: any later write failure
+            // happens on a connection the server already accepted and is a
+            // genuine transport error.
+            stream.write_all(&req).map_err(|e| {
+                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+                         TLS handshake, before the request could be sent — the peer likely \
+                         rejected the handshake: write: {e}")
+            })?;
+            stream.flush().map_err(|e| {
+                format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}connection failed immediately after the \
+                         TLS handshake, before the request could be sent — the peer likely \
+                         rejected the handshake: flush: {e}")
+            })?;
             // A TLS 1.3 client considers ITS side of the handshake finished (and so
             // `is_handshaking()` above already flipped false) as soon as it has sent
             // its own Finished — the server can still reject afterwards (e.g. a
@@ -1954,6 +2296,19 @@ fn perform(
                          TLS handshake with no response — the peer likely rejected the handshake \
                          (e.g. a required client certificate was not presented): {e}"
                     )
+                } else if e.contains("received fatal alert") {
+                    // FIX (tls-handshake-enforcement-gap, doc 21): the peer
+                    // rejected the connection with a TLS alert instead of
+                    // closing silently — e.g. `CertificateRequired` from a
+                    // `certificateVerification="required"` connector when the
+                    // client presented none (`TestSslHandshakeFailure
+                    // .testMissingClientCertificate`). No response byte has
+                    // been read at this point, so this is a rejected
+                    // handshake, not a mid-stream transport error, and real
+                    // JSSE raises `SSLHandshakeException` for it. Without
+                    // this it fell through to the generic `IOException`
+                    // wrapper — the exact type mismatch that test asserts on.
+                    format!("{TLS_HANDSHAKE_FAILURE_SENTINEL}{e}")
                 } else {
                     e
                 }
@@ -2049,7 +2404,7 @@ fn perform_with_retry(
     body: &[u8],
     connect_timeout: Duration,
     read_timeout: Duration,
-    established_https_stream_id: Option<i32>,
+    tls_restrictions: Option<&ClientTlsRestrictions>,
 ) -> Result<(i32, Vec<(String, String)>, Vec<u8>), String> {
     let resp = perform(
         ctx,
@@ -2060,10 +2415,23 @@ fn perform_with_retry(
         body,
         connect_timeout,
         read_timeout,
-        established_https_stream_id,
+        tls_restrictions,
     );
     match resp {
-        Err(ref e) if e == "connection closed before response head" && established_https_stream_id.is_none() => {
+        // FIX (tls-handshake-enforcement-gap, doc 21): the second condition
+        // is the "Tomcat wanted to renegotiate for a client certificate and
+        // couldn't" case — see `t27_tls::deferred_client_auth_contexts`. The
+        // server has, by the time it closed this connection, armed itself to
+        // request the certificate on the NEXT handshake, so retrying once on
+        // a fresh connection is what completes the exchange. A server that
+        // rejects for any other reason simply fails the retry the same way
+        // (one extra loopback handshake), and the caller still receives
+        // `SSLHandshakeException`.
+        Err(ref e)
+            if e == "connection closed before response head"
+                || (e.starts_with(TLS_HANDSHAKE_FAILURE_SENTINEL)
+                    && e.contains("connection closed immediately after the TLS handshake")) =>
+        {
             perform(
                 ctx,
                 connection,
@@ -2073,7 +2441,7 @@ fn perform_with_retry(
                 body,
                 connect_timeout,
                 read_timeout,
-                established_https_stream_id,
+                tls_restrictions,
             )
         }
         other => other,
@@ -2438,15 +2806,19 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
     };
 
     // FIX (client-cipher-restriction): resolve any real caller-installed
-    // SSLSocketFactory BEFORE calling perform — the up-call needs `ctx`.
-    let established_https_stream = if parsed.scheme == "https" {
-        huc_upcall_create_socket_if_custom_factory(ctx, &parsed.host, parsed.port)?
+    // SSLSocketFactory BEFORE calling perform — the probe up-call needs `ctx`.
+    let tls_restrictions = if parsed.scheme == "https" {
+        huc_client_tls_restrictions(ctx, &parsed.host, parsed.port)?
     } else {
         None
     };
     // `perform` manages its own (fine-grained) blocking regions internally —
     // see its doc — so this caller must not wrap the whole call in one.
-    let (status, headers, body_bytes) = match perform(
+    // Goes through `perform_with_retry` (like `huc_real_perform` already did)
+    // so `HttpURLConnection.connect()` gets the same one-shot retry on a
+    // connection the peer closed before responding — including the
+    // deferred-client-auth case (doc 21).
+    let (status, headers, body_bytes) = match perform_with_retry(
         ctx,
         Some(this),
         &parsed,
@@ -2455,7 +2827,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
         &body,
         connect_to,
         read_to,
-        established_https_stream,
+        tls_restrictions.as_ref(),
     ) {
         Ok(v) => v,
         // FIX (client-cipher-restriction): mirror `huc_real_perform`'s
@@ -2479,6 +2851,17 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
                 e.trim_start_matches(TLS_HANDSHAKE_FAILURE_SENTINEL),
             ));
         }
+        // See the matching arm in `huc_real_perform`: a `HostnameVerifier`
+        // rejection is `SSLPeerUnverifiedException`, not a handshake failure.
+        // Registered on this path too so `HttpURLConnection.connect()` and
+        // `getInputStream()`/`getResponseCode()` agree on the exception type.
+        Err(ref e) if e.starts_with(TLS_PEER_UNVERIFIED_SENTINEL) => {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "javax/net/ssl/SSLPeerUnverifiedException",
+                e.trim_start_matches(TLS_PEER_UNVERIFIED_SENTINEL),
+            ));
+        }
         Err(e) => return Err(ioex(format!("HttpURLConnection.connect failed: {e}"))),
     };
 
@@ -2490,6 +2873,7 @@ fn ensure_connected(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallR
             response_body: body_bytes,
             response_headers: headers,
             body_consumed: false,
+            truncated: take_response_truncated(),
         });
     ctx.set_field(this, HUC_CONN_ID, Value::Int(id));
     ctx.set_field(this, HUC_CONNECTED, Value::Int(1));
@@ -2679,7 +3063,8 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             if full.starts_with("http://") || full.starts_with("https://") {
                 huc_real_perform(ctx, this, &full)?;
                 let body = huc_real_body(ctx, this);
-                return Ok(Some(make_byte_array_input_stream(ctx, &body)));
+                let truncated = huc_real_truncated(ctx, this);
+                return make_response_input_stream(ctx, &body, truncated);
             }
             return ctx.invoke_virtual(maybe_url, "openStream", "()Ljava/io/InputStream;", &[]);
         }
@@ -2701,14 +3086,8 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }
 
     ensure_connected(ctx, this)?;
-    let body_bytes = with_state(ctx, this, |s| s.response_body.clone()).unwrap_or_default();
-    let body_arr = new_byte_array(ctx, &body_bytes);
-    let len = body_bytes.len() as i32;
-    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
-    ctx.set_field(stream, 0, Value::Object(Some(body_arr)));
-    ctx.set_field(stream, 1, Value::Int(0));
-    ctx.set_field(stream, 2, Value::Int(0));
-    ctx.set_field(stream, 3, Value::Int(len));
+    let (body_bytes, truncated) = with_state(ctx, this, |s| (s.response_body.clone(), s.truncated))
+        .unwrap_or_default();
     // Mark consumed so a follow-up read doesn't double-pull.
     if let Value::Int(id) = ctx.get_field(this, HUC_CONN_ID) {
         if let Ok(mut reg) = registry().lock() {
@@ -2717,7 +3096,7 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             }
         }
     }
-    Ok(Some(Value::Object(Some(stream))))
+    make_response_input_stream(ctx, &body_bytes, truncated)
 }
 
 fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2730,7 +3109,8 @@ fn huc_get_error_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
                 return Ok(Some(Value::Object(None)));
             }
             let body = huc_real_body(ctx, this);
-            return Ok(Some(make_byte_array_input_stream(ctx, &body)));
+            let truncated = huc_real_truncated(ctx, this);
+            return make_response_input_stream(ctx, &body, truncated);
         }
     }
     if !matches!(ctx.get_field(this, HUC_CONNECTED), Value::Int(1)) {
@@ -3402,7 +3782,15 @@ fn huc_get_instance_follow_redirects(
 }
 
 fn huc_using_proxy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Always false — we don't honor proxies in the legacy path yet.
+    // KEEP the constant `false`. This is not a stub standing in for an
+    // unimplemented lookup: `perform`/`connect_plain` dial the origin host
+    // directly and consult no `ProxySelector`, so "this connection is going
+    // through a proxy" is genuinely false for every connection this class
+    // makes. Returning true — or consulting `proxy_selector.rs` and reporting
+    // what a proxy-aware client WOULD have done — would be the lie, and
+    // callers branch on this to decide whether to send an absolute-form
+    // request line or `Proxy-Authorization`. If the legacy path ever learns
+    // to honour proxies, this must start reading the connection's own state.
     Ok(Some(Value::Int(0)))
 }
 
@@ -3884,12 +4272,14 @@ mod http_url_connection_tests {
             response_body: b"a".to_vec(),
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         let id2 = reg.allocate(ConnState {
             status: 404,
             response_body: b"b".to_vec(),
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         assert_ne!(id1, id2);
         assert_eq!(reg.get(id1).unwrap().status, 200);
@@ -3904,6 +4294,7 @@ mod http_url_connection_tests {
             response_body: vec![],
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         assert!(reg.get(id).is_some());
         reg.remove(id);
@@ -3979,6 +4370,7 @@ mod http_url_connection_tests {
             response_body: vec![],
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         ctx.set_field(this, HUC_CONN_ID, Value::Int(id));
         ctx.set_field(this, HUC_CONNECTED, Value::Int(1));

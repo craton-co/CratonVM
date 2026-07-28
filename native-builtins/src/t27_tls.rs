@@ -380,12 +380,110 @@ pub(crate) fn attach_trust_managers_to_ctx(
             list.len()
         );
     }
+    // FIX (tls-handshake-enforcement-gap, doc 21): snapshot each manager's
+    // accepted issuers now, while we still hold a `ctx` to call Java with.
+    //
+    // A server that delegates trust to an application `TrustManager` has no
+    // keystore-derived CA (Tomcat's `trustManagerClassName` mechanism), so
+    // `PassthroughClientCertVerifier` is used — and its `root_hint_subjects`
+    // was hard-coded empty, meaning the `CertificateRequest` carried no
+    // acceptable-CA list at all. Real JSSE sends the manager's
+    // `getAcceptedIssuers()` there, and clients rely on it:
+    // `TestCustomSslTrustManager.testCustomTrustManagerCA` asserts that its
+    // `KeyManager.chooseClientAlias` was offered EXACTLY the test CA.
+    //
+    // Captured here (rather than when the config is built) because
+    // `engine_begin` runs with no native context. A failure to call the
+    // manager is not fatal — the hints are an optimisation for the peer, and
+    // an empty list is exactly the old behaviour — so errors are swallowed
+    // rather than propagated out of `SSLContext.init`.
+    let issuers = capture_accepted_issuer_dns(ctx, &list);
     let mut table = ctx_trust_managers_table().lock();
     if list.is_empty() {
         table.remove(&key);
+        ctx_accepted_issuers_table().lock().remove(&key);
     } else {
         table.insert(key, list);
+        ctx_accepted_issuers_table().lock().insert(key, issuers);
     }
+}
+
+/// DER-encoded subject DNs of every `TrustManager`'s accepted issuers, keyed
+/// like `ctx_trust_managers_table`. See `attach_trust_managers_to_ctx`.
+fn ctx_accepted_issuers_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<Vec<u8>>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Accepted-issuer DNs recorded for `ctx_key`, as rustls
+/// `DistinguishedName`s ready to go into a `CertificateRequest`.
+fn accepted_issuer_hints(ctx_key: Option<u64>) -> Vec<rustls::DistinguishedName> {
+    let Some(key) = ctx_key else {
+        return Vec::new();
+    };
+    ctx_accepted_issuers_table()
+        .lock()
+        .get(&key)
+        .map(|ders| {
+            ders.iter()
+                .map(|d| rustls::DistinguishedName::from(d.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Call `X509TrustManager.getAcceptedIssuers()` on each manager and collect
+/// the DER encoding of every returned certificate's subject DN.
+///
+/// Capped, because a manager backed by the platform trust store legitimately
+/// returns ~150 roots and putting all of them in every `CertificateRequest`
+/// would bloat each handshake for no benefit to the callers this exists for.
+fn capture_accepted_issuer_dns(ctx: &mut dyn NativeContext, managers: &[ObjectRef]) -> Vec<Vec<u8>> {
+    const MAX_ISSUER_HINTS: usize = 16;
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for tm in managers {
+        if out.len() >= MAX_ISSUER_HINTS {
+            break;
+        }
+        let certs = match ctx.invoke_virtual(
+            *tm,
+            "getAcceptedIssuers",
+            "()[Ljava/security/cert/X509Certificate;",
+            &[],
+        ) {
+            Ok(Some(Value::Object(Some(arr)))) => arr,
+            _ => continue,
+        };
+        let len = ctx.array_length(certs);
+        for i in 0..len {
+            if out.len() >= MAX_ISSUER_HINTS {
+                break;
+            }
+            let Value::Object(Some(cert)) = ctx.get_array_element(certs, i) else {
+                continue;
+            };
+            let principal = match ctx.invoke_virtual(
+                cert,
+                "getSubjectX500Principal",
+                "()Ljavax/security/auth/x500/X500Principal;",
+                &[],
+            ) {
+                Ok(Some(Value::Object(Some(p)))) => p,
+                _ => continue,
+            };
+            let encoded = match ctx.invoke_virtual(principal, "getEncoded", "()[B", &[]) {
+                Ok(Some(Value::Object(Some(b)))) => b,
+                _ => continue,
+            };
+            let n = ctx.array_length(encoded);
+            let mut der = vec![0u8; n];
+            let read = ctx.read_byte_array_into(encoded, 0, &mut der);
+            if read == n && n > 0 {
+                out.push(der);
+            }
+        }
+    }
+    out
 }
 
 /// The `ctx_trust_managers_table` key for `ctx_obj`, if real Java
@@ -660,22 +758,27 @@ pub(crate) fn client_config_for_ssl_context_with_ciphers(
         Some(key),
         Some(key),
         enabled_ciphers,
+        &[],
     )
 }
 
 /// As `build_engine_client_config_with_identity`, but additionally restricts
-/// the negotiable cipher suites to `enabled_ciphers` when non-empty. Used by
-/// `SSLSocket.setEnabledCipherSuites` (net_phase_e.rs) to reconnect a socket
-/// created via `SSLSocketFactory.createSocket` under a real cipher
-/// restriction — callers rely on the JDK contract that a socket rejects the
-/// handshake when restricted to a suite the server doesn't support (e.g.
-/// Tomcat's `TesterSupport.ClientSSLSocketFactory`).
+/// the negotiable cipher suites to `enabled_ciphers` and the offered TLS
+/// versions to `enabled_protocols`, each when non-empty. Used by
+/// `SSLSocket.setEnabledCipherSuites`/`setEnabledProtocols` (net_phase_e.rs)
+/// and by `http_url_connection`'s HTTPS connect once a caller-installed
+/// `SSLSocketFactory` has been probed for its restrictions (see
+/// `huc_client_tls_restrictions`) — callers rely on the JDK contract that a
+/// socket rejects the handshake when restricted to a suite or protocol
+/// version the server doesn't support (e.g. Tomcat's
+/// `TesterSupport.ClientSSLSocketFactory`).
 pub(crate) fn build_engine_client_config_with_identity_ciphers(
     alpn: &[&str],
     client_identity: Option<(&str, &str)>,
     km_ctx_key: Option<u64>,
     trust_managers_ctx_key: Option<u64>,
     enabled_ciphers: &[String],
+    enabled_protocols: &[String],
 ) -> Result<Arc<ClientConfig>, String> {
     let trust_roots = active_client_trust_roots();
     let revocation = trust_roots.as_ref().and_then(|r| r.revocation.clone());
@@ -688,7 +791,7 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
                 .map(|managers| (!managers.is_empty()).then_some(key))
         })
         .is_some();
-    let provider = cipher_provider_for(enabled_ciphers);
+    let (provider, versions) = provider_and_versions(enabled_ciphers, enabled_protocols);
     if let Some(key) = km_ctx_key {
         let has_kms = ctx_key_managers_table()
             .lock()
@@ -707,6 +810,7 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
                 revocation,
                 use_java_trust_manager,
                 provider,
+                &versions,
             );
         }
     }
@@ -717,6 +821,7 @@ pub(crate) fn build_engine_client_config_with_identity_ciphers(
         revocation,
         use_java_trust_manager,
         provider,
+        &versions,
     )
 }
 
@@ -1417,13 +1522,37 @@ pub(crate) fn build_server_config_single_cert_ex(
         optional_client_cert,
         client_ca_pem,
         &[],
+        &[],
     )
+}
+
+/// Start a rustls `ServerConfig` builder whose accepted TLS versions honour
+/// `enabled_protocols` (Java `SSLEngine.setEnabledProtocols` names, which
+/// Tomcat feeds from `SSLHostConfig.protocols`). An empty/unmappable list
+/// keeps rustls's safe defaults — see `protocol_versions_for`.
+///
+/// FIX (tls-handshake-enforcement-gap, doc 21): every server config built
+/// here previously hard-coded `with_safe_default_protocol_versions()`, so a
+/// connector configured for exactly one TLS version happily accepted the
+/// other. `TestSSLHostConfigProtocol`'s `testTlsVersionMismatch*` cases
+/// (server TLSv1.3-only vs client TLSv1.2-only, and the reverse) expect
+/// `SSLHandshakeException`; both sides silently negotiated the version they
+/// had in common instead.
+fn server_builder_with_versions(
+    enabled_ciphers: &[String],
+    enabled_protocols: &[String],
+) -> Result<rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier>, String> {
+    let (provider, versions) = provider_and_versions(enabled_ciphers, enabled_protocols);
+    ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&versions)
+        .map_err(|e| format!("with_protocol_versions failed: {}", e))
 }
 
 /// As `build_server_config_single_cert_ex`, but restricts the negotiable
 /// cipher suites to `enabled_ciphers` (Java `SSLEngine.setEnabledCipherSuites`
-/// names) when non-empty — an empty list keeps the unrestricted `ring`
-/// default, identical to `build_server_config_single_cert_ex`.
+/// names) and the accepted TLS versions to `enabled_protocols` when non-empty
+/// — empty lists keep the unrestricted `ring` default and rustls's safe
+/// default versions, identical to `build_server_config_single_cert_ex`.
 pub(crate) fn build_server_config_single_cert_ex_ciphers(
     cert_pem: &str,
     key_pem: &str,
@@ -1432,14 +1561,12 @@ pub(crate) fn build_server_config_single_cert_ex_ciphers(
     optional_client_cert: bool,
     client_ca_pem: Option<&str>,
     enabled_ciphers: &[String],
+    enabled_protocols: &[String],
 ) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
     let key = parse_private_key_pem(key_pem)?;
 
-    let provider = cipher_provider_for(enabled_ciphers);
-    let builder = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("with_safe_default_protocol_versions failed: {}", e))?;
+    let builder = server_builder_with_versions(enabled_ciphers, enabled_protocols)?;
     let builder = if require_client_cert || optional_client_cert {
         let ca_pem = client_ca_pem
             .ok_or_else(|| "client auth requested but client_ca_pem is None".to_string())?;
@@ -1788,12 +1915,19 @@ fn build_client_config_ex(
         revocation,
         use_java_trust_manager,
         Arc::new(cbc_augmented_default_provider()),
+        &[],
     )
 }
 
 /// Provider-aware implementation of `build_client_config_ex`.  A distinct
 /// provider is required when Java `SSLParameters` narrows the allowed cipher
 /// suites, including for the custom-verifier and Java-KeyManager branches.
+///
+/// `versions` narrows the offered TLS protocol versions (see
+/// `protocol_versions_for`); an EMPTY slice means "rustls safe defaults"
+/// (TLS 1.3 + TLS 1.2), which is what every caller that has no explicit
+/// `SSLSocket.setEnabledProtocols`/`SSLEngine.setEnabledProtocols`
+/// restriction passes.
 fn build_client_config_ex_with_provider(
     roots: RootCertStore,
     alpn_protocols: &[&str],
@@ -1801,15 +1935,33 @@ fn build_client_config_ex_with_provider(
     revocation: Option<crate::x509_manager::RevocationConfig>,
     use_java_trust_manager: bool,
     provider: Arc<rustls::crypto::CryptoProvider>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> Result<Arc<ClientConfig>, String> {
+    // `with_protocol_versions(&[])` is an error in rustls, and so is a list
+    // whose versions the provider cannot serve — fall back to the safe
+    // defaults rather than failing the whole connection, matching
+    // `cipher_provider_for`'s "an unmappable restriction never starves the
+    // connection to zero" contract.
+    macro_rules! with_versions {
+        ($b:expr) => {{
+            let b = $b;
+            if versions.is_empty() {
+                b.with_safe_default_protocol_versions()
+                    .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
+            } else {
+                match b.with_protocol_versions(versions) {
+                    Ok(v) => v,
+                    Err(e) => return Err(format!("with_protocol_versions failed: {e}")),
+                }
+            }
+        }};
+    }
     let builder = if use_java_trust_manager {
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
             Arc::new(PassthroughServerCertVerifier {
                 algorithms: provider.signature_verification_algorithms.clone(),
             });
-        ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
+        with_versions!(ClientConfig::builder_with_provider(provider.clone()))
             .dangerous()
             .with_custom_certificate_verifier(verifier)
     } else {
@@ -1821,15 +1973,11 @@ fn build_client_config_ex_with_provider(
                     .map_err(|e| format!("WebPkiServerVerifier::builder failed: {e}"))?;
                 let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
                     Arc::new(OcspAwareServerCertVerifier { inner, revocation });
-                ClientConfig::builder_with_provider(provider.clone())
-                    .with_safe_default_protocol_versions()
-                    .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
+                with_versions!(ClientConfig::builder_with_provider(provider.clone()))
                     .dangerous()
                     .with_custom_certificate_verifier(verifier)
             }
-            None => ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map_err(|e| format!("with_safe_default_protocol_versions failed: {e}"))?
+            None => with_versions!(ClientConfig::builder_with_provider(provider))
                 .with_root_certificates(roots),
         }
     };
@@ -2333,9 +2481,71 @@ fn java_cipher_name_to_suite(name: &str) -> Option<rustls::CipherSuite> {
         "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256" => TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
         "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384" => TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
         "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384" => TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+        // FIX (tls-handshake-enforcement-gap, doc 21): classic finite-field
+        // DHE suites map onto their ECDHE analogue.
+        //
+        // rustls implements no finite-field Diffie-Hellman key exchange in
+        // any crypto provider (`ring`/`aws-lc-rs` ship ECDHE only) — a real
+        // upstream limitation we cannot close from here. Refusing to map
+        // them at all, though, is strictly worse than mapping them onto the
+        // suite that differs ONLY in the key-exchange group: a caller's
+        // cipher POLICY (which certificate/authentication algorithm the peer
+        // must use, and which bulk cipher + PRF strength) is fully preserved
+        // by this substitution, and it is exactly that policy every affected
+        // caller is expressing. Left unmapped, `cipher_provider_for` fell
+        // back to the unrestricted provider, so a deliberately incompatible
+        // restriction quietly negotiated something else and SUCCEEDED —
+        // `TestSSLHostConfigCipher.testTls12CipherNotAvailable` and
+        // `TestSSLHostConfigCompat.testHostECwithRSAClient` both expect
+        // `SSLHandshakeException` and got a normal response instead.
+        //
+        // The mapping is applied consistently on BOTH ends (the same
+        // function serves the server's `SSLHostConfig.ciphers` and the
+        // client's `setEnabledCipherSuites`), so an intersection that is
+        // empty in JSSE terms stays empty here and a non-empty one stays
+        // non-empty. What is NOT reproduced is the wire-level key exchange:
+        // a peer that genuinely only offers FFDHE still cannot be talked to.
+        // These names are also advertised from the supported-suite lists
+        // (`getSupportedCipherSuites`/`getSupportedSSLParameters`) so
+        // Tomcat's `SSLUtilBase.getEnabled` stops silently dropping them
+        // from a connector's configured list.
+        //
+        // Only the `DHE_RSA` family is mapped. `DHE_DSS` is deliberately
+        // left unmapped: substituting an RSA-authenticated suite for it
+        // would change the AUTHENTICATION algorithm, which is exactly the
+        // property this mapping exists to preserve.
+        "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256" => TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384" => TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
         _ => return None,
     })
 }
+
+/// The Java cipher-suite names CratonVM's TLS stack advertises as supported,
+/// in JSSE preference order. Single source of truth for
+/// `SSLEngine.getSupportedCipherSuites`, `SSLSocket
+/// .getSupportedCipherSuites` and `SSLContext.getSupportedSSLParameters()`,
+/// which previously each kept their own hand-maintained copy and had already
+/// drifted apart.
+pub(crate) const SUPPORTED_CIPHER_SUITE_NAMES: &[&str] = &[
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
+    // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
+    // Negotiated as their ECDHE analogue — see `java_cipher_name_to_suite`.
+    "TLS_DHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_DHE_RSA_WITH_AES_256_GCM_SHA384",
+];
 
 /// `ring`'s default `CryptoProvider`, augmented with the T-CBC.1 CBC-mode
 /// TLS1.2 suites (`crate::t27_tls_cbc`) that `ring` itself never implements —
@@ -2390,18 +2600,211 @@ fn cipher_provider_for(enabled: &[String]) -> Arc<rustls::crypto::CryptoProvider
 }
 
 /// True if at least one of `ciphers` maps to a real rustls `CipherSuite` (see
-/// `java_cipher_name_to_suite`). Classic TLS 1.2 `TLS_DHE_RSA_*` names never
-/// map — rustls has never implemented finite-field DHE key exchange in any of
-/// its crypto providers (`ring`/`aws-lc-rs` only ship ECDHE + TLS 1.3), which
-/// is a real upstream library limitation, not an oversight here. Callers that
-/// would otherwise silently fall back to an unrestricted connection (see
-/// `cipher_provider_for`) should use this to detect that case up front and
-/// leave an existing connection alone instead of tearing it down for a
-/// restriction that cannot actually be enforced through rustls.
+/// `java_cipher_name_to_suite`). Callers that would otherwise silently fall
+/// back to an unrestricted connection (see `cipher_provider_for`) should use
+/// this to detect that case up front and leave an existing connection alone
+/// instead of tearing it down for a restriction that cannot actually be
+/// enforced through rustls.
 pub(crate) fn any_cipher_mappable(ciphers: &[String]) -> bool {
     ciphers
         .iter()
         .any(|n| java_cipher_name_to_suite(n).is_some())
+}
+
+/// Map Java protocol names (`SSLSocket`/`SSLEngine.setEnabledProtocols`,
+/// Tomcat's `SSLHostConfig.protocols`) onto the rustls
+/// `SupportedProtocolVersion`s to offer/accept.
+///
+/// Returns an EMPTY vec — meaning "leave rustls's safe defaults alone" — when
+/// `enabled` is empty or names nothing rustls implements. rustls only ships
+/// TLS 1.2 and TLS 1.3; the legacy names (`SSLv2Hello`/`SSLv3`/`TLSv1`/
+/// `TLSv1.1`) are deliberately unmapped, exactly as Tomcat's own
+/// `SSLUtilBase.getEnabled` already reports them as skipped for this engine.
+/// Never returning a *narrower-than-requested* non-empty list matters: a list
+/// that resolved to zero versions would make `with_protocol_versions` fail
+/// and take down a connection the caller only meant to constrain.
+fn protocol_versions_for(enabled: &[String]) -> Vec<&'static rustls::SupportedProtocolVersion> {
+    if enabled.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<&'static rustls::SupportedProtocolVersion> = Vec::new();
+    // Preserve rustls's own preference order (1.3 before 1.2) rather than the
+    // caller's, which is a preference list, not a policy ordering.
+    if enabled.iter().any(|p| p == "TLSv1.3") {
+        out.push(&rustls::version::TLS13);
+    }
+    if enabled.iter().any(|p| p == "TLSv1.2") {
+        out.push(&rustls::version::TLS12);
+    }
+    out
+}
+
+/// True when `protocols` is a GENUINE narrowing of what this TLS stack can
+/// negotiate — i.e. it names at least one version we implement and leaves at
+/// least one out.
+///
+/// The mirror of `setEnabledCipherSuites`' "is this the full supported set?"
+/// guard: callers routinely re-assert the whole list (`setEnabledProtocols(
+/// getSupportedProtocols())`) as ordinary connection setup, and tearing down
+/// an established connection for that would turn a harmless no-op into a
+/// reconnect — and, worse, into a handshake that cannot redo semantics the
+/// original one had (a Java `TrustManager` that accepted a self-signed test
+/// certificate). An empty or wholly unrecognised list is likewise not a
+/// restriction we can act on.
+pub(crate) fn protocol_restriction_is_real(protocols: &[String]) -> bool {
+    let mapped = protocol_versions_for(protocols);
+    !mapped.is_empty() && mapped.len() < 2
+}
+
+/// Would real JSSE put `host` in the TLS `server_name` (SNI) extension?
+///
+/// FIX (tls-handshake-enforcement-gap, doc 21). The JDK only sends SNI for a
+/// host name it can turn into an `SNIHostName`, and
+/// `sun.security.ssl.Utilities.rawToSNIHostName` rejects anything that is not
+/// a fully-qualified DNS name: IP literals (RFC 6066 forbids them outright)
+/// and — the case that matters here — single-label names with no dot, such as
+/// the ubiquitous `localhost`. rustls has no such rule and always advertises
+/// SNI for any name that parses as a `DnsName`.
+///
+/// That difference is directly observable to a server. `TestSsl.testSni`'s
+/// final assertion issues a plain `getUrl("https://localhost:<port>/...")`
+/// against a connector with a `localhost` virtual host and
+/// `defaultSSLHostConfigName="_default_"`, and expects **400**: with no SNI,
+/// Tomcat's `AbstractEndpoint.checkSni` compares the DEFAULT host config
+/// against the `localhost` one, they differ, and the request is rejected.
+/// Sending SNI made both lookups resolve to the same `localhost` config, so
+/// CratonVM answered 200 — the "SNI mismatch accepted" symptom this doc
+/// originally recorded, which turns out not to be a validation gap at all but
+/// an over-eager client extension.
+///
+/// Deliberately conservative: only suppress SNI where the JDK definitely
+/// would (no dot, or a numeric/IPv6 literal). A name with a dot is passed
+/// through unchanged, so ordinary internet hosts are unaffected.
+pub(crate) fn jsse_would_send_sni(host: &str) -> bool {
+    if host.is_empty() || !host.contains('.') || host.contains(':') {
+        // No dot => single-label name (`localhost`); a colon => IPv6 literal.
+        return false;
+    }
+    // Dotted-quad IPv4 literal: every label is numeric.
+    if host.split('.').all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    true
+}
+
+/// Return `config` with the SNI extension suppressed when JSSE would not send
+/// it for `host` (see [`jsse_would_send_sni`]). Clones only in that case, so
+/// the shared, session-cache-owning config is reused for every ordinary host.
+///
+/// Applied on the native `HttpURLConnection` path only. The
+/// `SSLSocketFactory.createSocket` path deliberately keeps sending SNI: a real
+/// JSSE `SSLSocket` defers its handshake until the first I/O, so a caller can
+/// still force SNI afterwards with `SSLParameters.setServerNames` (which
+/// `TestSsl.testSni` does, precisely because JSSE would not send it for
+/// `localhost` on its own). Ours handshakes eagerly inside `createSocket` and
+/// can never see that later call, so suppressing SNI there would produce the
+/// opposite wire behaviour from what such a caller asked for.
+pub(crate) fn client_config_for_host(config: Arc<ClientConfig>, host: &str) -> Arc<ClientConfig> {
+    if jsse_would_send_sni(host) {
+        return config;
+    }
+    let mut cloned = (*config).clone();
+    cloned.enable_sni = false;
+    Arc::new(cloned)
+}
+
+/// Resolve the `(CryptoProvider, protocol versions)` pair to build a config
+/// from, given a Java cipher-suite restriction and a Java protocol
+/// restriction (either or both possibly empty = unrestricted).
+///
+/// FIX (tls-handshake-enforcement-gap, doc 21). Cipher suites and protocol
+/// versions are not independent, and treating them as if they were broke
+/// connections in BOTH directions:
+///
+/// * **Client.** A caller that narrows to TLS 1.2 suites only (Tomcat's
+///   `TesterSupport.ClientSSLSocketFactory.setCipher`, and every
+///   `TestSSLHostConfigCompat`/`TestSSLHostConfigCipher` case that uses it)
+///   must stop OFFERING TLS 1.3 — real JSSE drops a protocol version whose
+///   cipher suites are all disabled. rustls does not do that itself: it
+///   happily advertises `supported_versions = [1.3, 1.2]` with a
+///   `cipher_suites` list containing no TLS 1.3 suite, the peer selects
+///   TLS 1.3 (its preference), finds no suite in common, and the handshake
+///   dies — turning a restriction the caller expected to SUCCEED into a
+///   `handshake_failure`.
+/// * **Server.** The mirror image: `with_protocol_versions` hard-errors with
+///   "no usable cipher suites configured" if the restricted provider has no
+///   suite for any requested version, and an error there aborts
+///   `engine_begin` before a single TLS byte is written, so the peer sees a
+///   bare connection close. A connector configured `protocols="TLSv1.2"`
+///   whose cipher list happens to resolve to TLS 1.3 suites only would take
+///   the whole virtual host down. An unenforceable cipher restriction must
+///   never disable a protocol version the operator explicitly configured, so
+///   the restriction is dropped (and reported) rather than the version.
+///
+/// Precedence: an explicit protocol restriction always wins; the cipher list
+/// can only narrow WITHIN it, never beyond it.
+fn provider_and_versions(
+    enabled_ciphers: &[String],
+    enabled_protocols: &[String],
+) -> (
+    Arc<rustls::crypto::CryptoProvider>,
+    Vec<&'static rustls::SupportedProtocolVersion>,
+) {
+    fn versions_with_suites(
+        provider: &rustls::crypto::CryptoProvider,
+        candidates: &[&'static rustls::SupportedProtocolVersion],
+    ) -> Vec<&'static rustls::SupportedProtocolVersion> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|v| {
+                provider
+                    .cipher_suites
+                    .iter()
+                    .any(|cs| cs.version().version == v.version)
+            })
+            .collect()
+    }
+
+    const ALL: [&rustls::SupportedProtocolVersion; 2] =
+        [&rustls::version::TLS13, &rustls::version::TLS12];
+    let requested = protocol_versions_for(enabled_protocols);
+    let candidates: Vec<&'static rustls::SupportedProtocolVersion> = if requested.is_empty() {
+        ALL.to_vec()
+    } else {
+        requested
+    };
+
+    let provider = cipher_provider_for(enabled_ciphers);
+    let usable = versions_with_suites(&provider, &candidates);
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] provider_and_versions ciphers={:?} protocols={:?} -> versions={:?}",
+            enabled_ciphers,
+            enabled_protocols,
+            usable.iter().map(|v| v.version).collect::<Vec<_>>()
+        );
+    }
+    if !usable.is_empty() {
+        return (provider, usable);
+    }
+    // The cipher restriction starved every requested version — keep the
+    // versions, drop the restriction.
+    let unrestricted = Arc::new(cbc_augmented_default_provider());
+    let usable = versions_with_suites(&unrestricted, &candidates);
+    let versions = if usable.is_empty() {
+        ALL.to_vec()
+    } else {
+        usable
+    };
+    if crate::nbflags().dbg_tls_auth_ok {
+        eprintln!(
+            "[dbg-tls-auth] provider_and_versions: cipher restriction {:?} has no suite for \
+             protocols {:?} — restriction dropped",
+            enabled_ciphers, enabled_protocols
+        );
+    }
+    (unrestricted, versions)
 }
 
 /// A `ClientCertVerifier` that accepts any structurally-valid, correctly
@@ -2446,6 +2849,11 @@ pub(crate) fn any_cipher_mappable(ciphers: &[String]) -> bool {
 struct PassthroughClientCertVerifier {
     mandatory: bool,
     algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+    /// Acceptable-CA list to advertise in the `CertificateRequest` — the
+    /// delegating Java `TrustManager`'s `getAcceptedIssuers()`, snapshotted at
+    /// `SSLContext.init` time (see `capture_accepted_issuer_dns`). Empty when
+    /// no manager was registered or it accepts any issuer.
+    root_hints: Vec<rustls::DistinguishedName>,
 }
 
 impl rustls::server::danger::ClientCertVerifier for PassthroughClientCertVerifier {
@@ -2456,7 +2864,7 @@ impl rustls::server::danger::ClientCertVerifier for PassthroughClientCertVerifie
         self.mandatory
     }
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        &[]
+        &self.root_hints
     }
     fn verify_client_cert(
         &self,
@@ -2499,19 +2907,22 @@ fn build_server_config_single_cert_passthrough_client_auth(
     alpn_protocols: &[&str],
     require_client_cert: bool,
     enabled_ciphers: &[String],
+    enabled_protocols: &[String],
+    root_hints: Vec<rustls::DistinguishedName>,
 ) -> Result<Arc<ServerConfig>, String> {
     let chain = parse_cert_chain_pem(cert_pem)?;
     let key = parse_private_key_pem(key_pem)?;
-    let provider = cipher_provider_for(enabled_ciphers);
-    let algorithms = provider.signature_verification_algorithms;
+    let builder = server_builder_with_versions(enabled_ciphers, enabled_protocols)?;
+    let algorithms = provider_and_versions(enabled_ciphers, enabled_protocols)
+        .0
+        .signature_verification_algorithms;
     let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
         Arc::new(PassthroughClientCertVerifier {
             mandatory: require_client_cert,
             algorithms,
+            root_hints,
         });
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("with_safe_default_protocol_versions failed: {}", e))?
+    let mut config = builder
         .with_client_cert_verifier(verifier)
         .with_single_cert(chain, key)
         .map_err(|e| format!("ServerConfig with_single_cert failed: {}", e))?;
@@ -2533,10 +2944,10 @@ pub(crate) fn build_client_config_ciphers(
     client_auth: Option<(&str, &str)>,
     enabled_ciphers: &[String],
 ) -> Result<Arc<ClientConfig>, String> {
-    let provider = cipher_provider_for(enabled_ciphers);
+    let (provider, versions) = provider_and_versions(enabled_ciphers, &[]);
     let builder = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("with_safe_default_protocol_versions failed: {}", e))?
+        .with_protocol_versions(&versions)
+        .map_err(|e| format!("with_protocol_versions failed: {}", e))?
         .with_root_certificates(roots);
     let mut config = match client_auth {
         Some((cert_pem, key_pem)) => {
@@ -3078,6 +3489,11 @@ struct PendingLayeredSocket {
     use_java_trust_manager: bool,
     client_identity: Option<(String, String)>,
     enabled_ciphers: Vec<String>,
+    /// Same deal for `SSLSocket.setEnabledProtocols()` — a caller may narrow
+    /// the offered TLS versions any time before the deferred handshake
+    /// starts, and (per real JSSE) the handshake must then genuinely fail
+    /// when the peer supports none of them.
+    enabled_protocols: Vec<String>,
     server_identity: Option<(String, String)>,
     host: String,
     client_mode: bool,
@@ -3186,6 +3602,7 @@ pub(crate) fn stash_pending_layered_socket(
             use_java_trust_manager,
             client_identity,
             enabled_ciphers: Vec::new(),
+            enabled_protocols: Vec::new(),
             server_identity,
             host,
             client_mode: true,
@@ -3200,6 +3617,14 @@ pub(crate) fn stash_pending_layered_socket(
 pub(crate) fn set_pending_layered_socket_ciphers(pending_id: i32, ciphers: Vec<String>) {
     if let Some(p) = pending_layered_sockets().lock().get_mut(&pending_id) {
         p.enabled_ciphers = ciphers;
+    }
+}
+
+/// `setEnabledProtocols(...)` on a still-pending layered socket — the
+/// protocol-version sibling of `set_pending_layered_socket_ciphers`.
+pub(crate) fn set_pending_layered_socket_protocols(pending_id: i32, protocols: Vec<String>) {
+    if let Some(p) = pending_layered_sockets().lock().get_mut(&pending_id) {
+        p.enabled_protocols = protocols;
     }
 }
 
@@ -3248,7 +3673,8 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
             })
         };
         let roots = root_store_for_trust_roots(trust_roots.as_ref());
-        let provider = cipher_provider_for(&pending.enabled_ciphers);
+        let (provider, versions) =
+            provider_and_versions(&pending.enabled_ciphers, &pending.enabled_protocols);
         let client_config = build_client_config_ex_with_provider(
             roots,
             &["http/1.1"],
@@ -3261,6 +3687,7 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
             None,
             pending.use_java_trust_manager,
             provider,
+            &versions,
         )
         .map_err(|e| format!("layered client config: {e}"))?;
         match pending.stream {
@@ -3551,6 +3978,117 @@ fn set_ssl_server_socket_state(
         .insert(gc_stable_objref_key(ctx, socket), state);
 }
 
+/// `listener_id` → the server identity its rustls `ServerConfig` was built
+/// from.
+///
+/// STUB-REMOVAL (wave 2): `SSLServerSocket.setNeedClientAuth`/
+/// `setWantClientAuth` were unconditional no-ops. A server that stood up an
+/// mTLS listener therefore accepted every anonymous client while believing a
+/// client certificate was mandatory — a silently disabled authentication
+/// check, the most dangerous shape a constant native can take. Honouring the
+/// call means rebuilding the listener's `ServerConfig` with a
+/// `WebPkiClientVerifier` (`build_server_config_single_cert_ex`), which needs
+/// the (cert, key) PEM the listener was originally built from — the
+/// `TlsServerListenerEntry` only keeps the finished config, so record the
+/// ingredients here at `createServerSocket` time.
+fn sss_listener_identities() -> &'static Mutex<HashMap<i32, RuntimeTlsIdentity>> {
+    static T: OnceLock<Mutex<HashMap<i32, RuntimeTlsIdentity>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Per-`SSLServerSocket` client-auth request as last set by
+/// `setNeedClientAuth`/`setWantClientAuth`, keyed by `gc_stable_objref_key`.
+/// Tuple is `(need, want)`, each 0/1; JSSE makes the two mutually exclusive.
+fn sss_client_auth_states() -> &'static Mutex<HashMap<u64, (i32, i32)>> {
+    static T: OnceLock<Mutex<HashMap<u64, (i32, i32)>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Non-destructive client-CA source for the rebuild above. Deliberately NOT
+/// `active_client_trust_roots()`: that one *takes* the thread-local selected
+/// context slot, which a later client handshake on the same thread still
+/// needs.
+fn sss_client_ca_pem() -> String {
+    let roots = selected_context_trust_roots().or_else(huc_default_trust_roots);
+    trust_roots_pem(roots.as_ref())
+}
+
+/// Apply a `setNeedClientAuth`/`setWantClientAuth` request to the live
+/// listener by rebuilding its `ServerConfig`.
+///
+/// Fails LOUDLY rather than silently when the request cannot be honoured: a
+/// caller that asked for mandatory client authentication and got no exception
+/// is entitled to assume it is in force. Turning client auth OFF is the state
+/// the listener was already built in, so that direction never throws.
+fn sss_apply_client_auth(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    need: bool,
+    want: bool,
+) -> Result<Option<Value>, cratonvm_types::error::MethodCallFailed> {
+    let key = gc_stable_objref_key(ctx, this);
+    if !need && !want {
+        sss_client_auth_states().lock().insert(key, (0, 0));
+        return Ok(None);
+    }
+    let listener_id = ssl_server_socket_state(ctx, this)
+        .map(|state| state.listener_id)
+        .unwrap_or_else(|| ctx.get_field(this, SSS_LISTENER_ID).as_int().unwrap_or(-1));
+    if listener_id < 0 {
+        return Err(RuntimeError::IOException {
+            message: "SSLServerSocket is closed".into(),
+        }
+        .into());
+    }
+    let identity = sss_listener_identities()
+        .lock()
+        .get(&listener_id)
+        .cloned()
+        .ok_or_else(|| RuntimeError::IllegalStateException {
+            message: "client auth requested on a listener with no recorded TLS identity"
+                .to_string(),
+        })?;
+    let client_ca = match identity.client_ca_pem.as_deref() {
+        Some(ca) => ca.to_string(),
+        None => {
+            let pem = sss_client_ca_pem();
+            if pem.is_empty() {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "setNeedClientAuth(true) requires javax.net.ssl.trustStore"
+                        .to_string(),
+                }
+                .into());
+            }
+            pem
+        }
+    };
+    let config = build_server_config_single_cert_ex(
+        &identity.cert_pem,
+        &identity.key_pem,
+        &["h2", "http/1.1"],
+        need,
+        want,
+        Some(client_ca.as_str()),
+    )
+    .map_err(|message| RuntimeError::IOException { message })?;
+    {
+        let mut reg = sreg().lock();
+        match reg.listeners.get_mut(&listener_id) {
+            Some(entry) => entry.config = TlsServerConfig::Rustls(config),
+            None => {
+                return Err(RuntimeError::IOException {
+                    message: "SSLServerSocket is closed".into(),
+                }
+                .into());
+            }
+        }
+    }
+    sss_client_auth_states()
+        .lock()
+        .insert(key, (i32::from(need), i32::from(want)));
+    Ok(None)
+}
+
 // Server-side SSLSocket returned from accept(): reuses the existing
 // SSLSocket 6-field layout but field 2 (tls_id) references the rustls
 // server-streams table rather than the native-tls client table. The
@@ -3735,6 +4273,10 @@ fn create_ssl_server_socket(
         reg.listeners.insert(id, entry);
         id
     };
+    // Remember the ingredients so `setNeedClientAuth`/`setWantClientAuth` can
+    // rebuild this listener's config with a client verifier — see
+    // `sss_listener_identities`.
+    sss_listener_identities().lock().insert(id, identity);
 
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLServerSocket", SSS_FIELDS);
     set_ssl_server_socket_state(
@@ -3882,6 +4424,11 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         let id = state.listener_id;
         if id >= 0 {
             rustls_listener_close(id);
+            // Drop the recorded identity with the listener it belongs to (see
+            // `sss_listener_identities`), so the table cannot grow without
+            // bound and a recycled listener id cannot inherit stale key
+            // material.
+            sss_listener_identities().lock().remove(&id);
             ctx.set_field(this, SSS_LISTENER_ID, Value::Int(-1));
         }
         set_ssl_server_socket_state(
@@ -3951,8 +4498,47 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // bind call is a no-op for our synthetic model.
         Ok(None)
     });
-    r.register(sss, "setNeedClientAuth", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(sss, "setWantClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    // STUB-REMOVAL (wave 2): both were `Ok(None)` no-ops — see
+    // `sss_listener_identities` for why a silently-ignored
+    // `setNeedClientAuth(true)` is the worst failure mode in this file. These
+    // now rebuild the listener's rustls `ServerConfig` with a real
+    // `WebPkiClientVerifier` (mandatory for `need`, `allow_unauthenticated`
+    // for `want`) and throw when that cannot be done, so a server never
+    // believes mTLS is enforced when it is not.
+    r.register(sss, "setNeedClientAuth", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        // JSSE: setNeedClientAuth(true) clears wantClientAuth.
+        sss_apply_client_auth(ctx, this, on, false)
+    });
+    r.register(sss, "setWantClientAuth", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        sss_apply_client_auth(ctx, this, false, on)
+    });
+    // Paired getters: `javax.net.ssl.SSLServerSocket` declares both abstract,
+    // so without a native an ordinary read-back throws AbstractMethodError.
+    // Now that the setters keep real state, report it.
+    r.register(sss, "getNeedClientAuth", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let need = sss_client_auth_states()
+            .lock()
+            .get(&key)
+            .map(|(need, _)| *need)
+            .unwrap_or(0);
+        Ok(Some(Value::Int(need)))
+    });
+    r.register(sss, "getWantClientAuth", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = gc_stable_objref_key(ctx, this);
+        let want = sss_client_auth_states()
+            .lock()
+            .get(&key)
+            .map(|(_, want)| *want)
+            .unwrap_or(0);
+        Ok(Some(Value::Int(want)))
+    });
     // getEnabledProtocols/setEnabledProtocols — `javax.net.ssl.SSLServerSocket`
     // is a real, abstract JDK class; unlike `SSLSocket`/`SSLEngine` (whose
     // `cls_impl` natives cover these via the shared `with_engine` state),
@@ -4142,6 +4728,16 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         "getDefaultSSLSocketFactory",
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, _args| {
+            // FIX (tls-handshake-enforcement-gap, doc 21): honour the JDK's
+            // documented round trip — once `setDefaultSSLSocketFactory` has
+            // published a factory (see `publish_default_ssl_socket_factory`
+            // below), return THAT object rather than a fresh, unrelated
+            // placeholder. Callers that install a configured factory and later
+            // read it back (to wrap it, or to restore it in a test teardown)
+            // otherwise silently lost their configuration.
+            if let Some(f) = huc_default_ssl_socket_factory() {
+                return Ok(Some(Value::Object(Some(f))));
+            }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -4248,6 +4844,45 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             }
         }
     }
+    // FIX (tls-handshake-enforcement-gap, doc 21): this native REPLACES the
+    // real `HttpsURLConnection.setDefaultSSLSocketFactory` bytecode, so the
+    // real JDK static field `HttpsURLConnection.defaultSSLSocketFactory` was
+    // left permanently null. `http_url_connection::
+    // huc_upcall_create_socket_if_custom_factory` — the ONLY mechanism that
+    // makes a caller-installed `SSLSocketFactory`'s real Java `createSocket`
+    // (and therefore its `setEnabledCipherSuites`/`setEnabledProtocols`
+    // restrictions) actually run for an `HttpsURLConnection` request — reads
+    // exactly that field to find the installed factory, so it silently found
+    // nothing and the whole up-call path was dead code. Every Tomcat test
+    // that restricts the CLIENT's ciphers or protocols and expects the
+    // handshake to fail (`TestSSLHostConfigCipher`, `TestSSLHostConfigCompat`,
+    // `TestSSLHostConfigProtocol`) therefore connected unrestricted and
+    // succeeded where real JSSE refuses. Publish the factory into the real
+    // static field so the reader finds it — and so ordinary Java code calling
+    // `getDefaultSSLSocketFactory()` observes the JDK-documented round trip.
+    // Writing the real field (rather than caching the `ObjectRef` in a native
+    // global) also keeps the factory reachable as a normal static GC root.
+    fn publish_default_ssl_socket_factory(
+        ctx: &mut dyn cratonvm_native_api::NativeContext,
+        factory: ObjectRef,
+    ) {
+        // Keep the reference in a GC-rooted native slot. Writing the real JDK
+        // static field was tried first and does NOT work: with
+        // `CRATONVM_DBG_TLS_AUTH` the very next read reports "default factory
+        // is null", so the probe that applies a caller's client-side
+        // restriction never ran at all. See `huc_default_factory_slot`.
+        set_huc_default_ssl_socket_factory(factory);
+        // Still attempt the field write, so ordinary Java code reading
+        // `HttpsURLConnection.defaultSSLSocketFactory` reflectively sees it if
+        // the VM ever starts honouring this.
+        let Some(cid) = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection") else {
+            return;
+        };
+        let Some(idx) = ctx.static_field_index_by_name(cid, "defaultSSLSocketFactory") else {
+            return;
+        };
+        ctx.set_static_field(cid, idx, Value::Object(Some(factory)));
+    }
     r.register(
         hurl,
         "setDefaultSSLSocketFactory",
@@ -4255,6 +4890,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             if let Some(Value::Object(Some(f))) = args.first() {
                 capture_huc_client_identity(ctx, *f, None);
+                publish_default_ssl_socket_factory(ctx, *f);
             }
             Ok(None)
         },
@@ -4281,11 +4917,45 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // STUB-REMOVAL (wave 2): the two setters were `Ok(None)` no-ops and the two
+    // getters always minted a fresh default verifier, so a caller-installed
+    // `HostnameVerifier` was discarded and could not even be read back. That is
+    // a security-relevant drop in one direction — an application installing a
+    // verifier STRICTER than RFC 6125 endpoint identification had its extra
+    // check silently removed — and a plain fidelity bug in the other (a
+    // permissive verifier, the usual test shape, also vanished).
+    //
+    // Store the verifier in the REAL JDK fields (`HttpsURLConnection
+    // .defaultHostnameVerifier` static, `hostnameVerifier` instance) rather
+    // than a native side table: those are ordinary GC roots, so no new
+    // `ObjectRef`-holding static needs wiring into
+    // `gc_scan_tls_ctx_trust_manager_roots`. Both getters read them back and
+    // only fall back to the synthetic default when nothing was installed.
+    //
+    // RESIDUAL, deliberately not papered over: the stored verifier is NOT yet
+    // consulted during a request. This VM's HTTPS path
+    // (`http_url_connection::perform`) owns its rustls connection end to end
+    // and rustls performs RFC 6125 endpoint identification itself, so the
+    // DEFAULT verifier's job is already done — but a stricter app-supplied
+    // verifier is still not additionally applied. Making it run means calling
+    // it from `http_url_connection::perform`, which is outside this file.
+    fn hurl_default_verifier_field(
+        ctx: &dyn NativeContext,
+    ) -> Option<(cratonvm_types::ClassId, usize)> {
+        let cid = ctx.class_id_by_name("javax/net/ssl/HttpsURLConnection")?;
+        let idx = ctx.static_field_index_by_name(cid, "defaultHostnameVerifier")?;
+        Some((cid, idx))
+    }
     r.register(
         hurl,
         "getDefaultHostnameVerifier",
         "()Ljavax/net/ssl/HostnameVerifier;",
         |ctx, _args| {
+            if let Some((cid, idx)) = hurl_default_verifier_field(ctx) {
+                if let Value::Object(Some(v)) = ctx.get_static_field(cid, idx) {
+                    return Ok(Some(Value::Object(Some(v))));
+                }
+            }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -4294,19 +4964,68 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         hurl,
         "setDefaultHostnameVerifier",
         "(Ljavax/net/ssl/HostnameVerifier;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // Static method: slot 0 IS the verifier, not a receiver (same
+            // shape as `setDefaultSSLSocketFactory` above). Real JDK rejects
+            // null with IllegalArgumentException.
+            let verifier = match args.first() {
+                Some(Value::Object(Some(v))) => *v,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "no default HostnameVerifier specified".to_string(),
+                    }
+                    .into());
+                }
+            };
+            // Resolve the field in its own statement so the immutable
+            // reborrow of `ctx` is finished before the `&mut` write below.
+            let field = hurl_default_verifier_field(ctx);
+            if let Some((cid, idx)) = field {
+                ctx.set_static_field(cid, idx, Value::Object(Some(verifier)));
+            }
+            Ok(None)
+        },
     );
     r.register(
         hurl,
         "setHostnameVerifier",
         "(Ljavax/net/ssl/HostnameVerifier;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let connection = obj_arg(args, 0)?;
+            let verifier = match args.get(1) {
+                Some(Value::Object(Some(v))) => *v,
+                _ => {
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: "no HostnameVerifier specified".to_string(),
+                    }
+                    .into());
+                }
+            };
+            ctx.set_field_by_name(
+                connection,
+                "hostnameVerifier",
+                Value::Object(Some(verifier)),
+            );
+            Ok(None)
+        },
     );
     r.register(
         hurl,
         "getHostnameVerifier",
         "()Ljavax/net/ssl/HostnameVerifier;",
-        |ctx, _args| {
+        |ctx, args| {
+            if let Ok(connection) = obj_arg(args, 0) {
+                if let Value::Object(Some(v)) =
+                    ctx.get_field_by_name(connection, "hostnameVerifier")
+                {
+                    return Ok(Some(Value::Object(Some(v))));
+                }
+            }
+            if let Some((cid, idx)) = hurl_default_verifier_field(ctx) {
+                if let Value::Object(Some(v)) = ctx.get_static_field(cid, idx) {
+                    return Ok(Some(Value::Object(Some(v))));
+                }
+            }
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/HostnameVerifier", 0);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -5836,6 +6555,11 @@ pub(crate) struct EngineState {
     /// engine (whether it passed, failed, or found nothing to check) so it
     /// only happens once per connection.
     trust_check_done: bool,
+    /// True once this engine's rustls config was built asking the peer for a
+    /// certificate (NEED, WANT, or the deferred-auth substitute below). Used
+    /// to tell Tomcat's "renegotiate to collect the client certificate"
+    /// second `beginHandshake()` apart from an ordinary redundant one.
+    client_auth_requested: bool,
 }
 
 impl Default for EngineState {
@@ -5863,6 +6587,7 @@ impl Default for EngineState {
             peer_cert_chain_der: Vec::new(),
             trust_managers_ctx_key: None,
             trust_check_done: false,
+            client_auth_requested: false,
         }
     }
 }
@@ -6125,6 +6850,31 @@ fn handshake_status_of(s: &EngineState) -> i32 {
         None => return HS_NOT_HANDSHAKING_R,
     };
     if !conn.is_handshaking() {
+        // FIX (tls-handshake-enforcement-gap, doc 21): a TLS 1.2 SERVER
+        // queues its ChangeCipherSpec + Finished only AFTER it has processed
+        // the client's Finished, so `is_handshaking()` flips false while the
+        // server's own final flight is still sitting inside rustls. Reporting
+        // FINISHED at that moment makes the caller stop driving the
+        // handshake — Tomcat's `SecureNioChannel.handshake` returns as soon
+        // as it sees FINISHED and only flushes `netOutBuffer`, never calling
+        // `wrap` again — so those records never reach the wire and the peer
+        // waits for a Finished that never comes, then sees the connection
+        // torn down ("connection closed by peer during handshake").
+        //
+        // TLS 1.3 hid this completely: there the server's whole flight is
+        // sent BEFORE the client's Finished arrives, so nothing is ever
+        // pending at the moment the flag flips. Since nothing in the suite
+        // pinned a connector to TLS 1.2 until protocol enforcement started
+        // working (above), no TLS 1.2 server handshake had ever actually
+        // completed through this engine.
+        //
+        // Demand one more `wrap` while records remain. The extra wrap also
+        // gets TLS 1.3 NewSessionTicket messages onto the wire instead of
+        // dropping them. Gated on `!handshake_finished_reported` so ordinary
+        // post-handshake application writes still report NOT_HANDSHAKING.
+        if !s.handshake_finished_reported && conn.wants_write() {
+            return HS_NEED_WRAP_R;
+        }
         if !s.handshake_finished_reported {
             return HS_FINISHED_R;
         }
@@ -6557,6 +7307,66 @@ fn default_engine_server_config(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Deferred (renegotiation-substitute) client authentication
+// ---------------------------------------------------------------------------
+//
+// FIX (tls-handshake-enforcement-gap, doc 21). Tomcat's default
+// `certificateVerification` is "none": the connector does NOT ask for a client
+// certificate during the initial handshake, and only discovers a request needs
+// `CLIENT-CERT` auth after parsing the request line. It then collects the
+// certificate by RENEGOTIATING mid-connection —
+// `NioEndpoint$NioSocketWrapper.doClientAuth` calls
+// `SSLEngine.setNeedClientAuth(true)` followed by `SecureNioChannel
+// .rehandshake()`, i.e. a SECOND `beginHandshake()` on an engine whose
+// handshake already finished.
+//
+// rustls categorically does not implement renegotiation (TLS 1.2 or 1.3): it
+// answers any post-handshake ClientHello/HelloRequest with a
+// `no_renegotiation` alert. So that second `beginHandshake()` could never do
+// anything, Tomcat's rehandshake loop stalled and the connection was dropped
+// with no response — which is exactly the "connection closed immediately
+// after the TLS handshake" failure `TestClientCert`,
+// `TestCustomSslTrustManager` and `TestResolverSSL` all reported.
+//
+// What IS implementable is doing the same thing one connection later. When
+// the rehandshake attempt is detected we (a) remember that this connector
+// wants a client certificate and (b) fail fast so the connection closes
+// immediately instead of stalling. `http_url_connection::perform_with_retry`
+// then transparently retries the request on a fresh connection, and THAT
+// handshake carries an optional `CertificateRequest`, so the client's real
+// Java `KeyManager.chooseClientAlias` runs (the suite asserts on the issuers
+// it was offered) and the certificate is presented in time for Tomcat's
+// `SSLAuthenticator` to find it already on the session — no renegotiation
+// needed.
+//
+// The marker is keyed by the OWNING `SSLContext`'s GC-stable key (which
+// `set_engine_trust_ctx_key` records for every engine, whether or not that
+// context has TrustManagers), so it is scoped to one connector: a later test
+// in the same JVM builds a fresh `SSLContext` and starts clean. That matters
+// — `TestClientCert` asserts `getLastClientAuthRequestedIssuerCount() == 0`
+// for the FIRST, unprotected request of every test, which a process-wide or
+// certificate-keyed marker would break.
+//
+// Observable difference from real renegotiation: one extra TCP connection,
+// and the request is re-sent on it (the body is already buffered by the
+// caller, so this is transparent). What is NOT emulated is collecting the
+// certificate on the SAME connection.
+fn deferred_client_auth_contexts() -> &'static Mutex<std::collections::HashSet<u64>> {
+    static T: OnceLock<Mutex<std::collections::HashSet<u64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn mark_deferred_client_auth(ctx_key: u64) {
+    deferred_client_auth_contexts().lock().insert(ctx_key);
+}
+
+fn wants_deferred_client_auth(ctx_key: Option<u64>) -> bool {
+    ctx_key
+        .map(|k| deferred_client_auth_contexts().lock().contains(&k))
+        .unwrap_or(false)
+}
+
 /// Begin the handshake — construct the rustls connection from the cached
 /// configs (or defaults) and stash it on the engine.
 fn engine_begin(state: &mut EngineState) -> Result<(), String> {
@@ -6565,6 +7375,22 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
             eprintln!(
                 "[dbg-tls-auth] engine_begin SHORT-CIRCUIT (conn already realized) need={} want={}",
                 state.need_client_auth, state.want_client_auth
+            );
+        }
+        // Tomcat's `doClientAuth` rehandshake — see the module comment above.
+        // Recognised by: server engine, handshake already realized WITHOUT a
+        // certificate request, and client auth now switched on.
+        if !state.is_client
+            && !state.client_auth_requested
+            && (state.need_client_auth || state.want_client_auth)
+        {
+            if let Some(key) = state.trust_managers_ctx_key {
+                mark_deferred_client_auth(key);
+            }
+            return Err(
+                "TLS renegotiation is not supported; the client certificate will be requested \
+                 on the next handshake for this connector"
+                    .to_string(),
             );
         }
         return Ok(());
@@ -6620,7 +7446,17 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                 // is restricted to, so the handshake succeeded instead of
                 // failing with `SSLHandshakeException` as real-JDK does
                 // (`connectWithSslBundleAndOptionsMismatch`).
-                let provider = cipher_provider_for(&state.enabled_ciphers);
+                // FIX (tls-handshake-enforcement-gap, doc 21): honour
+                // `SSLEngine.setEnabledProtocols` too. Same shape as the
+                // cipher gap described just above — a client engine
+                // restricted to one TLS version still offered both, so a
+                // deliberate version mismatch negotiated the OTHER version
+                // and succeeded (`TestSSLHostConfigProtocol`'s
+                // `testTlsVersionMismatch*`). `provider_and_versions` also
+                // stops a TLS-1.2-only cipher restriction from advertising
+                // TLS 1.3 it cannot actually negotiate.
+                let (provider, versions) =
+                    provider_and_versions(&state.enabled_ciphers, &state.enabled_protocols);
                 build_client_config_ex_with_provider(
                     roots,
                     &alpn_strs,
@@ -6628,6 +7464,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     revocation,
                     use_java_trust_manager,
                     provider,
+                    &versions,
                 )?
             }
         };
@@ -6731,17 +7568,54 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     // directly — still wins and still enforces REQUIRED
                     // semantics exactly as before; this is unaffected by the
                     // revert below).
-                    let speculative_optional_auth = false
-                        && !state.need_client_auth
+                    //
+                    // FIX (tls-handshake-enforcement-gap, doc 21): the
+                    // speculative request is no longer unconditional — it is
+                    // armed ONLY after this connector has actually attempted
+                    // the rehandshake (see `deferred_client_auth_contexts`
+                    // and the short-circuit branch at the top of
+                    // `engine_begin`). That is precisely what makes it
+                    // compatible with the suite invariant described above:
+                    // the first, unprotected request of every test still
+                    // sees NO CertificateRequest (`assertEquals(0,
+                    // getLastClientAuthRequestedIssuerCount())` holds), and
+                    // only a connector that has already demanded client auth
+                    // once asks up front.
+                    //
+                    // Still gated on a real trust source, and specifically on
+                    // THIS context's registered `TrustManager[]` — not on
+                    // `trust_roots_override`. Those roots are seeded from a
+                    // process-global "selected context" slot at
+                    // `createSSLEngine` time, so a connector configured with
+                    // NO trust source at all can still inherit roots another
+                    // context loaded earlier. `TestCustomSslTrustManager`'s
+                    // `TrustType.NONE` case is exactly that shape — it nulls
+                    // the truststore and sets no `trustManagerClassName`, and
+                    // asserts the protected request does NOT succeed. Arming
+                    // deferred auth off the inherited roots made the server
+                    // request, accept and authenticate a certificate it had
+                    // no business trusting, turning a correct refusal into a
+                    // 200. `SSLContext.init(kms, null, null)` leaves
+                    // `ctx_trust_managers_table` empty for that context,
+                    // which is the signal we actually want.
+                    let has_trust_source = state
+                        .trust_managers_ctx_key
+                        .map(|k| {
+                            ctx_trust_managers_table()
+                                .lock()
+                                .get(&k)
+                                .map(|v| !v.is_empty())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    let speculative_optional_auth = !state.need_client_auth
                         && !state.want_client_auth
-                        && state
-                            .trust_roots_override
-                            .as_ref()
-                            .map(|r| !r.root_ders.is_empty())
-                            .unwrap_or(false);
+                        && has_trust_source
+                        && wants_deferred_client_auth(state.trust_managers_ctx_key);
                     let request = state.need_client_auth
                         || state.want_client_auth
                         || speculative_optional_auth;
+                    state.client_auth_requested = request;
                     let client_ca = if request {
                         let trust_roots = state
                             .trust_roots_override
@@ -6807,6 +7681,8 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             &alpn_strs,
                             state.need_client_auth,
                             &state.enabled_ciphers,
+                            &state.enabled_protocols,
+                            accepted_issuer_hints(state.trust_managers_ctx_key),
                         )
                     } else {
                         build_server_config_single_cert_ex_ciphers(
@@ -6817,6 +7693,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             optional_client_cert,
                             client_ca.as_deref(),
                             &state.enabled_ciphers,
+                            &state.enabled_protocols,
                         )
                     };
                     built?
@@ -6832,6 +7709,13 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                 }
             },
         };
+        // Every server-config branch above that asked the peer for a
+        // certificate did so because NEED/WANT was already set (the
+        // speculative deferred-auth branch sets this flag itself). Recording
+        // it here as well covers the pre-built-config and global-identity
+        // branches, so `engine_begin`'s rehandshake detector never mistakes
+        // "already asked" for "asking for the first time".
+        state.client_auth_requested |= state.need_client_auth || state.want_client_auth;
         let sc =
             ServerConnection::new(config).map_err(|e| format!("ServerConnection::new: {}", e))?;
         state.conn = Some(EngineConn::Server(sc));
@@ -7296,6 +8180,14 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if mode { 1 } else { 0 })))
     });
 
+    // KEEP (deliberate, audited wave 2): this pair is intentionally inert AND
+    // intentionally consistent — the setter accepts nothing and the getter
+    // reports "no selector installed", so a caller probing whether JDK-style
+    // ALPN callbacks are active gets a truthful "no" rather than being handed
+    // back a selector this VM would never invoke. ALPN itself is not disabled:
+    // rustls negotiates it from `SSLParameters` and
+    // `getApplicationProtocol()` returns the real result.
+    //
     // Netty configures JDK ALPN support through this concrete implementation
     // method. A rustls-backed engine is deliberately allocated without
     // SunJSSE's private `conContext` graph, so interpreting the real body
@@ -7436,23 +8328,8 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         "getSupportedCipherSuites",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let suites = [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-                // T-CBC.1: real (not just reported) CBC-mode suites, see
-                // `t27_tls_cbc` / docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
-                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
-            ];
+            // Single source of truth — see `SUPPORTED_CIPHER_SUITE_NAMES`.
+            let suites = SUPPORTED_CIPHER_SUITE_NAMES;
             let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
             for (i, &s) in suites.iter().enumerate() {
                 let so = ctx.create_string(s);
@@ -8134,11 +9011,10 @@ fn do_unwrap(
             if idx >= pending.len() {
                 break;
             }
-            let n = bb_write_from(ctx, *d, &pending[idx..]);
-            idx += n;
-            if n == 0 {
-                break;
-            }
+            // NOTE: a dst that accepts 0 bytes is FULL, not a stop signal —
+            // keep scattering into the remaining buffers. See the identical
+            // note on the Step-3 scatter below.
+            idx += bb_write_from(ctx, *d, &pending[idx..]);
         }
         let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
         let status = if idx < pending.len() {
@@ -8385,6 +9261,17 @@ fn do_unwrap(
     bb_set_pos(ctx, src, src_view.layout, offset);
 
     // Step 3: write plaintext into dsts (may span multiple buffers).
+    //
+    // A dst that accepts 0 bytes is simply FULL — it must NOT stop the scatter,
+    // because `unwrap(src, dsts, off, len)` is a scattering operation and later
+    // buffers may still have room. Tomcat's HTTP/2 async parser reads every
+    // frame into `[frameHeader(9), framePayload(maxFrameSize)]`; once the 9-byte
+    // header is filled by the first unwrap, EVERY subsequent unwrap sees dst[0]
+    // full. Breaking there produced `produced=0` while the record had already
+    // been consumed, so the whole record went to `plaintext_pending`, which the
+    // caller cannot see. The connection then wedged in a BUFFER_OVERFLOW loop
+    // and the request body was truncated after the first DATA frame
+    // (`TestLargeUpload`: 13107 of 65535 bytes read by the servlet).
     let mut produced_total = 0usize;
     let mut idx = 0usize;
     for dst in &dsts {
@@ -8394,9 +9281,6 @@ fn do_unwrap(
         let n = bb_write_from(ctx, *dst, &plaintext[idx..]);
         produced_total += n;
         idx += n;
-        if n == 0 {
-            break;
-        }
     }
     // If we have plaintext left over, signal BUFFER_OVERFLOW and stash the
     // remainder back in rustls' reader by re-injecting via writer? We can't —
@@ -8607,23 +9491,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
             // accessors return non-null arrays. ALPN still rides the objref-keyed
             // side-table below (getApplicationProtocols reads it regardless of how
             // the SSLParameters was constructed), so this does not regress ALPN.
-            const DEFAULT_CIPHERS: &[&str] = &[
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-                // T-CBC.1: real (not just reported) CBC-mode suites, see
-                // `t27_tls_cbc` / docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
-                "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-                "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
-                "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
-            ];
+            const DEFAULT_CIPHERS: &[&str] = SUPPORTED_CIPHER_SUITE_NAMES;
             let protocols = with_engine(id, |s| s.enabled_protocols.clone())
                 .filter(|l| !l.is_empty())
                 .unwrap_or_else(|| vec!["TLSv1.3".to_string(), "TLSv1.2".to_string()]);
@@ -8745,6 +9613,41 @@ pub fn gc_scan_tls_ctx_trust_manager_roots(roots: &mut Vec<ObjectRef>) {
             }
         }
     }
+    drop(table);
+    if let Some(f) = *huc_default_factory_slot().lock() {
+        if !f.as_ptr().is_null() {
+            roots.push(f);
+        }
+    }
+}
+
+/// The `SSLSocketFactory` last installed via
+/// `HttpsURLConnection.setDefaultSSLSocketFactory`.
+///
+/// FIX (tls-handshake-enforcement-gap, doc 21): this used to be published
+/// into the real JDK static field `HttpsURLConnection.defaultSSLSocketFactory`
+/// so `http_url_connection::huc_client_tls_restrictions` could read it back.
+/// Measured (`CRATONVM_DBG_TLS_AUTH`): the write never sticks — the read
+/// immediately after reports `default factory is null` — so the probe that
+/// applies a caller's client-side cipher/protocol restriction never ran at
+/// all. Keep the reference here instead, where we control its lifetime.
+///
+/// Holds a live `ObjectRef`, so it MUST stay in the GC root set: it is
+/// scanned and remapped by `gc_scan_tls_ctx_trust_manager_roots` /
+/// `gc_update_tls_ctx_trust_manager_refs` above, alongside
+/// `ctx_trust_managers_table` (the only other `ObjectRef`-holding table in
+/// this module).
+fn huc_default_factory_slot() -> &'static Mutex<Option<ObjectRef>> {
+    static T: OnceLock<Mutex<Option<ObjectRef>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_huc_default_ssl_socket_factory(factory: ObjectRef) {
+    *huc_default_factory_slot().lock() = Some(factory);
+}
+
+pub(crate) fn huc_default_ssl_socket_factory() -> Option<ObjectRef> {
+    *huc_default_factory_slot().lock()
 }
 
 /// Post-move remap companion to `gc_scan_tls_ctx_trust_manager_roots`.
@@ -8762,6 +9665,18 @@ pub fn gc_update_tls_ctx_trust_manager_refs(map: &std::collections::HashMap<usiz
                 // by the moving collector for the object previously at `old`.
                 *tm = unsafe { ObjectRef::from_raw(new as *mut u8) };
             }
+        }
+    }
+    drop(table);
+    // Same treatment for the installed default `SSLSocketFactory` — see
+    // `huc_default_factory_slot`.
+    let mut slot = huc_default_factory_slot().lock();
+    if let Some(f) = *slot {
+        let old = f.as_ptr() as usize;
+        if let Some(&new) = map.get(&old) {
+            debug_assert!(new != 0, "GC pointer map contains null address");
+            // SAFETY: as above.
+            *slot = Some(unsafe { ObjectRef::from_raw(new as *mut u8) });
         }
     }
 }
@@ -8996,6 +9911,8 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // KEEP (correct constants, audited wave 2 — these are protocol limits, not
+    // placeholders).
     // Buffer sizes are layout-independent JSSE constants. The real JDK returns
     // 16384 (max TLS plaintext record) for `getApplicationBufferSize` and 16709
     // (16384 + TLS record overhead: 5 header + 256 padding + 68 MAC/IV) for

@@ -585,6 +585,18 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 4)))
         }
     });
+    // Was an unconditional null, so a jar's per-entry comment was invisible
+    // even when the entry object genuinely carried one (Spring Boot's
+    // `UNPACK:` marker is exactly such a comment). Real-layout entries have a
+    // `comment` field — read it; the synthetic 4-slot layout does not track
+    // comments, so null remains the honest answer there.
+    r.register(je, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if je_is_real_layout(ctx, this) {
+            return Ok(Some(ctx.get_field_by_name(this, "comment")));
+        }
+        Ok(Some(ctx.get_field(this, 4)))
+    });
     r.register(je, "getSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = if je_is_real_layout(ctx, this) {
@@ -943,9 +955,18 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             sb2_launcher_get_main_class,
         );
+        // KEEP: `isExploded()` asks whether the launcher was started from an
+        // exploded directory rather than a packaged jar. The `createArchive`
+        // native immediately above unconditionally builds a `JarFileArchive`,
+        // so for every launcher object that can reach this native the answer
+        // really is "packaged" — this is derived from our own behaviour, not
+        // a placeholder.
         r.register(cls, "isExploded", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(0)))
         });
+        // KEEP: Spring Boot's own `ExecutableArchiveLauncher` returns false
+        // here from 2.4 onwards; the hook it gates was deprecated and removed.
+        // `false` matches the class we are shadowing.
         r.register(
             cls,
             "isPostProcessingClassPathArchives",
@@ -976,8 +997,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "(Ljava/util/List;)Ljava/lang/ClassLoader;",
             sb2_launcher_create_class_loader_bypass_archive_walk,
         );
-        // getClassPathIndex(Archive) — returns null so no layered-JAR
-        // classpath index is loaded (correct for non-layered Spring Boot 2 JARs).
+        // KEEP: getClassPathIndex(Archive) — returns null so no layered-JAR
+        // classpath index is loaded. The index only exists to ORDER the
+        // archives that `getClassPathArchives()` yields, and
+        // `createClassLoader` (registered just above) bypasses the archive
+        // walk entirely in favour of CratonVM's own classpath scanner, which
+        // has already extracted every BOOT-INF/lib entry at startup. Parsing
+        // `classpath.idx` here would produce an ordering nothing consults.
         r.register(
             cls,
             "getClassPathIndex",
@@ -1004,6 +1030,10 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // banner prints. The fast-exception flag is a pure perf hint; making
     // the setter a no-op preserves correctness while sidestepping the
     // cascading static init failure.
+    //
+    // KEEP: the flag it would have set only chooses between a pre-allocated
+    // shared FileNotFoundException and a freshly-filled-in one — a pure
+    // allocation optimisation with no observable behavioural difference.
     let sb2_handler = "org/springframework/boot/loader/jar/Handler";
     r.register(
         sb2_handler,
@@ -1019,16 +1049,24 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // super.findResource path still walks each URL[] entry through
     // URLClassPath/URLUtil/URL.getDefaultPort, where a synthetic SB2 nested
     // jar URL (whose handler field was never populated by URL.<init>)
-    // dereferences a null URLStreamHandler. Spring only calls findResource
-    // here for optional banner.gif/png/jpg lookups (and a few similar
-    // best-effort scans); returning null preserves the "no resource found"
-    // semantics the banner code already handles.
+    // dereferences a null URLStreamHandler.
+    //
+    // The old body answered null UNCONDITIONALLY on the grounds that Spring
+    // only reaches here for optional banner.gif/png/jpg lookups. That is not
+    // true — `ClassPathResource.exists()` and every `ResourceLoader` probe
+    // funnel through `findResource` as well, and an always-null result made
+    // each of them report "absent" for resources demonstrably on the
+    // classpath. `ucl_find_resource` IS the local `URLClassLoader.findResource`
+    // this method delegates to (it resolves against the loader's own recorded
+    // URLs, and is already what `URLClassLoader.findResource` is bound to), so
+    // route there instead of skipping the lookup — which still avoids the SB2
+    // nested-jar `Handler` walk described above.
     let luc = "org/springframework/boot/loader/LaunchedURLClassLoader";
     r.register(
         luc,
         "findResource",
         "(Ljava/lang/String;)Ljava/net/URL;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        crate::classloader::ucl_find_resource,
     );
 
     // SB2 LaunchedURLClassLoader.loadClass(String, boolean) — the real

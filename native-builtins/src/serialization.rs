@@ -15,7 +15,7 @@ use crate::lang_class::{
     create_constructor_object, create_method_object, read_constructor_descriptor,
 };
 use crate::lang_invoke::alloc_method_handle;
-use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
+use crate::{alloc_concurrent_synthetic, native_noop, obj_arg};
 use cratonvm_native_api::{MethodMetadata, NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
@@ -2054,7 +2054,17 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // writeFields()V
+    // writeFields()V — flushes the `PutField` accumulator returned by
+    // `putFields()` into the stream.
+    //
+    // KEPT as a no-op, with the reason recorded rather than assumed: the
+    // accumulator is empty BY CONSTRUCTION. `putFields()` below hands back a
+    // 2-slot `ObjectOutputStream$PutField` whose only `put*` entry points are
+    // the abstract JDK declarations — no `PutField.put(String, …)` native is
+    // registered anywhere in the tree — so nothing is ever buffered for this
+    // method to emit. Writing a zero-length field block would be exactly as
+    // empty as writing nothing. The gap to close is `PutField.put*`, not this
+    // method; recorded as an open residual in the wave-2 report.
     r.register(cls, "writeFields", "()V", |_ctx, _args| Ok(None));
 
     // putFields() -> ObjectOutputStream.PutField
@@ -2070,8 +2080,20 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // writeStreamHeader()V
-    r.register(cls, "writeStreamHeader", "()V", |_ctx, _args| Ok(None));
+    // writeStreamHeader()V — emit STREAM_MAGIC (0xACED) + STREAM_VERSION (5).
+    //
+    // Was a no-op. `<init>` already calls `write_stream_header` directly, so
+    // the constructor path was fine, but this method is `protected` precisely
+    // so a subclass (or `reset()`-style re-priming code) can re-emit the
+    // header — and those callers silently produced a stream with no magic,
+    // which the matching `ObjectInputStream` then rejects as corrupt. Writing
+    // the real four bytes costs nothing on the constructor path because that
+    // path does not route through here.
+    r.register(cls, "writeStreamHeader", "()V", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        write_stream_header(this.as_ptr() as usize);
+        Ok(None)
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3030,6 +3052,11 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `readObjectOverride()` is `protected Object readObjectOverride() { return
+    // null; }` in the real `ObjectInputStream` — a hook that exists only to be
+    // overridden by a subclass built with the protected no-arg constructor.
+    // Returning null is the JDK body verbatim, not a stub; a subclass that
+    // overrides it resolves to its own declaring class and never reaches here.
     r.register(
         cls,
         "readObjectOverride",
@@ -4092,13 +4119,69 @@ fn register_object_stream_field(r: &mut NativeMethodRegistry) {
     });
 
     // isUnshared() -> boolean
-    r.register(cls, "isUnshared", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    //
+    // Was a hard `false`. The real `ObjectStreamField` carries a `boolean
+    // unshared` set by the `(String, Class, boolean)` constructor and by
+    // `ObjectStreamClass`'s `serialPersistentFields` walk; an unconditional
+    // `false` tells `writeObject`/`readObject` to use the shared handle table
+    // for a field a class explicitly declared unshared, which silently aliases
+    // two logically distinct objects. Read the named field so the real-JDK
+    // layout answers truthfully; our 4-slot synthetic has no such field and
+    // `get_field_by_name` reports `Object(None)` for it, which falls through to
+    // `false` — the same answer as before for synthetic-built descriptors.
+    r.register(cls, "isUnshared", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let unshared = match ctx.get_field_by_name(this, "unshared") {
+            Value::Int(v) => v != 0,
+            _ => false,
+        };
+        Ok(Some(Value::Int(if unshared { 1 } else { 0 })))
     });
 
     // compareTo(Object) -> int
-    r.register(cls, "compareTo", "(Ljava/lang/Object;)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    //
+    // Was a constant 0, i.e. "every field compares equal". `ObjectStreamClass`
+    // sorts its `ObjectStreamField[]` with this comparator before writing the
+    // class descriptor and before matching a received descriptor against the
+    // local class, so a constant 0 left the field order at whatever the
+    // reflection walk happened to produce. Two JVMs that enumerate declared
+    // fields in different orders then disagree on the stream layout and
+    // deserialisation reads each value into the wrong field.
+    //
+    // Real JDK body: primitives sort before object fields; within a group,
+    // by field name.
+    r.register(cls, "compareTo", "(Ljava/lang/Object;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            // `compareTo(null)` is a NullPointerException in the JDK; our
+            // callers only ever pass real descriptors, so treat anything else
+            // as "sorts after" rather than unwinding mid-sort.
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let this_prim = type_code_is_primitive(ctx.get_field(this, 1).as_int().unwrap_or(0));
+        let other_prim = type_code_is_primitive(ctx.get_field(other, 1).as_int().unwrap_or(0));
+        if this_prim != other_prim {
+            return Ok(Some(Value::Int(if this_prim { -1 } else { 1 })));
+        }
+        // No allocation happens between these reads, so the raw refs are safe.
+        let this_name = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let other_name = match ctx.get_field(other, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        // Java's String.compareTo is UTF-16 code-unit order. Field names are
+        // Java identifiers (ASCII in every practical case), for which Rust's
+        // byte-wise Ord agrees exactly.
+        let ord = match this_name.cmp(&other_name) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+        Ok(Some(Value::Int(ord)))
     });
 }
 
@@ -4108,27 +4191,24 @@ fn register_object_stream_field(r: &mut NativeMethodRegistry) {
 
 fn register_serializable(r: &mut NativeMethodRegistry) {
     let cls = "java/io/Serializable";
-    // Marker interface — registerNatives is a static no-op stub.
+    // Marker interface: it declares no methods at all, so `registerNatives` has
+    // no body to shadow and doing nothing matches HotSpot, where the JVM-side
+    // hook is likewise empty.
     r.register(cls, "registerNatives", "()V", native_noop);
 }
 
-fn register_externalizable(r: &mut NativeMethodRegistry) {
-    let cls = "java/io/Externalizable";
-    // Interface contract methods — concrete subclasses override these to
-    // perform their own serialization. Default no-op for the abstract base.
-    r.register(
-        cls,
-        "writeExternal",
-        "(Ljava/io/ObjectOutput;)V",
-        native_noop_with_this,
-    );
-    r.register(
-        cls,
-        "readExternal",
-        "(Ljava/io/ObjectInput;)V",
-        native_noop_with_this,
-    );
-}
+// `java/io/Externalizable` deliberately has NO registrations. `writeExternal` /
+// `readExternal` are ABSTRACT interface methods whose behaviour is defined
+// entirely by the implementing class, so no native can ever be right here. The
+// no-op pair that used to live here was unreachable for a real implementor
+// (native lookup keys on the resolved method's declaring class — the user class
+// — and the ancestor walk follows `superclass` only, never the interface list)
+// and actively wrong on the one path that does resolve to the interface: a
+// receiver whose class collapses to `java/io/Externalizable` silently
+// serialized NOTHING instead of raising AbstractMethodError. No CratonVM
+// synthetic implements Externalizable, so there is no synthetic receiver to
+// serve either. `oos_write_object` drives the real thing by
+// `invoke_virtual`-ing `writeExternal` on the user object.
 
 // ---------------------------------------------------------------------------
 // ObjectInputFilter (JEP 290) — 4-field synthetic
@@ -4580,23 +4660,27 @@ fn register_object_input_filter(r: &mut NativeMethodRegistry) {
 
 fn register_object_output(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ObjectOutput";
-    // Static interface initializer — true static no-op.
+    // Static interface initializer: `ObjectOutput` declares no `registerNatives`
+    // body of its own, so there is nothing to shadow and doing nothing matches
+    // HotSpot.
     r.register(cls, "registerNatives", "()V", native_noop);
-    // Interface defaults — concrete subclasses (ObjectOutputStream) provide the
-    // real implementations dispatched via virtual dispatch.
-    r.register(
-        cls,
-        "writeObject",
-        "(Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    r.register(cls, "flush", "()V", native_noop_with_this);
-    r.register(cls, "close", "()V", native_noop_with_this);
+    // `writeObject` / `flush` / `close` are ABSTRACT interface methods and used
+    // to be no-ops here. `ObjectOutputStream` — the only implementor CratonVM
+    // ever produces — carries real natives for all three (see
+    // `register_object_output_stream`), and dispatch keys on the resolved
+    // method's declaring class, so those are what a genuine receiver reaches.
+    // The interface entries were therefore dead weight except on a receiver
+    // that collapses to the bare interface, where a no-op `writeObject`
+    // silently produced an EMPTY serialization stream and a no-op `close`
+    // leaked the sink. A loud AbstractMethodError is the better outcome, so
+    // nothing is registered for them.
 }
 
 fn register_object_input(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ObjectInput";
-    // Static interface initializer — true static no-op.
+    // Static interface initializer: `ObjectInput` declares no `registerNatives`
+    // body of its own, so there is nothing to shadow and doing nothing matches
+    // HotSpot.
     r.register(cls, "registerNatives", "()V", native_noop);
     // Round-7 HIGH-12 fix: previously a blanket UnsupportedOperationException
     // here propagated out of any JNDI / RMI bootstrap path that probes the
@@ -4624,8 +4708,13 @@ fn register_object_input(r: &mut NativeMethodRegistry) {
     r.register(cls, "available", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
-    // Interface default close — concrete subclasses provide real implementations.
-    r.register(cls, "close", "()V", native_noop_with_this);
+    // `close()` is an ABSTRACT interface method; `ObjectInputStream` provides
+    // the real one and dispatch keys on the resolved method's declaring class,
+    // so the no-op that used to sit here only ever fired for a receiver that
+    // collapsed to the bare interface — where it silently leaked the underlying
+    // stream. Not registered: let that surface as AbstractMethodError.
+    // (`readObject` / `available` above stay because they return a value the
+    // JDK contract genuinely permits, not because they do nothing.)
 }
 
 // ---------------------------------------------------------------------------
@@ -4691,12 +4780,16 @@ fn register_not_serializable_exception(r: &mut NativeMethodRegistry) {
 
 fn register_stream_corrupted_exception(r: &mut NativeMethodRegistry) {
     register_exception_type(r, "java/io/StreamCorruptedException");
-    // No-arg constructor — exception fields default to null/empty.
+    // No-arg constructor. A bare no-op leaves `detailMessage` null (correct)
+    // but ALSO skips `fillInStackTrace()`, so `getStackTrace()` came back empty
+    // — the same bug `native_exception_init_empty` was written to fix for every
+    // other no-arg exception ctor (`register_exception_extras_natives`, which
+    // does not list this class). Use that shared helper.
     r.register(
         "java/io/StreamCorruptedException",
         "<init>",
         "()V",
-        native_noop_with_this,
+        crate::native_exception_init_empty,
     );
 }
 
@@ -4710,7 +4803,6 @@ pub(crate) fn register_serialization_natives(r: &mut NativeMethodRegistry) {
     register_object_stream_class(r);
     register_object_stream_field(r);
     register_serializable(r);
-    register_externalizable(r);
     register_object_input_filter(r);
     register_object_output(r);
     register_object_input(r);
@@ -4962,6 +5054,10 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
         },
     );
+    // `flush()` is inherited from `OutputStream`, whose body is empty, and
+    // `ByteArrayOutputStream.close()` is documented as having no effect (the
+    // buffer stays readable afterwards). Both no-ops match the JDK exactly —
+    // this stream has no sink to push to and no descriptor to release.
     r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
 }
@@ -5208,7 +5304,9 @@ mod serialization_tests {
     }
 
     #[test]
-    fn test_externalizable_registered() {
+    fn test_externalizable_not_registered() {
+        // `writeExternal`/`readExternal` belong to the implementing class; a
+        // native on the interface can only ever silently swallow it.
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
         assert!(r
@@ -5217,7 +5315,14 @@ mod serialization_tests {
                 "writeExternal",
                 "(Ljava/io/ObjectOutput;)V"
             )
-            .is_some());
+            .is_none());
+        assert!(r
+            .find(
+                "java/io/Externalizable",
+                "readExternal",
+                "(Ljava/io/ObjectInput;)V"
+            )
+            .is_none());
     }
 
     #[test]
@@ -5371,12 +5476,22 @@ mod serialization_tests {
     }
 
     #[test]
-    fn test_object_output_interface_registered() {
+    fn test_object_output_interface_writes_are_not_stubbed() {
+        // The real writer lives on `ObjectOutputStream`; a no-op on the
+        // interface would emit an empty stream instead of failing loudly.
         let mut r = NativeMethodRegistry::new();
         register_serialization_natives(&mut r);
         assert!(r
             .find(
                 "java/io/ObjectOutput",
+                "writeObject",
+                "(Ljava/lang/Object;)V"
+            )
+            .is_none());
+        assert!(r.find("java/io/ObjectOutput", "close", "()V").is_none());
+        assert!(r
+            .find(
+                "java/io/ObjectOutputStream",
                 "writeObject",
                 "(Ljava/lang/Object;)V"
             )

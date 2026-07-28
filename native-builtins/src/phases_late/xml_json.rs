@@ -590,6 +590,427 @@ pub(crate) fn dom_get_text_content(ctx: &mut dyn NativeContext, node: ObjectRef)
     result
 }
 
+// =============================================================================
+// javax.xml.transform — the identity transform
+//
+// Synthetic `Transformer` layout: slot 0 is the output-property map
+// (`java/util/HashMap`), allocated on the first `setOutputProperty`.
+// =============================================================================
+
+const TRANSFORMER_PROPS: usize = 0;
+
+/// Default indent step for `indent=yes`. JAXP's own default varies by
+/// implementation and is overridden through a vendor-specific
+/// `indent-amount` property we do not model; four spaces matches the
+/// `com.sun.org.apache.xml` serializer's shipped default.
+const XSLT_INDENT_STEP: usize = 4;
+
+/// XML-escape text content.
+fn xslt_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// XML-escape an attribute value (text escapes plus the quote delimiter).
+fn xslt_escape_attr(s: &str) -> String {
+    xslt_escape_text(s).replace('"', "&quot;")
+}
+
+/// A `javax.xml.transform.TransformerException` carrying `message`.
+///
+/// Built as the real class so `catch (TransformerException)` matches. When the
+/// transform cannot be performed this is what callers get — never a silent
+/// empty result, which is indistinguishable from a successful transform of an
+/// empty document.
+fn xslt_exception(ctx: &mut dyn NativeContext, message: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(message);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "javax/xml/transform/TransformerException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalStateException {
+        message: message.to_string(),
+    }
+    .into()
+}
+
+/// A `javax.xml.xpath.XPathExpressionException` explaining that CratonVM's
+/// synthetic XML surface ships no XPath engine.
+///
+/// Built as the real class so `catch (XPathExpressionException)` matches; falls
+/// back to `IllegalStateException` when the class cannot be constructed (the
+/// same shape as `xslt_exception` above).
+fn xpath_unsupported(ctx: &mut dyn NativeContext, what: &str) -> MethodCallFailed {
+    let message = format!(
+        "{what}: CratonVM's synthetic javax.xml surface has no XPath engine \
+         (run without --synthetic-jdk to use the real JDK implementation)"
+    );
+    let detail = ctx.create_string(&message);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "javax/xml/xpath/XPathExpressionException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalStateException { message }.into()
+}
+
+/// Read a `()Ljava/lang/String;` DOM accessor; "" on null or failure.
+fn xslt_dom_str(ctx: &mut dyn NativeContext, node: ObjectRef, method: &str) -> String {
+    match ctx.invoke_virtual(node, method, "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Read a numeric DOM accessor (`()S` for `getNodeType`, `()I` for
+/// `getLength`); 0 on failure.
+fn xslt_dom_num(ctx: &mut dyn NativeContext, node: ObjectRef, method: &str, desc: &str) -> i32 {
+    match ctx.invoke_virtual(node, method, desc, &[]) {
+        Ok(Some(v)) => v.as_int().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// A node's attributes as plain `(name, value)` data — deliberately not as
+/// `ObjectRef`s, so the caller holds nothing the GC can move.
+fn xslt_attributes(ctx: &mut dyn NativeContext, node: ObjectRef) -> Vec<(String, String)> {
+    let map = match ctx.invoke_virtual(node, "getAttributes", "()Lorg/w3c/dom/NamedNodeMap;", &[]) {
+        Ok(Some(Value::Object(Some(map)))) => map,
+        _ => return Vec::new(),
+    };
+    // Pin across the accessor callbacks below — a moving young GC there would
+    // relocate the map/attribute nodes (native stale-local family).
+    let map_pin = ctx.pin_native_root(map);
+    let len = xslt_dom_num(ctx, map, "getLength", "()I").max(0);
+    let mut attrs = Vec::new();
+    for i in 0..len {
+        let map = ctx.read_native_pin(map_pin, map);
+        if let Ok(Some(Value::Object(Some(attr)))) =
+            ctx.invoke_virtual(map, "item", "(I)Lorg/w3c/dom/Node;", &[Value::Int(i)])
+        {
+            let attr_pin = ctx.pin_native_root(attr);
+            let name = xslt_dom_str(ctx, attr, "getNodeName");
+            let attr = ctx.read_native_pin(attr_pin, attr);
+            let value = xslt_dom_str(ctx, attr, "getNodeValue");
+            ctx.unpin_native_roots(attr_pin);
+            if !name.is_empty() {
+                attrs.push((name, value));
+            }
+        }
+    }
+    ctx.unpin_native_roots(map_pin);
+    attrs
+}
+
+/// A node's children, each returned WITH its own pin handle.
+///
+/// The caller serializes them one at a time, and serializing a child re-enters
+/// the interpreter, so a bare `Vec<ObjectRef>` would go stale halfway through
+/// the list. The caller re-reads each entry through its handle immediately
+/// before use and releases the whole batch with the first handle.
+fn xslt_child_nodes(ctx: &mut dyn NativeContext, node: ObjectRef) -> Vec<(usize, ObjectRef)> {
+    let list = match ctx.invoke_virtual(node, "getChildNodes", "()Lorg/w3c/dom/NodeList;", &[]) {
+        Ok(Some(Value::Object(Some(list)))) => list,
+        _ => return Vec::new(),
+    };
+    let list_pin = ctx.pin_native_root(list);
+    let len = xslt_dom_num(ctx, list, "getLength", "()I").max(0);
+    let mut refs = Vec::new();
+    let mut pins = Vec::new();
+    for i in 0..len {
+        let list = ctx.read_native_pin(list_pin, list);
+        if let Ok(Some(Value::Object(Some(child)))) =
+            ctx.invoke_virtual(list, "item", "(I)Lorg/w3c/dom/Node;", &[Value::Int(i)])
+        {
+            pins.push(ctx.pin_native_root(child));
+            refs.push(child);
+        }
+    }
+    for (index, pin) in pins.iter().enumerate() {
+        let current = refs[index];
+        refs[index] = ctx.read_native_pin(*pin, current);
+    }
+    // Drop the whole gathering batch (the NodeList pin sits underneath the
+    // child pins, so it cannot be released on its own) and immediately re-pin
+    // just the children. Nothing between these two statements can allocate.
+    ctx.unpin_native_roots(list_pin);
+    let mut pinned = Vec::with_capacity(refs.len());
+    for child in refs {
+        pinned.push((ctx.pin_native_root(child), child));
+    }
+    pinned
+}
+
+/// Serialize a DOM node to XML text through the public DOM API only, so it
+/// works for this file's synthetic nodes and for a real `org.w3c.dom` tree
+/// alike. `indent` is `Some(step)` when the `indent` output property is "yes".
+fn xslt_serialize_node(
+    ctx: &mut dyn NativeContext,
+    node: ObjectRef,
+    indent: Option<usize>,
+    depth: usize,
+    out: &mut String,
+) {
+    if depth > 256 {
+        return;
+    }
+    let node_pin = ctx.pin_native_root(node);
+    let node_type = xslt_dom_num(ctx, node, "getNodeType", "()S");
+    let node = ctx.read_native_pin(node_pin, node);
+    match node_type {
+        NODE_TEXT | NODE_CDATA => {
+            let mut text = xslt_dom_str(ctx, node, "getNodeValue");
+            if text.is_empty() {
+                let node = ctx.read_native_pin(node_pin, node);
+                text = xslt_dom_str(ctx, node, "getData");
+            }
+            out.push_str(&xslt_escape_text(&text));
+        }
+        NODE_DOCUMENT => {
+            // A Document is serialized through its root element: unlike
+            // Element, it is not guaranteed to answer `getChildNodes`.
+            let root =
+                ctx.invoke_virtual(node, "getDocumentElement", "()Lorg/w3c/dom/Element;", &[]);
+            if let Ok(Some(Value::Object(Some(root)))) = root {
+                xslt_serialize_node(ctx, root, indent, depth, out);
+            } else {
+                let node = ctx.read_native_pin(node_pin, node);
+                let children = xslt_child_nodes(ctx, node);
+                let base = children.first().map(|(pin, _)| *pin);
+                for (pin, child) in &children {
+                    let child = ctx.read_native_pin(*pin, *child);
+                    xslt_serialize_node(ctx, child, indent, depth, out);
+                }
+                if let Some(base) = base {
+                    ctx.unpin_native_roots(base);
+                }
+            }
+        }
+        NODE_ELEMENT => {
+            let mut tag = xslt_dom_str(ctx, node, "getTagName");
+            let node = ctx.read_native_pin(node_pin, node);
+            if tag.is_empty() {
+                tag = xslt_dom_str(ctx, node, "getNodeName");
+            }
+            let node = ctx.read_native_pin(node_pin, node);
+            if !tag.is_empty() {
+                let attrs = xslt_attributes(ctx, node);
+                let node = ctx.read_native_pin(node_pin, node);
+                let children = xslt_child_nodes(ctx, node);
+                let base = children.first().map(|(pin, _)| *pin);
+                // Mixed content is never re-indented: inserting whitespace
+                // around a text node would change the element's value.
+                let mut mixed = false;
+                for (pin, child) in &children {
+                    let child = ctx.read_native_pin(*pin, *child);
+                    let kind = xslt_dom_num(ctx, child, "getNodeType", "()S");
+                    if kind == NODE_TEXT || kind == NODE_CDATA {
+                        mixed = true;
+                        break;
+                    }
+                }
+                let child_indent = if mixed { None } else { indent };
+                if let Some(step) = indent {
+                    if depth > 0 {
+                        out.push('\n');
+                        out.extend(std::iter::repeat(' ').take(step * depth));
+                    }
+                }
+                out.push('<');
+                out.push_str(&tag);
+                for (name, value) in &attrs {
+                    out.push(' ');
+                    out.push_str(name);
+                    out.push_str("=\"");
+                    out.push_str(&xslt_escape_attr(value));
+                    out.push('"');
+                }
+                if children.is_empty() {
+                    out.push_str("/>");
+                } else {
+                    out.push('>');
+                    for (pin, child) in &children {
+                        let child = ctx.read_native_pin(*pin, *child);
+                        xslt_serialize_node(ctx, child, child_indent, depth + 1, out);
+                    }
+                    if let Some(step) = child_indent {
+                        out.push('\n');
+                        out.extend(std::iter::repeat(' ').take(step * depth));
+                    }
+                    out.push_str("</");
+                    out.push_str(&tag);
+                    out.push('>');
+                }
+                if let Some(base) = base {
+                    ctx.unpin_native_roots(base);
+                }
+            }
+        }
+        // Comments, PIs and doctypes carry no information the identity
+        // transform's callers depend on, and the synthetic Comment node has no
+        // value accessor to read them through.
+        _ => {}
+    }
+    ctx.unpin_native_roots(node_pin);
+}
+
+/// One output property of a synthetic `Transformer`, exactly as it was set.
+/// Callers compare case-insensitively — JAXP property values are "yes"/"no"
+/// tokens, not user data.
+fn xslt_output_property(
+    ctx: &mut dyn NativeContext,
+    transformer: ObjectRef,
+    name: &str,
+) -> Option<String> {
+    if ctx.object_num_fields(transformer) <= TRANSFORMER_PROPS {
+        return None;
+    }
+    let Value::Object(Some(props)) = ctx.get_field(transformer, TRANSFORMER_PROPS) else {
+        return None;
+    };
+    let props_pin = ctx.pin_native_root(props);
+    let key = ctx.create_string(name);
+    let props = ctx.read_native_pin(props_pin, props);
+    let found = cratonvm_native_collections::native_map_get_pub(
+        ctx,
+        &[Value::Object(Some(props)), Value::Object(Some(key))],
+    );
+    ctx.unpin_native_roots(props_pin);
+    match found {
+        Ok(Some(Value::Object(Some(value)))) => ctx.read_string(value),
+        _ => None,
+    }
+}
+
+/// Pull the XML text out of a `javax.xml.transform.Source`.
+///
+/// `DOMSource` and `StreamSource` cover essentially every identity-transform
+/// caller; anything else (notably `SAXSource`) returns `None` so `transform`
+/// can report it rather than emit an empty result.
+fn xslt_source_text(ctx: &mut dyn NativeContext, source: ObjectRef) -> Option<String> {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(source))
+        .unwrap_or_default();
+    if class_name.ends_with("DOMSource") {
+        if let Ok(Some(Value::Object(Some(node)))) =
+            ctx.invoke_virtual(source, "getNode", "()Lorg/w3c/dom/Node;", &[])
+        {
+            let mut out = String::new();
+            xslt_serialize_node(ctx, node, None, 0, &mut out);
+            return Some(out);
+        }
+        return None;
+    }
+    if class_name.ends_with("StreamSource") {
+        let source_pin = ctx.pin_native_root(source);
+        if let Ok(Some(Value::Object(Some(stream)))) =
+            ctx.invoke_virtual(source, "getInputStream", "()Ljava/io/InputStream;", &[])
+        {
+            let text = xml_read_input_stream(ctx, stream);
+            ctx.unpin_native_roots(source_pin);
+            return Some(text);
+        }
+        let source = ctx.read_native_pin(source_pin, source);
+        if let Ok(Some(Value::Object(Some(reader)))) =
+            ctx.invoke_virtual(source, "getReader", "()Ljava/io/Reader;", &[])
+        {
+            // `Reader.read()` yields chars; the stream drain's `read()` loop is
+            // the same shape, so reuse it rather than duplicating the pinning.
+            let text = xml_read_input_stream(ctx, reader);
+            ctx.unpin_native_roots(source_pin);
+            return Some(text);
+        }
+        ctx.unpin_native_roots(source_pin);
+        return None;
+    }
+    None
+}
+
+/// Write `text` into a `javax.xml.transform.Result`. Returns `false` when the
+/// Result kind is not one we can write, so the caller can raise
+/// `TransformerException` instead of dropping the output.
+fn xslt_write_result(
+    ctx: &mut dyn NativeContext,
+    result: ObjectRef,
+    text: &str,
+) -> Result<bool, MethodCallFailed> {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(result))
+        .unwrap_or_default();
+    // Pin across every callback below — each one re-enters the interpreter and
+    // can move the Result (native stale-local family).
+    let result_pin = ctx.pin_native_root(result);
+    if class_name.ends_with("DOMResult") {
+        let doc = xml_parse_to_document(ctx, text);
+        let doc_pin = ctx.pin_native_root(doc);
+        let result = ctx.read_native_pin(result_pin, result);
+        let doc = ctx.read_native_pin(doc_pin, doc);
+        let attached = ctx.invoke_virtual(
+            result,
+            "setNode",
+            "(Lorg/w3c/dom/Node;)V",
+            &[Value::Object(Some(doc))],
+        );
+        ctx.unpin_native_roots(result_pin);
+        attached?;
+        return Ok(true);
+    }
+    if !class_name.ends_with("StreamResult") {
+        ctx.unpin_native_roots(result_pin);
+        return Ok(false);
+    }
+    if let Ok(Some(Value::Object(Some(writer)))) =
+        ctx.invoke_virtual(result, "getWriter", "()Ljava/io/Writer;", &[])
+    {
+        let writer_pin = ctx.pin_native_root(writer);
+        let payload = ctx.create_string(text);
+        let writer = ctx.read_native_pin(writer_pin, writer);
+        let written = ctx.invoke_virtual(
+            writer,
+            "write",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(payload))],
+        );
+        let writer = ctx.read_native_pin(writer_pin, writer);
+        if written.is_ok() {
+            let _ = ctx.invoke_virtual(writer, "flush", "()V", &[]);
+        }
+        ctx.unpin_native_roots(result_pin);
+        written?;
+        return Ok(true);
+    }
+    let result = ctx.read_native_pin(result_pin, result);
+    if let Ok(Some(Value::Object(Some(stream)))) =
+        ctx.invoke_virtual(result, "getOutputStream", "()Ljava/io/OutputStream;", &[])
+    {
+        let stream_pin = ctx.pin_native_root(stream);
+        let bytes = text.as_bytes();
+        let buffer = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        let buffer_pin = ctx.pin_native_root(buffer);
+        for (index, byte) in bytes.iter().enumerate() {
+            ctx.set_array_element(buffer, index, Value::Int(*byte as i8 as i32));
+        }
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        let buffer = ctx.read_native_pin(buffer_pin, buffer);
+        let written = ctx.invoke_virtual(stream, "write", "([B)V", &[Value::Object(Some(buffer))]);
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        if written.is_ok() {
+            let _ = ctx.invoke_virtual(stream, "flush", "()V", &[]);
+        }
+        ctx.unpin_native_roots(result_pin);
+        written?;
+        return Ok(true);
+    }
+    ctx.unpin_native_roots(result_pin);
+    Ok(false)
+}
+
 pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -679,12 +1100,34 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
+    // The builder now carries the two configuration flags the factory holds
+    // (namespaceAware=0, validating=1) so `DocumentBuilder`'s own accessors
+    // below can answer truthfully instead of a flat `false`.
     r.register(
         dbf,
         "newDocumentBuilder",
         "()Ljavax/xml/parsers/DocumentBuilder;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilder", 0);
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Read the flags out as plain ints BEFORE the allocation below —
+            // `alloc_concurrent_synthetic` can move `this` (native stale-local
+            // family), and an i32 carries across a GC where an ObjectRef would
+            // not.
+            let ns = if ctx.object_num_fields(this) > 0 {
+                ctx.get_field(this, 0).as_int().unwrap_or(0)
+            } else {
+                0
+            };
+            let validating = if ctx.object_num_fields(this) > 1 {
+                ctx.get_field(this, 1).as_int().unwrap_or(0)
+            } else {
+                0
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/DocumentBuilder", 2);
+            if ctx.object_num_fields(obj) > 1 {
+                ctx.set_field(obj, 0, Value::Int(ns));
+                ctx.set_field(obj, 1, Value::Int(validating));
+            }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -749,11 +1192,28 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(doc))))
         },
     );
-    r.register(db, "isNamespaceAware", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // These two used to be flat `false`, so a caller that had explicitly done
+    // `factory.setNamespaceAware(true)` was told its builder was
+    // namespace-unaware — the usual reaction is to fall back to a
+    // prefix-splitting code path on a document that was parsed for it.
+    // Report what the producing factory was configured with.
+    r.register(db, "isNamespaceAware", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let flag = if ctx.object_num_fields(this) > 0 {
+            ctx.get_field(this, 0).as_int().unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Some(Value::Int(i32::from(flag != 0))))
     });
-    r.register(db, "isValidating", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(db, "isValidating", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let flag = if ctx.object_num_fields(this) > 1 {
+            ctx.get_field(this, 1).as_int().unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Some(Value::Int(i32::from(flag != 0))))
     });
 
     // SAXParserFactory = 3-field (namespaceAware=0, validating=1, features=2 HashMap)
@@ -839,12 +1299,24 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
+    // Carry the factory's namespaceAware flag into the parser (slot 0) so
+    // `SAXParser.isNamespaceAware()` below reports what was configured.
     r.register(
         spf,
         "newSAXParser",
         "()Ljavax/xml/parsers/SAXParser;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParser", 0);
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // Plain int before the allocation — see `newDocumentBuilder`.
+            let ns = if ctx.object_num_fields(this) > 0 {
+                ctx.get_field(this, 0).as_int().unwrap_or(0)
+            } else {
+                0
+            };
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/parsers/SAXParser", 1);
+            if ctx.object_num_fields(obj) > 0 {
+                ctx.set_field(obj, 0, Value::Int(ns));
+            }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -897,8 +1369,14 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    r.register(sp, "isNamespaceAware", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(sp, "isNamespaceAware", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let flag = if ctx.object_num_fields(this) > 0 {
+            ctx.get_field(this, 0).as_int().unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Some(Value::Int(i32::from(flag != 0))))
     });
 
     // === DOM Node/Element/Document/Text/Attr/NodeList methods (G7) ===
@@ -940,6 +1418,12 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(t))))
         },
     );
+    // The `getNodeType()` family below (Document/Element/Text/Comment/Attr)
+    // is constant BY DEFINITION — DOM Level 2 fixes one nodeType per node
+    // interface (Document=9, Element=1, Text=3, Comment=8, Attr=2), and each
+    // native is registered on exactly the class whose constant it returns.
+    // These are not stubs and must not be "implemented"; the constants ARE
+    // the specification.
     r.register(doc_cls, "getNodeType", "()S", |_ctx, _args| {
         Ok(Some(Value::Int(NODE_DOCUMENT)))
     });
@@ -952,13 +1436,18 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // getElementById returns null, and that is the SPEC answer here rather
+    // than a shortcut: DOM Level 2 matches only attributes whose *declared
+    // type* is ID, which requires a DTD or schema. This parser is
+    // non-validating and processes no DTD, so no attribute is ever of type ID
+    // — exactly like Xerces' `CoreDocumentImpl`, whose identifier table stays
+    // empty for a DTD-less document. Matching any attribute literally spelled
+    // "id" would be a heuristic that DISAGREES with HotSpot.
     r.register(
         doc_cls,
         "getElementById",
         "(Ljava/lang/String;)Lorg/w3c/dom/Element;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None))) // simplified
-        },
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
     r.register(
         doc_cls,
@@ -1178,6 +1667,19 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     );
 
     // Node interface (registered on both Element and generic Node)
+    //
+    // `getNamespaceURI` / `getPrefix` return null, which is the DOM Level 2
+    // answer for a node created by a NAMESPACE-UNAWARE parse — and that is
+    // what this parser is: `xml_parse` records `xmlns` declarations as plain
+    // attributes and never builds a prefix→URI scope stack, so slot 0 holds
+    // the raw qualified name and there is no binding to resolve a prefix
+    // against. Reporting a prefix while `getNamespaceURI()` stayed null would
+    // put the (namespaceURI, localName, prefix) triple into a state the DOM
+    // spec does not allow, so the three accessors stay consistently
+    // namespace-unaware together. Making them real means teaching `xml_parse`
+    // lexical namespace scoping first (`xml_stax::NsScopes` is the model);
+    // tracked as an open residual in the wave-2 report, deliberately not
+    // attempted here because it also changes `getLocalName`.
     for cls in ["org/w3c/dom/Node", "org/w3c/dom/Element"] {
         r.register(
             cls,
@@ -1362,7 +1864,11 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "newTransformer",
         "()Ljavax/xml/transform/Transformer;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/transform/Transformer", 0);
+            // One slot for the output-property map (filled lazily by
+            // `setOutputProperty`); no stylesheet, so this is the identity
+            // transformer, which is what `newTransformer()` means.
+            let obj = alloc_concurrent_synthetic(ctx, "javax/xml/transform/Transformer", 1);
+            ctx.set_field(obj, TRANSFORMER_PROPS, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1373,13 +1879,133 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         tr,
         "setOutputProperty",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            if ctx.object_num_fields(this) <= TRANSFORMER_PROPS {
+                return Ok(None);
+            }
+            let props = match ctx.get_field(this, TRANSFORMER_PROPS) {
+                Value::Object(Some(props)) => props,
+                _ => {
+                    // Pin across the map alloc/init below — a moving young GC
+                    // there would relocate them (native stale-local family).
+                    let this_pin = ctx.pin_native_root(this);
+                    let name_pin = pinned_object_value(ctx, name);
+                    let value_pin = pinned_object_value(ctx, value);
+                    let props = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+                    let props_pin = ctx.pin_native_root(props);
+                    cratonvm_native_collections::native_map_init(
+                        ctx,
+                        &[Value::Object(Some(props))],
+                    )
+                    .ok();
+                    let this = ctx.read_native_pin(this_pin, this);
+                    let props = ctx.read_native_pin(props_pin, props);
+                    ctx.set_field(this, TRANSFORMER_PROPS, Value::Object(Some(props)));
+                    let name = read_pinned_object_value(ctx, name_pin, name);
+                    let value = read_pinned_object_value(ctx, value_pin, value);
+                    ctx.unpin_native_roots(this_pin);
+                    cratonvm_native_collections::native_map_put_pub(
+                        ctx,
+                        &[Value::Object(Some(props)), name, value],
+                    )?;
+                    return Ok(None);
+                }
+            };
+            cratonvm_native_collections::native_map_put_pub(
+                ctx,
+                &[Value::Object(Some(props)), name, value],
+            )?;
+            Ok(None)
+        },
+    );
+    // `getOutputProperty` exists so a caller can read back what it set — the
+    // serializer and the getter must agree on one store.
+    r.register(
+        tr,
+        "getOutputProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= TRANSFORMER_PROPS {
+                return Ok(Some(Value::Object(None)));
+            }
+            let Value::Object(Some(props)) = ctx.get_field(this, TRANSFORMER_PROPS) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let found = cratonvm_native_collections::native_map_get_pub(
+                ctx,
+                &[Value::Object(Some(props)), name],
+            )?;
+            Ok(Some(found.unwrap_or(Value::Object(None))))
+        },
     );
     r.register(
         tr,
         "transform",
         "(Ljavax/xml/transform/Source;Ljavax/xml/transform/Result;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let source = obj_arg(args, 1)?;
+            let result = obj_arg(args, 2)?;
+            // No stylesheet is ever attached here (`newTransformer()` is the
+            // only factory), so this is the identity transform: serialize the
+            // Source and hand the text to the Result. A real XSLT engine is
+            // out of scope — see the unsupported-Source arm below, which
+            // reports rather than silently emitting nothing.
+            let this_pin = ctx.pin_native_root(this);
+            let source_pin = ctx.pin_native_root(source);
+            let result_pin = ctx.pin_native_root(result);
+            let text = xslt_source_text(ctx, source);
+            let this = ctx.read_native_pin(this_pin, this);
+            let Some(body) = text else {
+                let source = ctx.read_native_pin(source_pin, source);
+                let class_name = ctx
+                    .class_name_of_id(ctx.class_id_of_object(source))
+                    .unwrap_or_default();
+                ctx.unpin_native_roots(this_pin);
+                return Err(xslt_exception(
+                    ctx,
+                    &format!("unsupported or empty transform Source: {class_name}"),
+                ));
+            };
+            // Each property read interns a key String, so re-read the pinned
+            // receiver between them (native stale-local family).
+            let indent = xslt_output_property(ctx, this, "indent")
+                .filter(|v| v.eq_ignore_ascii_case("yes"))
+                .map(|_| XSLT_INDENT_STEP);
+            let this = ctx.read_native_pin(this_pin, this);
+            let omit_declaration = xslt_output_property(ctx, this, "omit-xml-declaration")
+                .is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+            let this = ctx.read_native_pin(this_pin, this);
+            let encoding =
+                xslt_output_property(ctx, this, "encoding").unwrap_or_else(|| "UTF-8".to_string());
+            let mut out = String::new();
+            if !omit_declaration {
+                out.push_str(&format!("<?xml version=\"1.0\" encoding=\"{encoding}\"?>"));
+                if indent.is_some() {
+                    out.push('\n');
+                }
+            }
+            out.push_str(&body);
+            let result = ctx.read_native_pin(result_pin, result);
+            let written = xslt_write_result(ctx, result, &out);
+            let result = ctx.read_native_pin(result_pin, result);
+            let class_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(result))
+                .unwrap_or_default();
+            ctx.unpin_native_roots(this_pin);
+            if !written? {
+                return Err(xslt_exception(
+                    ctx,
+                    &format!("unsupported transform Result: {class_name}"),
+                ));
+            }
+            Ok(None)
+        },
     );
 
     // XPath
@@ -1403,17 +2029,25 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         },
     );
     let xp = "javax/xml/xpath/XPath";
+    // There is no XPath engine behind these two. They used to answer `null`,
+    // which is indistinguishable from a legitimate "expression matched
+    // nothing" (for `evaluate`) and detonates as an NPE one call later at
+    // `compile(expr).evaluate(doc)` — with a stack that points at the caller
+    // rather than at the missing engine. Both methods declare `throws
+    // XPathExpressionException`, so raising it is spec-legal and tells the
+    // truth. NOTE: this converts calls that used to "succeed" with null into
+    // a checked exception; see the wave-2 report.
     r.register(
         xp,
         "evaluate",
         "(Ljava/lang/String;Ljava/lang/Object;)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| Err(xpath_unsupported(ctx, "XPath.evaluate")),
     );
     r.register(
         xp,
         "compile",
         "(Ljava/lang/String;)Ljavax/xml/xpath/XPathExpression;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| Err(xpath_unsupported(ctx, "XPath.compile")),
     );
     r.set_category(__prev_cat);
 }
@@ -2892,9 +3526,29 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
 
     // Also register for ObjectNode (extends JsonNode)
     let on = "com/fasterxml/jackson/databind/node/ObjectNode";
-    // No-arg constructor: ObjectNode fields are initialised lazily
-    // when entries are added. NEW-6: documented.
-    r.register(on, "<init>", "()V", native_noop_with_this);
+    // A fresh `ObjectNode` is an EMPTY OBJECT node, not a blank slate. Leaving
+    // the slots at their allocation defaults leaves JN_TYPE unset, so every
+    // accessor above (`isObject`, `size`, `get`, `toString`) reads it as 0 and
+    // reports a NULL node. Stamp the same shape `alloc_json_node(ctx, 1)`
+    // produces; the keys/children arrays stay null until the first entry is
+    // added, since JN_COUNT is what drives the walks.
+    r.register(on, "<init>", "()V", |ctx, args| {
+        let this = crate::obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) <= JN_DBL {
+            // A real Jackson `ObjectNode` (its own, much smaller layout) —
+            // leave it entirely alone rather than writing over real fields.
+            return Ok(None);
+        }
+        ctx.set_field(this, JN_TYPE, Value::Int(1));
+        ctx.set_field(this, JN_TEXT, Value::Object(None));
+        ctx.set_field(this, JN_NUM, Value::Long(0));
+        ctx.set_field(this, JN_BOOL, Value::Int(0));
+        ctx.set_field(this, JN_CHILDREN, Value::Object(None));
+        ctx.set_field(this, JN_KEYS, Value::Object(None));
+        ctx.set_field(this, JN_COUNT, Value::Int(0));
+        ctx.set_field(this, JN_DBL, Value::Double(0.0));
+        Ok(None)
+    });
     r.set_category(__prev_cat);
 }
 

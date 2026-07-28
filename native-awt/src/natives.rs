@@ -678,6 +678,10 @@ fn build_headless_toolkit(ctx: &mut dyn NativeContext) -> MethodCallResult {
 }
 
 fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
+    // KEEP (deliberate no-op): `initIDs` caches JNI field/method IDs for the
+    // native disposer thread. CratonVM resolves fields by name and has no JNI
+    // ID cache, so there is nothing to initialize — same rationale as the
+    // `initIDs` block further down this file.
     registry.register("sun/java2d/Disposer", "initIDs", "()V", |_ctx, _args| {
         void_ok()
     });
@@ -710,6 +714,12 @@ fn register_toolkit_natives(registry: &mut NativeMethodRegistry) {
             Ok(dim)
         },
     );
+    // KEEP (deliberate constant): 96 dpi is the companion of the fixed
+    // 1920x1080 `getScreenSize` above — a stock JDK on Windows reports 96 for
+    // an unscaled display, and the two values have to describe the same
+    // fictional screen or `Toolkit`-derived layout maths comes out
+    // inconsistent. A real headless JDK throws HeadlessException from both;
+    // CratonVM deliberately answers instead so headless layout code runs.
     registry.register(
         "java/awt/Toolkit",
         "getScreenResolution",
@@ -1110,6 +1120,12 @@ fn register_frame_natives(registry: &mut NativeMethodRegistry) {
         }
         void_ok()
     });
+    // KEEP (deliberate no-ops): all four are window-manager requests against
+    // a peer that is never mapped to a display. `toFront`/`toBack` reorder a
+    // stack that does not exist; `setIconImage`/`setMenuBar` decorate a frame
+    // nobody can see. The JDK's own headless/offscreen peers do the same
+    // thing, and none of the four has a getter whose answer we would be
+    // falsifying by dropping the value.
     registry.register("java/awt/Frame", "toFront", "()V", |_ctx, _args| void_ok());
     registry.register("java/awt/Frame", "toBack", "()V", |_ctx, _args| void_ok());
     registry.register(
@@ -2307,12 +2323,27 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/Class;)V",
         |_ctx, _args| void_ok(),
     );
+    // KEEP (deliberate constants) — audited 2026-07-27. Every native below
+    // manipulates the libjpeg `jpeg_decompress_struct` that the real JDK
+    // allocates in `libjavajpeg`. CratonVM decodes JPEG in Rust instead (see
+    // `imageio_reader_read` a few lines down, which reads the stream itself
+    // and never consults the handle), so there is no C struct to create,
+    // point at a source, reset, or free.
+    //
+    // `initJPEGImageReader` must still return a NON-ZERO opaque handle: the
+    // JDK bytecode stores it in `structPointer` and treats 0 as "native
+    // allocation failed", throwing from the constructor. `1` is that
+    // never-dereferenced token, not a placeholder value.
     registry.register(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "initJPEGImageReader",
         "()J",
         |_ctx, _args| Ok(Some(Value::Long(1))),
     );
+    // The remaining five are lifecycle calls against that non-existent
+    // struct — setSource/resetReader/resetLibraryState/disposeReader/dispose
+    // have nothing to own, point at, or release, so an empty body is the
+    // correct implementation rather than a missing one.
     registry.register(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "setSource",
@@ -3083,6 +3114,10 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, _args| obj_ok(ctx.create_string("javax.swing.plaf.metal.MetalLookAndFeel")),
     );
+    // KEEP (deliberate no-op): both look-and-feel getters above answer
+    // `MetalLookAndFeel` unconditionally, so there is exactly one L&F to be
+    // in. Recording the requested class name would only let a caller read
+    // back a name that nothing renders with.
     registry.register(
         "javax/swing/UIManager",
         "setLookAndFeel",

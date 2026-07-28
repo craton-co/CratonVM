@@ -18,15 +18,16 @@ exception behavior while avoiding repeated host file reads.
 
 ## Verification
 
-Using JDK `25.0.3.9-hotspot`, r170 of the dedicated CratonVM binary, and the
+Using JDK `25.0.3.9-hotspot`, r171 of the dedicated CratonVM binary built
+after merging current `origin/dev`, and the
 Spring Boot fixture root `C:\craton\CratonVM-spring-boot-rerun-20260717\apps\spring-boot`:
 
 | mode | classes | failures | aborts | skips | container failures | wall time |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| no-JIT | 15/15 PASS | 0 | 0 | 0 | 0 | 332.402 s |
-| JIT | 15/15 PASS | 0 | 0 | 0 | 0 | 150.340 s |
+| no-JIT | 15/15 PASS | 0 | 0 | 0 | 0 | 138.160 s |
+| JIT | 15/15 PASS | 0 | 0 | 0 | 0 | 109.571 s |
 
-`ZipContentTests` completed all 29 tests in 289.9 s no-JIT and 126.8 s JIT,
+`ZipContentTests` completed all 29 tests in 119.1 s no-JIT and 92.7 s JIT,
 both inside the required 300-second per-class timeout.  This closes the
 residual 15-class loader shard; no unresolved issue document was present to
 move from `docs/known-issues`.

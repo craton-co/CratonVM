@@ -43,6 +43,13 @@ struct InflaterState {
     // Tracked here so that `reset(long)` can recreate the stream in the same
     // mode, since flate2's `Decompress::reset` takes the header flag as an arg.
     zlib_header: bool,
+    /// Running ADLER-32 of the UNCOMPRESSED bytes produced so far — what
+    /// `Inflater.getAdler()` is documented to return. `flate2::Decompress`
+    /// does not expose zlib's internal `strm->adler`, and it is only
+    /// maintained at all for zlib-wrapped streams, so we accumulate it
+    /// ourselves over every output chunk. Seeded with the zlib initial value
+    /// (1), reset back to 1 by `reset(long)`.
+    adler: u32,
 }
 
 struct DeflaterState {
@@ -58,6 +65,31 @@ struct DeflaterState {
     // guaranteed) — track completion explicitly and short-circuit instead
     // of re-entering zlib once finished.
     finished: bool,
+    /// Running ADLER-32 of the UNCOMPRESSED input consumed so far — what
+    /// `Deflater.getAdler()` is documented to return. See the matching field
+    /// on `InflaterState` for why it is accumulated here rather than read out
+    /// of `flate2::Compress`.
+    adler: u32,
+}
+
+/// Rolling ADLER-32 (RFC 1950 §9). `adler` starts at 1; feeding successive
+/// slices is equivalent to hashing their concatenation, which is what lets the
+/// Deflater/Inflater states keep a running value across many native calls.
+fn adler32_update(adler: u32, data: &[u8]) -> u32 {
+    const MOD_ADLER: u32 = 65521;
+    let mut s1 = adler & 0xFFFF;
+    let mut s2 = (adler >> 16) & 0xFFFF;
+    // Chunk so the u32 accumulators cannot overflow before the reduction
+    // (5552 is the classic zlib NMAX for 8-bit input).
+    for chunk in data.chunks(5552) {
+        for &b in chunk {
+            s1 += b as u32;
+            s2 += s1;
+        }
+        s1 %= MOD_ADLER;
+        s2 %= MOD_ADLER;
+    }
+    (s2 << 16) | s1
 }
 
 fn inflater_table() -> &'static Mutex<HashMap<i64, InflaterState>> {
@@ -235,6 +267,7 @@ fn infl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let state = InflaterState {
         decomp: Decompress::new(zlib_header),
         zlib_header,
+        adler: 1,
     };
     let handle = next_handle();
     inflater_table()
@@ -303,6 +336,10 @@ fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             (false, needs)
         }
     };
+    // `Inflater.getAdler()` reports the ADLER-32 of the uncompressed data.
+    // `.min(len)` is belt-and-braces: a slice panic here would abort the VM.
+    let produced = (output_consumed as usize).min(output_buf.len());
+    st.adler = adler32_update(st.adler, &output_buf[..produced]);
 
     drop(tbl);
 
@@ -352,6 +389,11 @@ fn infl_do_decompress(
         Ok(flate2::Status::Ok | flate2::Status::BufError) => (false, false),
         Err(e) => (false, e.needs_dictionary().is_some()),
     };
+    // Same running ADLER-32 over the uncompressed output as the bytes-bytes
+    // overload above — `getAdler()` must agree no matter which overload the
+    // JDK wrapper picked. `.min(len)` guards against a slice panic.
+    let produced = (output_consumed as usize).min(output_buf.len());
+    st.adler = adler32_update(st.adler, &output_buf[..produced]);
     (input_consumed, output_consumed, finished, need_dict)
 }
 
@@ -454,12 +496,14 @@ fn infl_inflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 fn infl_get_adler(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let addr = arg_long(args, 0);
     let tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
-    // flate2::Decompress doesn't directly expose adler; return 1 (initial
-    // zlib adler-32 seed / placeholder). Adler is only consulted when the
-    // stream is zlib-wrapped and we'd want to surface a checksum; JARs use
-    // raw deflate (nowrap=true) so this is unused in the bootstrap path.
-    let _ = tbl.get(&addr);
-    Ok(Some(Value::Int(1)))
+    // Was an unconditional `1` (the zlib seed), i.e. the checksum never
+    // changed no matter how much data was inflated — a caller validating a
+    // zlib-wrapped stream by comparing `getAdler()` against the trailer would
+    // always see a mismatch (or, worse, silently "verify" an empty stream).
+    // The real ADLER-32 of the uncompressed output is now accumulated by
+    // `infl_do_decompress`/`infl_inflate_bytes_bytes`.
+    let adler = tbl.get(&addr).map_or(1, |st| st.adler);
+    Ok(Some(Value::Int(adler as i32)))
 }
 
 fn infl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -467,6 +511,8 @@ fn infl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let mut tbl = inflater_table().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(st) = tbl.get_mut(&addr) {
         st.decomp.reset(st.zlib_header);
+        // `Inflater.reset()` restarts the checksum at the zlib seed too.
+        st.adler = 1;
     }
     Ok(None)
 }
@@ -499,6 +545,7 @@ fn defl_init(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         compress: Compress::new(level, zlib_header),
         zlib_header,
         finished: false,
+        adler: 1,
     };
     let handle = next_handle();
     deflater_table()
@@ -582,6 +629,10 @@ fn defl_do_compress(
         })?;
     let input_consumed = (st.compress.total_in() - total_in_before) as u32;
     let output_consumed = (st.compress.total_out() - total_out_before) as u32;
+    // `Deflater.getAdler()` reports the ADLER-32 of the uncompressed input.
+    // `.min(len)` is belt-and-braces: a slice panic here would abort the VM.
+    let consumed = (input_consumed as usize).min(input_data.len());
+    st.adler = adler32_update(st.adler, &input_data[..consumed]);
     let finished = matches!(status, flate2::Status::StreamEnd);
     if finished {
         st.finished = true;
@@ -799,8 +850,16 @@ fn defl_deflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     ))))
 }
 
-fn defl_get_adler(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(1)))
+fn defl_get_adler(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = arg_long(args, 0);
+    let tbl = deflater_table().lock().unwrap_or_else(|e| e.into_inner());
+    // Was an unconditional `1` regardless of how much data had been fed in,
+    // so `Deflater.getAdler()` could never be used to checksum the payload
+    // (nor to cross-check a matching `Inflater.getAdler()`). Now returns the
+    // real running ADLER-32 of the uncompressed input, maintained by
+    // `defl_do_compress`.
+    let adler = tbl.get(&addr).map_or(1, |st| st.adler);
+    Ok(Some(Value::Int(adler as i32)))
 }
 
 fn defl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -809,6 +868,8 @@ fn defl_reset(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     if let Some(st) = tbl.get_mut(&addr) {
         st.compress.reset();
         st.finished = false;
+        // `Deflater.reset()` restarts the checksum at the zlib seed too.
+        st.adler = 1;
     }
     Ok(None)
 }

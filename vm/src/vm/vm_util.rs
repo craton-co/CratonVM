@@ -596,6 +596,32 @@ pub fn is_class_initialized_fast(class: &Class) -> bool {
         == cratonvm_classloading::CLASS_INIT_INITIALIZED
 }
 
+thread_local! {
+    /// Classes this host thread has already observed fully initialized, scoped
+    /// to a `SharedVm` so sequential in-process VMs cannot alias `ClassId`s.
+    ///
+    /// Class initialization is monotonic: once a class reaches
+    /// `CLASS_INIT_INITIALIZED` it stays there for the life of the VM (a failed
+    /// `<clinit>` poisons the class into an *erroneous* state instead, which
+    /// never reads as initialized). A positive answer is therefore permanently
+    /// valid and needs no invalidation. Negative answers are NOT memoized —
+    /// they change as soon as `<clinit>` completes.
+    ///
+    /// Without this, every JIT `getstatic` — `ensure_class_initialized_shared`
+    /// runs on each one — acquired and released the process-wide
+    /// `class_manager` `RwLock` just to read a per-class atomic. That lock
+    /// acquire is an atomic read-modify-write on one shared cache line, so a
+    /// hot loop containing a `getstatic` (e.g. `name.toLowerCase(Locale.ENGLISH)`,
+    /// which reads `Locale.ENGLISH` every iteration) degraded sharply as soon
+    /// as more than one mutator thread ran it.
+    static CLASS_INITIALIZED_MEMO: std::cell::RefCell<Vec<(usize, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Entry cap for [`CLASS_INITIALIZED_MEMO`]. Linear-scanned; one entry per
+/// distinct class whose statics this thread touches on a hot path.
+const CLASS_INITIALIZED_MEMO_CAP: usize = 64;
+
 /// Round-9 vm CRIT-1 fix: convenience wrapper that takes a
 /// `ClassId`, briefly holds `class_manager.read()` to resolve it to a
 /// `&Class`, and probes the embedded atomic. Returns `false` for
@@ -609,11 +635,28 @@ pub fn is_class_initialized_fast(class: &Class) -> bool {
 /// full Err-returning machinery.
 #[inline]
 pub fn is_class_initialized_via_manager(shared: &SharedVm, class_id: ClassId) -> bool {
-    let cm = shared.classes.class_manager.read();
-    match cm.get_class(class_id) {
-        Some(class) => is_class_initialized_fast(class),
-        None => false,
+    let vm_key = shared as *const SharedVm as usize;
+    let raw = class_id.as_u32();
+    if CLASS_INITIALIZED_MEMO.with(|memo| memo.borrow().iter().any(|e| *e == (vm_key, raw))) {
+        return true;
     }
+    let initialized = {
+        let cm = shared.classes.class_manager.read();
+        match cm.get_class(class_id) {
+            Some(class) => is_class_initialized_fast(class),
+            None => false,
+        }
+    };
+    if initialized {
+        CLASS_INITIALIZED_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if memo.len() >= CLASS_INITIALIZED_MEMO_CAP {
+                memo.remove(0);
+            }
+            memo.push((vm_key, raw));
+        });
+    }
+    initialized
 }
 
 /// Decide whether a class is eligible to skip Pass 3 (bytecode) verification.

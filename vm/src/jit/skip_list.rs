@@ -100,6 +100,11 @@ pub enum SkipReason {
     /// Method is being invoked from an unnamed thread (typically a test
     /// harness in early init), where thread-local JIT state may not be set up.
     UnnamedThread,
+    /// A generated `java.lang.reflect.Proxy` subclass method. Its body is a
+    /// pure `super.h.invoke(this, mN, args)` trampoline whose semantics
+    /// CratonVM overrides at DISPATCH, not in the bytecode -- see
+    /// `is_jdk_dynamic_proxy_class`.
+    JdkDynamicProxyTrampoline,
     /// `MutableBigInteger` divide/normalization arithmetic has a confirmed
     /// JIT-only array-index corruption residual. Keep the implementation
     /// interpreted until the lowering defect is identified.
@@ -308,12 +313,46 @@ pub enum InitComplexity {
 /// Every other opcode is benign. The scan stops at the first
 /// disqualifier and returns `Complex`. If it walks the entire stream
 /// without finding one, it returns `Trivial`.
+/// Bisect knob (default OFF — no behaviour change): treat a constructor whose
+/// ONLY disqualifier is `putfield` as `Trivial`, keeping the ban for
+/// `putstatic` / `monitorenter` / `monitorexit` / `invokedynamic`.
+///
+/// Why this knob exists. `putfield` is what essentially every *real*
+/// constructor does — it is the whole point of one — so the blanket gate makes
+/// "allocate an object whose constructor assigns a field" run its constructor
+/// in the interpreter forever. Measured from C2-compiled code on the
+/// `CallRate` probe: ~2200 ns/alloc for a one-field constructor against
+/// ~130-160 ns for a field-store-free one, i.e. the gate, not allocation
+/// itself, is the dominant cost of `new` on every hot path in the VM
+/// (`new String(...)`, `new HashMap.Node(...)`, ...).
+///
+/// The ban predates the open-source import (`a6dc911ed`) and is one of the
+/// four *structural* bans; unlike the ~46 named correctness bans it carries no
+/// incident write-up — only the "field stores trigger the JIT's
+/// load-forwarding interaction" note above. Per the ban-sweep methodology in
+/// `docs/known-issues/jit-bans/jit-skip-list-open-bans-20260725.md`, the first
+/// move on an unverified ban is to make it testable at runtime rather than to
+/// delete it. Set `CRATONVM_JIT_ALLOW_PUTFIELD_INIT=1` to lift it for a
+/// measurement run.
+fn allow_putfield_init() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ALLOW_PUTFIELD_INIT").is_some()
+    })
+}
+
 pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
     use std::cmp::min;
+    let allow_putfield = allow_putfield_init();
     let mut pc = 0usize;
     while pc < bytecode.len() {
         let op = bytecode[pc];
         match op {
+            // `putfield` alone is separable from the other four: see
+            // `allow_putfield_init`. When the knob is off this arm is
+            // unreachable and the classification is byte-identical to before.
+            0xb5 if allow_putfield => {}
             0xb3 | 0xb5 | 0xc2 | 0xc3 | 0xba => return InitComplexity::Complex,
             _ => {}
         }
@@ -518,6 +557,63 @@ fn should_skip_jit_internal(
         return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
 
+    // SPRING-RT-EQUALS.1 (2026-07-27) — REGRESSION REPAIR, not a new ban.
+    //
+    // `654dfb918` ("retire the inert is_known_miscompile ban block") deleted
+    // ~189 (class, method) entries after finding the block's gate had drifted
+    // and concluding the list was inert. That held for most of it, but not
+    // here: the deleted list covered the `ConcurrentReferenceHashMap` lookup
+    // chain that reaches this method, and dropping it re-enabled a live
+    // miscompile of `ResolvableType.equals`.
+    //
+    // Symptom (~59 Spring Boot classes): `ResolvableType.forType` does
+    // `cache.get(key)` on a `ConcurrentReferenceHashMap` then
+    // `checkcast ResolvableType` (bytecode 61 -> 64). The lookup compares keys
+    // with `ResolvableType.equals`, whose compiled body confuses a
+    // `ResolvableType[]` with a `ResolvableType` element, so the map hands back
+    // the wrong object and the cast throws
+    //   `ClassCastException: class org.springframework.core.ResolvableType
+    //    cannot be cast to class org.springframework.core.ResolvableType`
+    //
+    // That message READS like a duplicate-class / loader-identity split and is
+    // NOT one. The receiver is an ARRAY (`kind=Array`,
+    // `arr_desc="[Lorg/springframework/core/ResolvableType;"`, component cid ==
+    // target cid), and `jit_checkcast` renders an array receiver by its
+    // COMPONENT name. The typecheck refusal is correct; the value reaching it
+    // is not. `jit_typecheck_resolve`'s own comment already warned this shape
+    // "made this look like a class-identity split for far longer than it should
+    // have" — it cost two wrong diagnoses again here, so the checkcast-fail
+    // trace in `vm/src/jit/helpers.rs` now prints kind + array descriptor.
+    //
+    // Isolation (one binary, no rebuilds), witness `ConditionalOnPropertyTests`
+    // (38 tests):
+    //   --nojit                                                     -> 38/38 pass
+    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/core           -> pass
+    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/util           -> pass
+    //   CRATONVM_JIT_BISECT_ONLY=<core>,<util>                      -> FAIL (minimal pair)
+    //   CRATONVM_JIT_BISECT_SKIP=ResolvableType.equals, full JIT    -> 38/38 pass
+    // Not heap/GC dependent (identical at --Xmx 512m and 8g) and not the
+    // pointer-keyed typecheck target cache (instrumented: zero stale hits).
+    //
+    // Scope: this ban is deliberately ONE method. An earlier revision of this
+    // fix banned the whole six-entry `ConcurrentReferenceHashMap` lookup chain
+    // (`get`/`getReference`/`getEntryIfAvailable` +
+    // `$Segment.{getReference,findInChain,restructureIfNecessary}`), which also
+    // works — but only because banning `findInChain` stops `equals` being
+    // INLINED into it. `equals` is the actual defective body: skipping it alone,
+    // with no chain ban at all, passes 38/38. Independently bisected to the same
+    // method by dev's `c7c0ac86e`. Banning one leaf method instead of a hot
+    // map-lookup chain keeps `ConcurrentReferenceHashMap` JIT-eligible.
+    //
+    // Still open as a codegen defect — see
+    // docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md.
+    // Remove this ban when the array-vs-element confusion in the lowerer is
+    // fixed, not before: verified load-bearing on dev at 70f1fddfc (removing it
+    // returns the witness class to 38/38 FAIL).
+    if class_name == "org/springframework/core/ResolvableType" && method_name == "equals" {
+        return Some(SkipReason::JavaUtilCollection);
+    }
+
     // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
     // in-process javac invocation per fixture. Once the real JDK's
     // `JavacTool.getTask` is tier-compiled, its `context.put(JavaFileManager,
@@ -597,6 +693,97 @@ fn should_skip_jit_internal(
     // alone, ruling out `fillIn` despite it being the frame actually named in
     // SPRING-TESTCOMPILER.2's stack trace) is equally sufficient. Keep
     // `complete` interpreted until the x64 lowering bug is found.
+    //
+    // RE-VERIFIED 2026-07-27, and symptom (a)'s cause corrected. The
+    // "duplicate element 'value' in annotation @SuppressWarnings" defect
+    // found in 2026-07-26's javac sweep turned out to be a VM-wide
+    // `LinkedHashSet.remove` bug (it deleted the element but answered
+    // `false`, which is exactly when javac's `Annotate.attributeAnnotation`
+    // reports that error) and was fixed the same day -- so the open question
+    // that write-up left behind, "was SPRING-TESTCOMPILER.3's symptom (a)
+    // actually THAT bug rather than a JIT miscompile?", was tested directly.
+    // It was not. With the LinkedHashSet fix in place and this ban lifted (an
+    // env-gated build, all other bans left active):
+    //
+    //   AutowiredAnnotationBeanRegistrationAotContributionTests  14/14 -> 9/14
+    //       (exactly the 5 `DeprecationTests`, symptom (a) verbatim:
+    //        "warnings found and -Werror specified" against generated source
+    //        that does carry `@SuppressWarnings("deprecation")`)
+    //   BeanDefinitionMethodGeneratorTests                       34/34 -> 32/34
+    //
+    // Both are 100% with this ban active, matching HotSpot JDK 25. So the ban
+    // stays.
+    //
+    // What that round DID buy is a Spring-free standalone reproducer where
+    // there was none: `DeprecationSuppressionProbe.java` (committed at
+    // docs/known-issues/repros/jitban-remaining-20260726/) reproduces symptom
+    // (a) at iteration ~21 in ~2 minutes. The shape is load-bearing -- the
+    // deprecated type must live in a SEPARATE, already-compiled `.class` file
+    // on the classpath. A single-file probe never reproduces it, because
+    // javac emits no deprecation warning at all when
+    // `s.outermostClass() == other.outermostClass()`.
+    //
+    // ROOT-CAUSED 2026-07-28. Symptom (a) is not an arithmetic or lowering
+    // defect in this method at all -- it is a JIT-compiled `finally` that
+    // never runs. `[PUTFIELD-WATCH]` on `Annotate.blockCount`
+    // (`CRATONVM_DBG_FIELD_WATCH=Annotate.blockCount`) shows the healthy
+    // compilations pairing `blockAnnotations()` (counter++) with
+    // `unblockAnnotationsNoFlush()` (counter--) and returning to 0, and the
+    // first failing compilation running five `blockAnnotations()` with no
+    // matching unblock, ending at 4. `complete` brackets its body in
+    // `try { annotate.blockAnnotations(); ... } finally {
+    // annotate.unblockAnnotationsNoFlush(); dependencies.pop(); }`, so a
+    // skipped `finally` leaves annotations blocked and `Annotate.flush()` a
+    // no-op for the rest of that compilation -- and javac throws
+    // `CompletionFailure` through `complete` constantly while resolving
+    // cross-compilation-unit references, which is exactly why the standalone
+    // reproducer needs the deprecated type in a separate `.class` file.
+    //
+    // Reduced to a 3-second, javac-free witness --
+    // `try { n++; thrower(); } finally { n--; }` in a loop where `thrower`
+    // throws every 7th call leaks one count per throw under JIT and zero
+    // under `--nojit` / HotSpot (`FinallyBalanceProbe`, `FinallyShapeProbe`,
+    // `FinallyThrowSiteProbe`, `CallPathProbe`, all committed at
+    // docs/known-issues/repros/jitban-remaining-20260726/). Only a catch-all
+    // (`catch_type == 0`) leaks; typed `catch`, `catch (Throwable)` and
+    // catch-and-rethrow are unaffected, because a catch-all has nothing but
+    // the pc range to match on.
+    //
+    // Three independent escape routes were found. TWO ARE FIXED (2026-07-28,
+    // this commit):
+    //
+    //   1. Foreign throw pc. `JitSignals::athrow_bci` was left holding the
+    //      bci that the CALLEE's compiled `athrow` lowering stashed, and the
+    //      interpreter range-checked that foreign pc against THIS method's
+    //      exception table. Fixed by stamping the invoke's own bci in the
+    //      post-invoke exception-check stub (`JitRuntimeHelpers::set_throw_bci`,
+    //      `emit_exception_check_stub` now emits one pad per distinct bci).
+    //   2. Whole-method re-execution. When a compiled caller invoked a
+    //      compiled callee that threw, `route_implicit_exc_through_callee`
+    //      answered by re-running the callee from its entry -- duplicating
+    //      every side effect the compiled attempt had already performed
+    //      before the throw. Fixed by resuming the callee AT its handler
+    //      instead (`interpreter::run_jit_callee_handler`).
+    //
+    // The THIRD is still open and is why this ban stays: a compiled method
+    // reached through LAMBDA / method-reference dispatch
+    // (`try_lambda_dispatch` -> `invoke_shared` / `invoke_on_class_shared*`,
+    // not the invoke-cache `CachedInvokeTarget::Jit` path) escapes without
+    // any drain consulting its exception table -- no
+    // `route_jit_signal_exception` and no `route_implicit_exc_through_callee`
+    // fires for it. `CallPathProbe` isolates this precisely: with both fixes
+    // in place `STATIC-direct`, `IFACE-class-inline` and
+    // `IFACE-class-delegating` are clean while `LAMBDA-methodref` and
+    // `LAMBDA-body` still leak. `ClassFinder`'s completer is
+    // `Completer thisCompleter = this::complete;` -- a method reference --
+    // so javac takes exactly that route, and the ban is still load-bearing:
+    // AutowiredAnnotationBeanRegistrationAotContributionTests is 9/14 with it
+    // lifted and 14/14 with it active.
+    //
+    // Also measured, contradicting a common assumption: this method IS
+    // JIT-compiled despite carrying a non-empty exception table
+    // (`CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are
+    // never admitted" rule of thumb does not apply here.
     if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
         return Some(SkipReason::ClassFinderComplete);
     }
@@ -756,6 +943,13 @@ fn should_skip_jit_internal(
     if !current_thread_named {
         return Some(SkipReason::UnnamedThread);
     }
+    // SPR-PROXY.1 -- see `is_jdk_dynamic_proxy_class`. Deliberately NOT
+    // liftable by `CRATONVM_JIT_ALLOW_PACKAGES`: a compiled proxy body is a
+    // dispatch path the VM's proxy semantics do not cover, and there is no
+    // throughput to win back from a trampoline.
+    if is_jdk_dynamic_proxy_class(class_name) {
+        return Some(SkipReason::JdkDynamicProxyTrampoline);
+    }
 
     // HIB-BIGINTEGER-AIOOBE.1 (2026-07-17) — the real-JDK
     // `MutableBigInteger` divide/normalization implementation is the only
@@ -906,7 +1100,9 @@ fn should_skip_jit_internal(
     // every configuration. No longer reproduces on current dev.
     // `JettyWsIoProbe.java` is the regression witness.
 
-    // HIB-LONGTAIL.1 (2026-07-15, narrowed 2026-07-20): Hibernate's H2-backed
+    // HIB-LONGTAIL.1 (2026-07-15; narrowed 2026-07-20, again 2026-07-27 — it
+    // covers `org/h2/` ONLY now, see the removal note just above the `if`):
+    // Hibernate's H2-backed
     // collection loading runs correctly in the interpreter, but JITting the H2
     // SQL/MVStore and ANTLR-runtime together turned ordinary 9-second HotSpot
     // tests into multi-minute CratonVM runs. Originally this also blanket-banned
@@ -993,15 +1189,26 @@ fn should_skip_jit_internal(
     // Full evidence, repro commands and the residual-4 measurement:
     // `docs/known-issues/h2/h2-jitban-residuals-20260726.md`.
     //
-    // The `org/antlr/v4/runtime/` half is NOT held by any of that — the H2
-    // suite never exercises ANTLR. A concurrent session isolated it against
-    // Hibernate ORM's own HQL suite (which does, heavily) and came back clean;
-    // see `docs/known-issues/hib-antlr-1-removed-shadowed-20260726.md`. That
-    // half is the better-evidenced candidate for narrowing this rule.
-    if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
-        || (class_name.starts_with("org/antlr/v4/runtime/")
-            && !package_allowed("org/antlr/v4/runtime/", allow_packages))
-    {
+    // 2026-07-27: the `org/antlr/v4/runtime/` half is REMOVED — this rule is
+    // now `org/h2/` only. Nothing above ever held the ANTLR half: every piece
+    // of evidence this ban still rests on comes from the H2 suite, which never
+    // loads an `org/antlr/` class at all (the H2 parser is hand-written). The
+    // ANTLR half was isolated against the one real fixture that does exercise
+    // it heavily — Hibernate ORM 8.0's own HQL suite, where every query goes
+    // through `org/antlr/v4/runtime/` — as a same-binary A/B over all 57
+    // `org.hibernate.orm.test.hql` classes with `org/hibernate/` still banned
+    // (HIB-TEMPORAL.1) so ANTLR was the only variable: byte-identical
+    // per-class ok/failed/aborted counts, 0 failures either way, and the
+    // ban-removed binary re-confirmed the same. That also covers this rule's
+    // ancestor claim (HIB-ANTLR.1: a JIT-compiled parse leaving
+    // `ATNState.transitions` null and corrupting the *next* parse in the same
+    // process) — CratonRunner runs every class in one process, so hundreds of
+    // consecutive HQL parses shared one ATN, and nothing degraded.
+    // Evidence: `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md`.
+    // The narrow `PredictionContext` equality/hash guard
+    // (`is_antlr_prediction_context_miscompile`, ANTLR-COLDPATH.1 below) is
+    // unaffected and still applies to both the shaded and unshaded runtimes.
+    if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }
 
@@ -1140,97 +1347,80 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::JavaUtilCollection);
         }
-        // JASPER-JDT.2 -- REMOVED 2026-07-26. Originally (2026-07-08) the
-        // real Tomcat `org.apache.jasper.compiler.TestCompiler` suite hit
-        // nondeterministic parser-adjacent heap corruption/OOM (first face:
-        // `ArrayIndexOutOfBoundsException` in `Parser.parse`) that bisected
-        // to `Parser.consumeRule` and the parser package generally. Given
-        // the ban's own documented nondeterminism, re-verified with a much
-        // higher bar than a single run: the real Tomcat fixture's own
-        // `TestCompiler` class (12 real JSP-compilation test methods, each
-        // a full embedded Tomcat boot+shutdown) run twice as baseline
-        // (ban active) and twice with `CRATONVM_JIT_ALLOW_PACKAGES=
-        // org/eclipse/jdt/internal/compiler/parser/` -- all 4 runs `OK (12
-        // tests)`, 0 failures, no AIOOBE, no heap corruption. No longer
-        // reproduces on current dev. JASPER-JDT.3
-        // (org/eclipse/jdt/internal/compiler/ast/, a separate, different
-        // AST-package miscompile found via Tomcat's FORM-auth JSP tests)
-        // is NOT covered by this removal and remains banned/open -- see
-        // docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md.
-
-        // JASPER-JDT.3 -- REMOVED 2026-07-26. Originally (2026-07-10) a
-        // second, independent Eclipse JDT miscompile family (AST/flow-
-        // analysis package, distinct from JASPER-JDT.2's parser package):
-        // real Tomcat FORM-auth JSP compilation
-        // (`TestFormAuthenticatorA/B/C`) intermittently threw
-        // `JasperException` from an `ArrayIndexOutOfBoundsException`
-        // reported at `QualifiedNameReference.analyseCode` -- a trivial
-        // delegating wrapper with no array access of its own, i.e. the
-        // JIT lost/mis-attributed an inlined callee's frame. Documented
-        // as nondeterministic ("0/8 hits" under `--nojit` vs. consistent
-        // hits with JIT). Re-verified with the same repeat-run bar used
-        // for JASPER-JDT.2: the real Tomcat fixture's own
-        // `TestFormAuthenticatorA` (9 real FORM-auth JSP-compilation test
-        // methods, each a full embedded Tomcat boot+shutdown) run twice
-        // as baseline (ban active) and twice with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`
-        // -- all 4 runs `OK (9 tests)`, 0 failures, no AIOOBE. No longer
-        // reproduces on current dev, same as its sibling JASPER-JDT.2.
-        // See docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md
-        // for the full evidence for both bans.
-        // JASPER-JDT.3 -- RESTORED 2026-07-27. The removal above is sound for
-        // the configuration it was measured in, and unsound for the one that
-        // now ships. Every one of its four re-verification runs was made while
-        // `helpers::direct_virtual_compiled_callee_entry_enabled()` was
+        // JASPER-JDT.2 (`org/eclipse/jdt/internal/compiler/parser/`) and
+        // JASPER-JDT.3 (`org/eclipse/jdt/internal/compiler/ast/`) -- REMOVED
+        // 2026-07-28, this time with the defect behind them root-caused first.
+        //
+        // Both were real Eclipse-JDT (ECJ) miscompiles, found through Tomcat's
+        // use of ECJ to compile JSPs. JASPER-JDT.2 (2026-07-08): nondeterministic
+        // parser-adjacent heap corruption / OOM, first face an
+        // `ArrayIndexOutOfBoundsException` in `Parser.parse`, bisected to
+        // `Parser.consumeRule`. JASPER-JDT.3 (2026-07-10): an AIOOBE reported at
+        // `QualifiedNameReference.analyseCode` -- a delegating wrapper with no
+        // array access of its own -- during FORM-auth JSP compilation.
+        //
+        // They were removed once before, on 2026-07-26, and RESTORED on
+        // 2026-07-27. Every one of those four re-verification runs was made
+        // while `helpers::direct_virtual_compiled_callee_entry_enabled()` was
         // default-OFF, and that flag gates the only write of
-        // `mic.cached_entry_ptr` -- i.e. with it off a JIT-compiled caller's
-        // `invokevirtual` never reaches a JIT-compiled callee at all. The
-        // compiled-to-compiled virtual dispatch this family lives in was
-        // therefore inert during the re-verification: the runs could not have
-        // reproduced it whatever the state of the underlying defect. Same
-        // shadowing shape as the removals this module already annotates as
-        // no-ops, just hidden behind a flag rather than behind another rule.
-        //
-        // Turning that flag on (2026-07-27, for the H2 `TestFreeSpace` /
-        // `TestNestedJoins` residuals) brings the family straight back, with a
-        // new face: real Tomcat `jakarta.el.TestOptionalELResolverInJsp` fails
-        // 2/2 with the flag on and passes 2/2 with it off, on the same binary,
-        // its JSP compile dying with
-        // `ClassCastException: org.eclipse.jdt.internal.compiler.ast.
-        // QualifiedTypeReference cannot be cast to
-        // org.eclipse.jdt.internal.compiler.ast.FieldDeclaration`
+        // `mic.cached_entry_ptr`: with it off, a compiled caller's
+        // `invokevirtual` never reaches a compiled callee at all, so the
+        // dispatch this family lives in was inert and those runs measured
+        // nothing. With the flag on the family came straight back, with a new
+        // face -- real Tomcat `jakarta.el.TestOptionalELResolverInJsp` failing
+        // its JSP compile with `ClassCastException:
+        // org.eclipse.jdt.internal.compiler.ast.QualifiedTypeReference cannot be
+        // cast to org.eclipse.jdt.internal.compiler.ast.FieldDeclaration`
         // (`JasperException: Unable to compile class for JSP` -> HTTP 500).
-        // A wrong-type AST node reaching a cast is the same "dispatch landed on
-        // the wrong target" shape as the original AIOOBE at
-        // `QualifiedNameReference.analyseCode`.
         //
-        // Liftable for bisection with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`.
-        // Any future attempt to remove this must be measured with the virtual
-        // direct-entry path ON, or it measures nothing.
-        // JASPER-JDT.2 is restored for the same reason and is the half that is
-        // DIRECTLY re-confirmed: with the virtual direct-entry path on,
-        // `CRATONVM_JIT_DENY=org/eclipse/jdt/internal/compiler/parser/` turns
-        // the failing `TestOptionalELResolverInJsp` back to PASS, while denying
-        // `.../ast/`, `.../lookup/` or `.../util/` does not. JASPER-JDT.3
-        // (`ast/`) is restored on the shadowing argument alone -- its own repro
-        // (`TestFormAuthenticatorA`) has not been re-run under the flag, and its
-        // removal evidence is void for exactly the same reason, so leaving it
-        // out would be asserting something no measurement supports.
-        for prefix in [
-            "org/eclipse/jdt/internal/compiler/ast/",
-            "org/eclipse/jdt/internal/compiler/parser/",
-        ] {
-            if class_name.starts_with(prefix) && !package_allowed(prefix, allow_packages) {
-                return Some(SkipReason::RustJvmTestFixture);
-            }
-        }
+        // That failure is now fixed, and this removal rests on knowing by what.
+        // Bisected over the 150 commits between the restore point (`4f280090f`,
+        // 3/3 FAIL) and dev, two runs per step, both packages JIT-allowed and
+        // the direct-entry path ON throughout: the first clean commit is
+        // `613b10f4c`, "fix(jit): LICM/speculative pre-header bypassed by a
+        // branch into the loop header". Every speculative pre-header the x86-64
+        // backend emits -- LICM hoists AND speculative bounds-check-elision
+        // guards -- is emitted inline at the loop-header PC and is skipped by
+        // any forward branch that jumps straight into the header, so such a loop
+        // ran against an uninitialised hoist slot, or with bounds checks elided
+        // by a guard that never executed. ECJ's `Parser`/AST code is full of
+        // that shape, and an unchecked array read handing back the wrong live
+        // object is exactly a `QualifiedTypeReference` arriving where a
+        // `FieldDeclaration` was expected -- and exactly the AIOOBE /
+        // heap-corruption faces these two bans were originally opened for.
+        //
+        // Re-verified on the real Tomcat fixture with the direct-entry path at
+        // its default (ON) and both packages actually compiling (166 parser + 29
+        // ast methods per run, counted with `CRATONVM_DBG_DUMP_JIT=LIST`, so the
+        // lift is not a no-op): `TestOptionalELResolverInJsp`,
+        // `org.apache.jasper.compiler.TestCompiler` (12 tests) and
+        // `org.apache.catalina.authenticator.TestFormAuthenticatorA/B/C` (9/6/7
+        // tests), repeat runs, all clean.
+        //
+        // Any future re-test of this family must leave
+        // `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` at its default
+        // (on), or it measures nothing -- that is what voided the 2026-07-26
+        // removal.
 
-        if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
-            && !package_allowed(class_name, allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // ES-FRAGILE-CLUSTER.1 (blanket `org/elasticsearch/`) -- REMOVED
+        // 2026-07-27. The ban's last re-verification (the retired
+        // `es-fragile-cluster-confirmed-needed-20260726` write-up)
+        // kept it on the strength of a single class,
+        // `index.mapper.blockloader.FloatFieldBlockLoaderTests`, which gained
+        // 3 failures with the package allowed (38/120 -> 41/120) while the
+        // other 17 classes in that spread sample were byte-identical. That
+        // regression, and the `cluster.NodeConnectionsServiceTests` SIGSEGV
+        // investigated in the same window, were both the ownerless
+        // stale-compiled-entry family fixed in `vm/src/jit/helpers.rs` and
+        // `vm/src/runtime/interpreter.rs`: `try_jit_compile_callee` handed out
+        // a bare compiled-entry address after releasing its
+        // `Arc<CompiledMethod>`, so a concurrent tier-up `JitCache::put` could
+        // unmap the body while generated code still called it. Re-measured
+        // with that fix in place: the 19-class spread sample and 3 runs each
+        // way of `TextFieldMapperTests` are identical ban-on vs ban-off,
+        // `FloatFieldBlockLoaderTests` is 31 failures both ways, and
+        // `FloatHierarchicalKMeansTests` hangs 3/3 with the ban ON but
+        // completes in ~50s with it lifted.
 
         // ES-HAMCREST.1 -- REMOVED 2026-07-26. Re-verified with a
         // standalone probe (`HamcrestProbe.java`, real hamcrest-core +
@@ -1241,11 +1431,11 @@ fn should_skip_jit_internal(
         // aggressive-compilation pass: 0 mismatches in every configuration.
         // No longer reproduces on current dev (the original bug's own
         // `System$1.findNative` FFM bridge fix + subsequent JIT correctness
-        // work appears to have already closed it). Note: the broader
-        // `org/elasticsearch/` blanket ban immediately above this one
-        // (`is_elasticsearch_suite_jit_fragile_cluster`) was NOT re-tested --
-        // no Elasticsearch checkout/fixture is available on this host, see
-        // `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`.
+        // work appears to have already closed it). The broader
+        // `org/elasticsearch/` blanket ban that used to sit immediately above
+        // this one was removed 2026-07-27 against the real ES 9.6.0-SNAPSHOT
+        // fixture (the retired `es-fragile-cluster-confirmed-needed-20260726`
+        // write-up).
         // `HamcrestProbe.java` is the regression witness for this entry only.
 
         // WILDFLY-CONTROLLER-JIT.1 (2026-07-13): the optimized
@@ -1255,11 +1445,12 @@ fn should_skip_jit_internal(
         // reaches past that point with CRATONVM_DISABLE_JIT=1. Keep controller
         // bytecode interpreted until the special-call backend is corrected.
         // Liftable with CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/controller/.
-        if class_name.starts_with("org/jboss/as/controller/")
-            && !package_allowed("org/jboss/as/controller/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // WILDFLY-CONTROLLER-JIT.1's org/jboss/as/controller/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("org/jboss/as/controller/")
+        //     && !package_allowed("org/jboss/as/controller/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
 
         // JSONSMART-PARSER.1 -- REMOVED 2026-07-26. Originally (2026-07-09)
         // the default JIT crashed inside emitted code after compiling parser
@@ -1273,6 +1464,20 @@ fn should_skip_jit_internal(
         // `CRATONVM_JIT_THRESHOLD=1` aggressive-compilation pass -- 0
         // failures in every configuration. No longer reproduces on current
         // dev. `JsonSmartProbe.java` is the regression witness.
+        //
+        // Re-confirmed 2026-07-27 against the stronger case that removal did
+        // not cover: real json-smart-2.6.0 (not 2.3), 10 varied documents,
+        // 300000 iterations = 3,000,000 parse/serialize/re-parse operations,
+        // with `JSONParserString.read`/`readS`/`JSONParserBase.skipSpace`
+        // verified JIT-compiled (CRATONVM_DBG_DUMP_JIT=LIST) -- 0 errors, and
+        // 0 again under CRATONVM_JIT_THRESHOLD=1. The residual that re-testing
+        // DID surface was VM-wide rather than json-smart's: the
+        // trivial-constructor elision dropped the native-shadowed
+        // `java/util/HashMap.<init>()V`, so a JIT-created HashMap got a
+        // 32-bucket table where the interpreter gives 16 (fixed in
+        // `is_elidable_construction`; regression net
+        // vm/tests/jit_collection_ctor_identity.rs). Full writeup:
+        // docs/internal/jsonsmart-parser-jit-retired-20260727.md.
         // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
         // The `InstantTests` failure cluster was not a Hibernate data bug: with
         // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`
@@ -1598,12 +1803,13 @@ fn should_skip_jit_internal(
         // was out of scope for this round. Do NOT lift until that producer
         // is found and fixed, or until the EC `AllTests` run completes
         // cleanly under the allow-packages override.
-        if class_name.starts_with("org/bouncycastle/")
-            && !is_bouncycastle_crypto_hotpath_carveout(class_name, method_name)
-            && !package_allowed("org/bouncycastle/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // RBC.1's org/bouncycastle/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("org/bouncycastle/")
+        //     && !is_bouncycastle_crypto_hotpath_carveout(class_name, method_name)
+        //     && !package_allowed("org/bouncycastle/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
 
         // SUNEC-INTPOLY -- REMOVED 2026-07-26, BUT SEE THE WARNING BELOW.
         // Re-verified with a standalone probe (EcIntPolyProbe.java, pure
@@ -1827,11 +2033,13 @@ fn should_skip_jit_internal(
         // costs throughput on every Spring Cloud boot path but avoids
         // a second iteration if the next downstream gap surfaces there.
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/cloud/`.
-        if class_name.starts_with("org/springframework/cloud/")
-            && !package_allowed("org/springframework/cloud/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.5's org/springframework/cloud/ guard (Spring CLOUD, not plain
+        // Spring/Spring Boot) -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("org/springframework/cloud/")
+        //     && !package_allowed("org/springframework/cloud/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
 
         // ANTLR.1 -- REMOVED 2026-07-26. Reason 1 (correctness -- the
         // PredictionContext equality/hash miscompile) was already
@@ -1872,30 +2080,34 @@ fn should_skip_jit_internal(
         // needed via a real 218-class H2 suite run finding a
         // "Schema not found" DB-reconnect corruption -- a different,
         // reconnect-specific trigger this HQL-parsing test batch does not
-        // exercise). This removal is therefore redundant/shadowed, not an
-        // independent unban: default (Conservative) behavior for
-        // org/antlr/v4/runtime/ classes is UNCHANGED -- they stay
-        // interpreted via HIB-LONGTAIL.1 regardless. Same pattern as
-        // SPRINGBOOT-WITHOUT-JACKSON.2s removal earlier this session. The
-        // real, positive, non-shadowed finding here is narrower: this
-        // bans own specific correctness claim no longer reproduces.
+        // exercise). At the time this check was deleted it was therefore a
+        // redundant/shadowed removal, not an independent unban -- default
+        // (Conservative) behavior for org/antlr/v4/runtime/ classes was
+        // UNCHANGED, they stayed interpreted via HIB-LONGTAIL.1 regardless.
+        //
+        // 2026-07-27 FOLLOW-UP: that shadow is gone. HIB-LONGTAIL.1 was
+        // narrowed to `org/h2/` only (see its own comment above), on a
+        // same-binary A/B over all 57 org.hibernate.orm.test.hql classes
+        // plus a ban-removed rebuild. org/antlr/v4/runtime/ is now genuinely
+        // JIT-eligible under Conservative; only the narrow
+        // is_antlr_prediction_context_miscompile guard (ANTLR-COLDPATH.1)
+        // still forces specific PredictionContext methods to the
+        // interpreter, in both the shaded and unshaded runtimes.
 
-        // SPB.6 (Session 113 r1) — provisional blanket ban for the
-        // Netflix Eureka discovery client. `com/netflix/discovery/
-        // DiscoveryClient.<init>` allocates Eureka `InstanceInfo` /
-        // `ApplicationInfoManager` objects whose ctors store
-        // `metadata`/`leaseInfo`/`port` immediately after allocation
-        // — the same allocate-then-putfield archetype. Eureka also
-        // installs a `ScheduledExecutorService` whose task submit path
-        // is the same `LinkedBlockingQueue.offer` / `enqueue` pair
-        // already covered by EXEC.1; this per-package ban covers the
-        // Eureka-specific allocations. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=com/netflix/discovery/`.
-        if class_name.starts_with("com/netflix/discovery/")
-            && !package_allowed("com/netflix/discovery/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.6 -- REMOVED 2026-07-27, UNVERIFIED. Was a provisional
+        // blanket ban (Session 113 r1) for the Netflix Eureka discovery
+        // client (`com/netflix/discovery/DiscoveryClient.<init>`
+        // allocate-then-putfield on `InstanceInfo`/`ApplicationInfoManager`,
+        // plus its `ScheduledExecutorService` task-submit path already
+        // covered by EXEC.1). No fixture ever existed to test this against
+        // on this host: exhaustively searched twice (this session and a
+        // concurrent one) for the original `eureka-server` app or any
+        // `eureka-client`/`eureka-core` jar (Maven/Gradle cache, vendored,
+        // source checkout) -- zero matches. Removed by explicit user
+        // decision (accepting the risk of the original, never-reproduced-
+        // here SIGSEGV/corruption) rather than re-verified evidence. If a
+        // real Eureka client crash resurfaces, re-add this ban and treat
+        // it as confirmed-needed, not provisional.
 
         // SPB.7 (Session 113 r1) — provisional blanket ban for Feign /
         // OpenFeign HTTP client allocations. Spring Cloud OpenFeign
@@ -1903,9 +2115,10 @@ fn should_skip_jit_internal(
         // `MethodMetadata` and `RequestTemplate` objects, each storing
         // `template` / `headers` / `body` slots immediately after `new`.
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=feign/`.
-        if class_name.starts_with("feign/") && !package_allowed("feign/", allow_packages) {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.7's feign/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("feign/") && !package_allowed("feign/", allow_packages) {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
 
         // SPB.8 (Session 113 r2) — provisional blanket ban for the JBoss
         // Modules class-graph and resource loading code paths.
@@ -1936,30 +2149,44 @@ fn should_skip_jit_internal(
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/modules/`. The
         // companion `org/jboss/as/` ban below covers the WildFly server
         // boot path that consumes the module graph.
-        if class_name.starts_with("org/jboss/modules/")
-            && !package_allowed("org/jboss/modules/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.8's org/jboss/modules/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("org/jboss/modules/")
+        //     && !package_allowed("org/jboss/modules/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
 
-        // SPB.8b (Session 113 r2) — companion blanket ban for the WildFly
-        // server boot path (`org/jboss/as/`). Once JBoss Modules is
-        // unblocked by SPB.8, the next downstream consumer is the JBoss AS
-        // server bootstrap (`org/jboss/as/server`, `org/jboss/as/controller`,
-        // `org/jboss/as/jmx`, etc.), which exhibits the same
-        // allocate-then-putfield pattern: `ServerLogger_$logger_en_US`
-        // ctors store i18n message slots, `PluggableMBeanServerImpl`
-        // delegates allocate fresh `Subject` / `ClassLoader` references
-        // per invocation, and `ServerEnvironment.<init>` resolves dozens
-        // of `-Djboss.*` properties via `Long.parseLong` /
-        // `Boolean.parseBoolean`. Pre-emptive to avoid a second iteration
-        // if the next gap surfaces in this layer. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/`.
-        if class_name.starts_with("org/jboss/as/")
-            && !package_allowed("org/jboss/as/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.8b — `org/jboss/as/` blanket ban REMOVED 2026-07-27.
+        //
+        // Added Session 113 r2 as a pre-emptive companion to SPB.8 (never
+        // driven by a failure of its own), then re-confirmed on 2026-07-26 by
+        // a real `standalone.sh` boot that died on
+        // `NullPointerException: ... "this.validTypes" is null` in
+        // `ModelTypeValidator` with the ban lifted and JIT on, and booted with
+        // the ban lifted and `--nojit` — a differential that read as a JIT
+        // miscompile. It was not one. The NPE was a *consequence* of the boot
+        // being torn down mid-flight: `Runtime.addShutdownHook` was a no-op
+        // stub, so WildFly's `BootstrapImpl$ShutdownHook` — which holds the MSC
+        // `ServiceContainer` — became unreachable the moment `Main.main`
+        // returned, MSC 1.5's leak-detector `Cleaner` called
+        // `container.shutdown()`, and `AbstractControllerService.stop` reset
+        // `controller` to null under the still-running boot thread. WHEN that
+        // collection happened depended on GC timing, which the JIT changes;
+        // hence the clean-looking `--nojit` differential.
+        //
+        // With that root fixed (plus the `HashSet.addAll(<foreign
+        // open-addressed set>)` null-hole fix that unmasked the boot's own
+        // failure reporting), WildFly 32.0.1.Final boots to `WFLYSRV0026` with
+        // this package JIT-compiled, at the same rate as with the ban in place:
+        // 4/6 vs 5/6 over a 6+6 A/B on the Azure host, and every failure in
+        // BOTH arms is the same pre-existing flaky
+        // `NoSuchMethodError: java/lang/Object.hasNext()Z` from
+        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
+        // The full write-up (root causes, the A/B, and the per-package results
+        // for the four sibling bans, which stay in place) is the retired
+        // `modeltypevalidator-validtypes-npe` doc — archived with the rest of
+        // docs/internal. The residual it hands off to is
+        // `docs/known-issues/wildfly/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
 
         // SPB.8c (Session 113 r2) — companion blanket ban for the WildFly
         // security-manager package (`org/wildfly/`). The
@@ -1986,21 +2213,22 @@ fn should_skip_jit_internal(
         // were dispatched ~200x in the trace immediately before the crash).
         // Both `org/jboss/msc/` and `org/jboss/logging/` are extended below
         // with the same SPB.8 archetype reasoning.
-        if class_name.starts_with("org/wildfly/")
-            && !package_allowed("org/wildfly/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/jboss/msc/")
-            && !package_allowed("org/jboss/msc/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/jboss/logging/")
-            && !package_allowed("org/jboss/logging/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.8c's org/wildfly/, org/jboss/msc/, org/jboss/logging/ guards -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("org/wildfly/")
+        //     && !package_allowed("org/wildfly/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
+        // if class_name.starts_with("org/jboss/msc/")
+        //     && !package_allowed("org/jboss/msc/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
+        // if class_name.starts_with("org/jboss/logging/")
+        //     && !package_allowed("org/jboss/logging/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
 
         // SPB.9 -- `org/slf4j/` and `ch/qos/logback/` REMOVED 2026-07-26.
         // Originally (Session 114) banned as a blanket trio (with
@@ -2065,11 +2293,14 @@ fn should_skip_jit_internal(
         // SEGV. Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=net/sf/cglib/`.
         // Track for a real fix once the underlying allocate-then-putfield
         // miscompile is root-caused.
-        if class_name.starts_with("net/sf/cglib/")
-            && !package_allowed("net/sf/cglib/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // CGL.1's net/sf/cglib/ guard (the standalone, unshaded CGLIB
+        // artifact -- Spring's OWN internal copy is org/springframework/cglib/
+        // and is unaffected either way) -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("net/sf/cglib/")
+        //     && !package_allowed("net/sf/cglib/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
 
         // SPB-FLYWAY-HSQLDB.1 -- REMOVED 2026-07-26. Re-verified with a
         // standalone probe (FlywayHsqldbProbe.java, real hsqldb-2.7.4.jar --
@@ -2081,69 +2312,38 @@ fn should_skip_jit_internal(
         // CRATONVM_JIT_THRESHOLD=1 aggressive-compilation pass: 0 failures
         // in every configuration. No longer reproduces on current dev.
         // FlywayHsqldbProbe.java is the regression witness.
-        // SPB.9b (Session 114) — companion blanket ban for the Spring
-        // Boot loader + reactive web context, plus the Spring Beans
-        // factory support layer. After SPB.9 pins the per-class logger
-        // wiring, the next downstream consumers that allocate-then-putfield
-        // on the `prepareEnvironment` -> component-scan critical path are:
-        //   * `org/springframework/boot/loader/` — JarLauncher /
-        //     LaunchedURLClassLoader allocate per-jar `Archive` /
-        //     `Source` records and store them via putfield. Note this
-        //     intentionally overrides the SPB.4c `loader/` exemption
-        //     because the insurance-backend JarLauncher.launch frame is
-        //     itself the entry point that fails dispatch.
-        //   * `org/springframework/web/reactive/` and
-        //     `org/springframework/boot/web/reactive/` — insurance-backend
-        //     uses Spring WebFlux; `ReactiveWebServerApplicationContext`
-        //     and `ReactiveWebServerFactory` allocate Reactor Netty
-        //     handler chains (`HttpHandler`, `WebFilter`) whose ctors
-        //     store config slots immediately after `new`.
-        //   * `org/springframework/beans/factory/support/` —
-        //     `DefaultListableBeanFactory.registerBeanDefinition` and
-        //     `BeanDefinitionMap.put` are called once per scanned
-        //     component (~50+ beans for a minimal Spring Boot 3.2
-        //     reactive app), and the `RootBeanDefinition.<init>` ctor
-        //     copies ~15 fields (factoryClass, factoryMethod, scope,
-        //     ctorArgs, ...) via putfield — exact W2-CHM archetype.
-        // Lifted per-package via
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/boot/loader/,
-        // org/springframework/web/reactive/,
-        // org/springframework/boot/web/reactive/,
-        // org/springframework/beans/factory/support/`.
-        if class_name.starts_with("org/springframework/boot/loader/")
-            && !package_allowed("org/springframework/boot/loader/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/springframework/web/reactive/")
-            && !package_allowed("org/springframework/web/reactive/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/springframework/boot/web/reactive/")
-            && !package_allowed("org/springframework/boot/web/reactive/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        // org/springframework/beans/factory/support/ -- REMOVED 2026-07-26,
-        // the ONLY one of SPB.9b's three sub-bans lifted so far (the other
-        // two, org/springframework/boot/loader/ and
-        // org/springframework/web/reactive/ + org/springframework/boot/web/reactive/
-        // above, remain banned -- they need the full insurance-backend
-        // JarLauncher/WebFlux-boot scaffold to test faithfully, which is
-        // confirmed absent from this host; this sub-package alone is
-        // independently testable via plain DefaultListableBeanFactory
-        // usage). Re-verified with a standalone probe
-        // (`BeanFactorySupportProbe.java`, real spring-beans-7.0.7.jar +
-        // spring-core-7.0.7.jar + commons-logging-1.2.jar) registering 60
-        // real RootBeanDefinition instances per iteration (matching the
+        // SPB.9b -- ALL THREE sub-bans now removed (companion blanket ban,
+        // Session 114, for the Spring Boot loader + reactive web context,
+        // plus the Spring Beans factory support layer).
+        //
+        // `org/springframework/beans/factory/support/` was REMOVED
+        // 2026-07-26 with real re-verification evidence: a standalone
+        // probe (`BeanFactorySupportProbe.java`, real spring-beans-7.0.7.jar
+        // + spring-core-7.0.7.jar + commons-logging-1.2.jar) registering 60
+        // real `RootBeanDefinition` instances per iteration (matching the
         // ban's own "~50+ beans" scale) via a real
         // `DefaultListableBeanFactory`, 500 iterations: baseline,
         // package-allowed, and a `CRATONVM_JIT_THRESHOLD=1`
         // aggressive-compilation pass -- 0 failures, correct bean counts
         // and field reads every call in every configuration. No longer
         // reproduces on current dev. `BeanFactorySupportProbe.java` is the
-        // regression witness for this one sub-package only.
+        // regression witness for this one sub-package.
+        //
+        // `org/springframework/boot/loader/` (JarLauncher /
+        // LaunchedURLClassLoader) and `org/springframework/web/reactive/` +
+        // `org/springframework/boot/web/reactive/` (WebFlux reactive
+        // handler chains) were REMOVED 2026-07-27, UNVERIFIED. No fixture
+        // ever existed on this host to test these against: they need the
+        // full `insurance-backend` app's JarLauncher/WebFlux-boot scaffold
+        // (a real executable fat jar + a real reactive web server boot),
+        // and that named app was exhaustively searched for at full
+        // filesystem depth (by content/purpose, not just name) twice --
+        // this session and a concurrent one -- with zero matches. Removed
+        // by explicit user decision (accepting the risk of the original,
+        // never-reproduced-here SIGSEGV in `JarLauncher.launch`) rather
+        // than re-verified evidence. If a real Spring Boot fat-jar boot or
+        // WebFlux app crash resurfaces on either of these packages, re-add
+        // the ban and treat it as confirmed-needed, not provisional.
 
         // SPB.9c -- REMOVED 2026-07-26. Originally (Session 114):
         // companion blanket bans for the Spring component-scan critical
@@ -2250,11 +2450,14 @@ fn should_skip_jit_internal(
         // project and intentionally left JIT-eligible. Track for a real
         // fix once the underlying allocate-then-putfield / PIC dispatch
         // miscompile is root-caused.
-        if class_name.starts_with("org/junit/platform/console/shadow/picocli/")
-            && !package_allowed("org/junit/platform/console/shadow/picocli/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // PIC.1's org/junit/platform/console/shadow/picocli/ guard (JUnit
+        // Platform's own console-standalone launcher tool, not any of the 5
+        // target apps' own test execution path) -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
+        // if class_name.starts_with("org/junit/platform/console/shadow/picocli/")
+        //     && !package_allowed("org/junit/platform/console/shadow/picocli/", allow_packages)
+        // {
+        //     return Some(SkipReason::RustJvmTestFixture);
+        // }
     }
 
     None
@@ -2274,19 +2477,6 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
             | ("java/util/Objects", "hashCode")
             | ("java/util/Objects", "equals")
     )
-}
-
-// Elasticsearch suite classes are kept interpreted under the conservative
-// policy until the package can be safely re-bisected. The July 2026 vector and
-// DiskBBQ hang residuals are covered by this same containment: the affected
-// test classes and their Elasticsearch vector-codec bodies sit under
-// `org/elasticsearch/`. Lucene bytecode is no longer skip-listed: the
-// LUCENE-POSTINGS.1 blanket `org/apache/lucene/` ban was retired by
-// `117d2d906` ("admit Lucene after synchronized-method gate") once the
-// interpreter started gating ACC_SYNCHRONIZED methods out of JIT/OSR itself,
-// which closed the IndexWriter monitor repro that had kept the ban alive.
-fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
-    class_name.starts_with("org/elasticsearch/")
 }
 
 fn hibernate_temporal_residual_skip_prefix(class_name: &str) -> Option<&'static str> {
@@ -2518,22 +2708,73 @@ fn is_known_miscompile_clq_family(class_name: &str, method_name: &str) -> bool {
     )
 }
 
+/// True for a class generated by `java.lang.reflect.Proxy` -- JDK 9+ names
+/// them `jdk/proxy<N>/$Proxy<M>` (one package per defining loader) and puts
+/// unnamed-module proxies for non-public interfaces in the interface's own
+/// package as `<pkg>/$Proxy<M>`.
+///
+/// **Why these must never be JIT-compiled** (SPR-PROXY.1, 2026-07-28): every
+/// method a proxy class declares is the same three-line trampoline --
+/// `return (T) super.h.invoke(this, mN, args)` -- so compiling one buys
+/// nothing in throughput. What it costs is correctness: CratonVM does not
+/// implement proxy semantics in that bytecode, it implements them at DISPATCH
+/// (`vm_exec.rs`'s `proxy_invoke_handler_shared` /
+/// `proxy_annotation_handler_invoke` / `annotation_proxy_dispatch_impl`,
+/// which is where annotation-member coercion and the delegation of `equals`
+/// to a FOREIGN proxy of the same annotation type live). A compiled proxy
+/// body is a THIRD dispatch path that bypasses all of it, on top of the two
+/// the `MergedAnnotationsTests` asymmetric-`equals` fix already had to chase.
+///
+/// Measured symptom: `beans.PropertyDescriptorUtilsPropertyResolutionTests`
+/// (a JUnit `@ParameterizedClass` + `@FieldSource` with `@Nested` children,
+/// so JUnit's annotation scanning drives proxy accessors hard) died with
+/// `OutOfMemoryError: Java heap space` after ~100 s of GCs that reclaimed
+/// almost nothing -- at 512 MB, 2 GB and 8 GB heaps alike. `--nojit` runs it
+/// clean. Package bisection over eight configurations pinned it exactly:
+/// every configuration with `jdk/proxy` JIT-eligible died, every
+/// configuration without it passed, including one with `org/springframework/,
+/// org/junit/, java/, org/assertj/, net/bytebuddy/` all compiled.
+fn is_jdk_dynamic_proxy_class(class_name: &str) -> bool {
+    let Some(simple) = class_name.rsplit('/').next() else {
+        return false;
+    };
+    let Some(rest) = simple.strip_prefix("$Proxy") else {
+        return false;
+    };
+    // `$Proxy` is followed by the generator's counter and nothing else; a
+    // user class merely NAMED `$ProxyFactory` must stay compilable.
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -> bool {
+    // Matched on the suffix so BOTH copies of the ANTLR 4 runtime are covered:
+    // Groovy's shaded `groovyjarjarantlr4/` fork (where the equality/hash
+    // miscompile was originally found) and the ordinary unshaded
+    // `org/antlr/v4/runtime/` artifact that Hibernate and Keycloak depend on.
+    // The two are the same bytecode under different package names, so the same
+    // 7 methods are at risk in both.
+    //
+    // The unshaded half used to be pinned to the interpreter only INCIDENTALLY,
+    // by HIB-LONGTAIL.1's second `org/antlr/v4/runtime/` prefix. That prefix
+    // was dropped 2026-07-27 (see its comment in `should_skip_jit_internal`)
+    // once a real Hibernate HQL A/B showed the broad ban was unnecessary --
+    // which would have silently un-pinned this narrow cluster too. Naming both
+    // prefixes here keeps the narrow, evidence-backed guard exactly as strong
+    // as it was while the broad package ban goes away. Mirrors what
+    // `is_antlr_prediction_context_native_override` (interpreter.rs) already
+    // does for the native-dispatch side.
+    let Some(rest) = class_name
+        .strip_prefix("groovyjarjarantlr4/v4/runtime/")
+        .or_else(|| class_name.strip_prefix("org/antlr/v4/runtime/"))
+    else {
+        return false;
+    };
     matches!(
-        (class_name, method_name),
-        (
-            "groovyjarjarantlr4/v4/runtime/atn/PredictionContext",
-            "calculateHashCode" | "hashCode"
-        ) | (
-            "groovyjarjarantlr4/v4/runtime/atn/PredictionContext$IdentityEqualityComparator",
-            "hashCode"
-        ) | (
-            "groovyjarjarantlr4/v4/runtime/atn/SingletonPredictionContext",
-            "equals" | "isEmpty" | "size"
-        ) | (
-            "groovyjarjarantlr4/v4/runtime/misc/ObjectEqualityComparator",
-            "equals"
-        )
+        (rest, method_name),
+        ("atn/PredictionContext", "calculateHashCode" | "hashCode")
+            | ("atn/PredictionContext$IdentityEqualityComparator", "hashCode")
+            | ("atn/SingletonPredictionContext", "equals" | "isEmpty" | "size")
+            | ("misc/ObjectEqualityComparator", "equals")
     )
 }
 
@@ -3173,58 +3414,43 @@ mod tests {
     }
 
     #[test]
-    fn jdt_parser_and_ast_packages_are_banned_under_conservative_after_jasper_jdt_2_3_restore() {
+    fn jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal() {
         // JASPER-JDT.2 (`org/eclipse/jdt/internal/compiler/parser/`) and
         // JASPER-JDT.3 (`org/eclipse/jdt/internal/compiler/ast/`) were removed
-        // 2026-07-26 and then RESTORED -- see the loop over those two prefixes
-        // in should_skip_jit_internal and its comment: the removal evidence was
-        // void because those runs never lifted the ban that was shadowing them,
-        // so removing them would assert something no measurement supports.
+        // 2026-07-26, RESTORED 2026-07-27 -- the removal runs had the
+        // compiled-callee direct-entry path switched off and so measured an
+        // inert dispatch -- and removed for good 2026-07-28, this time after
+        // bisecting the real Tomcat repro to the commit that fixes it
+        // (`613b10f4c`, the LICM / speculative pre-header bypass) and re-running
+        // the Tomcat JSP suites with that dispatch path ON. See the removal
+        // comment in `should_skip_jit_internal`.
         //
-        // This test previously asserted the opposite (that both packages are
-        // JIT-eligible) and was left behind by that restore, so it failed on
-        // `dev`. It now pins the restored state: banned under Conservative,
-        // eligible under Aggressive (which bypasses the whole block), and
-        // liftable per-package via the allow-list.
+        // Both packages must now be JIT-eligible under the DEFAULT Conservative
+        // policy, with no allow-list entry needed.
         let cases = [
             (
                 "org/eclipse/jdt/internal/compiler/parser/Parser",
                 "consumeRule",
-                "org/eclipse/jdt/internal/compiler/parser/",
             ),
             (
                 "org/eclipse/jdt/internal/compiler/parser/Parser",
                 "consumeTypeImportOnDemandDeclarationName",
-                "org/eclipse/jdt/internal/compiler/parser/",
             ),
             (
                 "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
                 "analyseCode",
-                "org/eclipse/jdt/internal/compiler/ast/",
             ),
         ];
-        for (class_name, method, prefix) in cases {
+        for (class_name, method) in cases {
             assert_eq!(
                 check(class_name, method, false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name}.{method} must stay interpreted under Conservative -- JASPER-JDT.2/.3 were restored",
+                None,
+                "{class_name}.{method} must be JIT-eligible under Conservative -- JASPER-JDT.2/.3 were removed 2026-07-28",
             );
             assert_eq!(
                 check(class_name, method, false, true, SkipPolicy::Aggressive),
                 None,
-                "{class_name}.{method} must be JIT-eligible under Aggressive, which bypasses the Conservative-only block",
-            );
-            assert_eq!(
-                check_with(
-                    class_name,
-                    method,
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                    &[prefix],
-                ),
-                None,
-                "{class_name}.{method} must be JIT-eligible once {prefix} is explicitly allowed",
+                "{class_name}.{method} must be JIT-eligible under Aggressive too",
             );
         }
     }
@@ -3279,7 +3505,20 @@ mod tests {
     }
 
     #[test]
-    fn elasticsearch_vector_diskbbq_hang_cluster_stays_interpreted_by_default() {
+    fn elasticsearch_vector_diskbbq_cluster_is_jit_eligible_after_es_cluster_removal() {
+        // Drive-by repair, 2026-07-28. The blanket `org/elasticsearch/` ban
+        // (ES-FRAGILE-CLUSTER.1) was removed on 2026-07-27 by `bae30dc3c` --
+        // see the removal comment above `should_skip_jit_internal` -- but this
+        // test was left asserting the ban, so `cargo test -p cratonvm-vm --lib
+        // skip_list` has been red on `dev` ever since. Exactly the shape
+        // `b8225b18c` had to repair for the JASPER-JDT test, so it is corrected
+        // here alongside the JASPER-JDT.2/.3 removal rather than left for the
+        // next session to trip over. Nothing about elasticsearch was re-measured
+        // in doing so: the assertion is simply flipped to match the ban state
+        // the lift established. (ElasticSearch is also outside the
+        // tomcat/hibernate/spring/spring-boot/h2 scope this session is
+        // otherwise focused on, so no ES-specific ban is being reconsidered
+        // here either way -- this is purely fixing a red test.)
         for class_name in [
             "org/elasticsearch/index/codec/vectors/diskbbq/DocIdsWriterTests",
             "org/elasticsearch/index/codec/vectors/diskbbq/ES920DiskBBQVectorsFormatTests",
@@ -3289,22 +3528,14 @@ mod tests {
             "org/elasticsearch/index/codec/vectors/es93/ES93HnswBitVectorsFormatTests",
             "org/elasticsearch/search/vectors/IVFKnnFloatSlicedVectorQueryTests",
         ] {
-            assert_eq!(
-                check(
-                    class_name,
-                    "testBody",
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                ),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name} must stay interpreted under the conservative policy"
-            );
-            assert_eq!(
-                check(class_name, "testBody", false, true, SkipPolicy::Aggressive),
-                None,
-                "aggressive policy must still lift {class_name} for bisection"
-            );
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, "testBody", false, true, policy),
+                    None,
+                    "{class_name} must be JIT-eligible now that the blanket \
+                     org/elasticsearch/ ban is removed"
+                );
+            }
             assert_eq!(
                 check_with(
                     class_name,
@@ -3328,9 +3559,7 @@ mod tests {
                 SkipPolicy::Conservative,
             ),
             None,
-            "Lucene is JIT-admitted at the skip-list level since 117d2d906 \
-             retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED \
-             methods are gated in the interpreter, not here)"
+            "Lucene is JIT-admitted at the skip-list level since 117d2d906              retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED              methods are gated in the interpreter, not here)"
         );
     }
 
@@ -3349,15 +3578,34 @@ mod tests {
     }
 
     #[test]
-    fn beans_factory_support_is_jit_eligible_after_spb9b_partial_removal() {
-        // Only the org/springframework/beans/factory/support/ sub-ban of
-        // SPB.9b was removed 2026-07-26 -- see the removal comment above
-        // should_skip_jit_internal for the re-verification evidence
-        // (BeanFactorySupportProbe.java, real spring-beans-7.0.7.jar). The
-        // other two SPB.9b sub-bans (org/springframework/boot/loader/,
-        // org/springframework/web/reactive/ + org/springframework/boot/web/reactive/)
-        // remain active -- they need the full insurance-backend app
-        // (confirmed absent from this host) to test faithfully.
+    fn netflix_discovery_is_jit_eligible_after_spb6_removal() {
+        // SPB.6 (com/netflix/discovery/, Netflix Eureka DiscoveryClient)
+        // was removed 2026-07-27 WITHOUT re-verification -- no fixture
+        // ever existed on this host (no eureka-server app, no
+        // eureka-client/eureka-core jar anywhere). Removed by explicit
+        // user decision; see the removal comment above
+        // should_skip_jit_internal.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "com/netflix/discovery/DiscoveryClient",
+                    "register",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "com/netflix/discovery/ must be JIT-eligible now that SPB.6 is removed (unverified)"
+            );
+        }
+    }
+
+    #[test]
+    fn beans_factory_support_is_jit_eligible_after_spb9b_full_removal() {
+        // org/springframework/beans/factory/support/ was removed
+        // 2026-07-26 with real re-verification evidence (see the removal
+        // comment above should_skip_jit_internal:
+        // BeanFactorySupportProbe.java, real spring-beans-7.0.7.jar).
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -3371,11 +3619,10 @@ mod tests {
                 "org/springframework/beans/factory/support/ must be JIT-eligible now that its SPB.9b sub-ban is removed"
             );
         }
-        // UPDATE: the sibling org/springframework/beans/factory/ ban
-        // (excluding .../support/) was ALSO removed 2026-07-26, as the
-        // 4th sub-ban of the separate SPB.9c group -- see that removal
-        // comment above should_skip_jit_internal. So non-support factory
-        // classes are now JIT-eligible too.
+        // The sibling org/springframework/beans/factory/ ban (excluding
+        // .../support/) was ALSO removed 2026-07-26, as the 4th sub-ban
+        // of the separate SPB.9c group -- see that removal comment above
+        // should_skip_jit_internal.
         for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
             assert_eq!(
                 check(
@@ -3389,18 +3636,35 @@ mod tests {
                 "org/springframework/beans/factory/ (excluding support/) must be JIT-eligible now that SPB.9c's 4th sub-ban is also removed"
             );
         }
-        // The other two still-active SPB.9b sub-bans must remain banned.
-        assert_eq!(
-            check(
-                "org/springframework/boot/loader/JarLauncher",
-                "launch",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "org/springframework/boot/loader/ must remain banned -- not covered by this partial removal"
-        );
+        // org/springframework/boot/loader/ and org/springframework/web/reactive/
+        // + org/springframework/boot/web/reactive/ -- SPB.9b's other two
+        // sub-bans -- were removed 2026-07-27 WITHOUT re-verification (no
+        // fixture ever existed on this host; see the removal comment above
+        // should_skip_jit_internal for the explicit-user-decision rationale).
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/boot/loader/JarLauncher",
+                    "launch",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/springframework/boot/loader/ must be JIT-eligible now that SPB.9b is fully removed (unverified)"
+            );
+            assert_eq!(
+                check(
+                    "org/springframework/web/reactive/function/server/RouterFunctions",
+                    "route",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/springframework/web/reactive/ must be JIT-eligible now that SPB.9b is fully removed (unverified)"
+            );
+        }
     }
 
     #[test]
@@ -3463,19 +3727,25 @@ mod tests {
                 );
             }
         }
-        // org/springframework/boot/loader/ is untouched by this removal --
-        // SPB.9b's own, separate ban on it stays active regardless.
-        assert_eq!(
-            check(
-                "org/springframework/boot/loader/JarLauncher",
-                "launch",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "org/springframework/boot/loader/ must stay skipped under Conservative -- SPB.9b, not SPB.4c, covers it"
-        );
+        // org/springframework/boot/loader/ was untouched by the SPB.4/.4b/.4c
+        // removal itself (SPB.9b's own, separate ban on it was the reason it
+        // stayed banned at the time) -- but SPB.9b's remaining sub-bans were
+        // themselves removed 2026-07-27 (see
+        // beans_factory_support_is_jit_eligible_after_spb9b_full_removal),
+        // so it is now JIT-eligible too.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/boot/loader/JarLauncher",
+                    "launch",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/springframework/boot/loader/ must be JIT-eligible now that SPB.9b is fully removed"
+            );
+        }
     }
 
     #[test]
@@ -3673,36 +3943,54 @@ mod tests {
     }
 
     #[test]
-    fn hibernate_unshaded_antlr_runtime_stays_interpreted_via_hib_longtail_1() {
-        // HIB-ANTLR.1's own specific check was removed 2026-07-26 (see the
-        // removal comment above should_skip_jit_internal), but
-        // org/antlr/v4/runtime/ classes stay interpreted under Conservative
-        // regardless -- HIB-LONGTAIL.1 (a separate, still-active,
-        // already-confirmed-needed ban covering the same prefix) already
-        // catches them. This test now documents THAT shadowing relationship
-        // rather than HIB-ANTLR.1's own removed check.
-        assert_eq!(
-            check(
-                "org/antlr/v4/runtime/atn/ParserATNSimulator",
-                "computeTargetState",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "org/antlr/v4/runtime/ must still be interpreted under Conservative via HIB-LONGTAIL.1"
-        );
+    fn hibernate_unshaded_antlr_runtime_is_jit_eligible_after_hib_longtail_1_narrowing() {
+        // HIB-ANTLR.1's own check was removed 2026-07-26; the last thing still
+        // forcing org/antlr/v4/runtime/ to the interpreter was HIB-LONGTAIL.1's
+        // second prefix, dropped 2026-07-27 after a same-binary A/B over all 57
+        // org.hibernate.orm.test.hql classes (the only real fixture on record
+        // that parses HQL through this runtime) came back byte-identical, and a
+        // ban-removed rebuild re-confirmed it. Every remaining justification for
+        // HIB-LONGTAIL.1 comes from the H2 suite, which never loads an
+        // org/antlr/ class -- so the two halves were independent all along.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/antlr/v4/runtime/atn/ParserATNSimulator",
+                    "computeTargetState",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/antlr/v4/runtime/ must be JIT-eligible now that HIB-LONGTAIL.1 is org/h2/-only"
+            );
+        }
+        // ...but the narrow PredictionContext equality/hash guard
+        // (ANTLR-COLDPATH.1) still covers the unshaded runtime too, and is
+        // deliberately not lifted by CRATONVM_JIT_ALLOW_PACKAGES.
         assert_eq!(
             check_with(
-                "org/antlr/v4/runtime/atn/ParserATNSimulator",
-                "computeTargetState",
+                "org/antlr/v4/runtime/atn/PredictionContext",
+                "calculateHashCode",
                 false,
                 true,
                 SkipPolicy::Conservative,
                 &["org/antlr/v4/runtime/"],
             ),
-            None,
-            "CRATONVM_JIT_ALLOW_PACKAGES=org/antlr/v4/runtime/ lifts HIB-LONGTAIL.1 (same prefix) too"
+            Some(SkipReason::RustJvmTestFixture),
+            "ANTLR-COLDPATH.1 still pins the PredictionContext cluster in the unshaded runtime"
+        );
+        // The org/h2/ half of HIB-LONGTAIL.1 is untouched by that narrowing.
+        assert_eq!(
+            check(
+                "org/h2/mvstore/MVStore",
+                "commit",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "org/h2/ must still be interpreted under Conservative via HIB-LONGTAIL.1"
         );
     }
 
@@ -4269,47 +4557,27 @@ mod tests {
     }
 
     #[test]
-    fn bouncycastle_math_ec_carveout_is_jit_eligible() {
-        assert_eq!(
-            check(
-                "org/bouncycastle/math/ec/ECPoint",
-                "normalize",
-                false,
-                true,
-                SkipPolicy::Conservative
-            ),
-            None
-        );
-        assert_eq!(
-            check(
-                "org/bouncycastle/crypto/BufferedBlockCipher",
-                "getUpdateOutputSize",
-                false,
-                true,
-                SkipPolicy::Conservative
-            ),
-            None
-        );
-        assert_eq!(
-            check(
-                "org/bouncycastle/crypto/DefaultBufferedBlockCipher",
-                "getUpdateOutputSize",
-                false,
-                true,
-                SkipPolicy::Conservative
-            ),
-            None
-        );
-        assert_eq!(
-            check(
-                "org/bouncycastle/crypto/engines/CAST5Engine",
-                "init",
-                false,
-                true,
-                SkipPolicy::Conservative
-            ),
-            Some(SkipReason::RustJvmTestFixture)
-        );
+    fn bouncycastle_is_jit_eligible_after_rbc1_removed() {
+        // RBC.1's org/bouncycastle/ blanket ban was commented out
+        // 2026-07-28 (unverified, explicit user decision -- only
+        // tomcat/hibernate/spring/spring-boot/h2 need to work right now).
+        // The carveout function (`is_bouncycastle_crypto_hotpath_carveout`)
+        // used to make a FEW methods JIT-eligible despite the broader ban;
+        // now that the ban itself is gone, EVERY bouncycastle method is
+        // JIT-eligible, including the ones the carveout used to exempt
+        // AND the ones that used to stay banned (e.g. CAST5Engine.init).
+        for (class_name, method_name) in [
+            ("org/bouncycastle/math/ec/ECPoint", "normalize"),
+            ("org/bouncycastle/crypto/BufferedBlockCipher", "getUpdateOutputSize"),
+            ("org/bouncycastle/crypto/DefaultBufferedBlockCipher", "getUpdateOutputSize"),
+            ("org/bouncycastle/crypto/engines/CAST5Engine", "init"),
+        ] {
+            assert_eq!(
+                check(class_name, method_name, false, true, SkipPolicy::Conservative),
+                None,
+                "{class_name}.{method_name} must be JIT-eligible now that RBC.1 is commented out"
+            );
+        }
     }
 
     #[test]
@@ -4352,8 +4620,11 @@ mod tests {
             );
         }
 
-        // ...but the two narrower bans these used to shadow are deliberately
-        // still in force. PIC.1 keeps its own documented SEGV evidence.
+        // UPDATE 2026-07-28: PIC.1 itself was ALSO commented out (unverified,
+        // explicit user decision -- only tomcat/hibernate/spring/spring-boot/h2
+        // need to work right now; the JUnit Platform console-standalone
+        // launcher tool this ban protected is none of those five), so the
+        // shadowed picocli copy is now JIT-eligible too.
         assert_eq!(
             check(
                 "org/junit/platform/console/shadow/picocli/CommandLine$Model$OptionSpec",
@@ -4362,8 +4633,8 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            Some(SkipReason::RustJvmTestFixture),
-            "PIC.1 is now the live gate for the shadowed picocli copy and must survive the blanket-ban removal",
+            None,
+            "PIC.1 was commented out 2026-07-28; the shadowed picocli copy must now be JIT-eligible",
         );
     }
 

@@ -376,6 +376,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // multiple sources and strip any `file:` scheme prefix before
             // handing the result to `p57_to_os_path`.
             let mut candidates: Vec<String> = Vec::new();
+            // 0. `URI.getPath()` -- the DECODED path component, which is what
+            //    the real `Path.of(URI)` ends up with. Every field probe below
+            //    reads a RAW (still percent-encoded) component, so a directory
+            //    genuinely named `custom#root` came back as `custom%23root`
+            //    and `Files.exists`/`Files.walk` saw nothing
+            //    (`core.io.support.PathMatchingResourcePatternResolverTests
+            //    .encodedHashtagInPath`). Same shape as the `new File(URI)`
+            //    raw-path fix.
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[])
+            {
+                if let Some(decoded) = ctx.read_string(s) {
+                    candidates.push(decoded);
+                }
+            }
             // 1. URI.path by name (real-JDK URIs constructed via real-JDK
             //    URI bytecode populate this; ours don't but cheap to try).
             if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "path") {
@@ -921,19 +936,50 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // KEEP: the default FileSystem is open for the life of the VM (real JDK
+    // says so too), and the mounted jar/jrt FileSystems this VM synthesizes
+    // hold no closeable handle, so there is no state that could make this
+    // false.
     r.register(fs_class, "isOpen", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1))) // default FS is always open
     });
 
-    r.register(fs_class, "isReadOnly", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // Was unconditionally writable. A mounted runtime image (`jrt:`) is
+    // read-only by definition, and this VM's jar-FS mount is read-only too
+    // (`jarfs_*` has no in-place update path), so a caller that checked
+    // `isReadOnly()` before attempting a write was told to go ahead and then
+    // failed further downstream with an unrelated error.
+    r.register(fs_class, "isReadOnly", "()Z", |ctx, args| {
+        let virtual_fs = matches!(obj_arg(args, 0), Ok(this)
+            if matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_)))
+                || matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_))));
+        Ok(Some(Value::Int(i32::from(virtual_fs))))
     });
 
     // Round 63 — Keycloak 26.6.1 calls FileSystem.close() during shutdown/cleanup
     // paths. FileSystem.close() is abstract in the real JDK; without a native
-    // override the synthetic default-FS object throws AbstractMethodError. We
-    // make close() a no-op (the synthetic FS has no underlying resource).
-    r.register(fs_class, "close", "()V", |_ctx, _args| Ok(None));
+    // override the synthetic default-FS object throws AbstractMethodError.
+    //
+    // It used to be an unconditional no-op, which quietly disagreed with the
+    // spec: `FileSystem.close()` on the DEFAULT file system throws
+    // `UnsupportedOperationException` ("The default file system cannot be
+    // closed"), and a caller that closes what it believes is a mounted
+    // zip/jar FileSystem — but actually holds the default one — was silently
+    // told it succeeded. Throw for the default FS (what HotSpot does, so any
+    // caller reaching here already has to handle it) and stay a no-op for a
+    // mounted jar/jrt FileSystem, which holds no OS handle to release.
+    r.register(fs_class, "close", "()V", |ctx, args| {
+        let virtual_fs = matches!(obj_arg(args, 0), Ok(this)
+            if matches!(ctx.get_field(this, P57_FS_JAR_FIELD), Value::Object(Some(_)))
+                || matches!(ctx.get_field(this, P57_FS_JRT_FIELD), Value::Object(Some(_))));
+        if virtual_fs {
+            return Ok(None);
+        }
+        Err(RuntimeError::UnsupportedOperationException {
+            message: "The default file system cannot be closed".into(),
+        }
+        .into())
+    });
 
     // Supplementary FileSystem methods that are abstract in real JDK and may
     // be invoked on the synthetic default-FS object.
@@ -1293,24 +1339,47 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let path_obj = ctx.get_field(this, 0);
-            // Compute the basic attrs (5-field: creation,access,mod,isDir,size),
-            // then re-home them into a DosFileAttributes instance.
+            let path = extract_path_string(ctx, Some(&path_obj));
             let bfa = p59_files_read_attributes(ctx, &[path_obj])?;
-            if let Some(Value::Object(Some(bfa_obj))) = bfa {
-                // Pin across the Dos alloc below — a moving young GC there
-                // would relocate the basic attrs (native stale-local family).
-                let bfa_pin = ctx.pin_native_root(bfa_obj);
-                let dos =
-                    alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributes", 5);
-                let bfa_obj = ctx.read_native_pin(bfa_pin, bfa_obj);
-                for i in 0..5 {
-                    let v = ctx.get_field(bfa_obj, i);
-                    ctx.set_field(dos, i, v);
-                }
-                ctx.unpin_native_roots(bfa_pin);
-                return Ok(Some(Value::Object(Some(dos))));
-            }
-            Ok(Some(Value::Object(None)))
+            let bfa_obj = match bfa {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            // Read through the ACCESSOR helpers rather than copying slots
+            // 0..4 verbatim: on a real-JDK boot `basic_file_attributes_alloc`
+            // hands back a genuine `sun.nio.fs.{Unix,Windows}FileAttributes`
+            // whose slots 0..4 are NOT (creation, access, modified, isDir,
+            // size), so the old raw copy filled every Dos slot with garbage
+            // — `isDirectory()` on a `DosFileAttributes` was answering from
+            // whatever happened to live in the real class's fourth field.
+            let creation = basic_file_attributes_time_millis(ctx, bfa_obj, "creation");
+            let access = basic_file_attributes_time_millis(ctx, bfa_obj, "access");
+            let modified = basic_file_attributes_time_millis(ctx, bfa_obj, "modified");
+            let is_dir = basic_file_attributes_is_dir(ctx, bfa_obj);
+            let size = basic_file_attributes_size(ctx, bfa_obj);
+            // Slot 5 (new) records the backing path so the DOS flag reads can
+            // query the real file instead of answering a hardcoded `false`.
+            let dos =
+                alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/DosFileAttributes", 6);
+            // Pin across each allocation below — a moving young GC there would
+            // relocate the fresh attributes (native stale-local family).
+            let dos_pin = ctx.pin_native_root(dos);
+            let ct = filetime_alloc(ctx, creation);
+            let dos_cur = ctx.read_native_pin(dos_pin, dos);
+            ctx.set_field(dos_cur, 0, Value::Object(Some(ct)));
+            let at = filetime_alloc(ctx, access);
+            let dos_cur = ctx.read_native_pin(dos_pin, dos);
+            ctx.set_field(dos_cur, 1, Value::Object(Some(at)));
+            let mt = filetime_alloc(ctx, modified);
+            let dos_cur = ctx.read_native_pin(dos_pin, dos);
+            ctx.set_field(dos_cur, 2, Value::Object(Some(mt)));
+            ctx.set_field(dos_cur, 3, Value::Int(i32::from(is_dir)));
+            ctx.set_field(dos_cur, 4, Value::Long(size));
+            let ps = ctx.create_string(&path);
+            let dos_cur = ctx.read_native_pin(dos_pin, dos);
+            ctx.set_field(dos_cur, 5, Value::Object(Some(ps)));
+            ctx.unpin_native_roots(dos_pin);
+            Ok(Some(Value::Object(Some(dos_cur))))
         },
     );
     r.register(
@@ -1356,13 +1425,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             },
         );
     }
-    for setter in ["setReadOnly", "setHidden", "setSystem", "setArchive"] {
-        r.register(
-            "java/nio/file/attribute/DosFileAttributeView",
-            setter,
-            "(Z)V",
-            |_ctx, _args| Ok(None),
-        );
+    //
+    // UPDATE (wave-2 stub removal): all four were no-ops, so Gradle's
+    // `setReadOnly(true)` on a cache dir reported success and left the
+    // directory writable — and a later `readAttributes().isReadOnly()` said
+    // so. `setReadOnly` now really chmods/clears the write bits; the three
+    // DOS-only flags are applied for real on Windows, and on a non-Windows
+    // host a request to SET one now fails loudly instead of pretending
+    // (clearing one is a no-op there, because it can never have been set).
+    {
+        let dos_view = "java/nio/file/attribute/DosFileAttributeView";
+        r.register(dos_view, "setReadOnly", "(Z)V", dos_view_set_read_only);
+        r.register(dos_view, "setHidden", "(Z)V", dos_view_set_hidden);
+        r.register(dos_view, "setSystem", "(Z)V", dos_view_set_system);
+        r.register(dos_view, "setArchive", "(Z)V", dos_view_set_archive);
     }
     // PosixFileAttributeView — completes the view returned by
     // `getFileAttributeView(path, PosixFileAttributeView.class)` above.
@@ -1426,17 +1502,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // this view is reachable. `Files.getOwner`/`setOwner` (registered
     // elsewhere in this file) already treat owner lookup as unsupported
     // (null/no-op); match that rather than inventing a UserPrincipal.
+    // `getOwner` KEEP-as-null is deliberate and matches the `Files.getOwner`
+    // native: this VM has no `UserPrincipalLookupService`, so there is no
+    // principal object to hand back, and inventing one would be worse than
+    // null (callers `equals`-compare principals).
     r.register(
         "java/nio/file/attribute/PosixFileAttributeView",
         "getOwner",
         "()Ljava/nio/file/attribute/UserPrincipal;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // `setOwner` was a silent no-op that reported success while leaving the
+    // file's owner untouched — the worst outcome for a caller doing a
+    // permissions handover. There is no portable `chown` behind this VM, so
+    // fail honestly instead.
     r.register(
         "java/nio/file/attribute/PosixFileAttributeView",
         "setOwner",
         "(Ljava/nio/file/attribute/UserPrincipal;)V",
-        |_ctx, _args| Ok(None),
+        |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "PosixFileAttributeView.setOwner is not supported".into(),
+            }
+            .into())
+        },
     );
     // DosFileAttributes — same 5-field layout as BasicFileAttributes
     // (creation=0, lastAccess=1, lastMod=2, isDir=3, size=4) plus the four
@@ -1479,28 +1568,65 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let is_dir = matches!(ctx.get_field(this, 3), Value::Int(1));
             Ok(Some(Value::Int(if is_dir { 0 } else { 1 })))
         });
-        r.register(dfa, "isSymbolicLink", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        // The five predicates below were hardcoded `false` — "no file this VM
+        // ever describes is a symlink, read-only, hidden, archived or a system
+        // file". `readAttributes` above now records the backing path in slot
+        // 5, so each one can answer from the real file. A caller that skipped
+        // a read-only file, or re-processed a hidden one, was being told the
+        // wrong thing on every single query.
+        r.register(dfa, "isSymbolicLink", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = dos_attrs_path(ctx, this);
+            let link = !p.is_empty() && std::path::Path::new(&p).is_symlink();
+            Ok(Some(Value::Int(i32::from(link))))
         });
+        // KEEP: "other" means neither regular file, directory, nor symlink
+        // (a device/socket/FIFO). Nothing in this VM's Path surface can name
+        // one, and reporting `true` would be a fabrication.
         r.register(dfa, "isOther", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
         r.register(dfa, "size", "()J", |ctx, args| {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 4)))
         });
+        // KEEP: `null` is the documented JDK answer when a file key is
+        // unavailable (the JDK's own Windows provider returns null on
+        // FAT-class volumes and network shares), and `FileTreeWalker.wouldLoop`
+        // — the only JDK consumer — handles it by skipping its identity check.
         r.register(dfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| {
             Ok(Some(Value::Object(None)))
         });
-        r.register(dfa, "isReadOnly", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        r.register(dfa, "isReadOnly", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = dos_attrs_path(ctx, this);
+            let ro = !p.is_empty()
+                && std::fs::metadata(&p)
+                    .map(|m| m.permissions().readonly())
+                    .unwrap_or(false);
+            Ok(Some(Value::Int(i32::from(ro))))
         });
-        r.register(dfa, "isHidden", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        r.register(dfa, "isHidden", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = dos_attrs_path(ctx, this);
+            Ok(Some(Value::Int(i32::from(dos_attr_flag(
+                &p,
+                DOS_ATTR_HIDDEN,
+            )))))
         });
-        r.register(dfa, "isArchive", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        r.register(dfa, "isArchive", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = dos_attrs_path(ctx, this);
+            Ok(Some(Value::Int(i32::from(dos_attr_flag(
+                &p,
+                DOS_ATTR_ARCHIVE,
+            )))))
         });
-        r.register(dfa, "isSystem", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        r.register(dfa, "isSystem", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = dos_attrs_path(ctx, this);
+            Ok(Some(Value::Int(i32::from(dos_attr_flag(
+                &p,
+                DOS_ATTR_SYSTEM,
+            )))))
         });
     }
 
@@ -1552,17 +1678,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let t = if cfg!(windows) { "NTFS" } else { "ext4" };
             Ok(Some(Value::Object(Some(ctx.create_string(t)))))
         });
+        // KEEP: the synthetic `FileStore` is only ever built for a real host
+        // path this VM already reads and writes (see `p57_alloc_file_store`),
+        // and there is no portable read-only-MOUNT query — a permissions probe
+        // on the mount root would answer "read-only" for any root-owned `/`.
         r.register(fs_store, "isReadOnly", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(0)))
         });
-        r.register(fs_store, "getTotalSpace", "()J", |_ctx, _args| {
-            Ok(Some(Value::Long(i64::MAX)))
+        // These three were `Long::MAX_VALUE` — "infinite disk". Any caller
+        // doing capacity planning (ES's disk-threshold allocation decider,
+        // Spring Boot's `DiskSpaceHealthIndicator`, an installer's free-space
+        // pre-check) got a fabricated answer and could never report a full
+        // disk. `file_disk_space_bytes` is the same real query the
+        // `java.io.File` disk-space natives already use; field 0 holds the
+        // store's mount root.
+        r.register(fs_store, "getTotalSpace", "()J", |ctx, args| {
+            Ok(Some(Value::Long(file_store_space(ctx, args, 0))))
         });
-        r.register(fs_store, "getUsableSpace", "()J", |_ctx, _args| {
-            Ok(Some(Value::Long(i64::MAX)))
+        r.register(fs_store, "getUsableSpace", "()J", |ctx, args| {
+            Ok(Some(Value::Long(file_store_space(ctx, args, 2))))
         });
-        r.register(fs_store, "getUnallocatedSpace", "()J", |_ctx, _args| {
-            Ok(Some(Value::Long(i64::MAX)))
+        r.register(fs_store, "getUnallocatedSpace", "()J", |ctx, args| {
+            Ok(Some(Value::Long(file_store_space(ctx, args, 1))))
         });
         // Real JDK's `FileStore.getBlockSize()` default body unconditionally
         // throws `UnsupportedOperationException` (only OS-specific subclasses
@@ -1571,18 +1708,44 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         r.register(fs_store, "getBlockSize", "()J", |_ctx, _args| {
             Ok(Some(Value::Long(4096)))
         });
+        // Both overloads used to answer `true` for EVERY view — including
+        // `acl` on Linux and `posix` on Windows, neither of which this VM can
+        // serve. A caller that pre-checks with `supportsFileAttributeView`
+        // and then calls `getFileAttributeView` therefore got a null view (or
+        // an `UnsupportedOperationException`) it had explicitly guarded
+        // against. Answer from the same per-platform list
+        // `FileSystem.supportedFileAttributeViews()` reports.
         r.register(
             fs_store,
             "supportsFileAttributeView",
             "(Ljava/lang/Class;)Z",
-            |_ctx, _args| Ok(Some(Value::Int(1))),
+            |ctx, args| {
+                let supported = obj_arg(args, 1)
+                    .ok()
+                    .and_then(|m| crate::lang_class::mirror_class_name(ctx, m))
+                    .as_deref()
+                    .and_then(attribute_view_short_name)
+                    .map(|n| supported_attribute_view_names().contains(&n))
+                    .unwrap_or(false);
+                Ok(Some(Value::Int(i32::from(supported))))
+            },
         );
         r.register(
             fs_store,
             "supportsFileAttributeView",
             "(Ljava/lang/String;)Z",
-            |_ctx, _args| Ok(Some(Value::Int(1))),
+            |ctx, args| {
+                let name = match args.get(1) {
+                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                    _ => return Ok(Some(Value::Int(0))),
+                };
+                let supported = supported_attribute_view_names().contains(&name.as_str());
+                Ok(Some(Value::Int(i32::from(supported))))
+            },
         );
+        // KEEP: `null` is the documented JDK answer for an unsupported
+        // `FileStoreAttributeView` type, and this VM implements none of them
+        // (the only standard one is the JDK-internal disk-space view).
         r.register(
             fs_store,
             "getFileStoreAttributeView",
@@ -1723,6 +1886,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
                 ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
                 return Ok(Some(Value::Object(Some(result))));
+            }
+            // `URI.getPath()` first -- the DECODED path component (see the
+            // matching note in the `Path.of(URI)` native above); the field
+            // probes below all yield the RAW, still percent-encoded form.
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[])
+            {
+                if let Some(decoded) = ctx.read_string(s) {
+                    if !decoded.is_empty() {
+                        let os_path = p57_to_os_path(&decoded);
+                        let result = p57_alloc_path(ctx, &os_path);
+                        return Ok(Some(Value::Object(Some(result))));
+                    }
+                }
             }
             // URI field 4 is the path component (from our toUri registration)
             let path_str = match ctx.get_field(uri, 4) {
@@ -5123,6 +5300,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(arr);
         cratonvm_native_collections::make_iterator_from_array(ctx, arr, len)
     });
+    // KEEP: `newDirectoryStream` above materializes the whole listing into a
+    // Java array up front, so this stream owns no OS directory handle and has
+    // nothing to release. (Contrast the `InflaterInputStream.close` case,
+    // which really did hold a wrapped stream open.)
     r.register(ds, "close", "()V", |_ctx, _args| Ok(None));
     r.register(
         ds,
@@ -6371,14 +6552,49 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             fs_cls,
             "setLastModifiedTime",
             "(Ljava/io/File;J)Z",
-            |_ctx, _args| {
-                // Stub — not critical for bootstrap
-                Ok(Some(Value::Int(1)))
+            |ctx, args| {
+                // Real-JDK `File.setLastModified(long)` bytecode delegates here.
+                // This used to be a stub that claimed success without touching
+                // the file, so any caller that reached the bytecode path (rather
+                // than the direct `java/io/File.setLastModified` native below)
+                // got `true` and an unchanged timestamp. Share the same helper
+                // so both entry points behave identically for files AND
+                // directories.
+                let file_ref = obj_arg(args, 1)?;
+                // Same `path`-field read as the sibling `getLastModifiedTime` /
+                // `getLength` / `delete0` handlers in this loop.
+                let path = match ctx.get_field(file_ref, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let millis = match args.get(2) {
+                    Some(Value::Long(v)) => *v,
+                    _ => 0,
+                };
+                Ok(Some(Value::Int(if set_file_mtime_millis(&path, millis) {
+                    1
+                } else {
+                    0
+                })))
             },
         );
 
-        r.register(fs_cls, "setReadOnly", "(Ljava/io/File;)Z", |_ctx, _args| {
-            Ok(Some(Value::Int(1)))
+        // Was a hardcoded `true`: `File.setReadOnly()`'s real bytecode
+        // delegates here, so a caller was told the file had been made
+        // read-only while its permissions were untouched — and a follow-up
+        // `canWrite()` (which IS a real permission query) then contradicted
+        // it. Same body as the direct `java/io/File.setReadOnly()` native.
+        r.register(fs_cls, "setReadOnly", "(Ljava/io/File;)Z", |ctx, args| {
+            let file_ref = obj_arg(args, 1)?;
+            let path = file_read_path(ctx, file_ref);
+            let ok = std::fs::metadata(&path)
+                .and_then(|meta| {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(true);
+                    std::fs::set_permissions(&path, perms)
+                })
+                .is_ok();
+            Ok(Some(Value::Int(if ok { 1 } else { 0 })))
         });
 
         // real-JDK `File.getTotalSpace()`/`getFreeSpace()`/`getUsableSpace()`
@@ -7394,18 +7610,27 @@ pub(crate) fn jrtfs_decode(p: &str) -> Option<(String, String)> {
 /// multi-MB) pathologically slow. Classpath/mounted jars are read-only for the
 /// VM lifetime, so memoise the bytes (re-parsing the in-memory zip is cheap
 /// relative to re-reading multi-MB files from disk hundreds of times).
+///
+/// Keyed on (path, [`crate::net_phase_e::archive_stamp`]) rather than the path
+/// alone: an application server replaces a war/jar in place and redeploys, so a
+/// path-only key serves the OLD archive forever (see `archive_stamp`'s doc for
+/// the Tomcat `TestHostConfigAutomaticDeployment*` failure this caused).
 pub(crate) fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<u8>>>>>> =
-        OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<(String, u64, u64), Option<Arc<Vec<u8>>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
+    let key = (jar.to_string(), mtime, len);
     if let Some(cached) = cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(jar)
+        .get(&key)
         .cloned()
     {
-        return cached.clone();
+        return cached;
     }
     // A mounted nested archive uses a jarfs-encoded parent entry as its
     // container. Resolve that entry through the parent archive instead of
@@ -7418,10 +7643,9 @@ pub(crate) fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     // Resolving a nested container recursively calls this function for its
     // parent JAR. Do that work outside the cache mutex; holding it here would
     // self-deadlock on every `jar:nested:` filesystem mount.
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(jar.to_string(), bytes.clone());
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|(p, _, _), _| p != jar);
+    guard.insert(key, bytes.clone());
     bytes
 }
 
@@ -7444,15 +7668,22 @@ pub(crate) struct JarFsIndex {
     children: std::collections::HashMap<String, Vec<(String, bool)>>,
 }
 
+/// Keyed on (path, [`crate::net_phase_e::archive_stamp`]) — see
+/// `jar_bytes_cached` for why a path-only key is wrong for a redeployable
+/// archive.
 pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<JarFsIndex>>>>> =
-        OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<(String, u64, u64), Option<Arc<JarFsIndex>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
+    let key = (jar.to_string(), mtime, len);
     if let Some(cached) = cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(jar)
+        .get(&key)
         .cloned()
     {
         return cached;
@@ -7514,10 +7745,9 @@ pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
     // Building an index for a nested archive first reads the archive entry
     // from its parent, which in turn indexes that parent.  Do not retain this
     // cache lock across that recursive work.
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(jar.to_string(), built.clone());
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|(p, _, _), _| p != jar);
+    guard.insert(key, built.clone());
     built
 }
 
@@ -8574,6 +8804,310 @@ pub(crate) fn p57_alloc_jrt_filesystem(ctx: &mut dyn NativeContext, java_home: &
     fs
 }
 
+// ---------------------------------------------------------------------------
+// File.deleteOnExit
+// ---------------------------------------------------------------------------
+
+/// Paths registered via `File.deleteOnExit()`, deleted in reverse
+/// registration order when the process exits (the JDK's `DeleteOnExitHook`
+/// order).
+static DELETE_ON_EXIT: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+static DELETE_ON_EXIT_HOOK_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn delete_on_exit_run() {
+    let Some(lock) = DELETE_ON_EXIT.get() else {
+        return;
+    };
+    let paths = match lock.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(e) => std::mem::take(&mut *e.into_inner()),
+    };
+    // Reverse order so a directory registered before its contents is removed
+    // last, exactly as `DeleteOnExitHook` does.
+    for p in paths.iter().rev() {
+        // Best effort, like the JDK: a failure to delete is not reported.
+        if std::fs::remove_file(p).is_err() {
+            let _ = std::fs::remove_dir(p);
+        }
+    }
+}
+
+pub(crate) fn delete_on_exit_register(path: String) {
+    let lock = DELETE_ON_EXIT.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    {
+        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if g.iter().any(|p| p == &path) {
+            return;
+        }
+        g.push(path);
+    }
+    if !DELETE_ON_EXIT_HOOK_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // `libc::atexit` (rather than a local `extern "C"` declaration) so the
+        // workspace-wide `clashing_extern_declarations = deny` lint has a
+        // single source of truth for the symbol. Available on every target
+        // this VM builds for, Windows UCRT included.
+        unsafe {
+            libc::atexit(delete_on_exit_run);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DosFileAttributeView setters / DosFileAttributes flag reads
+// ---------------------------------------------------------------------------
+
+/// Windows `FILE_ATTRIBUTE_*` bits used by the DOS view/attribute natives.
+pub(crate) const DOS_ATTR_HIDDEN: u32 = 0x0000_0002;
+pub(crate) const DOS_ATTR_SYSTEM: u32 = 0x0000_0004;
+pub(crate) const DOS_ATTR_ARCHIVE: u32 = 0x0000_0020;
+
+/// Path behind a synthetic `*FileAttributeView` (slot 0 holds the `Path`).
+fn attr_view_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let v = ctx.get_field(this, 0);
+    extract_path_string(ctx, Some(&v))
+}
+
+fn attr_view_flag_arg(args: &[Value]) -> bool {
+    args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0
+}
+
+pub(crate) fn dos_view_set_read_only(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let on = attr_view_flag_arg(args);
+    let path = attr_view_path(ctx, this);
+    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
+    let mut perms = meta.permissions();
+    perms.set_readonly(on);
+    std::fs::set_permissions(&path, perms).map_err(|e| p57_io_error(&e))?;
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], flag: u32) -> MethodCallResult {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    extern "system" {
+        fn SetFileAttributesW(lp_file_name: *const u16, dw_file_attributes: u32) -> i32;
+    }
+    let this = obj_arg(args, 0)?;
+    let on = attr_view_flag_arg(args);
+    let path = attr_view_path(ctx, this);
+    let meta = std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
+    let mut attrs = meta.file_attributes();
+    if on {
+        attrs |= flag;
+    } else {
+        attrs &= !flag;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(&path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attrs) } == 0 {
+        return Err(RuntimeError::IOException {
+            message: format!("SetFileAttributes failed for {path}"),
+        }
+        .into());
+    }
+    Ok(None)
+}
+
+#[cfg(not(windows))]
+fn dos_view_set_flag(ctx: &mut dyn NativeContext, args: &[Value], _flag: u32) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let on = attr_view_flag_arg(args);
+    let path = attr_view_path(ctx, this);
+    // Validate the file the way the real view does, whichever branch we take.
+    std::fs::metadata(&path).map_err(|e| p57_io_error(&e))?;
+    if !on {
+        // Clearing a flag that can never be set here is trivially satisfied.
+        return Ok(None);
+    }
+    Err(RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "DOS hidden/system/archive attributes are not settable on this platform: {path}"
+        ),
+    }
+    .into())
+}
+
+pub(crate) fn dos_view_set_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    dos_view_set_flag(ctx, args, DOS_ATTR_HIDDEN)
+}
+
+pub(crate) fn dos_view_set_system(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    dos_view_set_flag(ctx, args, DOS_ATTR_SYSTEM)
+}
+
+pub(crate) fn dos_view_set_archive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    dos_view_set_flag(ctx, args, DOS_ATTR_ARCHIVE)
+}
+
+/// Backing path recorded in slot 5 of a synthetic `DosFileAttributes` (see
+/// `DosFileAttributeView.readAttributes`). Empty when the object predates the
+/// 6-slot layout, in which case every flag read below answers `false` — the
+/// old hardcoded result.
+fn dos_attrs_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    if ctx.object_num_fields(this) <= 5 {
+        return String::new();
+    }
+    match ctx.get_field(this, 5) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+#[cfg(windows)]
+fn dos_attr_flag(path: &str, flag: u32) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    std::fs::metadata(path)
+        .map(|m| m.file_attributes() & flag != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn dos_attr_flag(path: &str, flag: u32) -> bool {
+    // Unix has no system/archive concept; "hidden" is the dot-file convention
+    // (the same rule `java.io.File.isHidden()` uses in this VM).
+    if flag == DOS_ATTR_HIDDEN {
+        return std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with('.'))
+            .unwrap_or(false);
+    }
+    false
+}
+
+/// Shared body for the three `java/nio/file/FileStore` space accessors.
+/// `which` is `0` = total, `1` = unallocated (free), `2` = usable.
+/// Field 0 of the synthetic store holds its mount root.
+pub(crate) fn file_store_space(ctx: &mut dyn NativeContext, args: &[Value], which: u8) -> i64 {
+    let path = match args.first() {
+        Some(Value::Object(Some(this))) => match ctx.get_field(*this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| match which {
+        0 => total as i64,
+        1 => free as i64,
+        _ => usable as i64,
+    })
+}
+
+/// True when a `CopyOption[]` varargs argument contains `REPLACE_EXISTING`.
+/// Same `toString()` probe the `Files.move` native uses.
+pub(crate) fn copy_options_replace_existing(
+    ctx: &mut dyn NativeContext,
+    opts: Option<&Value>,
+) -> bool {
+    let arr = match opts {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return false,
+    };
+    // Pin: the `toString()` probe re-enters Java and a moving young GC there
+    // would relocate the option array (native stale-local family).
+    let pin = ctx.pin_native_root(arr);
+    let len = ctx.array_length(arr);
+    let mut found = false;
+    for i in 0..len {
+        let arr_cur = ctx.read_native_pin(pin, arr);
+        if let Value::Object(Some(opt)) = ctx.get_array_element(arr_cur, i) {
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
+            {
+                if ctx
+                    .read_string(s)
+                    .unwrap_or_default()
+                    .contains("REPLACE_EXISTING")
+                {
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    ctx.unpin_native_roots(pin);
+    found
+}
+
+/// Build a REAL `java/nio/file/FileAlreadyExistsException` (same approach as
+/// the `Files.move` native): the exception is caught by real library bytecode
+/// and its `getFile()` may be read by real `Throwable` formatting, so it needs
+/// genuine field layout rather than a guessed synthetic one.
+pub(crate) fn p57_file_already_exists(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> cratonvm_types::error::MethodCallFailed {
+    if let Ok(Some(Value::Object(Some(exc)))) =
+        ctx.new_object("java/nio/file/FileAlreadyExistsException")
+    {
+        let exc_pin = ctx.pin_native_root(exc);
+        let file_str = ctx.create_string(path);
+        let exc_cur = ctx.read_native_pin(exc_pin, exc);
+        let _ = ctx.invoke(
+            "java/nio/file/FileAlreadyExistsException",
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(exc_cur)), Value::Object(Some(file_str))],
+        );
+        let exc_cur = ctx.read_native_pin(exc_pin, exc);
+        ctx.unpin_native_roots(exc_pin);
+        return MethodCallFailed::ExceptionThrown(exc_cur);
+    }
+    RuntimeError::IOException {
+        message: format!("FileAlreadyExistsException: {path}"),
+    }
+    .into()
+}
+
+/// The attribute-view names this VM's default `FileSystem` actually supports,
+/// per platform. Single source of truth shared by
+/// `FileSystem.supportedFileAttributeViews()` and
+/// `FileStore.supportsFileAttributeView(...)`, which previously disagreed —
+/// the latter answered `true` for every view name ever asked about.
+pub(crate) fn supported_attribute_view_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["basic", "dos", "acl", "owner", "user"]
+    } else {
+        &["owner", "dos", "basic", "posix", "user", "unix"]
+    }
+}
+
+/// Map a `FileAttributeView` subinterface name (binary or internal form) to
+/// the short view name `supportedFileAttributeViews()` reports.
+pub(crate) fn attribute_view_short_name(class_name: &str) -> Option<&'static str> {
+    let simple = class_name
+        .rsplit(['/', '.', '$'])
+        .next()
+        .unwrap_or(class_name);
+    // `FileOwnerAttributeView` breaks the `<Kind>FileAttributeView` pattern.
+    if simple == "FileOwnerAttributeView" {
+        return Some("owner");
+    }
+    let base = simple.strip_suffix("FileAttributeView")?;
+    Some(match base {
+        "Basic" => "basic",
+        "Dos" => "dos",
+        "Posix" => "posix",
+        "Acl" => "acl",
+        "Owner" => "owner",
+        "User" | "UserDefined" => "user",
+        "Unix" => "unix",
+        _ => return None,
+    })
+}
+
 /// Allocate a synthetic `java/nio/file/FileStore` for `path`. Field 0 holds
 /// the store's `name()` — the drive root on Windows (`C:\`), or `/` on
 /// Unix — since real JDK FileStore names are the mount point, not the
@@ -9516,6 +10050,30 @@ pub(crate) fn encode_file_uri_path(path: &str) -> String {
     out
 }
 
+/// Set a path's last-modified time, in milliseconds since the epoch, the way
+/// `java.io.File.setLastModified(long)` must: it has to work for
+/// **directories** as well as regular files, and report failure (`false`) when
+/// the path does not exist.
+///
+/// The obvious `OpenOptions::new().write(true).open(path)` + `File::set_modified`
+/// spelling silently gets this wrong for directories on every platform — on
+/// Windows `CreateFileW` refuses a directory handle without
+/// `FILE_FLAG_BACKUP_SEMANTICS`, and on Unix `open(2)` with `O_WRONLY` returns
+/// `EISDIR` — so it returned `false` for every directory. Tomcat's
+/// `TestHostConfigAutomaticDeploymentUpdateWarOffline` calls
+/// `dir.setLastModified(...)` on the expanded webapp directory to age it and
+/// asserts the return value, so it failed all four of its tests on CratonVM
+/// while passing on HotSpot. `filetime::set_file_mtime` opens with the right
+/// flags on both platforms.
+pub(crate) fn set_file_mtime_millis(path: &str, millis: i64) -> bool {
+    // Split into whole seconds + non-negative nanosecond remainder, which is
+    // what `FileTime::from_unix_time` expects (its nanos argument must be in
+    // `0..1_000_000_000` even for pre-epoch timestamps).
+    let secs = millis.div_euclid(1000);
+    let nanos = (millis.rem_euclid(1000) * 1_000_000) as u32;
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, nanos)).is_ok()
+}
+
 pub(crate) fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     // Prefer the real-JDK `getPath()` implementation when Available (correct
     // `prefixLength` + internal path for `java.io.File` loaded from modules).
@@ -9580,7 +10138,49 @@ pub(crate) fn file_normalise_path(path: &str) -> String {
 
 #[cfg(not(windows))]
 pub(crate) fn file_normalise_path(path: &str) -> String {
-    path.to_string()
+    // `UnixFileSystem.normalize`: collapse runs of `/` and drop a single
+    // trailing `/` (but keep the root `/` itself). `File.<init>` stores the
+    // NORMALIZED string, so `getPath()`/`getAbsolutePath()` observe it.
+    //
+    // Leaving it un-normalized let a trailing separator survive into
+    // `getAbsolutePath()`, and Spring's
+    // `PathMatchingResourcePatternResolver.retrieveMatchingFiles` builds its
+    // glob as `rootDir.getAbsolutePath() + "/" + subPattern` — a root
+    // directory that already ended in `/` produced `.../scanned//*.txt`, which
+    // matches nothing (`core.io.support.PathMatchingResourcePatternResolverTests
+    // .encodedHashtagInPath` found zero files). The root came straight from
+    // `new File(uri.getSchemeSpecificPart())`, whose value legitimately ends
+    // in `/` for a directory URL.
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        let is_slash = ch == '/';
+        if !(is_slash && prev_slash) {
+            out.push(ch);
+        }
+        prev_slash = is_slash;
+    }
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+#[cfg(test)]
+mod file_normalise_tests {
+    use super::file_normalise_path;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_normalise_matches_unixfilesystem() {
+        assert_eq!(file_normalise_path("/tmp/x/scanned/"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/tmp/x//scanned"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/tmp/x///scanned//"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/"), "/");
+        assert_eq!(file_normalise_path("//"), "/");
+        assert_eq!(file_normalise_path("relative/dir/"), "relative/dir");
+        assert_eq!(file_normalise_path(""), "");
+    }
 }
 
 /// Resolve `new File(parent, child)` the way the JDK's
@@ -10545,17 +11145,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        // Use std::fs::File + set_modified (Rust 1.75+)
-        let ok = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .and_then(|f| {
-                let time =
-                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis.max(0) as u64);
-                f.set_modified(time)
-            })
-            .is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        Ok(Some(Value::Int(if set_file_mtime_millis(&path, millis) {
+            1
+        } else {
+            0
+        })))
     });
     r.register(file, "setReadable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -11086,14 +11680,27 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(file_alloc(ctx, &full)))))
         },
     );
-    r.register(file, "deleteOnExit", "()V", |_ctx, _args| {
-        // Best effort: no actual tracking; caller should delete manually
+    // Was a documented "no actual tracking" no-op: the file was never deleted
+    // and nothing told the caller so. Anything relying on it for cleanup (temp
+    // files from `File.createTempFile(...).deleteOnExit()`, unpacked native
+    // libraries, scratch DB files) leaked on every run. Record the path and
+    // delete it from a C-runtime `atexit` handler, which is what
+    // `DeleteOnExitHook` does from the JDK's shutdown hook. Deletion is
+    // reverse-registration order, matching the JDK.
+    r.register(file, "deleteOnExit", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = file_read_path(ctx, this);
+        if !path.is_empty() {
+            delete_on_exit_register(path);
+        }
         Ok(None)
     });
     r.register(file, "separator", "Ljava/lang/String;", |ctx, _args| {
         let s = ctx.create_string(std::path::MAIN_SEPARATOR_STR);
         Ok(Some(Value::Object(Some(s))))
     });
+    // KEEP: `File.separatorChar` is a compile-time platform constant in the
+    // real JDK too; `MAIN_SEPARATOR` is the genuine host value, not a stand-in.
     r.register(file, "separatorChar", "C", |_ctx, _args| {
         Ok(Some(Value::Int(std::path::MAIN_SEPARATOR as i32)))
     });
@@ -11688,15 +12295,28 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
                 ctx, this,
             )))))
         });
+        // Was `!isDirectory()`, which called a symlink read under
+        // NOFOLLOW_LINKS a regular file. Check the real type bits instead.
         r.register(attrs_class, "isRegularFile", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(Value::Int(i32::from(!basic_file_attributes_is_dir(
-                ctx, this,
-            )))))
+            Ok(Some(Value::Int(i32::from(
+                basic_file_attributes_is_regular(ctx, this),
+            ))))
         });
-        r.register(attrs_class, "isSymbolicLink", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        // Was a hardcoded `false`, so `Files.readAttributes(p, …,
+        // NOFOLLOW_LINKS).isSymbolicLink()` could never be true no matter what
+        // was on disk — a caller walking a tree had no way to spot a link and
+        // would follow it. Read the same `st_mode`/`fileAttrs` bits the other
+        // predicates use; `p59_files_read_attributes` now populates them.
+        r.register(attrs_class, "isSymbolicLink", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Int(i32::from(
+                basic_file_attributes_is_symlink(ctx, this),
+            ))))
         });
+        // KEEP: "other" is a device/socket/FIFO — nothing this VM's Path
+        // surface can name, so `false` is the honest answer rather than a
+        // placeholder.
         r.register(attrs_class, "isOther", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(0)))
         });
@@ -12030,6 +12650,32 @@ pub(crate) fn basic_file_attributes_is_dir(ctx: &dyn NativeContext, attrs: Objec
     matches!(ctx.get_field_by_name(attrs, "st_mode"), Value::Int(v) if v & 0o170000 == 0o040000)
 }
 
+/// `st_mode` type bits (`S_IFMT` / `S_IFLNK` / `S_IFREG`) and the Windows
+/// `FILE_ATTRIBUTE_REPARSE_POINT` bit, used by the type predicates below.
+pub(crate) const UNIX_S_IFMT: i32 = 0o170000;
+pub(crate) const UNIX_S_IFLNK: i32 = 0o120000;
+pub(crate) const UNIX_S_IFREG: i32 = 0o100000;
+pub(crate) const WIN_ATTR_DIRECTORY: i32 = 0x10;
+pub(crate) const WIN_ATTR_REPARSE_POINT: i32 = 0x400;
+
+pub(crate) fn basic_file_attributes_is_symlink(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
+            Value::Int(v) if v & WIN_ATTR_REPARSE_POINT != 0);
+    }
+    matches!(ctx.get_field_by_name(attrs, "st_mode"),
+        Value::Int(v) if v & UNIX_S_IFMT == UNIX_S_IFLNK)
+}
+
+pub(crate) fn basic_file_attributes_is_regular(ctx: &dyn NativeContext, attrs: ObjectRef) -> bool {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        return matches!(ctx.get_field_by_name(attrs, "fileAttrs"),
+            Value::Int(v) if v & (WIN_ATTR_DIRECTORY | WIN_ATTR_REPARSE_POINT) == 0);
+    }
+    matches!(ctx.get_field_by_name(attrs, "st_mode"),
+        Value::Int(v) if v & UNIX_S_IFMT == UNIX_S_IFREG)
+}
+
 pub(crate) fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         "size"
@@ -12182,12 +12828,19 @@ pub(crate) fn p59_files_read_attributes(
         return Ok(Some(Value::Object(Some(bfa))));
     }
 
-    // Check if NOFOLLOW_LINKS is specified (would use symlink_metadata)
+    // NOFOLLOW_LINKS. `java.nio.file.LinkOption` is a single-constant enum, so
+    // a non-empty `LinkOption[]` unambiguously means NOFOLLOW_LINKS — no
+    // re-entrant `toString()` probe needed. This used to be an unimplemented
+    // comment: every read followed links, so `isSymbolicLink()` could never be
+    // true and a link's own size/timestamps were never visible.
+    let nofollow = matches!(args.get(1), Some(Value::Object(Some(a))) if ctx.array_length(*a) > 0);
     let meta_result = if path_str.is_empty() {
         Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "empty path",
         ))
+    } else if nofollow {
+        std::fs::symlink_metadata(&path_str)
     } else {
         std::fs::metadata(&path_str)
     };
@@ -12219,6 +12872,33 @@ pub(crate) fn p59_files_read_attributes(
                 mod_millis,
                 perm_bits,
             );
+            // Record link-ness so `isSymbolicLink()` can stop answering a
+            // hardcoded `false`. Only reachable under NOFOLLOW_LINKS, since a
+            // following read resolves the target (and the real JDK likewise
+            // reports `isSymbolicLink() == false` there).
+            if meta.file_type().is_symlink() {
+                if basic_file_attributes_is_windows(ctx, bfa) {
+                    let cur = match ctx.get_field_by_name(bfa, "fileAttrs") {
+                        Value::Int(v) => v,
+                        _ => 0,
+                    };
+                    ctx.set_field_by_name(
+                        bfa,
+                        "fileAttrs",
+                        Value::Int(cur | WIN_ATTR_REPARSE_POINT),
+                    );
+                } else {
+                    let cur = match ctx.get_field_by_name(bfa, "st_mode") {
+                        Value::Int(v) => v,
+                        _ => 0,
+                    };
+                    ctx.set_field_by_name(
+                        bfa,
+                        "st_mode",
+                        Value::Int((cur & !UNIX_S_IFMT) | UNIX_S_IFLNK),
+                    );
+                }
+            }
             // `UnixFileAttributes.owner()`/`group()` (real JDK bytecode) read
             // these two fields and hand them to `UnixUserPrincipals.fromUid/
             // fromGid`. They were never populated, so every file reported
@@ -12633,11 +13313,24 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         let flags = ctx.get_field(this, 4).as_int().unwrap_or(0);
         Ok(Some(Value::Int(if flags & 4 != 0 { 1 } else { 0 })))
     });
+    // KEEP: IFF_POINTOPOINT has no portable query, and this VM's interface
+    // enumeration (see `getNetworkInterfaces` above) only ever synthesizes
+    // loopback/broadcast interfaces from bound addresses — it cannot produce a
+    // PPP/tun device, so `false` is the honest answer for every object that
+    // can reach this native.
     r.register(ni, "isPointToPoint", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
-    r.register(ni, "isVirtual", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // Was a hardcoded `false`. The JDK defines a "virtual" interface as a
+    // sub-interface, which is exactly the `eth0:1` naming convention — read it
+    // off the name (slot 0) rather than asserting none exist.
+    r.register(ni, "isVirtual", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        Ok(Some(Value::Int(i32::from(name.contains(':')))))
     });
     r.register(ni, "getHardwareAddress", "()[B", |ctx, _args| {
         // Return a dummy MAC address (00:00:00:00:00:00) — real MAC requires platform APIs
@@ -12663,6 +13356,9 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(enum_obj))))
         },
     );
+    // KEEP: `null` is the documented JDK answer for an interface that is not
+    // a sub-interface, and `getSubInterfaces()` above never yields any, so no
+    // object reaching this native can have a parent.
     r.register(
         ni,
         "getParent",
@@ -13465,7 +14161,16 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
         ctx.set_field(list, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(list))))
     });
-    r.register(wk, "reset", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    // Was a hardcoded `true`. The JDK contract is "false if the key is no
+    // longer valid" — a watch loop is written as
+    // `if (!key.reset()) break;`, so an always-true answer turned a cancelled
+    // key into an endless spin over a directory nobody is watching any more.
+    // Slot 0 is the validity flag `cancel()` clears.
+    r.register(wk, "reset", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let valid = matches!(ctx.get_field(this, 0), Value::Int(1));
+        Ok(Some(Value::Int(i32::from(valid))))
+    });
     r.register(wk, "cancel", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, 0, Value::Int(0));
@@ -14255,17 +14960,92 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    // Both `Files.copy` stream overloads returned 0 without moving a single
+    // byte. The caller was told "copied 0 bytes" — a legal-looking answer for
+    // an empty source — so an unpacked resource, a saved upload, or a streamed
+    // download silently produced nothing, and no exception ever surfaced. They
+    // now perform the copy and report the real byte count.
     r.register(
         f,
         "copy",
         "(Ljava/io/InputStream;Ljava/nio/file/Path;[Ljava/nio/file/CopyOption;)J",
-        |_ctx, _args| Ok(Some(Value::Long(0))),
+        |ctx, args| {
+            let src = match args.first() {
+                Some(Value::Object(Some(s))) => *s,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Files.copy: source stream is null".into()),
+                    }
+                    .into())
+                }
+            };
+            let target = obj_arg(args, 1)?;
+            let replace = copy_options_replace_existing(ctx, args.get(2));
+            // Pin `target` across the drain and the option probe: both re-enter
+            // Java and a moving young GC there would relocate it (native
+            // stale-local family).
+            let target_pin = ctx.pin_native_root(target);
+            let bytes = zip_streams::drain_input_stream_bulk(ctx, src);
+            let target = ctx.read_native_pin(target_pin, target);
+            let p = p57_read_path(ctx, target);
+            ctx.unpin_native_roots(target_pin);
+            // NIO contract: without REPLACE_EXISTING an existing target is a
+            // FileAlreadyExistsException, not an overwrite.
+            if !replace && std::fs::symlink_metadata(&p).is_ok() {
+                return Err(p57_file_already_exists(ctx, &p));
+            }
+            match std::fs::write(&p, &bytes) {
+                Ok(()) => Ok(Some(Value::Long(bytes.len() as i64))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(p57_no_such_file(ctx, &p))
+                }
+                Err(e) => Err(p57_io_error(&e)),
+            }
+        },
     );
     r.register(
         f,
         "copy",
         "(Ljava/nio/file/Path;Ljava/io/OutputStream;)J",
-        |_ctx, _args| Ok(Some(Value::Long(0))),
+        |ctx, args| {
+            let src = obj_arg(args, 0)?;
+            let out = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Files.copy: target stream is null".into()),
+                    }
+                    .into())
+                }
+            };
+            let p = p57_read_path(ctx, src);
+            let bytes = match std::fs::read(&p) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(p57_no_such_file(ctx, &p))
+                }
+                Err(e) => return Err(p57_io_error(&e)),
+            };
+            // Pin the sink across the array alloc, then hand the whole payload
+            // over in ONE bulk `write([BII)` rather than a per-byte loop.
+            let out_pin = ctx.pin_native_root(out);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            ctx.write_byte_array_from(arr, 0, &bytes);
+            let out = ctx.read_native_pin(out_pin, out);
+            let res = ctx.invoke_virtual(
+                out,
+                "write",
+                "([BII)V",
+                &[
+                    Value::Object(Some(arr)),
+                    Value::Int(0),
+                    Value::Int(bytes.len() as i32),
+                ],
+            );
+            ctx.unpin_native_roots(out_pin);
+            res?;
+            Ok(Some(Value::Long(bytes.len() as i64)))
+        },
     );
     r.register(
         f,
@@ -14285,12 +15065,28 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(map))))
         },
     );
+    // Was null. `Files.getFileStore` never returns null in the real JDK, so
+    // every caller dereferences the result unconditionally (ES's `ESFileStore`
+    // wrapper does) — a guaranteed NPE. Hand back the same synthetic
+    // `FileStore` the `FileSystemProvider.getFileStore` native above builds.
     r.register(
         f,
         "getFileStore",
         "(Ljava/nio/file/Path;)Ljava/nio/file/FileStore;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let path_obj = obj_arg(args, 0)?;
+            let p = p57_read_path(ctx, path_obj);
+            // NIO contract: the path must exist.
+            if std::fs::symlink_metadata(&p).is_err() {
+                return Err(p57_no_such_file(ctx, &p));
+            }
+            Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)))))
+        },
     );
+    // KEEP: same reasoning as `PosixFileAttributeView.getOwner` — this VM has
+    // no `UserPrincipalLookupService`, so there is no principal object to
+    // return, and synthesizing one would break the `equals` comparisons every
+    // caller performs on the result.
     r.register(
         f,
         "getOwner",

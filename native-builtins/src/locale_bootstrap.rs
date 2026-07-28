@@ -569,6 +569,16 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // Neutralise the "should not come down here" fallback by returning null.
     // Most callers handle a null provider gracefully (fall back to defaults
     // or other adapters); an `InternalError` aborts the whole chain.
+    //
+    // Wave-2 re-check: this is a KEEP, and not for convenience. The real
+    // `JRELocaleProviderAdapter.getLocaleServiceProvider` body is a
+    // `switch` over the known SPI classes ending in `throw new
+    // InternalError("should not come down here")`, so there is no "correct"
+    // non-null value to synthesise for a provider class this VM does not
+    // implement — the honest choices are null or that InternalError, and the
+    // JDK's own callers (`LocaleServiceProviderPool.findAdapter`) are written
+    // to skip a null adapter and try the next one. Registered only on the
+    // synthetic path.
     registry.register(
         "sun/util/locale/provider/JRELocaleProviderAdapter",
         "getLocaleServiceProvider",

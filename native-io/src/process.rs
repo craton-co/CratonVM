@@ -1962,6 +1962,205 @@ fn native_process_get_output_stream(
 }
 
 // ---------------------------------------------------------------------------
+// ProcessHandleImpl OS introspection
+//
+// Linux exposes everything these three natives need through `/proc`. Other
+// hosts have no portable equivalent, so they answer the JDK's documented
+// "unknown" values (-1 / no entries / untouched fields) rather than
+// fabricating data.
+// ---------------------------------------------------------------------------
+
+/// Parent pid of `pid`, or `-1` when unknown. `/proc/<pid>/status` is used
+/// rather than `/proc/<pid>/stat` because the latter embeds the (unescaped,
+/// possibly space- and paren-containing) executable name in field 2.
+#[cfg(target_os = "linux")]
+fn os_parent_pid(pid: i64) -> i64 {
+    if pid <= 0 {
+        return -1;
+    }
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return -1;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            if let Ok(v) = rest.trim().parse::<i64>() {
+                return if v > 0 { v } else { -1 };
+            }
+        }
+    }
+    -1
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_parent_pid(_pid: i64) -> i64 {
+    -1
+}
+
+/// `(pid, ppid)` for every visible process when `of_pid == 0`, or for the
+/// direct children of `of_pid` otherwise — the two modes the JDK's
+/// `getProcessPids0` contract defines.
+#[cfg(target_os = "linux")]
+fn os_list_processes(of_pid: i64) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(pid) = name.parse::<i64>() else {
+            continue;
+        };
+        let ppid = os_parent_pid(pid);
+        if of_pid == 0 || ppid == of_pid {
+            out.push((pid, ppid.max(0)));
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_list_processes(_of_pid: i64) -> Vec<(i64, i64)> {
+    Vec::new()
+}
+
+/// `(command, arguments)` from `/proc/<pid>/cmdline` (NUL-separated).
+#[cfg(target_os = "linux")]
+fn os_process_cmdline(pid: i64) -> Option<(String, Vec<String>)> {
+    if pid <= 0 {
+        return None;
+    }
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let mut parts: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let command = parts.remove(0);
+    Some((command, parts))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_process_cmdline(_pid: i64) -> Option<(String, Vec<String>)> {
+    None
+}
+
+/// `java.lang.ProcessHandleImpl.parent0(long pid, long startTime) -> long`
+fn native_proc_handle_parent0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let pid = match args.first() {
+        Some(Value::Long(p)) => *p,
+        _ => return Ok(Some(Value::Long(-1))),
+    };
+    // pid 0 is this VM's own `ProcessHandle.current()` sentinel in some call
+    // paths; resolve it to the real process id first.
+    let pid = if pid == 0 {
+        std::process::id() as i64
+    } else {
+        pid
+    };
+    Ok(Some(Value::Long(os_parent_pid(pid))))
+}
+
+/// `java.lang.ProcessHandleImpl.getProcessPids0(long, long[], long[], long[]) -> int`
+///
+/// Returns the number of processes found. The JDK caller grows its arrays and
+/// retries whenever the count exceeds their length, so filling only as far as
+/// each array reaches (and still reporting the true total) is the contract.
+fn native_proc_handle_get_process_pids0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let of_pid = match args.first() {
+        Some(Value::Long(p)) => *p,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let found = os_list_processes(of_pid);
+    let arr_of = |idx: usize| -> Option<ObjectRef> {
+        match args.get(idx) {
+            Some(Value::Object(Some(a))) => Some(*a),
+            _ => None,
+        }
+    };
+    let pids = arr_of(1);
+    let ppids = arr_of(2);
+    let starts = arr_of(3);
+    // `set_array_element` cannot allocate, so none of these refs can move
+    // underneath the loop.
+    for (i, (pid, ppid)) in found.iter().enumerate() {
+        if let Some(a) = pids {
+            if i < ctx.array_length(a) {
+                ctx.set_array_element(a, i, Value::Long(*pid));
+            }
+        }
+        if let Some(a) = ppids {
+            if i < ctx.array_length(a) {
+                ctx.set_array_element(a, i, Value::Long(*ppid));
+            }
+        }
+        if let Some(a) = starts {
+            if i < ctx.array_length(a) {
+                // 0 = "start time unknown", the JDK's own sentinel.
+                ctx.set_array_element(a, i, Value::Long(0));
+            }
+        }
+    }
+    Ok(Some(Value::Int(found.len() as i32)))
+}
+
+/// `java.lang.ProcessHandleImpl$Info.info0(long pid)V` — an INSTANCE method,
+/// so `args[0]` is the `Info` receiver whose fields are filled in and
+/// `args[1]` is the pid.
+fn native_proc_handle_info0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let pid = match args.get(1) {
+        Some(Value::Long(p)) => *p,
+        _ => return Ok(None),
+    };
+    let pid = if pid == 0 {
+        std::process::id() as i64
+    } else {
+        pid
+    };
+    // Nothing to report on a host without `/proc`: leave the fields at their
+    // constructor defaults, which `Info` renders as `Optional.empty()`.
+    let Some((command, arguments)) = os_process_cmdline(pid) else {
+        return Ok(None);
+    };
+    let command_line = if arguments.is_empty() {
+        command.clone()
+    } else {
+        format!("{command} {}", arguments.join(" "))
+    };
+    // Pin `this` across every allocation below — each `create_string` /
+    // `new_array` can trigger a moving young GC that would relocate it.
+    let this_pin = ctx.pin_native_root(this);
+    let cmd_str = ctx.create_string(&command);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this_cur, "command", Value::Object(Some(cmd_str)));
+    let line_str = ctx.create_string(&command_line);
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    ctx.set_field_by_name(this_cur, "commandLine", Value::Object(Some(line_str)));
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, arguments.len());
+    let arr_pin = ctx.pin_native_root(arr);
+    for (i, a) in arguments.iter().enumerate() {
+        let s = ctx.create_string(a);
+        let arr_cur = ctx.read_native_pin(arr_pin, arr);
+        ctx.set_array_element(arr_cur, i, Value::Object(Some(s)));
+    }
+    let this_cur = ctx.read_native_pin(this_pin, this);
+    let arr_cur = ctx.read_native_pin(arr_pin, arr);
+    ctx.set_field_by_name(this_cur, "arguments", Value::Object(Some(arr_cur)));
+    ctx.unpin_native_roots(this_pin);
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -1993,6 +2192,11 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
     // ultimately reach these.
     // OpenJDK <clinit> calls initNative(); without it, UnsatisfiedLinkError leaves
     // internal stubs null and Spring Boot / logging fails on ProcessHandle.current().
+    //
+    // KEEP: `initNative()` exists purely to cache JNI jfieldIDs and start
+    // HotSpot's process-reaper thread. CratonVM resolves fields by name and
+    // reaps through `PROCESS_TABLE`, so there is genuinely nothing to do —
+    // the same reasoning as the `initIDs` no-ops elsewhere in this crate.
     registry.register(
         "java/lang/ProcessHandleImpl",
         "initNative",
@@ -2038,38 +2242,47 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(if ok { 1 } else { 0 })))
         },
     );
-    // parent0(pid, startTime) -> long. We don't track parent relationships;
-    // returning -1 is the documented "unknown" value.
+    // parent0(pid, startTime) -> long. Was a hardcoded -1 ("unknown") for
+    // every process, so `ProcessHandle.parent()` was permanently empty — a
+    // caller walking up the process tree (or checking whether it was launched
+    // by a known supervisor) silently got nothing. The `long` here really IS
+    // an OS pid: `Process.pid()` resolves the table handle through
+    // `pid_for_handle` before the JDK bytecode reaches this native.
     registry.register(
         "java/lang/ProcessHandleImpl",
         "parent0",
         "(JJ)J",
-        |_ctx, _args| Ok(Some(Value::Long(-1))),
+        native_proc_handle_parent0,
     );
     // getProcessPids0(pid, pids[], ppids[], starttimes[]) -> int (count).
-    // We don't enumerate child processes; return 0 (no children found).
+    // Was a hardcoded 0, i.e. "this process has no children and the machine is
+    // running no processes" — indistinguishable from a real empty answer, so
+    // `ProcessHandle.children()`/`allProcesses()` quietly returned nothing.
     registry.register(
         "java/lang/ProcessHandleImpl",
         "getProcessPids0",
         "(J[J[J[J)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_proc_handle_get_process_pids0,
     );
 
-    // ProcessHandleImpl$Info: initIDs() is a JNI fieldID cache init — no-op for us.
-    // info0(pid) fills in command/user/arguments/startTime/totalTime fields. Without
-    // OS-level introspection we leave the fields at their constructor defaults (null/-1),
-    // which the JDK code path handles gracefully (info() returns a partially-empty Info).
+    // KEEP: `ProcessHandleImpl$Info.initIDs()` is a JNI jfieldID cache init;
+    // CratonVM resolves fields by name, so an empty body is the spec-correct
+    // implementation (same as every other `initIDs` in this crate).
     registry.register(
         "java/lang/ProcessHandleImpl$Info",
         "initIDs",
         "()V",
         |_ctx, _args| Ok(None),
     );
+    // info0(pid) fills command/commandLine/arguments/startTime/totalTime/user
+    // on the receiver. It used to leave every field at its constructor default,
+    // so `ProcessHandle.info()` reported an entirely empty record for a process
+    // that plainly has a command line. Populate what the OS will tell us.
     registry.register(
         "java/lang/ProcessHandleImpl$Info",
         "info0",
         "(J)V",
-        |_ctx, _args| Ok(None),
+        native_proc_handle_info0,
     );
 
     // Process methods on our synthetic Process — override the stubs

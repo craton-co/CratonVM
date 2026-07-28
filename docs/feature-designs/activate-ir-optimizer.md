@@ -1786,8 +1786,8 @@ which lifted the int-div / `ldc2_w` exclusions (slice C). The consolidated,
 current status — including the *key realization* that this VM marshals FP through
 **integer** registers (the doc's "FP args in XMM" was wrong) — is in
 **["Remaining roadmap" item 3](#remaining-roadmap-post-inc-36)**; the per-slice
-mechanism detail is archived in
-`docs/internal/feature-designs/ir-fp-tier-remaining.md`.
+mechanism detail was tracked in a since-archived internal handoff and is fully
+superseded by that summary.
 
 ## Runtime wiring — the reachability fix (`CRATONVM_JIT_C2_FIRST_CALL`, gated) landed
 
@@ -2165,9 +2165,9 @@ are landed and (where flagged) default-ON. What remains, in dependency order:
    default-ON, commit `14635585`).** Inc 30–35 plus slices **A** (`frem`/`drem`,
    `62f6e6f4`), **B** (FP arrays, `f9cfc485`), **C** (FP-slot deopt resume,
    `5312b11c`) landed; the FP IR tier admits any FP method and is now the default
-   (`CRATONVM_JIT_IR_FP=0` opts out). The per-slice mechanism detail is archived in
-   `docs/internal/feature-designs/ir-fp-tier-remaining.md` (a completed handoff,
-   non-normative).
+   (`CRATONVM_JIT_IR_FP=0` opts out). The per-slice mechanism detail was tracked
+   in a since-archived internal handoff (completed, non-normative — fully
+   superseded by this section).
 
    **Shared invariants the FP tier preserves (DO NOT BREAK when extending it):**
    (1) **Compact all-GPR i64 ABI** — `execute_jit_call`/`jit_invoke_dispatch`

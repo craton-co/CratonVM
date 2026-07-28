@@ -87,6 +87,40 @@ pub(crate) fn socket_capture(dir: char, fd: i32, data: &[u8]) {
 // T16.5 — java.net.MulticastSocket overrides (pre-existing)
 // ---------------------------------------------------------------------------
 
+/// Last value each `MulticastSocket.setOption` call was given, keyed by
+/// `(fd, option name)`. Backs `getOption` for the options the std `UdpSocket`
+/// API exposes no getter for (SO_SNDBUF / SO_RCVBUF / SO_REUSEADDR); live reads
+/// off the socket take precedence where they exist. Keys are plain integers and
+/// strings, so this table holds no heap references and needs no GC root.
+fn ms_option_cache() -> &'static Mutex<FxHashMap<(i32, String), i32>> {
+    static T: OnceLock<Mutex<FxHashMap<(i32, String), i32>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// Box a socket-option value as the type its `SocketOption<T>` declares.
+/// `getOption` is generic (`<T> T`), so a raw `Value::Int` returned for an
+/// object-typed method coerces to null and the caller NPEs on the unbox.
+fn ms_box_option(ctx: &mut dyn NativeContext, opt_name: &str, raw: i32) -> MethodCallResult {
+    if matches!(
+        opt_name,
+        "SO_BROADCAST" | "SO_REUSEADDR" | "SO_REUSEPORT" | "IP_MULTICAST_LOOP"
+    ) {
+        ctx.invoke(
+            "java/lang/Boolean",
+            "valueOf",
+            "(Z)Ljava/lang/Boolean;",
+            &[Value::Int(if raw != 0 { 1 } else { 0 })],
+        )
+    } else {
+        ctx.invoke(
+            "java/lang/Integer",
+            "valueOf",
+            "(I)Ljava/lang/Integer;",
+            &[Value::Int(raw)],
+        )
+    }
+}
+
 /// Register MulticastSocket overrides. Called after the phase-72 registrations
 /// so this wins for the signatures we implement. Other (non-overridden) methods
 /// continue to be served by the phase-72 impls.
@@ -254,18 +288,114 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
                             let _ = ctx.fd_table().udp_set_ttl(fd as u32, n.max(0) as u32);
                         }
                     }
-                    // IP_MULTICAST_LOOP / IP_MULTICAST_IF / IP_TOS / SO_BROADCAST / …: no-op.
+                    "SO_BROADCAST" => {
+                        let _ = ctx
+                            .fd_table()
+                            .udp_set_broadcast(fd as u32, ival.unwrap_or(0) != 0);
+                    }
+                    // IP_MULTICAST_LOOP / IP_MULTICAST_IF / IP_TOS / …: no-op.
                     _ => {}
+                }
+                if !opt_name.is_empty() {
+                    // Mirror the request so `getOption` can answer the options
+                    // the std socket API gives us no getter for (SO_SNDBUF /
+                    // SO_RCVBUF / SO_REUSEADDR). Without this the pair could
+                    // never agree.
+                    ms_option_cache()
+                        .lock()
+                        .insert((fd, opt_name.clone()), ival.unwrap_or(0));
                 }
             }
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // getOption returned a constant null while `setOption` above really applied
+    // SO_REUSEADDR / SO_SNDBUF / SO_RCVBUF / IP_MULTICAST_TTL to the fd — so the
+    // socket accepted an option and then denied having it. Null is also not a
+    // legal answer here: `getOption` is declared `<T> T`, so every caller
+    // unboxes the result and gets an NPE rather than a wrong value. (This
+    // registration wins in BOTH run modes: it is registered after phase 72, and
+    // `interpreter.rs::force_native_over_real_jdk_bytecode` lists
+    // MulticastSocket.getOption so it also beats the real JDK bytecode.)
+    //
+    // Read what the live socket can tell us, fall back to what `setOption` was
+    // told, and raise the exception the JDK spec names for an option this
+    // surface does not model instead of answering null.
     r.register(
         ms,
         "getOption",
         "(Ljava/net/SocketOption;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let opt_name = match args.get(1) {
+                Some(Value::Object(Some(o))) => {
+                    match ctx.invoke_virtual(*o, "name", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    }
+                }
+                _ => String::new(),
+            };
+            let fd = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+            // Live reads first — these are the socket's actual state, so they
+            // stay right even if something set the option behind our back.
+            let live = if fd >= 0 {
+                match opt_name.as_str() {
+                    "SO_BROADCAST" => ctx
+                        .fd_table()
+                        .udp_try_clone(fd as u32)
+                        .ok()
+                        .and_then(|s| s.broadcast().ok())
+                        .map(i32::from),
+                    "IP_MULTICAST_LOOP" => ctx
+                        .fd_table()
+                        .udp_try_clone(fd as u32)
+                        .ok()
+                        .and_then(|s| s.multicast_loop_v4().ok())
+                        .map(i32::from),
+                    // The 5-field layout mirrors the multicast TTL in slot 4
+                    // (written by `setTimeToLive`/`setOption`), and the JDK
+                    // default for a fresh MulticastSocket is 1.
+                    "IP_MULTICAST_TTL" => Some(if ctx.object_num_fields(this) >= 5 {
+                        ctx.get_field(this, 4).as_int().unwrap_or(1)
+                    } else {
+                        1
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let cached = live.or_else(|| {
+                if fd < 0 {
+                    return None;
+                }
+                ms_option_cache()
+                    .lock()
+                    .get(&(fd, opt_name.clone()))
+                    .copied()
+            });
+            let raw = match cached {
+                Some(v) => v,
+                // Never set and not live-readable: answer the JDK default for
+                // the options this surface models, and refuse the rest.
+                None => match opt_name.as_str() {
+                    "SO_BROADCAST" | "SO_REUSEADDR" | "IP_MULTICAST_LOOP" => 0,
+                    "SO_SNDBUF" | "SO_RCVBUF" => 0,
+                    "IP_MULTICAST_TTL" => 1,
+                    _ => {
+                        return Err(RuntimeError::UnsupportedOperationException {
+                            message: format!("MulticastSocket option not supported: {opt_name}"),
+                        }
+                        .into())
+                    }
+                },
+            };
+            ms_box_option(ctx, &opt_name, raw)
+        },
     );
 
     // setSoTimeout / setTimeToLive — store on the object and apply to the fd.
@@ -411,10 +541,12 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
     });
 
     // receive(DatagramPacket) — fills the packet's backing buffer + length.
-    // A read timeout surfaces as java.net.SocketTimeoutException so callers that
-    // loop on it (Tribes' McastServiceImpl.receive) continue cleanly; all other
-    // recv errors are likewise reported as timeouts to keep the daemon loop
-    // alive rather than tearing it down.
+    // A read timeout surfaces as a real `java.net.SocketTimeoutException`
+    // (see `udp_recv_error`) so callers that loop on it — Tribes'
+    // `McastServiceImpl.receive` catches exactly that type and ignores it —
+    // continue cleanly; every other recv error stays a plain IOException,
+    // which is what the JDK does and what those callers' recovery paths
+    // expect to see.
     r.register(
         ms,
         "receive",
@@ -491,16 +623,42 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
                 }
                 Err(e) => {
                     ctx.unpin_native_roots(pkt_pin);
-                    Err(RuntimeError::IOException {
-                        message: format!("SocketTimeoutException: Receive timed out: {e}"),
-                    }
-                    .into())
+                    Err(udp_recv_error(e))
                 }
             }
         },
     );
 
     r.set_category(__prev_cat);
+}
+
+/// Classify a UDP `recv` failure into the Java exception the JDK would raise.
+///
+/// A datagram socket with `SO_TIMEOUT` set reports an expired read as
+/// `WSAETIMEDOUT` on Windows (`ErrorKind::TimedOut`) and `EAGAIN`/
+/// `EWOULDBLOCK` on Unix (`ErrorKind::WouldBlock`); the JDK turns both into
+/// `java.net.SocketTimeoutException`. Returning a bare `java.io.IOException`
+/// instead makes every `catch (SocketTimeoutException)` miss, which is not a
+/// cosmetic difference for polling receivers: Tomcat Tribes'
+/// `McastServiceImpl.ReceiverThread` treats anything else as a receive
+/// **failure** — it logs, sleeps 500 ms (so the membership socket is only
+/// listening half the time), skips the `checkExpired()` at the end of
+/// `receive()`, and after `recoveryCounter` (10) such "errors" hands the
+/// service to `RecoveryThread`, which stops and restarts membership
+/// altogether. Since the poll timeout is the *normal* exit of every idle
+/// receive, that turned steady-state membership into a stop/start churn and
+/// members never converged.
+pub(crate) fn udp_recv_error(e: std::io::Error) -> MethodCallFailed {
+    if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+        return RuntimeError::SocketTimeoutException {
+            message: "Receive timed out".into(),
+        }
+        .into();
+    }
+    RuntimeError::IOException {
+        message: format!("UDP recv: {e}"),
+    }
+    .into()
 }
 
 /// Invoke a no-arg `int`-returning method on `recv`, returning `None` on any
@@ -966,7 +1124,13 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         map.entry(fd).or_insert(NetSocketHandle::Unbound);
     }
 
-    let listener = TcpListener::bind(&bind_addr).map_err(|e| net_err(&bind_addr, e))?;
+    // Bind exactly one address. Letting `TcpListener::bind` walk the whole
+    // resolution list turns "port already in use" into a silent bind to some
+    // other address of the same name — see `socket_channel::single_bind_addr`
+    // for the Tribes auto-bind loop that breaks on.
+    let target = crate::socket_channel::single_bind_addr(&addr_text, port.clamp(0, 65535) as u16)
+        .map_err(|e| net_err(&bind_addr, e))?;
+    let listener = TcpListener::bind(target).map_err(|e| net_err(&bind_addr, e))?;
 
     // C26 fix: do NOT write the resolved port into FileDescriptor.handle —
     // `handle` is the fd-id sentinel that `net_fd_from_descriptor` falls back
@@ -2303,6 +2467,11 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // KEEP: the `poll*Value()` family is specified to return the platform's
+    // POLLIN/POLLOUT/POLLERR/POLLHUP/POLLNVAL/POLLCONN bit constants — the real
+    // JNI implementations return exactly these compile-time values too. A
+    // constant here is the whole method, not a placeholder; `NET_POLL*` are the
+    // platform-correct values `net_poll` itself compares against.
     r.register(net, "pollinValue", "()S", |_c, _a| {
         Ok(Some(Value::Int(NET_POLLIN)))
     });

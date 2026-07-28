@@ -150,7 +150,7 @@ code, but another manifestation of the same already-tracked, OPEN,
 deferred `update_root_snapshot` per-native-call GC-root-snapshot cost being
 `O(current interpreter stack depth)` (see
 [`reference_update_root_snapshot_reflective_chain_scaling_20260721`],
-[`docs/internal/tomcat-suite-bugs/04-embedded-server-throughput-wall-OPEN.md`](../tomcat/04-embedded-server-throughput-wall-OPEN.md),
+[`docs/internal/tomcat-suite-bugs/04-embedded-server-throughput-wall-OPEN.md`](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md),
 and this directory's own
 [`astparserloadingtest-jaxb-reflection-storm-throughput-wall-20260721.md`](astparserloadingtest-jaxb-reflection-storm-throughput-wall-20260721.md)):
 a 140-160-frame-deep, native-call-heavy (JDBC/reflection-backed property

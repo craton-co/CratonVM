@@ -1468,12 +1468,37 @@ impl GenerationalHeap {
     /// young-gen and go straight to the old generation.
     ///
     /// Threshold = [`HUMONGOUS_YOUNG_FRACTION_PERCENT`] of one young
-    /// semi-space capacity.  Computed from a live read of the
-    /// `young_from` arena so the cap correctly tracks any in-flight
-    /// expansion (see `collect_garbage_inner`'s adaptive growth path).
+    /// semi-space capacity, which tracks any in-flight expansion (see
+    /// `collect_garbage_inner`'s adaptive growth path).
+    ///
+    /// The capacity is read from the lock-free [`region_bounds`] mirror
+    /// rather than `young_from.lock().capacity()`. `is_humongous` runs on
+    /// EVERY array allocation, so the mutex made array allocation a global
+    /// serialisation point: measured on this box with a bare
+    /// `new long[16]` loop, aggregate allocation throughput was FLAT at
+    /// ~11.4 Mops/s from 1 to 4 threads (1.01x for 4x the threads) while
+    /// `new Object()` — which never calls this — scaled 3.3x, and HotSpot
+    /// scaled ~27x. Any allocation-heavy concurrent workload was capped at
+    /// one thread's worth of array allocation. This is the same fix, for
+    /// the same reason, that [`region_bounds`] itself documents for
+    /// `is_object_address`'s old triple-lock.
+    ///
+    /// Freshness is identical to the locked read: slot 0 holds young
+    /// from-space's `[base, base + capacity)` and is republished at
+    /// construction and at the start AND end of every GC — the only points
+    /// where the young arenas swap or grow. Mutators allocate only between
+    /// GC cycles (GC is stop-the-world), so they always observe the current
+    /// capacity. A zero span means the mirror has not been published yet
+    /// (pre-construction ordering), so fall back to the authoritative
+    /// locked read rather than treat every allocation as humongous.
     #[inline]
     fn is_humongous(&self, total_size: usize) -> bool {
-        let semi = self.young_from.lock().capacity();
+        let base = self.region_bounds[0].0.load(Ordering::Acquire);
+        let end = self.region_bounds[0].1.load(Ordering::Acquire);
+        let semi = match end.checked_sub(base) {
+            Some(span) if span != 0 => span,
+            _ => self.young_from.lock().capacity(),
+        };
         // Saturating arithmetic: a tiny semi-space (e.g. 1 KiB test heap)
         // can produce a 0-byte threshold under integer truncation — clamp
         // up to at least one allocation so the humongous path doesn't fire
@@ -12219,6 +12244,68 @@ mod tests {
             }
             other => panic!("live chain corrupted after hole reuse: {other:?}"),
         }
+    }
+
+    /// Regression guard for the GC-overhead productivity metric (consumed by
+    /// `vm/src/runtime/interpreter.rs::note_gc_productivity`).
+    ///
+    /// The non-moving young sweep reclaims dead objects into the from-space
+    /// free list WITHOUT retreating the bump cursor, so `allocated_bytes()`
+    /// scores a fully-productive sweep as "freed 0"; eight of those in a row
+    /// latch `gc_overhead_limit_exceeded` and every subsequent allocation
+    /// throws `OutOfMemoryError` on a heap that is almost entirely garbage.
+    /// `live_bytes_estimate()` is the only metric that sees the reclaim.
+    ///
+    /// This has been regressed once already — a9c580aff fixed it, d8092acba
+    /// ("fix-tests-real-jdk-contracts") reverted the `interpreter.rs` hunk the
+    /// same day while leaving the accessor in place and caller-less, and
+    /// Tomcat's `TestMethodPerformance` OOM'd from then on. Pin the invariant
+    /// here so a third revert fails a unit test instead of a suite class.
+    #[test]
+    fn live_bytes_estimate_sees_non_moving_sweep_that_allocated_bytes_misses() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        // One live object plus a pile of garbage, all in young.
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        heap.set_field(live, 0, Value::Int(1));
+        for i in 0..16 {
+            let dead = heap.alloc_object(ClassId::new(9), 1);
+            heap.set_field(dead, 0, Value::Int(i));
+        }
+
+        let allocated_before = heap.allocated_bytes();
+        let live_before = heap.live_bytes_estimate();
+
+        // Force the non-moving path (the production default whenever any
+        // thread holds a live JIT frame), exactly as
+        // `non_moving_sweep_when_jit_active` does.
+        crate::gc_quiescence::publish_moving_young_enabled(false);
+        crate::gc_quiescence::enter();
+        let mut roots = vec![live];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+        crate::gc_quiescence::leave();
+
+        assert!(
+            result.stats.bytes_freed > 0,
+            "the sweep must actually have reclaimed the dead objects"
+        );
+
+        let freed_by_allocated = allocated_before.saturating_sub(heap.allocated_bytes());
+        let live_after = heap.live_bytes_estimate();
+        let freed_by_live = live_before.saturating_sub(live_after);
+
+        assert_eq!(
+            freed_by_allocated, 0,
+            "allocated_bytes cannot see a non-moving sweep (the bump cursor \
+             never retreats) — this is precisely why it must not be used as \
+             the GC-overhead productivity metric"
+        );
+        assert!(
+            freed_by_live > 0,
+            "live_bytes_estimate must report the reclaimed bytes \
+             (before={live_before}, after={live_after})"
+        );
     }
 
     #[test]

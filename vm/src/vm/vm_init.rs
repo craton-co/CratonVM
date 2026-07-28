@@ -2565,11 +2565,30 @@ impl SharedVm {
             format!("{}/lib", java_home_val),
         );
 
-        // Hibernate ORM 8 defaults to its graph-based ActionQueue. Its
-        // cycle-breaking planner can spend several minutes in dispatch-heavy
-        // DFS work on CratonVM's real-JDK runtime. The mature legacy queue
+        // Hibernate ORM 8 defaults to its graph-based `ActionQueue`, whose
+        // `CycleBreaker` planner needs minutes per flush on CratonVM's
+        // real-JDK runtime where HotSpot needs 738 ms. The mature legacy queue
         // completes the same workloads predictably. An explicit user property
         // is applied immediately below and therefore still selects `graph`.
+        //
+        // This default is a WORKAROUND for a VM performance gap, not a
+        // preference, and it is expensive: it also makes 17 of upstream's own
+        // `action.queue` tests self-abort ("Skipping GRAPH test with non-GRAPH
+        // queue type"). Removing it needs the planner's hot path to be viable.
+        //
+        // One cause has been fixed since: the planner keys its dependency
+        // graph on records (`GroupNode`, `FlushOperationGroup`,
+        // `StatementShapeKey`), and a record's `hashCode`/`equals` is a bare
+        // `invokedynamic` that the x64 backend lowers to an unconditional
+        // deopt, so those bodies ran interpreter-only — 1576 ns against
+        // HotSpot's 0.9 ns. They are now interpreter intrinsics
+        // (`InterpIntrinsic::RecordHashCode`/`RecordEquals`), worth 3-5x on
+        // record-keyed collections. It is not enough on its own: the planner
+        // is still ~2400x off HotSpot because essentially nothing in that
+        // workload gets JIT-compiled at all (1362 of 1463 hot methods stuck in
+        // the interpreter with `tier_fail_count=3`, including 5-byte getters
+        // called 500k+ times). See
+        // `docs/known-issues/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727.md`.
         if !config.use_synthetic_jdk {
             sys_props
                 .entry("hibernate.flush.queue.type".to_string())
@@ -5060,7 +5079,7 @@ impl Vm {
         self.main_thread.set_vm_state(state);
         self.main_thread.tlab.retire();
         {
-            let ctx = crate::vm::vm_exec::NativeContextImpl {
+            let mut ctx = crate::vm::vm_exec::NativeContextImpl {
                 shared: &self.shared,
                 thread: &mut self.main_thread,
             };

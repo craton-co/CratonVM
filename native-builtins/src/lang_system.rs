@@ -24,6 +24,74 @@ use crate::{alloc_concurrent_synthetic, obj_arg, platform_lib_name};
 // app boot (e.g. Cassandra NodeTool's airline NPE catch path) at least
 // dumps the dispatch_trace ring when `CRATONVM_DBG_EXIT=1` is set.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Runtime.addShutdownHook / removeShutdownHook registry.
+//
+// The hook threads are held as JNI-global-ref handles (see
+// `NativeContext::add_global_root`), a persistent, GC-remapped root.
+//
+// Registration MUST root the hook. A shutdown hook is normally never started,
+// so on HotSpot the only thing keeping it — and everything it references —
+// alive is the `ApplicationShutdownHooks.hooks` static map, and real
+// applications rely on that. WildFly's `BootstrapImpl$ShutdownHook.register()`
+// calls `addShutdownHook(this)` and only then stores the MSC `ServiceContainer`
+// in its own field, while MSC 1.5's `ServiceContainer$Factory.create` registers
+// a `Cleaner` that calls `container.shutdown()` once the container object
+// becomes unreachable (its leak detector). With the hook dropped on the floor
+// that whole chain became garbage the moment `Main.main` returned, the leak
+// detector fired mid-boot, `AbstractControllerService.stop` reset `controller`
+// to null, and the boot thread died on `WFLYCTL0085` / `WFLYSRV0056`.
+//
+// Handles rather than raw addresses: the global-ref table is remapped by the
+// moving collector, so a stored `ObjectRef` would go stale while a handle stays
+// valid. `removeShutdownHook` resolves each handle and compares it against the
+// argument, so identity matching survives object motion.
+//
+// Known gap, unchanged by this registry: cratonvm does not yet RUN the
+// registered hooks at VM shutdown. Retaining them is what the correctness of
+// the *running* program depends on; executing them on exit is tracked
+// separately in the doc above.
+// ---------------------------------------------------------------------------
+static SHUTDOWN_HOOKS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Register `hook` as a shutdown hook, rooting it for the life of the VM.
+/// Idempotent per object: re-registering the same thread does not add a second
+/// root (HotSpot throws `IllegalArgumentException` there; keeping the single
+/// existing registration is the conservative choice and never loses the root).
+fn shutdown_hook_add(ctx: &mut dyn NativeContext, hook: ObjectRef) {
+    {
+        let hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        if hooks
+            .iter()
+            .any(|h| ctx.resolve_global_root(*h) == Some(hook))
+        {
+            return;
+        }
+    }
+    let handle = ctx.add_global_root(hook);
+    SHUTDOWN_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(handle);
+}
+
+/// Drop a previously registered hook. Returns true iff it was registered —
+/// `Runtime.removeShutdownHook`'s documented contract.
+fn shutdown_hook_remove(ctx: &mut dyn NativeContext, hook: ObjectRef) -> bool {
+    let handle = {
+        let mut hooks = SHUTDOWN_HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        match hooks
+            .iter()
+            .position(|h| ctx.resolve_global_root(*h) == Some(hook))
+        {
+            Some(pos) => hooks.remove(pos),
+            None => return false,
+        }
+    };
+    ctx.remove_global_root(handle);
+    true
+}
+
 type PreExitHook = fn(code: i32);
 static PRE_EXIT_HOOK: std::sync::OnceLock<PreExitHook> = std::sync::OnceLock::new();
 
@@ -1215,13 +1283,25 @@ pub(crate) fn register_runtime_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/Runtime",
         "addShutdownHook",
         "(Ljava/lang/Thread;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // args[0] = the `Runtime` receiver, args[1] = the hook `Thread`.
+            if let Some(Value::Object(Some(hook))) = args.get(1) {
+                shutdown_hook_add(ctx, *hook);
+            }
+            Ok(None)
+        },
     );
     registry.register(
         "java/lang/Runtime",
         "removeShutdownHook",
         "(Ljava/lang/Thread;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            let removed = match args.get(1) {
+                Some(Value::Object(Some(hook))) => shutdown_hook_remove(ctx, *hook),
+                _ => false,
+            };
+            Ok(Some(Value::Int(i32::from(removed))))
+        },
     );
     registry.register("java/lang/Runtime", "gc", "()V", |ctx, _args| {
         ctx.force_gc();

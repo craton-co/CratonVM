@@ -1334,9 +1334,20 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
     #[cfg(feature = "synthetic-jdk")]
     {
         // -------------------------------------------------------------------------
-        // java.io.InputStream.close() — no-op
+        // java.io.InputStream.close() — spec-correct no-op: the base class body
+        // in java.base is literally empty (`public void close() throws
+        // IOException {}`); every stream that owns a handle overrides it, and an
+        // override resolves to the subclass, not here.
         // -------------------------------------------------------------------------
         r.register("java/io/InputStream", "close", "()V", native_noop_with_this);
+        // KEEP (deliberate constant), audited 2026-07-27. `InputStream.read()`
+        // is abstract in java.base — a native on it is only ever reached by a
+        // synthetic-mode subclass that supplies no `read()` of its own, i.e.
+        // a stream with no source. EOF is the only answer that does not
+        // fabricate data. It is NOT the answer for a stream that does have a
+        // source: every such class (ByteArrayInputStream, the
+        // getResourceAsStream product, FileInputStream) registers its own
+        // `read` and that override wins.
         r.register("java/io/InputStream", "read", "()I", |_ctx, _args| {
             Ok(Some(Value::Int(-1))) // EOF
         });
@@ -1378,14 +1389,45 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        r.register(
-            "java/io/InputStreamReader",
-            "close",
-            "()V",
-            native_noop_with_this,
-        );
-        r.register("java/io/InputStreamReader", "read", "()I", |_ctx, _args| {
-            Ok(Some(Value::Int(-1)))
+        // `InputStreamReader.close()` is NOT an empty base-class body: the real
+        // one closes its StreamDecoder, which closes the wrapped InputStream.
+        // The three synthetic `<init>`s above park that stream in slot 0, so
+        // propagate the close to it — a no-op here held the underlying stream
+        // (and its OS handle) open for the rest of the process. Clearing the
+        // slot keeps `close()` idempotent, as the contract requires; it happens
+        // BEFORE the nested dispatch because that call runs arbitrary Java and a
+        // moving young GC there would relocate `this`, stranding a write made
+        // afterwards (native stale-local family).
+        r.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+                ctx.set_field(this, 0, Value::Object(None));
+                let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            }
+            Ok(None)
+        });
+        // `read()` has to consume from the stream those three `<init>`s parked
+        // in slot 0, exactly as `close()` above propagates to it. The constant
+        // `-1` this replaced reported permanent EOF, so in synthetic mode
+        // every `new InputStreamReader(in).read()` — and every BufferedReader
+        // layered on one — saw an empty stream rather than the resource's
+        // bytes.
+        //
+        // This is a byte-for-char passthrough: exact for US-ASCII and
+        // ISO-8859-1, and it splits a multi-byte UTF-8 sequence into separate
+        // chars. That is a known approximation of the real StreamDecoder, and
+        // still strictly better than claiming EOF. The default (real-JDK)
+        // build never reaches this code — see the RDR-MIGRATION note above.
+        r.register("java/io/InputStreamReader", "read", "()I", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Value::Object(Some(stream)) = ctx.get_field(this, 0) else {
+                // No source, or already closed (close() nulls slot 0).
+                return Ok(Some(Value::Int(-1)));
+            };
+            match ctx.invoke_virtual(stream, "read", "()I", &[])? {
+                Some(Value::Int(b)) => Ok(Some(Value::Int(b))),
+                _ => Ok(Some(Value::Int(-1))),
+            }
         });
 
         // Real-JDK BufferedReader methods retain their bytecode implementation.
@@ -1741,7 +1783,14 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         crate::classloader::cl_get_resource_as_stream_essential,
     );
 
-    // URLClassLoader.close() — no-op
+    // URLClassLoader.close() — nothing to release. Real `close()` shuts the
+    // JarFiles that URLClassPath keeps open, but this synthetic loader opens
+    // none: `<init>`/`addURL` hand the paths to `ctx.register_dynamic_classpath`
+    // and keep only the URL[] and parent refs. The remaining half of the
+    // contract (a closed loader must stop serving new classes/resources) needs a
+    // VM-side way to retract a dynamic-classpath entry, which does not exist —
+    // so post-close loads still succeed here. Left as-is deliberately rather
+    // than faked; see the stub-removal report.
     r.register(ucl, "close", "()V", native_noop_with_this);
 
     // =========================================================================
@@ -2253,9 +2302,124 @@ pub(crate) const RUSTLS_SOCK_ID_BASE: i32 = 0x4000_0000;
 /// collide; see `t27_tls::{stash_pending_layered_socket, drive_pending_layered_handshake}`.
 pub(crate) const PENDING_LAYERED_SOCK_ID_BASE: i32 = 0x2000_0000;
 
+// ---------------------------------------------------------------------------
+// Plaintext readahead for TLS streams
+// ---------------------------------------------------------------------------
+//
+// FIX (tls-handshake-enforcement-gap, doc 21 — `TestSsl` class-level hang).
+// `SSLSocketInputStream.read()I` (phases_late/ssl_security.rs) is a native
+// call that reads exactly ONE byte, bracketed by
+// `begin_blocking_region`/`end_blocking_region` and, for native-tls ids, a
+// registry-lock lookup. Real JSSE's `SSLSocketInputStream` serves single-byte
+// reads out of a plain Java `byte[]`, so a caller that reads a large body one
+// byte at a time (`TestSsl.testPost` — 8 threads x 16 MiB, i.e. ~134 MILLION
+// calls) costs HotSpot a few seconds and cost CratonVM ~7.4 minutes, which is
+// most of why that whole class timed out.
+//
+// The buffer is keyed by STREAM ID rather than by the Java `InputStream`
+// object: `SSLSocket.getInputStream()` mints a fresh synthetic stream object
+// on every call, and unrelated code reads the same id straight through
+// `s2_tls_read`, so a per-object buffer could strand already-read bytes.
+// Keying by id and draining at the top of `s2_tls_read` keeps every reader of
+// a stream consistent no matter which entry point it uses.
+//
+// Semantics are unchanged: a refill does exactly ONE underlying `read`, which
+// returns as soon as any plaintext is available, so this never blocks waiting
+// to "fill" the buffer — identical to wrapping the stream in a
+// `BufferedInputStream`, which is effectively what the real JDK path is.
+const TLS_READAHEAD_CAP: usize = 32 * 1024;
+
+struct TlsReadahead {
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+fn tls_readahead() -> &'static parking_lot::Mutex<HashMap<i32, TlsReadahead>> {
+    static T: OnceLock<parking_lot::Mutex<HashMap<i32, TlsReadahead>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Move up to `out.len()` already-buffered plaintext bytes for `id` into
+/// `out`. Returns 0 when nothing is buffered (the caller must then do a real,
+/// blocking read).
+fn tls_readahead_drain(id: i32, out: &mut [u8]) -> usize {
+    let mut table = tls_readahead().lock();
+    let Some(entry) = table.get_mut(&id) else {
+        return 0;
+    };
+    let avail = entry.buf.len() - entry.pos;
+    if avail == 0 {
+        table.remove(&id);
+        return 0;
+    }
+    let n = avail.min(out.len());
+    out[..n].copy_from_slice(&entry.buf[entry.pos..entry.pos + n]);
+    entry.pos += n;
+    if entry.pos == entry.buf.len() {
+        table.remove(&id);
+    }
+    n
+}
+
+/// Number of plaintext bytes currently buffered for `id` — `available()` must
+/// count these, since they have already been taken off the socket.
+pub(crate) fn s2_tls_buffered_len(id: i32) -> usize {
+    tls_readahead()
+        .lock()
+        .get(&id)
+        .map(|e| e.buf.len() - e.pos)
+        .unwrap_or(0)
+}
+
+/// Pop one buffered plaintext byte without any blocking-region bookkeeping.
+/// `None` means "nothing buffered" — the caller must fall back to
+/// [`s2_tls_fill_readahead`] inside a blocking region.
+pub(crate) fn s2_tls_pop_buffered_byte(id: i32) -> Option<u8> {
+    let mut out = [0u8; 1];
+    (tls_readahead_drain(id, &mut out) == 1).then_some(out[0])
+}
+
+/// Do ONE real read into the readahead buffer for `id`. Returns the number of
+/// bytes buffered (0 = EOF). MUST be called inside a blocking region — it
+/// performs genuine blocking socket I/O.
+pub(crate) fn s2_tls_fill_readahead(id: i32) -> std::io::Result<usize> {
+    let mut buf = vec![0u8; TLS_READAHEAD_CAP];
+    let n = s2_tls_read_direct(id, &mut buf)?;
+    if n == 0 {
+        return Ok(0);
+    }
+    buf.truncate(n);
+    tls_readahead()
+        .lock()
+        .insert(id, TlsReadahead { buf, pos: 0 });
+    Ok(n)
+}
+
+/// Drop any readahead for `id` — called when the stream is closed so a
+/// recycled id can never inherit a dead stream's bytes.
+pub(crate) fn s2_tls_discard_readahead(id: i32) {
+    tls_readahead().lock().remove(&id);
+}
+
 /// NEW-13: read from a TLS stream registered via `s2_tls_connect` (native-tls),
 /// or — for ids ≥ `RUSTLS_SOCK_ID_BASE` — the rustls client/server stream table.
+///
+/// Serves any readahead buffered by [`s2_tls_fill_readahead`] first so every
+/// reader of a stream observes the same byte sequence regardless of entry
+/// point.
 pub(crate) fn s2_tls_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
+    if !buf.is_empty() {
+        let n = tls_readahead_drain(id, buf);
+        if n > 0 {
+            return Ok(n);
+        }
+    }
+    s2_tls_read_direct(id, buf)
+}
+
+/// The unbuffered read — bypasses the readahead entirely. Only
+/// [`s2_tls_read`] (after draining) and [`s2_tls_fill_readahead`] may call it.
+fn s2_tls_read_direct(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
     if id >= RUSTLS_SOCK_ID_BASE {
         return crate::t27_tls::rustls_stream_read(id - RUSTLS_SOCK_ID_BASE, buf);
     }
@@ -2317,6 +2481,7 @@ pub(crate) fn s2_tls_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
 /// NEW-13: perform a graceful TLS shutdown (close_notify) and drop the stream.
 /// Idempotent: closing an unknown id is a no-op.
 pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
+    s2_tls_discard_readahead(id);
     if id >= RUSTLS_SOCK_ID_BASE {
         crate::t27_tls::rustls_stream_close(id - RUSTLS_SOCK_ID_BASE);
         return Ok(());
@@ -5138,6 +5303,16 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(cls, "array", "()[I", |ctx, args| {
             Ok(Some(Value::Object(s2_bb_arr(ctx, obj_arg(args, 0)?))))
         });
+        // KEEP (deliberate constants) — audited 2026-07-27. Every receiver
+        // reaching these is a view buffer produced by `s2_view_buf_fn!` and
+        // backed by the int[] that `s2_bb_arr` (just above) hands out, so
+        // `isDirect() == false` is a fact about the layout, not a
+        // placeholder: a direct buffer would have no accessible backing
+        // array. `isReadOnly() == false` is exact for the same reason —
+        // `asReadOnlyBuffer` is unimplemented for these classes (see the note
+        // immediately below), so no read-only view of one can exist yet.
+        // Whoever implements it must replace this with a real flag read
+        // rather than leave the constant standing.
         r.register(cls, "isDirect", "()Z", |_, _| Ok(Some(Value::Int(0))));
         r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
     }

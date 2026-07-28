@@ -3298,6 +3298,15 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Object(None))),
     };
     let mut elems = al_or_collection_elements(ctx, this);
+    if heuristic_snapshot_is_suspect(ctx, this, &elems) {
+        // Null holes from a foreign non-List backing array (see
+        // `heuristic_snapshot_is_suspect`). `toArray` is not on the iterator
+        // native's path, so the real `iterator()` is safe to drive here.
+        let real = collect_via_real_iterator_once(ctx, this);
+        if !real.is_empty() {
+            elems = real;
+        }
+    }
     if elems.is_empty() {
         // `collect_collection_elements` only knows fixed collection layouts and
         // returns empty for any other Collection — but this native is also
@@ -3361,6 +3370,64 @@ fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Ve
         }
     }
     out
+}
+
+/// Recursion-safe wrapper around [`collect_via_real_iterator`].
+///
+/// The real `iterator()` of a foreign collection can land back in a
+/// collection native that itself wants a fallback snapshot. One level is all
+/// any caller needs, so a re-entrant request yields an empty Vec (and the
+/// caller keeps whatever it already had) instead of recursing.
+fn collect_via_real_iterator_once(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+    use std::cell::Cell;
+    thread_local! {
+        static IN_REAL_ITER: Cell<bool> = const { Cell::new(false) };
+    }
+    if IN_REAL_ITER.with(Cell::get) {
+        return Vec::new();
+    }
+    IN_REAL_ITER.with(|g| g.set(true));
+    let out = collect_via_real_iterator(ctx, coll);
+    IN_REAL_ITER.with(|g| g.set(false));
+    out
+}
+
+/// True iff a heuristic element snapshot of `coll` must not be trusted.
+///
+/// The layout probes in [`collect_collection_elements`] assume the backing
+/// array is a dense `arr[0..size)` prefix. That is a *list* invariant. A
+/// foreign open-addressed collection keeps NULL holes for empty buckets in
+/// exactly those slots, so the probe returns the right element *count* made up
+/// of mostly nulls and looks entirely plausible — the failure only shows up
+/// when the caller dereferences one. Known members of that shape: MSC's
+/// `org.jboss.msc.service.IdentityHashSet`, Kafka's
+/// `ImplicitLinkedHashCollection`, Jetty's `BlockingArrayQueue`; the latter two
+/// carry hand-written special cases in `collect_collection_elements` precisely
+/// because of this, which is what this general guard replaces the need for.
+///
+/// Concretely closed here: `new HashSet<>().addAll(mscIdentityHashSet)` turned
+/// a 3-element set into `{null}`, so WildFly's `ContainerStateMonitor`
+/// iterated a null `ServiceController` and every boot that reported a failed
+/// service died on `NullPointerException: ... "controller" is null` instead of
+/// logging the report.
+///
+/// A `List` may legitimately hold nulls at any index, so nulls are only
+/// suspicious in a non-`List` receiver. Note this deliberately does NOT consult
+/// `is_synthetic_backed_collection`: its `al_is_list_layout` arm matches on the
+/// very `(Object[], int)` shape an open-addressed foreign set has, so it
+/// reported MSC's `IdentityHashSet` as synthetic-backed and suppressed the
+/// guard. Callers only *adopt* the real-iterator answer when it is non-empty,
+/// and CratonVM's own synthetic sets/maps resolve `iterator()` to their own
+/// (correct) natives, so re-deriving is at worst equivalent for them.
+fn heuristic_snapshot_is_suspect(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+    elems: &[Value],
+) -> bool {
+    if !elems.iter().any(|v| matches!(v, Value::Object(None))) {
+        return false;
+    }
+    !obj_is_instance_of(ctx, coll, "java/util/List")
 }
 
 /// Read elements for the `toArray` / `forEach` natives. These are registered on
@@ -5224,11 +5291,25 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
         None
     };
 
-    let (_old_buckets0, size, old_cap) = map_state(ctx, this);
+    let (old_buckets0, size, old_cap) = map_state(ctx, this);
     if old_cap >= MAP_MAX_CAPACITY {
         return; // cannot grow further
     }
-    let new_cap = std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY);
+    // `native_map_put` also routes here to MATERIALISE a table for a map that
+    // has none (a JDK-bytecode constructor that leaves `table` null, or any
+    // path that skipped the synthetic `<init>` native). That is not a growth
+    // step: HotSpot's `resize()` on a null table allocates
+    // DEFAULT_INITIAL_CAPACITY buckets, it does not double. Doubling gave
+    // every lazily-initialised map a 32-bucket table where HotSpot has 16,
+    // which shifts every key's bucket index and makes iteration order diverge
+    // from HotSpot for the identical set of keys (found via a json-smart
+    // parse -> serialize -> re-parse round trip, where one map came from the
+    // interpreter and the other from JIT-compiled code).
+    let new_cap = if old_buckets0.is_none() {
+        std::cmp::max(old_cap, MAP_DEFAULT_CAPACITY as i32)
+    } else {
+        std::cmp::min(old_cap * 2, MAP_MAX_CAPACITY)
+    };
     // gcstress residual face-1 fix — `alloc_ref_array` can trigger a moving
     // young GC (deterministic under CRATONVM_DBG_GC_STRESS) that relocates
     // `this` and its bucket array. Both were captured as bare Rust locals
@@ -22940,18 +23021,44 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(None),
     };
     let ois_cls = "java/io/ObjectInputStream";
+    // Pin BEFORE the first GC-capable call: `defaultReadObject` already
+    // replays this map's own serialized fields, so it allocates and can
+    // collect just like the per-entry `readObject`s below.
+    let this_pin = ctx.pin_native_root(this);
+    let ois_pin = ctx.pin_native_root(ois);
+    let mut this = this;
+    let mut ois = ois;
     ctx.invoke(
         ois_cls,
         "defaultReadObject",
         "()V",
         &[Value::Object(Some(ois))],
     )?;
+    ois = ctx.read_native_pin(ois_pin, ois);
     // buckets (ignored — capacity is recomputed from size)
     let _ = ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])?;
+    ois = ctx.read_native_pin(ois_pin, ois);
     let n = match ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])? {
         Some(Value::Int(v)) => v,
         _ => 0,
     };
+    ois = ctx.read_native_pin(ois_pin, ois);
+    this = ctx.read_native_pin(this_pin, this);
+    // GC-safety: each `readObject` below replays an arbitrary nested object
+    // graph, so it allocates and can collect. `this` and `ois` were captured
+    // into bare Rust locals at entry and are invisible to the collector's root
+    // scan; a collection that relocates them — the "non-moving" young sweep
+    // still SELECTIVELY PROMOTES survivors into old gen — leaves both locals
+    // addressing reclaimed young memory.
+    //
+    // Both stale locals were observed crashing
+    // `TestGroupChannelSenderConnections`: a stale `ois` is passed as the
+    // receiver of the NEXT `readObject`, and the interpreter's getfield
+    // receiver barrier then faults reading a reclaimed header
+    // (`VmHeap::load_and_forward`); a stale `this` faults in
+    // `native_map_put_evict`'s `object_num_fields`. Pin both across the whole
+    // replay and re-read after every GC-capable call. `key` has to survive the
+    // second `readObject` too, so it is pinned across it.
     for _ in 0..n {
         let key = ctx
             .invoke(
@@ -22961,6 +23068,8 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 &[Value::Object(Some(ois))],
             )?
             .unwrap_or(Value::Object(None));
+        ois = ctx.read_native_pin(ois_pin, ois);
+        let key_pin = pin_value(ctx, key);
         let value = ctx
             .invoke(
                 ois_cls,
@@ -22969,6 +23078,9 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 &[Value::Object(Some(ois))],
             )?
             .unwrap_or(Value::Object(None));
+        ois = ctx.read_native_pin(ois_pin, ois);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        this = ctx.read_native_pin(this_pin, this);
         // evict=false mirrors HotSpot's `HashMap.readObject`, which calls
         // `putVal(hash, key, value, false, false)`: the trailing `evict=false`
         // suppresses `afterNodeInsertion`'s `removeEldestEntry` callback while
@@ -22980,7 +23092,17 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // `NullPointerException: Cannot invoke
         // "...removeEldestEntry(...)" because "this.this$0" is null`.
         native_map_put_evict(ctx, &[Value::Object(Some(this)), key, value], false)?;
+        // `native_map_put_evict` itself runs bytecode (hashCode/equals on the
+        // key, plus table growth), so refresh the pinned receiver once more
+        // before the next iteration reuses it.
+        this = ctx.read_native_pin(this_pin, this);
+        ois = ctx.read_native_pin(ois_pin, ois);
+        if key_pin != usize::MAX {
+            ctx.unpin_native_roots(key_pin);
+        }
     }
+    ctx.unpin_native_roots(ois_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
@@ -29455,6 +29577,17 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
 fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
     let elems = collect_collection_elements(ctx, coll);
     if !elems.is_empty() {
+        if heuristic_snapshot_is_suspect(ctx, coll, &elems) {
+            // A plausible-looking but null-holed snapshot of a foreign
+            // non-List collection — see `heuristic_snapshot_is_suspect`. Every
+            // caller of this helper (addAll / removeAll / retainAll /
+            // containsAll / hashCode / copy ctors) is off the iterator
+            // native's path, so driving the real `iterator()` is safe.
+            let real = collect_via_real_iterator_once(ctx, coll);
+            if !real.is_empty() {
+                return real;
+            }
+        }
         return elems;
     }
     let real_size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
@@ -36134,6 +36267,174 @@ fn chm_init_segments(
     // segments array length, which is always a power of two.
 }
 
+/// `ConcurrentHashMap.writeObject(ObjectOutputStream)`.
+///
+/// CratonVM keeps a `ConcurrentHashMap`'s entries in the segmented native
+/// layout rooted at `CHM_FIELD_SEGMENTS`, NOT in the real JDK's `table` field
+/// (which stays null for the object's whole life). The JDK's own
+/// `writeObject` walks `table` with a `Traverser`, so it found nothing and
+/// serialised EVERY `ConcurrentHashMap` as EMPTY -- `deser(ser(chm)).size()`
+/// was 0 for a two-entry map, while `HashMap` (whose natives do maintain the
+/// real bucket layout) round-tripped fine.
+///
+/// Real-world fallout: Spring's `PersistenceAnnotationBeanPostProcessor`
+/// tracks extended `EntityManager`s to close in a
+/// `ConcurrentHashMap<Object, EntityManager>`. Serialising a `SimpleMapScope`
+/// carries that post-processor along; after deserialisation the map came back
+/// empty, so `postProcessBeforeDestruction` found no EM to close and
+/// `PersistenceInjectionTests.publicExtendedPersistenceContextSetterWith\
+/// Serialization` failed on `assertThat(DummyInvocationHandler.closed).isTrue()`.
+///
+/// This emits the JDK's serial form byte-for-byte compatibly: the three
+/// `serialPersistentFields` (`segments`, `segmentShift`, `segmentMask`),
+/// then alternating key/value objects, then two nulls as the terminator.
+/// `segments` is written as null -- the JDK writes a freshly built,
+/// entry-free `Segment[16]` there purely for pre-Java-8 stream compatibility
+/// and its own `readObject` discards the value without dereferencing it, so a
+/// null is accepted by both HotSpot's reader and ours.
+fn native_chm_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let stream_pin = ctx.pin_native_root(stream);
+
+    let result = (|| -> MethodCallResult {
+        // --- serialPersistentFields, in the JDK's declaration order.
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        let put_field = match ctx.invoke_virtual(
+            stream,
+            "putFields",
+            "()Ljava/io/ObjectOutputStream$PutField;",
+            &[],
+        )? {
+            Some(Value::Object(Some(pf))) => pf,
+            _ => return Ok(None),
+        };
+        let pf_pin = ctx.pin_native_root(put_field);
+        for (name, value) in [
+            ("segments", Value::Object(None)),
+            // DEFAULT_CONCURRENCY_LEVEL is 16 => ssize 16, sshift 4.
+            ("segmentShift", Value::Int(32 - 4)),
+            ("segmentMask", Value::Int(16 - 1)),
+        ] {
+            let name_obj = ctx.create_string(name);
+            let put_field = ctx.read_native_pin(pf_pin, put_field);
+            let desc = if matches!(value, Value::Int(_)) {
+                "(Ljava/lang/String;I)V"
+            } else {
+                "(Ljava/lang/String;Ljava/lang/Object;)V"
+            };
+            ctx.invoke_virtual(
+                put_field,
+                "put",
+                desc,
+                &[Value::Object(Some(name_obj)), value],
+            )?;
+        }
+        ctx.unpin_native_roots(pf_pin);
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        ctx.invoke_virtual(stream, "writeFields", "()V", &[])?;
+
+        // --- key/value pairs, then the two-null terminator.
+        let this = ctx.read_native_pin(this_pin, this);
+        let entries = collect_entries_any(ctx, this);
+        let flat: Vec<Value> = entries.iter().flat_map(|(k, v)| [*k, *v]).collect();
+        let (_, flat_pins) = pin_value_slice(ctx, &flat);
+        for i in 0..flat.len() {
+            let v = read_pinned_elem(ctx, flat_pins[i], flat[i]);
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            ctx.invoke_virtual(stream, "writeObject", "(Ljava/lang/Object;)V", &[v])?;
+        }
+        for _ in 0..2 {
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            ctx.invoke_virtual(
+                stream,
+                "writeObject",
+                "(Ljava/lang/Object;)V",
+                &[Value::Object(None)],
+            )?;
+        }
+        Ok(None)
+    })();
+
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+/// `ConcurrentHashMap.readObject(ObjectInputStream)` -- the read side of
+/// [`native_chm_write_object`].
+///
+/// The JDK body rebuilds the real `table`, which our `get`/`size`/`entrySet`
+/// natives never look at, so even a correctly written stream would have
+/// deserialised to a map that reads as empty. Read the same wire form and
+/// funnel every pair through the segmented native layout instead.
+///
+/// The stream allocates the instance without running any `<init>`, so the
+/// segments array is absent on entry and has to be built before the first
+/// `put` (`chm_segment_for` would otherwise answer `None` and silently drop
+/// every entry).
+fn native_chm_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let this_pin = ctx.pin_native_root(this);
+    let stream_pin = ctx.pin_native_root(stream);
+
+    let result = (|| -> MethodCallResult {
+        let stream = ctx.read_native_pin(stream_pin, stream);
+        ctx.invoke_virtual(stream, "defaultReadObject", "()V", &[])?;
+
+        let this = ctx.read_native_pin(this_pin, this);
+        if !matches!(
+            ctx.get_field(this, CHM_FIELD_SEGMENTS),
+            Value::Object(Some(_))
+        ) {
+            chm_init_segments(
+                ctx,
+                this,
+                CHM_DEFAULT_INIT_SEGMENTS,
+                CHM_DEFAULT_SEGMENT_CAP,
+            );
+        }
+
+        loop {
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            let key = match ctx.invoke_virtual(stream, "readObject", "()Ljava/lang/Object;", &[])? {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => break,
+            };
+            let key_pin = pin_value(ctx, key);
+            let stream = ctx.read_native_pin(stream_pin, stream);
+            let val = match ctx.invoke_virtual(stream, "readObject", "()Ljava/lang/Object;", &[])? {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => {
+                    ctx.unpin_native_roots(key_pin);
+                    break;
+                }
+            };
+            let key = read_pinned_elem(ctx, key_pin, key);
+            let this = ctx.read_native_pin(this_pin, this);
+            native_chm_put(ctx, &[Value::Object(Some(this)), key, val])?;
+            ctx.unpin_native_roots(key_pin);
+        }
+        Ok(None)
+    })();
+
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -36144,6 +36445,27 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "<init>", "(I)V", native_chm_init_capacity);
     r.register(c, "<init>", "(IFI)V", native_chm_init_full);
     r.register(c, "<init>", "(Ljava/util/Map;)V", native_chm_init_from_map);
+
+    // Java serialization -- the real JDK bodies walk/rebuild the `table`
+    // field that CratonVM's segmented layout never populates, so a CHM
+    // round-tripped through ObjectOutputStream came back EMPTY. See
+    // `native_chm_write_object`. Both are private and reached through
+    // `ObjectStreamClass.invokeWriteObject`/`invokeReadObject`'s reflective
+    // `Method.invoke`, so they also need the
+    // `force_native_over_real_jdk_bytecode` entry (interpreter.rs) to beat
+    // the real bytecode.
+    r.register(
+        c,
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
+        native_chm_write_object,
+    );
+    r.register(
+        c,
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+        native_chm_read_object,
+    );
 
     // Core operations — segmented
     r.register(c, "size", "()I", native_chm_size);
@@ -36787,6 +37109,86 @@ fn chm_seg_get(
     Ok(None)
 }
 
+/// Allocation-free String-key fast path for `ConcurrentHashMap.get`, the direct
+/// analogue of [`native_hashmap_get_string_fast`] on the HashMap side.
+///
+/// String hashing and equality are *final, pure* operations: they run no Java
+/// code and therefore cannot trigger a collection. That removes the reason for
+/// nearly everything the general [`chm_seg_get`] path pays per lookup — the
+/// receiver/key pinning, a second `map_hash_key`, and above all the
+/// snapshot-the-entire-chain-into-two-heap-allocated-`Vec`s dance, which exists
+/// only so a *user-defined* `equals` cannot observe a half-relinked chain or
+/// re-enter a resize and self-deadlock on the stripe lock. With no user code in
+/// play the chain can simply be walked in place under the read lock, exactly
+/// like a JDK lock-free `get`.
+///
+/// `native_chm_get` measured 6920 cycles/call without this path — 6x the
+/// equivalent HashMap lookup — which is what made `CharsetCache.getCharset` (a
+/// `ConcurrentMap<String,Charset>` probe) lose to the *uncached*
+/// `Charset.forName` baseline in `TestCharsetCachePerformance`.
+///
+/// Returns `None` — meaning "fall through to the general path, unchanged" —
+/// whenever anything is not a plain `java.lang.String`: a non-String lookup
+/// key, or a chain containing any non-String key. Mixed-key maps and every
+/// exotic key type (enums, Thread mirrors, user-defined `equals`) therefore run
+/// exactly the code they ran before.
+fn native_chm_get_string_fast(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: ObjectRef,
+) -> Option<Value> {
+    let raw_hash = ctx.java_string_hash_code(key)?;
+    // Same spreading `map_hash_key` applies — this must agree with whatever
+    // bucket `put` chose.
+    let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
+    let seg = chm_segment_for(ctx, this, hash)?;
+    // The same stripe read lock the general path takes, for the same reason:
+    // serialize against `map_resize_concurrent`'s in-place NEXT relinking.
+    let seg_id = ctx.identity_hash_code(seg);
+    let _read_guard = chm_seg_lock_for(seg_id).read();
+    let buckets = match ctx.get_field_volatile(seg, MAP_FIELD_BUCKETS) {
+        Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
+        _ => return Some(Value::Object(None)),
+    };
+    let cap = ctx.array_length(buckets) as i32;
+    if cap <= 0 {
+        return Some(Value::Object(None));
+    }
+    let mut node_value = ctx.get_array_element(buckets, map_bucket_index(hash, cap));
+    const CHAIN_WALK_LIMIT: usize = 4096;
+    for _ in 0..CHAIN_WALK_LIMIT {
+        let Value::Object(Some(node)) = node_value else {
+            return Some(Value::Object(None));
+        };
+        let Value::Object(Some(node_key)) = get_node_key(ctx, node) else {
+            // CHM rejects null keys, so this is an unexpected node shape —
+            // defer to the general path rather than guessing.
+            return None;
+        };
+        match ctx.java_strings_equal(node_key, key) {
+            Some(true) => {
+                let value = get_node_value(ctx, node);
+                // An in-flight `computeIfAbsent` parks the segment object
+                // itself in the value slot as a reservation marker; lock-free
+                // readers must read that as absent, exactly as `chm_seg_get`
+                // does (CHM-mapper-deadlock fix, 2026-07-21).
+                if let Value::Object(Some(v)) = value {
+                    if std::ptr::eq(v.as_ptr(), seg.as_ptr()) {
+                        return Some(Value::Object(None));
+                    }
+                }
+                return Some(value);
+            }
+            Some(false) => {}
+            // A non-String key on the chain — hand the whole lookup back so
+            // the general path's full equality ladder decides.
+            None => return None,
+        }
+        node_value = ctx.get_field_volatile(node, NODE_FIELD_NEXT);
+    }
+    None
+}
+
 pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -36794,6 +37196,11 @@ pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     chm_reject_null_key(&key)?;
+    if let Value::Object(Some(key_object)) = key {
+        if let Some(value) = native_chm_get_string_fast(ctx, this, key_object) {
+            return Ok(Some(value));
+        }
+    }
     let this_pin = ctx.pin_native_root(this);
     let key_pin = pin_value(ctx, key);
     let key = read_pinned_elem(ctx, key_pin, key);
@@ -41110,18 +41517,39 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let mut target = args.get(1).cloned().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Int(0))),
+    // Stub-removal wave 2 (2026-07-28): `al_state` only understands the
+    // ArrayList shape (field 0 = backing array, field 1 = size). EVERY other
+    // Collection — `Arrays.asList` (an `Arrays$ArrayList`), `HashSet`,
+    // `LinkedList`, any user Collection — fell into the `None` arm and
+    // reported frequency 0, i.e. "this element does not occur", for a
+    // collection full of matches. Measured against HotSpot 25:
+    // Arrays.asList 3 -> 0, HashSet 1 -> 0, LinkedList 2 -> 0.
+    // Drive the receiver's own `toArray()` instead; every Collection has one.
+    let (data, size) = match data {
+        Some(d) => (d, size),
+        None => {
+            let coll_pin = ctx.pin_native_root(coll);
+            let target_pin = pin_value(ctx, target);
+            let arr = ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])?;
+            target = read_pinned_elem(ctx, target_pin, target);
+            ctx.unpin_native_roots(coll_pin);
+            match arr {
+                Some(Value::Object(Some(a))) => {
+                    let n = ctx.array_length(a) as i32;
+                    (a, n)
+                }
+                _ => return Ok(Some(Value::Int(0))),
+            }
+        }
     };
     // Family-1 fix (cce0079): pinned scan (counts every match, so no
     // early-exit helper).
     let data_pin = ctx.pin_native_root(data);
     let th = pin_value(ctx, target);
     let mut data = data;
-    let mut target = target;
+
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
@@ -44724,6 +45152,16 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- ForkJoinPool.awaitQuiescence ---
+    //
+    // KEEP (W2 stub sweep). `true` means "the pool became quiescent within the
+    // timeout", and that is unconditionally the truth for CratonVM's
+    // ForkJoinPool: `phases_early`'s `register_forkjoin_natives` AND its
+    // real-JDK twin `register_real_jdk_forkjoin_essentials` both override
+    // `fork`/`invoke`/`submit`/`join` to run `compute()` INLINE on the calling
+    // thread, so no task is ever outstanding in a worker by the time any thread
+    // can observe the pool. It is consistent with the `getActiveThreadCount()
+    // == 0` / `getQueuedTaskCount() == 0` pair in that same file. Waiting or
+    // returning false here would only ever be a wait for nothing.
     let pool = "java/util/concurrent/ForkJoinPool";
     r.register(
         pool,

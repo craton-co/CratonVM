@@ -405,11 +405,17 @@ pub mod incomplete_reason {
     /// A live compiled frame's spill band could not be bounded (no exact RBP or
     /// no recorded frame size), so "every oop is published" is unverifiable.
     pub const UNBOUNDED_FRAME_BAND: usize = 11;
+    /// The innermost RBP recorded for a chain entry belongs to a DEEPER frame
+    /// that was entered by a direct JIT->JIT call (the inline MIC/PIC cascade
+    /// or the hashed megamorphic stub), which pushes no guard. The entry's
+    /// `compiled_method` therefore does not describe the frame at that RBP, so
+    /// neither its coverage nor its oop slots can be resolved.
+    pub const FOREIGN_INNERMOST_RBP: usize = 12;
 
     /// One past the highest defined reason code. Sizes the per-reason counter
     /// array; a new variant must bump it (asserted by
     /// `every_incomplete_reason_has_a_label`).
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 13;
 
     /// Human-readable label for a reason code (for the fallback diagnostic).
     pub fn label(code: usize) -> &'static str {
@@ -426,6 +432,7 @@ pub mod incomplete_reason {
             XT_HELPER_WINDOW => "xt-helper-window-conservative-scan",
             UNPUBLISHED_FRAME_OOP => "compiled-frame-oop-not-published",
             UNBOUNDED_FRAME_BAND => "compiled-frame-band-unbounded",
+            FOREIGN_INNERMOST_RBP => "innermost-rbp-belongs-to-unguarded-callee",
             _ => "unknown",
         }
     }
@@ -443,6 +450,7 @@ pub mod incomplete_reason {
 // reason as every other counter in this module.
 #[cfg(not(test))]
 static MOVING_YOUNG_REASON_COUNTS: [AtomicUsize; incomplete_reason::COUNT] = [
+    AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
@@ -802,6 +810,30 @@ pub fn take_major_gc_request() -> bool {
         c.set(false);
         v
     })
+}
+
+/// Will the young half of the collection this thread is about to initiate
+/// certainly take the NON-MOVING young marker?
+///
+/// The non-moving young marker (`gen_heap::mark_young_precise_object`) follows
+/// the loader-scoped side-table edges — `loader_pin`, `mirror_pin` and
+/// `metadata_pin` — as ordinary marking edges. The MOVING (Cheney) young
+/// closure does not: it seeds strictly from the direct root set. So a young
+/// object reachable ONLY through one of those side tables can safely be left
+/// out of the unconditional root set exactly when this returns true, and must
+/// be rooted directly otherwise.
+///
+/// Mirrors `GenerationalHeap::collect_garbage_inner`'s `divert_non_moving`
+/// decision, but deliberately only in its *certain* direction: every term here
+/// forces the non-moving sweep on its own, and the two switches that could
+/// still route a cycle back to the moving path (`CRATONVM_MOVING_YOUNG`,
+/// `CRATONVM_DBG_FORCE_MOVING`) veto it. A false negative merely costs one
+/// extra conservative root; a false positive would DROP a live root, so this
+/// errs strictly toward `false`.
+pub fn young_marker_follows_side_tables() -> bool {
+    !crate::gc_flags().dbg_force_moving
+        && !moving_young_enabled()
+        && (is_active() || unregistered_jit_frame_on_stack() || major_gc_requested())
 }
 
 // ---------------------------------------------------------------------------

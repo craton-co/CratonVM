@@ -3137,10 +3137,14 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
     );
 
     let flow_sub = "java/util/concurrent/Flow$Subscription";
-    registry.register(flow_sub, "request", "(J)V", |_ctx, _args| {
-        // No-op for default subscription
-        Ok(None)
-    });
+    // SUPERSEDED — do not "fix" this in place. `streams::register_stream_overrides`
+    // is called from lib.rs IMMEDIATELY after `register_concurrent_natives`
+    // (in both run modes) precisely to replace this no-op with
+    // `native_flow_request`, a real saturating-add demand counter; a unit test
+    // (`register_stream_overrides_installs_flow_subscription_request`) asserts
+    // that override is installed. The no-op below never runs. It is kept so the
+    // triple exists even if a caller registers only this module.
+    registry.register(flow_sub, "request", "(J)V", |_ctx, _args| Ok(None));
     registry.register(flow_sub, "cancel", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -4742,10 +4746,20 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
         native_fut_get_timed,
     );
     registry.register(fut, "isDone", "()Z", native_fut_is_done);
-    registry.register(fut, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    registry.register(fut, "isCancelled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    // Real cancel/isCancelled over the shared future layout (field
+    // FUT_FIELD_DONE: 0=pending, 1=normal, 2=exceptional, 3=cancelled) — the
+    // same encoding `cf.cancel`/`cf.isCancelled` above use. The previous
+    // constant `false` made every `Future.cancel(..)` fail and every
+    // `isCancelled()` deny a cancellation that had in fact happened, so
+    // `while (!f.isCancelled())` loops never terminated.
+    //
+    // NOTE (registration order): `register_phase55_executors`
+    // (phases_late/concurrent.rs) re-registers all three of
+    // `java/util/concurrent/Future`'s isDone/isCancelled/cancel LATER in
+    // `register_synthetic_overrides`, so on the interface triple that one wins.
+    // These stay correct-by-construction in case that order changes.
+    registry.register(fut, "cancel", "(Z)Z", native_fut_cancel);
+    registry.register(fut, "isCancelled", "()Z", native_fut_is_cancelled);
 
     // FutureTask
     registry.register(ft, "get", "()Ljava/lang/Object;", native_fut_get);
@@ -4756,10 +4770,14 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
         native_fut_get_timed,
     );
     registry.register(ft, "isDone", "()Z", native_fut_is_done);
-    registry.register(ft, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    registry.register(ft, "isCancelled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    // Synthetic FutureTask uses the same (result=0, done=1) layout — see the
+    // `alloc_concurrent_synthetic(.., "java/util/concurrent/FutureTask", 2)`
+    // call sites in phases_late/net_channels.rs. Nothing else registers
+    // FutureTask.cancel/isCancelled, so the old constant `false` pair was the
+    // live answer: `FutureTask.cancel(true)` could never succeed and a
+    // cancelled task still reported `isCancelled() == false`.
+    registry.register(ft, "cancel", "(Z)Z", native_fut_cancel);
+    registry.register(ft, "isCancelled", "()Z", native_fut_is_cancelled);
 
     // CompletableFuture timed get
     registry.register(
@@ -4768,6 +4786,44 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         native_fut_get_timed,
     );
+}
+
+/// `Future.cancel(boolean)` / `FutureTask.cancel(boolean)` over the shared
+/// synthetic future layout. `FUT_FIELD_DONE` encodes 0=pending, 1=completed
+/// normally, 2=completed exceptionally, 3=cancelled (the encoding
+/// `CompletableFuture.cancel` already used). Per the `Future` contract this
+/// returns false when the task has already completed and true once the task is
+/// (or already was) cancelled.
+fn native_fut_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let done = match ctx.get_field(this, FUT_FIELD_DONE) {
+        Value::Int(d) => d,
+        _ => 0,
+    };
+    if done == 3 {
+        // Already cancelled — the JDK returns true for repeated cancel().
+        return Ok(Some(Value::Int(1)));
+    }
+    if done != 0 {
+        // Already completed normally/exceptionally: cannot cancel.
+        return Ok(Some(Value::Int(0)));
+    }
+    ctx.set_field(this, FUT_FIELD_DONE, Value::Int(3));
+    Ok(Some(Value::Int(1)))
+}
+
+/// `Future.isCancelled()` / `FutureTask.isCancelled()` — see
+/// [`native_fut_cancel`] for the `FUT_FIELD_DONE` encoding.
+fn native_fut_is_cancelled(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cancelled = matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(3));
+    Ok(Some(Value::Int(if cancelled { 1 } else { 0 })))
 }
 
 fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5239,7 +5295,100 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // Phase 34: ReadWriteLock, Atomic extras, LongAdder
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// Real AQS long state
+// ---------------------------------------------------------------------------
+//
+// JDK 25's ReentrantReadWriteLock uses AbstractQueuedLongSynchronizer.  Its
+// state word is only ever reached through these final protected methods by the
+// real lock implementation, but the generic Unsafe CAS path stores a 64-bit
+// value in CratonVM's 16-byte Value slot.  Keep the JDK queue and lock
+// algorithm intact while placing that one scalar state word in an AtomicI64.
+// The side table is keyed with the same moving-GC-stable identity protocol as
+// the other native lock state tables.
+fn aqls_state_table(
+) -> &'static parking_lot::Mutex<
+    std::collections::HashMap<usize, std::sync::Arc<std::sync::atomic::AtomicI64>>,
+> {
+    static TABLE: std::sync::OnceLock<
+        parking_lot::Mutex<
+            std::collections::HashMap<usize, std::sync::Arc<std::sync::atomic::AtomicI64>>,
+        >,
+    > = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn aqls_state_slot(
+    ctx: &mut dyn NativeContext,
+    synchronizer: ObjectRef,
+) -> std::sync::Arc<std::sync::atomic::AtomicI64> {
+    let key = gc_stable_lock_key(ctx, synchronizer);
+    let mut table = aqls_state_table().lock();
+    table
+        .entry(key)
+        // AbstractQueuedLongSynchronizer initializes `state` to zero. Every
+        // later Java-side transition goes through the three forced natives
+        // registered below, including deserialization's `setState` path.
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)))
+        .clone()
+}
+
+fn native_aqls_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(synchronizer))) = args.first() else {
+        return Ok(Some(Value::Long(0)));
+    };
+    let state = aqls_state_slot(ctx, *synchronizer)
+        .load(std::sync::atomic::Ordering::SeqCst);
+    Ok(Some(Value::Long(state)))
+}
+
+fn native_aqls_set_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (Some(Value::Object(Some(synchronizer))), Some(Value::Long(state))) =
+        (args.first(), args.get(1))
+    else {
+        return Ok(None);
+    };
+    aqls_state_slot(ctx, *synchronizer).store(*state, std::sync::atomic::Ordering::SeqCst);
+    Ok(None)
+}
+
+fn native_aqls_compare_and_set_state(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let (
+        Some(Value::Object(Some(synchronizer))),
+        Some(Value::Long(expected)),
+        Some(Value::Long(new_state)),
+    ) = (args.first(), args.get(1), args.get(2))
+    else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let swapped = aqls_state_slot(ctx, *synchronizer)
+        .compare_exchange(
+            *expected,
+            *new_state,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok();
+    Ok(Some(Value::Int(i32::from(swapped))))
+}
+
+fn register_aqls_state_natives(registry: &mut NativeMethodRegistry) {
+    let aqls = "java/util/concurrent/locks/AbstractQueuedLongSynchronizer";
+    registry.register(aqls, "getState", "()J", native_aqls_get_state);
+    registry.register(aqls, "setState", "(J)V", native_aqls_set_state);
+    registry.register(
+        aqls,
+        "compareAndSetState",
+        "(JJ)Z",
+        native_aqls_compare_and_set_state,
+    );
+}
+
 pub(crate) fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
+    register_aqls_state_natives(registry);
     // Real AQS is the default (and is explicitly enabled by the Spring Boot
     // runner).  Its `ReentrantReadWriteLock` constructor creates real
     // ReadLock/WriteLock views whose `sync` field points at the real nested
@@ -7267,7 +7416,11 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/StructuredTaskScope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
+            // Do not downgrade an already shut-down / closed scope (state 2):
+            // `shutdown(); join();` must leave isShutdown() == true.
+            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
+                ctx.set_field(this, 1, Value::Int(1));
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -7277,7 +7430,9 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         "(Ljava/time/Instant;)Ljava/util/concurrent/StructuredTaskScope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
+            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
+                ctx.set_field(this, 1, Value::Int(1));
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -7286,7 +7441,15 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int(2));
         Ok(None)
     });
-    r.register(scope, "shutdown", "()V", |_ctx, _args| Ok(None));
+    // shutdown() must be observable by isShutdown() below (which tests
+    // field 1 == 2). The former no-op meant `scope.shutdown();
+    // scope.isShutdown()` answered false, so ShutdownOn*-style loops that
+    // poll for the shutdown flag never saw it and kept forking subtasks.
+    r.register(scope, "shutdown", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 1, Value::Int(2));
+        Ok(None)
+    });
     r.register(scope, "isShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(
@@ -8984,5 +9147,55 @@ mod concurrency_tests {
             &[Value::Object(Some(t)), Value::Long(0), Value::Int(1)],
         );
         assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn aqls_state_natives_preserve_atomic_long_transitions() {
+        let mut ctx = make_ctx();
+        let synchronizer = ctx.alloc_object(cratonvm_types::ClassId::new(0), 4);
+
+        assert_eq!(
+            native_aqls_get_state(&mut ctx, &[Value::Object(Some(synchronizer))])
+                .unwrap()
+                .unwrap(),
+            Value::Long(0)
+        );
+        native_aqls_set_state(
+            &mut ctx,
+            &[Value::Object(Some(synchronizer)), Value::Long(4)],
+        )
+        .unwrap();
+        assert_eq!(
+            native_aqls_compare_and_set_state(
+                &mut ctx,
+                &[
+                    Value::Object(Some(synchronizer)),
+                    Value::Long(4),
+                    Value::Long(8),
+                ],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(1)
+        );
+        assert_eq!(
+            native_aqls_compare_and_set_state(
+                &mut ctx,
+                &[
+                    Value::Object(Some(synchronizer)),
+                    Value::Long(4),
+                    Value::Long(12),
+                ],
+            )
+            .unwrap()
+            .unwrap(),
+            Value::Int(0)
+        );
+        assert_eq!(
+            native_aqls_get_state(&mut ctx, &[Value::Object(Some(synchronizer))])
+                .unwrap()
+                .unwrap(),
+            Value::Long(8)
+        );
     }
 }

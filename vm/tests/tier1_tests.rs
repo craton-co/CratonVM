@@ -1310,7 +1310,11 @@ fn t9_stub_audit_counts_match_census() {
         "lib.rs",
         "phases_late.rs",
         "phases_early.rs",
-        "crypto.rs",
+        // NOTE: `crypto.rs` used to be listed here and DOES NOT EXIST. Because
+        // the read below used `unwrap_or_default()`, it silently contributed 0
+        // for however long it has been stale — a phantom entry that made the
+        // gate look broader than it was. The read is now a hard error (see
+        // below) so the next phantom is caught immediately.
         "tls.rs",
         "serialization.rs",
         "jmx.rs",
@@ -1320,6 +1324,12 @@ fn t9_stub_audit_counts_match_census() {
         "aot.rs",
         "classfile_api.rs",
         "lang_string.rs",
+        // NOTE: `tests_extracted.rs` is DEAD SOURCE — there is no
+        // `mod tests_extracted;` anywhere in the tree, so it is never
+        // compiled and its registrations never run. It is deliberately still
+        // counted here (conservatively) so that wiring it back in cannot
+        // smuggle in uncounted stubs; the census records why its ~9 remaining
+        // hits are not real.
         "tests_extracted.rs",
     ];
 
@@ -1328,10 +1338,15 @@ fn t9_stub_audit_counts_match_census() {
     let mut total_ret_false = 0usize;
     let mut total_ret_null = 0usize;
     let mut total_ret_zero = 0usize;
+    let mut total_ret_true = 0usize;
 
     for file in &files {
         let path = format!("{}{}", base, file);
-        let src = std::fs::read_to_string(&path).unwrap_or_default();
+        // Hard error, not `unwrap_or_default()`: a file listed here that does
+        // not exist must fail loudly rather than contribute a silent 0.
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("T9 GATE: cannot read audited file {path}: {e}. If the file was renamed or removed, update this list AND docs/stub-census.md.")
+        });
         // Count only actual registrations, not function definitions,
         // imports, comments, or test code.
         let mut in_use_block = false;
@@ -1375,10 +1390,21 @@ fn t9_stub_audit_counts_match_census() {
             if trimmed.contains("native_return_zero") && !trimmed.starts_with("pub") {
                 total_ret_zero += 1;
             }
+            // `native_return_true` is a seventh constant helper that this gate
+            // did not count at all until 2026-07-27. An always-true predicate
+            // is exactly as wrong as an always-false one.
+            if trimmed.contains("native_return_true") && !trimmed.starts_with("pub") {
+                total_ret_true += 1;
+            }
         }
     }
 
-    let total = total_noop + total_with_this + total_ret_false + total_ret_null + total_ret_zero;
+    let total = total_noop
+        + total_with_this
+        + total_ret_false
+        + total_ret_null
+        + total_ret_zero
+        + total_ret_true;
 
     // These counts are the documented census from docs/stub-census.md.
     // Update BOTH the census doc AND these assertions when stubs change.
@@ -1386,25 +1412,47 @@ fn t9_stub_audit_counts_match_census() {
     // Direction: counts should only go DOWN (stubs replaced with real
     // impls) or STAY THE SAME (no change). A count going UP means a
     // new stub was added, which this test should flag for review.
+    // Ceilings tightened to the exact post-sweep actuals (2026-07-27), down
+    // from total<=250 / noop<=65 / ret_false<=15. Every category is now
+    // capped — `native_noop_with_this`, `native_return_null` and
+    // `native_return_zero` were previously uncapped, which is how
+    // `with_this` reached 92 unremarked.
     assert!(
-        total <= 250,
-        "T9 GATE: total stub count ({total}) exceeds census ceiling (250). \
+        total <= 67,
+        "T9 GATE: total stub count ({total}) exceeds census ceiling (67). \
          If you added a new stub, justify it in docs/stub-census.md. \
-         If you converted stubs to real impls, update the ceiling."
+         If you converted stubs to real impls, LOWER the ceiling."
     );
     assert!(
-        total_noop <= 65,
-        "T9 GATE: native_noop count ({total_noop}) exceeds ceiling (65)"
+        total_noop <= 47,
+        "T9 GATE: native_noop count ({total_noop}) exceeds ceiling (47)"
     );
     assert!(
-        total_ret_false <= 15,
-        "T9 GATE: native_return_false count ({total_ret_false}) exceeds ceiling (15)"
+        total_with_this <= 14,
+        "T9 GATE: native_noop_with_this count ({total_with_this}) exceeds ceiling (14)"
+    );
+    assert!(
+        total_ret_false <= 4,
+        "T9 GATE: native_return_false count ({total_ret_false}) exceeds ceiling (4)"
+    );
+    assert!(
+        total_ret_null == 0,
+        "T9 GATE: native_return_null count ({total_ret_null}) must stay 0 — \
+         every site was replaced with a real implementation on 2026-07-27"
+    );
+    assert!(
+        total_ret_zero <= 1,
+        "T9 GATE: native_return_zero count ({total_ret_zero}) exceeds ceiling (1)"
+    );
+    assert!(
+        total_ret_true <= 1,
+        "T9 GATE: native_return_true count ({total_ret_true}) exceeds ceiling (1)"
     );
 
     eprintln!(
         "[t9] Stub audit: noop={total_noop}, with_this={total_with_this}, \
          ret_false={total_ret_false}, ret_null={total_ret_null}, \
-         ret_zero={total_ret_zero}, TOTAL={total}"
+         ret_zero={total_ret_zero}, ret_true={total_ret_true}, TOTAL={total}"
     );
 }
 

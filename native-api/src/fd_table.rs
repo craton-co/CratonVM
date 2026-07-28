@@ -143,8 +143,20 @@ enum FileEntry {
     FileWrite(Mutex<BufWriter<fs::File>>),
     /// Read+write access for AsynchronousFileChannel / RandomAccessFile
     FileReadWrite(Mutex<fs::File>),
-    /// UDP socket for DatagramChannel
-    UdpSocket(Mutex<std::net::UdpSocket>),
+    /// UDP socket for DatagramChannel.
+    ///
+    /// Deliberately NOT behind a `Mutex`: every `std::net::UdpSocket` method
+    /// this table calls takes `&self`, so the lock bought no safety — it only
+    /// serialized send against receive. A datagram receiver parks inside
+    /// `recv_from` for its whole `SO_TIMEOUT`, so holding a lock across that
+    /// syscall stalled every concurrent `send` on the same socket by up to
+    /// that timeout. Tomcat Tribes runs exactly that shape (one
+    /// `McastServiceImpl` socket, a receiver thread polling on a 500 ms
+    /// `soTimeout` and a sender thread announcing every 500 ms), so its
+    /// membership announcements went out a whole poll interval late at random
+    /// and peer discovery ran up to a second behind HotSpot's few
+    /// milliseconds.
+    UdpSocket(std::net::UdpSocket),
     /// TCP stream socket (SocketChannel)
     TcpStream(Mutex<std::net::TcpStream>),
     /// TCP listener socket (ServerSocketChannel).
@@ -1130,7 +1142,7 @@ impl FileDescriptorTable {
         disable_udp_connreset(&socket);
         self.entries
             .write()
-            .insert(fd, Arc::new(FileEntry::UdpSocket(Mutex::new(socket))));
+            .insert(fd, Arc::new(FileEntry::UdpSocket(socket)));
         Ok(fd)
     }
 
@@ -1172,7 +1184,7 @@ impl FileDescriptorTable {
         disable_udp_connreset(&udp);
         self.entries
             .write()
-            .insert(fd, Arc::new(FileEntry::UdpSocket(Mutex::new(udp))));
+            .insert(fd, Arc::new(FileEntry::UdpSocket(udp)));
         Ok(fd)
     }
 
@@ -1182,10 +1194,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp send"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => {
-                let s = sock.lock();
-                s.send_to(data, target)
-            }
+            FileEntry::UdpSocket(sock) => sock.send_to(data, target),
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for udp send",
@@ -1203,7 +1212,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp connect"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => sock.lock().connect(target),
+            FileEntry::UdpSocket(sock) => sock.connect(target),
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for udp connect",
@@ -1217,7 +1226,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp write"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => sock.lock().send(data),
+            FileEntry::UdpSocket(sock) => sock.send(data),
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for udp write",
@@ -1232,7 +1241,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp clone"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => sock.lock().try_clone(),
+            FileEntry::UdpSocket(sock) => sock.try_clone(),
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "bad fd for udp clone",
@@ -1247,8 +1256,7 @@ impl FileDescriptorTable {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp recv"))?;
         match &*entry {
             FileEntry::UdpSocket(sock) => {
-                let s = sock.lock();
-                let (n, addr) = s.recv_from(buf)?;
+                let (n, addr) = sock.recv_from(buf)?;
                 Ok((n, addr.to_string()))
             }
             _ => Err(io::Error::new(
@@ -1264,7 +1272,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => sock.lock().set_nonblocking(nonblocking),
+            FileEntry::UdpSocket(sock) => sock.set_nonblocking(nonblocking),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1275,7 +1283,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(sock) => Ok(sock.lock().local_addr()?.to_string()),
+            FileEntry::UdpSocket(sock) => Ok(sock.local_addr()?.to_string()),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1513,10 +1521,9 @@ impl FileDescriptorTable {
                 // primitive: it neither flips the socket's persistent
                 // blocking mode nor consumes the pending datagram, so a
                 // concurrent blocking `udp_recv` on the same fd can never
-                // observe a transient non-blocking window. The lock is
-                // still taken so the raw handle stays valid for the call.
-                let s = sock.lock();
-                poll_socket_readiness(&*s)
+                // observe a transient non-blocking window. The `Arc<FileEntry>`
+                // clone taken above keeps the raw handle alive for the call.
+                poll_socket_readiness(sock)
             }
             FileEntry::TcpStream(stream) => {
                 // Non-destructive readiness probe — see the UdpSocket arm.
@@ -1832,11 +1839,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => {
-                let sock = s.lock();
-                let sock_ref = socket2::SockRef::from(&*sock);
-                sock_ref.set_reuse_address(on)
-            }
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).set_reuse_address(on),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1847,7 +1850,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => s.lock().set_broadcast(on),
+            FileEntry::UdpSocket(s) => s.set_broadcast(on),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1858,7 +1861,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => s.lock().set_ttl(ttl),
+            FileEntry::UdpSocket(s) => s.set_ttl(ttl),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1873,7 +1876,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => s.lock().set_read_timeout(timeout),
+            FileEntry::UdpSocket(s) => s.set_read_timeout(timeout),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1884,10 +1887,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => {
-                let sock = s.lock();
-                socket2::SockRef::from(&*sock).set_send_buffer_size(size)
-            }
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).set_send_buffer_size(size),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1898,10 +1898,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => {
-                let sock = s.lock();
-                socket2::SockRef::from(&*sock).set_recv_buffer_size(size)
-            }
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).set_recv_buffer_size(size),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1917,7 +1914,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => s.lock().join_multicast_v4(multiaddr, interface),
+            FileEntry::UdpSocket(s) => s.join_multicast_v4(multiaddr, interface),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -1933,7 +1930,7 @@ impl FileDescriptorTable {
             .get_entry(fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
         match &*entry {
-            FileEntry::UdpSocket(s) => s.lock().leave_multicast_v4(multiaddr, interface),
+            FileEntry::UdpSocket(s) => s.leave_multicast_v4(multiaddr, interface),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
         }
     }
@@ -2723,10 +2720,7 @@ mod tests {
         let expected = {
             let entry = table.get_entry(fd).unwrap();
             match &*entry {
-                FileEntry::UdpSocket(sock) => {
-                    let sock = sock.lock();
-                    poll_socket_readiness(&*sock)
-                }
+                FileEntry::UdpSocket(sock) => poll_socket_readiness(sock),
                 _ => unreachable!(),
             }
         };

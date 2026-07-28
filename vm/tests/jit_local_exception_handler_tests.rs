@@ -187,3 +187,64 @@ fn test_jit_indy_after_side_effect_no_double_execution() {
         other => panic!("counterValue returned unexpected value: {other:?}"),
     }
 }
+
+fn precise_handler_frame_class_files_available() -> bool {
+    let dir = test_resources_dir();
+    std::path::Path::new(&format!(
+        "{dir}/cratonvm/JitPreciseHandlerFrame.class"
+    ))
+    .exists()
+}
+
+/// Every entry point returns a MISMATCH COUNT, so a duplicated loop iteration
+/// (an OSR bail re-running part of the loop) re-checks instead of corrupting an
+/// expected checksum — only a real routing defect makes these non-zero.
+fn precise_handler_mismatches(method: &str) -> i32 {
+    let mut vm = test_vm();
+    match vm.invoke("cratonvm/JitPreciseHandlerFrame", method, "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        other => panic!("{method} returned unexpected value: {other:?}"),
+    }
+}
+
+#[test]
+fn test_compiled_callee_catches_its_own_athrow() {
+    if !precise_handler_frame_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // `plainStep`'s handler reads only parameters, so it compiles with or
+    // without the precise-handler-frame relaxation. Its callee `maybeThrow`
+    // athrows at ITS OWN bci 13, and `JitSignals::athrow_bci` carries no method
+    // identity — `plainStep`'s drain used that 13 against its own protected
+    // range [0,4), matched no handler, and let the exception escape its own
+    // `catch (Boom)`.
+    assert_eq!(precise_handler_mismatches("plainMismatches"), 0);
+}
+
+#[test]
+fn test_precise_handler_frame_catches_a_throw_at_the_end_of_its_try() {
+    if !precise_handler_frame_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // `buildStep`'s protected range is [8,14) and its only invoke is at pc 11,
+    // so the invoke's SUCCESSOR (14) is `end_pc` — outside the handler. The
+    // precise exceptional frame used to be keyed on that successor and handed
+    // to `route_jit_exception_through_method` as the THROW pc, so the range
+    // test rejected the method's own handler. `sb` (local 2) must also survive
+    // into the handler, which is what the precise frame is for.
+    assert_eq!(precise_handler_mismatches("buildMismatches"), 0);
+}
+
+#[test]
+fn test_precise_handler_frame_keeps_a_handler_only_local() {
+    if !precise_handler_frame_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // `scopeStep`'s `keep` is read only on the path through the handler, so
+    // handler-blind liveness let register allocation alias it with `other`
+    // (live across the try).
+    assert_eq!(precise_handler_mismatches("scopeMismatches"), 0);
+}

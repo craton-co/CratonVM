@@ -1,6 +1,21 @@
 # TestDefaultInstanceManager — class-unloading count mismatch (FIXED)
 
-**Status:** FIXED and retired on 2026-07-14.
+**Status:** FIXED and retired on 2026-07-14 — but **INCOMPLETE**. The test
+recurred (`expected:<8> but was:<9>`) on the 2026-07-28 local Windows full-suite
+runs and was closed for real on 2026-07-27; see
+[defaultinstancemanager-classunload-offbyone-recurrence-FIXED.md](defaultinstancemanager-classunload-offbyone-recurrence-FIXED.md)
+for the two actual root causes. Everything below still holds — those changes are
+in `dev` and are load-bearing — but they were not sufficient. Two lessons worth
+carrying forward:
+
+- Whether the fix below suffices depends on whether the evicted JSP's `Class`
+  mirror had been **promoted to old gen** before the test's single
+  `System.gc()`. That is a heap-sizing/GC-count accident, which is why the
+  Azure-Linux verification recorded here passed while the Windows suite fixture
+  (`-Xmx2g`) failed. A pass on one fixture does not generalize for this test.
+- A parked pool thread's per-thread JIT memo caches were independently pinning
+  the entire JSP compiler graph — something no amount of class-mirror root
+  gating can fix.
 
 `org.apache.catalina.core.TestDefaultInstanceManager.testClassUnloading` loads
 three JSPs with `maxLoadedJsps=2`, forces `System.gc()`, and expects Tomcat's

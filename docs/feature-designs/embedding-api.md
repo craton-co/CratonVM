@@ -31,7 +31,7 @@ embedders that load the JVM via `JNI_CreateJavaVM`.
 ## Current state (cited)
 
 - **A Rust-native embedding path already works and is documented.**
-  `docs/internal/embedding.md` is the current guide: `Vm::new(VmConfig)` does the
+  `docs/EMBEDDING_VM_CRATE.md` is the current guide: `Vm::new(VmConfig)` does the
   full bootstrap, `Vm::invoke(class, name, descriptor, &[Value])` drives calls,
   custom natives register via `SharedVm::native_methods`. The `Vm` struct is at
   `vm/src/vm/vm_init.rs:4253` with `impl Vm` at `:4261` exposing `new` (`:4263`),
