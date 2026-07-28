@@ -1,5 +1,18 @@
 # `CriteriaOrderedSetAggregateTest` — ordered-set aggregate used as a window function (`OVER (PARTITION BY ...)`) returns the *first partition's* value for every row
 
+> **RESOLVED 2026-07-27 — this doc is retired.** Root cause: CratonVM's Rust
+> override of `org.h2.expression.ExpressionColumn.getValue`
+> (`native-builtins/src/apps_h2.rs`) skipped H2's `SelectGroups` prologue, so in a
+> grouped/windowed query every emitted row read the **last scanned source row**
+> instead of its own buffered value. Fixed by delegating to H2's own bytecode
+> whenever `TableFilter.select.groupData` is non-null (or the resolver is not a
+> `TableFilter`). All classes in this doc now pass, matching HotSpot exactly.
+> Full analysis, the Hibernate-free repro, and the 21-class verification table:
+> [`h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md`](h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md).
+> The historical investigation below is preserved as written; note that its own
+> root-cause speculation (a generic iteration/GC defect in shared substrate) was
+> wrong — CratonVM does intercept H2 at this call.
+
 **Status: OPEN, genuine CratonVM bug.** Confirmed via HotSpot diff (fails on CratonVM,
 100% clean on real HotSpot JDK 25, exact same SQL text and bound parameters both sides),
 confirmed NOT a suite-subset/ordering artifact (reproduces in a fresh single-class
