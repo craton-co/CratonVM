@@ -266,7 +266,7 @@ pub fn register_deprecated_io_util_natives(r: &mut NativeMethodRegistry) {
     register_hashtable_enumerations(r);
     register_string_buffer_input_stream(r);
     register_line_number_input_stream(r);
-    register_locale_noop(r);
+    // T8.2.12 (`register_locale_noop`) removed — see the note where it stood.
     register_url_codec(r);
 }
 
@@ -1572,15 +1572,12 @@ fn register_line_number_input_stream(r: &mut NativeMethodRegistry) {
 // T8.2.12 — Locale no-op marker
 // ---------------------------------------------------------------------------
 
-fn register_locale_noop(r: &mut NativeMethodRegistry) {
-    // No-op marker: getISO3Language deprecated alias is Java-level delegation.
-    r.register(
-        "java/util/Locale",
-        "__deprecated_marker__",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
-}
+// REMOVED (wave-2 inline-constant stub removal): this registered
+// `java/util/Locale.__deprecated_marker__()V`, a method name that exists in no
+// class file and that no bytecode can reference — the registry entry was
+// unreachable in BOTH run modes and is named by neither `deprecated_verify`'s
+// manifest nor its JDK-25 checklist. `Locale.getISO3Language` is, as the old
+// comment said, plain Java-level delegation and needs no native at all.
 
 // ---------------------------------------------------------------------------
 // T8.2.13 / T8.2.14 — URLDecoder.decode(String) / URLEncoder.encode(String)

@@ -508,6 +508,38 @@ fn zstd_set_compression_level(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Int(0)))
 }
 
+/// `(size_t)(-ZSTD_error_parameter_unsupported)` — the canonical libzstd code
+/// for "this build cannot honour that parameter". Matches the value
+/// `register_err_const` publishes as `Zstd.errParameterUnsupported()`, which is
+/// what zstd-jni compares an error return against.
+const ZSTD_ERR_PARAMETER_UNSUPPORTED: i32 = -40;
+
+/// `Zstd.setCompressionMagicless` / `setDecompressionMagicless`.
+fn zstd_set_magicless(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Requesting magicless == false leaves us in the state we are already in.
+    if arg_int(args, 1) == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    Ok(Some(Value::Int(ZSTD_ERR_PARAMETER_UNSUPPORTED)))
+}
+
+/// `Zstd.loadDictCompress(long, byte[], int)` / `loadDictDecompress(...)`.
+fn zstd_load_dict_bytes(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let has_dict = matches!(args.get(1), Some(Value::Object(Some(_)))) && arg_int(args, 2) > 0;
+    if has_dict {
+        return Ok(Some(Value::Int(ZSTD_ERR_PARAMETER_UNSUPPORTED)));
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+/// `Zstd.loadFastDictCompress(long, ZstdDictCompress)` / the decompress twin.
+fn zstd_load_dict_object(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if matches!(args.get(1), Some(Value::Object(Some(_)))) {
+        return Ok(Some(Value::Int(ZSTD_ERR_PARAMETER_UNSUPPORTED)));
+    }
+    Ok(Some(Value::Int(0)))
+}
+
 // ===========================================================================
 // lz4-java — net.jpountz.lz4.LZ4JNI (canonical LZ4 block format)
 // ===========================================================================
@@ -823,6 +855,10 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
 
     // --- lz4-java: net.jpountz.lz4.LZ4JNI (static methods, block format) ---
     let lz = "net/jpountz/lz4/LZ4JNI";
+    // KEEP: `LZ4JNI.init()` exists solely to force the JNI library load
+    // (`System.loadLibrary`) before the first codec call. Every LZ4 entry
+    // point is already bound to a Rust implementation below, so there is no
+    // library to load and an empty body is the correct implementation.
     r.register(lz, "init", "()V", |_c, _a| Ok(None));
     r.register(lz, "LZ4_compressBound", "(I)I", lz4_compress_bound);
     r.register(
@@ -852,6 +888,8 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
 
     // --- lz4-java: net.jpountz.xxhash.XXHashJNI (static, LZ4 frame checksums) ---
     let xx = "net/jpountz/xxhash/XXHashJNI";
+    // KEEP: same as `LZ4JNI.init` — a JNI library-load trigger with nothing
+    // to load here.
     r.register(xx, "init", "()V", |_c, _a| Ok(None));
     r.register(xx, "XXH32", "([BIII)I", xxh32_oneshot);
     r.register(xx, "XXH32_init", "(I)J", xxh32_init);
@@ -906,6 +944,12 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(z, "getErrorCode", "(J)J", zstd_get_error_code);
     r.register(z, "compressBound", "(J)J", zstd_compress_bound);
+    // KEEP: `3` is not a placeholder — it is libzstd's `ZSTD_CLEVEL_DEFAULT`,
+    // the same constant `ZSTD_defaultCLevel()` returns and the level the
+    // bundled libzstd actually uses when none is given. (Spelled as a literal
+    // rather than calling `ZSTD_defaultCLevel` because that entry point is
+    // behind zstd-sys's `experimental` bindings gate, unlike the min/max
+    // accessors below.)
     r.register(z, "defaultCompressionLevel", "()I", |_c, _a| {
         Ok(Some(Value::Int(3)))
     });
@@ -920,9 +964,10 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
         })))
     });
 
-    // Parameter setters: apply the level (frame-affecting and cheap), no-op the
-    // rest (Kafka's default codec path leaves them at their defaults, and a
-    // 0/"success" return keeps the stream init from throwing). Each returns int.
+    // Parameter setters: apply the level (frame-affecting and cheap), accept
+    // the tuning-only knobs, and REFUSE the ones that would change the wire
+    // format if honoured. Each returns an int the caller feeds to
+    // `Zstd.isError`.
     r.register(
         z,
         "setCompressionLevel",
@@ -930,8 +975,13 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
         zstd_set_compression_level,
     );
     for name in [
+        // Every parameter below affects only the compressor's speed/ratio
+        // trade-off or its internal window/table sizing. None of them changes
+        // whether the emitted frame is decodable, so accepting and ignoring
+        // them cannot corrupt anything a peer reads — KEEP with that
+        // justification rather than failing a stream Kafka would otherwise
+        // compress correctly.
         "setCompressionChecksums",
-        "setCompressionMagicless",
         "setCompressionLong",
         "setCompressionWorkers",
         "setCompressionOverlapLog",
@@ -944,7 +994,6 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
         "setCompressionWindowLog",
         "setCompressionStrategy",
         "setDecompressionLongMax",
-        "setDecompressionMagicless",
         "setRefMultipleDDicts",
         "setValidateSequences",
         "setSequenceProducerFallback",
@@ -956,24 +1005,36 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
         r.register(z, name, "(JI)I", |_c, _a| Ok(Some(Value::Int(0))));
         r.register(z, name, "(JZ)I", |_c, _a| Ok(Some(Value::Int(0))));
     }
-    // Dictionary loaders (Kafka uses no dictionary): report 0 (success/no dict).
-    r.register(z, "loadDictCompress", "(J[BI)I", |_c, _a| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(z, "loadDictDecompress", "(J[BI)I", |_c, _a| {
-        Ok(Some(Value::Int(0)))
-    });
+    // "Magicless" frames omit the 4-byte ZSTD magic number, so a frame written
+    // (or expected) magicless is NOT interchangeable with a normal one.
+    // Silently accepting the request produced a stream neither side could
+    // read, with a "success" return to say all was well. Accept a request to
+    // DISABLE it (that is the state we are already in) and report
+    // ZSTD_error_parameter_unsupported otherwise.
+    for name in ["setCompressionMagicless", "setDecompressionMagicless"] {
+        r.register(z, name, "(JI)I", zstd_set_magicless);
+        r.register(z, name, "(JZ)I", zstd_set_magicless);
+    }
+    // Dictionary loaders. These used to report 0 ("dictionary loaded") while
+    // discarding it: a compressor would then emit dictionary-less frames a
+    // dictionary-expecting peer rejects, and a decompressor would fail later
+    // on dictionary-compressed input with an unrelated corruption error. A
+    // null/empty dictionary is genuinely a no-op and still returns 0; a real
+    // dictionary now reports ZSTD_error_parameter_unsupported at the point of
+    // the request.
+    r.register(z, "loadDictCompress", "(J[BI)I", zstd_load_dict_bytes);
+    r.register(z, "loadDictDecompress", "(J[BI)I", zstd_load_dict_bytes);
     r.register(
         z,
         "loadFastDictCompress",
         "(JLcom/github/luben/zstd/ZstdDictCompress;)I",
-        |_c, _a| Ok(Some(Value::Int(0))),
+        zstd_load_dict_object,
     );
     r.register(
         z,
         "loadFastDictDecompress",
         "(JLcom/github/luben/zstd/ZstdDictDecompress;)I",
-        |_c, _a| Ok(Some(Value::Int(0))),
+        zstd_load_dict_object,
     );
 
     // Canonical libzstd error-code accessors. These are only consulted on the

@@ -298,6 +298,41 @@ pub(crate) mod jdbc_registry {
         Ok((stmt_id, row_count))
     }
 
+    /// Does `sql` yield a ResultSet, i.e. does the compiled statement declare
+    /// any result columns?
+    ///
+    /// `Statement.execute(String)` has to answer that question BEFORE it runs
+    /// anything, because the JDBC return value (`true` ⇒ first result is a
+    /// ResultSet, `false` ⇒ it is an update count) picks which of
+    /// `getResultSet()` / `getUpdateCount()` the caller may then read.
+    /// `Connection::prepare` only compiles — it never steps — so probing here
+    /// does not execute the statement a second time.
+    pub fn produces_result_set(conn_id: i64, sql: &str) -> Result<bool, String> {
+        let reg = registry().lock();
+        let conn = reg
+            .connections
+            .get(&conn_id)
+            .ok_or_else(|| "Connection not found".to_string())?;
+        let stmt = conn.prepare(sql).map_err(|e| sanitize_error(&e))?;
+        Ok(stmt.column_count() > 0)
+    }
+
+    /// `produces_result_set` for an already-prepared statement — same
+    /// compile-only probe, resolved through the stored SQL and connection.
+    pub fn prepared_produces_result_set(ps_id: i64) -> Result<bool, String> {
+        let reg = registry().lock();
+        let ps = reg
+            .prepared
+            .get(&ps_id)
+            .ok_or_else(|| "Prepared statement not found".to_string())?;
+        let conn = reg
+            .connections
+            .get(&ps.conn_id)
+            .ok_or_else(|| "Connection not found".to_string())?;
+        let stmt = conn.prepare(&ps.sql).map_err(|e| sanitize_error(&e))?;
+        Ok(stmt.column_count() > 0)
+    }
+
     /// Execute an update (INSERT/UPDATE/DELETE). Returns rows affected.
     pub fn execute_update(conn_id: i64, sql: &str) -> Result<i32, String> {
         let reg = registry().lock();
@@ -968,6 +1003,51 @@ pub(crate) mod jdbc_registry {
     }
 }
 
+/// `PreparedStatement.close()` / `CallableStatement.close()`.
+///
+/// Frees the compiled statement held in the registry (slot 0 is its id) and
+/// sets the closed flag in slot 1. `java/sql/Statement.close()V` cannot do
+/// this: on a plain Statement slot 0 is the CONNECTION id, so it has no
+/// prepared handle to release.
+///
+/// A named fn rather than an inline closure because it has to be registered
+/// TWICE — once alongside the other PreparedStatement natives, and once more
+/// after the `alias_class` calls at the end of `register_p68_jdbc`.
+/// `alias_class` is last-writer-wins and `close()V` is the one descriptor the
+/// Statement and PreparedStatement sets have in common, so aliasing Statement
+/// onto the two subinterfaces overwrote this with Statement's own `close`.
+/// The result was that `free_prepared` never ran for any prepared or callable
+/// statement and every compiled handle leaked for the life of the VM.
+fn native_prepared_statement_close(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let ps_id = match ctx.get_field(this, 0) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => 0,
+    };
+    // Closing a Statement closes its current ResultSet — identical rule and
+    // identical leak as `java/sql/Statement.close()V`, which this native
+    // REPLACES on both subinterfaces, so it has to do the same thing. Slots
+    // 4/5 are cleared before the cache is dropped so a later
+    // `getResultSet()` reports no current result rather than a stale id.
+    let rs_id = match ctx.get_field(this, 4) {
+        Value::Long(v) => v,
+        Value::Int(v) => v as i64,
+        _ => 0,
+    };
+    ctx.set_field(this, 4, Value::Long(0));
+    ctx.set_field(this, 5, Value::Int(-1));
+    if rs_id != 0 {
+        jdbc_registry::free_results(rs_id);
+    }
+    jdbc_registry::free_prepared(ps_id);
+    ctx.set_field(this, 1, Value::Int(1));
+    Ok(None)
+}
+
 pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1007,9 +1087,21 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             match jdbc_registry::open_connection(&url) {
                 Ok(conn_id) => {
-                    let conn = alloc_concurrent_synthetic(ctx, "java/sql/Connection", 2);
+                    // Connection = 4-field: conn_id=0, closed=1,
+                    // auto_commit=2, tx_isolation=3 — same shape as the
+                    // single-arg overload above. This allocated only 2 slots
+                    // until 2026-07-27, and because `set_field` is required to
+                    // bounds-check, every write to slots 2/3 on such a
+                    // Connection was silently dropped: `setAutoCommit` and
+                    // `setTransactionIsolation` still reached SQLite, but
+                    // `getAutoCommit()` / `getTransactionIsolation()` never
+                    // reflected the change for any connection obtained
+                    // through this overload.
+                    let conn = alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4);
                     ctx.set_field(conn, 0, Value::Long(conn_id));
                     ctx.set_field(conn, 1, Value::Int(0));
+                    ctx.set_field(conn, 2, Value::Int(1)); // auto_commit=true
+                    ctx.set_field(conn, 3, Value::Int(8)); // SERIALIZABLE
                     Ok(Some(Value::Object(Some(conn))))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
@@ -1027,9 +1119,21 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             match jdbc_registry::open_connection(&url) {
                 Ok(conn_id) => {
-                    let conn = alloc_concurrent_synthetic(ctx, "java/sql/Connection", 2);
+                    // Connection = 4-field: conn_id=0, closed=1,
+                    // auto_commit=2, tx_isolation=3 — same shape as the
+                    // single-arg overload above. This allocated only 2 slots
+                    // until 2026-07-27, and because `set_field` is required to
+                    // bounds-check, every write to slots 2/3 on such a
+                    // Connection was silently dropped: `setAutoCommit` and
+                    // `setTransactionIsolation` still reached SQLite, but
+                    // `getAutoCommit()` / `getTransactionIsolation()` never
+                    // reflected the change for any connection obtained
+                    // through this overload.
+                    let conn = alloc_concurrent_synthetic(ctx, "java/sql/Connection", 4);
                     ctx.set_field(conn, 0, Value::Long(conn_id));
                     ctx.set_field(conn, 1, Value::Int(0));
+                    ctx.set_field(conn, 2, Value::Int(1)); // auto_commit=true
+                    ctx.set_field(conn, 3, Value::Int(8)); // SERIALIZABLE
                     Ok(Some(Value::Object(Some(conn))))
                 }
                 Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
@@ -1050,10 +1154,27 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                 Value::Int(v) => v as i64,
                 _ => 0,
             };
-            // Statement = 2-field (conn_id=0, closed=1)
-            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/Statement", 2);
+            // Statement = 8-field. The layout is shared with
+            // PreparedStatement/CallableStatement (see `prepareStatement`
+            // below) because the `alias_class` calls at the end of this fn
+            // copy every Statement native onto both of them, so a slot has to
+            // mean the same thing on all three:
+            //   0 primary handle (conn_id here, ps_id on the other two)
+            //   1 closed        2 conn_id        3 reserved
+            //   4 currentResultSetId             5 currentUpdateCount
+            //   6 maxRows                        7 queryTimeout
+            // Slots 4/5 back the JDBC execute()/getResultSet()/
+            // getUpdateCount() trio; before they existed those three natives
+            // were constants (null / -1 / false) and every `execute` +
+            // `getResultSet` caller silently saw an empty result.
+            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/Statement", 8);
             ctx.set_field(stmt, 0, Value::Long(conn_id)); // pass conn_id through
             ctx.set_field(stmt, 1, Value::Int(0)); // not closed
+            ctx.set_field(stmt, 2, Value::Long(conn_id)); // uniform conn_id slot
+            ctx.set_field(stmt, 4, Value::Long(0)); // no current ResultSet
+            ctx.set_field(stmt, 5, Value::Int(-1)); // no current update count
+            ctx.set_field(stmt, 6, Value::Int(0)); // maxRows: unlimited
+            ctx.set_field(stmt, 7, Value::Int(0)); // queryTimeout: none
             Ok(Some(Value::Object(Some(stmt))))
         },
     );
@@ -1073,11 +1194,20 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let ps_id = jdbc_registry::prepare(conn_id, &sql);
-            // PreparedStatement = 3-field (ps_id=0, closed=1, conn_id=2)
-            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/PreparedStatement", 3);
+            // PreparedStatement = 8-field, laid out exactly like
+            // java/sql/Statement above (ps_id=0, closed=1, conn_id=2,
+            // reserved=3, currentResultSetId=4, currentUpdateCount=5,
+            // maxRows=6, queryTimeout=7) so every Statement native the
+            // `alias_class` calls copy onto this class reads and writes the
+            // same slots it would on a plain Statement.
+            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/PreparedStatement", 8);
             ctx.set_field(stmt, 0, Value::Long(ps_id));
             ctx.set_field(stmt, 1, Value::Int(0)); // not closed
             ctx.set_field(stmt, 2, Value::Long(conn_id));
+            ctx.set_field(stmt, 4, Value::Long(0)); // no current ResultSet
+            ctx.set_field(stmt, 5, Value::Int(-1)); // no current update count
+            ctx.set_field(stmt, 6, Value::Int(0)); // maxRows: unlimited
+            ctx.set_field(stmt, 7, Value::Int(0)); // queryTimeout: none
             Ok(Some(Value::Object(Some(stmt))))
         },
     );
@@ -1105,10 +1235,14 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             let ps_id = jdbc_registry::prepare(conn_id, &sql);
-            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/CallableStatement", 3);
+            let stmt = alloc_concurrent_synthetic(ctx, "java/sql/CallableStatement", 8);
             ctx.set_field(stmt, 0, Value::Long(ps_id));
             ctx.set_field(stmt, 1, Value::Int(0)); // not closed
             ctx.set_field(stmt, 2, Value::Long(conn_id));
+            ctx.set_field(stmt, 4, Value::Long(0)); // no current ResultSet
+            ctx.set_field(stmt, 5, Value::Int(-1)); // no current update count
+            ctx.set_field(stmt, 6, Value::Int(0)); // maxRows: unlimited
+            ctx.set_field(stmt, 7, Value::Int(0)); // queryTimeout: none
             Ok(Some(Value::Object(Some(stmt))))
         },
     );
@@ -1213,7 +1347,14 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         })))
     });
 
-    // Statement = 2-field (conn_id=0, closed=1)
+    // Statement = 8-field, and the layout is SHARED with PreparedStatement /
+    // CallableStatement because `alias_class` (end of this fn) copies every
+    // native registered below onto both of them:
+    //   0 conn_id (ps_id on the two subinterfaces)   1 closed
+    //   2 conn_id (uniform on all three)             3 reserved
+    //   4 currentResultSetId                         5 currentUpdateCount
+    //   6 maxRows                                    7 queryTimeout
+    // A native here must only touch slots whose meaning holds for all three.
     let stmt = "java/sql/Statement";
     r.register(
         stmt,
@@ -1221,7 +1362,15 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/sql/ResultSet;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let conn_id = match ctx.get_field(this, 0) {
+            // Slot 2, not slot 0: slot 0 is the connection id only on a plain
+            // Statement — it is the prepared-statement id on the two
+            // subinterfaces this native is aliased onto. Slot 2 is the
+            // connection id on all three. (JDBC requires the String-taking
+            // overloads to throw on a PreparedStatement receiver, so this is
+            // only reachable from a non-conforming caller; reading the right
+            // slot costs nothing and stops the wrong one being copied
+            // outward.)
+            let conn_id = match ctx.get_field(this, 2) {
                 Value::Long(v) => v,
                 Value::Int(v) => v as i64,
                 _ => 0,
@@ -1232,6 +1381,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             match jdbc_registry::execute_query(conn_id, &sql) {
                 Ok((stmt_id, row_count)) => {
+                    // Publish the current result BEFORE allocating: the
+                    // allocation below can move `this` under a young GC, so a
+                    // field write made afterwards would land on a stale ref.
+                    ctx.set_field(this, 4, Value::Long(stmt_id));
+                    ctx.set_field(this, 5, Value::Int(-1));
                     // ResultSet = 3-field (stmt_id=0, cursor=1, rowCount=2)
                     let rs = alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3);
                     ctx.set_field(rs, 0, Value::Long(stmt_id));
@@ -1249,7 +1403,9 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)I",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let conn_id = match ctx.get_field(this, 0) {
+            // Slot 2 = connection id on all three statement layouts; see
+            // executeQuery above.
+            let conn_id = match ctx.get_field(this, 2) {
                 Value::Long(v) => v,
                 Value::Int(v) => v as i64,
                 _ => 0,
@@ -1259,14 +1415,20 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
                 _ => String::new(),
             };
             match jdbc_registry::execute_update(conn_id, &sql) {
-                Ok(n) => Ok(Some(Value::Int(n))),
+                Ok(n) => {
+                    ctx.set_field(this, 4, Value::Long(0)); // no ResultSet
+                    ctx.set_field(this, 5, Value::Int(n)); // current update count
+                    Ok(Some(Value::Int(n)))
+                }
                 Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
             }
         },
     );
     r.register(stmt, "execute", "(Ljava/lang/String;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let conn_id = match ctx.get_field(this, 0) {
+        // Slot 2 = connection id on all three statement layouts; see
+        // executeQuery above.
+        let conn_id = match ctx.get_field(this, 2) {
             Value::Long(v) => v,
             Value::Int(v) => v as i64,
             _ => 0,
@@ -1275,47 +1437,157 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let _ = jdbc_registry::execute_update(conn_id, &sql);
-        Ok(Some(Value::Int(1)))
+        // JDBC contract: `true` ⇒ the first result is a ResultSet (read it
+        // with getResultSet()), `false` ⇒ it is an update count (read it with
+        // getUpdateCount()). This used to run every statement through
+        // `execute_update`, discard the Result, and hardcode `true` — so a
+        // SELECT reported "there is a ResultSet" and the paired
+        // getResultSet() constant then handed back null, and a failed
+        // CREATE/INSERT reported success. Probe the compiled statement for
+        // result columns instead, then take the matching path.
+        match jdbc_registry::produces_result_set(conn_id, &sql) {
+            Ok(true) => match jdbc_registry::execute_query(conn_id, &sql) {
+                Ok((stmt_id, _row_count)) => {
+                    ctx.set_field(this, 4, Value::Long(stmt_id));
+                    ctx.set_field(this, 5, Value::Int(-1));
+                    Ok(Some(Value::Int(1)))
+                }
+                Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
+            },
+            Ok(false) => match jdbc_registry::execute_update(conn_id, &sql) {
+                Ok(n) => {
+                    ctx.set_field(this, 4, Value::Long(0));
+                    ctx.set_field(this, 5, Value::Int(n));
+                    Ok(Some(Value::Int(0)))
+                }
+                Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
+            },
+            Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
+        }
     });
     r.register(stmt, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Int(1));
+        // JDBC: closing a Statement also closes its current ResultSet. Slot 4
+        // holds the row-cache id of that result, and nothing else ever
+        // released it — so `try (Statement s = ...) { ... }` without an
+        // explicit `rs.close()`, the common form, leaked every row it had
+        // fetched for the life of the VM.
+        //
+        // Clear slots 4/5 BEFORE dropping the cache, so a later
+        // `getResultSet()` on the closed Statement sees "no current result"
+        // (slot 4 == 0 ⇒ it returns null) instead of a stale id.
+        let rs_id = match ctx.get_field(this, 4) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        ctx.set_field(this, 4, Value::Long(0));
+        ctx.set_field(this, 5, Value::Int(-1));
+        if rs_id != 0 {
+            jdbc_registry::free_results(rs_id);
+        }
+        // Slot 1 is the closed flag; slot 0 is the connection id. This wrote
+        // slot 0 until 2026-07-27, which made `isClosed()` (reading the same
+        // slot) report *closed* from the moment the Statement was created and
+        // destroyed the conn_id every later call needs. `alias_class` below
+        // copies this native onto PreparedStatement/CallableStatement, whose
+        // slot 0 holds the prepared-statement id, so it corrupted those too.
+        ctx.set_field(this, 1, Value::Int(1));
         Ok(None)
     });
     r.register(stmt, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Int(
+            ctx.get_field(this, 1).as_int().unwrap_or(0),
+        )))
     });
+    // JDBC: the current result as a ResultSet, or null when the current
+    // result is an update count or there is no current result. `execute`
+    // above parks the row-cache id in slot 4.
     r.register(
         stmt,
         "getResultSet",
         "()Ljava/sql/ResultSet;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stmt_id = match ctx.get_field(this, 4) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            if stmt_id == 0 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let rows = jdbc_registry::get_row_count(stmt_id);
+            // ResultSet = 3-field (stmt_id=0, cursor=1, rowCount=2)
+            let rs = alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3);
+            ctx.set_field(rs, 0, Value::Long(stmt_id));
+            ctx.set_field(rs, 1, Value::Int(-1)); // cursor before first row
+            ctx.set_field(rs, 2, Value::Int(rows as i32));
+            Ok(Some(Value::Object(Some(rs))))
+        },
     );
-    r.register(stmt, "getUpdateCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(-1)))
+    // JDBC: the current result as an update count, or -1 when the current
+    // result is a ResultSet or there is no current result. Slot 5 is written
+    // by `execute` / `executeUpdate` above.
+    r.register(stmt, "getUpdateCount", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(
+            ctx.get_field(this, 5).as_int().unwrap_or(-1),
+        )))
     });
-    r.register(stmt, "getMoreResults", "()Z", |_ctx, _args| {
+    // JDBC: move to this Statement's next result, closing the current
+    // ResultSet. The SQLite backend produces exactly one result per execute,
+    // so there is never a next one — but "there isn't one" still has to free
+    // the cached rows and reset both slots, otherwise a stale update count
+    // stays readable through getUpdateCount() forever (which is what the old
+    // bare `false` constant did).
+    r.register(stmt, "getMoreResults", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 4) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        if stmt_id != 0 {
+            jdbc_registry::free_results(stmt_id);
+        }
+        ctx.set_field(this, 4, Value::Long(0));
+        ctx.set_field(this, 5, Value::Int(-1));
         Ok(Some(Value::Int(0)))
     });
+    // maxRows and queryTimeout live in slots 6/7, NOT 2/3.
+    //
+    // These four are copied onto PreparedStatement and CallableStatement by
+    // the `alias_class` calls at the end of this fn, and on those two classes
+    // slot 2 is the CONNECTION ID. Storing maxRows there — which is what this
+    // did until 2026-07-27 — meant `ps.setMaxRows(n)` overwrote the prepared
+    // statement's conn_id with `n`, after which every registry lookup for
+    // that statement resolved to the wrong connection or to none at all.
+    // Slots 6/7 are free on all three layouts, so one implementation is now
+    // correct for every receiver the alias can hand it.
     r.register(stmt, "setMaxRows", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let max = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        ctx.set_field(this, 2, Value::Int(max)); // store in field 2
+        ctx.set_field(this, 6, Value::Int(max));
         Ok(None)
     });
     r.register(stmt, "getMaxRows", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let max = ctx.get_field(this, 2).as_int().unwrap_or(0);
+        let max = ctx.get_field(this, 6).as_int().unwrap_or(0);
         Ok(Some(Value::Int(max)))
     });
     r.register(stmt, "setQueryTimeout", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let timeout = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
-        ctx.set_field(this, 3, Value::Int(timeout)); // store in field 3
-                                                     // Apply busy_timeout to SQLite connection
-        let conn_id = match ctx.get_field(this, 0) {
+        ctx.set_field(this, 7, Value::Int(timeout));
+        // Apply busy_timeout to the SQLite connection. Read the id from slot
+        // 2, which every one of the three statement layouts sets to the
+        // connection id; slot 0 is the connection id only for a plain
+        // Statement (it is the prepared-statement id on the other two), so
+        // reading it here sent the PRAGMA to a bogus connection whenever the
+        // alias delivered a PreparedStatement/CallableStatement receiver.
+        let conn_id = match ctx.get_field(this, 2) {
             Value::Long(v) => v,
             Value::Int(v) => v as i64,
             _ => 0,
@@ -1329,11 +1601,13 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     });
     r.register(stmt, "getQueryTimeout", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let timeout = ctx.get_field(this, 3).as_int().unwrap_or(0);
+        let timeout = ctx.get_field(this, 7).as_int().unwrap_or(0);
         Ok(Some(Value::Int(timeout)))
     });
 
-    // PreparedStatement = 3-field (ps_id=0, closed=1, conn_id=2)
+    // PreparedStatement = 8-field (ps_id=0, closed=1, conn_id=2, reserved=3,
+    // currentResultSetId=4, currentUpdateCount=5, maxRows=6, queryTimeout=7)
+    // — identical to the java/sql/Statement layout above.
     let pstmt = "java/sql/PreparedStatement";
     r.register(pstmt, "setString", "(ILjava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1490,6 +1764,10 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             match jdbc_registry::execute_prepared_query(ps_id) {
                 Ok((stmt_id, row_count)) => {
+                    // Publish the current result before allocating — the
+                    // allocation can move `this` (see Statement.executeQuery).
+                    ctx.set_field(this, 4, Value::Long(stmt_id));
+                    ctx.set_field(this, 5, Value::Int(-1));
                     let rs = alloc_concurrent_synthetic(ctx, "java/sql/ResultSet", 3);
                     ctx.set_field(rs, 0, Value::Long(stmt_id));
                     ctx.set_field(rs, 1, Value::Int(-1));
@@ -1508,7 +1786,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         match jdbc_registry::execute_prepared_update(ps_id) {
-            Ok(n) => Ok(Some(Value::Int(n))),
+            Ok(n) => {
+                ctx.set_field(this, 4, Value::Long(0)); // no ResultSet
+                ctx.set_field(this, 5, Value::Int(n)); // current update count
+                Ok(Some(Value::Int(n)))
+            }
             Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
         }
     });
@@ -1519,22 +1801,35 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Value::Int(v) => v as i64,
             _ => 0,
         };
-        match jdbc_registry::execute_prepared_update(ps_id) {
-            Ok(_) => Ok(Some(Value::Int(1))),
-            Err(_) => Ok(Some(Value::Int(0))),
+        // Same JDBC contract as Statement.execute(String): the boolean says
+        // which of getResultSet()/getUpdateCount() is readable. This always
+        // took the update path and answered `true`, so a prepared SELECT was
+        // routed through `conn.execute` (which rusqlite rejects for
+        // row-producing SQL), the error was swallowed, and the caller was
+        // told a ResultSet was waiting that never existed.
+        match jdbc_registry::prepared_produces_result_set(ps_id) {
+            Ok(true) => match jdbc_registry::execute_prepared_query(ps_id) {
+                Ok((stmt_id, _row_count)) => {
+                    ctx.set_field(this, 4, Value::Long(stmt_id));
+                    ctx.set_field(this, 5, Value::Int(-1));
+                    Ok(Some(Value::Int(1)))
+                }
+                Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
+            },
+            Ok(false) => match jdbc_registry::execute_prepared_update(ps_id) {
+                Ok(n) => {
+                    ctx.set_field(this, 4, Value::Long(0));
+                    ctx.set_field(this, 5, Value::Int(n));
+                    Ok(Some(Value::Int(0)))
+                }
+                Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
+            },
+            Err(e) => Err(RuntimeError::IllegalStateException { message: e }.into()),
         }
     });
-    r.register(pstmt, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let ps_id = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            Value::Int(v) => v as i64,
-            _ => 0,
-        };
-        jdbc_registry::free_prepared(ps_id);
-        ctx.set_field(this, 1, Value::Int(1));
-        Ok(None)
-    });
+    // Registered here for readability, and AGAIN after the `alias_class`
+    // calls at the end of this fn — see `native_prepared_statement_close`.
+    r.register(pstmt, "close", "()V", native_prepared_statement_close);
     r.register(pstmt, "addBatch", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let ps_id = match ctx.get_field(this, 0) {
@@ -1596,6 +1891,14 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 1, Value::Int(next_cursor));
             Ok(Some(Value::Int(1)))
         } else {
+            // Park the cursor exactly one past the last row — and no further,
+            // so repeated calls cannot run it away. Until 2026-07-27 an
+            // exhausting `next()` left the cursor ON the last row, which is
+            // indistinguishable from "positioned on the last row": that is
+            // why `isAfterLast()` could never be implemented, and why the
+            // getters kept returning the final row's values after the loop
+            // had ended instead of the JDBC "no current row".
+            ctx.set_field(this, 1, Value::Int(rows));
             Ok(Some(Value::Int(0)))
         }
     });
@@ -1847,14 +2150,71 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             _ => Ok(Some(Value::Object(None))),
         }
     });
+    // Column-name overload of getObject. This returned a bare null for every
+    // column, so `rs.getObject("id")` reported SQL NULL on a populated row
+    // while the by-index overload right above returned the value. Resolve the
+    // name to an index the same way getString(String) does, then share that
+    // overload's cell lookup.
     r.register(
         rs,
         "getObject",
         "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stmt_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+            let col_name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let col_count = jdbc_registry::get_column_count(stmt_id);
+            let col = (0..col_count)
+                .find(|&i| jdbc_registry::get_column_name(stmt_id, i) == col_name)
+                .unwrap_or(0);
+            match jdbc_registry::get_result(stmt_id, cursor, col) {
+                Some(s) if s != "NULL" => {
+                    jdbc_registry::set_was_null(stmt_id, false);
+                    Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+                }
+                _ => {
+                    jdbc_registry::set_was_null(stmt_id, true);
+                    Ok(Some(Value::Object(None)))
+                }
+            }
+        },
     );
-    r.register(rs, "getBytes", "(I)[B", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
+    // `execute_query` caches every cell as text, so getBytes hands back that
+    // cell's UTF-8 bytes (and null for SQL NULL, per the JDBC contract). It
+    // returned a zero-length array for every column until 2026-07-27, turning
+    // each byte[] / BLOB read into a silent "empty" instead of the data or an
+    // error.
+    r.register(rs, "getBytes", "(I)[B", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        let raw = jdbc_registry::get_result(stmt_id, cursor, col);
+        let is_null = raw.as_deref().map(|s| s == "NULL").unwrap_or(true);
+        jdbc_registry::set_was_null(stmt_id, is_null);
+        if is_null {
+            return Ok(Some(Value::Object(None)));
+        }
+        let bytes = raw.unwrap_or_default().into_bytes();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+        }
         Ok(Some(Value::Object(Some(arr))))
     });
     r.register(rs, "wasNull", "()Z", |ctx, args| {
@@ -1892,29 +2252,42 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(rsmd))))
         },
     );
+    // The three cursor predicates below all read slot 1 (cursor) and slot 2
+    // (rowCount). Each of them read the WRONG slot until 2026-07-27:
+    // `getRow` returned slot 0 — the row-cache id, so it reported an
+    // arbitrary large number that grew with every query in the process — and
+    // the other two read slots 0/1, i.e. the cache id as the cursor and the
+    // cursor as the row count. Cursor convention: -1 before the first row,
+    // 0..rowCount-1 on a row, rowCount once `next()` has run off the end.
+    //
+    // JDBC `getRow()`: the 1-based current row number, or 0 when there is no
+    // current row (before the first or after the last).
     r.register(rs, "getRow", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let cursor = ctx.get_field(this, 1).as_int().unwrap_or(-1);
+        let rows = ctx.get_field(this, 2).as_int().unwrap_or(0);
+        let row_no = if cursor >= 0 && cursor < rows {
+            cursor + 1
+        } else {
+            0
+        };
+        Ok(Some(Value::Int(row_no)))
     });
+    // JDBC `isBeforeFirst()`: true if the cursor is before the first row;
+    // always false when the result set contains no rows.
     r.register(rs, "isBeforeFirst", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let cursor = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if cursor == 0 { 1 } else { 0 })))
+        let cursor = ctx.get_field(this, 1).as_int().unwrap_or(-1);
+        let rows = ctx.get_field(this, 2).as_int().unwrap_or(0);
+        Ok(Some(Value::Int(i32::from(rows > 0 && cursor < 0))))
     });
+    // JDBC `isAfterLast()`: true if the cursor is past the last row; always
+    // false when the result set contains no rows.
     r.register(rs, "isAfterLast", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let cursor = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let rows = match ctx.get_field(this, 1) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if cursor > rows { 1 } else { 0 })))
+        let cursor = ctx.get_field(this, 1).as_int().unwrap_or(-1);
+        let rows = ctx.get_field(this, 2).as_int().unwrap_or(0);
+        Ok(Some(Value::Int(i32::from(rows > 0 && cursor >= rows))))
     });
 
     // ResultSetMetaData = 1-field (stmt_id=0)
@@ -1983,17 +2356,33 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))))
         },
     );
+    // JDBC spec for getTableName: "table name or "" if not applicable". The
+    // row cache built by `execute_query` keeps column names only — SQLite's
+    // originating-table metadata (sqlite3_column_table_name) is a build-time
+    // option rusqlite does not surface — so report the spec's not-applicable
+    // value. `null` (the answer until 2026-07-27) is not a legal
+    // ResultSetMetaData result and NPE'd every caller that compared it.
     r.register(
         rsmd,
         "getTableName",
         "(I)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string(""))))),
     );
+    // KEEP (deliberate constant): `1` is `ResultSetMetaData.columnNullable`.
+    // We do not record per-column NOT NULL constraints, and a SQLite column
+    // is nullable unless explicitly declared otherwise, so columnNullable is
+    // the correct default for the overwhelming majority of columns — and it
+    // is the permissive direction: a caller told "nullable" null-checks, a
+    // caller told "not nullable" would not.
     r.register(rsmd, "isNullable", "(I)I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     }); // columnNullable
 
-    // SQL types constants
+    // KEEP (deliberate constants): these are the `java.sql.Types` int
+    // constants, fixed by the JDBC specification — every value below matches
+    // the JDK's `java.sql.Types` field. They are registered as natives only
+    // because synthetic-jdk mode has no `java/sql/Types` bytecode to read the
+    // static finals from.
     let types = "java/sql/Types";
     r.register(types, "INTEGER", "I", |_ctx, _args| Ok(Some(Value::Int(4))));
     r.register(types, "VARCHAR", "I", |_ctx, _args| {
@@ -2058,6 +2447,10 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // KEEP (deliberate constants): the major/minor split of
+    // `jdbc_registry::driver_version()` ("1.0"), which `getDriverVersion`
+    // above reports as a string. These describe OUR driver, so a literal is
+    // the right answer — they must stay in step with `driver_version`.
     r.register(dbmd, "getDriverMajorVersion", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -2074,6 +2467,16 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("");
         Ok(Some(Value::Object(Some(s))))
     });
+    // KEEP (deliberate constants). Each of these is a true statement about
+    // THIS driver, not a placeholder:
+    //   isReadOnly          — `open_connection` always opens read/write
+    //                         (`rusqlite::Connection::open`); we never open a
+    //                         database in read-only mode.
+    //   supportsTransactions— backed by real BEGIN/COMMIT/ROLLBACK in
+    //                         `set_auto_commit` / `commit` / `rollback`.
+    //   supportsSavepoints  — backed by `savepoint_create` /
+    //                         `savepoint_rollback` / `savepoint_release`.
+    //   supportsBatchUpdates— backed by `add_batch` / `execute_batch`.
     r.register(dbmd, "isReadOnly", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -2485,6 +2888,33 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     r.alias_class("java/sql/Statement", "java/sql/PreparedStatement");
     r.alias_class("java/sql/Statement", "java/sql/CallableStatement");
 
+    // ---- undo the one collision the aliases above introduce ---------------
+    //
+    // `alias_class` is last-writer-wins. Comparing the two registration sets
+    // by (method, descriptor), `close()V` is the ONLY pair they share —
+    // executeQuery/executeUpdate/execute differ by descriptor
+    // (`(Ljava/lang/String;)…` vs `()…`), and nothing else overlaps at all.
+    // So the three calls above left `java/sql/Statement`'s `close`, which
+    // only flips the closed flag, installed on both subinterfaces, and
+    // `free_prepared` was never reached for a prepared or callable statement:
+    // every compiled statement leaked its registry entry for the life of the
+    // VM. Put the prepared-aware close back on both.
+    //
+    // The Statement path is untouched — `java/sql/Statement.close()V` itself
+    // is not re-registered here.
+    r.register(
+        "java/sql/PreparedStatement",
+        "close",
+        "()V",
+        native_prepared_statement_close,
+    );
+    r.register(
+        "java/sql/CallableStatement",
+        "close",
+        "()V",
+        native_prepared_statement_close,
+    );
+
     // NEW-14.N1 — CallableStatement output parameter support.
     //
     // `registerOutParameter(int, int)` / `registerOutParameter(int, int, int)`
@@ -2497,6 +2927,11 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // `wasNull()` / `getObject(int)` fall through to the inherited
     // PreparedStatement implementation which returns the corresponding
     // ResultSet column value.
+    //
+    // KEEP (deliberate no-ops) — re-confirmed 2026-07-27. The registration
+    // itself carries no state SQLite could honour; the values a caller
+    // subsequently reads come from the ResultSet path above, so recording the
+    // requested SQL type here would change nothing that is ever read back.
     let cstmt = "java/sql/CallableStatement";
     r.register(cstmt, "registerOutParameter", "(II)V", |_ctx, _args| {
         Ok(None)

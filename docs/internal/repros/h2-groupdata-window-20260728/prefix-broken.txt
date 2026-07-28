@@ -1,0 +1,39 @@
+# H2OsaWindowProbe on a PRE-FIX control binary — what the defect actually looked like.
+#
+# Built 2026-07-28 from the SAME tree as the passing binary (dev d0a6c7987) with only
+# the two delegation branches of `h2_expression_column_get_value`
+# (native-builtins/src/apps_h2.rs) disabled, then the source reverted. So this is a
+# same-commit, same-toolchain A/B: the ONLY difference from expected-output.txt is
+# whether that native delegates to H2's own bytecode when a grouped/windowed query is
+# executing.
+#
+# It reproduces all four symptom shapes that were filed as separate bugs:
+#   (a) stuck on the FIRST partition's value      -> OSA.* lines
+#   (b) H2's unreachable-by-design exception       -> the "Feature not supported" lines
+#   (c) off-by-one with wraparound                 -> WF.sum.filter.window
+#   (d) a scalar column stuck on the LAST row      -> the id column of WF.avg/count.partition
+# and it dies outright on the bulkid INSERT ... SELECT shape.
+#
+# Confirms the fix is still load-bearing on today's dev — it has not been silently
+# reverted or shadowed by later changes.
+
+OSA.percentile_disc.window   n=5   5 5 5 5 5              # (a)  correct: 5 5 6 7 13
+OSA.listagg.filter.window    n=5   5,5 5,5 5,5 5,5 5,5    # (a)  correct: 5,5 6 7 null 5,5
+OSA.percentile_disc.plain    n=1   6                      #      correct — plain aggregate, phase-1 only
+OSA.listagg.plain            n=1   5,13,7,6,5             #      correct — same reason
+WF.rank.partition            n=0   EX: Feature not supported: "Window function"; [50100-240]   # (b)
+WF.rownumber.noorder         n=5   1 2 3 4 5              #      correct — no PARTITION BY key to mis-read
+WF.rownumber.partition       n=0   EX: Feature not supported: "Window function"; [50100-240]   # (b)
+WF.denserank.partition       n=0   EX: Feature not supported: "Window function"; [50100-240]   # (b)
+WF.sum.filter.window         n=5   null 6 13 26 null      # (c)  correct: null null 6 13 26 — output[i]=correct[(i+1) mod 5]
+WF.frame                     n=5   11 18 26 25 18         #      correct
+WF.lag.partition             n=0   EX: Feature not supported: "Window function"; [50100-240]   # (b)
+WF.avg.partition             n=5   5/5.0 5/5.0 5/5.0 5/5.0 5/5.0   # (d) id stuck on the last scanned row
+WF.count.partition           n=5   5/2 5/2 5/2 5/2 5/2             # (d) same
+WF.rownumber.groupby         n=4   5/1 6/2 7/3 13/4       #      correct
+BULK.insertselect            -- probe dies, exit 1:
+#   JdbcSQLIntegrityConstraintViolationException: Unique index or primary key violation:
+#   "PUBLIC.CONSTRAINT_9 PRIMARY KEY ON PUBLIC.SCRATCH(ID) ( /* key:25 */ 25, 1 )"
+# key 25 = 5+20, i.e. the id derived from the LAST driving row — the exact
+# `bulkid.*MutationStrategy*Test.testInsertSelect` failure, reproduced here with no
+# Hibernate at all, on the same commit as the passing binary.

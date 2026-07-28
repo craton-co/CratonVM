@@ -98,6 +98,12 @@ struct PoolState {
     queue: VecDeque<PoolTask>,
     shutdown: bool,
     active: usize,
+    /// Tasks a worker has pulled off the shared submission queue. In a real
+    /// ForkJoinPool a "steal" is a task taken from a queue other than the
+    /// worker's own; this pool has a single shared queue, so every task a
+    /// worker picks up was submitted by another thread and is a steal by that
+    /// definition. Backs `ForkJoinPool.getStealCount()`.
+    steals: u64,
 }
 
 impl WorkStealingPool {
@@ -107,6 +113,7 @@ impl WorkStealingPool {
                 queue: VecDeque::new(),
                 shutdown: false,
                 active: 0,
+                steals: 0,
             }),
             Condvar::new(),
         ));
@@ -131,6 +138,7 @@ impl WorkStealingPool {
                     }
                     if let Some(t) = state.queue.pop_front() {
                         state.active += 1;
+                        state.steals = state.steals.saturating_add(1);
                         break t;
                     }
                     cv.wait(&mut state);
@@ -192,6 +200,13 @@ impl WorkStealingPool {
 
     pub(crate) fn parallelism(&self) -> usize {
         self.parallelism
+    }
+
+    /// Total tasks pulled off the shared queue by worker threads since VM
+    /// start. See `PoolState::steals`.
+    pub(crate) fn steal_count(&self) -> u64 {
+        let (lock, _) = &*self.inner;
+        lock.lock().steals
     }
 }
 
@@ -289,11 +304,14 @@ fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(common_pool().parallelism() as i32)))
     });
 
-    // ForkJoinPool.getStealCount — steals are per-submission in our
-    // single-queue model; report the common-pool active count as a
-    // reasonable proxy.
+    // ForkJoinPool.getStealCount — the pool has a single shared submission
+    // queue, so every task a worker pulls off it was submitted by a different
+    // thread, which is exactly the JDK's definition of a steal. Report the
+    // real running total instead of a hardcoded 0 (which made every
+    // `getStealCount() > 0` health check report an idle pool no matter how
+    // much work it had actually run).
     r.register(pool, "getStealCount", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
+        Ok(Some(Value::Long(common_pool().steal_count() as i64)))
     });
 
     // ForkJoinPool.hasQueuedSubmissions — checked against the real queue.

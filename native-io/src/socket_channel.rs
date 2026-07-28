@@ -428,7 +428,11 @@ fn alloc_obj(ctx: &mut dyn NativeContext, class_name: &str, nfields: usize) -> O
 /// overridable `SocketChannelImpl.close`), so a null `closeLock` killed the
 /// reactor worker under load → "I/O reactor has been shut down" (ES
 /// testManyAsyncRequests). Idempotent; safe to call on any channel.
-fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) {
+///
+/// Returns the channel ref, which the caller MUST use from here on: seeding
+/// `interruptor` allocates, and an allocation can move `ch`.
+#[must_use]
+fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
     // Seed each monitor field with the channel object ITSELF rather than a fresh
     // `new Object()`. The fields only need to be a non-null, stable monitor; the
     // channel is one, and using it avoids the allocation entirely — which matters
@@ -438,11 +442,68 @@ fn init_channel_locks(ctx: &mut dyn NativeContext, ch: ObjectRef) {
     // testManyAsyncRequests). `synchronized(closeLock)` then `synchronized(keyLock)`
     // both lock the same channel monitor reentrantly (same thread) — correct, and
     // distinct channels still use distinct monitors.
+    //
+    // These three MUST be seeded before `seed_channel_interruptor` below, which
+    // does allocate: if that allocation moves `ch`, a moving GC rewrites the
+    // reference stored in these slots along with every other, so a lock seeded
+    // first survives the move. A lock seeded after would be written to a stale
+    // address instead — which is the exact failure the paragraph above records.
     for f in ["closeLock", "keyLock", "regLock"] {
         if !matches!(ctx.get_field_by_name(ch, f), Value::Object(Some(_))) {
             ctx.set_field_by_name(ch, f, Value::Object(Some(ch)));
         }
     }
+    seed_channel_interruptor(ctx, ch)
+}
+
+/// Seed `AbstractInterruptibleChannel.interruptor` on a bridge-built channel.
+///
+/// `interruptor` is a `final` field the real `AbstractInterruptibleChannel()`
+/// constructor always assigns, and `begin()` dereferences it unconditionally
+/// once `Thread.currentThread().isInterrupted()` is true. CratonVM builds
+/// socket channels without running that constructor, so the slot stayed null
+/// and ANY channel operation on a thread whose interrupt flag happened to be
+/// set died with
+/// `NullPointerException: Cannot invoke "sun.nio.ch.Interruptible.interrupt(
+/// java.lang.Thread)" because "this.interruptor" is null`
+/// instead of performing the specified asynchronous close.
+///
+/// `sun/nio/ch/FileChannelImpl` was fixed for the H2 `TestStreamStore` NPE on
+/// 2026-07-26; the socket channels were left open then because seeding needs an
+/// allocation and this path carries an empirically-earned warning against
+/// allocating (see `init_channel_locks`). Sequencing the allocation AFTER the
+/// three monitor fields, and pinning `ch` across it, removes that objection:
+/// nothing that can be left null by a relocation is written afterwards, and the
+/// caller is handed the post-GC ref.
+///
+/// Returns the (possibly relocated) channel ref.
+#[must_use]
+fn seed_channel_interruptor(ctx: &mut dyn NativeContext, ch: ObjectRef) -> ObjectRef {
+    if matches!(ctx.get_field_by_name(ch, "interruptor"), Value::Object(Some(_))) {
+        return ch;
+    }
+    // `new_object_initialized` allocates and runs bytecode, either of which can
+    // relocate `ch`; pin it across the call and read the live address back
+    // (native stale-local family).
+    let pin = ctx.pin_native_root(ch);
+    let interruptor = ctx
+        .new_object_initialized(
+            "java/nio/channels/spi/AbstractInterruptibleChannel$1",
+            "(Ljava/nio/channels/spi/AbstractInterruptibleChannel;)V",
+            &[Value::Object(Some(ch))],
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(Value::Object(None));
+    let ch = ctx.read_native_pin(pin, ch);
+    ctx.unpin_native_roots(pin);
+    // In synthetic-JDK mode the anonymous class does not exist and the
+    // construction above fails; writing null is then exactly the previous
+    // behaviour, and `set_field_by_name` is a no-op when the slot is absent.
+    if matches!(interruptor, Value::Object(Some(_))) {
+        ctx.set_field_by_name(ch, "interruptor", interruptor);
+    }
+    ch
 }
 
 /// Layout convention:
@@ -989,7 +1050,7 @@ fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 /// Shared body of `SocketChannel.open()` / `open(ProtocolFamily)`.
 fn sc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    init_channel_locks(ctx, ch);
+    let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -1314,12 +1375,98 @@ fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(sock))))
 }
 
-/// No-op override for `java.net.Socket` option setters. The `Socket` returned
-/// by `SocketChannel.socket()` is a bare adapter with no real `SocketImpl`, so
-/// the real setter bytecode would call `getImpl()` and NPE. These options are
-/// best-effort (the channel carries the live socket), so swallow them. When
-/// `CRATONVM_REAL_NET_SOCKETS` is set the central registry filter drops every
-/// `java/net/Socket` registration, so the real java.net path is used instead.
+/// `java.net.Socket` option setters, for the `Socket` handed out by
+/// `SocketChannel.socket()`.
+///
+/// These used to be a blanket constant `Ok(None)`. The intent was narrow — the
+/// bare-adapter `Socket` (the `SocketAdaptor.create` fallback in [`sc_socket`])
+/// has no real `SocketImpl`, so the real setter bytecode would go through
+/// `getImpl()` — but the registry is keyed on the CLASS NAME, so the no-op
+/// caught EVERY `java.net.Socket` in the VM, and `register_io_natives` runs
+/// after `register_essential_natives_with_shims` (see `vm/src/vm/vm_init.rs`),
+/// so last-writer-wins handed it the slot for all of them.
+/// `socket.setTcpNoDelay(true)` was therefore discarded process-wide while the
+/// matching getters in `net_phase_e` reported the socket's true (unset) state.
+///
+/// Now: when the receiver is one of THIS module's channel-backed sockets the
+/// option is applied for real and recorded in `tcp_option_state`, so
+/// `setTcpNoDelay(true)` / `getTcpNoDelay()` round-trips through
+/// [`sc_get_option`]. Anything else is left alone — see
+/// [`socket_opt_apply`]'s note on the plain-`Socket` case.
+fn socket_opt_apply(ctx: &mut dyn NativeContext, args: &[Value], name: &str) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let id = match read_reg_id(ctx, this) {
+        Some(id) => id,
+        // Plain `java.net.Socket`: its live `TcpStream` lives in
+        // `cratonvm-native-builtins` (`servlet::s2_registry`, written by
+        // `net_phase_e`'s `Socket.connect`/`ServerSocket.accept`), which this
+        // crate cannot reach — `native-builtins` depends on `native-io`, not
+        // the other way round. Accepting and ignoring is still strictly better
+        // than dropping the registration: without one, real `Socket` bytecode
+        // runs `getImpl()` on a null `impl`, takes `createImpl(true)` and
+        // manufactures a throwaway OS socket to apply the option to, leaking an
+        // fd per call (the same defect `net_phase_e` just fixed on the getter
+        // side). The registration loop below no longer shadows a real setter if
+        // an earlier registrar provided one, so this arm disappears for any key
+        // that gets a proper implementation.
+        None => return Ok(None),
+    };
+    let val = socket_option_value(ctx, args.get(1).copied().unwrap_or(Value::Int(0)));
+    tcp_option_state()
+        .write()
+        .insert((id, name.to_string()), val);
+    let map = tcp_registry().read();
+    // `Stream` holds an `Arc<TcpStream>` and `Bound` a plain `TcpStream`, so
+    // the two cannot share an or-pattern binding — reborrow each to `&TcpStream`.
+    let stream: Option<&TcpStream> = match map.get(&id) {
+        Some(TcpHandle::Stream(s)) => Some(s.as_ref()),
+        Some(TcpHandle::Bound(s)) => Some(s),
+        _ => None,
+    };
+    if let Some(s) = stream {
+        if let Err(e) = apply_option(s, name, val) {
+            return Err(map_err(&format!("setOption({name})"), e));
+        }
+    }
+    Ok(None)
+}
+
+fn socket_opt_set_rcvbuf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_RCVBUF")
+}
+
+fn socket_opt_set_sndbuf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_SNDBUF")
+}
+
+fn socket_opt_set_keepalive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_KEEPALIVE")
+}
+
+fn socket_opt_set_reuseaddr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_REUSEADDR")
+}
+
+fn socket_opt_set_nodelay(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "TCP_NODELAY")
+}
+
+fn socket_opt_set_oobinline(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    socket_opt_apply(ctx, args, "SO_OOBINLINE")
+}
+
+fn socket_opt_set_linger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // `setSoLinger(boolean on, int linger)` — arg 1 is the flag, which is what
+    // `apply_option`/`read_option` key on.
+    socket_opt_apply(ctx, args, "SO_LINGER")
+}
+
+/// `setPerformancePreferences(int,int,int)` is advisory in the JDK too — the
+/// spec says an implementation is free to ignore the hint entirely, and HotSpot
+/// ignores it for a connected socket. The no-op IS the behaviour, not a stub.
 fn socket_opt_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
@@ -2831,7 +2978,7 @@ fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 /// Shared body of `ServerSocketChannel.open()` / `open(ProtocolFamily)`.
 fn ssc_open_family_value(ctx: &mut dyn NativeContext, family: i32) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", N_FIELDS);
-    init_channel_locks(ctx, ch);
+    let ch = init_channel_locks(ctx, ch);
     cf_set(ctx, ch, F_OPEN, Value::Int(1));
     cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
     cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
@@ -3110,7 +3257,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tcp_blocking_state().write().insert(new_id, blocking);
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    init_channel_locks(ctx, child);
+    let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(
         ctx,
@@ -3224,7 +3371,7 @@ fn ssc_accept_unix(
     let path = cf_get_str(ctx, this, F_UDS_PATH).unwrap_or_default();
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    init_channel_locks(ctx, child);
+    let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(
         ctx,
@@ -3617,17 +3764,31 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     // owns its own setSoTimeout implementation, so do not shadow the base
     // Socket setter: ordinary sockets must apply SO_RCVTIMEO to their stream.
     let client_socket = "java/net/Socket";
-    for (m, d) in [
-        ("setReceiveBufferSize", "(I)V"),
-        ("setSendBufferSize", "(I)V"),
-        ("setKeepAlive", "(Z)V"),
-        ("setReuseAddress", "(Z)V"),
-        ("setTcpNoDelay", "(Z)V"),
-        ("setOOBInline", "(Z)V"),
-        ("setSoLinger", "(ZI)V"),
-        ("setPerformancePreferences", "(III)V"),
+    for (m, d, cb) in [
+        (
+            "setReceiveBufferSize",
+            "(I)V",
+            socket_opt_set_rcvbuf as cratonvm_native_api::registry::NativeCallback,
+        ),
+        ("setSendBufferSize", "(I)V", socket_opt_set_sndbuf),
+        ("setKeepAlive", "(Z)V", socket_opt_set_keepalive),
+        ("setReuseAddress", "(Z)V", socket_opt_set_reuseaddr),
+        ("setTcpNoDelay", "(Z)V", socket_opt_set_nodelay),
+        ("setOOBInline", "(Z)V", socket_opt_set_oobinline),
+        ("setSoLinger", "(ZI)V", socket_opt_set_linger),
+        ("setPerformancePreferences", "(III)V", socket_opt_noop),
     ] {
-        r.register(client_socket, m, d, socket_opt_noop);
+        // Do NOT shadow a real implementation an earlier registrar already
+        // installed for this key. This block runs late (`register_io_natives`
+        // is called after `register_essential_natives_with_shims`), so without
+        // this guard it silently replaced, for every `java.net.Socket` in the
+        // VM, whatever real setter phases_early/net_phase_e had provided —
+        // last-writer-wins. The channel-adaptor case that these handlers exist
+        // for only ever needs them when nobody else claimed the key.
+        if r.find(client_socket, m, d).is_some() {
+            continue;
+        }
+        r.register(client_socket, m, d, cb);
     }
     r.set_category(__prev_cat);
 }

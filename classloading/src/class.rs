@@ -384,7 +384,29 @@ pub struct Class {
     /// stubs, reflection) can cheaply share a handle that outlives
     /// the borrow of the enclosing `Class`.
     pub init_state: Arc<std::sync::atomic::AtomicU8>,
+
+    /// Lazily-computed cache for [`Class::generated_record_object_methods`].
+    ///
+    /// `0` means "not computed yet"; a computed value always has
+    /// [`RECORD_OBJ_COMPUTED`] set, so a record with none of the three
+    /// generated bodies still caches a non-zero answer. Computing the answer
+    /// needs a linear method scan plus a bytecode-shape check — far too
+    /// expensive to repeat on the record `hashCode`/`equals` hot path, where
+    /// a single `HashMap` probe keyed by a record runs it once per component.
+    pub record_object_methods: std::sync::atomic::AtomicU8,
 }
+
+/// Bit set in [`Class::generated_record_object_methods`] for a javac-generated
+/// `hashCode()I` body (`aload_0; invokedynamic ObjectMethods; ireturn`).
+pub const RECORD_OBJ_HASH_CODE: u8 = 1 << 0;
+/// Bit set in [`Class::generated_record_object_methods`] for a javac-generated
+/// `equals(Ljava/lang/Object;)Z` body.
+pub const RECORD_OBJ_EQUALS: u8 = 1 << 1;
+/// Bit set in [`Class::generated_record_object_methods`] for a javac-generated
+/// `toString()Ljava/lang/String;` body.
+pub const RECORD_OBJ_TO_STRING: u8 = 1 << 2;
+/// Marker bit distinguishing "computed, none generated" from "not computed".
+pub const RECORD_OBJ_COMPUTED: u8 = 1 << 7;
 
 /// RKC16N.3 — Metadata for a synthesised array class.
 ///
@@ -556,6 +578,156 @@ impl Class {
     #[inline]
     pub fn is_sealed(&self) -> bool {
         !self.permitted_subclasses.is_empty()
+    }
+
+    /// Which of `hashCode`/`equals`/`toString` this record declares with the
+    /// **javac-generated** body — a bare `invokedynamic` against
+    /// `java.lang.runtime.ObjectMethods.bootstrap` (JEP 395).
+    ///
+    /// The result is `RECORD_OBJ_COMPUTED | <bits>`; a non-record, or a record
+    /// that hand-writes all three, yields just `RECORD_OBJ_COMPUTED`. The
+    /// answer is memoised in [`Class::record_object_methods`].
+    ///
+    /// Callers use this to run those three methods through the VM's direct
+    /// record implementation instead of interpreting the `invokedynamic`. A
+    /// hand-written override must NOT be diverted, hence the exact body-shape
+    /// check rather than a name match: javac emits precisely
+    ///
+    /// * `hashCode()I`                    — `aload_0; invokedynamic; ireturn`
+    /// * `equals(Ljava/lang/Object;)Z`    — `aload_0; aload_1; invokedynamic; ireturn`
+    /// * `toString()Ljava/lang/String;`   — `aload_0; invokedynamic; areturn`
+    ///
+    /// and the `invokedynamic`'s bootstrap method is verified to be
+    /// `ObjectMethods.bootstrap` before the bit is set.
+    pub fn generated_record_object_methods(&self) -> u8 {
+        use std::sync::atomic::Ordering;
+        let cached = self.record_object_methods.load(Ordering::Relaxed);
+        if cached != 0 {
+            return cached;
+        }
+        let mut bits = RECORD_OBJ_COMPUTED;
+        if self.is_record() {
+            if self.record_object_body_is_generated("hashCode", "()I", &[0x2a], 0xac) {
+                bits |= RECORD_OBJ_HASH_CODE;
+            }
+            if self.record_object_body_is_generated(
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[0x2a, 0x2b],
+                0xac,
+            ) {
+                bits |= RECORD_OBJ_EQUALS;
+            }
+            if self.record_object_body_is_generated(
+                "toString",
+                "()Ljava/lang/String;",
+                &[0x2a],
+                0xb0,
+            ) {
+                bits |= RECORD_OBJ_TO_STRING;
+            }
+        }
+        // Racing threads compute the same value, so a plain store is fine.
+        self.record_object_methods.store(bits, Ordering::Relaxed);
+        bits
+    }
+
+    /// `true` when `name`/`descriptor` is declared by this class with exactly
+    /// `prologue` (the `aload_*` receiver/argument pushes), one
+    /// `invokedynamic` bound to `ObjectMethods.bootstrap`, and `ret_opcode`.
+    fn record_object_body_is_generated(
+        &self,
+        name: &str,
+        descriptor: &str,
+        prologue: &[u8],
+        ret_opcode: u8,
+    ) -> bool {
+        let Some(method) = self.find_method(name, descriptor) else {
+            return false;
+        };
+        // `ClassFileMethod::code()` only sees an ALREADY-decoded Code
+        // attribute, and the caller runs at inline-cache fill time — before
+        // this body has ever executed, so the attribute is still `Raw` and
+        // `code()` reads as absent. (Relying on `code()` here silently
+        // disabled the whole fast path: every record cached "not generated"
+        // on its first call and kept it forever.) Decode on demand instead;
+        // the answer is memoised by the caller, so this runs once per class.
+        for attribute in &method.attributes {
+            let Some(decoded) = attribute.decoded_or_decode(&self.constant_pool) else {
+                continue;
+            };
+            if let cratonvm_reader::attribute::Attribute::Code(code) = &*decoded {
+                return self.code_is_generated_object_method(&code.code, prologue, ret_opcode);
+            }
+        }
+        false
+    }
+
+    /// The bytecode-shape half of [`Class::record_object_body_is_generated`].
+    fn code_is_generated_object_method(
+        &self,
+        body: &[u8],
+        prologue: &[u8],
+        ret_opcode: u8,
+    ) -> bool {
+        if body.len() != prologue.len() + 6 {
+            return false;
+        }
+        if !body.starts_with(prologue) {
+            return false;
+        }
+        let indy_at = prologue.len();
+        if body[indy_at] != 0xba
+            || body[indy_at + 3] != 0
+            || body[indy_at + 4] != 0
+            || body[indy_at + 5] != ret_opcode
+        {
+            return false;
+        }
+        let cp_index = ((body[indy_at + 1] as u16) << 8) | body[indy_at + 2] as u16;
+        self.invokedynamic_uses_object_methods_bootstrap(cp_index)
+    }
+
+    /// Resolve an `InvokeDynamic` constant-pool entry through the
+    /// `BootstrapMethods` attribute and report whether its bootstrap method is
+    /// `java.lang.runtime.ObjectMethods.bootstrap`.
+    fn invokedynamic_uses_object_methods_bootstrap(&self, cp_index: u16) -> bool {
+        use cratonvm_reader::constant_pool::ConstantPoolEntry;
+        let bsm_attr_index = match self.constant_pool.get(cp_index) {
+            Some(ConstantPoolEntry::InvokeDynamic {
+                bootstrap_method_attr_index,
+                ..
+            }) => *bootstrap_method_attr_index as usize,
+            _ => return false,
+        };
+        let Some(bsm) = self.bootstrap_methods.get(bsm_attr_index) else {
+            return false;
+        };
+        let method_ref_index = match self.constant_pool.get(bsm.bootstrap_method_ref) {
+            Some(ConstantPoolEntry::MethodHandle {
+                reference_index, ..
+            }) => *reference_index,
+            _ => return false,
+        };
+        let (class_index, name_and_type_index) = match self.constant_pool.get(method_ref_index) {
+            Some(ConstantPoolEntry::MethodReference {
+                class_index,
+                name_and_type_index,
+            })
+            | Some(ConstantPoolEntry::InterfaceMethodReference {
+                class_index,
+                name_and_type_index,
+            }) => (*class_index, *name_and_type_index),
+            _ => return false,
+        };
+        if self.constant_pool.get_class_name(class_index) != Some("java/lang/runtime/ObjectMethods")
+        {
+            return false;
+        }
+        matches!(
+            self.constant_pool.get_name_and_type(name_and_type_index),
+            Some(("bootstrap", _))
+        )
     }
 
     /// Check if this is a hidden class (JEP 371).
@@ -1521,6 +1693,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         }
     }
 

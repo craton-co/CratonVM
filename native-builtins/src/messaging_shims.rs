@@ -2156,6 +2156,20 @@ pub(crate) fn register_spring_messaging_bridges(registry: &mut NativeMethodRegis
         "(Lorg/apache/activemq/broker/Broker;Lorg/apache/activemq/broker/ConnectionContext;Lorg/apache/activemq/command/ConsumerInfo;)V",
         native_activemq_abstract_subscription_init,
     );
+    // KEEP (deliberate, load-bearing constant) — audited 2026-07-27.
+    // `isFull()` is the broker's dispatch gate. Its real body is a predicate
+    // over `active`, `prefetchExtension` and `dispatched` — and the synthetic
+    // `<init>` immediately above (`native_activemq_topic_subscription_init`)
+    // parks `active = false` and never populates `prefetchExtension` at all,
+    // so running the real bytecode here reports a permanently-full (or
+    // null-dereferencing) subscription and the broker never dispatches a
+    // single message. Reporting "not full" is what keeps dispatch alive.
+    //
+    // Known consequence, deliberately accepted: prefetch backpressure never
+    // engages, so a consumer that stops acking will not throttle the broker.
+    // Fixing this properly means teaching that `<init>` to build a real
+    // `prefetchExtension` and flip `active`, at which point this registration
+    // should be deleted rather than reimplemented.
     registry.register(
         "org/apache/activemq/broker/region/TopicSubscription",
         "isFull",
@@ -2222,6 +2236,10 @@ pub(crate) fn register_netty_internal_tcnative_natives(registry: &mut NativeMeth
         };
         Ok(Some(Value::Int(v)))
     });
+    // KEEP (deliberate, load-bearing constants). `has`/`initialize0` must
+    // both answer positively or `Library.<clinit>` throws and every class in
+    // the io.netty.internal.tcnative package becomes unloadable — which is
+    // the crash this whole registrar exists to avoid (see the fn doc above).
     registry.register(lib, "has", "(I)Z", |_ctx, _args| Ok(Some(Value::Int(1))));
     registry.register(lib, "initialize0", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
@@ -2335,12 +2353,30 @@ pub(crate) fn register_netty_internal_tcnative_natives(registry: &mut NativeMeth
         "x509vErrIpAddressMismatch",
         "x509vErrDaneNoMatch",
     ];
+    // KEEP (deliberate constants) with a caveat worth knowing about.
+    // `NativeStaticallyReferencedJniMethods` is how tcnative imports the
+    // OpenSSL `SSL_OP_*` / `SSL_ERROR_*` / `X509_V_ERR_*` numeric constants;
+    // its <clinit>-time reads must not throw, hence a value for every name.
+    // Zero is chosen uniformly because there is no OpenSSL behind ANY of this
+    // — `SSL.initialize`/`version` below are stubs too and no handshake ever
+    // runs — so no code path here compares two of these against each other.
+    //
+    // The caveat: if a real tcnative handshake path is ever wired up, the
+    // uniform zero makes every SSL_ERROR_* compare equal to SSL_ERROR_NONE,
+    // i.e. a failed handshake would read as success. Filling in the true
+    // OpenSSL values is a prerequisite for that work, not an optional
+    // cleanup.
     let nsm = "io/netty/internal/tcnative/NativeStaticallyReferencedJniMethods";
     for name in NETTY_STATIC_INT_NATIVES {
         registry.register(nsm, name, "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
     }
 
     let ssl = "io/netty/internal/tcnative/SSL";
+    // KEEP (deliberate constants): `initialize` returns OpenSSL's success
+    // code (0), and `version` reports the OpenSSL 1.1.1g version number that
+    // matches the "OpenSSL cratonvm-stub" string below — tcnative gates
+    // feature detection on that number, so it has to name a plausible
+    // release. Nothing behind these two actually links OpenSSL.
     registry.register(ssl, "initialize", "(Ljava/lang/String;)I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });

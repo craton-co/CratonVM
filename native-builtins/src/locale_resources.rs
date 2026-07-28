@@ -448,6 +448,14 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
         ctx.set_field(obj_now, 1, Value::Object(Some(root_locale)));
     }
 
+    // Record the base name so `getBaseBundleName()` has something true to
+    // report. By name, so it lands on the real JDK's private `name` field when
+    // that layout is present and is a harmless no-op when it is not. `obj` is
+    // re-read through the pin AFTER `create_string`, which can move it.
+    let base_name = ctx.create_string(bundle_name);
+    let obj_now = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field_by_name(obj_now, "name", Value::Object(Some(base_name)));
+
     // .properties fallback for user resources.
     let resource_name = format!("{}.properties", bundle_name.replace('.', "/"));
     let mut populated_from_props = false;
@@ -1004,6 +1012,12 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let map_now = ctx.read_native_pin(map_pin, map);
     ctx.set_field(obj_now, 0, Value::Object(Some(map_now)));
     ctx.set_field(obj_now, 1, Value::Object(None));
+
+    // Base name for `getBaseBundleName()` — see the matching write in
+    // `build_bundle`. Re-read `obj` through its pin after `create_string`.
+    let base_name = ctx.create_string(&bundle_name);
+    let obj_now = ctx.read_native_pin(obj_pin, obj);
+    ctx.set_field_by_name(obj_now, "name", Value::Object(Some(base_name)));
 
     let mut matched: Option<(String, String)> = None;
     for (cand, m_lang, m_country) in &chain {
@@ -1697,11 +1711,26 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")))))
     });
+    // getBaseBundleName() — the real `ResourceBundle` returns its private
+    // `name` field. The Javadoc permits null ("or null if unknown"), but we
+    // are never in that position: every bundle this file builds was built FOR
+    // a specific base name, so answering null threw away information we hold.
+    // Spring's `ResourceBundleMessageSource` and JDK `Bundles` caches key on
+    // it. Read the named field (populated by `build_bundle` /
+    // `rb_get_bundle`, and by the real JDK factory in real-JDK mode) and fall
+    // back to null only when it genuinely is not set.
     registry.register(
         rb,
         "getBaseBundleName",
         "()Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            if let Some(Value::Object(Some(this))) = args.first() {
+                if let v @ Value::Object(Some(_)) = ctx.get_field_by_name(*this, "name") {
+                    return Ok(Some(v));
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
 
     // sun.util.resources.LocaleData.getBundle(String, Locale)  →ResourceBundle

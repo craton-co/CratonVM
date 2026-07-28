@@ -3015,11 +3015,27 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // `CallSite.type()` is defined as `target.type()`. It used to be a constant
+    // null, which NPE'd every caller that asks a call site for its type
+    // (`CallSite.dynamicInvoker`, `MutableCallSite.syncAll`, and any JDK code
+    // that type-checks a call site before invoking it). Slot 0 is the target
+    // MethodHandle; a MethodHandle keeps its MethodType in its named `type`
+    // field, falling back to slot 0 (see the `MethodHandle.type` native).
     r.register(
         cs,
         "type",
         "()Ljava/lang/invoke/MethodType;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let target = match ctx.get_field(this, 0) {
+                Value::Object(Some(t)) => t,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            match ctx.get_field_by_name(target, "type") {
+                named @ Value::Object(Some(_)) => Ok(Some(named)),
+                _ => Ok(Some(ctx.get_field(target, 0))),
+            }
+        },
     );
 
     // MutableCallSite
@@ -4603,8 +4619,11 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
 pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // Mixed block:
     //   * MethodHandleProxies.asInterfaceInstance is still a SIMPLIFIED stub —
-    //     returns the MH itself as the "proxy"; isWrapperInstance→0;
-    //     wrapperInstance{Target,Type}→null.
+    //     it returns the MH itself as the "proxy". `isWrapperInstance` and
+    //     `wrapperInstanceTarget` are now answered CONSISTENTLY with that
+    //     (is-a-MethodHandle / the handle itself) instead of the old blanket
+    //     0/null, which contradicted what `asInterfaceInstance` had just
+    //     returned. `wrapperInstanceType` is not registered — see below.
     //   * LambdaMetafactory.metafactory / altMetafactory are now a faithful
     //     bridge to the VM's real lambda-proxy machinery (the same one the
     //     `invokedynamic` opcode uses): they register a proxy class via
@@ -4628,24 +4647,59 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
         },
     );
+    // The three queries below used to be blanket `false` / `null` / `null`,
+    // which directly contradicted what `asInterfaceInstance` had just handed
+    // the caller: under this simplification a "wrapper instance" IS the
+    // MethodHandle itself. Answer them consistently off that, so
+    // `isWrapperInstance(asInterfaceInstance(...))` is true and the two
+    // accessors return the target and its type instead of null.
+    fn mhp_wrapper_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<ObjectRef> {
+        let Some(Value::Object(Some(obj))) = args.first().copied() else {
+            return None;
+        };
+        let mh_class_id = ctx.class_id_by_name("java/lang/invoke/MethodHandle")?;
+        let obj_class_id = ctx.class_id_of_object(obj);
+        if obj_class_id == mh_class_id || ctx.is_subclass(obj_class_id, mh_class_id) {
+            Some(obj)
+        } else {
+            None
+        }
+    }
     r.register(
         mhp,
         "isWrapperInstance",
         "(Ljava/lang/Object;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let present = mhp_wrapper_handle(ctx, args).is_some();
+            Ok(Some(Value::Int(if present { 1 } else { 0 })))
+        },
     );
     r.register(
         mhp,
         "wrapperInstanceTarget",
         "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| match mhp_wrapper_handle(ctx, args) {
+            // Real JDK throws IllegalArgumentException for a non-wrapper; we
+            // keep the historical null there so an existing caller that never
+            // checked `isWrapperInstance` first does not start throwing.
+            Some(mh) => Ok(Some(Value::Object(Some(mh)))),
+            None => Ok(Some(Value::Object(None))),
+        },
     );
-    r.register(
-        mhp,
-        "wrapperInstanceType",
-        "(Ljava/lang/Object;)Ljava/lang/Class;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // `wrapperInstanceType` is deliberately NOT registered. The registration
+    // deleted here keyed on `(Ljava/lang/Object;)Ljava/lang/Class;`, but the
+    // real `MethodHandleProxies.wrapperInstanceType(Object)` returns a
+    // `MethodType` — descriptor
+    // `(Ljava/lang/Object;)Ljava/lang/invoke/MethodType;` — so the key was
+    // permanently unmatchable against real JDK bytecode, and nothing declares
+    // the `Class`-returning spelling in synthetic mode either
+    // (`MethodHandleProxies` has no `synthetic_jdk_method_decls` entry, and no
+    // caller anywhere in-tree). It was a dead AND wrong-typed constant null, so
+    // it is deleted rather than kept as an unmatchable key.
+    //
+    // To provide it for real: register under the MethodType descriptor and
+    // return the handle's `type` (named field, slot-0 fallback) using
+    // `mhp_wrapper_handle` above.
 
     // Round-9 perf: LambdaMetafactory CallSite cache. Each lambda shape
     // (functional_interface_type, samMethodType, instantiatedMethodType,

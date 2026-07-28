@@ -23,6 +23,7 @@ pub mod integer;
 pub mod long;
 pub mod math;
 pub mod object;
+pub mod record;
 pub mod string;
 pub mod stringbuilder;
 pub mod system;
@@ -141,6 +142,7 @@ pub fn might_have_method_descriptor(name: &str, desc: &str) -> bool {
             | ("min", "(JJ)J")
             | ("max", "(JJ)J")
             | ("sqrt", "(D)D")
+            | ("equals", "(Ljava/lang/Object;)Z")
     )
 }
 
@@ -216,6 +218,9 @@ pub fn dispatch(
         MathMinLong => math::intrinsic_math_min_long(ctx, args),
         MathMaxLong => math::intrinsic_math_max_long(ctx, args),
         MathSqrt => math::intrinsic_math_sqrt(ctx, args),
+        // Records
+        RecordHashCode => record::intrinsic_record_hash_code(ctx, args),
+        RecordEquals => record::intrinsic_record_equals(ctx, args),
     }
 }
 
@@ -268,6 +273,8 @@ pub fn callback_for(kind: InterpIntrinsic) -> cratonvm_native_api::NativeCallbac
         MathMinLong => tramp!(MathMinLong),
         MathMaxLong => tramp!(MathMaxLong),
         MathSqrt => tramp!(MathSqrt),
+        RecordHashCode => tramp!(RecordHashCode),
+        RecordEquals => tramp!(RecordEquals),
     }
 }
 

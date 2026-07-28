@@ -1775,12 +1775,33 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         "()V",
         native_jboss_thread_run,
     );
+    // A JBossThread whose task throws routes the Throwable through here; the
+    // real body hands it to the thread's UncaughtExceptionHandler, whose JDK
+    // default prints "Exception in thread ..." plus the stack trace to
+    // System.err. The no-op this replaced (added in be6055605 as part of a
+    // bulk registration, with no rationale of its own) swallowed every
+    // uncaught exception raised on a WildFly worker thread — a failed boot
+    // task simply vanished. Reproduce the JDK default: print the Throwable.
     r.register(
         "org/jboss/threads/JBossThread",
         "dispatchUncaughtException",
         "(Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            // Instance shape is [this, throwable]; if the receiver is ever
+            // elided the arg list is just [throwable]. The Throwable is the
+            // last argument either way.
+            if let Some(Value::Object(Some(t))) = args.last() {
+                let _ = ctx.invoke_virtual(*t, "printStackTrace", "()V", &[]);
+            }
+            Ok(None)
+        },
     );
+    // KEEP (honest failure, not a stub): `onExit` asks to register a hook to
+    // be run once the calling thread terminates. CratonVM has no per-thread
+    // exit-hook table to put it in, and jboss-threads' contract is that the
+    // boolean says whether the hook WAS registered — so `false` is the true
+    // answer and callers that care can react. Silently returning `true` would
+    // promise an invocation that never happens.
     r.register(
         "org/jboss/threads/JBossThread",
         "onExit",
@@ -2089,6 +2110,15 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         // (an `AtomicLongFieldUpdater.compareAndSet` on that field, which can
         // never succeed against an unmaintained field). Shim the lifecycle to
         // clean terminal values so synthetic-mode cleanup completes.
+        //
+        // KEEP (deliberate, load-bearing constants), re-confirmed 2026-07-27.
+        // Note what they actually claim: `isShutdown`/`isTerminated`/
+        // `awaitTermination` report terminal state UNCONDITIONALLY — true even
+        // before `shutdown()` is called — because the synthetic executor
+        // drains tasks inline in `native_exec_execute` and therefore has no
+        // in-flight work to wait for at any point. This whole block is gated
+        // behind the default-OFF `CRATONVM_SYNTHETIC_EQE=1`; the default build
+        // runs the real jboss-threads bytecode instead.
         let eqe = "org/jboss/threads/EnhancedQueueExecutor";
         r.register(eqe, "shutdown", "()V", |_ctx, _args| Ok(None));
         r.register(eqe, "shutdown", "(Z)V", |_ctx, _args| Ok(None));
