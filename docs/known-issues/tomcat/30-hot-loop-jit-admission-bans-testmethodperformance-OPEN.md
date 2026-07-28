@@ -1,11 +1,12 @@
-# Two conservative JIT-admission bans leave `TestMethodPerformance`'s whole hot path interpreted
+# Three conservative JIT-admission bans leave `TestMethodPerformance`'s whole hot path interpreted
 
 **Status:** 🔴 **OPEN.** Residual of
 [24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) (whose `OutOfMemoryError` is FIXED).
 This is a *throughput* residual, in the family of
-[04](04-embedded-server-throughput-wall-OPEN.md) and
-[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) — but unlike those it
-is root-caused here to two **specific, named** admission gates, both of which
+[31](31-synchronized-code-never-jit-compiled.md) (and of the retired
+[04](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md) /
+[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md)) — but unlike those it
+is root-caused here to three **specific, named** admission gates, all of which
 were added deliberately to close real silent-corruption bugs.
 
 ## Symptom
@@ -32,9 +33,10 @@ That same run is also the end-to-end confirmation for bug 24 — it cleared
 200 000 000+ iterations with no `OutOfMemoryError`, against a pre-fix baseline
 that died before 10 000 000.
 
-## Root cause — two independent admission bans on the same hot path
+## Root cause — three independent admission bans on the same hot path
 
-Both are visible in one `CRATONVM_DBG_JITC=1` run of the class:
+The first two are visible in one `CRATONVM_DBG_JITC=1` run of the class; the
+third is in the probe table below.
 
 ### 1. The driving loop is permanently OSR-denied (RBC.7 `invokedynamic` ban)
 
@@ -110,8 +112,8 @@ for this whole shape is `CRATONVM_DBG_JIT_METHOD_STATS=1`, which prints
 > (17 concurrent `cratonvm` processes from other sessions at one point), so
 > treat every absolute figure below as a *lower bound* — see
 > `feedback_shared_host_multitenant_confound`. The HotSpot control ran under
-> the same conditions, and the two structural findings above (OSR-denied,
-> RBC.6-refused) are compile-time facts read out of a trace, not timings, so
+> the same conditions, and the structural findings above (OSR-denied,
+> RBC.6-refused, constructor-refused) are compile-time facts read out of a trace, so
 > neither depends on host load.
 
 Per-operation cost in a JIT-compiled loop, nanoseconds. HotSpot's figures are
@@ -132,13 +134,11 @@ a like-for-like ratio; the CratonVM *column* is the interesting part.
 | `allocEsc` | same allocation **inline in the C2/OSR loop** | 3 | 2331 |
 | `allocBody` | `new Body()` whose ctor writes one field | – | 2338 |
 
-Two leads fall out of this table that are **not** explained by either ban
-above and are worth their own investigation:
+Two leads fell out of this table. Both are now root-caused:
 
-* an allocation whose constructor has a body costs ~20× one whose constructor
-  is empty (2338 vs 162 ns), even though the C2 artifact compiles cleanly and
-  does not deopt (`CRATONVM_DBG_DEOPT=1` shows compile-time map emission
-  only); and
+* **an allocation whose constructor has a body costs ~20× one whose
+  constructor is empty (2338 vs 162 ns)** — root-caused to a THIRD admission
+  ban, and the biggest of the three. See the section below; and
 * ~~a C2/OSR loop that mixes an allocation with another helper-call op can
   enter an **endless OSR recompile loop**~~ — **FIXED** (`fix(jit): stop the
   OSR recompile loop on a permanently un-enterable entry pc`). The
@@ -153,6 +153,67 @@ above and are worth their own investigation:
   retries were guaranteed to reproduce it. Now 200 -> **1** compile, with
   legitimate OSR (compile-then-reuse) unaffected. The loop still runs
   interpreted; this removed the wasted compiles, not the interpretation.
+
+## 3. Constructors that store a field are never compiled — the biggest lever
+
+The "ctor with a body costs 20×" lead above is not an allocation cost at all.
+`classify_init_complexity` (`vm/src/jit/skip_list.rs`) marks any `<init>`
+containing `putfield`, `putstatic`, `monitorenter/exit` or `invokedynamic` as
+`InitComplexity::Complex`, and `should_skip_jit_with_init` then refuses it with
+`SkipReason::Constructor`. A constructor that assigns a field — which is what
+constructors are *for* — is therefore never compiled and, unlike the RBC.6
+case, never even **enqueued**:
+
+```
+allocNEsc (static callee):  tiered-enqueue CallRate.make(I)… invoc_count=500  -> compiled
+allocBody (ctor callee):    (nothing — no tiered-enqueue, no bg-compile, ever)
+```
+
+So every `new` whose constructor stores a field runs that constructor in the
+interpreter, forever: `new String(…)`, `new HashMap.Node(…)`, essentially the
+whole JDK. This is a VM-wide ceiling on allocation, not a Tomcat issue.
+
+**Measured prize** (`CRATONVM_JIT_ALLOW_PUTFIELD_INIT=1`, a new default-OFF
+bisect knob that lifts the ban for `putfield` only, keeping it for the other
+three opcodes):
+
+| probe | ban on (default) | ban lifted |
+|---|---|---|
+| `allocBody` (ctor assigns one field) | 1846 ns | **226 ns** (8.2×) |
+| `allocArg` (ctor, empty body) | 200 ns | 186 ns |
+| `allocBare` | 100 ns | 103 ns |
+| `allocNoCtor` | 86 ns | 106 ns |
+
+Controls flat, so the knob does only what it claims.
+
+**Correctness evidence so far.** `CtorCheck` (a probe that READS BACK every
+field — plain stores, a superclass ctor storing before a subclass ctor, a store
+whose value comes from an instance method call on the half-built object, and a
+conditional store) gives byte-identical checksums across HotSpot, CratonVM
+`--nojit`, ban-on and ban-lifted, at both 200k and 2M iterations. Six JIT test
+binaries pass with the ban lifted (`jit_interp_differential`,
+`jit_collection_ctor_identity`, `jit_local_exception_handler_tests`,
+`jit_null_receiver_npe`, `jit_arity_5plus`, `jit_category2_params` — 26 tests).
+A six-class Tomcat sweep produced **no attributable regression**: 3 PASS, and
+all 3 non-PASS reproduce identically with the knob OFF.
+
+**What is NOT yet established.** The ban predates the open-source import
+(`a6dc911ed`) and is one of the four *structural* bans; unlike the ~46 named
+correctness bans it carries no incident write-up, only the one-line "field
+stores trigger the JIT's load-forwarding interaction". Nothing here proves that
+rationale stale — it proves only that six Tomcat classes and 26 JIT tests do
+not catch it. Before flipping the default, this needs a full-suite run
+(Tomcat + Spring Boot + Hibernate) **on a quiet host**; see the warning below.
+
+> **Warning to anyone measuring this.** `TestDefaultServlet` has a
+> **pre-existing flaky stack overflow** on `dev` under load — an unmodified
+> baseline binary crashed once in four runs with
+> "thread 'main-vm' has overflowed its stack" while this host was running three
+> concurrent heavy jobs. It ate an entire investigation cycle here: a single
+> crash-vs-pass pair was read as attribution three separate times (to the
+> constructor ban, then to an OSR change, then to a debug `eprintln!`), and
+> every one of those was refuted by simply repeating the baseline. **Repeat the
+> control before believing any difference against this class.**
 
 ## What a fix would involve
 

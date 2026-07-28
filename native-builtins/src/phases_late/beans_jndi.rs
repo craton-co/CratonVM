@@ -14,8 +14,19 @@ use super::*;
 // java.util.prefs.Preferences — 2-field synthetic (data=0 HashMap, name=1 String)
 // =============================================================================
 
+/// Synthetic `java.util.prefs.Preferences` layout:
+///   0: values   (HashMap<String,String> — the key/value store)
+///   1: name     (String — this node's simple name; "" for a root)
+///   2: parent   (Preferences — null for a root, per `Preferences.parent()`)
+///   3: children (HashMap<String,Preferences> — nodes created via `node()`)
+///
+/// Slots 2 and 3 were added in stub-removal wave 2: without a parent link
+/// `parent()` could only ever answer null, and without a child registry
+/// `nodeExists()` could only ever answer false — and `node("x")` minted a
+/// fresh detached node on every call, so `node("x").put(k,v)` followed by
+/// `node("x").get(k, d)` silently returned the default.
 pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 2);
+    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 4);
     // Pin across the map/string allocs below — a moving young GC there would
     // relocate them (native stale-local family).
     let prefs_pin = ctx.pin_native_root(prefs);
@@ -28,8 +39,36 @@ pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
     let name_str = ctx.create_string("");
     let prefs = ctx.read_native_pin(prefs_pin, prefs);
     ctx.set_field(prefs, 1, Value::Object(Some(name_str)));
+    // Roots have no parent; the child registry is created lazily by
+    // `p72_prefs_children` on the first `node()` call.
+    ctx.set_field(prefs, 2, Value::Object(None));
+    ctx.set_field(prefs, 3, Value::Object(None));
     ctx.unpin_native_roots(prefs_pin);
     prefs
+}
+
+/// The child-node registry of `this`, created on demand in slot 3.
+///
+/// Mirrors `p72_prefs_map`'s lazy-init shape (including its pinning), so a
+/// `Preferences` built before slots 2/3 existed still works.
+pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(this) < 4 {
+        return None;
+    }
+    if let Value::Object(Some(m)) = ctx.get_field(this, 3) {
+        return Some(m);
+    }
+    // Pin across the map alloc/init below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    let this = ctx.read_native_pin(this_pin, this);
+    let map = ctx.read_native_pin(map_pin, map);
+    ctx.set_field(this, 3, Value::Object(Some(map)));
+    ctx.unpin_native_roots(this_pin);
+    Some(map)
 }
 
 pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
@@ -109,25 +148,87 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let name_str = ctx.create_string("");
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 1, Value::Object(Some(name_str)));
+            // Slots 2 (parent) and 3 (child registry) — see the layout note on
+            // `p72_alloc_prefs`. Guarded because a receiver constructed against
+            // an older/foreign layout may have fewer slots.
+            if ctx.object_num_fields(this) > 3 {
+                ctx.set_field(this, 2, Value::Object(None));
+                ctx.set_field(this, 3, Value::Object(None));
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         });
+        // node(path) — resolve, CREATING if absent, and remember the result.
+        //
+        // This used to mint a brand-new detached `Preferences` on every call
+        // and drop `this` on the floor, so nothing written through one
+        // `node("x")` was visible through the next, and the returned node had
+        // neither a parent nor an entry anywhere its owner could find. Now the
+        // child is memoised in the parent's slot-3 registry and back-linked
+        // through slot 2, which is what makes `parent()` and `nodeExists()`
+        // below able to answer truthfully.
         r.register(
             cls,
             "node",
             "(Ljava/lang/String;)Ljava/util/prefs/Preferences;",
             |ctx, args| {
+                let this = obj_arg(args, 0)?;
                 let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
-                // Pin across the prefs alloc below — a moving young GC there
-                // would relocate it (native stale-local family).
-                let name_pin = pinned_object_value(ctx, name_val);
-                let p = p72_alloc_prefs(ctx);
-                let name_val = read_pinned_object_value(ctx, name_pin, name_val);
-                ctx.set_field(p, 1, name_val);
-                if let Some((h, _)) = name_pin {
-                    ctx.unpin_native_roots(h);
+                // Per the Preferences spec the empty path names THIS node.
+                let name_txt = match name_val {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if name_txt.is_empty() {
+                    return Ok(Some(Value::Object(Some(this))));
                 }
-                Ok(Some(Value::Object(Some(p))))
+                let Some(children) = p72_prefs_children(ctx, this) else {
+                    // Pre-wave-2 layout (no child registry): fall back to the
+                    // old detached-node behaviour rather than failing.
+                    let name_pin = pinned_object_value(ctx, name_val);
+                    let p = p72_alloc_prefs(ctx);
+                    let name_val = read_pinned_object_value(ctx, name_pin, name_val);
+                    ctx.set_field(p, 1, name_val);
+                    if let Some((h, _)) = name_pin {
+                        ctx.unpin_native_roots(h);
+                    }
+                    return Ok(Some(Value::Object(Some(p))));
+                };
+                // Pin everything carried across the map calls and the child
+                // allocation below — each can trigger a moving young GC
+                // (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let children_pin = ctx.pin_native_root(children);
+                let name_pin = pinned_object_value(ctx, name_val);
+                let existing = cratonvm_native_collections::native_map_get_pub(
+                    ctx,
+                    &[Value::Object(Some(children)), name_val],
+                )?;
+                if let Some(v @ Value::Object(Some(_))) = existing {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(Some(v));
+                }
+                let child = p72_alloc_prefs(ctx);
+                let child_pin = ctx.pin_native_root(child);
+                let name_val = read_pinned_object_value(ctx, name_pin, name_val);
+                let child = ctx.read_native_pin(child_pin, child);
+                ctx.set_field(child, 1, name_val);
+                let this = ctx.read_native_pin(this_pin, this);
+                let child = ctx.read_native_pin(child_pin, child);
+                ctx.set_field(child, 2, Value::Object(Some(this)));
+                let children = ctx.read_native_pin(children_pin, children);
+                let child = ctx.read_native_pin(child_pin, child);
+                cratonvm_native_collections::native_map_put_pub(
+                    ctx,
+                    &[
+                        Value::Object(Some(children)),
+                        name_val,
+                        Value::Object(Some(child)),
+                    ],
+                )?;
+                let child = ctx.read_native_pin(child_pin, child);
+                ctx.unpin_native_roots(this_pin);
+                Ok(Some(Value::Object(Some(child))))
             },
         );
         r.register(
@@ -376,14 +477,54 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 1)))
         });
+        // parent() — the node that created this one via `node()`, or null for
+        // a root (`userRoot`/`systemRoot`/`*NodeForPackage`), which is exactly
+        // what the spec says a root must return. Was an unconditional null, so
+        // every node looked like a root and `absolutePath()`-style upward walks
+        // terminated immediately.
         r.register(
             cls,
             "parent",
             "()Ljava/util/prefs/Preferences;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if ctx.object_num_fields(this) > 2 {
+                    if let v @ Value::Object(Some(_)) = ctx.get_field(this, 2) {
+                        return Ok(Some(v));
+                    }
+                }
+                Ok(Some(Value::Object(None)))
+            },
         );
-        r.register(cls, "nodeExists", "(Ljava/lang/String;)Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        // nodeExists(path) — was an unconditional false, which contradicted
+        // `node(path)` on the very next line: creating a child and then being
+        // told it does not exist. Answers from the slot-3 child registry now.
+        // The empty path names this node, which exists unless it was removed
+        // (we have no removeNode, so it always does).
+        r.register(cls, "nodeExists", "(Ljava/lang/String;)Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name_txt = match name_val {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if name_txt.is_empty() {
+                return Ok(Some(Value::Int(1)));
+            }
+            if ctx.object_num_fields(this) < 4 {
+                return Ok(Some(Value::Int(0)));
+            }
+            // Read slot 3 directly rather than through `p72_prefs_children`:
+            // a pure query must not create the registry as a side effect.
+            let Value::Object(Some(children)) = ctx.get_field(this, 3) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let found = cratonvm_native_collections::native_map_contains_key_pub(
+                ctx,
+                &[Value::Object(Some(children)), name_val],
+            )?;
+            let exists = matches!(found, Some(Value::Int(n)) if n != 0);
+            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
         });
         r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
@@ -1243,6 +1384,13 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // makes perfectly ordinary callers (including Introspector's superclass
     // merge) dispatch to the abstract declaration and fail with
     // AbstractMethodError.
+    //
+    // The four constants below are not placeholders: they are the bodies of
+    // `java.beans.SimpleBeanInfo`, the JDK's own do-nothing BeanInfo, verbatim
+    // — `getDefaultPropertyIndex()`/`getDefaultEventIndex()` return -1 ("no
+    // default"), `getAdditionalBeanInfo()` and `getIcon(int)` return null. A
+    // descriptor synthesised by reflection has no designer metadata to report,
+    // so -1/null IS the right answer, not an unimplemented one.
     r.register(bi, "getDefaultPropertyIndex", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(-1)))
     });
@@ -1385,6 +1533,109 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
 /// (e.g. `ConfigurationClassPostProcessor.setMetadataReaderFactory`, declared
 /// on a superclass) are visible — Spring's `BeanWrapperImpl.setPropertyValue`
 /// requires `pd.getWriteMethod() != null` to consider a property writable.
+/// Java-binary name -> JVM field descriptor.
+fn binary_name_to_descriptor(name: &str) -> String {
+    match name {
+        "int" => "I".to_string(),
+        "long" => "J".to_string(),
+        "double" => "D".to_string(),
+        "float" => "F".to_string(),
+        "boolean" => "Z".to_string(),
+        "byte" => "B".to_string(),
+        "char" => "C".to_string(),
+        "short" => "S".to_string(),
+        "void" => "V".to_string(),
+        n if n.starts_with('[') => n.replace('.', "/"),
+        n => format!("L{};", n.replace('.', "/")),
+    }
+}
+
+/// Resolve a bean accessor's declared type against the BEAN class the way
+/// `java.beans.Introspector` does, through the JDK's own public
+/// `com.sun.beans.TypeResolver`.
+///
+/// Without this the introspector reported the ERASED type of anything
+/// inherited from a generic supertype. `class Person extends BaseEntity<Long>`,
+/// where `BaseEntity<T extends Number>.getId()` erases to `Number`, answered
+/// `propertyType=Number` where HotSpot answers `Long`; and
+/// `PersonWithOverriddenGetter` (a `Long getId()` override over the inherited
+/// `setId(Number)`) lost its WRITE METHOD outright, because the
+/// setter-selection walk below seeds the assignable chain from the getter's
+/// type and `Number` is not assignable to `Long`. Both are
+/// `PropertyDescriptorUtilsPropertyResolutionTests` failures (Spring gh-36019);
+/// `probes/BridgeProbe.java` is the standalone HotSpot-vs-CratonVM repro.
+///
+/// `is_getter` selects the accessor shape: return type for a getter,
+/// parameter 0 for a setter. Returns `None` — caller keeps the erased type,
+/// i.e. the previous behaviour — if any step is unavailable, so nothing
+/// regresses on a class whose generic signature cannot be read.
+fn resolve_accessor_type_in_bean(
+    ctx: &mut dyn NativeContext,
+    bean_mirror: ObjectRef,
+    method_mirror: ObjectRef,
+    is_getter: bool,
+) -> Option<(ObjectRef, Option<cratonvm_types::ClassId>, String)> {
+    let bean_pin = ctx.pin_native_root(bean_mirror);
+    let method_pin = ctx.pin_native_root(method_mirror);
+    let result = (|| {
+        let method_mirror = ctx.read_native_pin(method_pin, method_mirror);
+        let generic = if is_getter {
+            match ctx.invoke_virtual(
+                method_mirror,
+                "getGenericReturnType",
+                "()Ljava/lang/reflect/Type;",
+                &[],
+            ) {
+                Ok(Some(Value::Object(Some(t)))) => t,
+                _ => return None,
+            }
+        } else {
+            let arr = match ctx.invoke_virtual(
+                method_mirror,
+                "getGenericParameterTypes",
+                "()[Ljava/lang/reflect/Type;",
+                &[],
+            ) {
+                Ok(Some(Value::Object(Some(a)))) => a,
+                _ => return None,
+            };
+            if ctx.array_length(arr) < 1 {
+                return None;
+            }
+            match ctx.get_array_element(arr, 0) {
+                Value::Object(Some(t)) => t,
+                _ => return None,
+            }
+        };
+        let generic_pin = ctx.pin_native_root(generic);
+        let bean_mirror = ctx.read_native_pin(bean_pin, bean_mirror);
+        let generic = ctx.read_native_pin(generic_pin, generic);
+        let resolved = match ctx.invoke(
+            "com/sun/beans/TypeResolver",
+            "resolveInClass",
+            "(Ljava/lang/Class;Ljava/lang/reflect/Type;)Ljava/lang/reflect/Type;",
+            &[Value::Object(Some(bean_mirror)), Value::Object(Some(generic))],
+        ) {
+            Ok(Some(v @ Value::Object(Some(_)))) => v,
+            _ => return None,
+        };
+        let erased = match ctx.invoke(
+            "com/sun/beans/TypeResolver",
+            "erase",
+            "(Ljava/lang/reflect/Type;)Ljava/lang/Class;",
+            &[resolved],
+        ) {
+            Ok(Some(Value::Object(Some(c)))) => c,
+            _ => return None,
+        };
+        let cid = crate::lang_class::mirror_class_id(ctx, erased)?;
+        let name = ctx.class_name_of_id(cid)?;
+        Some((erased, Some(cid), binary_name_to_descriptor(&name)))
+    })();
+    ctx.unpin_native_roots(bean_pin);
+    result
+}
+
 pub(crate) fn introspector_get_bean_info(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1531,7 +1782,19 @@ pub(crate) fn introspector_get_bean_info(
             ctx.superclass_of(cid)
         };
     }
-    {
+    // ...but only for a CLASS target. `java.beans.Introspector` does not
+    // inherit properties into a sub-interface: `getBeanInfo(GenericService)`
+    // (which declares `T getId()` / `void setId(T)`) reports the `id`
+    // property, while `getBeanInfo(SubGenericService extends GenericService)`
+    // reports NOTHING -- asserted directly by
+    // `PropertyDescriptorUtilsPropertyResolutionTests
+    // .determineBasicPropertiesWithUnresolvedGenericsInSubInterface`, which
+    // spells the rule out in a comment. The superinterface walk below exists
+    // for interface DEFAULT methods reached through an implementing CLASS
+    // (jakarta.el `TestBeanELResolver.testGetDefaultValue`, property
+    // `valueC`), so gating it on the target not being an interface keeps that
+    // case and drops the sub-interface inheritance.
+    if !ctx.is_interface_class(class_id) {
         let mut seen_if: std::collections::HashSet<cratonvm_types::ClassId> =
             std::collections::HashSet::new();
         let mut queue: Vec<cratonvm_types::ClassId> = scan_cids
@@ -1625,7 +1888,23 @@ pub(crate) fn introspector_get_bean_info(
                     method.access_flags,
                 );
                 let mm_pin = ctx.pin_native_root(mm);
+                let mut ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
+                let mut ret_desc = ret_desc;
+                let mut ret_cid = ret_cid;
+                // Resolve `T` against the BEAN class, as java.beans does --
+                // see `resolve_accessor_type_in_bean`.
+                let bean_mirror_now = ctx.read_native_pin(class_mirror_pin, class_mirror);
+                let mm_now = ctx.read_native_pin(mm_pin, mm);
+                if let Some((rm, rcid, rdesc)) =
+                    resolve_accessor_type_in_bean(ctx, bean_mirror_now, mm_now, true)
+                {
+                    ret_mirror = rm;
+                    ret_cid = rcid;
+                    ret_desc = rdesc;
+                }
+                let ret_mirror_pin = ctx.pin_native_root(ret_mirror);
                 let ret_mirror = ctx.read_native_pin(ret_mirror_pin, ret_mirror);
+                let mm = ctx.read_native_pin(mm_pin, mm);
                 let idx = prop_idx(&mut props, &prop_name);
                 let p = &mut props[idx];
                 if is_is {
@@ -1686,11 +1965,29 @@ pub(crate) fn introspector_get_bean_info(
                         method.access_flags,
                     );
                     let mm_pin = ctx.pin_native_root(mm);
+                    let mut param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
+                    let mut param_desc = params[0].clone();
+                    let mut param_cid = param_cid;
+                    // Same bean-class type-variable resolution as the getter
+                    // above; without it an inherited `setId(T)` keeps its
+                    // erased parameter and fails the assignable-chain check
+                    // against a covariantly overridden getter.
+                    let bean_mirror_now = ctx.read_native_pin(class_mirror_pin, class_mirror);
+                    let mm_now = ctx.read_native_pin(mm_pin, mm);
+                    if let Some((pm, pcid, pdesc)) =
+                        resolve_accessor_type_in_bean(ctx, bean_mirror_now, mm_now, false)
+                    {
+                        param_mirror = pm;
+                        param_cid = pcid;
+                        param_desc = pdesc;
+                    }
+                    let param_mirror_pin = ctx.pin_native_root(param_mirror);
                     let param_mirror = ctx.read_native_pin(param_mirror_pin, param_mirror);
+                    let mm = ctx.read_native_pin(mm_pin, mm);
                     let idx = prop_idx(&mut props, &prop_name);
                     props[idx].write_methods.push((
                         (mm_pin, mm),
-                        params[0].clone(),
+                        param_desc,
                         (param_mirror_pin, param_mirror),
                         param_cid,
                     ));
@@ -1838,7 +2135,7 @@ pub(crate) fn introspector_get_bean_info(
     // Pin across the per-property ctor invokes below — a moving young GC there
     // would relocate the fresh array (native stale-local family).
     let pd_arr_pin = ctx.pin_native_root(pd_arr);
-    for (i, (prop_name, getter, setter, _type_mirror, idx_read, idx_write)) in
+    for (i, (prop_name, getter, setter, type_mirror, idx_read, idx_write)) in
         properties.iter().enumerate()
     {
         let name_str = ctx.create_string(prop_name);
@@ -1903,6 +2200,16 @@ pub(crate) fn introspector_get_bean_info(
                 let setter_cur = setter.map(|(h, o)| ctx.read_native_pin(h, o));
                 build_property_descriptor(ctx, name_str, getter_cur, setter_cur)
             }
+        };
+        // Install the bean-class-resolved property type -- see
+        // `stamp_property_type`. Skipped for the synthesised "class" property,
+        // whose type is already exact.
+        let pd = if prop_name == "class" {
+            pd
+        } else {
+            let bean_now = ctx.read_native_pin(class_mirror_pin, class_mirror);
+            let type_now = type_mirror.map(|(h, o)| ctx.read_native_pin(h, o));
+            stamp_property_type(ctx, pd, bean_now, type_now)
         };
         let pd_arr = ctx.read_native_pin(pd_arr_pin, pd_arr);
         ctx.set_array_element(pd_arr, i, Value::Object(Some(pd)));
@@ -1970,6 +2277,58 @@ pub(crate) fn introspector_get_bean_info(
 
     ctx.unpin_native_roots(class_mirror_pin);
     Ok(Some(Value::Object(Some(bean_info))))
+}
+
+/// Stamp the bean class and the already-resolved property type onto a freshly
+/// built `PropertyDescriptor`.
+///
+/// `PropertyDescriptor`'s public `(String, Method, Method)` ctor derives
+/// `propertyType` through `findPropertyType`, which resolves type variables
+/// against `getClass0()` -- and that ctor leaves `class0` null until
+/// `setReadMethod` sets it to the READ METHOD'S DECLARING CLASS. For a
+/// property inherited from a generic supertype that is the wrong class:
+/// `Person extends BaseEntity<Long>` gets `class0 = BaseEntity`, where `T`
+/// resolves only to its own bound, so `getPropertyType()` answered `Number`
+/// where HotSpot answers `Long`. HotSpot's `Introspector` never takes that
+/// path -- it builds descriptors from `com.sun.beans.introspect.PropertyInfo`,
+/// which already carries the type resolved against the BEAN class (JDK 25
+/// dropped the package-private `(Class, String, Method, Method)` ctor that
+/// used to be the shortcut).
+///
+/// The bean-class-resolved type was already computed during discovery (see
+/// `resolve_accessor_type_in_bean`), so install it: `setClass0(bean)` so any
+/// later JDK recompute agrees, then the private `setPropertyType`. Both
+/// invokes are best-effort -- a failure leaves exactly the previous behaviour.
+fn stamp_property_type(
+    ctx: &mut dyn NativeContext,
+    pd: ObjectRef,
+    bean_mirror: ObjectRef,
+    type_mirror: Option<ObjectRef>,
+) -> ObjectRef {
+    let pd_pin = ctx.pin_native_root(pd);
+    let bean_pin = ctx.pin_native_root(bean_mirror);
+    let type_pin = type_mirror.map(|t| ctx.pin_native_root(t));
+    let pd_now = ctx.read_native_pin(pd_pin, pd);
+    let bean_now = ctx.read_native_pin(bean_pin, bean_mirror);
+    let _ = ctx.invoke(
+        "java/beans/PropertyDescriptor",
+        "setClass0",
+        "(Ljava/lang/Class;)V",
+        &[Value::Object(Some(pd_now)), Value::Object(Some(bean_now))],
+    );
+    if let (Some(h), Some(t)) = (type_pin, type_mirror) {
+        let pd_now = ctx.read_native_pin(pd_pin, pd);
+        let t_now = ctx.read_native_pin(h, t);
+        let _ = ctx.invoke(
+            "java/beans/PropertyDescriptor",
+            "setPropertyType",
+            "(Ljava/lang/Class;)V",
+            &[Value::Object(Some(pd_now)), Value::Object(Some(t_now))],
+        );
+    }
+    let live = ctx.read_native_pin(pd_pin, pd);
+    ctx.unpin_native_roots(pd_pin);
+    live
 }
 
 /// Build a genuine `java.beans.PropertyDescriptor` from a name + read/write
@@ -2406,7 +2765,11 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         "javax/naming/NameAlreadyBoundException",
         "javax/naming/NoInitialContextException",
     ] {
-        r.register(cls, "<init>", "()V", |_ctx, _args| Ok(None));
+        // No-arg ctor: the fields are already null (correct), but a bare no-op
+        // ALSO skips `fillInStackTrace()`, so `new NamingException()` came back
+        // with an empty `getStackTrace()`. Same defect — and same fix — as the
+        // `java/io/StreamCorruptedException` ctor in `serialization.rs`.
+        r.register(cls, "<init>", "()V", crate::native_exception_init_empty);
         r.register(cls, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
             if let Some(Value::Object(Some(this))) = args.first().copied() {
                 let msg = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -2499,7 +2862,13 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(ctx_iface, "close", "()V", |_ctx, _args| {
-        // Default interface implementation — concrete classes override.
+        // Reached only by a receiver whose `close()` resolves on the interface
+        // itself (see the note above); `InitialContext` carries its own real
+        // `close`. Doing nothing is right rather than convenient: the bindings
+        // this interface fallback operates on live in an in-memory map on the
+        // receiver, with no socket, file handle or provider connection to
+        // release — unlike `ObjectInput.close`, which wave 1 deleted precisely
+        // because a no-op there leaked the underlying stream.
         Ok(None)
     });
     r.set_category(__prev_cat);

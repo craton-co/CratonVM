@@ -1317,15 +1317,16 @@ pub struct SafepointPublishPlan {
     /// local whose last read is already behind us is not a live root and need
     /// not be published.
     ///
-    /// **Precondition.** Liveness here is computed from the ordinary bytecode
-    /// CFG, which has no edges into exception handlers (the handler table is
-    /// not threaded into this module). Under today's admission rules that is
-    /// safe — `jit/src/lib.rs::local_handler_reads_unsafe_local` refuses to
-    /// compile any method whose handler reads a non-parameter local — but a
-    /// consumer that narrows by liveness inherits that dependency. Use
-    /// [`Self::publish_always`] if you do not want it. Indexed by bci; entries
-    /// past the end are absent, and a caller must fall back to
-    /// `publish_always`.
+    /// Liveness here models EXCEPTION EDGES when the caller passes the method's
+    /// handler ranges, so a reference local that only a catch block reads is
+    /// still published at every safepoint inside the protected range. That used
+    /// to be guaranteed the other way round — by
+    /// `jit/src/lib.rs::local_handler_reads_unsafe_local` refusing to compile
+    /// such a method at all — but the RBC.6 precise-handler-frame relaxation
+    /// admits exactly that population, so the guarantee has to live here.
+    /// Passing no handlers keeps the old ordinary-CFG answer (correct for a
+    /// method with no exception table). Indexed by bci; entries past the end are
+    /// absent, and a caller must fall back to `publish_always`.
     pub publish_at: Vec<u64>,
 }
 
@@ -1375,6 +1376,7 @@ pub fn plan_safepoint_publication(
     num_params: usize,
     assignments: &[Option<u8>],
     extra_reference_locals: u64,
+    handlers: &[(usize, usize, usize)],
 ) -> SafepointPublishPlan {
     let reference_locals =
         find_reference_locals(code, code_len, num_locals) | extra_reference_locals;
@@ -1394,7 +1396,7 @@ pub fn plan_safepoint_publication(
     // Trusting it would publish nothing at a safepoint in unreached-but-
     // executed code (an exception handler the CFG cannot see) and drop a live
     // oop. Uncovered PCs therefore fall back to the bci-independent set.
-    let (live_at, covered) = live_locals_per_pc_with_coverage(code, code_len, num_params);
+    let (live_at, covered) = live_locals_per_pc_inner(code, code_len, num_params, handlers);
     let publish_at: Vec<u64> = live_at
         .iter()
         .zip(covered.iter())
@@ -1431,6 +1433,39 @@ pub fn allocate_registers(
         loops,
         &LOCAL_REGS,
         &LOCAL_XMMS,
+        &[],
+    )
+}
+
+/// [`allocate_registers`] with the method's exception table modelled.
+///
+/// `handlers` is `(start_pc, end_pc, handler_pc)` per entry. Modelling them adds
+/// the "protected code can branch to the handler" edges to the CFG the
+/// interference graph is built from, so a local that only the handler reads
+/// stays live across the protected range and cannot be given a register another
+/// local is already using there.
+///
+/// Callers pass a non-empty slice only for methods compiled with precise
+/// exceptional frames — the population whose handler genuinely reads
+/// non-parameter locals AND whose handler frame is reconstructed from register
+/// homes. Every other compile passes `&[]` and allocates byte-identically.
+pub fn allocate_registers_with_handlers(
+    code: &[u8],
+    code_len: usize,
+    num_locals: usize,
+    num_params: usize,
+    loops: &[(usize, usize)],
+    handlers: &[(usize, usize, usize)],
+) -> RegAllocResult {
+    allocate_registers_with(
+        code,
+        code_len,
+        num_locals,
+        num_params,
+        loops,
+        &LOCAL_REGS,
+        &LOCAL_XMMS,
+        handlers,
     )
 }
 
@@ -1505,12 +1540,24 @@ fn live_locals_per_pc_with_coverage(
     live_locals_per_pc_inner(code, code_len, num_params, &[])
 }
 
-fn live_locals_per_pc_inner(
+/// Build the CFG with EXCEPTION EDGES modelled: every handler pc becomes a
+/// block leader, and every block overlapping a protected range gains that
+/// range's handler block as a successor.
+///
+/// `handlers` is `(start_pc, end_pc, handler_pc)` per exception-table entry; an
+/// empty slice yields exactly [`build_cfg`]'s result, so callers that do not
+/// model handlers are unaffected.
+///
+/// Shared by the two analyses that must agree about handler liveness: the
+/// per-pc liveness behind the precise exceptional-frame snapshot, and the
+/// interference graph behind register allocation. When only the first modelled
+/// them, the snapshot correctly said "local `i` is live in register `r`" while
+/// the allocator had already handed `r` to someone else.
+fn build_cfg_with_handlers(
     code: &[u8],
     code_len: usize,
-    num_params: usize,
     handlers: &[(usize, usize, usize)],
-) -> (Vec<u64>, Vec<bool>) {
+) -> Vec<BasicBlock> {
     let leaders: Vec<usize> = handlers.iter().map(|&(_, _, h)| h).collect();
     let mut blocks = build_cfg_with_leaders(code, code_len, &leaders);
     if !handlers.is_empty() {
@@ -1533,6 +1580,16 @@ fn live_locals_per_pc_inner(
             }
         }
     }
+    blocks
+}
+
+fn live_locals_per_pc_inner(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    handlers: &[(usize, usize, usize)],
+) -> (Vec<u64>, Vec<bool>) {
+    let mut blocks = build_cfg_with_handlers(code, code_len, handlers);
     for block in &mut blocks {
         compute_gen_kill(code, block);
     }
@@ -1589,6 +1646,7 @@ pub fn allocate_registers_arm64(
         loops,
         &ARM64_LOCAL_GPRS,
         &ARM64_LOCAL_FPS,
+        &[],
     )
 }
 
@@ -1601,6 +1659,7 @@ fn allocate_registers_with(
     loops: &[(usize, usize)],
     gpr_regs: &[u8],
     fp_regs: &[u8],
+    handlers: &[(usize, usize, usize)],
 ) -> RegAllocResult {
     let available = gpr_regs;
 
@@ -1618,8 +1677,10 @@ fn allocate_registers_with(
     // Detect float/double locals — these use XMM registers, not GPRs
     let float_mask = find_float_locals(code, code_len, num_locals);
 
-    // Build CFG and solve liveness
-    let mut blocks = build_cfg(code, code_len);
+    // Build CFG and solve liveness. `handlers` is empty for every compile that
+    // does not reconstruct a handler frame from register homes, in which case
+    // this is exactly `build_cfg`.
+    let mut blocks = build_cfg_with_handlers(code, code_len, handlers);
     for block in &mut blocks {
         compute_gen_kill(code, block);
     }
@@ -2645,6 +2706,67 @@ mod tests {
         );
     }
 
+    /// A local that ONLY the exception handler reads must not be given the
+    /// register of a local that is live across the protected range.
+    ///
+    /// Without exception edges the handler block has no predecessor, so such a
+    /// local's live range is the handler alone: it interferes with nothing in
+    /// the try and the colorer hands both locals the same physical register.
+    /// The precise exceptional frame then reconstructs the handler's local from
+    /// that register and reads the OTHER local's value — an unrelated object
+    /// standing where a live one was, which is exactly the json-smart symptom
+    /// this whole family produced.
+    #[test]
+    fn handler_only_local_does_not_share_a_register_with_a_live_local() {
+        // 0: aconst_null   1: astore_1        (local 1 — read ONLY by the handler)
+        // 2: aconst_null   3: astore_2        (local 2 — read after the try)
+        // 4: nop           5: nop             protected [4,6)
+        // 6: goto +6 -> 12
+        // 9: astore_3     10: aload_1  11: areturn      <- handler at 9
+        // 12: aload_2     13: areturn
+        let code: Vec<u8> = vec![
+            0x01, 0x4c, 0x01, 0x4d, 0x00, 0x00, 0xa7, 0x00, 0x06, 0x4e, 0x2b, 0xb0, 0x2c, 0xb0,
+        ];
+        let code_len = code.len();
+        let handlers = [(4usize, 6usize, 9usize)];
+
+        // Assert the INTERFERENCE relation, not a coloring outcome: with four
+        // locals and a full callee-saved file the colorer has no pressure to
+        // alias, so "they got the same register" is not a reliable statement of
+        // the hazard — "the allocator does not know they are simultaneously
+        // live" is.
+        let interference = |handlers: &[(usize, usize, usize)]| -> u64 {
+            let mut blocks = build_cfg_with_handlers(&code, code_len, handlers);
+            for block in &mut blocks {
+                compute_gen_kill(&code, block);
+            }
+            solve_liveness(&mut blocks, 0);
+            build_interference(&code, &blocks, 4)[1]
+        };
+
+        assert_eq!(
+            interference(&[]) & (1 << 2),
+            0,
+            "documents the hazard: without exception edges the handler-only local \
+             does not interfere with the local live across the try, so the colorer \
+             is free to give them the same register"
+        );
+        assert_ne!(
+            interference(&handlers) & (1 << 2),
+            0,
+            "with exception edges the handler-only local is live across the \
+             protected range and must interfere with the local live there"
+        );
+
+        // ...and the allocator built on that graph must keep them apart.
+        let modelled = allocate_registers_with_handlers(&code, code_len, 4, 0, &[], &handlers);
+        assert!(
+            modelled.assignments[1].is_some() && modelled.assignments[2].is_some(),
+            "modelling handlers must not de-register-home either local"
+        );
+        assert_ne!(modelled.assignments[1], modelled.assignments[2]);
+    }
+
     #[test]
     fn find_reference_locals_sees_handler_locals_after_a_return() {
         // `find_reference_locals` walks raw bytecode, not the CFG, so it was
@@ -2686,7 +2808,7 @@ mod tests {
         let code_len = code.len();
         // Pretend the colourer gave local 0 a register home.
         let assignments = vec![Some(12u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0);
+        let plan = plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0, &[]);
 
         assert_eq!(plan.reference_locals, 0, "no aload/astore anywhere");
         assert_eq!(plan.register_homed_reference_locals, 0);
@@ -2713,7 +2835,7 @@ mod tests {
         let code_len = code.len();
         // Locals 0 and 1 are refs, local 2 is an int; all three get registers.
         let assignments = vec![Some(12u8), Some(13u8), Some(14u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 3, 1, &assignments, 0);
+        let plan = plan_safepoint_publication(&code, code_len, 3, 1, &assignments, 0, &[]);
 
         assert_eq!(plan.reference_locals, 0b011);
         assert_eq!(plan.register_homed_reference_locals, 0b011);
@@ -2747,7 +2869,7 @@ mod tests {
         ];
         let code_len = code.len();
         let assignments = vec![Some(12u8), Some(13u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
         assert_ne!(plan.register_homed_reference_locals & (1 << 1), 0);
         assert_eq!(
             plan.publish_at_bci(4) & (1 << 1),
@@ -2770,7 +2892,7 @@ mod tests {
         ];
         let code_len = code.len();
         let assignments = vec![Some(12u8), Some(13u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
         // pc past the end of the code is definitionally uncovered.
         assert_eq!(
             plan.publish_at_bci(code_len + 32),
@@ -2792,7 +2914,7 @@ mod tests {
         // Local 1 spilled (no register home) — its canonical frame slot is
         // already authoritative, so it is not part of the publish set.
         let assignments = vec![Some(12u8), None];
-        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
         assert_ne!(plan.reference_locals & (1 << 1), 0);
         assert_eq!(
             plan.register_homed_reference_locals & (1 << 1),
@@ -2807,7 +2929,7 @@ mod tests {
         // taints slot 0, so only the caller's descriptor-derived mask knows.
         let code: Vec<u8> = vec![0xb1]; // return
         let assignments = vec![Some(12u8)];
-        let plan = plan_safepoint_publication(&code, code.len(), 1, 1, &assignments, 0b1);
+        let plan = plan_safepoint_publication(&code, code.len(), 1, 1, &assignments, 0b1, &[]);
         assert_ne!(plan.reference_locals & 1, 0);
         assert_ne!(plan.register_homed_reference_locals & 1, 0);
         assert!(!plan.no_reference_in_registers());
@@ -2879,6 +3001,7 @@ mod tests {
             &[],
             &ARM64_LOCAL_GPRS,
             &ARM64_LOCAL_FPS,
+            &[],
         );
         assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
     }
@@ -2894,6 +3017,7 @@ mod tests {
             &[],
             &ARM64_LOCAL_GPRS,
             &ARM64_LOCAL_FPS,
+            &[],
         );
         assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
     }
@@ -2904,7 +3028,7 @@ mod tests {
         // must be empty (a non-empty one would reserve slots the prologue
         // never writes and shift every later frame region).
         let code: Vec<u8> = vec![0x1a, 0x1b, 0x60, 0x3c, 0xb1];
-        let result = allocate_registers_with(&code, code.len(), 2, 2, &[], &[], &[]);
+        let result = allocate_registers_with(&code, code.len(), 2, 2, &[], &[], &[], &[]);
         assert!(result.assignments.iter().all(Option::is_none));
         assert!(result.used_callee_saved.is_empty());
     }

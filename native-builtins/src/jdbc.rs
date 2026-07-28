@@ -80,11 +80,22 @@ pub fn register_jdbc_driver_natives(registry: &mut NativeMethodRegistry) {
 /// that policy its CratonVM default while leaving an application's explicit
 /// setting authoritative.
 fn register_ucp_borrow_creation_bridge(registry: &mut NativeMethodRegistry) {
+    // UCP's own implementation reads the `oracle.ucp.createConnectionInBorrowThread`
+    // system property. The constant `true` this used to return contradicted
+    // the "leaving an application's explicit setting authoritative" contract
+    // documented above: an app that had deliberately set the property to
+    // `false` still got the borrow-thread policy. Honour the property when it
+    // is present and fall back to `true` only as the CratonVM default.
     registry.register(
         "oracle/ucp/util/Util",
         "createConnectionInBorrowThread",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, _args| {
+            let enabled = ctx
+                .get_system_property("oracle.ucp.createConnectionInBorrowThread")
+                .map_or(true, |v| !v.eq_ignore_ascii_case("false"));
+            Ok(Some(Value::Int(if enabled { 1 } else { 0 })))
+        },
     );
 }
 

@@ -638,8 +638,37 @@ fn native_is_redefine_supported0(
 }
 
 /// `boolean isNativeMethodPrefixSupported0()`. Args: [this].
+///
+/// Returns FALSE, and that is deliberate — flipped from a constant `true` on
+/// 2026-07-27 (stub-removal wave 2).
+///
+/// WARNING to anyone tempted to flip it back: `true` here was an UNBACKED
+/// capability claim, unlike its `isRetransformClassesSupported0` /
+/// `isRedefineClassesSupported0` siblings above, whose capability really is
+/// implemented (`native_retransform_classes0` +
+/// `NativeContext::retransform_class`, plus the shadow-suppression guards
+/// `native_shadow_suppressed_by_redefine` / `redefine_immune_reflection_native`
+/// in `vm/src/runtime/interpreter.rs`).
+///
+/// `setNativeMethodPrefix0` and the JDK-25 bulk `setNativeMethodPrefixes` only
+/// RECORD the requested prefix on the `TransformerEntry`; NOTHING consults
+/// `TransformerEntry::native_method_prefix` at native dispatch. So under the
+/// old `true` an agent was told "supported", registered a `$$pfx$$`-style
+/// wrapper, and the wrapper silently never bound — the failure surfaced
+/// arbitrarily far away as "native prefixing mysteriously does nothing".
+/// Answering `false` makes the JDK's own `Instrumentation.setNativeMethodPrefix`
+/// throw `UnsupportedOperationException` at the point of use, which names the
+/// limitation precisely.
+///
+/// TO MAKE THIS `true` AGAIN, one thing has to become real first:
+/// `TransformerEntry::native_method_prefix` must actually be consulted on the
+/// native-method dispatch path, so that a method the agent has wrapped resolves
+/// to `<prefix><name>` when the unprefixed native is absent (JVMTI
+/// SetNativeMethodPrefix semantics). Until then this must stay `false`.
+/// Grep anchor: `native_method_prefix` in this file — if the only hits are
+/// still the struct field, the recorders, and the tests, nothing consults it.
 fn native_is_prefix_supported0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(1)))
+    Ok(Some(Value::Int(0)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,15 +1620,69 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/instrument/ClassFileTransformer;Ljava/lang/String;)V",
         native_set_native_method_prefix0,
     );
-    // JDK 25 setNativeMethodPrefixes(long, String[], boolean) — bulk variant.
+    // JDK 25 setNativeMethodPrefixes(long, String[], boolean) — bulk variant,
+    // and the form `Instrumentation.setNativeMethodPrefix` actually calls on
+    // JDK 25. It used to discard the array outright, so on a JDK-25 class
+    // library the single-transformer `setNativeMethodPrefix0` handler above was
+    // never reached and an agent's prefixes vanished with no diagnostic while
+    // `isNativeMethodPrefixSupported0` still answered "supported".
+    //
+    // The array is the owning `TransformerManager`'s prefixes in transformer
+    // order, so replay it positionally over the chain entries whose
+    // retransformability matches the flag. NOTE: as with the single-transformer
+    // path, the recorded prefix is still NOT consulted at native dispatch (see
+    // the debug note in `native_set_native_method_prefix0`) — this records the
+    // agent's intent so it is observable rather than silently dropped.
+    //
+    // Since 2026-07-27 `isNativeMethodPrefixSupported0` answers FALSE, so the
+    // JDK's own `Instrumentation.setNativeMethodPrefix` now throws
+    // `UnsupportedOperationException` before it ever reaches this native. This
+    // handler is kept (rather than reverted to a no-op) so that the recording
+    // is already correct on the day the capability becomes real — see the
+    // "TO MAKE THIS `true` AGAIN" note on `native_is_prefix_supported0`.
     r.register(
         impl_class,
         "setNativeMethodPrefixes",
         "(J[Ljava/lang/String;Z)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let prefixes = match args.get(2) {
+                Some(Value::Object(Some(arr))) => *arr,
+                _ => return Ok(None),
+            };
+            let is_retransformable = args.get(3).and_then(Value::as_int).unwrap_or(0) != 0;
+            let len = ctx.array_length(prefixes);
+            let mut collected: Vec<Option<String>> = Vec::with_capacity(len);
+            for index in 0..len {
+                collected.push(match ctx.get_array_element(prefixes, index) {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                });
+            }
+            if let Ok(mut chain) = transformer_chain().write() {
+                let mut next = collected.into_iter();
+                for entry in chain.iter_mut() {
+                    if entry.can_retransform != is_retransformable {
+                        continue;
+                    }
+                    match next.next() {
+                        Some(prefix) => entry.native_method_prefix = prefix,
+                        None => break,
+                    }
+                }
+            }
+            Ok(None)
+        },
     );
     // setHasRetransformableTransformers(long, boolean) — JVMTI capability flag toggle.
     // We always claim retransform support; this setter is a no-op.
+    // KEEP (constant, justified): unlike the prefix capability below, the
+    // retransform claim IS backed — `native_retransform_classes0` /
+    // `NativeContext::retransform_class` re-run the transformer chain from the
+    // preserved original bytes, and the shadow-suppression guards in
+    // `interpreter.rs` (`native_shadow_suppressed_by_redefine`, with the
+    // `redefine_immune_reflection_native` allow-list) cede a redefined class's
+    // methods to the woven bytecode. So there is no capability bit to gate on
+    // and nothing for this setter to record.
     r.register(
         impl_class,
         "setHasRetransformableTransformers",
