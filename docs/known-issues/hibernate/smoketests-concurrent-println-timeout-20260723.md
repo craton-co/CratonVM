@@ -89,6 +89,47 @@ reach 120 s. Closure is therefore gated on the tiered-manager work
 spend more effort on per-call micro-optimisations here; the measurements above
 bound what they can possibly buy.
 
+### The workload is essentially never compiled
+
+`CRATONVM_DBG=jit-method-stats` on `SmokeConcProbe 2 200 5 1 full` (note the
+spelling — a bare `CRATONVM_DBG_JIT_METHOD_STATS=1` is rejected with a warning
+and does nothing):
+
+```
+1642 distinct methods tracked, 1638 ever invoked, 4277121 total invocations
+still-interpreted=1535  c1=32  full-profile=0  c2=75
+compiles: c1=107 c2=77 osr=4 deopts=0 c2_bailouts=0 total_compile_time_ms=1
+c1_threshold=500  hot_but_stuck_in_interpreter=1531
+```
+
+**1531 of 1642 hot methods never compile**, and the entire process spends
+**1 ms** compiling. Every one of the top 30 stuck methods carries
+`tier_fail_count=3` — the `MAX_TIER_FAIL_RETRIES` permanent ban
+(`jit/src/tiered.rs:39`). They are trivial accessors called tens of thousands of
+times: `SessionLocal.isClosed()Z` (55 348), `JdbcConnection.checkClosed()V`
+(44 468), `SessionImpl.isClosed()Z`, `AbstractQueuedSynchronizer.getState()I`.
+Same shape as the `action.queue` doc's root cause 2 and tomcat doc 30.
+
+The mechanism is the one `background_compile_task`'s own comment describes
+(`vm/src/runtime/interpreter.rs`): the tier manager keeps enqueueing methods the
+skip list rejects, the background task declines each one *before* its
+`CRATONVM_DBG=jitc` trace point, and three declines ban the method for the
+process. With `CRATONVM_DBG=jitc`, **78 of 92 enqueued methods never produce a
+`bg-compile` line at all** — they are enqueued at `invoc_count=500`, again at
+564, again at 628, then banned.
+
+For a large share of this workload that is skip-list-by-design rather than a
+compiler bug: `org/hibernate/` is banned wholesale (HIB-TEMPORAL.1) and the
+`AbstractQueuedSynchronizer` `getState`/`setState`/`compareAndSetState` family is
+banned unconditionally (`vm/src/jit/skip_list.rs:2558`) — and those are precisely
+the methods at the top of the stuck list. So the two facts compose: the hot code
+is mostly ineligible, and the part that *is* eligible does not pay off (row 3 of
+the lever table). Both have to change before this class can pass.
+
+Checked and rejected as the cause: a global `any_class_redefined()` latch
+disabling all background compilation. `bg-compile` lines continue to the end of
+the run, so compilation is not shut off process-wide.
+
 Two concrete sub-defects are worth fixing on the way, both independent of the
 main gap:
 
