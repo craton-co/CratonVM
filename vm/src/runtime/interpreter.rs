@@ -10527,7 +10527,7 @@ fn execute_frame_from_index(
                     // 3 RwLocks + 2 hierarchy walks ran on EVERY virtual call and
                     // the inline cache was never consulted.)
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                        shared, thread, frame_idx, cp_index, saved_pc, false, false,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10551,7 +10551,7 @@ fn execute_frame_from_index(
                     // Miss path — VtableManager lock-free dispatch; a hit here
                     // populates invoke_cache for the next call.
                     match execute_invokevirtual_vtable_fast(
-                        shared, thread, frame_idx, cp_index, saved_pc,
+                        shared, thread, frame_idx, cp_index, saved_pc, false,
                     ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -10596,7 +10596,7 @@ fn execute_frame_from_index(
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, true,
+                        shared, thread, frame_idx, cp_index, saved_pc, true, false,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10716,7 +10716,7 @@ fn execute_frame_from_index(
                     // invokeinterface is 5 bytes: opcode(1) + index(2) + count(1) + 0(1)
                     thread.frames[frame_idx].pc = saved_pc + 5;
                     let cached_result = execute_invokevirtual_cached(
-                        shared, thread, frame_idx, cp_index, saved_pc, false,
+                        shared, thread, frame_idx, cp_index, saved_pc, false, true,
                     );
                     match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
@@ -10743,7 +10743,7 @@ fn execute_frame_from_index(
                     // whether the call-site is invokevirtual or
                     // invokeinterface.
                     match execute_invokevirtual_vtable_fast(
-                        shared, thread, frame_idx, cp_index, saved_pc,
+                        shared, thread, frame_idx, cp_index, saved_pc, true,
                     ) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
@@ -16814,6 +16814,7 @@ fn execute_instruction(
                 *index,
                 saved_pc,
                 is_special_invoke,
+                false,
             )? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
@@ -16920,7 +16921,7 @@ fn execute_instruction(
             // once a receiver's concrete class is known (see the
             // `execute_invokevirtual_vtable_fast` "miss path" comment in the
             // raw fast-dispatch loop, which already relies on this fact).
-            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false)?
+            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false, true)?
             {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
@@ -23135,10 +23136,22 @@ fn execute_invoke_kind(
         } else {
             None
         };
+    let receiver_interface_dispatch = (is_interface && !is_special)
+        .then_some(receiver_class_id)
+        .flatten()
+        .filter(|class_id| *class_id != ClassId::new(0))
+        .filter(|class_id| !shared.classes.lambda_proxies.read().contains_key(class_id));
     let dispatch_override: Option<ClassId> = if let Some((declaring_id, _)) =
         &private_virtual_target
     {
         Some(*declaring_id)
+    } else if let Some(receiver_id) = receiver_interface_dispatch {
+        // find_method_recursive performs the JVMS maximally-specific
+        // default-method selection only when it starts at the runtime
+        // receiver. Starting at the CP owner returns that interface's own
+        // default immediately and bypasses a covariant bridge declared by a
+        // subinterface implemented by the receiver.
+        Some(receiver_id)
     } else if let Some(interface_id) = loader_interface_override {
         Some(interface_id)
     } else if !is_special && crate::runtime::env_cache::loader_aware_resolution() {
@@ -40597,6 +40610,7 @@ fn execute_invokevirtual_vtable_fast(
     frame_idx: usize,
     cp_index: u16,
     site_pc: usize,
+    is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     dbg_invoke_stats_record(2);
     let caller_class_id = thread.frames[frame_idx].class_id;
@@ -41187,6 +41201,28 @@ fn execute_invokevirtual_vtable_fast(
         // dispatch would otherwise form an AB-BA deadlock.
         drop(guard);
 
+        // A vtable slot stores one erased (name, descriptor) target, but an
+        // invokeinterface call can require a more-specific interface default
+        // than the slot inherited from its CP owner. Validate that the slot
+        // agrees with receiver-rooted JVMS selection before dispatching it.
+        // In particular, a covariant bridge has the parent return descriptor,
+        // so starting resolution at the CP interface picks its own default and
+        // skips the subinterface bridge.
+        if is_interface {
+            let cm = shared.classes.class_manager.read();
+            let receiver_selected = crate::classloading::find_method_recursive(
+                receiver_class_id,
+                &method_name,
+                &method_descriptor,
+                &cm.class_store,
+            )
+            .map(|(_, declaring_id)| declaring_id);
+            drop(cm);
+            if receiver_selected != Some(cached.declaring_class_id) {
+                return Ok(CachedCallResult::CacheMiss);
+            }
+        }
+
         // JVMTI redefine guard — the VtableManager entry's `resolved_method`
         // is an immutable `Arc<CachedBytecodeMethod>` snapshot with NO
         // staleness tracking of its own (unlike `CachedInvokeTarget`, which
@@ -41538,6 +41574,7 @@ fn execute_invokevirtual_cached(
     cp_index: u16,
     site_pc: usize,
     is_special: bool,
+    is_interface: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
@@ -41936,6 +41973,30 @@ fn execute_invokevirtual_cached(
                             .unwrap_or(false);
                         drop(cm);
                         if is_ann_proxy {
+                            return Ok(CachedCallResult::CacheMiss);
+                        }
+                    }
+
+                    // A cache entry created through a vtable slot is valid for
+                    // an interface site only when it is the same target that
+                    // receiver-rooted maximally-specific default resolution
+                    // selects. This prevents a parent-interface default from
+                    // remaining cached after it masked a covariant bridge on a
+                    // receiver subinterface.
+                    if is_interface {
+                        let cm = shared.classes.class_manager.read();
+                        let receiver_selected = crate::classloading::find_method_recursive(
+                            actual_class_id,
+                            &cached.method_name,
+                            &cached.method_descriptor,
+                            &cm.class_store,
+                        )
+                        .map(|(_, declaring_id)| declaring_id);
+                        drop(cm);
+                        if receiver_selected != Some(cached.declaring_class_id) {
+                            thread
+                                .invoke_cache
+                                .evict(caller_class_id, cp_index, is_special);
                             return Ok(CachedCallResult::CacheMiss);
                         }
                     }
