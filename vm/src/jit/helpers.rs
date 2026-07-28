@@ -547,6 +547,16 @@ pub fn is_jit_thread_set() -> bool {
     JIT_THREAD.with(|t| !t.get().is_null())
 }
 
+/// The `*mut JvmThread` installed for this OS thread, or null when none is.
+///
+/// Unlike [`jit_get_current_thread`] this does **no** JIT-boundary bookkeeping
+/// (`note_jit_boundary`), so GC-side verification code can consult it without
+/// perturbing the per-thread scan cache it is in the middle of using.
+#[inline(always)]
+pub fn current_jit_thread_ptr() -> *mut JvmThread {
+    JIT_THREAD.with(|t| t.get())
+}
+
 /// Restore a previously saved JIT thread scope. Used to support re-entrant
 /// JIT calls (e.g. JIT put() → jit_invoke_dispatch → interpreter::execute hash()
 /// which may JIT-compile hash() and call set_jit_thread again). Re-installs the
@@ -8022,6 +8032,23 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
 
     let receiver_class_id = vm.mem.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
+    // A reference array stores its COMPONENT class id in
+    // `ObjectHeader.class_id` — the same invariant the KC26 array.clone() note
+    // further down calls out — so `receiver_cid` alone cannot tell a `Foo[]`
+    // from a `Foo`. Per JVMS §4.4.1 an array class inherits `Object`'s method
+    // table, not its component's, so every class-id-keyed fast path below must
+    // refuse array receivers and let the resolving miss path (which asks
+    // `virtual_dispatch_target_for_receiver`, and gets `java/lang/Object`)
+    // handle them. Without this a MIC warmed on a `Foo` receiver called
+    // straight into compiled `Foo.equals` with a `Foo[]` as `this`, and its
+    // first `checkcast Foo` threw
+    // `ClassCastException: class [LFoo; cannot be cast to class Foo` — the
+    // `ResolvableType[]`/`ResolvableType` Spring Boot failure this was found
+    // as. The inline machine-code cascades in `jit/src/x64.rs`,
+    // `jit/src/ir_lower.rs` and `jit/src/runtime_lowering.rs` carry the same
+    // guard against `ObjectHeader.kind`.
+    let receiver_is_plain_object =
+        vm.mem.heap.kind_of(receiver_ref) == cratonvm_types::ObjectKind::Object;
 
     // Real-layout Matcher methods are registered natives, so they can never
     // publish a compiled entry into the ordinary MIC/PIC. Without this leaf
@@ -8183,6 +8210,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // a bounded secondary target cache so those misses still avoid repeated
     // class hierarchy resolution and compile-cache probing.
     if cached_cid != receiver_cid
+        && receiver_is_plain_object
         && pic_ptr != 0
         && direct_virtual_compiled_callee_entry_enabled()
         && !redefine_jit_quiesced
@@ -8207,7 +8235,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // If the receiver ClassId matches the cached value AND we have a cached
     // entry pointer, dispatch directly without any class_manager lookup or
     // method resolution.  This is the zero-overhead dispatch path.
-    if cached_cid == receiver_cid && cached_cid != 0 {
+    if cached_cid == receiver_cid && cached_cid != 0 && receiver_is_plain_object {
         mic.record_hit();
 
         // Try the cached compiled entry pointer (true inline cache hit)
