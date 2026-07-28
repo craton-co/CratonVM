@@ -55,14 +55,16 @@ cratonvm-properties-map-20260728-019fa8dd.exe
 SHA-256 EF93787280EA0D66DAB6010B1AD9197939228EF63C52B979D8FCB4B35A334684
 ```
 
+After merging current `origin/dev`, the final integrated release executable
+had SHA-256 `C61F1E896735B06E22FBD7CA34624ACA3CE53B5B93837D6CADB08549D53721E7`.
 Using the external `apps/spring-boot` fixture with JDK 25 and the suite
 runner's per-module generated classpath, the complete class passed in both
 required modes:
 
 | Mode | `SBRUNNER_RESULT` accounting | Wall test time |
 |---|---|---:|
-| JIT | `tests=45 failed=0 aborted=0 skipped=0 containersFailed=0` | 13.457s |
-| `--nojit` | `tests=45 failed=0 aborted=0 skipped=0 containersFailed=0` | 17.540s |
+| JIT | `tests=45 failed=0 aborted=0 skipped=0 containersFailed=0` | 11.2s |
+| `--nojit` | `tests=45 failed=0 aborted=0 skipped=0 containersFailed=0` | 12.4s |
 
 This validates the former `bindToPropertiesShouldBeEquivalentToMapOfStringString`
 failure together with the other 44 `MapBinderTests` methods in both execution
