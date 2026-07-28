@@ -4332,40 +4332,6 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
         native_new_cached_pool,
     );
-    let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    registry.register(
-        exec,
-        "defaultThreadFactory",
-        "()Ljava/util/concurrent/ThreadFactory;",
-        |ctx, _args| {
-            let factory = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1);
-            ctx.set_field(factory, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(factory))))
-        },
-    );
-    registry.register(
-        tf,
-        "newThread",
-        "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
-        |ctx, args| {
-            // BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2
-            // residual): this used to allocate a real-shaped Thread object via
-            // alloc_concurrent_synthetic and then poke 5 legacy synthetic
-            // slots — the exact same half-real pattern that made
-            // ThreadPoolExecutor's mainLock/ctl/workQueue null (see
-            // initialize_real_thread_pool_executor in phases_early.rs). A
-            // Thread built this way never runs the real constructor, so
-            // start()/start0() operate on an uninitialized `holder` and the
-            // worker never actually runs — real ThreadPoolExecutor.execute()
-            // silently never executes submitted tasks. Drive the real
-            // Thread(Runnable) constructor instead so start() works.
-            // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
-            let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.new_object_initialized("java/lang/Thread", "(Ljava/lang/Runnable;)V", &[runnable])
-        },
-    );
-    registry.set_category(__prev_cat);
 
     // ExecutorService methods
     registry.register(
