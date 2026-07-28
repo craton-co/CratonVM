@@ -8068,7 +8068,11 @@ struct Compiler {
     /// letting the JIT keep running with a bogus `0` return value (which
     /// previously masked the true exception with a downstream NPE; see the
     /// Jetty `Main.main` "getClasspath on null" miscompile).
-    exception_check_stubs: Vec<usize>,
+    /// `(patch_offset, throw_site_bci)` -- the bci is the bytecode pc of
+    /// the fallible operation whose cold path branches here, so the stub
+    /// can stamp it onto the pending-exception signal (see
+    /// `JitRuntimeHelpers::set_throw_bci`).
+    exception_check_stubs: Vec<(usize, usize)>,
     /// Speculative BCE: deopt guards to emit at loop headers.
     /// Each guard checks that array.length >= loop_bound before entering the loop.
     speculative_bce_guards: Vec<SpeculativeBCEGuard>,
@@ -18454,7 +18458,8 @@ impl Compiler {
             if self.precise_exception_frames {
                 self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
-                self.exception_check_stubs.push(patch_offset);
+                self.exception_check_stubs
+                    .push((patch_offset, self.dbg_last_pc));
             }
             // .keep: patch the JNE above to land here (self-relative ⇒ copy-safe).
             let keep_off = self.buf.pos();
@@ -18468,7 +18473,8 @@ impl Compiler {
             if self.precise_exception_frames {
                 self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
-                self.exception_check_stubs.push(patch_offset);
+                self.exception_check_stubs
+                    .push((patch_offset, self.dbg_last_pc));
             }
         }
     }
@@ -18495,7 +18501,8 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.exception_check_stubs.push(patch_offset);
+        self.exception_check_stubs
+            .push((patch_offset, self.dbg_last_pc));
         // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
         // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
         // allocation-failure GC and to construct the OOME — which only the
@@ -18512,19 +18519,50 @@ impl Compiler {
             return;
         }
 
-        let stub_offset = self.buf.pos();
-
-        // MOV RAX, i64::MIN  — deopt sentinel so the interpreter's post-JIT
-        // path treats this as a deopt return and drains the pending
-        // exception. 48 B8 <imm64>
-        self.buf.emit(&[0x48, 0xB8]);
-        self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-
-        // Standard method epilogue: restore callee-saved regs and return.
-        self.emit_epilogue();
-
-        // Patch every recorded JE branch to point to the shared stub.
-        for &patch_off in &self.exception_check_stubs {
+        // One stub per DISTINCT throw-site bci, not one shared stub.
+        //
+        // The bci matters because `JitSignals::athrow_bci` is consumed by
+        // `execute_jit_call` as *this* method's throw site and range-checked
+        // against `[start_pc, end_pc)` of every entry in this method's own
+        // exception table. Until this stub stamps it, that field still held
+        // whatever the CALLEE's compiled `athrow` lowering left there -- a pc
+        // in a different method, which lands inside this method's protected
+        // region only by coincidence.
+        //
+        // A typed handler survives that coincidence often enough to look
+        // healthy (it is also matched on exception class), but a catch-all
+        // (`catch_type == 0`, i.e. a javac `finally`) has nothing else to
+        // match on: a foreign bci outside the region silently drops it and the
+        // `finally` never runs. `FinallyBalanceProbe.java` is the witness --
+        // `try { n++; thrower(); } finally { n--; }` leaked one count per
+        // throw under JIT and zero under `--nojit` / HotSpot.
+        //
+        // Grouping by bci keeps the cost at one small pad per distinct
+        // fallible bytecode rather than per branch site (unrolled loop copies
+        // share their original bci).
+        let sites = self.exception_check_stubs.clone();
+        let mut stub_by_bci: FxHashMap<usize, usize> = FxHashMap::default();
+        for (patch_off, bci) in sites {
+            let stub_offset = match stub_by_bci.get(&bci) {
+                Some(&off) => off,
+                None => {
+                    let off = self.buf.pos();
+                    stub_by_bci.insert(bci, off);
+                    // Stamp this method's own throw-site bci over whatever the
+                    // callee left behind. The argument registers are dead here
+                    // -- the method is about to return.
+                    self.emit_mov_imm32_sx(ARG_REGS[0], bci as i32); // Cast: bci fits i32
+                    self.emit_call_absolute(self.helpers.set_throw_bci);
+                    // MOV RAX, i64::MIN - deopt sentinel so the interpreter's
+                    // post-JIT path treats this as a deopt return and drains
+                    // the pending exception. 48 B8 <imm64>
+                    self.buf.emit(&[0x48, 0xB8]);
+                    self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                    // Standard method epilogue: restore callee-saved regs and return.
+                    self.emit_epilogue();
+                    off
+                }
+            };
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
@@ -21838,10 +21876,10 @@ impl Compiler {
                                     .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
-                                let orig_excn_stubs: Vec<usize> = self
+                                let orig_excn_stubs: Vec<(usize, usize)> = self
                                     .exception_check_stubs
                                     .iter()
-                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
                                 // JEP 358: each entry is (action, patch_offset);
@@ -22053,8 +22091,11 @@ impl Compiler {
                                             .iter()
                                             .map(|&(po, bci)| (po + shift_us, bci)),
                                     );
-                                    self.exception_check_stubs
-                                        .extend(orig_excn_stubs.iter().map(|&po| po + shift_us));
+                                    self.exception_check_stubs.extend(
+                                        orig_excn_stubs
+                                            .iter()
+                                            .map(|&(po, bci)| (po + shift_us, bci)),
+                                    );
                                     self.null_check_store_stubs.extend(
                                         orig_nullstore_stubs
                                             .iter()
@@ -30594,6 +30635,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
+            set_throw_bci: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
             jit_frem: sentinel,
