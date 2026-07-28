@@ -8357,6 +8357,9 @@ struct Compiler {
     /// local is dead" would discard the whole frame, so the snapshot builder
     /// falls back to "everything live" there.
     local_liveness_covered: Vec<bool>,
+    /// Debug-only: number of exception ranges modelled by the liveness /
+    /// interference analyses for this method (CRATONVM_DBG_EXCFRAME).
+    exception_ranges_dbg_len: usize,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -9425,6 +9428,7 @@ impl Compiler {
             local_kinds: Vec::new(),
             local_liveness: Vec::new(),
             local_liveness_covered: Vec::new(),
+            exception_ranges_dbg_len: 0,
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
@@ -9842,6 +9846,20 @@ impl Compiler {
             if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
                 let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
                 if live_here & (1u64 << i) == 0 {
+                    // `CRATONVM_DBG_EXCFRAME=1` reports every local DROPPED
+                    // from a snapshot. That is the actionable signal for this
+                    // whole bug class: a handler that reads a dropped local
+                    // sees 0 / null, silently and without a crash. If a value
+                    // you expect at a handler appears here, the liveness at
+                    // `bci` is not modelling the exception edge that reaches
+                    // it — see `regalloc::handler_live_mask`.
+                    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_EXCFRAME").is_some() {
+                        eprintln!(
+                            "[excframe] DROP local={i} at bci={bci} live_mask={live_here:#x} \
+                             precise={} handler_ranges={}",
+                            self.precise_exception_frames, self.exception_ranges_dbg_len,
+                        );
+                    }
                     locals.push(FrameValue::Undefined);
                     continue;
                 }
@@ -29835,6 +29853,7 @@ pub fn compile_with_param_slots(
         );
         compiler.local_liveness = liveness;
         compiler.local_liveness_covered = covered;
+        compiler.exception_ranges_dbg_len = exception_ranges.len();
     }
 
     // Emit prologue

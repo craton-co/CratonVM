@@ -5235,9 +5235,16 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
     } else {
         return Err(format!("unsupported URL: {url}"));
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // An authority ends at the first path, query, or fragment delimiter. A
+    // query-only target (for example `http://host:8080?trace=false`) must not
+    // feed `8080?trace=false` to the port parser; HTTP's origin-form still
+    // requires a leading slash. Fragments are client-side only and therefore
+    // must not be sent on the wire.
+    let (authority, path) = match rest.find(|c| matches!(c, '/' | '?' | '#')) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
+        Some(i) => (&rest[..i], "/".to_string()),
+        None => (rest, "/".to_string()),
     };
     // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
     // LAST '@' (userinfo may itself contain an encoded/raw '@').
@@ -5253,7 +5260,7 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
         }
         None => (hostport.to_string(), if scheme { 443 } else { 80 }),
     };
-    Ok((scheme, host, port, path.to_string(), userinfo))
+    Ok((scheme, host, port, path, userinfo))
 }
 
 fn http_perform_request(
@@ -13418,6 +13425,24 @@ mod tests {
         assert_eq!(port, 8080);
         assert_eq!(path, "/resource");
         assert_eq!(userinfo.as_deref(), Some("alice:secret"));
+    }
+
+    #[test]
+    fn re1_http_parse_url_query_only_and_fragment_do_not_extend_authority() {
+        let (https, host, port, path, userinfo) =
+            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false")
+                .unwrap();
+        assert!(!https);
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/?trace=false&message=false");
+        assert_eq!(userinfo.as_deref(), Some("alice:secret"));
+
+        let (_, host, port, path, _) =
+            http_parse_url("https://example.com:8443#client-only").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8443);
+        assert_eq!(path, "/");
     }
 
     #[test]

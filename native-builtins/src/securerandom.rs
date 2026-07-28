@@ -880,6 +880,16 @@ pub(crate) fn native_secure_random_get_instance_with_provider(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // The provider argument is otherwise discarded (every algorithm here is
+    // served by the OS CSPRNG regardless), but real JDK still resolves the
+    // named provider first and rejects one that was never registered — see
+    // `check_named_provider_arg`.
+    crate::jca::provider_chain::check_named_provider_arg(
+        ctx,
+        args,
+        1,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     native_secure_random_get_instance(ctx, args)
 }
 

@@ -1,6 +1,6 @@
 # UTF-16 `CharsetEncoder.encode()` re-emits the byte-order-mark on every call instead of once per stream
 
-**Status: OPEN — found 2026-07-23**
+**Status: RESOLVED — fixed 2026-07-24; closure verified 2026-07-28**
 
 ## Symptom
 
@@ -51,15 +51,37 @@ buffer small enough to force one `encode()` call per character (as this
 test deliberately does), that means one BOM per character instead of one
 BOM total.
 
-**Fix direction (not applied — investigation only):** thread a persistent
+**Implemented fix:** thread a persistent
 "have I already written the BOM for this encoder instance" flag through
 `native_encoder_encode` (e.g. a field on the synthetic `CharsetEncoder`
 carrier, mirroring `sun.nio.cs.UTF_16$Encoder.first`), and have
 `engine::encode_chars` (or a `charset::encode_chars` variant it can call for
 continuation calls) skip the BOM once that flag is set.
 
+The implementation in `native-builtins/src/charset.rs` uses a GC-stable,
+identity-keyed side table for this per-encoder session state, encodes UTF-16
+atoms as UTF-16BE after explicitly writing the initial `FE FF`, and clears the
+state from `CharsetEncoder.reset()`. This also covers the cached-encoder
+reuse path: reset starts a new stream and therefore re-arms exactly one BOM.
+
 ## Affected classes
 
 | Module | Class |
 |---|---|
 | core/spring-boot | org.springframework.boot.json.AppendableByteArrayTests |
+
+## Closure verification (2026-07-28)
+
+Fresh fat-LTO release build: `cratonvm-utf16-encoder-bom-20260728.exe`
+(SHA-256 `6bcf9e0f0c9e49bd258134076e73e0ed47ec396caf7cd40fe895704916e19bd5`).
+The external Spring Boot fixture at `C:\craton\CratonVM\apps\spring-boot` was
+run through `apps/spring-boot-suite-runner` against the full affected class,
+not only the originally failing method:
+
+| Mode | Result |
+|---|---|
+| JIT | `SBRUNNER_RESULT tests=4 failed=0 aborted=0 skipped=0 containersFailed=0` |
+| `--nojit` | `SBRUNNER_RESULT tests=4 failed=0 aborted=0 skipped=0 containersFailed=0` |
+
+Both runs completed every discovered test, including the expanding-buffer and
+cached-encoder/reset coverage. No residual remains for this issue.
