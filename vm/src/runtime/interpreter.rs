@@ -33662,6 +33662,52 @@ mod dynamic_dispatch_slot_tests {
     }
 }
 
+/// `CRATONVM_DBG_JITC` diagnostic: name the cache state that forced an OSR
+/// recompile — `no-cached-artifact` (the one legitimate case),
+/// `cached-not-via-osr`, or `cached-cannot-enter-at-pc`.
+///
+/// The last one is the interesting one: a PUBLISHED `compiled_via_osr` artifact
+/// that cannot be entered at `entry_pc` will never become enterable
+/// (`osr_pc_to_native[entry_pc]` is a pure function of the bytecode and the
+/// entry pc — the codegen writes `-1` for a pc strictly inside a LICM-hoisted
+/// loop body), so every recompile rebuilds it byte for byte. Measured on the
+/// `CallRate.allocPutOld` probe: 200 full C2 pipelines per 200 000 iterations,
+/// 199 of them this case, with the loop interpreted throughout.
+///
+/// `#[inline(never)]` + `#[cold]` keep the formatting temporaries of a
+/// debug-only path out of `compile_osr_artifact`'s frame. That caller is ~1100
+/// lines and runs on the mutator stack, and a frame reservation is
+/// unconditional even for a branch that never executes without the env var —
+/// so this is worth keeping out of line on principle, cheaply.
+///
+/// (Honesty note for the next reader: this was briefly *suspected* of causing
+/// a `main-vm` stack overflow in `TestDefaultServlet`. It does not. That crash
+/// reproduces on binaries with no diagnostic and no OSR change at all — it is
+/// a pre-existing flaky, load-dependent overflow on `dev`, seen once in four
+/// runs of an unmodified baseline binary on a heavily loaded host. Do not read
+/// these attributes as fixing anything.)
+#[inline(never)]
+#[cold]
+fn dbg_osr_recompile_reason(
+    cached_osr: Option<&crate::jit::CompiledMethod>,
+    class_name: &str,
+    method_name: &str,
+    method_descriptor: &str,
+    entry_pc: usize,
+) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_none() {
+        return;
+    }
+    let why = match cached_osr {
+        None => "no-cached-artifact",
+        Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
+        Some(_) => "cached-cannot-enter-at-pc",
+    };
+    eprintln!(
+        "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+    );
+}
+
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -33806,20 +33852,22 @@ fn compile_osr_artifact(
     // reuse kicks in.
     let osr_reused =
         matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
-    // DBG: name WHY a cached artifact was not reused. A cached
-    // `compiled_via_osr` artifact that cannot enter at `entry_pc` means the
-    // recompile below is guaranteed to produce the same un-enterable result
-    // (same bytecode, same entry pc), i.e. a pure-waste recompile loop —
-    // distinguishing that from "no artifact yet" or "artifact came from the
-    // invocation path" is the whole diagnosis.
-    if !osr_reused && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
-        let why = match &cached_osr {
-            None => "no-cached-artifact",
-            Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
-            Some(_) => "cached-cannot-enter-at-pc",
-        };
-        eprintln!(
-            "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+    // DBG: name WHY a cached artifact was not reused — see
+    // `dbg_osr_recompile_reason`. MUST stay an `#[inline(never)]` call: this
+    // function runs on the mutator's stack and is already ~1100 lines, and
+    // `main-vm`'s remaining headroom here is thin enough that inlining even a
+    // cold `eprintln!`'s formatting temporaries into this frame overflowed the
+    // stack outright (`TestDefaultServlet`/`TestStandardWrapper`/`TestTomcat`
+    // all died with "thread 'main-vm' has overflowed its stack"; the same
+    // binaries pass with the diagnostic out of line). The branch never
+    // executes without the env var, but the frame reservation is unconditional.
+    if !osr_reused {
+        dbg_osr_recompile_reason(
+            cached_osr.as_deref(),
+            &class_name,
+            &method_name,
+            &method_descriptor,
+            entry_pc,
         );
     }
     let compiled = if osr_reused {
