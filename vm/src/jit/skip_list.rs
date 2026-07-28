@@ -1237,6 +1237,28 @@ fn should_skip_jit_internal(
     // The narrow `PredictionContext` equality/hash guard
     // (`is_antlr_prediction_context_miscompile`, ANTLR-COLDPATH.1 below) is
     // unaffected and still applies to both the shaded and unshaded runtimes.
+    // 2026-07-28 re-test (against the 2026-07-27 atomic-array RMW fix,
+    // `ffb8dfa22`, which was never re-tested against this ban afterward):
+    // the fix did NOT clear this ban's residuals. A/B control (same binary,
+    // ban active vs. lifted, one class at a time) confirms THREE classes
+    // still PASS with the ban active and CRASH the moment `org/h2/` is
+    // JIT-eligible -- genuine, reproducible regressions, not stale evidence:
+    //   * `TestPageStoreCoverage` and `TestReopen` share one root cause:
+    //     `InternalError: precise deoptimization unavailable for
+    //     org/h2/mvstore/db/RowDataType.read(...)  at bci 50; refusing
+    //     side-effecting replay` -- `interpreter.rs`'s deliberate safety
+    //     refusal (better to throw than silently replay committed side
+    //     effects) when a JIT-compiled method traps and precise resume
+    //     isn't available for it. A precise-maps/deopt coverage gap, not a
+    //     new bug class; left for that effort rather than patched here.
+    //   * `TestRunscript` fails a DIFFERENT way: `assertEqualDatabases`
+    //     diffs diverge (`AssertionError: expected: INSERT INTO
+    //     "PUBLIC"."TEST2" VALUES(462);`) -- a genuine data-correctness
+    //     bug, distinct root cause, not yet bisected.
+    // A fourth class, `TestFileSystem`, hangs to the runner's 300s timeout
+    // in BOTH arms (ban active AND lifted) -- ruled OUT as evidence for or
+    // against this ban; it is not a JIT regression at all. Full evidence:
+    // `docs/known-issues/h2/h2-jitban-longtail1-residuals-20260728.md`.
     if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }
