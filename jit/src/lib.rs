@@ -691,6 +691,19 @@ fn jit_code_cache_at_capacity() -> bool {
     true
 }
 
+/// Whether to trace code-buffer unmaps (`CRATONVM_DBG_JIT_UNMAP`). Read once and
+/// cached: `Drop` runs on compile threads and during teardown, where a
+/// per-call environment read would be both hot and needlessly fallible.
+fn dbg_jit_unmap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_UNMAP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         if self.ptr.is_null() {
@@ -700,6 +713,23 @@ impl Drop for ExecutableBuffer {
             regions.deregister(self.ptr);
         }
         COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
+        // DIAG: `CRATONVM_DBG_JIT_UNMAP=1` names every code buffer as it is
+        // unmapped. Paired with `CRATONVM_DBG=jitc` (which prints each
+        // artifact's `entry=0x..`) and the crash handler's `pc=` line, it
+        // answers "did this SIGSEGV jump into a body that had just been
+        // retired?" in a single run — the question each round of the
+        // retired-JIT-code family previously needed a bespoke LD_PRELOAD shim
+        // for. It is what identified the unrooted OSR direct-call targets
+        // (`osr_direct_callee_entries` in the interpreter's
+        // `compile_osr_artifact`).
+        if dbg_jit_unmap_enabled() {
+            eprintln!(
+                "[jit-unmap] ptr=0x{:x} cap={} tid={:?}",
+                self.ptr as usize,
+                self.capacity,
+                std::thread::current().id()
+            );
+        }
         platform::free_executable(self.ptr, self.capacity);
     }
 }
@@ -5550,13 +5580,28 @@ pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
 
 /// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
 /// baked direct-call targets cannot all be kept alive.
+/// Whether an unrootable baked direct-call target blocks publication.
+///
+/// DEFAULT-ON since 2026-07-28. It arrived default-OFF with the diagnostic that
+/// found the retired-JIT-code family (e4b848394), which only *counted* the
+/// event — so the common case was to publish anyway, exactly the use-after-free
+/// `prepare_for_publication`'s doc comment says must not happen. Observed on
+/// the `JitOsrLoopProgress` fixture: `step`'s C2 compile baked a CALL to
+/// `maybeThrow`'s live entry, a concurrent `maybeThrow` recompile replaced it
+/// and unmapped the old body BEFORE `step` reached publication, and the
+/// published `step` then jumped into the freed page (SIGSEGV, `pc == addr`).
+///
+/// Refusing publication costs one wasted compile: the method stays interpreted
+/// and is recompiled on a later invocation, by which point the callee has a
+/// live body. `CRATONVM_JIT_STRICT_CALLEE_ROOTS=0` restores the historical
+/// publish-anyway behaviour for bisection.
 fn strict_callee_roots_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_STRICT_CALLEE_ROOTS")
             .map(|v| v != "0")
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -5789,8 +5834,19 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.methods.load()).clone();
-        next.insert(h, (key, arc));
+        let superseded = next.insert(h, (key, arc));
         shard.methods.store(Arc::new(next));
+        // The artifact this publication replaces may still be EXECUTING: a
+        // mutator inside its body, or inside a callee it roots via
+        // `_direct_callee_roots`. Dropping it here runs
+        // `ExecutableBuffer::drop`, which unmaps the code under that thread —
+        // observed as a SIGSEGV with `pc == addr` MID-body (offset 0x553 of a
+        // 1732-byte `maybeThrow`) immediately after this site's `[jit-unmap]`
+        // line for the same page. Hand it to the same quiescence queue the
+        // inline caches use: `defer_jit_owner` drops immediately when no JIT
+        // execution is in flight (the common case, so no retention change) and
+        // otherwise holds the `Arc` until `ACTIVE_JIT_EXECUTIONS` reaches zero.
+        defer_jit_owner(superseded.map(|(_, cm)| cm));
         // T2.2 — bump on EVERY publication, not just replacements. A first-time
         // insertion is exactly the event the interpreter's negative
         // "no compiled body for this method" memo
@@ -5862,8 +5918,11 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.osr_methods.load()).clone();
-        next.insert(h, (key, arc));
+        let superseded = next.insert(h, (key, arc));
         shard.osr_methods.store(Arc::new(next));
+        // Same reasoning as `put` — an OSR body is, if anything, more likely to
+        // be mid-execution when it is replaced.
+        defer_jit_owner(superseded.map(|(_, cm)| cm));
         // T2.2 — unconditional, for the same reason as `put` above.
         JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -6029,20 +6088,39 @@ impl JitCache {
         for shard in self.shards.iter() {
             let current = shard.methods.load();
             if doomed(&current) {
+                // Retire through the quiescence queue — see `put`. An
+                // invalidation is exactly the case where a body is likely to be
+                // running (a redefine racing live code).
+                let evicted: Vec<Arc<CompiledMethod>> = current
+                    .values()
+                    .filter(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+                    .map(|(_, cm)| cm.clone())
+                    .collect();
                 let mut next = (**current).clone();
                 let old_len = next.len();
                 next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
                 removed += old_len - next.len();
                 shard.methods.store(Arc::new(next));
+                for cm in evicted {
+                    defer_jit_owner(Some(cm));
+                }
             }
 
             let current = shard.osr_methods.load();
             if doomed(&current) {
+                let evicted: Vec<Arc<CompiledMethod>> = current
+                    .values()
+                    .filter(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+                    .map(|(_, cm)| cm.clone())
+                    .collect();
                 let mut next = (**current).clone();
                 let old_len = next.len();
                 next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
                 removed += old_len - next.len();
                 shard.osr_methods.store(Arc::new(next));
+                for cm in evicted {
+                    defer_jit_owner(Some(cm));
+                }
             }
         }
         if removed != 0 {
@@ -6067,8 +6145,21 @@ impl JitCache {
                 }
             }
             count += shard.methods.load().len() + shard.osr_methods.load().len();
+            // Retire through the quiescence queue — see `put`. `clear_all` runs
+            // on JVMTI redefine, which does not stop the world here, so every
+            // body it drops may be live.
+            let evicted: Vec<Arc<CompiledMethod>> = [
+                shard.methods.load(),
+                shard.osr_methods.load(),
+            ]
+            .iter()
+            .flat_map(|map| map.values().map(|(_, cm)| cm.clone()).collect::<Vec<_>>())
+            .collect();
             shard.methods.store(Arc::new(FxHashMap::default()));
             shard.osr_methods.store(Arc::new(FxHashMap::default()));
+            for cm in evicted {
+                defer_jit_owner(Some(cm));
+            }
         }
         if count != 0 {
             JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);

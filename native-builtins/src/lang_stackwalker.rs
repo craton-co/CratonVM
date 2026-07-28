@@ -1011,13 +1011,25 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, SF_METHODNAME)))
         },
     );
-    // expandStackFrameInfo is a private native on StackFrameInfo that
-    // populates `name`/`type`/`bci` from a HotSpot intrinsic. We
-    // pre-populate everything our getters need, so this is a no-op.
+    // KEEP (no-op, justified): `expandStackFrameInfo` is the private
+    // StackFrameInfo native that fills `name`/`type`/`bci` from a HotSpot
+    // intrinsic, i.e. it is pure LAZY population — there is no other side
+    // effect to reproduce. Every StackFrameInfo this VM hands out is built
+    // EAGERLY by `populate_sfi` (the only construction site; used by both walk
+    // paths above), which writes SF_CLASSNAME/SF_METHODNAME/SF_FILENAME/
+    // SF_LINENUMBER/SF_BCI/SF_DECL_INTERNAL up front — exactly the fields the
+    // getters read. Expanding again would recompute identical values.
     registry.register(sfi, "expandStackFrameInfo", "()V", |_ctx, _args| Ok(None));
-    // ensureRetainClassRefEnabled is package-private on ClassFrameInfo
-    // and asserts the walker had RETAIN_CLASS_REFERENCE. We always
-    // populate the class mirror, so this is also a no-op.
+    // KEEP (no-op, deliberately permissive): real
+    // `ClassFrameInfo.ensureRetainClassRefEnabled` throws
+    // UnsupportedOperationException when the walker was created WITHOUT
+    // Option.RETAIN_CLASS_REFERENCE. CratonVM does not model StackWalker
+    // options at all (grep: RETAIN_CLASS_REFERENCE appears nowhere else in this
+    // module) and `populate_sfi` always stores the class mirror, so the check
+    // has no state to consult; throwing unconditionally would break every
+    // legitimate RETAIN_CLASS_REFERENCE caller, which is strictly worse than
+    // being lax for the callers that omitted the option. Implement this only
+    // together with recording the option set on the walker.
     registry.register(
         "java/lang/ClassFrameInfo",
         "ensureRetainClassRefEnabled",

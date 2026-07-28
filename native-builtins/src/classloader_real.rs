@@ -570,6 +570,20 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     // parallel-capable and `true` is the accurate answer, not an optimistic
     // one. (Real JDK returns false only for the bookkeeping case where a
     // superclass was not itself registered — a distinction we do not model.)
+    //
+    // Wave-3 shadowing note: this class+method+descriptor is registered THREE
+    // times — here, `classloader.rs::cl_register_as_parallel_capable`, and
+    // `deprecated_internal.rs`. All three return 1, so last-write-wins is
+    // currently harmless; if you ever change the answer, change all three or
+    // the edit will be silently shadowed.
+    //
+    // Known inconsistency (NOT fixable from here — this method is STATIC and
+    // has no receiver): `classloader.rs::cl_is_registered_as_parallel_capable`
+    // reports the per-instance `CL_IS_PARALLEL_CAPABLE` field, which nothing
+    // ever SETS, so `isRegisteredAsParallelCapable()` answers false while this
+    // answers true. Real JDK records the CALLER class in a static
+    // `ParallelLoaders` set; reconciling the pair means adding that set plus a
+    // caller-class lookup, and touches `classloader.rs`.
     r.register(cl, "registerAsParallelCapable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });

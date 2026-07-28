@@ -1106,6 +1106,69 @@ pub(crate) fn p67_segment_address(ctx: &mut dyn NativeContext, args: &[Value]) -
     }
 }
 
+/// `MemorySegment.isReadOnly()` — report the receiver's OWN read-only flag
+/// instead of a blanket `false`.
+///
+/// Two receiver shapes reach this. A REAL `jdk.internal.foreign
+/// .AbstractMemorySegmentImpl` keeps the flag in a concrete `readOnly` field
+/// and implements `isReadOnly()` in bytecode that every subclass inherits — so
+/// the constant `false` that used to be registered on the impl classes below
+/// SHADOWED that concrete method (FACT 1) and told callers that a segment
+/// handed out by `asReadOnly()` was writable, turning the
+/// `UnsupportedOperationException` a mutating access owes them into a silent
+/// write. The synthetic 6-slot carrier keeps the same flag at slot 3
+/// (`[0]=ptr,[1]=size,[2]=arena,[3]=ro,[4]=alive,[5]=offset` — see
+/// `panama::pe_arena_allocate_impl`; `asSlice`/`reinterpret` both propagate it).
+///
+/// `false` survives only as the fallback for a carrier too short to have the
+/// slot, which is what those (2- and 3-field) segments have always been.
+pub(crate) fn p67_segment_is_read_only(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if let Value::Int(v) = ctx.get_field_by_name(this, "readOnly") {
+        return Ok(Some(Value::Int(i32::from(v != 0))));
+    }
+    if ctx.object_num_fields(this) >= 6 {
+        if let Value::Int(v) = ctx.get_field(this, 3) {
+            return Ok(Some(Value::Int(i32::from(v != 0))));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+/// `jdk.internal.foreign.*MemorySegmentImpl.isNative()` — decide from the
+/// receiver's OWN runtime class rather than from the class the native happens
+/// to be registered on.
+///
+/// The registration on `AbstractMemorySegmentImpl` also intercepts
+/// `HeapMemorySegmentImpl` and its `OfByte`/`OfChar`/… nested subclasses
+/// (FACT 1: a native on a concrete/abstract class catches every subclass that
+/// doesn't override), so a constant answer keyed to the registration class is
+/// wrong for exactly the receivers that reach it through the base.
+fn p67_segment_impl_is_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    // Heap segments are the only non-native kind; a mapped segment IS native.
+    Ok(Some(Value::Int(i32::from(!name.contains("Heap")))))
+}
+
+/// `jdk.internal.foreign.*MemorySegmentImpl.isMapped()` — true only for a
+/// segment that came from `FileChannel.map`, i.e. a `MappedMemorySegmentImpl`.
+/// See `p67_segment_impl_is_native` for why this cannot be a constant.
+fn p67_segment_impl_is_mapped(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    Ok(Some(Value::Int(i32::from(
+        name == "jdk/internal/foreign/MappedMemorySegmentImpl",
+    ))))
+}
+
 pub(crate) fn p67_segment_get_width(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1907,13 +1970,35 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    r.register(ms, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    // SHADOWED: `panama.rs::register_pe_memory_segment` registers this exact
+    // class+method+descriptor too, and its registrar runs AFTER this one on
+    // both paths that reach them (`register_essential_natives`: foreign_ffm at
+    // lib.rs:9736 then panama at :9740; full registry: phase 67 at :22995 then
+    // `register_pe_panama` at :23051). Last-write-wins, so panama's is the live
+    // answer and this one is dead — yet it used to say FALSE where panama said
+    // TRUE, a contradiction that would have bitten whoever changed the
+    // registration order. Panama now answers from the receiver (heap-backed
+    // `ofArray` segments are not native, everything else is); the arena-backed
+    // carriers this file mints are all off-heap, so TRUE is this fallback's
+    // correct value and the two no longer disagree.
+    r.register(ms, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    // KEEP (constant, justified): "mapped" means "produced by
+    // `FileChannel.map`", and nothing constructs one of these carriers that
+    // way — every path that mints one (`Arena.allocate*`, `asSlice`,
+    // `reinterpret`, `MemorySegment.NULL`, `ofArray`) is malloc- or heap-backed.
+    // So `false` is a statement of fact about this model, not a placeholder.
     r.register(ms, "isMapped", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(ms, "isReadOnly", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(ms, "equals", "(Ljava/lang/Object;)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ms, "isReadOnly", "()Z", p67_segment_is_read_only);
+    // `MemorySegment` does not override `equals` in the JDK — segment equality
+    // IS reference identity. The constant `false` this used to return broke
+    // even reflexivity (`seg.equals(seg)` was false), so a segment could not be
+    // found in any collection it had just been put into, and the
+    // `slice.equals(other)` guards FFM callers write around aliasing all took
+    // the wrong branch.
+    r.register(ms, "equals", "(Ljava/lang/Object;)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let equal = matches!(args.get(1), Some(Value::Object(Some(other))) if *other == this);
+        Ok(Some(Value::Int(i32::from(equal))))
     });
     r.register(
         ms,
@@ -1966,15 +2051,17 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/foreign/ValueLayout$OfLong;J)J",
             |ctx, args| p67_segment_get_width(ctx, args, 8),
         );
-        r.register(ms_impl, "isNative", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(1)))
-        });
-        r.register(ms_impl, "isMapped", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(1)))
-        });
-        r.register(ms_impl, "isReadOnly", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
-        });
+        // `isNative`/`isMapped` were a constant TRUE for all three classes,
+        // which is right for only two of the six answers — a NATIVE segment is
+        // not mapped, and `AbstractMemorySegmentImpl` is the shared base of the
+        // HEAP impls too, so a blanket TRUE there reported every heap segment
+        // as both native and mapped. Answer from the receiver's own runtime
+        // class instead (see `p67_segment_impl_is_native`).
+        r.register(ms_impl, "isNative", "()Z", p67_segment_impl_is_native);
+        r.register(ms_impl, "isMapped", "()Z", p67_segment_impl_is_mapped);
+        // Was a constant `false`, which shadowed the real, concrete
+        // `AbstractMemorySegmentImpl.isReadOnly()` — see the helper's doc.
+        r.register(ms_impl, "isReadOnly", "()Z", p67_segment_is_read_only);
         r.register(
             ms_impl,
             "scope",

@@ -3340,6 +3340,15 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
     // reader answering a constant `false`, a loader that had just successfully
     // registered was told it had not — the register/query pair contradicted
     // itself. Report the same `true`.
+    //
+    // SHADOWED — this registration currently has NO runtime effect, and the
+    // contradiction above is still live. Both this function and
+    // `classloader::register_classloader_natives` are reachable only from
+    // `register_synthetic_overrides`, and lib.rs calls the classloader one
+    // LAST, so `cl_is_registered_as_parallel_capable` (which reads field
+    // `CL_IS_PARALLEL_CAPABLE`, only ever written as 0) wins. In real-JDK mode
+    // neither runs. Kept rather than deleted so the intended answer stays on
+    // record; the actual fix belongs at the classloader.rs registration.
     r.register(cl, "isRegisteredAsParallelCapable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -4927,6 +4936,13 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
+    // KEEP: `System.Logger` is an INTERFACE, so this never shadows a user or
+    // real-JDK implementation (the dispatcher declines a native for an
+    // interface instance method) — it only serves the 1-field synthetic
+    // logger `System.getLogger` hands out above, which carries a name and no
+    // level threshold. That receiver's `log` below emits unconditionally, so
+    // "every level is loggable" is the accurate report of what it does, not a
+    // placeholder. `vm.rs`'s System.Logger test asserts this pairing.
     r.register(
         slogger,
         "isLoggable",
