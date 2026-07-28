@@ -110,6 +110,36 @@ CratonVM's intentional LEGACY default and rules out any config-detection,
 ServiceLoader, or classpath-scanning bug — the selection mechanism itself
 works correctly and honors explicit overrides exactly as designed.
 
+## Second cost of the LEGACY default, measured 2026-07-28: −28 % throughput on an insert-heavy fixture
+
+The trade-off is not only "two contract tests fail". On a fixture that
+`persist()`s many rows in one transaction, the LEGACY queue is also
+substantially *slower* than the GRAPH default it replaces — the opposite of the
+direction one would assume from the `CycleBreaker`-hang rationale above.
+
+Measured on dev `d0a6c7987`, quiet host, one fresh process per sample,
+`OracleInlineMutationStrategyIdTest#testDeleteFromPerson` (its `@BeforeEach`
+persists 2200 JOINED-inheritance entities = 4400 INSERTs). Three samples per
+configuration, **interleaved** round-robin rather than in blocks, so host drift
+cannot favour one side:
+
+| configuration | samples (ms) | mean |
+|---|---|---:|
+| CratonVM default (LEGACY) | 255 999 / 241 995 / 216 814 | 238 269 |
+| `-Dhibernate.flush.queue.type=graph` | 168 208 / 185 606 / 159 862 | **171 225 (−28 %)** |
+
+The two sample sets do not overlap, so this is well clear of the ±8 % run-to-run
+spread the default alone shows.
+
+So the LEGACY default is currently paying twice: two expected-fail classes *and*
+better than a quarter of the wall clock on insert-heavy Hibernate fixtures. That
+does not change the disposition below — the `CycleBreaker` DFS hang it avoids is
+a >1000x pathology and this is 1.4x — but it does raise the value of revisiting
+the default once that hang is addressed, and it should be quoted alongside the
+hang when that trade is re-litigated. Full measurement context:
+[`h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md),
+residual section.
+
 ## Disposition
 
 **Leave as-is.** These two classes are, by construction, tests of upstream's
