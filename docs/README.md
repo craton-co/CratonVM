@@ -1,74 +1,170 @@
 # CratonVM Documentation
 
-> **📖 The complete manual lives in [`book/`](book/src/SUMMARY.md).**
-> It is a unified, navigable documentation site (mdBook-buildable, and readable
-> as Markdown on GitHub) covering installation, the user guide, Java support,
-> security, performance, GPU offload, embedding, internals, contributing, and a
-> full reference. Build it locally with `mdbook serve docs/book` (or just read
-> the Markdown). The standalone files below remain the source for several deep
-> reference tables and are linked from the book.
+The canonical manual is the [CratonVM book](book/src/SUMMARY.md). It is
+readable directly as Markdown and can be rendered with mdBook:
 
-Index of the CratonVM documentation set. Links are relative to this `docs/`
-folder. See also the root [`README.md`](../README.md) for a project overview
-and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the system design.
+```bash
+mdbook serve docs/book
+```
 
-## Getting started
+The manual covers installation, everyday use, Java compatibility, security,
+performance, operations, GPU offload, embedding, architecture, contributing,
+and reference material. Root and standalone documents provide deeper evidence
+and large reference tables without duplicating the manual.
 
-- [INSTALL.md](INSTALL.md) — install pre-built binaries or build from source.
-- [CONFIG.md](CONFIG.md) — configuration reference for the `cratonvm` launcher flags and `CRATONVM_*` env vars.
-- [CONTAINER.md](CONTAINER.md) — container / cgroup awareness and ergonomic resource defaults.
-- [PLATFORMS.md](PLATFORMS.md) — platform support matrix; which host OS supports which syscall-touching features.
-- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — common issues and their solutions.
+## Start here
 
-## Using and embedding
+- [Introduction](book/src/introduction.md)
+- [Installation](book/src/getting-started/installation.md)
+- [Your First Program](book/src/getting-started/first-program.md)
+- [Running Programs](book/src/user-guide/running-programs.md)
+- [Command-Line Reference](book/src/user-guide/cli-reference.md)
+- [Configuration](book/src/user-guide/configuration.md)
+- [Troubleshooting](book/src/user-guide/troubleshooting.md)
+- [FAQ](book/src/reference/faq.md)
 
-- [EMBEDDING.md](EMBEDDING.md) — embed CratonVM via the C-ABI (`libcratonvm`) or the Rust facade (`cratonvm-embed`).
-- [internal/embedding.md](internal/embedding.md) — host `cratonvm-vm` inside a Rust application (internal notes).
-- [internal/gc-tuning.md](internal/gc-tuning.md) — tune heap and GC behaviour for a given workload.
-- [PROFILING.md](PROFILING.md) — measure and improve CratonVM performance.
-- [COVERAGE.md](COVERAGE.md) — generate code coverage with `cargo-llvm-cov` (local + advisory CI).
+## Operating CratonVM
 
-## Reference and status
+- [Deployment and Operations](book/src/operations/deployment.md) — packaging,
+  immutable configuration, sizing, rollout, rollback, and operational
+  checklists.
+- [Observability](book/src/operations/observability.md) — logs, JFR, stack
+  dumps, native coverage audits, and incident evidence.
+- [Incident Response](book/src/operations/incident-response.md) — repeatable
+  crash, hang, wrong-result, OOM, compatibility, and regression triage.
+- [Containers and cgroups](book/src/user-guide/containers.md)
+- [Memory and Garbage Collection](book/src/user-guide/memory-and-gc.md)
+- [Security Overview](book/src/security/overview.md)
+- [Sandboxing and Hardening](book/src/security/sandboxing.md)
 
-- [JDK_COVERAGE.md](JDK_COVERAGE.md) — JDK class/method coverage, auto-generated from the native crates.
-- [internal/jck-compliance.md](internal/jck-compliance.md) — internal JCK compliance estimate matrix.
-- [legal.md](legal.md) — JCK licensing and legal requirements.
-- [RELEASE_READINESS.md](RELEASE_READINESS.md) - public release, crates.io dry-run, Apache-2.0 notice, and repository readiness checklist.
-- [SECURITY_HARDENING.md](SECURITY_HARDENING.md) — sandboxing, egress/SSRF policy, and crypto-hardening reference (companion to [`SECURITY.md`](../SECURITY.md)).
-- [CRYPTO_STATUS.md](CRYPTO_STATUS.md) — per-algorithm cryptographic implementation status (companion to [`SECURITY.md`](../SECURITY.md)).
-- [internal/javafx-status.md](internal/javafx-status.md) — JavaFX as an out-of-tree, non-core module.
-- [PRESENTATION.md](PRESENTATION.md) — JIT performance results write-up.
+## Performance
+
+- [Performance Tuning](book/src/performance/tuning.md) — the recommended
+  correctness-first tuning workflow and current runtime fast paths.
+- [Benchmarks](book/src/performance/benchmarks.md) — manual overview.
+- [`../BENCHMARK.md`](../BENCHMARK.md) — detailed methodology, current result
+  tables, raw-evidence expectations, and performance gate.
+- [Profiling](book/src/performance/profiling.md)
+- [How the JIT Got Fast](book/src/performance/jit-internals.md)
+- [JIT Optimization History](JIT_OPTIMIZATION.md)
+- [GC Tuning](gc-tuning.md)
+
+## Architecture and internals
+
+- [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — deep crate and subsystem
+  orientation.
+- [Architecture Overview](book/src/internals/architecture.md) — concise manual
+  map.
+- [Runtime Lifecycle](book/src/internals/runtime-lifecycle.md) — launcher,
+  typed bootstrap, loading, interpretation/JIT, GC, natives, and shutdown.
+- [Runtime Contracts](book/src/internals/runtime-contracts.md) — loader
+  identity, roots, barriers, safepoints, exception frames, dispatch, monitors,
+  native capabilities, flags, and bootstrap invariants.
+- [Interpreter](book/src/internals/interpreter.md)
+- [JIT Compiler](book/src/internals/jit.md)
+- [Garbage Collector](book/src/internals/garbage-collector.md)
+- [Class Loading and Verification](book/src/internals/class-loading.md)
+- [Threading and Concurrency](book/src/internals/threading.md)
+- [Native Methods](book/src/internals/native-methods.md)
+
+Current focused architecture notes live under [`architecture/`](architecture/).
+Forward-looking proposals live under
+[`feature-designs/`](feature-designs/README.md); a proposal is not evidence that
+the feature is implemented.
+
+Current deep dives include:
+
+- [Compact object and field layout](architecture/compact-object-and-field-layout.md)
+- [Class-loader unloading](architecture/class-loader-unloading.md)
+- [Inline allocation and reference publication](architecture/inline-allocation-and-reference-publication.md)
+- [Continuation-backed virtual threads](architecture/continuation-backed-virtual-threads.md)
+- [JIT safepoint polls](architecture/jit-safepoint-polls.md)
+- [JIT cache sharding and code reclamation](architecture/jit-cache-sharding-and-code-reclamation.md)
+- [Register allocation, recursion, and inlining](architecture/register-allocation-recursion-and-inlining.md)
+- [Shared verified-code IR](architecture/shared-verified-code-ir.md)
+- [Native target-method metadata](architecture/native-target-method-metadata.md)
+- [Mapped JAR and shared class bytes](architecture/mapped-jar-shared-class-bytes.md)
+
+The canonical in-source lock hierarchy is
+[`../vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs). The
+[no-synthetic-stubs policy](contributing/no-synthetic-stubs.md) and
+[stub ratchet](contributing/stub-ratchet.md) govern application-visible JDK
+compatibility work.
+
+## Compatibility and platform status
+
+- [Compatibility and Support Policy](book/src/reference/compatibility-policy.md)
+- [Java Version Support](book/src/java-support/version-support.md)
+- [Language Features](book/src/java-support/language-features.md)
+- [Standard Library Coverage](book/src/java-support/standard-library.md)
+- [Known Limitations](book/src/java-support/limitations.md)
+- [JDK Coverage Inventory](JDK_COVERAGE.md)
+- [Platform Support Matrix](book/src/reference/platform-support.md)
+- [JCK Engineering Status](jck-compliance.md)
+- [JavaFX Status](javafx-status.md)
+- [Divergence Log](known-gaps/divergence-log.md)
+
+CratonVM is not JCK-certified. See [legal.md](legal.md) for licensing and
+compliance terminology.
+
+## Embedding and native integration
+
+- [Embedding Overview](book/src/embedding/overview.md)
+- [C ABI / JNI Invocation API](book/src/embedding/c-abi.md)
+- [Rust Embedding Facade](book/src/embedding/rust-facade.md)
+- [Standalone Embedding Reference](EMBEDDING.md)
+- [Hosting the VM Crate](EMBEDDING_VM_CRATE.md)
+
+## Security and cryptography
+
+- [Security Overview](book/src/security/overview.md)
+- [Sandboxing and Hardening](book/src/security/sandboxing.md)
+- [Cryptography](book/src/security/cryptography.md)
+- [Security Hardening Reference](SECURITY_HARDENING.md)
+- [Cryptographic Algorithm Status](CRYPTO_STATUS.md)
+- [`../SECURITY.md`](../SECURITY.md) — vulnerability reporting policy.
 
 ## GPU offload
 
-- [gpu/README.md](gpu/README.md) — single source of truth for the opt-in GPU offload feature; phase specs and reports live alongside it under [`gpu/`](gpu/).
+- [GPU Offload Overview](book/src/gpu/overview.md)
+- [GPU Benchmarks](book/src/gpu/benchmarks.md)
+- [GPU Reference](gpu/README.md)
 
-## Design notes and policy
+GPU execution is opt-in and requires a `gpu-driver` build. The GPU reference is
+the source of truth for eligibility, driver requirements, and experimental
+status.
 
-- [`../vm/src/runtime/lock_order.rs`](../vm/src/runtime/lock_order.rs) — canonical, in-source definition of the global lock acquisition order (the `LockLevel` hierarchy) and its runtime-enforcement wrappers.
-- [internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](internal/fixed-suite-bugs/app-jvm-bugs/jvm-no-synthetic-stubs.md) — project rule: run real Java classes, no synthetic stubs.
-- [internal/feature_roadmap_interpreter_intrinsic_table.md](internal/feature_roadmap_interpreter_intrinsic_table.md) — interpreter intrinsic table roadmap.
-- [internal/feature_roadmap_jit_intrinsics.md](internal/feature_roadmap_jit_intrinsics.md) — roadmap for JIT-inlined intrinsics beyond `java.lang.Math`.
+## Contributors and maintainers
 
-## Design proposals (forward-looking)
+- [`../BUILD_GUIDE.md`](../BUILD_GUIDE.md)
+- [`../CONTRIBUTING.md`](../CONTRIBUTING.md)
+- [Testing](book/src/contributing/testing.md)
+- [Documentation Guide](book/src/contributing/documentation.md)
+- [`../RELEASING.md`](../RELEASING.md)
+- [`../ROADMAP.md`](../ROADMAP.md)
+- [Code Coverage](COVERAGE.md)
 
-Grounded engineering designs for larger, not-yet-landed features. See [`feature-designs/`](feature-designs/):
+Validate maintained Markdown and mdBook membership with:
 
-- [feature-designs/precise-jit-maps-default.md](feature-designs/precise-jit-maps-default.md) — precise JIT stack maps as the validated default.
-- [feature-designs/deopt-osr.md](feature-designs/deopt-osr.md) — real-frame deoptimization + virtual-object rematerialization + precise OSR.
-- [feature-designs/concurrent-gc-maturation.md](feature-designs/concurrent-gc-maturation.md) — mature G1 into a selectable, validated collector.
-- [feature-designs/foreign-thread-attach.md](feature-designs/foreign-thread-attach.md) — foreign-thread attach with safepoint participation.
-- [feature-designs/differential-fuzzer.md](feature-designs/differential-fuzzer.md) — semantic differential fuzzer vs HotSpot.
+```bash
+python3 tools/check_markdown_links.py
+```
 
-## Open investigations
+Use `--all` to audit historical/internal Markdown too. The default check covers
+the maintained public documentation so historical evidence with intentionally
+preserved links does not block normal documentation work.
 
-- [internal/bc-ec-mod-mododdinverse-investigation.md](internal/bc-ec-mod-mododdinverse-investigation.md) — BouncyCastle EC `Mod.modOddInverse` residual failures.
-- [internal/app-jvm-bugs/tomcat-selector-investigation.md](internal/fixed-suite-bugs/app-jvm-bugs/tomcat-selector-investigation.md) — Tomcat NIO selector investigation.
-- [internal/app-jvm-bugs/jit-safepoint-revert.md](internal/fixed-suite-bugs/app-jvm-bugs/jit-safepoint-revert.md) — JIT precise-oop-map fixes, reverted.
+## Issue and evidence taxonomy
 
-## Internal notes
+- `docs/known-issues/` contains unresolved bugs and active investigations.
+- After a bug is fixed and covered, move its document to `docs/internal/`.
+- `docs/internal/` is non-normative historical evidence and audit material.
+- `docs/architecture/` describes current architecture that remains useful
+  outside a single fix.
+- `docs/feature-designs/` contains proposals and must state when work is not yet
+  implemented.
 
-`docs/internal/` holds non-normative internal development notes (round logs,
-blocker maps, session handoffs, benchmark scratch). These are working notes,
-not authoritative. For canonical project status see the root
-[`ROADMAP.md`](../ROADMAP.md) and [`SECURITY.md`](../SECURITY.md).
+For current project status, use [`../ROADMAP.md`](../ROADMAP.md), the
+[compatibility policy](book/src/reference/compatibility-policy.md), and the
+[known limitations](book/src/java-support/limitations.md), not an old internal
+audit.

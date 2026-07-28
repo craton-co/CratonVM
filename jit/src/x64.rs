@@ -2874,6 +2874,28 @@ pub fn set_precise_exception_frame_request(on: bool) {
 }
 
 thread_local! {
+    /// One-shot `[start_pc, end_pc)` list of the next method's exception-table
+    /// protected ranges, published by the bytecode front-end.
+    ///
+    /// The backend is otherwise entirely exception-table-blind, and that is
+    /// fine for every lowering that RETURNS to this frame: the shared exception
+    /// stub re-enters the interpreter at the throwing bci and the method's own
+    /// handler table takes over from there. It is NOT fine for the sibling
+    /// tail-call, which tears this frame down and `JMP`s into the callee, so an
+    /// exception the callee raises unwinds straight past a handler that was
+    /// supposed to catch it. See `pc_is_protected`.
+    static PROTECTED_RANGES_REQUEST: std::cell::Cell<Option<Vec<(u32, u32)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Publish the next method compile's exception-table protected ranges.
+/// One-shot, like [`set_precise_exception_frame_request`], so a bailed compile
+/// cannot leak its ranges into the next unrelated method on this worker thread.
+pub fn set_protected_ranges_request(ranges: Vec<(u32, u32)>) {
+    PROTECTED_RANGES_REQUEST.with(|c| c.set(if ranges.is_empty() { None } else { Some(ranges) }));
+}
+
+thread_local! {
     /// OSR-tier sibling of [`KERNEL_REG_HOMES_REQUEST`] — set (only) by the
     /// interpreter's `compile_osr_artifact` (perf/halfgap-20260717).
     static KERNEL_REG_HOMES_OSR_REQUEST: std::cell::Cell<bool> =
@@ -5460,10 +5482,40 @@ fn plan_scalar_replacement(
 /// passing the header would have the same defect. That is a pre-existing
 /// limitation of the pre-header placement contract, not one this predicate
 /// widens.
+/// Exception-handler edges (`exception_ranges`, as
+/// `(start_pc, end_pc, handler_pc)`) are not bytecode branches, so the edge
+/// decoding below cannot see them: the real edge is "any throwing instruction
+/// in `[start_pc, end_pc)` -> `handler_pc`", materialised by the runtime's
+/// exception dispatch. A handler landing inside a loop body is an entry into
+/// that loop and bypasses its pre-header exactly as a `goto` into the header
+/// does — but only when it can be reached from OUTSIDE the loop, which is why
+/// the predicate also requires the protected range to escape `[header,
+/// loop_end)`. A range lying wholly inside the loop is sound and keeps its
+/// hoist (the throw can only have happened after the header was entered, so
+/// the pre-header already ran) — that is the shape javac emits for the common
+/// `while (…) { try { … } catch { … } }`.
+///
+/// **This handler clause is currently unreachable and is pre-emptive.** A
+/// method with a non-empty exception table is not admitted to this backend at
+/// all, so `exception_ranges` is empty in every production compile today and
+/// the codegen is byte-identical. Measured on dev `d134f7104` with
+/// `CRATONVM_DBG_DUMP_JIT=LIST`: `LicmEntryProbe.shapeA/shapeB` (no handlers)
+/// are listed as compiled; `TryCatchHot.f` (try/catch in a hot loop, 200 000
+/// calls) and `HandlerLoopProbe.shape` (400 000 calls) are not. It is written
+/// now because that admission gate has already been relaxed once (RBC.6
+/// admitted explicit `athrow`) and the hazard is silent when it goes live — a
+/// wrong loop bound, or a speculative-BCE guard elided but never run.
+/// `docs/known-issues/repros/jit-licm-handler-edge/` holds the dormant
+/// witness: an ASM generator for a shape javac cannot express (handler inside
+/// the loop, protected range entirely before it, normal path falling *through*
+/// into the header so no branch edge exists for the rule above to catch), plus
+/// a driver that alternates both entries. Run it first if that gate is ever
+/// relaxed.
 fn find_bypassable_loop_headers(
     code: &[u8],
     code_len: usize,
     loops: &[(usize, usize)],
+    exception_ranges: &[(usize, usize, usize)],
 ) -> FxHashSet<usize> {
     let mut bypassable: FxHashSet<usize> = FxHashSet::default();
     if loops.is_empty() {
@@ -5597,6 +5649,30 @@ fn find_bypassable_loop_headers(
             let target_inside = target >= header && target < loop_end;
             let src_inside = src >= header && src < loop_end;
             if target_inside && !src_inside {
+                bypassable.insert(header);
+                break;
+            }
+        }
+        // Exception-handler edges are NOT bytecode branches, so the decoding
+        // above cannot see them: the real edge is "any throwing instruction in
+        // `[start_pc, end_pc)` -> `handler_pc`", materialised by the runtime's
+        // exception dispatch. A handler that lands inside this loop's body is
+        // therefore an entry into the loop, and it bypasses the pre-header for
+        // exactly the same reason a `goto` into the header does.
+        //
+        // The predicate is the same one used for branch edges — an entry whose
+        // SOURCE is outside the loop — with the throwing site standing in for
+        // the branch source. A protected range lying wholly inside the loop is
+        // sound and keeps its hoist: the throw can only have happened after
+        // the header was entered, so the pre-header had already run. That is
+        // precisely the shape javac emits for the common
+        // `while (…) { try { … } catch { … } }`, so this costs nothing there.
+        // A range reaching before the header (or past the loop) can deliver
+        // control into the body from code the pre-header never covered.
+        for &(start_pc, end_pc, handler_pc) in exception_ranges {
+            let handler_inside = handler_pc >= header && handler_pc < loop_end;
+            let range_escapes = start_pc < header || end_pc > loop_end;
+            if handler_inside && range_escapes {
                 bypassable.insert(header);
                 break;
             }
@@ -7876,6 +7952,10 @@ struct Compiler {
     /// This method uses frame-preserving exception exits for handlers that
     /// read non-parameter locals (RBC.6 precise-handler continuation).
     precise_exception_frames: bool,
+    /// `[start_pc, end_pc)` ranges covered by this method's exception table.
+    /// Empty when the method has no handlers. Consulted only by
+    /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
+    protected_ranges: Vec<(u32, u32)>,
     /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
     /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
     /// Forces `has_dispatch` for the SAME thread-availability reason as
@@ -8267,6 +8347,12 @@ struct Compiler {
     /// the OSR-compiled code already committed
     /// (`docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
     local_liveness: Vec<u64>,
+    /// Parallel coverage bitmap for [`Self::local_liveness`]: `false` at a pc
+    /// no basic block covers, where the liveness answer is the `0` default
+    /// ("nothing live") rather than a computed result. Treating that as "every
+    /// local is dead" would discard the whole frame, so the snapshot builder
+    /// falls back to "everything live" there.
+    local_liveness_covered: Vec<bool>,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -8944,6 +9030,7 @@ impl Compiler {
         cache_jit_thread_for_inline_new: bool,
         reserve_stack_floor: bool,
         precise_exception_frames: bool,
+        protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
         // Each local takes 8 bytes: [rbp - 8], [rbp - 16], ...
@@ -9251,6 +9338,7 @@ impl Compiler {
             emitted_athrow: false,
             emitted_monitor_call: false,
             precise_exception_frames,
+            protected_ranges,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             forward_patches: Vec::new(),
@@ -9324,6 +9412,7 @@ impl Compiler {
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
             local_liveness: Vec::new(),
+            local_liveness_covered: Vec::new(),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
@@ -9734,7 +9823,10 @@ impl Compiler {
             // can overwrite it. `Undefined` maps to an inert zero and is sound
             // precisely because liveness proves no path reads the old value
             // before its next definition.
-            if i < 64 {
+            // Only act on a COMPUTED liveness answer. An uncovered pc (no
+            // basic block reaches it) reads as 0 = "nothing live", and acting
+            // on that would drop every local in the frame.
+            if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
                 let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
                 if live_here & (1u64 << i) == 0 {
                     locals.push(FrameValue::Undefined);
@@ -18281,20 +18373,58 @@ impl Compiler {
     /// dispatching a `J`/`D`-returning callee sound (a `Pack.bigEndianToLong`
     /// SHA-512 word == `0x8000_0000_0000_0000` would otherwise be misread as a
     /// deopt and the caller would silently bail mid-method).
+    /// Is `pc` inside any of this method's exception-table protected ranges?
+    ///
+    /// Only the sibling tail-call needs this. Every other lowering keeps this
+    /// frame alive across the call and routes a pending exception through the
+    /// shared stub, which re-enters the interpreter at the throwing bci where
+    /// the method's own handler table applies. A tail-call has already run
+    /// `emit_epilogue_without_ret` by the time the callee executes, so there is
+    /// no frame left to catch into and the exception escapes to this method's
+    /// caller instead — the wrong handler, silently.
+    fn pc_is_protected(&self, pc: usize) -> bool {
+        let pc = pc as u32;
+        self.protected_ranges
+            .iter()
+            .any(|(start, end)| pc >= *start && pc < *end)
+    }
+
     fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
+        // The simulated operand stack at this point is the state *after* the
+        // instruction which made the fallible call: every invoke lowering has
+        // already removed its receiver and arguments before emitting the ABI
+        // call above.  A frame-deopt snapshot must therefore resume at that
+        // instruction's successor, not at `dbg_last_pc` itself.  Resuming at
+        // the invoke would make the interpreter try to consume the already
+        // removed operands (TransactionUtil.wrapInTransaction's
+        // `Consumer.accept` was the concrete failure: the reconstructed frame
+        // resumed pc=25 with an empty stack, and the virtual dispatch cache
+        // underflowed after advancing to pc=30).
+        //
+        // Every caller invokes this helper after lowering a bytecode operation.
+        // `dbg_last_op` provides the exact encoded width for the only variable
+        // length invoke forms; all other supported fallible helpers here use
+        // the ordinary three-byte CP form or a one-byte operation.  Keeping the
+        // original PC for non-invoke operations avoids changing their exception
+        // routing semantics.
+        let deopt_resume_bci = match self.dbg_last_op {
+            0xb9 | 0xba => self.dbg_last_pc.saturating_add(5),
+            0xb6 | 0xb7 | 0xb8 => self.dbg_last_pc.saturating_add(3),
+            _ => self.dbg_last_pc,
+        };
         // The bytecode compiler has just emitted the dispatch, so its local
         // homes still describe the point at which an exception from that call
         // is caught. A params-only handler reconstruction is insufficient for
         // this method; retain a typed snapshot and branch to its frame-deopt
         // exit instead of the shared sentinel-only exit below.
         if self.precise_exception_frames
-            && !self.deopt_box_ptr_by_bci.contains_key(&self.dbg_last_pc)
+            && !self.deopt_box_ptr_by_bci.contains_key(&deopt_resume_bci)
         {
             let box_ptr = self.build_and_record_deopt_point(
-                self.dbg_last_pc,
+                deopt_resume_bci,
                 crate::deopt::DeoptReason::ReceiverTypeChanged,
             );
-            self.deopt_box_ptr_by_bci.insert(self.dbg_last_pc, box_ptr);
+            self.deopt_box_ptr_by_bci.insert(deopt_resume_bci, box_ptr);
         }
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
@@ -18322,7 +18452,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
@@ -18336,7 +18466,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
@@ -24916,8 +25046,13 @@ impl Compiler {
                                     (b'V', 0xB1) => true,
                                     _ => false,
                                 };
-                            let is_sibling_tail =
-                                tail_op_matches && callee_needs_ctx == self.needs_heap;
+                            // A tail-call inside a try region would tear this
+                            // frame down before the callee runs, so anything it
+                            // throws escapes the handler that covers this pc
+                            // (see `pc_is_protected`). Demote to a normal CALL.
+                            let is_sibling_tail = tail_op_matches
+                                && callee_needs_ctx == self.needs_heap
+                                && !self.pc_is_protected(pc);
 
                             // Round-8 wave-3: sibling-tail demotion.
                             // Tail-calling with stack args is non-trivial
@@ -25120,8 +25255,14 @@ impl Compiler {
                         // Self-recursive call (no invoke_info, no direct_call)
                         let n = self.num_params;
 
-                        // Check for tail call: invokestatic self at PC, xreturn at PC+3
-                        let is_tail_call = pc + 3 < code_len && matches!(code[pc + 3], 0xac..=0xb0); // ireturn..areturn
+                        // Check for tail call: invokestatic self at PC, xreturn at PC+3.
+                        // Never inside a try region — the tail form tears this
+                        // frame down, so a throw from the self-recursive callee
+                        // would bypass the handler covering this pc
+                        // (see `pc_is_protected`).
+                        let is_tail_call = pc + 3 < code_len
+                            && matches!(code[pc + 3], 0xac..=0xb0) // ireturn..areturn
+                            && !self.pc_is_protected(pc);
 
                         // jit-invokedynamic-groovy-regression fix: a method
                         // containing a live invokedynamic site (compiled as an
@@ -28553,6 +28694,15 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static PENDING_VERIFIED_MAX_STACK: std::cell::RefCell<Option<usize>> =
         const { std::cell::RefCell::new(None) };
+    /// `(start_pc, end_pc, handler_pc)` of this method's exception table,
+    /// staged for the next `compile_with_param_slots` on this thread and
+    /// consumed (taken) at its entry, so a compile that bails out cannot leak
+    /// them into the next method compiled on this worker. Empty for every
+    /// caller that does not stage them (tests, AOT, the legacy `compile`
+    /// wrapper, OSR artifacts) and for every handler-free method — byte
+    /// identical codegen there. See `find_bypassable_loop_headers`.
+    static PENDING_EXCEPTION_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Stage the compact-field-info for the next [`compile`] call on this thread.
@@ -28565,6 +28715,15 @@ pub fn set_pending_compact_field_info(info: Vec<(usize, u32, bool)>) {
 /// Synthetic callers that do not stage it keep using the local estimator.
 pub(crate) fn set_pending_verified_max_stack(max_stack: usize) {
     PENDING_VERIFIED_MAX_STACK.with(|c| *c.borrow_mut() = Some(max_stack));
+}
+
+/// Stage this method's exception table as `(start_pc, end_pc, handler_pc)` for
+/// the next x64 compile on this thread. Call immediately before
+/// `compile_with_param_slots`; it takes (clears) them. Consumed only by
+/// `find_bypassable_loop_headers`, to treat a handler that can be entered from
+/// outside a loop as an external entry into that loop's header.
+pub(crate) fn set_pending_exception_ranges(ranges: Vec<(usize, usize, usize)>) {
+    PENDING_EXCEPTION_RANGES.with(|c| *c.borrow_mut() = ranges);
 }
 
 /// Compile a JVM bytecode method to x86-64 machine code.
@@ -28722,12 +28881,21 @@ pub fn compile_with_param_slots(
 ) -> Option<CompiledMethod> {
     let needs_heap = needs_heap || !ldc_string_info.is_empty();
     let verified_max_stack = PENDING_VERIFIED_MAX_STACK.with(|c| c.borrow_mut().take());
+    // One-shot like every other staged request below: take it here so an early
+    // bail cannot leak this method's handler ranges into an unrelated later
+    // compile on this worker thread.
+    let exception_ranges: Vec<(usize, usize, usize)> =
+        PENDING_EXCEPTION_RANGES.with(|c| std::mem::take(&mut *c.borrow_mut()));
     // Consume the pure-kernel GPR local-homes request FIRST so an early bail
     // below can never leak it into an unrelated later compile on this thread.
     let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    // Same one-shot discipline as the flag above.
+    let protected_ranges = PROTECTED_RANGES_REQUEST
+        .with(|c| c.take())
+        .unwrap_or_default();
     // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
     // but the published artifact KEEPS its OSR entries — the trampoline's
     // register-seeded entry contract is exactly what the assignments
@@ -28805,7 +28973,8 @@ pub fn compile_with_param_slots(
     // every speculating transform for such headers — see
     // `find_bypassable_loop_headers` for the full derivation and the
     // `AttributesImpl.ensureCapacity` witness.
-    let bypassable_headers = find_bypassable_loop_headers(code, code_len, &loops);
+    let bypassable_headers =
+        find_bypassable_loop_headers(code, code_len, &loops, &exception_ranges);
     let hoist_info =
         if cratonvm_types::flags::runtime_var_os("CRATONVM_DISABLE_AALOAD_LICM").is_some() {
             Vec::new()
@@ -29210,6 +29379,7 @@ pub fn compile_with_param_slots(
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
         precise_exception_frames,
+        protected_ranges,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
     // Safepoint publication plan (arch-2026-07-26 R1). Built here rather than
@@ -29535,7 +29705,17 @@ pub fn compile_with_param_slots(
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
         // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
-        compiler.local_liveness = super::regalloc::live_locals_per_pc(code, code_len, num_params);
+        // The exception table MUST be modelled: these snapshots are taken at
+        // pcs inside protected ranges, and a local only the handler reads is
+        // otherwise computed dead exactly there.
+        let (liveness, covered) = super::regalloc::live_locals_per_pc_with_handlers(
+            code,
+            code_len,
+            num_params,
+            &exception_ranges,
+        );
+        compiler.local_liveness = liveness;
+        compiler.local_liveness_covered = covered;
     }
 
     // Emit prologue
@@ -30273,6 +30453,7 @@ mod tests {
             false,
             false,
             false,
+            Vec::new(),
         );
 
         assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));
@@ -36607,7 +36788,7 @@ mod tests {
         ];
         let loops = detect_loops(code, code.len());
         assert_eq!(loops, vec![(2, 10)], "expected one loop with header 2");
-        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops);
+        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops, &[]);
         assert!(
             bypassable.is_empty(),
             "a fall-through-only loop header must keep its pre-header, got {bypassable:?}"
@@ -36631,6 +36812,75 @@ mod tests {
     ///                     15: iconst_5      24: goto 13
     ///                     16: imul          27: iload_2 / 28: ireturn
     /// ```
+    #[test]
+    fn handler_reachable_from_outside_a_hoisted_loop_is_bypassable() {
+        // A plain counted loop whose only non-back-edge predecessor is the
+        // fall-through, so it is NOT bypassable on branch edges alone — every
+        // difference below comes from the exception table.
+        //
+        //  0: iconst_0
+        //  1: istore_2
+        //  2: iload_2            <-- loop header
+        //  3: iload_1
+        //  4: if_icmpge +13 -> 17
+        //  7: iload_0
+        //  8: iconst_3
+        //  9: imul
+        // 10: istore_3           (loop-invariant run, the hoist candidate)
+        // 11: iinc 2, 1
+        // 14: goto -12 -> 2      <-- back edge; loop body is [2, 17)
+        // 17: iload_2
+        // 18: ireturn
+        let code: &[u8] = &[
+            0x03, 0x3D, // iconst_0; istore_2
+            0x1C, 0x1B, 0xA2, 0x00, 0x0D, // iload_2; iload_1; if_icmpge -> 17
+            0x1A, 0x06, 0x68, 0x3E, // iload_0; iconst_3; imul; istore_3
+            0x84, 0x02, 0x01, // iinc 2,1
+            0xA7, 0xFF, 0xF4, // goto -> 2
+            0x1C, 0xAC, // iload_2; ireturn
+        ];
+        let loops = detect_loops(code, code.len());
+        assert_eq!(
+            loops,
+            vec![(2, 14)],
+            "expected exactly one natural loop with header 2"
+        );
+
+        // No exception table: single-entry header keeps its pre-header.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[]).is_empty(),
+            "a single-entry counted loop must not be reported bypassable"
+        );
+
+        // try/catch wholly INSIDE the loop body — the common javac shape for
+        // `while (…) { try { … } catch { … } }`. The throw can only happen
+        // after the header was entered, so the pre-header already ran: sound,
+        // and the hoist must be KEPT (this is the no-regression half).
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(7, 11, 10)]).is_empty(),
+            "a protected range wholly inside the loop must keep its hoist"
+        );
+
+        // Protected range starts BEFORE the header: a throw from pre-loop code
+        // delivers control into the body without the pre-header having run.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(0, 11, 7)]).contains(&2),
+            "a handler reachable from before the loop bypasses the pre-header"
+        );
+
+        // Protected range extends PAST the loop: same hazard from the far side.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(7, 19, 7)]).contains(&2),
+            "a handler reachable from after the loop bypasses the pre-header"
+        );
+
+        // Handler outside the loop entirely — irrelevant, keep the hoist.
+        assert!(
+            find_bypassable_loop_headers(code, code.len(), &loops, &[(0, 19, 17)]).is_empty(),
+            "a handler outside the loop must not drop the hoist"
+        );
+    }
+
     #[test]
     fn forward_goto_into_loop_header_is_bypassable() {
         let code: &[u8] = &[
@@ -36662,7 +36912,7 @@ mod tests {
             !find_arith_loop_hoists(code, code.len(), &loops).is_empty(),
             "expected arith-LICM to match the `n * 5` run at this header"
         );
-        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops);
+        let bypassable = find_bypassable_loop_headers(code, code.len(), &loops, &[]);
         assert!(
             bypassable.contains(&13),
             "header 13 is entered by the forward `goto` at pc 7 and must be \

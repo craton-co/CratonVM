@@ -3,7 +3,8 @@
 Status: implementation progress + remaining validation plan. Target branch: `design-concurrent-gc`.
 Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc_concurrent,concurrent_mark,satb,vm_heap}.rs`,
 `vm/src/config.rs`, `vm/src/vm/vm_init.rs`, `vm/src/runtime/interpreter.rs`, and
-`docs/internal/reviews/full-review-2026-06-20.md` (findings #18, the `gc-collectors` section, and the docs-governance row).
+an internal code-review pass that surfaced the SATB drain contract gap (finding #18,
+addressed in Step 3 / section 2.6 below) and a `gc-collectors` module assessment.
 
 ### Implementation progress
 
@@ -505,8 +506,7 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
     native stack when the entry chain is empty → full-stack mark + per-thread flag
     → non-moving sweep (pin) for that collection. So the G1+JIT multi-GC
     differential that this Step could not previously sustain is now unblocked.
-    Residuals: Windows-only; the chain-non-empty case. (Doc:
-    `docs/internal/app-jvm-bugs/gc-stress-bintrees-main-args-unregistered-jit-frame-FIXED.md`.)
+    Residuals: Windows-only; the chain-non-empty case.
   - **Remaining:** ✅ the JIT-root blocker (A5) is fixed; a diverse soak drove many
     serial + parallel GCs end-to-end and is clean for SERIAL, but **surfaced an
     OPEN parallel-evacuator data race** (defect 2 in the parallel-evac bullet
@@ -578,8 +578,6 @@ Author note: this doc is grounded in a read of `gc/src/{g1,g1_concurrent,zgc,zgc
       separate transient worker-vs-worker concurrency race**, ~2/40, verifier
       reports nothing and the rate rises under its timing perturbation (the
       original `task_58d60f7a` race). STILL OPEN; needs concurrency tooling.
-      Full writeup:
-      `docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`.
     - **Consequence:** because defect 2 lives in the shared `parallel_evacuate`
       closure that both young and mixed parallel paths drive, **mixed GC stays on
       the SERIAL evacuator** (the earlier plan to un-gate it was reverted — its

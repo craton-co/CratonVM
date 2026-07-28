@@ -411,10 +411,12 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
     });
 
     // receive(DatagramPacket) — fills the packet's backing buffer + length.
-    // A read timeout surfaces as java.net.SocketTimeoutException so callers that
-    // loop on it (Tribes' McastServiceImpl.receive) continue cleanly; all other
-    // recv errors are likewise reported as timeouts to keep the daemon loop
-    // alive rather than tearing it down.
+    // A read timeout surfaces as a real `java.net.SocketTimeoutException`
+    // (see `udp_recv_error`) so callers that loop on it — Tribes'
+    // `McastServiceImpl.receive` catches exactly that type and ignores it —
+    // continue cleanly; every other recv error stays a plain IOException,
+    // which is what the JDK does and what those callers' recovery paths
+    // expect to see.
     r.register(
         ms,
         "receive",
@@ -491,16 +493,42 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
                 }
                 Err(e) => {
                     ctx.unpin_native_roots(pkt_pin);
-                    Err(RuntimeError::IOException {
-                        message: format!("SocketTimeoutException: Receive timed out: {e}"),
-                    }
-                    .into())
+                    Err(udp_recv_error(e))
                 }
             }
         },
     );
 
     r.set_category(__prev_cat);
+}
+
+/// Classify a UDP `recv` failure into the Java exception the JDK would raise.
+///
+/// A datagram socket with `SO_TIMEOUT` set reports an expired read as
+/// `WSAETIMEDOUT` on Windows (`ErrorKind::TimedOut`) and `EAGAIN`/
+/// `EWOULDBLOCK` on Unix (`ErrorKind::WouldBlock`); the JDK turns both into
+/// `java.net.SocketTimeoutException`. Returning a bare `java.io.IOException`
+/// instead makes every `catch (SocketTimeoutException)` miss, which is not a
+/// cosmetic difference for polling receivers: Tomcat Tribes'
+/// `McastServiceImpl.ReceiverThread` treats anything else as a receive
+/// **failure** — it logs, sleeps 500 ms (so the membership socket is only
+/// listening half the time), skips the `checkExpired()` at the end of
+/// `receive()`, and after `recoveryCounter` (10) such "errors" hands the
+/// service to `RecoveryThread`, which stops and restarts membership
+/// altogether. Since the poll timeout is the *normal* exit of every idle
+/// receive, that turned steady-state membership into a stop/start churn and
+/// members never converged.
+pub(crate) fn udp_recv_error(e: std::io::Error) -> MethodCallFailed {
+    if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+        return RuntimeError::SocketTimeoutException {
+            message: "Receive timed out".into(),
+        }
+        .into();
+    }
+    RuntimeError::IOException {
+        message: format!("UDP recv: {e}"),
+    }
+    .into()
 }
 
 /// Invoke a no-arg `int`-returning method on `recv`, returning `None` on any
@@ -966,7 +994,13 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         map.entry(fd).or_insert(NetSocketHandle::Unbound);
     }
 
-    let listener = TcpListener::bind(&bind_addr).map_err(|e| net_err(&bind_addr, e))?;
+    // Bind exactly one address. Letting `TcpListener::bind` walk the whole
+    // resolution list turns "port already in use" into a silent bind to some
+    // other address of the same name — see `socket_channel::single_bind_addr`
+    // for the Tribes auto-bind loop that breaks on.
+    let target = crate::socket_channel::single_bind_addr(&addr_text, port.clamp(0, 65535) as u16)
+        .map_err(|e| net_err(&bind_addr, e))?;
+    let listener = TcpListener::bind(target).map_err(|e| net_err(&bind_addr, e))?;
 
     // C26 fix: do NOT write the resolved port into FileDescriptor.handle —
     // `handle` is the fd-id sentinel that `net_fd_from_descriptor` falls back

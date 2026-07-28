@@ -78,7 +78,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
@@ -540,6 +540,97 @@ fn channel_io_thread_of(
             Value::Object(Some(io_thread)) => Some(io_thread),
             _ => None,
         })
+}
+
+// ---------------------------------------------------------------------------
+// Conduit ready-handler registry
+// ---------------------------------------------------------------------------
+//
+// `setReadReadyHandler` / `setWriteReadyHandler` are how XNIO wires a conduit
+// back to the channel that owns it: `ConduitStreamSourceChannel.<init>`
+// installs a `ReadReadyHandler.ChannelListenerHandler` on its conduit, and
+// Undertow's framed channels install handlers of their own. The handler is
+// therefore state the conduit MUST retain — dropping it silently severs the
+// only path a conduit has for telling anyone the socket became ready.
+//
+// The handler lives in a side registry rather than an object slot: the
+// synthetic field layouts in `class_manager.rs::synthetic_stub_fields` stop at
+// `readSuspended` / `bufferedBytes`, and the io-thread binding above already
+// established the "global root keyed by object identity" idiom for state that
+// outgrew those layouts.
+
+fn read_ready_handler_registry() -> &'static Mutex<HashMap<ConduitObjKey, usize>> {
+    static R: OnceLock<Mutex<HashMap<ConduitObjKey, usize>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn write_ready_handler_registry() -> &'static Mutex<HashMap<ConduitObjKey, usize>> {
+    static R: OnceLock<Mutex<HashMap<ConduitObjKey, usize>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bind `handler` to `channel`. The setter is normally invoked on the raw
+/// conduit while the readiness notification runs against the owning channel
+/// object, so the binding is recorded under both identities (same two-key
+/// shape as `remember_channel_io_thread`).
+fn remember_ready_handler(
+    registry: &'static Mutex<HashMap<ConduitObjKey, usize>>,
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+    handler: ObjectRef,
+) {
+    let raw_conduit = raw_conduit_of(ctx, channel);
+    let handle = ctx.add_global_root(handler);
+    if handle == 0 {
+        // No root available — a bare field store would be reclaimed or moved
+        // out from under us, so record nothing rather than a stale address.
+        return;
+    }
+    let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    registry.insert(conduit_obj_key(ctx, channel), handle);
+    if let Some(raw_conduit) = raw_conduit {
+        registry.insert(conduit_obj_key(ctx, raw_conduit), handle);
+    }
+}
+
+/// `setXxxReadyHandler(null)` detaches the current handler — drop the binding
+/// (and its global root) so a rewrapped conduit cannot fire a stale one.
+fn forget_ready_handler(
+    registry: &'static Mutex<HashMap<ConduitObjKey, usize>>,
+    ctx: &mut dyn NativeContext,
+    channel: ObjectRef,
+) {
+    let raw_conduit = raw_conduit_of(ctx, channel);
+    let stale = {
+        let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stale = registry.remove(&conduit_obj_key(ctx, channel));
+        if let Some(raw_conduit) = raw_conduit {
+            stale = registry
+                .remove(&conduit_obj_key(ctx, raw_conduit))
+                .or(stale);
+        }
+        stale
+    };
+    if let Some(handle) = stale {
+        ctx.remove_global_root(handle);
+    }
+}
+
+fn ready_handler_of(
+    registry: &'static Mutex<HashMap<ConduitObjKey, usize>>,
+    ctx: &dyn NativeContext,
+    channel: ObjectRef,
+) -> Option<ObjectRef> {
+    let own_key = conduit_obj_key(ctx, channel);
+    let conduit_key = raw_conduit_of(ctx, channel).map(|c| conduit_obj_key(ctx, c));
+    let handle = {
+        let registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+        registry
+            .get(&own_key)
+            .copied()
+            .or_else(|| conduit_key.and_then(|k| registry.get(&k).copied()))
+    };
+    handle.and_then(|h| ctx.resolve_global_root(h))
 }
 
 /// Register a new source channel for the given transport. Returns the id.
@@ -1164,10 +1255,20 @@ fn source_read_suspended(ctx: &dyn NativeContext, source: ObjectRef, id: u64) ->
         .unwrap_or(true)
 }
 
+/// Readiness delivery, in XNIO's own order of precedence.
+///
+/// A `ChannelListener` on the channel wins: XNIO's stock `ReadReadyHandler`
+/// is `ChannelListenerHandler`, whose `readReady()` does nothing except
+/// invoke exactly that listener, so firing both would deliver `handleEvent`
+/// twice on one stack — the shape of the Undertow `requestState` self-
+/// deadlock documented on `native_source_resume_reads`. Only when no
+/// listener is bound does the conduit's own handler become the sole delivery
+/// path, and then it must be driven or the callback is simply lost (which is
+/// what the previous `setReadReadyHandler` no-op did to every caller).
 fn invoke_source_read_listener(ctx: &mut dyn NativeContext, source: ObjectRef) -> bool {
     let listener = match ctx.get_field(source, SRC_FIELD_READ_LISTENER) {
         Value::Object(Some(o)) => o,
-        _ => return false,
+        _ => return invoke_read_ready_handler(ctx, source),
     };
     if let Err(e) = ctx.invoke_virtual(
         listener,
@@ -1180,10 +1281,22 @@ fn invoke_source_read_listener(ctx: &mut dyn NativeContext, source: ObjectRef) -
     true
 }
 
+fn invoke_read_ready_handler(ctx: &mut dyn NativeContext, source: ObjectRef) -> bool {
+    let Some(handler) = ready_handler_of(read_ready_handler_registry(), ctx, source) else {
+        return false;
+    };
+    if let Err(e) = ctx.invoke_virtual(handler, "readReady", "()V", &[]) {
+        xnio_tcp_dbg!("source_read_ready_handler_error error={e:?}");
+    }
+    true
+}
+
+/// Write-side twin of [`invoke_source_read_listener`] — same precedence, same
+/// reason.
 fn invoke_sink_write_listener(ctx: &mut dyn NativeContext, sink: ObjectRef) -> bool {
     let listener = match ctx.get_field(sink, SINK_FIELD_WRITE_LISTENER) {
         Value::Object(Some(o)) => o,
-        _ => return false,
+        _ => return invoke_write_ready_handler(ctx, sink),
     };
     if let Err(e) = ctx.invoke_virtual(
         listener,
@@ -1192,6 +1305,16 @@ fn invoke_sink_write_listener(ctx: &mut dyn NativeContext, sink: ObjectRef) -> b
         &[Value::Object(Some(sink))],
     ) {
         xnio_tcp_dbg!("sink_write_listener_error error={e:?}");
+    }
+    true
+}
+
+fn invoke_write_ready_handler(ctx: &mut dyn NativeContext, sink: ObjectRef) -> bool {
+    let Some(handler) = ready_handler_of(write_ready_handler_registry(), ctx, sink) else {
+        return false;
+    };
+    if let Err(e) = ctx.invoke_virtual(handler, "writeReady", "()V", &[]) {
+        xnio_tcp_dbg!("sink_write_ready_handler_error error={e:?}");
     }
     true
 }
@@ -1436,19 +1559,11 @@ fn native_source_resume_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     if id.and_then(get_source_channel).is_none() {
         // Channel-less stub source: no poller coverage exists, so the
         // inline dispatch is the only delivery path (the WildFly domain
-        // managed-server startup case this invoke was added for).
-        let listener = match ctx.get_field(this, SRC_FIELD_READ_LISTENER) {
-            Value::Object(Some(o)) => Some(o),
-            _ => None,
-        };
-        if let Some(listener) = listener {
-            let _ = ctx.invoke_virtual(
-                listener,
-                "handleEvent",
-                CHANNEL_LISTENER_HANDLE_EVENT_DESC,
-                &[Value::Object(Some(this))],
-            );
-        }
+        // managed-server startup case this invoke was added for). Routed
+        // through `invoke_source_read_listener` so a source that carries
+        // only a conduit `ReadReadyHandler` — no `ChannelListener` — is
+        // served too; it has no other delivery path at all.
+        invoke_source_read_listener(ctx, this);
     }
     Ok(None)
 }
@@ -1471,19 +1586,8 @@ fn native_source_wakeup_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     ctx.set_field(this, SRC_FIELD_READ_READY_FLAG, Value::Int(1));
     if channel.is_none() {
         // Channel-less stub source: no poller coverage — inline dispatch is
-        // the only delivery path.
-        let listener = match ctx.get_field(this, SRC_FIELD_READ_LISTENER) {
-            Value::Object(Some(o)) => Some(o),
-            _ => None,
-        };
-        if let Some(listener) = listener {
-            let _ = ctx.invoke_virtual(
-                listener,
-                "handleEvent",
-                CHANNEL_LISTENER_HANDLE_EVENT_DESC,
-                &[Value::Object(Some(this))],
-            );
-        }
+        // the only delivery path (conduit `ReadReadyHandler` included).
+        invoke_source_read_listener(ctx, this);
     }
     xnio_tcp_dbg!(
         "wakeup_reads id={id:?} queued_for_poller={}",
@@ -1517,6 +1621,308 @@ fn native_source_shutdown_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 // ---------------------------------------------------------------------------
+// awaitReadable / awaitWritable
+// ---------------------------------------------------------------------------
+//
+// These are genuine blocking waits, not bookkeeping: XNIO's contract is
+// "block until the channel is ready (or the timeout expires)", and callers
+// use them as the back-off after a `read`/`write` returned 0. A no-op turns
+// every such caller into a hot spin on the calling thread.
+//
+// There is no selector behind these conduits — reads and writes go straight
+// at the transport — so readiness is established by asking the transport
+// itself: a non-blocking `peek` on the read side (already used by the
+// source poller) and an OS `poll`/`WSAPoll` state query on the write side.
+// Every sleep between probes runs inside the VM's blocking-region protocol;
+// without it a stop-the-world safepoint would wait for a thread that is
+// parked in `thread::sleep` and can never reach an interpreter poll.
+
+/// Interval between readiness probes. Short enough that a ready channel is
+/// picked up promptly (an order of magnitude under the 10 ms source-poller
+/// tick), long enough that a long wait costs no measurable CPU.
+const AWAIT_POLL_INTERVAL_MS: u64 = 1;
+
+/// Zero-timeout OS writability query for a TCP sink.
+///
+/// `TcpStream` exposes no writability predicate and there is no way to ask by
+/// writing (a zero-length `send` always succeeds and tells us nothing, while
+/// a real one would consume caller bytes). `poll(2)` is a pure query of
+/// kernel socket state: it neither touches the byte stream nor flips the
+/// socket's persistent blocking mode. A failed probe reports "writable" so
+/// the caller degrades to an immediate return — XNIO explicitly allows
+/// `awaitWritable` to return spuriously — instead of hanging forever.
+#[cfg(unix)]
+fn socket_write_ready(stream: &TcpStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let mut pfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
+    // matches the one-element buffer; timeout 0 returns immediately.
+    let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, 0) };
+    if rc < 0 {
+        return true;
+    }
+    // Error / hang-up conditions end the wait too: a write will now fail
+    // immediately rather than block, which is what the caller is waiting for.
+    pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+}
+
+#[cfg(windows)]
+fn socket_write_ready(stream: &TcpStream) -> bool {
+    use std::os::windows::io::AsRawSocket;
+
+    // `libc` does not re-export `WSAPoll`/`WSAPOLLFD` on Windows. The layout
+    // and signature below are byte-identical to the other `WSAPoll` binding
+    // in this crate (`servlet.rs`) — `clashing_extern_declarations` is a
+    // deny-lint here, so any divergence would fail the build.
+    #[repr(C)]
+    struct Wsapollfd {
+        fd: usize,
+        events: i16,
+        revents: i16,
+    }
+    const WSAPOLLWRNORM: i16 = 0x0010;
+    const WSAPOLLERR: i16 = 0x0001;
+    const WSAPOLLHUP: i16 = 0x0002;
+    const WSAPOLLNVAL: i16 = 0x0004;
+
+    #[link(name = "Ws2_32")]
+    extern "system" {
+        fn WSAPoll(fd_array: *mut Wsapollfd, fds: u32, timeout: i32) -> i32;
+    }
+
+    let mut pfd = Wsapollfd {
+        fd: stream.as_raw_socket() as usize,
+        events: WSAPOLLWRNORM,
+        revents: 0,
+    };
+    // SAFETY: single, fully-initialised WSAPOLLFD; `nfds == 1` matches the
+    // buffer length; timeout 0 returns immediately.
+    let rc = unsafe { WSAPoll(&mut pfd as *mut Wsapollfd, 1, 0) };
+    if rc < 0 {
+        return true;
+    }
+    pfd.revents & (WSAPOLLWRNORM | WSAPOLLERR | WSAPOLLHUP | WSAPOLLNVAL) != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn socket_write_ready(_stream: &TcpStream) -> bool {
+    // No readiness primitive on this target — report ready so the wait
+    // degrades to XNIO's permitted spurious return rather than a hang.
+    true
+}
+
+/// Would a `write` on this transport accept bytes right now? Mirrors the
+/// admission test each transport's own `write` applies, so "writable" here
+/// means exactly "the next `sink_channel_write` will not report would-block".
+fn transport_has_write_room(transport: &ConduitTransport) -> bool {
+    match transport {
+        ConduitTransport::Tcp(stream) => socket_write_ready(stream),
+        ConduitTransport::Pipe(pipe) => {
+            let queued = pipe.buf.lock().unwrap_or_else(|e| e.into_inner()).len();
+            queued < pipe.writable_cap
+        }
+    }
+}
+
+/// True when a `read` would complete without blocking: bytes or EOF pending,
+/// the read side terminated, or the channel already dropped from the registry
+/// (a wait on a channel nobody can make ready would never end).
+fn source_is_readable_now(id: u64) -> bool {
+    match get_source_channel(id) {
+        None => true,
+        Some(ch) => ch.shutdown.load(Ordering::Acquire) || source_has_pending_data(id),
+    }
+}
+
+/// Write-side twin of [`source_is_readable_now`]. A shut-down sink counts as
+/// ready: `sink_channel_write` throws `ClosedChannelException` immediately, so
+/// there is nothing left to wait for.
+fn sink_is_writable_now(id: u64) -> bool {
+    match get_sink_channel(id) {
+        None => true,
+        Some(ch) => ch.shutdown.load(Ordering::Acquire) || transport_has_write_room(&ch.transport),
+    }
+}
+
+/// One probe interval, taken inside the VM's blocking-region protocol.
+///
+/// `begin_timed_blocking_region` for the timeout overloads so
+/// `Thread.getState()` reports `TIMED_WAITING` (matching HotSpot for a
+/// bounded wait) and plain `begin_blocking_region` — reported as `WAITING` —
+/// for the untimed ones.
+fn await_blocking_tick(ctx: &mut dyn NativeContext, timed: bool) {
+    let mut refs: [Value; 0] = [];
+    if timed {
+        ctx.begin_timed_blocking_region();
+    } else {
+        ctx.begin_blocking_region();
+    }
+    thread::sleep(Duration::from_millis(AWAIT_POLL_INTERVAL_MS));
+    ctx.end_blocking_region_refs(&mut refs);
+}
+
+/// Resolve the `(long time, TimeUnit unit)` argument pair of the timeout
+/// overloads. `toNanos` is invoked on the unit rather than decoded from an
+/// ordinal so this works against both the synthetic `TimeUnit` and a real
+/// `java.base` one.
+fn await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<Duration> {
+    let time = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => return None,
+    };
+    if time <= 0 {
+        return Some(Duration::ZERO);
+    }
+    let unit = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(unit, "toNanos", "(J)J", &[Value::Long(time)]) {
+        Ok(Some(Value::Long(n))) if n >= 0 => Some(Duration::from_nanos(n as u64)),
+        _ => None,
+    }
+}
+
+/// Deadline for a timeout overload, or `None` for "wait indefinitely".
+/// An unreadable unit returns `Err(())`, which the callers turn into an
+/// immediate (spec-permitted spurious) return — guessing a time scale, or
+/// waiting forever on a timed call, would both be worse.
+fn await_deadline(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    timed: bool,
+) -> Result<Option<Instant>, ()> {
+    if !timed {
+        return Ok(None);
+    }
+    match await_timeout(ctx, args) {
+        // `checked_add` failing means an absurd timeout (`Long.MAX_VALUE`
+        // DAYS and friends) — indistinguishable from "no timeout".
+        Some(d) => Ok(Instant::now().checked_add(d)),
+        None => Err(()),
+    }
+}
+
+fn await_source_readable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    timed: bool,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // The id is a plain `u64`, so once it is in hand nothing below holds a
+    // reference the GC could move while this thread sleeps.
+    let Some(id) = source_id_of(ctx, this) else {
+        // Not one of our registered conduits: there is no transport to wait
+        // on and no event that could ever complete the wait.
+        return Ok(None);
+    };
+    let Ok(deadline) = await_deadline(ctx, args, timed) else {
+        return Ok(None);
+    };
+    loop {
+        if source_is_readable_now(id) {
+            return Ok(None);
+        }
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+        // XNIO documents `awaitReadable` as interruptible, and an untimed
+        // wait has no other exit — read the flag WITHOUT clearing it, which
+        // is the `InterruptedIOException` contract.
+        if ctx.is_interrupted(false) {
+            return Err(ioex("InterruptedIOException: awaitReadable interrupted"));
+        }
+        await_blocking_tick(ctx, timed);
+    }
+}
+
+fn await_sink_writable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    timed: bool,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let Some(id) = sink_id_of(ctx, this) else {
+        return Ok(None);
+    };
+    let Ok(deadline) = await_deadline(ctx, args, timed) else {
+        return Ok(None);
+    };
+    loop {
+        if sink_is_writable_now(id) {
+            return Ok(None);
+        }
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+        if ctx.is_interrupted(false) {
+            return Err(ioex("InterruptedIOException: awaitWritable interrupted"));
+        }
+        await_blocking_tick(ctx, timed);
+    }
+}
+
+fn native_source_await_readable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    await_source_readable(ctx, args, false)
+}
+
+fn native_source_await_readable_timed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    await_source_readable(ctx, args, true)
+}
+
+fn native_sink_await_writable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    await_sink_writable(ctx, args, false)
+}
+
+fn native_sink_await_writable_timed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    await_sink_writable(ctx, args, true)
+}
+
+fn native_source_set_read_ready_handler(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match args.get(1).copied() {
+        Some(Value::Object(Some(handler))) => {
+            remember_ready_handler(read_ready_handler_registry(), ctx, this, handler)
+        }
+        _ => forget_ready_handler(read_ready_handler_registry(), ctx, this),
+    }
+    Ok(None)
+}
+
+fn native_sink_set_write_ready_handler(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match args.get(1).copied() {
+        Some(Value::Object(Some(handler))) => {
+            remember_ready_handler(write_ready_handler_registry(), ctx, this, handler)
+        }
+        _ => forget_ready_handler(write_ready_handler_registry(), ctx, this),
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // Natives — sink-side
 // ---------------------------------------------------------------------------
 
@@ -1538,10 +1944,6 @@ fn native_source_is_read_resumed(ctx: &mut dyn NativeContext, args: &[Value]) ->
             || !matches!(ctx.get_field(this, SRC_FIELD_READ_SUSPENDED), Value::Int(v) if v != 0),
         );
     Ok(Some(Value::Int(if resumed { 1 } else { 0 })))
-}
-
-fn native_return_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
 }
 
 fn native_source_get_read_thread(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1584,10 +1986,6 @@ fn native_source_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn native_sink_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_channel_get_worker(ctx, args, SINK_FIELD_IO_THREAD)
-}
-
-fn native_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
 }
 
 fn native_sink_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1996,12 +2394,17 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_source_is_read_resumed,
     );
-    r.register(CLS_SOURCE, "awaitReadable", "()V", native_noop);
+    r.register(
+        CLS_SOURCE,
+        "awaitReadable",
+        "()V",
+        native_source_await_readable,
+    );
     r.register(
         CLS_SOURCE,
         "awaitReadable",
         "(JLjava/util/concurrent/TimeUnit;)V",
-        native_noop,
+        native_source_await_readable_timed,
     );
     r.register(
         CLS_SOURCE,
@@ -2013,7 +2416,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_SOURCE,
         "setReadReadyHandler",
         "(Lorg/xnio/conduits/ReadReadyHandler;)V",
-        native_noop,
+        native_source_set_read_ready_handler,
     );
     r.register(
         CLS_SOURCE,
@@ -2075,13 +2478,13 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_STREAM_SOURCE_CONDUIT,
         "awaitReadable",
         "()V",
-        native_noop,
+        native_source_await_readable,
     );
     r.register(
         CLS_STREAM_SOURCE_CONDUIT,
         "awaitReadable",
         "(JLjava/util/concurrent/TimeUnit;)V",
-        native_noop,
+        native_source_await_readable_timed,
     );
     r.register(
         CLS_STREAM_SOURCE_CONDUIT,
@@ -2093,7 +2496,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_STREAM_SOURCE_CONDUIT,
         "setReadReadyHandler",
         "(Lorg/xnio/conduits/ReadReadyHandler;)V",
-        native_noop,
+        native_source_set_read_ready_handler,
     );
     r.register(
         CLS_STREAM_SOURCE_CONDUIT,
@@ -2139,12 +2542,17 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_source_is_read_resumed,
     );
-    r.register(CLS_SOURCE_CONDUIT, "awaitReadable", "()V", native_noop);
+    r.register(
+        CLS_SOURCE_CONDUIT,
+        "awaitReadable",
+        "()V",
+        native_source_await_readable,
+    );
     r.register(
         CLS_SOURCE_CONDUIT,
         "awaitReadable",
         "(JLjava/util/concurrent/TimeUnit;)V",
-        native_noop,
+        native_source_await_readable_timed,
     );
     r.register(
         CLS_SOURCE_CONDUIT,
@@ -2156,7 +2564,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_SOURCE_CONDUIT,
         "setReadReadyHandler",
         "(Lorg/xnio/conduits/ReadReadyHandler;)V",
-        native_noop,
+        native_source_set_read_ready_handler,
     );
     r.register(
         CLS_SOURCE_CONDUIT,
@@ -2242,12 +2650,12 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_sink_is_write_resumed,
     );
-    r.register(CLS_SINK, "awaitWritable", "()V", native_noop);
+    r.register(CLS_SINK, "awaitWritable", "()V", native_sink_await_writable);
     r.register(
         CLS_SINK,
         "awaitWritable",
         "(JLjava/util/concurrent/TimeUnit;)V",
-        native_noop,
+        native_sink_await_writable_timed,
     );
     r.register(
         CLS_SINK,
@@ -2259,7 +2667,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_SINK,
         "setWriteReadyHandler",
         "(Lorg/xnio/conduits/WriteReadyHandler;)V",
-        native_noop,
+        native_sink_set_write_ready_handler,
     );
     r.register(
         CLS_SINK,
@@ -2330,12 +2738,17 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_sink_is_write_resumed,
     );
-    r.register(CLS_STREAM_SINK_CONDUIT, "awaitWritable", "()V", native_noop);
+    r.register(
+        CLS_STREAM_SINK_CONDUIT,
+        "awaitWritable",
+        "()V",
+        native_sink_await_writable,
+    );
     r.register(
         CLS_STREAM_SINK_CONDUIT,
         "awaitWritable",
         "(JLjava/util/concurrent/TimeUnit;)V",
-        native_noop,
+        native_sink_await_writable_timed,
     );
     r.register(
         CLS_STREAM_SINK_CONDUIT,
@@ -2347,7 +2760,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_STREAM_SINK_CONDUIT,
         "setWriteReadyHandler",
         "(Lorg/xnio/conduits/WriteReadyHandler;)V",
-        native_noop,
+        native_sink_set_write_ready_handler,
     );
     r.register(
         CLS_STREAM_SINK_CONDUIT,
@@ -2417,12 +2830,17 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         "()Z",
         native_sink_is_write_resumed,
     );
-    r.register(CLS_SINK_CONDUIT, "awaitWritable", "()V", native_noop);
+    r.register(
+        CLS_SINK_CONDUIT,
+        "awaitWritable",
+        "()V",
+        native_sink_await_writable,
+    );
     r.register(
         CLS_SINK_CONDUIT,
         "awaitWritable",
         "(JLjava/util/concurrent/TimeUnit;)V",
-        native_noop,
+        native_sink_await_writable_timed,
     );
     r.register(
         CLS_SINK_CONDUIT,
@@ -2434,7 +2852,7 @@ pub fn register_xnio_conduits_natives(r: &mut NativeMethodRegistry) {
         CLS_SINK_CONDUIT,
         "setWriteReadyHandler",
         "(Lorg/xnio/conduits/WriteReadyHandler;)V",
-        native_noop,
+        native_sink_set_write_ready_handler,
     );
     r.register(
         CLS_SINK_CONDUIT,

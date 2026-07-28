@@ -28,8 +28,18 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [14](14-classpath-url-protocol-not-registered-FIXED.md) | `classpath:` URL scheme unresolvable (`VM.isBooted` false → factory bypassed; pre-clinit factory publish; synthetic `URI.toURL` allowlist; webapp-TCCL resource scoping; `file:`-dir listing) | TestClasspathUrlStreamHandler, TestConfigFileLoader, TestPropertiesRoleMappingListener | FAIL | ✅ **FIXED** |
 | [16](16-full-suite-6shard-rerun-20260721.md) | Full 646-class Linux 6-shard run + HotSpot control diff (corrected 2026-07-24 for a harness CWD bug) | **91 classes** (was miscounted as 23) | FAIL/HANG/CRASH | 🔴 **OPEN** (individually undiagnosed, like 05) |
 | [18](18-fixture-environment-gaps-20260724.md) | True Linux fixture gaps (httpd/OCSP/LargeHeap/missing conf-Catalina-localhost/missing ant.jar), categorized by root cause | 35 classes | FAIL/HANG/CRASH | 🔴 **OPEN** (not CratonVM bugs — fixture completion work); its category J (9 classes, HANG-classification) turned out NOT to be a fixture gap at all — ✅ **FIXED**, see [hang-classification-unconfirmed-host-contention-FIXED.md](hang-classification-unconfirmed-host-contention-FIXED.md) |
+| [21](21-tls-handshake-enforcement-gap-FIXED.md) | TLS handshake enforcement too loose/too strict (SNI, cipher/protocol allow-lists, client-cert) — **nine** distinct defects, not the one the doc assumed; incl. no TLS 1.2 server handshake ever completing through the SSLEngine, and a JDK static field `set_static_field` cannot write | 8 classes (TestSsl, TestSSLHostConfig{Compat,Cipher,Protocol}, TestSslHandshakeFailure, TestClientCert, TestCustomSslTrustManager, TestResolverSSL) | FAIL | ✅ **FIXED** (one by-design residual: `TestClientCert.testClientCertPostZero` — needs real renegotiation) |
+| [22](22-tribes-realnetwork-membership-bug-FIXED.md) | Tribes real-socket group-membership undercounting — 3 causes: UDP recv timeout not typed `SocketTimeoutException` (so Tribes' receiver treated every idle poll as a failure and kept restarting membership); `bind` walked the whole address list, so a second bind to a live port silently took the other loopback family and every channel claimed port 4000; UDP socket `Mutex` held across `recv_from` delayed announcements by a poll interval | TestTcpFailureDetector, TestNonBlockingCoordinator | FAIL | ✅ **FIXED** (its one residual, the pre-existing TestGroupChannelSenderConnections SIGSEGV, is now also FIXED: [tribes-senderconnections-deserialize-segv-FIXED](tribes-senderconnections-deserialize-segv-FIXED.md)) |
+| [23](23-charsetcache-pathological-slowdown.md) | `CharsetCache`'s "cached" path is 3x SLOWER than uncached | TestCharsetCachePerformance | FAIL/perf | 🔴 **OPEN** |
+| [24](24-stringcache-oom-under-load-FIXED.md) | `StringCache.toString()` OOMs under sustained load at a heap HotSpot handles fine — NOT a StringCache bug: the GC-overhead limit scored every non-moving young sweep as "freed 0" (silently-reverted `a9c580aff` metric) | TestMethodPerformance | FAIL | ✅ **FIXED** — throughput residual tracked in [30](../../../known-issues/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md) |
+| [25](25-charchunk-tostring-null-vs-empty.md) | `CharChunk.toString()` returns `""` not `null` when empty/recycled | TestCharChunk | FAIL | 🔴 **OPEN** (small, well-isolated) |
+| [26](defaultinstancemanager-classunload-offbyone-recurrence-FIXED.md) | Class-unload count off-by-one (9 vs 8) — recurrence of the 2026-07-14 fix, which was real but incomplete (whether it sufficed depended on whether the mirror had been promoted before the test's single `System.gc()`). TWO defects, both required: (a) `roots.rs` step 6 gated mirror deferral on the OLD-GEN-ONLY `metadata_pin_deferrable`, so every YOUNG user-loader `Class` mirror was rooted unconditionally and its `classLoader` edge pinned the loader; (b) a PARKED pool thread's per-thread JIT memo caches are published into its root snapshot, so an idle `http-nio-*-exec-N` pinned a (HashMap, node) pair from the JSP compile → JDT graph → `JspCompilationContext` → `JasperLoader` → the mirror | TestDefaultInstanceManager | FAIL | ✅ **FIXED** (2026-07-27) |
+| [27](27-xxxendpoint-unix-domain-socket-init-failure-FIXED.md) | Unix domain socket connector init fails — `UnixDomainSocketAddress` was natively stubbed to throw even in real-JDK mode, and `{Server,}SocketChannel.open(ProtocolFamily)` had no CratonVM channel behind it; then, once bind/accept worked, `sc_read` held the `tcp_registry` read lock across a *blocking* `read()`, deadlocking the endpoint's acceptor against the in-VM client | TestXxxEndpoint | FAIL | ✅ **FIXED** (2026-07-27) |
+| [28](28-http2-largeupload-byte-mismatch-FIXED.md) | HTTP/2 large POST truncated to one DATA frame — native `SSLEngine.unwrap` stopped scattering at the first FULL dst buffer (NOT flow control) | TestLargeUpload | FAIL | ✅ **FIXED** |
+| [29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) | Throughput-wall recurrence (HostConfig/Http2Section_8_2), relative-perf-assertion family, 2 contention-suspected, 1 Windows-only fixture gap | ~11 classes | mixed | ✅ **CLOSED** (2026-07-27) — it was NOT all throughput. Four real defects fell out of it, all FIXED: `File.setLastModified` returning `false` for directories; jar/war byte caches keyed on path only, so a redeployed archive served stale content; a truncated HTTP response body discarded instead of delivered; `file:`-URL leading-slash decided before percent-decoding. Ant classpath gap fixed on the Windows harness. The genuine throughput residue moved into [04](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md) |
+| [30](../../../known-issues/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md) | Hot path fully interpreted: the loop method is OSR-denied by the RBC.7 `invokedynamic` ban (its trailing `println("…" + n)` string-concats), and `StringCache.toString` is refused by the RBC.6 handler-safety gate (its `synchronized` block's monitor handler) | TestMethodPerformance | perf | 🔴 **OPEN** (residual of 24) |
 
-9 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14); the open set is
+13 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14/21/22/27/28); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
 FAILs (05, 16).
 
@@ -109,3 +119,28 @@ current `dev` — not reconciled yet. See group 16's addendum for full detail.
 > [18](18-fixture-environment-gaps-20260724.md)). See group 16's
 > "CORRECTED addendum, 2026-07-24" for full detail — treat the 23/11/172
 > numbers anywhere above this notice as historical, not current.
+
+## Full 8-parallel LOCAL WINDOWS run, 2026-07-27/28 (groups 21-29)
+
+Complete 646-class run on the local Windows box (`apps\tomcat`,
+`apps\tomcat-suite-runner`, worktree `CratonVM-tomcat-full-suite-local-20260728`,
+branch `test/tomcat-full-suite-local-20260728`), `dev` @ `60a710ad8`,
+real JDK 25, 8-way `-Parallel`, 300s timeout: **547 PASS / 58 HANG / 40 FAIL
+/ 1 NOSUMMARY**. Reran all 99 non-PASS classes at `-TimeoutSec 1500` (5x):
+most HANGs turned out to be the known throughput wall finishing given
+enough time — confirmed **31 classes still FAIL/HANG at 1500s that PASS on
+a same-run HotSpot control** (7 of those still HANG even at 1500s).
+
+Merged `origin/dev` again (`→ 12c79a0ee`, 250+ more commits) and rebuilt
+before writing anything up — several classes in the 31 turned out to
+already be fixed or explained by concurrent sessions' work (`TestDeployTask`
+%20-decode fix, the Hashtable size-doubling fix that also explains
+`TestGenerator`'s NPE, `*LargeHeap` needing `-XX:+UseG1GC -Xmx10g` per
+[20](20-fixture-completion-regressions-closure-FIXED.md)) — reran the same
+99 classes again on the fresh binary before finalizing. **8 genuinely new,
+well-isolated CratonVM-only bugs** confirmed reproducing identically across
+both binaries, written up individually: groups 21-28. Everything else
+(throughput-wall recurrence, relative-performance-assertion family, 2
+contention-suspected findings, 1 Windows-only fixture gap) is in
+[29](29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md), not treated as new
+bugs.

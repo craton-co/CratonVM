@@ -376,6 +376,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // multiple sources and strip any `file:` scheme prefix before
             // handing the result to `p57_to_os_path`.
             let mut candidates: Vec<String> = Vec::new();
+            // 0. `URI.getPath()` -- the DECODED path component, which is what
+            //    the real `Path.of(URI)` ends up with. Every field probe below
+            //    reads a RAW (still percent-encoded) component, so a directory
+            //    genuinely named `custom#root` came back as `custom%23root`
+            //    and `Files.exists`/`Files.walk` saw nothing
+            //    (`core.io.support.PathMatchingResourcePatternResolverTests
+            //    .encodedHashtagInPath`). Same shape as the `new File(URI)`
+            //    raw-path fix.
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[])
+            {
+                if let Some(decoded) = ctx.read_string(s) {
+                    candidates.push(decoded);
+                }
+            }
             // 1. URI.path by name (real-JDK URIs constructed via real-JDK
             //    URI bytecode populate this; ours don't but cheap to try).
             if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "path") {
@@ -1723,6 +1738,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let result = p57_alloc_path(ctx, &jarfs_encode(&jar, &entry));
                 ctx.set_field(result, P57_PATH_FS_FIELD, Value::Object(Some(fs)));
                 return Ok(Some(Value::Object(Some(result))));
+            }
+            // `URI.getPath()` first -- the DECODED path component (see the
+            // matching note in the `Path.of(URI)` native above); the field
+            // probes below all yield the RAW, still percent-encoded form.
+            if let Ok(Some(Value::Object(Some(s)))) =
+                ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[])
+            {
+                if let Some(decoded) = ctx.read_string(s) {
+                    if !decoded.is_empty() {
+                        let os_path = p57_to_os_path(&decoded);
+                        let result = p57_alloc_path(ctx, &os_path);
+                        return Ok(Some(Value::Object(Some(result))));
+                    }
+                }
             }
             // URI field 4 is the path component (from our toUri registration)
             let path_str = match ctx.get_field(uri, 4) {
@@ -6371,9 +6400,30 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             fs_cls,
             "setLastModifiedTime",
             "(Ljava/io/File;J)Z",
-            |_ctx, _args| {
-                // Stub — not critical for bootstrap
-                Ok(Some(Value::Int(1)))
+            |ctx, args| {
+                // Real-JDK `File.setLastModified(long)` bytecode delegates here.
+                // This used to be a stub that claimed success without touching
+                // the file, so any caller that reached the bytecode path (rather
+                // than the direct `java/io/File.setLastModified` native below)
+                // got `true` and an unchanged timestamp. Share the same helper
+                // so both entry points behave identically for files AND
+                // directories.
+                let file_ref = obj_arg(args, 1)?;
+                // Same `path`-field read as the sibling `getLastModifiedTime` /
+                // `getLength` / `delete0` handlers in this loop.
+                let path = match ctx.get_field(file_ref, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let millis = match args.get(2) {
+                    Some(Value::Long(v)) => *v,
+                    _ => 0,
+                };
+                Ok(Some(Value::Int(if set_file_mtime_millis(&path, millis) {
+                    1
+                } else {
+                    0
+                })))
             },
         );
 
@@ -7383,17 +7433,27 @@ pub(crate) fn jrtfs_decode(p: &str) -> Option<(String, String)> {
 /// multi-MB) pathologically slow. Classpath/mounted jars are read-only for the
 /// VM lifetime, so memoise the bytes (re-parsing the in-memory zip is cheap
 /// relative to re-reading multi-MB files from disk hundreds of times).
+///
+/// Keyed on (path, [`crate::net_phase_e::archive_stamp`]) rather than the path
+/// alone: an application server replaces a war/jar in place and redeploys, so a
+/// path-only key serves the OLD archive forever (see `archive_stamp`'s doc for
+/// the Tomcat `TestHostConfigAutomaticDeployment*` failure this caused).
 pub(crate) fn jar_bytes_cached(jar: &str) -> Option<std::sync::Arc<Vec<u8>>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<Vec<u8>>>>>> =
-        OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<(String, u64, u64), Option<Arc<Vec<u8>>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
+    let key = (jar.to_string(), mtime, len);
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(jar) {
+    if let Some(cached) = guard.get(&key) {
         return cached.clone();
     }
     let bytes = std::fs::read(jar).ok().map(Arc::new);
-    guard.insert(jar.to_string(), bytes.clone());
+    guard.retain(|(p, _, _), _| p != jar);
+    guard.insert(key, bytes.clone());
     bytes
 }
 
@@ -7416,13 +7476,20 @@ pub(crate) struct JarFsIndex {
     children: std::collections::HashMap<String, Vec<(String, bool)>>,
 }
 
+/// Keyed on (path, [`crate::net_phase_e::archive_stamp`]) — see
+/// `jar_bytes_cached` for why a path-only key is wrong for a redeployable
+/// archive.
 pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Option<Arc<JarFsIndex>>>>> =
-        OnceLock::new();
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<(String, u64, u64), Option<Arc<JarFsIndex>>>>,
+    > = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let (mtime, len) = crate::net_phase_e::archive_stamp(jar);
+    let key = (jar.to_string(), mtime, len);
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = guard.get(jar) {
+    if let Some(cached) = guard.get(&key) {
         return cached.clone();
     }
     let built = (|| {
@@ -7479,7 +7546,8 @@ pub(crate) fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
             children,
         }))
     })();
-    guard.insert(jar.to_string(), built.clone());
+    guard.retain(|(p, _, _), _| p != jar);
+    guard.insert(key, built.clone());
     built
 }
 
@@ -9448,6 +9516,30 @@ pub(crate) fn encode_file_uri_path(path: &str) -> String {
     out
 }
 
+/// Set a path's last-modified time, in milliseconds since the epoch, the way
+/// `java.io.File.setLastModified(long)` must: it has to work for
+/// **directories** as well as regular files, and report failure (`false`) when
+/// the path does not exist.
+///
+/// The obvious `OpenOptions::new().write(true).open(path)` + `File::set_modified`
+/// spelling silently gets this wrong for directories on every platform — on
+/// Windows `CreateFileW` refuses a directory handle without
+/// `FILE_FLAG_BACKUP_SEMANTICS`, and on Unix `open(2)` with `O_WRONLY` returns
+/// `EISDIR` — so it returned `false` for every directory. Tomcat's
+/// `TestHostConfigAutomaticDeploymentUpdateWarOffline` calls
+/// `dir.setLastModified(...)` on the expanded webapp directory to age it and
+/// asserts the return value, so it failed all four of its tests on CratonVM
+/// while passing on HotSpot. `filetime::set_file_mtime` opens with the right
+/// flags on both platforms.
+pub(crate) fn set_file_mtime_millis(path: &str, millis: i64) -> bool {
+    // Split into whole seconds + non-negative nanosecond remainder, which is
+    // what `FileTime::from_unix_time` expects (its nanos argument must be in
+    // `0..1_000_000_000` even for pre-epoch timestamps).
+    let secs = millis.div_euclid(1000);
+    let nanos = (millis.rem_euclid(1000) * 1_000_000) as u32;
+    filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(secs, nanos)).is_ok()
+}
+
 pub(crate) fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     // Prefer the real-JDK `getPath()` implementation when Available (correct
     // `prefixLength` + internal path for `java.io.File` loaded from modules).
@@ -9512,7 +9604,49 @@ pub(crate) fn file_normalise_path(path: &str) -> String {
 
 #[cfg(not(windows))]
 pub(crate) fn file_normalise_path(path: &str) -> String {
-    path.to_string()
+    // `UnixFileSystem.normalize`: collapse runs of `/` and drop a single
+    // trailing `/` (but keep the root `/` itself). `File.<init>` stores the
+    // NORMALIZED string, so `getPath()`/`getAbsolutePath()` observe it.
+    //
+    // Leaving it un-normalized let a trailing separator survive into
+    // `getAbsolutePath()`, and Spring's
+    // `PathMatchingResourcePatternResolver.retrieveMatchingFiles` builds its
+    // glob as `rootDir.getAbsolutePath() + "/" + subPattern` — a root
+    // directory that already ended in `/` produced `.../scanned//*.txt`, which
+    // matches nothing (`core.io.support.PathMatchingResourcePatternResolverTests
+    // .encodedHashtagInPath` found zero files). The root came straight from
+    // `new File(uri.getSchemeSpecificPart())`, whose value legitimately ends
+    // in `/` for a directory URL.
+    let mut out = String::with_capacity(path.len());
+    let mut prev_slash = false;
+    for ch in path.chars() {
+        let is_slash = ch == '/';
+        if !(is_slash && prev_slash) {
+            out.push(ch);
+        }
+        prev_slash = is_slash;
+    }
+    if out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+#[cfg(test)]
+mod file_normalise_tests {
+    use super::file_normalise_path;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_normalise_matches_unixfilesystem() {
+        assert_eq!(file_normalise_path("/tmp/x/scanned/"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/tmp/x//scanned"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/tmp/x///scanned//"), "/tmp/x/scanned");
+        assert_eq!(file_normalise_path("/"), "/");
+        assert_eq!(file_normalise_path("//"), "/");
+        assert_eq!(file_normalise_path("relative/dir/"), "relative/dir");
+        assert_eq!(file_normalise_path(""), "");
+    }
 }
 
 /// Resolve `new File(parent, child)` the way the JDK's
@@ -10119,13 +10253,37 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         // mangled "file:\C:\..." Files emptied Gradle's ClasspathUtil walk
         // and with it every ProjectBuilder module classpath).
         let raw = crate::net_phase_e::uri_raw_string(ctx, uri);
-        let mut path = match ctx.get_field_by_name(uri, "path") {
-            Value::Object(Some(s)) => ctx
+        // Real `File(URI)` is `String p = uri.getPath();` — and `getPath()`
+        // returns the DECODED path, while the `path` FIELD holds the raw,
+        // still-percent-encoded one (`getRawPath()`'s value). Reading the field
+        // therefore produced `/tmp/dir/resource%23test1.txt` for a file
+        // genuinely named `resource#test1.txt`, so `exists()` was false for any
+        // path containing a character `File.toURI()` had escaped. Spring's
+        // `PathMatchingResourcePatternResolver` round-trips through
+        // `new File(url.toURI())` while walking a directory, so a single `#` in
+        // a resource name made the whole wildcard scan return nothing
+        // (`core.io.support.PathMatchingResourcePatternResolverTests
+        // .encodedHashtagInPath`).
+        //
+        // Ask the URI itself, so the decoding rules stay the JDK's. The field
+        // read remains as the fallback for the synthetic 7-slot URIs described
+        // below, whose `getPath()` may not be wired.
+        let mut path = match ctx.invoke_virtual(uri, "getPath", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx
                 .read_string(s)
                 .filter(|v| !v.is_empty() && *v != raw)
                 .unwrap_or_default(),
             _ => String::new(),
         };
+        if path.is_empty() {
+            path = match ctx.get_field_by_name(uri, "path") {
+                Value::Object(Some(s)) => ctx
+                    .read_string(s)
+                    .filter(|v| !v.is_empty() && *v != raw)
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+        }
         if path.is_empty() {
             // Parse from the full URI text:
             //   scheme:[//authority]path[?query][#fragment]
@@ -10453,17 +10611,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Long(v)) => *v,
             _ => 0,
         };
-        // Use std::fs::File + set_modified (Rust 1.75+)
-        let ok = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .and_then(|f| {
-                let time =
-                    std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis.max(0) as u64);
-                f.set_modified(time)
-            })
-            .is_ok();
-        Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+        Ok(Some(Value::Int(if set_file_mtime_millis(&path, millis) {
+            1
+        } else {
+            0
+        })))
     });
     r.register(file, "setReadable", "(Z)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;

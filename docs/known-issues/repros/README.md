@@ -7,7 +7,8 @@ at risk of being lost. The bugs span **Wildfly, Kafka, Hibernate, Elasticsearch,
 Keycloak and Spring** — not Spring-only.
 
 > **Re-run 2026-06-29 / archive cleanup 2026-07-01:** the **A2** (`ReflRepro`)
-> and **A5** (`gc-stress` bintrees) repro sets now live under `docs/internal/repros/`;
+> and **A5** (`gc-stress` bintrees) repro sets were retired from this tracked directory
+> (their bugs closed);
 > three more — `spring-bug-08`,
 > `keycloak-15`, `keycloak-16` — **no longer reproduce on dev** (see ✅ rows below). `A4`/`Fork6`
 > still exercises the architectural FJP register-root gap (non-fatal: prints `ALL-OK`).
@@ -27,9 +28,9 @@ $CV --java-home "$JDK" -cp <dir> <Repro>  # CratonVM (reproduces the gap)
 | `spring-bug-08-…` | `spring-bug-08-proxy-serialization/ProxySer.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: `RESULT=OK`, no `UnsatisfiedLinkError`). Was: serialize→deserialize a `Serializable` JDK proxy → `UnsatisfiedLinkError: Module.defineModule0` on deserialize. |
 | `keycloak-15-…` | `keycloak-15-path-root/PathRoot.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: `getRoot()=C:\`, `nameCount=2`, ==HotSpot). Was: `Paths.get("C:\\foo\\bar")` → `getRoot()=null`, `nameCount=3`. |
 | `keycloak-16-…` | `keycloak-16-stream-onclose/StreamOnClose.java` | ✅ **NOW PASSES on dev** (re-run 2026-06-29: onClose ran, lazy `peek=1`, ==HotSpot). Was: `onClose` handler dropped (close() no-op) and eager `peek` (`peeked=5`). |
-| `bug06-fam5-…` | ✅ **CLOSED 2026-07-02** — moved to `docs/internal/fixed-suite-bugs/repros/bug06-fam5-reflection-null/Refl5.java` | failcause extinct: 0 × `getDeclaredMethod on null` across the clean 2026-06-30/07-01 full re-runs and a fresh 196-class nojit+jit sweep on dev `ffb247e5`; probe stays ==HotSpot. |
+| `bug06-fam5-…` | ✅ **CLOSED 2026-07-02** — repro retired (bug fixed) | failcause extinct: 0 × `getDeclaredMethod on null` across the clean 2026-06-30/07-01 full re-runs and a fresh 196-class nojit+jit sweep on dev `ffb247e5`; probe stays ==HotSpot. |
 | `springrepos-…` (latent deep recursion) | `springrepos-deep-recursion/GroovyNestProbe.java` | deeply-nested Groovy closures; clean `dev` runs slow-not-crash — the native-stack overflow only with the unmerged cold-path JIT experiment. |
-| `g1-parallel-evac-persistent-forwarding-root-remap` | `g1-parallel-steady-churn/SteadyChurn.java` | archived 2026-07-04 at `docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md`; the tracked recreation and `run-g1-parallel-steady-churn.ps1` are retained as regression assets. |
+| `g1-parallel-evac-persistent-forwarding-root-remap` | `g1-parallel-steady-churn/SteadyChurn.java` | fixed 2026-07-04; the tracked recreation here and `run-g1-parallel-steady-churn.ps1` are retained as regression assets. |
 | `jetty-webserver-factory-poststartup-timeout-…` (TLD/JAR-scan residual) | `xerces-sax-manysmallfiles-slowdown/SaxManySmallFiles.java` + `SaxEncodingCompare.java` | Reused-`SAXParser` repeated small-doc parse — no file/jar/classpath I/O. HotSpot ~40-100us/parse; CratonVM ~8-13ms/parse (100-200x). `SaxEncodingCompare` refutes the `UTF8Reader`-decoder hypothesis (ASCII was not faster). Seconds per iteration instead of the full suite's 10+ minute rebuild-and-rerun cycle. |
 
 ## GC-root-race / Family-A probe (needs `GC_STRESS` or load)

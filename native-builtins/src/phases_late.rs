@@ -21,8 +21,8 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::{
-    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set, native_noop,
-    native_noop_with_this, obj_arg,
+    alloc_concurrent_synthetic, jul_logger_handlers_get, jul_logger_handlers_set,
+    jul_logger_parent_get, jul_logger_parent_set, native_noop, native_noop_with_this, obj_arg,
 };
 use crate::{native_cf_then_accept, native_cf_then_apply};
 use crate::{
@@ -2516,7 +2516,21 @@ pub fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         },
     );
     let phi = "java/lang/ProcessHandle$Info";
-    r.register(phi, "command", "()Ljava/util/Optional;", p60_empty_optional);
+    // `ProcessHandle.current().info().command()` is the standard way to find the
+    // running JVM's executable in order to spawn a child JVM -- Spring's
+    // `PathMatchingResourcePatternResolverTests$ClassPathManifestEntries` does
+    // exactly that, and an empty Optional there is an immediate
+    // `NoSuchElementException: No value present`. Report this VM's own
+    // executable, the way the real `ProcessHandleImpl.Info` does.
+    r.register(phi, "command", "()Ljava/util/Optional;", |ctx, args| {
+        let Ok(exe) = std::env::current_exe() else {
+            return p60_empty_optional(ctx, args);
+        };
+        let text = ctx.create_string(&exe.to_string_lossy());
+        let optional = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+        ctx.set_field(optional, 0, Value::Object(Some(text)));
+        Ok(Some(Value::Object(Some(optional))))
+    });
     r.register(
         phi,
         "arguments",
@@ -2600,12 +2614,14 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    r.register(
-        log,
-        "removeHandler",
-        "(Ljava/util/logging/Handler;)V",
-        native_noop_with_this,
-    );
+    // `removeHandler` is deliberately NOT registered here. It used to be a
+    // no-op, which silently dropped the removal while `addHandler` above kept
+    // appending to the same side table. Two real implementations already
+    // supersede this slot in every mode that reaches this function:
+    // `logmanager::register_logmanager_natives` (registered LAST in
+    // `register_synthetic_overrides`, after this phase) and
+    // `reflect_annotations::register_annotation_overrides`; both drive the
+    // same `jul_logger_handlers_*` side table `addHandler` writes.
     r.register(
         log,
         "getHandlers",
@@ -2636,17 +2652,44 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         let val = ctx.get_field(this, 4).as_int().unwrap_or(1);
         Ok(Some(Value::Int(val)))
     });
+    // Parent link: stored in the `jul_logger_parent_*` side table for the same
+    // reason the handler list is (real-JDK 25 keeps the parent inside
+    // `Logger$ConfigurationData`, the synthetic loggers keep their name in
+    // that slot), so `getParent` reads back what `setParent` stored instead of
+    // reporting "no parent" for every logger.
     r.register(
         log,
         "getParent",
         "()Ljava/util/logging/Logger;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            Ok(Some(match jul_logger_parent_get(ctx, this) {
+                Some(parent) => Value::Object(Some(parent)),
+                // A logger with no recorded parent is the root: null, exactly
+                // as `Logger.getParent()` reports for the root logger.
+                None => Value::Object(None),
+            }))
+        },
     );
     r.register(
         log,
         "setParent",
         "(Ljava/util/logging/Logger;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let parent = match args.get(1) {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
+            jul_logger_parent_set(ctx, this, parent);
+            Ok(None)
+        },
     );
 
     // --- StreamHandler = 2-field (stream=0, formatter=1) ---
@@ -4686,9 +4729,25 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;)Ljava/lang/System$Logger;",
-        |ctx, _args| {
+        |ctx, args| {
+            // args[0] is the requested logger name (static method). Dropping it
+            // left every System.Logger anonymous, so `getName()` and the `log`
+            // natives below had nothing to attribute records to. Pin it across
+            // the allocation below (native stale-local family).
+            let name = match args.first() {
+                Some(Value::Object(Some(o))) => Some(*o),
+                _ => None,
+            };
+            let name_pin = name.map(|o| (ctx.pin_native_root(o), o));
             let logger = alloc_concurrent_synthetic(ctx, "java/lang/System$Logger", 1);
-            ctx.set_field(logger, 0, Value::Object(None)); // name
+            let name = match name_pin {
+                Some((handle, o)) => Value::Object(Some(ctx.read_native_pin(handle, o))),
+                None => Value::Object(None),
+            };
+            ctx.set_field(logger, 0, name);
+            if let Some((handle, _)) = name_pin {
+                ctx.unpin_native_roots(handle);
+            }
             Ok(Some(Value::Object(Some(logger))))
         },
     );
@@ -4703,11 +4762,48 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/System$Logger$Level;)Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
     );
+    // `System.Logger.log(Level, String)` — the facade's primary entry point.
+    // A no-op here meant every `System.getLogger(...).log(...)` record was
+    // discarded, while `isLoggable` above answers true. Route it to the same
+    // console sink (`record_printed_line` + the System.out override) that every
+    // other logging shim in this crate publishes through, tagged with the
+    // level name and the logger name.
     r.register(
         slogger,
         "log",
         "(Ljava/lang/System$Logger$Level;Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let logger_name = match args.first() {
+                Some(Value::Object(Some(this))) => match ctx.get_field(*this, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            // Level enum: `name` by name on a real enum, slot 0 on the
+            // synthetic one built by `p57_alloc_enum`.
+            let level_name = match args.get(1) {
+                Some(Value::Object(Some(level))) => {
+                    let by_name = match ctx.get_field_by_name(*level, "name") {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    };
+                    by_name.or_else(|| match ctx.get_field(*level, 0) {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }
+            .unwrap_or_else(|| "INFO".to_string());
+            let message = match args.get(2) {
+                Some(Value::Object(Some(m))) => ctx.read_string(*m).unwrap_or_default(),
+                Some(Value::Object(None)) => "null".to_string(),
+                _ => return Ok(None),
+            };
+            crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
+            Ok(None)
+        },
     );
 
     // System.Logger.Level enum
@@ -6884,48 +6980,41 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let log = "java/util/logging/Logger";
+    // `entering`/`exiting`/`throwing` are defined by the spec purely in terms
+    // of a FINER record carrying a fixed message ("ENTRY"/"RETURN"/"THROW")
+    // plus the caller-supplied source class and method — i.e. exactly `logp`,
+    // which already builds the LogRecord (source class/method and `thrown`
+    // stamped) and publishes it to the logger's handler list. Route through it
+    // instead of discarding the call: as no-ops these three erased every
+    // method-trace record, and `throwing` in particular swallowed the
+    // Throwable a caller was logging before rethrowing/swallowing it.
     r.register(
         log,
         "entering",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| jul_log_trace_marker(ctx, args, "ENTRY"),
     );
     r.register(
         log,
         "exiting",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| jul_log_trace_marker(ctx, args, "RETURN"),
     );
     r.register(
         log,
         "throwing",
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V",
-        native_noop_with_this,
+        |ctx, args| jul_log_trace_marker(ctx, args, "THROW"),
     );
-    r.register(
-        log,
-        "log",
-        "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    r.register(
-        log,
-        "log",
-        "(Ljava/util/logging/Level;Ljava/lang/String;[Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    r.register(
-        log,
-        "log",
-        "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
-        native_noop_with_this,
-    );
-    r.register(
-        log,
-        "logp",
-        "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
+    // `log(Level, String, Object)`, `log(Level, String, Object[])`,
+    // `log(Level, String, Throwable)` and the 4-arg `logp` are deliberately
+    // NOT registered here any more. They were no-ops that discarded the
+    // record, and in every mode that reaches this function they are
+    // superseded anyway by `logmanager::register_logmanager_natives`
+    // (`native_jul_logger_log_param` / `_log_params` / `_log_throwable` /
+    // `_logp`), which is registered LAST in `register_synthetic_overrides` and
+    // does build a LogRecord and publish it to the logger's handlers. Keeping
+    // a no-op in this slot only risked winning a future reordering.
 
     // LogRecord is a real-JDK object in normal VM mode. Address its named
     // fields rather than the obsolete synthetic layout so Handler.isLoggable
@@ -7170,13 +7259,133 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    r.register(
-        "java/util/logging/LogManager",
-        "readConfiguration",
-        "()V",
-        native_noop_with_this,
-    );
+    // `LogManager.readConfiguration()` is deliberately NOT registered here.
+    // A no-op meant a re-read silently kept the old levels/handlers; the real
+    // implementation (`logmanager::native_read_configuration_no_arg`, which
+    // parses `java.util.logging.config.file` / `logging.properties` and
+    // applies the levels and handlers it finds) is registered LAST in
+    // `register_synthetic_overrides` and already wins this slot in every mode
+    // that reaches this function.
     r.set_category(__prev_cat);
+}
+
+/// Resolve `java.util.logging.Level.FINER`.
+///
+/// Prefers the initialized static field (real JDK, and the synthetic
+/// `Level.<clinit>` native which populates the same statics); falls back to
+/// the `FINER()` accessor native the synthetic JUL registers when the statics
+/// are not materialized. `None` means the level is unavailable, in which case
+/// the caller still logs, just without an explicit level.
+fn jul_level_finer(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    if let Ok(class) = ctx.ensure_class_initialized("java/util/logging/Level") {
+        if let Some(index) = ctx.static_field_index_by_name(class, "FINER") {
+            if let Value::Object(Some(level)) = ctx.get_static_field(class, index) {
+                return Some(level);
+            }
+        }
+    }
+    match ctx.invoke(
+        "java/util/logging/Level",
+        "FINER",
+        "()Ljava/util/logging/Level;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(level)))) => Some(level),
+        _ => None,
+    }
+}
+
+/// Shared body of `Logger.entering`/`exiting`/`throwing`.
+///
+/// `args` is `(this, sourceClass, sourceMethod[, thrown])`; `marker` is the
+/// spec's fixed message ("ENTRY", "RETURN", "THROW"). Delegates to `logp`,
+/// which owns the LogRecord construction and handler fan-out, using the 5-arg
+/// overload when a Throwable is present so `LogRecord.thrown` is set rather
+/// than dropped.
+fn jul_log_trace_marker(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    marker: &str,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        // No receiver: nothing to log against. Callers of these convenience
+        // methods must never see an NPE raised from the logging path itself.
+        _ => return Ok(None),
+    };
+    let source_class = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let source_method = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let thrown = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    // `create_string` and `Level.<clinit>` both allocate: pin every reference
+    // this native holds and re-read them afterwards (native stale-local
+    // family). `base` is the first handle, so one `unpin_native_roots(base)`
+    // releases the whole group.
+    let base = ctx.pin_native_root(this);
+    let class_pin = source_class.map(|o| (ctx.pin_native_root(o), o));
+    let method_pin = source_method.map(|o| (ctx.pin_native_root(o), o));
+    let thrown_pin = thrown.map(|o| (ctx.pin_native_root(o), o));
+    let message = ctx.create_string(marker);
+    let message_pin = ctx.pin_native_root(message);
+    let level = jul_level_finer(ctx);
+    let level_pin = level.map(|o| (ctx.pin_native_root(o), o));
+
+    let this = ctx.read_native_pin(base, this);
+    let message = ctx.read_native_pin(message_pin, message);
+    let level = match level_pin {
+        Some((handle, o)) => Value::Object(Some(ctx.read_native_pin(handle, o))),
+        None => Value::Object(None),
+    };
+    let source_class = match class_pin {
+        Some((handle, o)) => Value::Object(Some(ctx.read_native_pin(handle, o))),
+        None => Value::Object(None),
+    };
+    let source_method = match method_pin {
+        Some((handle, o)) => Value::Object(Some(ctx.read_native_pin(handle, o))),
+        None => Value::Object(None),
+    };
+    let thrown = thrown_pin.map(|(handle, o)| Value::Object(Some(ctx.read_native_pin(handle, o))));
+
+    let (descriptor, call_args) = match thrown {
+        Some(thrown) => (
+            "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;\
+             Ljava/lang/String;Ljava/lang/Throwable;)V",
+            vec![
+                level,
+                source_class,
+                source_method,
+                Value::Object(Some(message)),
+                thrown,
+            ],
+        ),
+        None => (
+            "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            vec![
+                level,
+                source_class,
+                source_method,
+                Value::Object(Some(message)),
+            ],
+        ),
+    };
+    let outcome = ctx.invoke_virtual(this, "logp", descriptor, &call_args);
+    ctx.unpin_native_roots(base);
+    if outcome.is_err() {
+        // `logp` is unavailable (or its handler chain failed). A trace-level
+        // convenience method must not turn that into an application-visible
+        // exception, but the record must not vanish either: fall back to the
+        // console sink every other logging shim in this crate writes to.
+        crate::emit_framework_log(ctx, &format!("FINER {marker}"));
+    }
+    Ok(None)
 }
 
 // =============================================================================

@@ -66,8 +66,7 @@ build-*.log
 # stray developer probe output
 /dd1.out
 
-# stray repro probe output under docs/internal
-docs/internal/**/cld*.out
+
 
 # Merge-conflict side-copies of crate sources. Resolving a conflict in a file
 # the size of native-builtins/src/lib.rs (~86k lines) tends to leave 3 MB
@@ -78,3 +77,20 @@ docs/internal/**/cld*.out
 /*-lib.merge.rs
 /*.dev.rs
 /*.merge.rs
+/*.merge.md
+
+# Local-only vendored JDK reference checkout (used ad hoc against
+# tools/flag-census/census.py, which explicitly skips this dir). Never a
+# build input; one file slipped into tracking before this rule existed.
+/jdk25src/
+
+# Compiled/build output under spring-suite; sources (e.g. MRun.java) stay
+# tracked, but .class/.out/.err build products should not be.
+spring-suite/build/
+
+# Personal / machine-specific dev build scripts (hardcoded usernames, dated
+# worktree paths, one-off investigation output names). scripts/README.md has
+# documented this as gitignored policy since before this rule actually
+# existed in .gitignore; scripts/internal/ had been tracked in the meantime.
+#scripts/internal/
+#scripts/smoke/

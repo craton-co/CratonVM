@@ -739,6 +739,10 @@ cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
 cached_is_ok!(athrow_dbg, "CRATONVM_DBG_ATHROW");
+/// `CRATONVM_DBG_STUBLOADER` -- trace the "would fabricate a synthetic stub,
+/// ask the calling class's own ClassLoader first" fallback in
+/// `NativeContextImpl::load_class`.
+cached_is_ok!(dbg_stub_loader, "CRATONVM_DBG_STUBLOADER");
 cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
 /// `CRATONVM_DBG_MODSTATIC` — JBoss-Modules `<clinit>`/static-dispatch
 /// diagnostic. This was read with an UNCACHED `cratonvm_types::flags::runtime_var(...).is_ok()`
@@ -995,6 +999,44 @@ impl RealSelector {
 
 cached_is_set!(dbg_gse, "CRATONVM_DBG_GSE");
 cached_is_set!(dbg_field_watch, "CRATONVM_DBG_FIELD_WATCH");
+
+/// Class-name filter for the [`dbg_field_watch`] getfield/putfield ledger.
+///
+/// `CRATONVM_DBG_FIELD_WATCH` started life as a bare on/off switch whose
+/// ledger was hard-wired to the H2 `Page` / `RootReference` investigation.
+/// The variable's *value* is now a comma-separated list of class-name
+/// substrings, so the same ledger can be aimed at any "the store ran but the
+/// read sees null" question (e.g.
+/// `CRATONVM_DBG_FIELD_WATCH=AbstractControllerService`). Call sites pass
+/// `<class>.<field>` where the field name is already to hand, so a pattern
+/// may also name a single field
+/// (`CRATONVM_DBG_FIELD_WATCH=AbstractControllerService.controller`) and keep
+/// the ledger down to the handful of lines that answer the question. An
+/// on/off-shaped
+/// value (empty, `1`, `true`, `on`, `yes`) keeps the original H2 filter, so
+/// every existing invocation behaves exactly as before.
+#[inline]
+pub fn field_watch_class_matches(name: &str) -> bool {
+    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+    let pats = CACHE.get_or_init(|| {
+        let raw =
+            cratonvm_types::flags::runtime_var("CRATONVM_DBG_FIELD_WATCH").unwrap_or_default();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || matches!(trimmed, "1" | "true" | "on" | "yes") {
+            return Vec::new();
+        }
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    });
+    if pats.is_empty() {
+        return name.contains("Page") || name.contains("RootReference");
+    }
+    pats.iter().any(|p| name.contains(p.as_str()))
+}
 cached_is_set!(dbg_watchref, "CRATONVM_DBG_WATCHREF");
 cached_is_set!(dbg_asserteq, "CRATONVM_DBG_ASSERTEQ");
 cached_is_set!(exec_frame_trace, "CRATONVM_EXEC_FRAME_TRACE");

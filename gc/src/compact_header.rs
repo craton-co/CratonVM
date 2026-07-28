@@ -697,7 +697,7 @@ impl NarrowKlassTable {
     /// had **no removal path of any kind** — no `remove`, `retain`, `prune` or
     /// `clear` anywhere in the impl. That satisfies neither arm of the
     /// "unload invalidation or hard bound" rule in
-    /// `docs/internal/class-loader-unloading-and-bounded-metadata.md`: the two
+    /// `docs/architecture/class-loader-unloading.md`: the two
     /// maps grew one entry per class defined, forever, so any workload that
     /// spins loaders (CGLIB, ByteBuddy, Groovy, repeated app redeploys) would
     /// leak them without bound. It was latent only because

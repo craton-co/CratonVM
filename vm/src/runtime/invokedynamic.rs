@@ -1139,12 +1139,25 @@ fn execute_cached_lambda(
 // `Integer.valueOf` cache in `native-builtins/src/lang_math.rs` (see
 // `gc_scan_lambda_singleton_roots` / `gc_update_lambda_singleton_refs`,
 // wired into `vm/src/memory/{roots.rs,gc.rs}`).
+///
+/// The key carries the invokedynamic INSTRUCTION's bci as well as the proxy
+/// class id. JVMS 5.4.3.6 links each `invokedynamic` *instruction* to its own
+/// call site, even when javac folds several occurrences onto ONE
+/// `CONSTANT_InvokeDynamic` entry -- which it does for repeated method
+/// references (`Foo::bar` written twice compiles to two instructions sharing a
+/// CP index). HotSpot therefore hands out a DISTINCT instance per occurrence,
+/// while keying only by `proxy_class_id` (which is per CP entry) collapsed them
+/// into one. Spring's `WebClient.Builder.defaultStatusHandler` keys a
+/// `LinkedHashMap` on the predicate, so two `HttpStatusCode::is4xxClientError`
+/// registrations became ONE entry and the second handler silently replaced the
+/// first (`web.reactive.function.client.DefaultWebClientTests
+/// .onStatusHandlerRegisteredGlobally`).
 static LAMBDA_SINGLETON_CACHE: std::sync::OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), ObjectRef>>,
+    parking_lot::Mutex<std::collections::HashMap<(usize, ClassId, usize), ObjectRef>>,
 > = std::sync::OnceLock::new();
 
 fn lambda_singleton_cache(
-) -> &'static parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), ObjectRef>> {
+) -> &'static parking_lot::Mutex<std::collections::HashMap<(usize, ClassId, usize), ObjectRef>> {
     LAMBDA_SINGLETON_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -1153,7 +1166,7 @@ fn lambda_singleton_cache(
 /// them live.
 pub fn gc_scan_lambda_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
     let cache = lambda_singleton_cache().lock();
-    for (&(vid, _), obj_ref) in cache.iter() {
+    for (&(vid, _, _), obj_ref) in cache.iter() {
         if vid == vm_identity {
             out.push(*obj_ref);
         }
@@ -1170,7 +1183,7 @@ pub fn gc_update_lambda_singleton_refs(
         return;
     }
     let mut cache = lambda_singleton_cache().lock();
-    for (&(vid, _), obj_ref) in cache.iter_mut() {
+    for (&(vid, _, _), obj_ref) in cache.iter_mut() {
         if vid != vm_identity {
             continue;
         }
@@ -1196,10 +1209,12 @@ fn allocate_lambda_proxy(
     // minted on a prior invocation just returns the cached instance —
     // matches real HotSpot's cached-INSTANCE-field optimization for
     // non-capturing lambdas (see LAMBDA_SINGLETON_CACHE above).
+    // Per-INSTRUCTION identity: see LAMBDA_SINGLETON_CACHE's doc comment.
+    let site_pc = thread.frames[frame_idx].pc;
     if num_captures == 0 {
         if let Some(cached) = lambda_singleton_cache()
             .lock()
-            .get(&(shared.vm_identity, proxy_class_id))
+            .get(&(shared.vm_identity, proxy_class_id, site_pc))
             .copied()
         {
             thread.frames[frame_idx]
@@ -1293,7 +1308,7 @@ fn allocate_lambda_proxy(
     if num_captures == 0 {
         lambda_singleton_cache()
             .lock()
-            .insert((shared.vm_identity, proxy_class_id), proxy_ref);
+            .insert((shared.vm_identity, proxy_class_id, site_pc), proxy_ref);
     }
 
     // Push the proxy object onto the stack

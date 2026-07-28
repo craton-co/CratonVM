@@ -152,6 +152,12 @@ pub fn register_h2_parser_fastpaths(registry: &mut NativeMethodRegistry) {
         h2_parser_add_expected_int,
     );
     registry.register(
+        "org/h2/command/ParserBase",
+        "testToken",
+        "(Ljava/lang/String;Lorg/h2/command/Token;)Z",
+        h2_parser_test_token_fast,
+    );
+    registry.register(
         "org/h2/command/Tokenizer",
         "eq",
         "(Ljava/lang/String;Ljava/lang/String;II)Z",
@@ -1270,7 +1276,30 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     })?;
     let table_filter_class = ctx.class_id_by_name("org/h2/table/TableFilter");
-    if table_filter_class.is_some_and(|class_id| ctx.class_id_of_object(resolver) == class_id) {
+    if !table_filter_class.is_some_and(|class_id| ctx.class_id_of_object(resolver) == class_id) {
+        // Resolver shapes other than `TableFilter` are not what this fast path
+        // exists for, and some of them (`SelectListColumnResolver`) DO carry
+        // the group/window state the prologue below is about. Run H2's own
+        // method for them rather than a partial re-implementation.
+        return h2_expression_column_get_value_bytecode(ctx, args);
+    }
+    // GROUPED / WINDOWED queries: H2's real `getValue` consults
+    // `select.getGroupDataIfCurrent(false).getCurrentGroupExprData(this)`
+    // BEFORE it ever asks the resolver, because for those queries the
+    // resolver's live row is NOT the row being emitted -- `Select.gatherGroup`
+    // has already scanned the source to completion, so `TableFilter.current`
+    // is pinned at the LAST scanned row while `processGroupResult` replays the
+    // buffered per-row values. Reading the resolver directly therefore gave
+    // every output row of a windowed query the last source row's value (the
+    // `bulkid` `INSERT ... SELECT ... row_number() over()` corruption), and a
+    // one-group shift for `GROUP BY`. `groupData` is non-null only while such
+    // a query is executing, so the ordinary non-grouped path is unaffected.
+    if let Some(select) = h2_object_field(ctx, resolver, "select") {
+        if h2_object_field(ctx, select, "groupData").is_some() {
+            return h2_expression_column_get_value_bytecode(ctx, args);
+        }
+    }
+    {
         let column_id = h2_int_field(ctx, column, "columnId");
         // `current` (TableFilter.next()'s lazily-fetched FULL row, populated
         // by the real getValue(Column) bytecode below on first need -- see
@@ -1348,6 +1377,22 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
         "getValue",
         "(Lorg/h2/table/Column;)Lorg/h2/value/Value;",
         &[Value::Object(Some(column))],
+    )
+}
+
+/// Run H2's own `ExpressionColumn.getValue` bytecode.
+///
+/// `invoke_special_bytecode_only` (not `invoke_virtual_bytecode_only`) so the
+/// call cannot re-enter the native override that is delegating to it.
+fn h2_expression_column_get_value_bytecode(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_special_bytecode_only(
+        "org/h2/expression/ExpressionColumn",
+        "getValue",
+        "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+        args,
     )
 }
 
@@ -2466,6 +2511,42 @@ fn h2_parser_add_expected_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         cratonvm_native_collections::native_al_add(ctx, &[Value::Object(Some(expected)), token]);
     ctx.unpin_native_roots(expected_pin);
     result.map(|_| None)
+}
+
+/// The overwhelmingly common H2 token is an IdentifierToken, whose `quoted`
+/// and `identifier` fields can be read directly.  Keep the uncommon token
+/// shapes on H2's own `asIdentifier()` path, but avoid interpreted token and
+/// String dispatch for the normal parser branch.
+fn h2_parser_test_token_fast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
+    let expected = match args.get(1) { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
+    let token = match args.get(2) { Some(Value::Object(Some(value))) => *value, _ => return Ok(Some(Value::Int(0))) };
+    if matches!(ctx.get_field_by_name(token, "quoted"), Value::Int(value) if value != 0) {
+        return Ok(Some(Value::Int(0)));
+    }
+    let identifier = match ctx.get_field_by_name(token, "identifier") {
+        Value::Object(Some(value)) => value,
+        _ => {
+            let expected_pin = ctx.pin_native_root(expected);
+            let token_pin = ctx.pin_native_root(token);
+            let token = ctx.read_native_pin(token_pin, token);
+            let result = ctx.invoke_virtual(token, "asIdentifier", "()Ljava/lang/String;", &[])?;
+            let expected = ctx.read_native_pin(expected_pin, expected);
+            ctx.unpin_native_roots(token_pin);
+            ctx.unpin_native_roots(expected_pin);
+            match result { Some(Value::Object(Some(value))) => value, _ => return Ok(Some(Value::Int(0))) }
+        }
+    };
+    if matches!(ctx.get_field_by_name(this, "identifiersToUpper"), Value::Int(value) if value != 0) {
+        return crate::lang_string::native_string_equals(
+            ctx,
+            &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
+        );
+    }
+    crate::lang_string::native_string_equals_ignore_case(
+        ctx,
+        &[Value::Object(Some(expected)), Value::Object(Some(identifier))],
+    )
 }
 
 /// Exact UTF-16-code-unit comparison used by H2's tokenizer for case-insensitive

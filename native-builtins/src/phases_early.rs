@@ -34,13 +34,12 @@ use crate::lang_string::{
     native_string_hash_code, native_string_to_lower_case, register_phase52_string_buffer,
 };
 use crate::{
-    alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
-    native_noop_with_this, native_return_false, native_return_zero,
+    alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop, native_return_false,
     native_unsafe_ensure_class_initialized, obj_arg,
 };
 use crate::{
-    native_return_first_arg, native_return_null, native_synchronized_collection,
-    native_synchronized_list, native_synchronized_map, native_synchronized_set,
+    native_return_first_arg, native_synchronized_collection, native_synchronized_list,
+    native_synchronized_map, native_synchronized_set,
 };
 
 fn object_array_element_hash_code(
@@ -224,13 +223,13 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
         cu,
         "min",
         "(Ljava/util/Collection;)Ljava/lang/Object;",
-        native_return_null,
+        native_collections_min,
     );
     r.register(
         cu,
         "max",
         "(Ljava/util/Collection;)Ljava/lang/Object;",
-        native_return_null,
+        native_collections_max,
     );
     r.register(cu, "swap", "(Ljava/util/List;II)V", |ctx, args| {
         // Swap two elements in an ArrayList
@@ -350,7 +349,7 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
         cu,
         "replaceAll",
         "(Ljava/util/List;Ljava/lang/Object;Ljava/lang/Object;)Z",
-        native_return_false,
+        native_collections_replace_all,
     );
     r.set_category(__prev_cat);
 }
@@ -427,9 +426,244 @@ fn native_collections_singleton_map(
     Ok(Some(Value::Object(Some(map))))
 }
 
-fn native_collections_frequency(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let _ = ctx;
-    Ok(Some(Value::Int(0))) // Simplified stub
+// ---------------------------------------------------------------------------
+// Shared helpers for the `java.util.Collections` natives below.
+//
+// `equals`/`compareTo`/`size`/`get`/`set` all re-enter Java, so anything held
+// across them can be moved by a collection. These mirror native-collections'
+// private `pin_value*`/`read_pinned_elem` idiom (that crate does not export
+// them) so the snapshots here are tracked by pin handle, not by raw ObjectRef.
+// ---------------------------------------------------------------------------
+
+fn pe_pin_value(ctx: &mut dyn NativeContext, v: Value) -> usize {
+    match v {
+        Value::Object(Some(o)) => ctx.pin_native_root(o),
+        _ => usize::MAX,
+    }
+}
+
+fn pe_pin_value_slice(ctx: &mut dyn NativeContext, vals: &[Value]) -> Vec<usize> {
+    vals.iter()
+        .map(|v| match v {
+            Value::Object(Some(o)) => ctx.pin_native_root(*o),
+            _ => usize::MAX,
+        })
+        .collect()
+}
+
+fn pe_read_pinned(ctx: &dyn NativeContext, handle: usize, orig: Value) -> Value {
+    match orig {
+        Value::Object(Some(o)) if handle != usize::MAX => {
+            Value::Object(Some(ctx.read_native_pin(handle, o)))
+        }
+        _ => orig,
+    }
+}
+
+/// Snapshot a `Collection`'s elements through the receiver's own `toArray()`.
+/// Going through the receiver keeps these natives correct for `HashSet` /
+/// `TreeSet` / `LinkedList`, unlike the neighbouring `swap`/`fill`/`copy`
+/// natives which read the ArrayList slot layout directly. Nothing between the
+/// call and the copy can run Java, so no pinning is needed inside.
+fn pe_collection_elements(
+    ctx: &mut dyn NativeContext,
+    coll: ObjectRef,
+) -> Result<Vec<Value>, MethodCallFailed> {
+    let arr = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Vec::new()),
+    };
+    let len = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        out.push(ctx.get_array_element(arr, i));
+    }
+    Ok(out)
+}
+
+/// `Objects.equals(a, b)`: identity first, then `a.equals(b)`, with two
+/// null/unset references counting as equal.
+fn pe_values_equal(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(Some(x)), Value::Object(Some(y))) => {
+            if x.as_ptr() == y.as_ptr() {
+                return Ok(true);
+            }
+            match ctx.invoke_virtual(
+                x,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(y))],
+            )? {
+                Some(Value::Int(v)) => Ok(v != 0),
+                _ => Ok(false),
+            }
+        }
+        (Value::Object(Some(_)), _) | (_, Value::Object(Some(_))) => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+/// `Collections.frequency(c, o)` — count the elements equal to `o`. The
+/// previous body returned a constant 0 regardless of the collection's
+/// contents.
+fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let coll = obj_arg(args, 0)?;
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Pin the receiver FIRST: `unpin_native_roots` releases everything from a
+    // handle onward, so one call at the end covers the target and the snapshot.
+    let coll_pin = ctx.pin_native_root(coll);
+    let result = pe_frequency_inner(ctx, coll_pin, coll, target);
+    ctx.unpin_native_roots(coll_pin);
+    result
+}
+
+fn pe_frequency_inner(
+    ctx: &mut dyn NativeContext,
+    coll_pin: usize,
+    coll: ObjectRef,
+    target: Value,
+) -> MethodCallResult {
+    let target_pin = pe_pin_value(ctx, target);
+    let coll_now = ctx.read_native_pin(coll_pin, coll);
+    let elems = pe_collection_elements(ctx, coll_now)?;
+    let handles = pe_pin_value_slice(ctx, &elems);
+    let mut count = 0i32;
+    for (i, orig) in elems.iter().enumerate() {
+        let elem = pe_read_pinned(ctx, handles[i], *orig);
+        let target_now = pe_read_pinned(ctx, target_pin, target);
+        if pe_values_equal(ctx, target_now, elem)? {
+            count += 1;
+        }
+    }
+    Ok(Some(Value::Int(count)))
+}
+
+fn native_collections_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    pe_collections_extreme(ctx, args, false)
+}
+
+fn native_collections_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    pe_collections_extreme(ctx, args, true)
+}
+
+/// `Collections.min`/`max` over the elements' natural ordering. `null` — what
+/// these used to return unconditionally — is never a legal answer: the JDK
+/// walks the collection with `Comparable.compareTo` and throws
+/// `NoSuchElementException` when it is empty.
+fn pe_collections_extreme(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    want_max: bool,
+) -> MethodCallResult {
+    let coll = obj_arg(args, 0)?;
+    let coll_pin = ctx.pin_native_root(coll);
+    let result = pe_collections_extreme_inner(ctx, coll_pin, coll, want_max);
+    ctx.unpin_native_roots(coll_pin);
+    result
+}
+
+fn pe_collections_extreme_inner(
+    ctx: &mut dyn NativeContext,
+    coll_pin: usize,
+    coll: ObjectRef,
+    want_max: bool,
+) -> MethodCallResult {
+    let coll_now = ctx.read_native_pin(coll_pin, coll);
+    let elems = pe_collection_elements(ctx, coll_now)?;
+    if elems.is_empty() {
+        return Err(RuntimeError::NoSuchElementException {
+            message: String::new(),
+        }
+        .into());
+    }
+    let handles = pe_pin_value_slice(ctx, &elems);
+    let mut best = 0usize;
+    for i in 1..elems.len() {
+        let cand = pe_read_pinned(ctx, handles[i], elems[i]);
+        let incumbent = pe_read_pinned(ctx, handles[best], elems[best]);
+        let (a, b) = match (cand, incumbent) {
+            (Value::Object(Some(a)), Value::Object(Some(b))) => (a, b),
+            // The JDK's own `compareTo` call site NPEs on a null element.
+            _ => {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("Collections.min/max: null element".to_string()),
+                }
+                .into())
+            }
+        };
+        let cmp = match ctx.invoke_virtual(
+            a,
+            "compareTo",
+            "(Ljava/lang/Object;)I",
+            &[Value::Object(Some(b))],
+        )? {
+            Some(Value::Int(v)) => v,
+            _ => 0,
+        };
+        if (want_max && cmp > 0) || (!want_max && cmp < 0) {
+            best = i;
+        }
+    }
+    Ok(Some(pe_read_pinned(ctx, handles[best], elems[best])))
+}
+
+/// `Collections.replaceAll(list, oldVal, newVal)` — replace every occurrence
+/// and report whether anything changed. The previous `native_return_false` did
+/// neither, so a caller that branches on the result skipped its update against
+/// a list that had also been left untouched.
+fn native_collections_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let list = obj_arg(args, 0)?;
+    let old_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    let list_pin = ctx.pin_native_root(list);
+    let result = pe_replace_all_inner(ctx, list_pin, list, old_val, new_val);
+    ctx.unpin_native_roots(list_pin);
+    result
+}
+
+fn pe_replace_all_inner(
+    ctx: &mut dyn NativeContext,
+    list_pin: usize,
+    list: ObjectRef,
+    old_val: Value,
+    new_val: Value,
+) -> MethodCallResult {
+    let old_pin = pe_pin_value(ctx, old_val);
+    let new_pin = pe_pin_value(ctx, new_val);
+    // Drive the receiver's own size/get/set so every List implementation works,
+    // not just the ArrayList slot layout the neighbours above assume.
+    let list_now = ctx.read_native_pin(list_pin, list);
+    let size = match ctx.invoke_virtual(list_now, "size", "()I", &[])? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    let mut changed = false;
+    for i in 0..size {
+        let list_now = ctx.read_native_pin(list_pin, list);
+        let elem = ctx
+            .invoke_virtual(list_now, "get", "(I)Ljava/lang/Object;", &[Value::Int(i)])?
+            .unwrap_or(Value::Object(None));
+        let old_now = pe_read_pinned(ctx, old_pin, old_val);
+        // Matches the JDK: `oldVal.equals(list.get(i))`, null-safe.
+        if !pe_values_equal(ctx, old_now, elem)? {
+            continue;
+        }
+        let list_now = ctx.read_native_pin(list_pin, list);
+        let new_now = pe_read_pinned(ctx, new_pin, new_val);
+        ctx.invoke_virtual(
+            list_now,
+            "set",
+            "(ILjava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Int(i), new_now],
+        )?;
+        changed = true;
+    }
+    Ok(Some(Value::Int(i32::from(changed))))
 }
 
 fn native_collections_ncopies(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2021,13 +2255,15 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(set))))
         },
     );
-    r.register(cu, "sort", "(Ljava/util/List;)V", native_noop); // overridden by native-collections
-    r.register(
-        cu,
-        "sort",
-        "(Ljava/util/List;Ljava/util/Comparator;)V",
-        native_noop,
-    ); // overridden by native-collections
+    // `Collections.sort(List)` / `sort(List, Comparator)` are deliberately NOT
+    // registered here. They used to be `native_noop` "overridden by
+    // native-collections" — and the override is real: `register_collections_natives`
+    // (native-collections `register_collections_utility_natives`) installs
+    // `native_collections_sort`/`native_collections_sort_comparator` and runs
+    // AFTER `register_builtins` in every VM init path (vm_init.rs synthetic and
+    // real-JDK arms alike), and `NativeMethodRegistry::register` is
+    // last-write-wins. So these two lines only ever pushed a no-op into the
+    // class-agnostic `by_method_desc` first-wins index.
     r.register(cu, "reverse", "(Ljava/util/List;)V", |ctx, args| {
         // Reverse an ArrayList in-place
         let list = match args.first() {
@@ -2577,11 +2813,30 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         r.register(cls, "registerNatives", "()V", native_noop);
     }
 
-    // jdk.internal.misc.Unsafe additional natives needed for class init
+    // jdk.internal.misc.Unsafe additional natives needed for class init.
+    //
+    // The three fences are REAL fences, not no-ops. They are the JMM primitives
+    // behind VarHandle release/acquire and the JDK's own lock-free code; a
+    // no-op is only accidentally correct on x86-TSO and still lets LLVM
+    // reorder the surrounding native accesses on every target. Orderings
+    // mirror the JDK contract: storeFence = StoreStore|LoadStore (release),
+    // loadFence = LoadLoad|LoadStore (acquire), fullFence = full barrier.
+    // (`unsafe_natives_ext::native_unsafe_fence` uses SeqCst for all three and
+    // is registered earlier in this same pass, so it only wins in real-JDK
+    // mode, where this function does not run.)
     let unsafe_cls = "jdk/internal/misc/Unsafe";
-    r.register(unsafe_cls, "storeFence", "()V", native_noop);
-    r.register(unsafe_cls, "loadFence", "()V", native_noop);
-    r.register(unsafe_cls, "fullFence", "()V", native_noop);
+    r.register(unsafe_cls, "storeFence", "()V", |_ctx, _args| {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        Ok(None)
+    });
+    r.register(unsafe_cls, "loadFence", "()V", |_ctx, _args| {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        Ok(None)
+    });
+    r.register(unsafe_cls, "fullFence", "()V", |_ctx, _args| {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    });
     r.register(
         unsafe_cls,
         "ensureClassInitialized0",
@@ -2591,6 +2846,15 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // jdk.internal.misc.CDS: CratonVM does not use HotSpot class-data sharing.
     // Report all dump/sharing modes disabled and make archive hooks no-ops.
+    //
+    // Every entry in this block is a spec-correct KEEP, not a stub: CDS is an
+    // optional HotSpot feature, and a JVM built or launched without it answers
+    // exactly this way. With `isDumpingClassList0`/`isDumpingArchive0`/
+    // `isSharingEnabled0` all false the JDK's own callers never consult an
+    // archive, so `initializeFromArchive` (fields stay at their <clinit>
+    // values), `defineArchivedModules` (the module graph is built normally),
+    // `logLambdaFormInvoker`, `dumpClassList` and `dumpDynamicArchive` are
+    // inert by definition rather than by omission.
     let cds_cls = "jdk/internal/misc/CDS";
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
@@ -2629,7 +2893,14 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         native_noop,
     );
 
-    // jdk.internal.misc.VM natives
+    // jdk.internal.misc.VM natives.
+    //
+    // `VM.initialize()` is a spec-correct KEEP in the same family as
+    // `registerNatives()`: everything HotSpot's counterpart publishes (the
+    // init level, the saved-properties snapshot, page/direct-buffer sizes) is
+    // already established by CratonVM's Rust bootstrap before any Java frame
+    // runs, and is served by the `initLevel`/`awaitInitLevel`/`getSavedProperty`
+    // natives immediately below. There is no VM state left for it to install.
     r.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);
     // WP1.3: VM.initLevel() reads the process-wide init-level registry
     // (see cratonvm_native_api::init_level).  Advances as the VM
@@ -2653,11 +2924,17 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // `getSavedProperty` must answer from the property store, not null. This
+    // registration runs after `register_essential_natives`' real one and is
+    // therefore the winner in synthetic mode, so it has to BE the real one —
+    // the previous always-null closure silently blanked every saved property
+    // (`java.home`, `sun.jnu.encoding`, …) that JDK bootstrap code reads
+    // through `VM.getSavedProperty`.
     r.register(
         "jdk/internal/misc/VM",
         "getSavedProperty",
         "(Ljava/lang/String;)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        crate::lang_system::native_vm_get_saved_property,
     );
     r.set_category(__vm_prev_cat);
 
@@ -6359,7 +6636,7 @@ pub(crate) fn register_identity_hashmap_natives(r: &mut NativeMethodRegistry) {
         });
         Ok(Some(Value::Int(if this_ptr == other_ptr { 1 } else { 0 })))
     });
-    r.register(c, "hashCode", "()I", native_return_zero);
+    r.register(c, "hashCode", "()I", native_identity_hashmap_hash_code);
     r.register(c, "clone", "()Ljava/lang/Object;", native_em_clone);
     r.register(
         c,
@@ -6368,6 +6645,62 @@ pub(crate) fn register_identity_hashmap_natives(r: &mut NativeMethodRegistry) {
         cratonvm_native_collections::native_map_to_string_pub,
     );
     r.set_category(__prev_cat);
+}
+
+/// `IdentityHashMap.hashCode()` — the sum over entries of
+/// `identityHashCode(key) ^ identityHashCode(value)`, matching JDK 25's
+/// `IdentityHashMap#hashCode` (which deliberately uses identity hashes, not
+/// the keys' own `hashCode`, so it pairs with the identity `equals` above).
+///
+/// A constant 0 made every IdentityHashMap hash-equal, so a HashMap keyed by
+/// IdentityHashMaps collapsed into a single bucket and `Objects.hash(map)`
+/// carried no information at all.
+fn native_identity_hashmap_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let this_pin = ctx.pin_native_root(this);
+    let result = ihm_hash_code_inner(ctx, this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
+fn ihm_hash_code_inner(
+    ctx: &mut dyn NativeContext,
+    this_pin: usize,
+    this: ObjectRef,
+) -> MethodCallResult {
+    let this_now = ctx.read_native_pin(this_pin, this);
+    // Reuse the same entry view the sibling registrations delegate to, so the
+    // side-table-backed HashMap state is seen (a hand-rolled bucket walk here
+    // would miss it entirely).
+    let keys = cratonvm_native_collections::native_map_keys_as_array(ctx, Some(this_now));
+    let keys_pin = ctx.pin_native_root(keys);
+    let len = ctx.array_length(keys);
+    let mut hash = 0i32;
+    for i in 0..len {
+        let keys_now = ctx.read_native_pin(keys_pin, keys);
+        let key = ctx.get_array_element(keys_now, i);
+        let key_pin = pe_pin_value(ctx, key);
+        let key_hash = match key {
+            Value::Object(Some(k)) => ctx.identity_hash_code(k),
+            _ => 0,
+        };
+        // `get` dispatches the key's hashCode/equals, i.e. arbitrary bytecode.
+        let this_now = ctx.read_native_pin(this_pin, this);
+        let key_now = pe_read_pinned(ctx, key_pin, key);
+        let value = cratonvm_native_collections::native_map_get_pub(
+            ctx,
+            &[Value::Object(Some(this_now)), key_now],
+        )?;
+        let value_hash = match value {
+            Some(Value::Object(Some(v))) => ctx.identity_hash_code(v),
+            _ => 0,
+        };
+        hash = hash.wrapping_add(key_hash ^ value_hash);
+    }
+    Ok(Some(Value::Int(hash)))
 }
 
 // ---------------------------------------------------------------------------
@@ -18273,10 +18606,52 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    // HttpURLConnection instance setters — our synthetic HUC doesn't
-    // track timeouts beyond defaults. NEW-6: documented no-op.
-    r.register(huc, "setConnectTimeout", "(I)V", native_noop_with_this);
-    r.register(huc, "setReadTimeout", "(I)V", native_noop_with_this);
+    // HttpURLConnection instance setters. These were `native_noop_with_this`,
+    // and because `register_phase54_net_extras` runs AFTER
+    // `http_url_connection::register_http_url_connection_real` (see the
+    // residual-4 note above) the no-ops WON: a caller's
+    // `setConnectTimeout(1234)` / `setReadTimeout(5678)` was discarded and the
+    // matching getter reported the unset default. Record the values on the
+    // carrier's free slots and serve the getters from them; `p54_huc_do_request`
+    // applies the read timeout to the socket.
+    r.register(huc, "setConnectTimeout", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if v < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "timeout can not be negative".to_string(),
+            }
+            .into());
+        }
+        p54_huc_set_slot(ctx, this, P54_HUC_CONNECT_TIMEOUT, Value::Int(v));
+        Ok(None)
+    });
+    r.register(huc, "getConnectTimeout", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = p54_huc_get_slot(ctx, this, P54_HUC_CONNECT_TIMEOUT)
+            .as_int()
+            .unwrap_or(0);
+        Ok(Some(Value::Int(v)))
+    });
+    r.register(huc, "setReadTimeout", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if v < 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "timeout can not be negative".to_string(),
+            }
+            .into());
+        }
+        p54_huc_set_slot(ctx, this, P54_HUC_READ_TIMEOUT, Value::Int(v));
+        Ok(None)
+    });
+    r.register(huc, "getReadTimeout", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = p54_huc_get_slot(ctx, this, P54_HUC_READ_TIMEOUT)
+            .as_int()
+            .unwrap_or(0);
+        Ok(Some(Value::Int(v)))
+    });
     r.register(
         huc,
         "getResponseMessage",
@@ -18314,31 +18689,55 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/io/InputStream;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
-    // More HUC instance setters. NEW-6: documented no-op.
-    r.register(
-        huc,
-        "setInstanceFollowRedirects",
-        "(Z)V",
-        native_noop_with_this,
-    );
-    r.register(huc, "setUseCaches", "(Z)V", native_noop_with_this);
+    // More HUC instance setters — same shadowing story as the timeouts above.
+    r.register(huc, "setInstanceFollowRedirects", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+        p54_huc_set_slot(
+            ctx,
+            this,
+            P54_HUC_NO_REDIRECTS,
+            Value::Int(i32::from(v == 0)),
+        );
+        Ok(None)
+    });
+    r.register(huc, "getInstanceFollowRedirects", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let disabled = p54_huc_get_slot(ctx, this, P54_HUC_NO_REDIRECTS)
+            .as_int()
+            .unwrap_or(0);
+        Ok(Some(Value::Int(i32::from(disabled == 0))))
+    });
+    r.register(huc, "setUseCaches", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(1);
+        p54_huc_set_slot(ctx, this, P54_HUC_NO_CACHES, Value::Int(i32::from(v == 0)));
+        Ok(None)
+    });
+    r.register(huc, "getUseCaches", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let disabled = p54_huc_get_slot(ctx, this, P54_HUC_NO_CACHES)
+            .as_int()
+            .unwrap_or(0);
+        Ok(Some(Value::Int(i32::from(disabled == 0))))
+    });
     r.register(
         huc,
         "setFixedLengthStreamingMode",
         "(I)V",
-        native_noop_with_this,
+        p54_huc_set_fixed_length_streaming_mode,
     );
     r.register(
         huc,
         "setFixedLengthStreamingMode",
         "(J)V",
-        native_noop_with_this,
+        p54_huc_set_fixed_length_streaming_mode,
     );
     r.register(
         huc,
         "setChunkedStreamingMode",
         "(I)V",
-        native_noop_with_this,
+        p54_huc_set_chunked_streaming_mode,
     );
 
     // HTTP response code constants
@@ -18443,6 +18842,110 @@ pub(crate) fn register_phase54_net_extras(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+// ---------------------------------------------------------------------------
+// Connection settings on the synthetic HttpURLConnection carrier.
+//
+// `net_phase_e`'s `URL.openConnection` allocates the carrier with 16 slots but
+// its layout only uses 0..=9 (url/method/code/fd/reqHeaders/respHeaders/body/
+// doInput/doOutput/connected), so 10..=15 are free. 10 and 11 deliberately
+// match `http_url_connection.rs`'s HUC_CONNECT_TIMEOUT / HUC_READ_TIMEOUT, so
+// the two synthetic HUC layouts in the tree agree at least on the timeouts.
+// ---------------------------------------------------------------------------
+const P54_HUC_CONNECT_TIMEOUT: usize = 10;
+const P54_HUC_READ_TIMEOUT: usize = 11;
+/// 1 = the flag was explicitly turned OFF. An unwritten slot decodes as
+/// `Int(0)` (VTAG_INT is the zero tag), so both booleans are stored NEGATED —
+/// that keeps the JDK default (`true`) for a carrier nobody configured, which
+/// a straight 0/1 encoding could not express.
+const P54_HUC_NO_REDIRECTS: usize = 12;
+const P54_HUC_NO_CACHES: usize = 13;
+/// `Long` = the configured streaming length / chunk size. Anything else (an
+/// unwritten `Int(0)` slot) means "not set", which is how the two modes detect
+/// each other the way `URLConnection`'s `-1` sentinels do.
+const P54_HUC_FIXED_LENGTH: usize = 14;
+const P54_HUC_CHUNK_LENGTH: usize = 15;
+
+/// Slot write guarded on the receiver's width: `java/net/HttpURLConnection`
+/// carries two different synthetic layouts in this tree (this file's 16-slot
+/// one and `http_url_connection.rs`'s 12-slot one), so a narrower carrier must
+/// drop the write rather than run off the end of the object.
+fn p54_huc_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, value: Value) {
+    if ctx.object_num_fields(this) > slot {
+        ctx.set_field(this, slot, value);
+    }
+}
+
+fn p54_huc_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+    if ctx.object_num_fields(this) > slot {
+        ctx.get_field(this, slot)
+    } else {
+        Value::Int(0)
+    }
+}
+
+/// `setFixedLengthStreamingMode(int|long)` — record the promised body length
+/// and raise the two exceptions the method specifies. The request path still
+/// buffers the body and derives `Content-Length` from it (same trade-off
+/// `http_url_connection.rs` documents for its own carrier), so the recorded
+/// length only has to be observable and mutually exclusive with the chunked
+/// setting. The "already connected" `IllegalStateException` is deliberately
+/// NOT raised: the connected flag lives at slot 9 in this layout but means
+/// `instanceFollowRedirects` in the other one, so the check cannot be made
+/// safely from a native registered on the shared class.
+fn p54_huc_set_fixed_length_streaming_mode(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let length = match args.get(1) {
+        Some(Value::Int(v)) => *v as i64,
+        Some(Value::Long(v)) => *v,
+        _ => {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: "invalid content length".to_string(),
+            }
+            .into())
+        }
+    };
+    if length < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "invalid content length".to_string(),
+        }
+        .into());
+    }
+    if matches!(
+        p54_huc_get_slot(ctx, this, P54_HUC_CHUNK_LENGTH),
+        Value::Long(_)
+    ) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Chunked encoding streaming mode set".to_string(),
+        }
+        .into());
+    }
+    p54_huc_set_slot(ctx, this, P54_HUC_FIXED_LENGTH, Value::Long(length));
+    Ok(None)
+}
+
+/// `setChunkedStreamingMode(int)` — the mirror image of the above.
+fn p54_huc_set_chunked_streaming_mode(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let chunk = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+    if matches!(
+        p54_huc_get_slot(ctx, this, P54_HUC_FIXED_LENGTH),
+        Value::Long(_)
+    ) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Fixed length streaming mode set".to_string(),
+        }
+        .into());
+    }
+    p54_huc_set_slot(ctx, this, P54_HUC_CHUNK_LENGTH, Value::Long(chunk as i64));
+    Ok(None)
+}
+
 /// Perform a real HTTP/1.1 request for HttpURLConnection.
 /// Connects via fd_table TCP, sends request, reads and parses the full response.
 fn p54_huc_do_request(
@@ -18525,6 +19028,22 @@ fn p54_huc_do_request(
     };
     ctx.set_field(this, 3, Value::Int(fd_id as i32));
 
+    // Honour `setReadTimeout(ms)`. Without it the response loop below blocks
+    // until the peer closes, which is what made the setter look harmless.
+    // 0 (the JDK default, and an unconfigured slot) still means "no timeout".
+    // The connect timeout can only be recorded for now — `FileDescriptorTable`
+    // has no connect-with-timeout entry point, so `open_tcp_connect` above
+    // still uses the OS default. FOLLOW-UP: add one and pass it through here.
+    let read_timeout_ms = p54_huc_get_slot(ctx, this, P54_HUC_READ_TIMEOUT)
+        .as_int()
+        .unwrap_or(0);
+    if read_timeout_ms > 0 {
+        let _ = ctx.fd_table().tcp_set_read_timeout(
+            fd_id,
+            Some(std::time::Duration::from_millis(read_timeout_ms as u64)),
+        );
+    }
+
     // Build HTTP/1.1 request
     let request_line = format!("{} {}{} HTTP/1.1\r\n", method, path, query);
     let mut request = request_line;
@@ -18567,7 +19086,28 @@ fn p54_huc_do_request(
         match ctx.fd_table().tcp_read(fd_id, &mut chunk) {
             Ok(0) => break,
             Ok(n) => response_buf.extend_from_slice(&chunk[..n]),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            // An expired read timeout surfaces as WouldBlock (POSIX) or
+            // TimedOut (Windows). Neither can occur on the blocking socket we
+            // get when no timeout was configured, so the historical
+            // "treat as end of response" behaviour is preserved for that case
+            // and only an explicitly configured timeout throws — silently
+            // truncating the body would be worse than the original no-op.
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if read_timeout_ms > 0 {
+                    let _ = ctx.fd_table().close(fd_id);
+                    ctx.set_field(this, 3, Value::Int(-1));
+                    return Err(RuntimeError::SocketTimeoutException {
+                        message: "Read timed out".to_string(),
+                    }
+                    .into());
+                }
+                break;
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
             Err(e) => {
                 let _ = ctx.fd_table().close(fd_id);

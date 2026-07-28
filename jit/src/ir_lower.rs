@@ -3341,6 +3341,50 @@ mod tests {
         unsafe { std::mem::zeroed() }
     }
 
+    /// Regression witness (2026-07-27): NO rel32 patch site in this file may
+    /// `expect`/`unwrap` its `try_patch_*` result.
+    ///
+    /// `ExecutableBuffer::emit` is non-panicking — on capacity exhaustion it
+    /// sets a sticky `overflowed` flag and DROPS the write, so recorded patch
+    /// offsets stop addressing their placeholder bytes and `try_patch_i32`
+    /// legitimately fails (setting the flag itself). `lower_inner` is built for
+    /// exactly that: its `if buf.overflowed() { return None }` bail discards the
+    /// artifact and the caller falls back to the single-pass backend. An
+    /// `expect` at a patch site turns that recoverable fallback into a
+    /// compile-thread panic, which in a release VM is
+    /// `fatal runtime error: failed to initiate panic` → SIGABRT of the whole
+    /// process. See `patch_rel32_to_here`'s doc comment for the same argument.
+    ///
+    /// How this was found: lifting the blanket `org/junit/` JIT ban aborted
+    /// 58 of 60 real Elasticsearch test classes, every one at
+    /// `emit_call_exc_stub`'s `expect("call-exc JE patch in-bounds")`. Thirteen
+    /// sites in this file still had that shape; they now use `.ok()`, matching
+    /// what `jit/src/x64.rs` has always done. Asserting on the source keeps a
+    /// future site from silently reintroducing the abort — a behavioural test
+    /// cannot reach these emitters without a graph large enough to overflow
+    /// `lower_inner`'s own buffer estimate, which is exactly the condition the
+    /// estimate exists to prevent.
+    #[test]
+    fn no_patch_site_panics_on_an_overflowed_buffer() {
+        let src = include_str!("ir_lower.rs");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                (t.starts_with(".expect(") || t.starts_with(".unwrap("))
+                    && l.contains("patch")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "patch sites must swallow the error and let `lower_inner`'s \
+             `buf.overflowed()` bail fall back to single-pass, not panic \
+             (use `.ok()`); offenders: {offenders:?}",
+        );
+    }
+
     #[test]
     fn live_new_uses_shared_allocation_stub_and_context_abi() {
         extern "C" fn allocate(vm: i64, class_id: i64, num_fields: i64) -> i64 {

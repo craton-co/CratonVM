@@ -49,9 +49,8 @@ regression gates.
 ## 2026-07-03 (later) — re-tested against `fix/interp-local-liveness` (dev `7b662188`): residual UNCHANGED, not the same bug
 
 Dev landed a real, separate, verified fix in this window
-(`abca7a25` + `c224e1a9`, doc:
-`docs/internal/fixed-suite-bugs/g1-parallel-evac-persistent-forwarding-root-remap.md` §"interpreter
-retention imprecision RESOLVED") for an *unbounded-retention* interpreter
+(`abca7a25` + `c224e1a9`, "interpreter retention imprecision RESOLVED",
+part of the G1 parallel-evac persistent-forwarding root-remap fix) for an *unbounded-retention* interpreter
 root-scan gap: `lstore`/`dstore` left the cat-2 reservation slot `i+1`
 holding a stale object reference, keeping it a GC root forever, plus a new
 per-bci liveness filter (`runtime/local_liveness.rs`,

@@ -1989,23 +1989,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // `setEnabledCipherSuites` call — this synthetic socket has no
     // set-side storage, so `set*` below are accepted but not persisted).
     fn ssl_sock_supported_cipher_suites(ctx: &mut dyn NativeContext) -> ObjectRef {
-        let suites = [
-            "TLS_AES_128_GCM_SHA256",
-            "TLS_AES_256_GCM_SHA384",
-            "TLS_CHACHA20_POLY1305_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-            // T-CBC.1: real CBC-mode suites, see t27_tls_cbc /
-            // docs/known-issues/springboot/rustls-cbc-cipher-suites-not-supported.md
-            "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
-            "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
-        ];
+        // Single source of truth — see `t27_tls::SUPPORTED_CIPHER_SUITE_NAMES`.
+        let suites = crate::t27_tls::SUPPORTED_CIPHER_SUITE_NAMES;
         let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
         for (i, &s) in suites.iter().enumerate() {
             let so = ctx.create_string(s);
@@ -2122,12 +2107,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // if one hasn't run yet — this socket may still be pending (see
             // `createSocket(Socket wrapped, ...)`'s doc comment).
             let fd_id = ensure_layered_handshake_started(ctx, this)?;
-            if crate::nbflags().dbg_tls_sock {
+            if crate::nbflags().dbg_tls_sock || crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
-                    "[dbg-tls-sock] thread={:?} getInputStream sock={:?} tls_id={}",
-                    std::thread::current().id(),
-                    this,
-                    fd_id
+                    "[dbg-tls-auth] SSLSocket.getInputStream sock={:?} tls_id={}",
+                    this, fd_id
                 );
             }
             // Return an InputStream that reads from the TLS fd
@@ -2136,6 +2119,32 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // Preserve the TLS id in the identity-keyed socket side table too.
             crate::net_phase_e::sock_set_for_create(ctx, is, 0, fd_id);
             ctx.set_field(is, 0, Value::Int(fd_id));
+            // INVESTIGATED AND REVERTED (tls-handshake-enforcement-gap, doc
+            // 21 — `TestSsl.testPost`): wrapping this in a real
+            // `java.io.BufferedInputStream`, so that a single-byte `read()`
+            // becomes bytecode over a Java `byte[]` instead of a native call.
+            // That is the shape real JSSE's `SSLSocketImpl$AppInputStream`
+            // has, and `testPost` reads 16 MiB one byte at a time on each of
+            // 8 threads (~134 million reads), so it looked like the obvious
+            // win. Measured: it made things WORSE — 368 s unwrapped vs >700 s
+            // (test timeout) wrapped.
+            //
+            // Why, from a `--stack-dump-on-timeout=120` capture: all 8 client
+            // threads sit in `BufferedInputStream.read`/`fill`/`getBufIfOpen`
+            // with `blocked=false` and a DIFFERENT pc in each dump — real
+            // progress, just too slow — while the Tomcat exec threads block in
+            // `doWrite` waiting for them to drain. JDK 25's
+            // `BufferedInputStream.read()` takes its `InternalLock` (or
+            // `synchronized`) on EVERY call, so per byte it costs an AQS
+            // lock/unlock plus interpreted bytecode, which on this VM is
+            // dearer than the one native call it replaces.
+            //
+            // The per-byte cost here is the Java->native transition itself,
+            // not the work behind it: a native-side readahead
+            // (`servlet::s2_tls_fill_readahead`) removes the rustls and
+            // registry work from every byte and only bought ~15%. Closing the
+            // rest needs cheaper native dispatch, which is the pre-existing
+            // throughput-wall work, not a TLS fix.
             Ok(Some(Value::Object(Some(is))))
         },
     );
@@ -2344,25 +2353,40 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         if tls_id < 0 {
             return Ok(Some(Value::Int(-1)));
         }
-        let mut buf = [0u8; 1];
+        // FIX (tls-handshake-enforcement-gap, doc 21 — TestSsl hang): serve
+        // from the shared plaintext readahead when possible. Reading a single
+        // byte through the full native path (blocking-region bracket +
+        // registry lock + per-call rustls plumbing) costs microseconds, and a
+        // caller that reads a multi-megabyte body a byte at a time —
+        // `TestSsl.testPost` reads 16 MiB per thread on 8 threads, ~134
+        // million calls — turned that into minutes. Real JSSE serves these
+        // out of a plain Java `byte[]`. See `servlet::s2_tls_fill_readahead`
+        // for why the buffer is keyed by stream id.
+        if let Some(b) = crate::servlet::s2_tls_pop_buffered_byte(tls_id) {
+            return Ok(Some(Value::Int(b as i32)));
+        }
         // STW-COOPERATION (tomcatservletwebserverfactorytests-stw-takeover-hang):
-        // `s2_tls_read`/`s2_tls_write` do a genuine OS-level blocking socket
-        // operation. Without the blocked-region bracket this thread stays
-        // counted as a cooperative mutator that can never reach a safepoint
-        // poll, so a concurrent STW (GC / cross-thread JIT takeover) waits on
-        // it forever — and the bytes it waits for are produced by a peer
-        // thread in this same process (Tomcat's NioEndpoint SocketProcessor)
-        // which DOES stop at the barrier: a mutual deadlock, observed as
-        // `rounds=64 pending=1 taken=0` repeating with no further progress.
-        // Same bug shape as the `net_phase_e` HttpClient and S2 selector
-        // fixes; see `docs/internal/fixed-suite-bugs/keycloak/
+        // the refill does a genuine OS-level blocking socket operation.
+        // Without the blocked-region bracket this thread stays counted as a
+        // cooperative mutator that can never reach a safepoint poll, so a
+        // concurrent STW (GC / cross-thread JIT takeover) waits on it forever
+        // — and the bytes it waits for are produced by a peer thread in this
+        // same process (Tomcat's NioEndpoint SocketProcessor) which DOES stop
+        // at the barrier: a mutual deadlock, observed as `rounds=64 pending=1
+        // taken=0` repeating with no further progress. Same bug shape as the
+        // `net_phase_e` HttpClient and S2 selector fixes; see
+        // `docs/internal/fixed-suite-bugs/keycloak/
         // keycloak-model-stw-takeover-hang-eventloopgroup-shutdown-FIXED.md`.
         ctx.begin_blocking_region();
-        let read_result = crate::servlet::s2_tls_read(tls_id, &mut buf);
+        let filled = crate::servlet::s2_tls_fill_readahead(tls_id);
         ctx.end_blocking_region();
-        match read_result {
+        match filled {
             Ok(0) => Ok(Some(Value::Int(-1))),
-            Ok(_) => Ok(Some(Value::Int(buf[0] as i32))),
+            Ok(_) => Ok(Some(Value::Int(
+                crate::servlet::s2_tls_pop_buffered_byte(tls_id)
+                    .map(|b| b as i32)
+                    .unwrap_or(-1),
+            ))),
             Err(e) => Err(RuntimeError::IOException {
                 message: e.to_string(),
             }
@@ -2427,11 +2451,26 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             .into()),
         }
     });
-    r.register(ssl_is, "available", "()I", |_ctx, _args| {
+    r.register(ssl_is, "available", "()I", |ctx, args| {
         // native-tls does not expose a non-blocking peek, so match the
         // reference JDK behaviour of reporting 0 bytes readable without
-        // blocking.
-        Ok(Some(Value::Int(0)))
+        // blocking — EXCEPT for plaintext already pulled off the socket into
+        // this stream's readahead (see `servlet::s2_tls_fill_readahead`),
+        // which is readable without blocking by definition and must be
+        // reported, or a caller that loops on `available()` would stall on
+        // bytes it has effectively already received.
+        let this = obj_arg(args, 0)?;
+        let tls_id = ctx
+            .get_field(this, 0)
+            .as_int()
+            .filter(|id| *id >= 0)
+            .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
+        if tls_id < 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        Ok(Some(Value::Int(
+            crate::servlet::s2_tls_buffered_len(tls_id) as i32,
+        )))
     });
     r.register(ssl_is, "close", "()V", |_ctx, _args| Ok(None));
 

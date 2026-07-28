@@ -550,12 +550,15 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     let this = ctx.read_native_pin(this_pin, this);
                     ctx.set_field(this, next_slot, old_head);
                     let q = ctx.read_native_pin(queue_pin, q);
-                    let size = match ctx.get_field(q, RQ_FIELD_SIZE) {
-                        Value::Int(v) => v,
-                        _ => 0,
-                    };
+                    // See `native_rq_poll`: preserve the slot's stored width.
+                    let old_size = ctx.get_field(q, RQ_FIELD_SIZE);
                     let q = ctx.read_native_pin(queue_pin, q);
-                    ctx.set_field(q, RQ_FIELD_SIZE, Value::Int(size + 1));
+                    let new_size = match old_size {
+                        Value::Long(v) => Value::Long(v + 1),
+                        Value::Int(v) => Value::Int(v + 1),
+                        _ => Value::Int(1),
+                    };
+                    ctx.set_field(q, RQ_FIELD_SIZE, new_size);
                     let this = ctx.read_native_pin(this_pin, this);
                     // Mark as enqueued — sentinel Int(1) distinguishes from
                     // never having had a queue.
@@ -660,12 +663,19 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
                     ctx.set_field(ref_obj, REF_FIELD_QUEUE, Value::Object(None));
                     let this = ctx.read_native_pin(this_pin, this);
-                    let size = match ctx.get_field(this, RQ_FIELD_SIZE) {
-                        Value::Int(v) => v,
-                        _ => 0,
-                    };
+                    // Slot 1 is `size` in the synthetic two-slot shape but
+                    // `queueLength` — a `long` — on a real JDK ReferenceQueue,
+                    // whose own `enqueue0` bytecode reads it back. Preserve the
+                    // stored width so a native poll can never leave an `int`
+                    // sitting in a `long` field.
+                    let old_size = ctx.get_field(this, RQ_FIELD_SIZE);
                     let this = ctx.read_native_pin(this_pin, this);
-                    ctx.set_field(this, RQ_FIELD_SIZE, Value::Int((size - 1).max(0)));
+                    let new_size = match old_size {
+                        Value::Long(v) => Value::Long((v - 1).max(0)),
+                        Value::Int(v) => Value::Int((v - 1).max(0)),
+                        _ => Value::Int(0),
+                    };
+                    ctx.set_field(this, RQ_FIELD_SIZE, new_size);
                     let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
                     Ok(Some(Value::Object(Some(ref_obj))))
                 })();

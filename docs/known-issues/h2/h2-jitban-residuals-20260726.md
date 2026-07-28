@@ -556,7 +556,7 @@ cd apps/h2database-suite-runner
 ./run-h2-suite.sh discover          # required in a fresh worktree; meta/ is not committed
 ONLY='TestStreamStore|TestFreeSpace|TestNestedJoins'
 TMPDIR=/data/tmp H2_ROOT=/data/data/h2database/h2 CRATONVM_BIN=<binary> \
-  CRATONVM_JIT_ALLOW_PACKAGES='org/h2/,org/antlr/v4/runtime/' \
+  CRATONVM_JIT_ALLOW_PACKAGES='org/h2/' \
   OUTROOT=<out> ./run-h2-suite.sh run --category all --only "$ONLY" --tag lifted
 ```
 
@@ -584,7 +584,8 @@ re-runs.
   2026-07-04 decision the dead-mask refinement is careful to preserve.
 - `docs/known-issues/jit-bans/jit-ban-sweep-consolidated-status-20260726.md` — the sweep this came out of.
 - `docs/known-issues/jit-bans/full-ban-inventory-status-20260726.md` — the cross-session ban tracker.
-- `docs/known-issues/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` — the
-  `org/antlr/v4/runtime/` half of this same ban, isolated clean by a concurrent
-  session; the H2 suite never exercises ANTLR, so that half remains the
-  better-evidenced candidate for narrowing.
+- `docs/internal/jit-bans/hib-antlr-1-removed-shadowed-20260726.md` — the
+  `org/antlr/v4/runtime/` half of this same ban. **Removed 2026-07-27**: the
+  H2 suite never exercises ANTLR, and a 57-class Hibernate HQL A/B came back
+  equivalent. HIB-LONGTAIL.1 is `org/h2/`-only now, so the three residuals
+  below are all that is left of it.
