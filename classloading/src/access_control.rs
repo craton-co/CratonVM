@@ -719,6 +719,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         id
     }
@@ -1062,6 +1063,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         id
     }
@@ -1672,6 +1674,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         id
     }

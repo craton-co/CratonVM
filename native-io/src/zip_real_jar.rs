@@ -11,13 +11,9 @@
 //! `getEntry(String)`, `entries()`, and `getInputStream(ZipEntry)`
 //! calls look up the archive by handle.
 //!
-//! `ZipEntry` is represented with two stable synthetic slots that
-//! any of our natives can introspect:
-//!   slot 0: String name
-//!   slot 1: Long method (DEFLATED=8 / STORED=0)
-//!   slot 2: Long size (uncompressed)
-//!   slot 3: Long compressedSize
-//!   slot 4: Long crc32
+//! Real JDK `ZipEntry` objects are populated by field name. Synthetic-JDK
+//! fallback objects retain the compact five-slot layout used by the older
+//! native ZIP bridge.
 //!
 //! `getInputStream(ZipEntry)` returns a `java.io.ByteArrayInputStream`
 //! populated with the inflated bytes — this sidesteps the need for
@@ -449,6 +445,10 @@ fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let size = entry.size() as i64;
     let csize = entry.compressed_size() as i64;
     let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
+    let extra = entry
+        .extra_data()
+        .filter(|bytes| !bytes.is_empty())
+        .map(ToOwned::to_owned);
     // Round-9 HIGH: do NOT collapse non-Deflate methods to DEFLATED(8).
     // A previous shortcut returned 8 for every non-stored method; later
     // code paths that select an inflate decompressor based on `method`
@@ -469,6 +469,7 @@ fn native_jarfile_get_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         size,
         csize,
         crc,
+        extra,
         times,
     )?))))
 }
@@ -513,11 +514,11 @@ fn alloc_zip_entry(
     size: i64,
     csize: i64,
     crc: i64,
+    extra: Option<Vec<u8>>,
     times: ZipEntryTimes,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    // Materialize FileTime objects before allocating the ZipEntry: each Java
-    // allocation is a GC point, so this avoids retaining an unpinned entry
-    // reference across an allocation.
+    // Materialize every allocation-prone value before allocating the ZipEntry.
+    // This keeps the fresh entry out of a bare native local across a GC point.
     let mtime = times
         .modified
         .map(|time| zip_filetime(ctx, time))
@@ -530,40 +531,63 @@ fn alloc_zip_entry(
         .creation
         .map(|time| zip_filetime(ctx, time))
         .transpose()?;
-    let entry = match ctx.ensure_class_initialized("java/util/zip/ZipEntry") {
+    let name_str = ctx.create_string(name);
+    let extra = extra.map(|bytes| {
+        let array = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        ctx.write_byte_array_from(array, 0, &bytes);
+        array
+    });
+    let (entry, real_layout) = match ctx.ensure_class_initialized("java/util/zip/ZipEntry") {
         Ok(cid) => {
             let real = ctx.class_num_total_fields(cid);
-            ctx.alloc_object(cid, real.max(6))
+            (
+                ctx.alloc_object(cid, real.max(6)),
+                ctx.resolve_field_index_by_class_id(cid, "xdostime")
+                    .is_some(),
+            )
         }
-        Err(_) => ctx.alloc_object(ClassId::new(0), 6),
+        Err(_) => (ctx.alloc_object(ClassId::new(0), 6), false),
     };
-    // Synthetic slots 0..4
-    let name_str = ctx.create_string(name);
-    ctx.set_field(entry, 0, Value::Object(Some(name_str)));
-    ctx.set_field(entry, 1, Value::Long(method));
-    ctx.set_field(entry, 2, Value::Long(size));
-    ctx.set_field(entry, 3, Value::Long(csize));
-    ctx.set_field(entry, 4, Value::Long(crc));
-    // Dual-write real JDK field names.
-    ctx.set_field_by_name(entry, "name", Value::Object(Some(name_str)));
-    ctx.set_field_by_name(entry, "method", Value::Int(method as i32));
-    ctx.set_field_by_name(entry, "size", Value::Long(size));
-    ctx.set_field_by_name(entry, "csize", Value::Long(csize));
-    ctx.set_field_by_name(entry, "crc", Value::Long(crc));
-    if let Some(time) = mtime {
-        ctx.set_field_by_name(entry, "mtime", Value::Object(Some(time)));
-    }
-    if let Some(time) = atime {
-        ctx.set_field_by_name(entry, "atime", Value::Object(Some(time)));
-    }
-    if let Some(time) = ctime {
-        ctx.set_field_by_name(entry, "ctime", Value::Object(Some(time)));
+    if real_layout {
+        // Do not dual-write synthetic slots here: in the real JDK layout slot
+        // 1 is `xdostime`, not `method`. The old write of `method` to slot 1
+        // made every native ZipFile entry report a DOS date in 1979.
+        ctx.set_field_by_name(entry, "name", Value::Object(Some(name_str)));
+        ctx.set_field_by_name(entry, "method", Value::Int(method as i32));
+        ctx.set_field_by_name(entry, "size", Value::Long(size));
+        ctx.set_field_by_name(entry, "csize", Value::Long(csize));
+        ctx.set_field_by_name(entry, "crc", Value::Long(crc));
+        if let Some(extra) = extra {
+            ctx.set_field_by_name(entry, "extra", Value::Object(Some(extra)));
+        }
+        if let Some(dos_time) = times.dos_time {
+            ctx.set_field_by_name(entry, "xdostime", Value::Long(dos_time));
+        }
+        if let Some(time) = mtime {
+            ctx.set_field_by_name(entry, "mtime", Value::Object(Some(time)));
+        }
+        if let Some(time) = atime {
+            ctx.set_field_by_name(entry, "atime", Value::Object(Some(time)));
+        }
+        if let Some(time) = ctime {
+            ctx.set_field_by_name(entry, "ctime", Value::Object(Some(time)));
+        }
+    } else {
+        // Compact synthetic-JDK fallback: name, method, size, csize, crc.
+        ctx.set_field(entry, 0, Value::Object(Some(name_str)));
+        ctx.set_field(entry, 1, Value::Long(method));
+        ctx.set_field(entry, 2, Value::Long(size));
+        ctx.set_field(entry, 3, Value::Long(csize));
+        ctx.set_field(entry, 4, Value::Long(crc));
     }
     Ok(entry)
 }
 
 #[derive(Clone, Copy, Default)]
 struct ZipEntryTimes {
+    /// The central-directory DOS timestamp packed as `(date << 16) | time`.
+    /// `ZipEntry.getTime()` uses this when no higher-precision `mtime` exists.
+    dos_time: Option<i64>,
     modified: Option<i64>,
     access: Option<i64>,
     creation: Option<i64>,
@@ -574,6 +598,9 @@ struct ZipEntryTimes {
 /// metadata, may be the 1980 fallback while the real values live in 0x5455.
 fn zip_entry_times(entry: &zip::read::ZipFile<'_>) -> ZipEntryTimes {
     let mut times = ZipEntryTimes::default();
+    times.dos_time = entry
+        .last_modified()
+        .map(|time| (i64::from(time.datepart()) << 16) | i64::from(time.timepart()));
     for field in entry.extra_data_fields() {
         merge_zip_entry_times(&mut times, zip_extra_field_times(field));
     }
@@ -586,11 +613,13 @@ fn zip_extra_field_times(field: &ExtraField) -> ZipEntryTimes {
             modified: timestamp.mod_time().map(|time| i64::from(time) * 1_000),
             access: timestamp.ac_time().map(|time| i64::from(time) * 1_000),
             creation: timestamp.cr_time().map(|time| i64::from(time) * 1_000),
+            ..ZipEntryTimes::default()
         },
         ExtraField::Ntfs(timestamp) => ZipEntryTimes {
             modified: Some(windows_filetime_to_unix_millis(timestamp.mtime())),
             access: Some(windows_filetime_to_unix_millis(timestamp.atime())),
             creation: Some(windows_filetime_to_unix_millis(timestamp.ctime())),
+            ..ZipEntryTimes::default()
         },
     }
 }
@@ -817,7 +846,7 @@ fn build_byte_array_input_stream(
 /// native rather than falling through to real bytecode.
 fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let handle = get_jar_handle(ctx, this);
-    let entries: Vec<(String, i64, i64, i64, i64, ZipEntryTimes)> = {
+    let entries: Vec<(String, i64, i64, i64, i64, Option<Vec<u8>>, ZipEntryTimes)> = {
         let mut table = jar_table().lock();
         let state = match table.get_mut(&handle) {
             Some(s) => s,
@@ -854,6 +883,10 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                 // Round-9 HIGH: real ZIP method code, not a DEFLATED stand-in.
                 // See `compression_method_code` for the mapping rationale.
                 let method: i64 = compression_method_code(&f.compression());
+                let extra = f
+                    .extra_data()
+                    .filter(|bytes| !bytes.is_empty())
+                    .map(ToOwned::to_owned);
                 let mut times = zip_entry_times(&f);
                 merge_zip_entry_times(&mut times, zip_local_entry_times(&state.path, &f));
                 v.push((
@@ -862,6 +895,7 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
                     f.size() as i64,
                     f.compressed_size() as i64,
                     f.crc32() as i64 & 0xFFFF_FFFFi64,
+                    extra,
                     times,
                 ));
             }
@@ -879,8 +913,8 @@ fn build_zip_entry_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     })?;
     let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_class, "<init>", "()V", &[Value::Object(Some(list))])?;
-    for (name, method, size, csize, crc, times) in entries {
-        let ze = alloc_zip_entry(ctx, &name, method, size, csize, crc, times)?;
+    for (name, method, size, csize, crc, extra, times) in entries {
+        let ze = alloc_zip_entry(ctx, &name, method, size, csize, crc, extra, times)?;
         ctx.invoke(
             al_class,
             "add",
@@ -1203,9 +1237,12 @@ pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use std::io::Write;
     use tempfile::NamedTempFile;
     use zip::write::SimpleFileOptions;

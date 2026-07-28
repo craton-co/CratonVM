@@ -204,7 +204,74 @@ pre-fix : select (id+20) from Doctor group by id          -> 22 23 ... 30 30
 post-fix: both match HotSpot
 ```
 
+## Re-verification 2026-07-28 on dev `d0a6c7987` — and why the family has no siblings left
+
+Re-derived from scratch rather than taken on trust, on a binary built fresh from
+`origin/dev` `d0a6c7987` (worktree `CratonVM-hib-osa-window-20260728`, branch
+`fix/hib-osa-window-partition-20260728`, binary `cratonvm-osawin-20260728.exe`).
+
+**1. Hibernate-free probe.** `docs/internal/repros/h2-groupdata-window-20260728/H2OsaWindowProbe.java`
+drives 16 query shapes through the real `h2-2.4.240.jar` over plain JDBC — both of the
+`orderedsetaggregate` doc's queries (`percentile_disc(...) within group (...) over(partition
+by ...)`, `listagg(...) filter (...) over(partition by ...)`), `rank`/`dense_rank`/
+`row_number`/`lag`/`avg`/`count` with and without `PARTITION BY`, a `ROWS BETWEEN` frame, a
+filtered window aggregate, a `GROUP BY` + `row_number()`, and the `bulkid`
+`INSERT ... SELECT ... row_number() over()`. CratonVM's output is **byte-identical to real
+HotSpot JDK 25 on all 16**; the HotSpot reference is checked in beside it as
+`expected-output.txt`.
+
+**2. Suite re-run.** `apps/hib-suite-runner/bulkid-family.txt` minus the one heavy class
+(see the residual section below), i.e. 20 of the 21 classes, one process each side:
+
+| | found | ok | failed | wall |
+|---|---:|---:|---:|---:|
+| CratonVM `d0a6c7987` | 117 | **117** | 0 | 649 s |
+| HotSpot JDK 25 | 117 | **117** | 0 | 25.9 s |
+
+Zero `@@FAIL` lines on either side. `CriteriaOrderedSetAggregateTest` is 10/10, which also
+re-confirms that doc 7's "parameterized `OFFSET` ignored" was never a separate bug.
+
+**3. Same-commit pre-fix control — the delegation is still load-bearing.** A second binary
+was built from this identical tree with *only* the two delegation branches of
+`h2_expression_column_get_value` disabled (then the source reverted), so the sole
+difference is whether the native hands off to H2's bytecode for grouped/windowed queries.
+It reproduces every symptom the seven docs described, in one probe run:
+
+| probe line | pre-fix | fixed / HotSpot | symptom shape |
+|---|---|---|---|
+| `OSA.percentile_disc.window` | `5 5 5 5 5` | `5 5 6 7 13` | stuck on the **first** partition |
+| `OSA.listagg.filter.window` | `5,5` ×5 | `5,5 6 7 null 5,5` | stuck on the **first** partition |
+| `WF.rank/rownumber/denserank/lag .partition` | `Feature not supported: "Window function"` | correct | H2's unreachable-by-design fallback |
+| `WF.sum.filter.window` | `null 6 13 26 null` | `null null 6 13 26` | off-by-one **with wraparound** |
+| `WF.avg.partition`, `WF.count.partition` | id column `5` on every row | `1 2 3 4 5` | scalar stuck on the **last** scanned row |
+| `BULK.insertselect` | `PRIMARY KEY violation … key:25` (= last driving row) | 5 rows inserted | the `bulkid` `testInsertSelect` failure |
+
+Plain (non-windowed) aggregates, `row_number() over()` with no `PARTITION BY`, and the
+`ROWS BETWEEN` frame are correct pre-fix — the same asymmetry that originally disguised
+one defect as seven. Captured verbatim as
+[`prefix-broken.txt`](../../repros/h2-groupdata-window-20260728/prefix-broken.txt); the
+fixed binary was re-run afterwards and still matches HotSpot on all 16 lines. This rules
+out the failure mode where a fix survives in the tree but has been shadowed or
+neutralised by later work — cf. the caller-less-`pub`-accessor case.
+
+**4. Why nothing else in H2 can carry this defect.** The bug class is "a CratonVM native
+override re-implements an H2 method whose real body consults the `SelectGroups` two-phase
+buffer". Enumerated exhaustively against the jar: `getCurrentGroupExprData` /
+`getGroupDataIfCurrent` are referenced by exactly **four** classes in `h2-2.4.240.jar` —
+`Select`, `SelectGroups`, `DataAnalysisOperation` and `ExpressionColumn`. CratonVM natively
+overrides exactly one of those four (`ExpressionColumn.getValue`), and that one now
+delegates. The other three run as ordinary bytecode. The other `Expression` subclasses
+CratonVM does override — `Comparison`, `ConditionAndOr`, `CoalesceFunction`,
+`CardinalityExpression` — contain no reference to either method (checked with `javap -c -p`),
+so they cannot reproduce this shape. The family is closed, not merely quiet.
+
 ## Residual (not this bug): `OracleInlineMutationStrategyIdTest` is timeout-marginal
+
+> **Superseded by the 2026-07-28 measurement below.** This section's "wall-clock
+> roulette / it sits near the limit" reading came from a loaded shared host. On an idle
+> box five of the six methods are *well* past 120 s, and its "HotSpot runs the whole
+> class in 5.3 s" figure is 29.0 s. Read it as the state of knowledge on 2026-07-27,
+> not as fact.
 
 Re-running the 21 classes after merging `origin/dev` (17 commits) on a heavily loaded
 host, 20/21 were clean and this one reported `ok=5 failed=1` — **not** a wrong value:
@@ -230,6 +297,140 @@ inserts with no grouped or windowed query in the fixture, and the measurements a
 put this change at +4 % on window queries and 0 % elsewhere — nowhere near enough to
 move a 15-minute class. It belongs to the general interpreter-throughput bucket, not
 here.
+
+### Residual resolved 2026-07-28 — measured, and it is not "roulette"
+
+Re-measured on dev `d0a6c7987` on a quiet host (12 % CPU, no peer VMs), with the
+harness's per-method cap lifted (`-Djunit.jupiter.execution.timeout.default=3600s`) so
+each method reports its real cost instead of being truncated. Per-method wall clock via
+`CratonRunnerTimed.java` (tracked in
+[`../../repros/hib-oracleinline-throughput-20260728/`](../../repros/hib-oracleinline-throughput-20260728/)
+along with the rest of this measurement kit; `apps/` itself is gitignored):
+
+| method | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| `testDeleteFromPerson` (first — carries `SessionFactory` bootstrap) | 8 264 ms | 266 781 ms | 32x |
+| `testDeleteFromEngineer` | 3 241 ms | 142 206 ms | 44x |
+| `testNullValueUpdateWithCriteria` | 3 847 ms | 217 659 ms | 57x |
+| `testInsert` | 3 594 ms | 108 936 ms | 30x |
+| `testInsertSelect` (this doc's actual defect) | 3 834 ms | 131 014 ms | 34x |
+| `testUpdate` | 3 408 ms | 256 155 ms | 75x |
+| **class** | **28 988 ms** | **1 127 560 ms** | **39x** |
+
+**All six pass — `ok=6 failed=0`.** So the correctness story is closed: nothing in this
+class produces a wrong value on CratonVM. What fails, when it fails, is a wall-clock
+budget — and the previous revision's "wall-clock roulette, a different method each run"
+reading understates it. **Five of the six methods cost more than 120 s on an idle box**
+(only `testInsert`, at 108.9 s, fits, and only just). The class cannot pass under a
+120 s-per-method cap on this hardware at all; that earlier runs reported only *one*
+failure is a consequence of how a truncated `@BeforeEach` leaves less data for the
+methods that follow, not of the class being borderline.
+
+**The 120 s budget is the harness's own, not Hibernate's.** It comes from
+`-Djunit.jupiter.execution.timeout.default=120s` in `apps/hib-suite-runner/common.args`.
+`hibernate-orm` ships no `junit-platform.properties` anywhere in the tree or in its
+built test resources, and sets no `timeout.default` in Gradle; CratonVM's *own* Gradle
+init script (`apps/hibernate-orm/init-cratonvm.gradle`, `CRATONVM_TEST_TIMEOUT`) uses a
+300 s **task** timeout and states in a comment that "CratonVM is ~10-20x slower than
+HotSpot". So the only thing asking a single test method to finish in 120 s is
+`common.args`, and the two CratonVM-side harnesses disagree with each other.
+
+**Where the 39x actually is.** Attributed by single-method A/B —
+`testDeleteFromPerson`, which still carries the whole 2200-entity `@BeforeEach`, one
+fresh process per case, same quiet host, `CratonRunnerTimed` reporting the method's own
+wall clock. HotSpot runs this method in 8 265 ms as a single-method run, against
+8 264 ms for the same method inside the full-class run — so selecting one method does
+not change what is being measured.
+
+A first single-sample pass suggested four separate levers. Because this class's run-to-run
+spread turned out to be wide, the three decisive configurations were then re-run
+**interleaved**, three samples each (round-robin, not in blocks, so host drift cannot
+favour one) — and that changes the conclusion, so only the repeated numbers are treated
+as established here:
+
+| configuration | samples (ms) | mean | vs default |
+|---|---|---:|---:|
+| HotSpot | 8 265 | 8 265 | — |
+| **CratonVM, defaults** | 255 999 / 241 995 / 216 814 | **238 269** | — |
+| `-Dhibernate.flush.queue.type=graph` | 168 208 / 185 606 / 159 862 | **171 225** | **−28 %** |
+| all four levers below, together | 183 805 / 169 377 / 171 422 | **174 868** | −27 % |
+
+**The default configuration alone varies 216 814–255 999 ms — a 39 s, ±8 % spread.** That
+is the measurement's noise floor, and it disqualifies two of the four single-sample
+readings:
+
+| single-sample-only configuration | one run | verdict |
+|---|---:|---|
+| `-Dhibernate.show_sql=false -Dhibernate.format_sql=false` | 190 473 ms | below the default's range — probably real, not separated from `graph` |
+| `CRATONVM_JIT_ALLOW_PACKAGES=org/h2/` | 214 861 ms | **inside the default's own spread — not established** |
+| `-Dlog4j2.configurationFile=log4j2-quiet.properties` | 222 233 ms | **inside the default's own spread — not established** |
+
+So the honest reading is: **one lever is demonstrated, and it is CratonVM's own.** The
+apparent −16 % from lifting the `org/h2/` JIT ban and −13 % from silencing Hibernate's
+TRACE logging are single samples that land inside the range the default configuration
+reaches on its own; they may be real but this data does not show it. And stacking all
+four changes nothing beyond what `graph` already gives (174 868 vs 171 225 ms) — the
+levers overlap rather than compose.
+
+Details of each, and what remains true regardless:
+
+1. **CratonVM's own forced `legacy` action queue is the one demonstrated lever, at −28 %
+   over three interleaved samples.** On real-JDK, `vm/src/vm/vm_init.rs:2561` overrides
+   Hibernate 8's `graph` flush-queue default with `legacy` (commit `0e87935f2`, to avoid a
+   >1000x `CycleBreaker` DFS hang). Running this fixture with upstream's own default is
+   more than a quarter faster, and its three samples (159 862–185 606 ms) do not overlap
+   the default's three (216 814–255 999 ms) at all. That trade-off is tracked in
+   [`../../../known-issues/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727.md`](../../../known-issues/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727.md),
+   which previously recorded only its *correctness* cost (two contract tests fail); this
+   measurement adds its throughput cost, and has been cross-posted there.
+2. **The `org/h2/` JIT ban (HIB-LONGTAIL.1, `vm/src/jit/skip_list.rs:1126`) is not shown
+   to matter for this class, and demonstrably does nothing for its inserts.** Its single
+   214 861 ms sample sits inside the default's own 217–256 s range, so the test-level
+   claim is unproven. The Hibernate-free half of the question is answered cleanly, though:
+   [`H2InsertRateProbe.java`](../../repros/hib-oracleinline-throughput-20260728/H2InsertRateProbe.java)
+   replays exactly this fixture's JDBC
+   traffic (4400 single-row `INSERT`s across the three JOINED-inheritance tables, one
+   transaction) with no Hibernate, no ORM and no logging:
+
+   | | HotSpot | CratonVM default | + `ALLOW_PACKAGES=org/h2/` |
+   |---|---:|---:|---:|
+   | 4400 inserts (round 2) | 31 ms | 10 258 ms | 11 161 ms |
+   | per insert | 0.007 ms | 2.33 ms (**331x**) | 2.54 ms |
+   | `update Person ... where employed` (1100 rows) | 21 ms | 3 845 ms | 2 631 ms |
+   | `delete from Engineer where fellow` (550 rows) | 5 ms | 1 213 ms | 768 ms |
+
+   The ban costs nothing on the per-statement insert path (2.33 → 2.54 ms is noise, in the
+   wrong direction) while clearly paying on the scan-heavy statements (−32 %/−37 %). That
+   asymmetry is also what makes the run self-validating: the flag demonstrably took
+   effect, so "no change on inserts" is a result and not a mis-set variable.
+3. **The suite runs with Hibernate's own diagnostics fully on, and that is not this
+   suite's choice.** Hibernate's shipped test `hibernate.properties` sets `show_sql=true`
+   and `format_sql=true`, so all 4400 fixture statements are pretty-printed to stdout;
+   its shipped test `log4j2.properties` separately puts `org.hibernate.orm.jdbc.bind` and
+   `.extract` at TRACE — exactly 9 900 bind lines per `@BeforeEach` (1100 doctors × 4
+   bound parameters + 1100 engineers × 5), counted in the run log. Turning the SQL echo
+   off measured 190 473 ms in one sample (below the default's range) and the TRACE
+   logging 222 233 ms (inside it), so the first is plausibly real and the second is not
+   shown. Either way these are pure diagnostics that a JIT absorbs and an interpreter
+   cannot, and neither is a CratonVM defect.
+
+**The floor matters more than the levers.** Even with all four applied at once the method
+still costs 174 868 ms — 21x HotSpot, and 46 % over the harness's 120 s cap. There is no
+combination of available switches that makes this class fit that budget; the residue is
+ordinary interpreter throughput. The sharpest isolated piece of it is the **331x on plain
+single-row `INSERT`s** through the real H2 driver — reproduced with the JIT ban already
+lifted, so not explained by it — a clean, Hibernate-free general-throughput finding worth
+its own investigation, with `H2InsertRateProbe.java` committed as its witness under
+`docs/internal/repros/hib-oracleinline-throughput-20260728/`. None of it
+is caused by, or fixable inside, this doc's change.
+
+**Disposition:** this residual is closed as *not a defect of this fix and not a
+correctness defect at all*. It is a general interpreter-throughput gap of the same
+family as
+[`hib-120s-junit-timeout-cluster-20260716.md`](hib-120s-junit-timeout-cluster-20260716.md),
+which is where any further work on it belongs. Measured with
+`-Djunit.jupiter.execution.timeout.default=3600s`, the class is 6/6 today; the slowest
+method is 267 s, so a 600 s cap would be enough to run it green in the suite harness.
 
 ## Other verification
 

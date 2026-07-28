@@ -565,6 +565,14 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
+    // A `Security.setProperty` override wins over the seeded default, and
+    // makes a key that has no default answerable at all (real
+    // `Security.getProperty` is backed by a mutable Properties, not a fixed
+    // table). See `security_property_overrides`.
+    if let Some(v) = security_property_overrides().lock().get(&key).cloned() {
+        let s = ctx.create_string(&v);
+        return Ok(Some(Value::Object(Some(s))));
+    }
     let val = match key.as_str() {
         "securerandom.source" => "file:/dev/urandom",
         "keystore.type" => "PKCS12",
@@ -576,9 +584,50 @@ fn security_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Object(Some(s))))
 }
 
-fn security_set_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // No-op — the seeded list above is fixed; mutating it would require
-    // a Properties-backed store which is out of scope for WP6.1.
+/// Process-wide overrides written by `Security.setProperty`.
+///
+/// Stub-removal wave 2 (2026-07-27): `security_set_property` used to be a
+/// no-op and `security_get_property` answered from a fixed four-entry table,
+/// so `Security.setProperty("keystore.type", "JKS")` was silently discarded
+/// and the very next `getProperty` still reported `PKCS12`. That is live in
+/// the DEFAULT (real-JDK) build — `register_jca_natives` is reached from
+/// `register_essential_natives_with_shims` — and it is what makes real
+/// `KeyStore.getDefaultType()` bytecode unconfigurable, since that method is
+/// specified as `Security.getProperty("keystore.type")`.
+///
+/// `phases_early::security_properties()` is the same idea but is registered
+/// only from `register_synthetic_overrides`; the two are never both
+/// authoritative (phases_early registers later, so it wins under
+/// `--synthetic-jdk`; only this one exists in the default build).
+fn security_property_overrides(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, String>> {
+    static OVERRIDES: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    OVERRIDES.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn security_set_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Real `Security.setProperty` NPEs on a null key or value.
+    let key = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("key can't be null".to_string()),
+            }
+            .into())
+        }
+    };
+    let val = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("datum can't be null".to_string()),
+            }
+            .into())
+        }
+    };
+    security_property_overrides().lock().insert(key, val);
     Ok(None)
 }
 
@@ -2012,8 +2061,17 @@ fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCall
 /// ordering: it names a provider that was never registered at all, and asserts
 /// the resulting `KeyStoreException`'s message (not a nested cause) contains the
 /// provider name — which only the provider-existence message includes.
-fn throw_no_such_provider(ctx: &mut dyn NativeContext, provider: &str) -> MethodCallFailed {
-    let msg = format!("no such provider: {provider}");
+pub(crate) fn throw_no_such_provider(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    wording: ProviderArgWording,
+) -> MethodCallFailed {
+    let msg = match wording {
+        ProviderArgWording::Shared => format!("no such provider: {provider}"),
+        // `Cipher.getInstance` does its own lookup instead of going through
+        // `GetInstance`, and capitalises both of its messages.
+        ProviderArgWording::Cipher => format!("No such provider: {provider}"),
+    };
     let detail = ctx.create_string(&msg);
     if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
         "java/security/NoSuchProviderException",
@@ -2023,6 +2081,91 @@ fn throw_no_such_provider(ctx: &mut dyn NativeContext, provider: &str) -> Method
         return MethodCallFailed::ExceptionThrown(exc);
     }
     cratonvm_types::error::RuntimeError::SecurityException { message: msg }.into()
+}
+
+/// Public wrapper over the module-private `throw_no_such_algorithm`, so engines
+/// living in sibling modules raise a real `java.security.NoSuchAlgorithmException`
+/// instead of reaching for whatever `RuntimeError` variant is nearest to hand.
+pub(crate) fn throw_no_such_algorithm_public(
+    ctx: &mut dyn NativeContext,
+    msg: &str,
+) -> MethodCallFailed {
+    throw_no_such_algorithm(ctx, msg)
+}
+
+/// Which of real JDK's two message spellings a given engine uses. `Cipher`
+/// rolls its own provider lookup and capitalises; everything routed through
+/// `GetInstance` does not. Verified against HotSpot 25, not guessed.
+#[derive(Clone, Copy)]
+pub(crate) enum ProviderArgWording {
+    Shared,
+    Cipher,
+}
+
+/// Validate the `String provider` argument of a JCA
+/// `getInstance(algorithm, provider)` overload, mirroring real JDK's ordering:
+/// the provider is resolved BEFORE the algorithm is looked up, so
+///
+/// * a null/empty name is `IllegalArgumentException("missing provider")`, and
+/// * an unregistered name is `NoSuchProviderException("no such provider: X")`
+///
+/// — never a `NoSuchAlgorithmException`, and never a silent success.
+///
+/// `KeyFactory`, `Signature`, `SecureRandom` and `Cipher` register ONE native
+/// for all three `getInstance` overloads and read only argument 0, so the
+/// provider argument was discarded entirely: asking a provider that was never
+/// registered for an algorithm quietly succeeded. That is the same defect
+/// `getinstance_instance_provider` fixes for every engine that does route
+/// through `Security.getImpl` — these four just never reach it. Call this
+/// first from any such native; it is a no-op for the single-argument and
+/// `(algorithm, Provider)` overloads, which carry no name to check.
+pub(crate) fn check_named_provider_arg(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    idx: usize,
+    wording: ProviderArgWording,
+) -> Result<(), MethodCallFailed> {
+    let Some(Value::Object(maybe_obj)) = args.get(idx) else {
+        // Absent argument => the single-argument overload. Nothing to check.
+        return Ok(());
+    };
+    let Some(obj) = maybe_obj else {
+        // An explicit null. Real JDK folds null in with empty here.
+        return Err(throw_missing_provider(ctx, wording));
+    };
+    // Discriminate the `(algorithm, String)` overload from `(algorithm,
+    // Provider)` by the argument's actual class rather than by whether
+    // `read_string` happens to succeed — a Provider object that read back as
+    // an empty string would otherwise be reported as a missing provider.
+    let is_string = ctx
+        .class_name_of_id(ctx.class_id_of_object(*obj))
+        .is_some_and(|n| n == "java/lang/String");
+    if !is_string {
+        return Ok(());
+    }
+    let name = ctx.read_string(*obj).unwrap_or_default();
+    if name.is_empty() {
+        return Err(throw_missing_provider(ctx, wording));
+    }
+    if find(&name).is_none() {
+        return Err(throw_no_such_provider(ctx, &name, wording));
+    }
+    Ok(())
+}
+
+fn throw_missing_provider(
+    ctx: &mut dyn NativeContext,
+    wording: ProviderArgWording,
+) -> MethodCallFailed {
+    let msg = match wording {
+        ProviderArgWording::Shared => "missing provider",
+        ProviderArgWording::Cipher => "Missing provider",
+    };
+    let _ = ctx;
+    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+        message: msg.to_string(),
+    }
+    .into()
 }
 
 /// Return the name of the first provider in chain order whose service table
@@ -2158,13 +2301,20 @@ fn getinstance_instance_provider(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let algo = read_arg_string(ctx, args, 2);
     let provider = read_arg_string(ctx, args, 3);
     if find(&provider).is_none() {
-        return Err(throw_no_such_provider(ctx, &provider));
+        return Err(throw_no_such_provider(
+            ctx,
+            &provider,
+            ProviderArgWording::Shared,
+        ));
     }
     match build_jca_instance(ctx, &provider, &type_str, &algo) {
         Some(r) => r,
         None => Err(throw_no_such_algorithm(
             ctx,
-            &format!("no {type_str} {algo} implementation for provider {provider}"),
+            // Real `GetInstance.getInstance` reports
+            // "no such algorithm: <algo> for provider <p>"; the engine type is
+            // not part of the message. Verified against HotSpot 25.
+            &format!("no such algorithm: {algo} for provider {provider}"),
         )),
     }
 }
@@ -2257,7 +2407,10 @@ fn getinstance_instance_search(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     // exception.
     Err(throw_no_such_algorithm(
         ctx,
-        &format!("no {type_str} {algo} implementation in any provider"),
+        // Real `GetInstance.getInstance(type, clazz, algorithm)` reports
+        // "<algo> <type> not available" when no provider supplies it.
+        // Verified against HotSpot 25.
+        &format!("{algo} {type_str} not available"),
     ))
 }
 
@@ -2717,6 +2870,11 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         provider_get_property,
     );
+    // KEEP (correct constant, not a stub): this reports a CAPABILITY, not a
+    // security decision — nothing is bypassed by answering it. CratonVM has no
+    // JFR security-event subsystem, so "security logging is off" is the true
+    // answer, and the real JDK returns the same `false` whenever the JFR
+    // security events are not enabled.
     // jdk.internal.event.EventHelper.isLoggingSecurity() — JFR security-event
     // logging gate. Its real body dereferences the static `JUJA`
     // (`SharedSecrets.getJavaUtilJarAccess()`), which is null in our VM, so it

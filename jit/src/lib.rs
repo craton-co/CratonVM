@@ -6531,6 +6531,82 @@ pub fn jit_bail_list_size() -> usize {
     jit_bail_list().read().len()
 }
 
+// ---------------------------------------------------------------------------
+// OSR entry-point reject memo
+// ---------------------------------------------------------------------------
+//
+// An OSR compile is requested for one specific back-edge PC, but the artifact
+// it produces decides for itself which PCs it will accept: `can_osr_enter`
+// refuses any PC whose `osr_dead_mask` is non-zero (a dead interpreter local
+// sharing a compiled location with a live one — state OSR cannot reconstruct).
+// Those two decisions are made by different parts of the pipeline, and they can
+// disagree: the compile succeeds and the resulting body then refuses the very
+// entry it was compiled for.
+//
+// Nothing memoised that disagreement, so the next trip over the same back-edge
+// ran the FULL x64 pipeline again, for the same PC, to the same conclusion —
+// forever. Measured on `org/h2/compress/CompressLZF.compress(Ljava/nio/
+// ByteBuffer;I[BI)I`: 256 compiles of `entry_pc=220` in ten operations of H2's
+// `TestFileSystem` `nioMemLZF:` case, zero OSR entries, zero compiled code
+// executed (2026-07-27). Same shape as the two waste loops this module already
+// memoises — RBC.2's 2,610 recompiles of `SecP521R1Curve$1.lookup` and RBC.4's
+// 35,923 re-run pipelines on `Nat.inc`.
+//
+// The rejection is a pure function of the compile, which is deterministic for a
+// given method, so it is permanent. It is keyed per (method, entry_pc) rather
+// than per method: a method's other back-edges are usually fine, and banning
+// all of them would cost real throughput.
+static OSR_ENTRY_REJECTS: std::sync::OnceLock<
+    parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>>,
+> = std::sync::OnceLock::new();
+
+fn osr_entry_rejects() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<(u64, usize)>> {
+    OSR_ENTRY_REJECTS.get_or_init(|| parking_lot::RwLock::new(rustc_hash::FxHashSet::default()))
+}
+
+fn osr_reject_key(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
+    // Same sentinel-ClassId rationale as `is_jit_bail_listed`: this is a
+    // negative cache, so a cross-loader name collision only costs one method
+    // one OSR entry point.
+    compute_jit_key_hash(
+        class_name,
+        method_name,
+        descriptor,
+        cratonvm_types::ClassId::new(0),
+    )
+}
+
+/// Whether a previous OSR compile for this method produced a body that refused
+/// to OSR-enter at `entry_pc`. Checked before re-running the OSR pipeline.
+pub fn is_osr_entry_rejected(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) -> bool {
+    osr_entry_rejects()
+        .read()
+        .contains(&(osr_reject_key(class_name, method_name, descriptor), entry_pc))
+}
+
+/// Record that compiling this method for `entry_pc` yields a body that cannot
+/// enter there, so the pipeline is never re-run for that PC.
+pub fn mark_osr_entry_rejected(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    entry_pc: usize,
+) {
+    osr_entry_rejects()
+        .write()
+        .insert((osr_reject_key(class_name, method_name, descriptor), entry_pc));
+}
+
+/// Diagnostic: number of (method, entry_pc) pairs currently OSR-reject-memoed.
+pub fn osr_entry_reject_count() -> usize {
+    osr_entry_rejects().read().len()
+}
+
 /// Parsed `CRATONVM_JIT_DENY` filter (see the `try_compile` call site).
 /// `None` = disabled.
 fn jit_deny_filter() -> Option<&'static Vec<String>> {
@@ -7432,32 +7508,52 @@ fn local_handler_reads_unsafe_local(
 
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///
-/// **Default OFF (2026-07-27).** The relaxation (added by `83e078aa5`) compiles
-/// methods whose exception handler reads a local beyond the incoming
-/// parameters, on the promise that every throwing site in the protected range
-/// publishes a precise exceptional frame. Measured against that promise, the
-/// handoff still loses live values:
+/// The relaxation compiles a method whose exception handler (or code reachable
+/// from it) reads a local beyond the incoming parameters, on the promise that
+/// every throwing site in its protected ranges publishes a precise exceptional
+/// frame instead of the params-only reconstruction
+/// `route_jit_exception_through_method` can do on its own. Without it, ordinary
+/// `try`/`catch` methods stay interpreted forever — `JSONValue.toJSONString`,
+/// `org.apache.tomcat.util.buf.CharsetCache.getCharset` (~15us interpreted vs
+/// ~2us compiled), `StringCache.toString`.
 ///
-/// | build (json-smart round-trip probe, `-Xmx64m`, 200k ops/run) | first error |
-/// |---|---|
-/// | dev before `83e078aa5` | none |
-/// | dev at/after `83e078aa5` | iteration 400-5,000 |
-/// | same, with this gate closed | none |
+/// **Default OFF between 2026-07-27 and 2026-07-28**, because a json-smart
+/// round-trip probe (`docs/known-issues/repros/jsonsmart/`, `-Xmx64m`) crashed
+/// or corrupted within ~20,000 iterations whenever it was open. Four defects
+/// were behind that, all fixed; keep them in mind before changing anything
+/// here:
 ///
-/// The failures are lost-object failures, not exception-handling failures: a
-/// re-parse returns one of the document's own keys, or a
-/// `ClassCastException: java.lang.Object cannot be cast to JSONArray` — an
-/// unrelated object standing where a live one used to be, i.e. a value dropped
-/// from a reconstructed frame (and with it, from the GC's view of that frame).
-/// One input to that has been fixed separately (the liveness scan behind the
-/// snapshot had no exception edges — see
-/// `regalloc::live_locals_per_pc_with_handlers`), but the shape survives it, so
-/// the admission stays closed until the handoff itself is proven.
+/// 1. `remap_active_jit_frames` (vm) walked the JIT rbp chain and passed the
+///    *unvalidated* parent link to a helper that dereferences
+///    `[parent_rbp - sp_id_slot_off]` and rewrites every oop-map slot. A zero
+///    link faulted; a garbage one rewrote arbitrary stack. This was the actual
+///    json-smart failure and is not specific to this gate — the gate only made
+///    the chain deep enough to walk. 3 SIGSEGVs in 4 probe runs before, 0 in 10
+///    after.
+/// 2. The exceptional frame was keyed on the throwing invoke's SUCCESSOR bci,
+///    but its consumer uses that bci as the THROW pc for the handler's
+///    `[start_pc, end_pc)` test — and javac routinely ends a protected range
+///    exactly at that successor, so the exception escaped its own catch block.
+/// 3. The frame was stashed in `LAST_DEOPT`, where every other consumer treats
+///    a stash as "resume this method at `bci`" — which for an exceptional frame
+///    executes past a call that never returned. It has its own stash now
+///    (`deopt::take_exceptional_frame`) and its own `DeoptReason`.
+/// 4. Register allocation and `regalloc::plan_safepoint_publication` both built
+///    their liveness from a CFG with no exception edges, which is only sound
+///    while this gate refuses the population that reads handler-only locals.
+///    Both now model the handler ranges for this population.
 ///
-/// Set `CRATONVM_JIT_PRECISE_HANDLER_FRAMES=1` to re-open it while working on
-/// it. Repro: `docs/known-issues/repros/jsonsmart/JsonSmartProbeWarmed.java`
-/// under `-Xmx64m`; writeup:
-/// `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+/// Regression fixture: `vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java`
+/// (three shapes, each returning a mismatch count that must be 0).
+/// `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES` restores the params-only refusal.
+fn precise_handler_frames_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES").is_none()
+    })
+}
+
 /// Opt-out for the STUB-S8 fix: when set, a method declaring an exception table
 /// is refused by the optimizing tier exactly as it was before that fix, so the
 /// same binary can be measured with and without the change.
@@ -7466,14 +7562,6 @@ fn exc_table_c2_disabled() -> bool {
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
         cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_EXC_TABLE_C2").is_some()
-    })
-}
-
-fn precise_handler_frames_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_PRECISE_HANDLER_FRAMES").is_some()
     })
 }
 
@@ -8290,6 +8378,12 @@ fn try_compile_inner(
                         if let Some((entry, callee_needs_ctx)) = direct_target {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
                             ir_direct_callee_entries.push(entry);
+                        } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                            .is_some()
+                        {
+                            eprintln!(
+                                "[cratonvm-jitc] ir-direct-call MISSED {cn}.{mn}{desc} @pc={pc} ir_direct={ir_direct} static={is_static} special={is_special}"
+                            );
                         }
                         // IR inline caches (jit-inlining-and-ir-calls). A
                         // virtual / interface site is NOT statically bound, so
@@ -9002,6 +9096,13 @@ fn try_compile_inner(
                                 ));
                                 inline_sites.insert(pc, site);
                                 planned_inline = true;
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                    .is_some()
+                                {
+                                    eprintln!(
+                                        "[cratonvm-jitc] inline-planned {class_name}.{method_name}{descriptor} @pc={pc}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -9160,6 +9261,64 @@ fn try_compile_inner(
                             },
                         ));
                         continue;
+                    }
+                } else if direct_jit_callee_calls_enabled {
+                    // INLINE-BAIL FALLBACK (tomcat doc 04, 2026-07-27).
+                    //
+                    // A site planned for inlining used to get NO direct call,
+                    // because the whole direct-call ladder sits inside
+                    // `!planned_inline`. The codegen tries `try_emit_inline`
+                    // first and ROLLS BACK on any unsupported bytecode
+                    // (`x64.rs` 0xb8 arm), and its fall-through order is
+                    // direct_calls → invoke_info — so a bailed inline landed on
+                    // the generic `jit_invoke_dispatch` helper, the SLOWEST of
+                    // the three options, for the life of the compiled body.
+                    //
+                    // That is not a corner case: `try_jit_compile_callee_slow`
+                    // (the tiered BACKGROUND worker, which compiles nearly
+                    // every hot method) always passes an inline resolver, while
+                    // the mutator path gates its own on the default-OFF
+                    // `CRATONVM_JIT_MAIN_INLINE`. So background-compiled bodies
+                    // planned inlining for every small static/special callee
+                    // and, whenever codegen declined it, paid ~196 ns per call
+                    // instead of the ~5 ns a raw CALL costs (measured with
+                    // `apps/tomcat-suite-runner/probes/CallCostProbe.java`,
+                    // same binary, `CRATONVM_BG_COMPILE=0` as the control).
+                    //
+                    // Planning a direct call ALONGSIDE the inline site costs
+                    // nothing when the inline succeeds (codegen checks
+                    // `inline_sites` first and `continue`s), and turns the bail
+                    // into a raw CALL instead of a helper round trip. No
+                    // `continue` here, so the RBC.3 `JitInvokeInfo` fallback is
+                    // still registered below as the last resort.
+                    if let Some(compiler) = callee_compiler.as_ref() {
+                        if let Some((entry, callee_needs_ctx)) =
+                            compiler(&class_name, &method_name, &descriptor)
+                        {
+                            if jit_direct_call_requires_dispatch(
+                                &class_name,
+                                &method_name,
+                                &descriptor,
+                            ) {
+                                needs_heap = true;
+                                mark_current_jit_compile_method_recursive_cycle();
+                            } else {
+                                if callee_needs_ctx {
+                                    needs_heap = true;
+                                }
+                                direct_callee_entries.push(entry);
+                                direct_calls.push((
+                                    pc,
+                                    JitDirectCall {
+                                        entry,
+                                        needs_context: callee_needs_ctx,
+                                        num_params,
+                                        return_type: ret_type,
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                            }
+                        }
                     }
                 } // end !planned_inline (RBC.3)
             }

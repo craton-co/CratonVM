@@ -1,0 +1,33 @@
+﻿Security.getProvider(ghost) => null
+Security.getProvider(SUN) != null => true
+KeyStore.getInstance(PKCS12, ghost) => java.security.NoSuchProviderException: no such provider: com.example.KeyStoreProvider
+KeyStore.getInstance(JKS, ghost) => java.security.NoSuchProviderException: no such provider: com.example.KeyStoreProvider
+KeyStore.getInstance(PKCS12, SUN) => OK
+KeyStore.getInstance(JKS, SUN) => OK
+KeyStore.getInstance(NoSuchType, SUN) => java.security.KeyStoreException: NoSuchType not found | cause=java.security.NoSuchAlgorithmException: no such algorithm: NoSuchType for provider SUN
+KeyStore.getInstance(PKCS12) => OK
+KeyStore.getInstance(NoSuchType) => java.security.KeyStoreException: NoSuchType not found | cause=java.security.NoSuchAlgorithmException: NoSuchType KeyStore not available
+MessageDigest.getInstance(SHA-256, ghost) => java.security.NoSuchProviderException: no such provider: com.example.KeyStoreProvider
+MessageDigest.getInstance(SHA-256, SUN) => OK
+MessageDigest.getInstance(NoSuchAlgo, SUN) => java.security.NoSuchAlgorithmException: no such algorithm: NoSuchAlgo for provider SUN
+KeyFactory.getInstance(RSA, ghost) => java.security.NoSuchProviderException: no such provider: com.example.KeyStoreProvider
+Signature.getInstance(SHA256withRSA, ghost) => java.security.NoSuchProviderException: no such provider: com.example.KeyStoreProvider
+SecureRandom.getInstance(SHA1PRNG, ghost) => java.security.NoSuchProviderException: no such provider: com.example.KeyStoreProvider
+Cipher.getInstance(AES/CBC/PKCS5Padding, ghost) => java.security.NoSuchProviderException: No such provider: com.example.KeyStoreProvider
+KeyStore.getInstance(PKCS12, emptyString) => java.lang.IllegalArgumentException: missing provider
+MessageDigest.getInstance(SHA-256, emptyString) => java.lang.IllegalArgumentException: missing provider
+KeyFactory.getInstance(RSA, emptyString) => java.lang.IllegalArgumentException: missing provider
+Signature.getInstance(SHA256withRSA, emptyString) => java.lang.IllegalArgumentException: missing provider
+SecureRandom.getInstance(SHA1PRNG, emptyString) => java.lang.IllegalArgumentException: missing provider
+Cipher.getInstance(AES/CBC/PKCS5Padding, emptyString) => java.lang.IllegalArgumentException: Missing provider
+KeyFactory.getInstance(RSA, SunRsaSign) => OK
+Signature.getInstance(SHA256withRSA, SunRsaSign) => OK
+SecureRandom.getInstance(SHA1PRNG, SUN) => OK
+Cipher.getInstance(AES/CBC/PKCS5Padding, SunJCE) => OK
+MessageDigest.getInstance(MD5, SUN) => OK
+MessageDigest.getInstance(SHA-1, SUN) => OK
+KeyFactory.getInstance(RSA, SUN) => java.security.NoSuchAlgorithmException: no such algorithm: RSA for provider SUN
+Cipher.getInstance(AES/CBC/PKCS5Padding, SUN) => java.security.NoSuchAlgorithmException: No such algorithm: AES/CBC/PKCS5Padding
+MessageDigest.getInstance(NoSuchAlgo) => java.security.NoSuchAlgorithmException: NoSuchAlgo MessageDigest not available
+MessageDigest.getInstance(SHA-256) => OK
+KeyFactory.getInstance(NoSuchAlgo) => java.security.NoSuchAlgorithmException: NoSuchAlgo KeyFactory not available

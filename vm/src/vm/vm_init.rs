@@ -752,9 +752,9 @@ impl SharedVm {
         let __boot_t0 = std::time::Instant::now();
         let mut class_manager = ClassManager::new(&boot_cp, &ext_cp, &config.classpath);
         let native_shim_selection =
-            cratonvm_native_builtins::app_shims::ShimSelection::from_resource_probe(
-                |resource| class_manager.application_contains_resource(resource),
-            );
+            cratonvm_native_builtins::app_shims::ShimSelection::from_resource_probe(|resource| {
+                class_manager.application_contains_resource(resource)
+            });
         let __boot_classpath_elapsed = __boot_t0.elapsed();
         tracing::info!(
             "boot phase 1/3 classpath ingestion: {:?} ({} boot entries, {} ext, {} app)",
@@ -1268,7 +1268,9 @@ impl SharedVm {
                 // NoSuchFileException trying to actually lock a real log
                 // file). Register just the FileHandler natives directly here.
                 // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
-                cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
+                cratonvm_native_builtins::phases_late::register_p61_file_handler(
+                    &mut native_methods,
+                );
 
                 // LinkedBlockingQueue.drainTo(Collection, int) - needed by SLF4J/Spring
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
@@ -1932,6 +1934,16 @@ impl SharedVm {
             // open the archive directly). Paired with the `check_override`
             // allow-list entry for `java/util/jar/JarFile`.
             cratonvm_native_builtins::phases_late::register_p59_jar(&mut native_methods);
+            // The loader's ZIP64 size-limit fixture streams six GiB through
+            // `InputStream.transferTo` (via Spring's `StreamUtils.copy`).
+            // Register the bulk-transfer bridge on this real-JDK path as
+            // well as the full synthetic registration path.
+            cratonvm_native_builtins::phases_late::register_p59_bulk_stream_transfer(
+                &mut native_methods,
+            );
+            cratonvm_native_builtins::phases_late::register_p59_zip_output_primitives(
+                &mut native_methods,
+            );
             // SB3-LOGBACK: Spring Boot 3.2's DefaultLogbackConfiguration.apply
             // NPEs on its first monitorenter against a synthetic LoggerContext.
             // Register a no-op native override so the boot path skips logback's
@@ -2553,11 +2565,30 @@ impl SharedVm {
             format!("{}/lib", java_home_val),
         );
 
-        // Hibernate ORM 8 defaults to its graph-based ActionQueue. Its
-        // cycle-breaking planner can spend several minutes in dispatch-heavy
-        // DFS work on CratonVM's real-JDK runtime. The mature legacy queue
+        // Hibernate ORM 8 defaults to its graph-based `ActionQueue`, whose
+        // `CycleBreaker` planner needs minutes per flush on CratonVM's
+        // real-JDK runtime where HotSpot needs 738 ms. The mature legacy queue
         // completes the same workloads predictably. An explicit user property
         // is applied immediately below and therefore still selects `graph`.
+        //
+        // This default is a WORKAROUND for a VM performance gap, not a
+        // preference, and it is expensive: it also makes 17 of upstream's own
+        // `action.queue` tests self-abort ("Skipping GRAPH test with non-GRAPH
+        // queue type"). Removing it needs the planner's hot path to be viable.
+        //
+        // One cause has been fixed since: the planner keys its dependency
+        // graph on records (`GroupNode`, `FlushOperationGroup`,
+        // `StatementShapeKey`), and a record's `hashCode`/`equals` is a bare
+        // `invokedynamic` that the x64 backend lowers to an unconditional
+        // deopt, so those bodies ran interpreter-only — 1576 ns against
+        // HotSpot's 0.9 ns. They are now interpreter intrinsics
+        // (`InterpIntrinsic::RecordHashCode`/`RecordEquals`), worth 3-5x on
+        // record-keyed collections. It is not enough on its own: the planner
+        // is still ~2400x off HotSpot because essentially nothing in that
+        // workload gets JIT-compiled at all (1362 of 1463 hot methods stuck in
+        // the interpreter with `tier_fail_count=3`, including 5-byte getters
+        // called 500k+ times). See
+        // `docs/known-issues/hibernate/actionqueue-graph-default-tests-legacy-tradeoff-20260727.md`.
         if !config.use_synthetic_jdk {
             sys_props
                 .entry("hibernate.flush.queue.type".to_string())
@@ -5119,9 +5150,8 @@ impl Vm {
         // fabricated data for several commands). `shared.clone()` coerces
         // to `Arc<dyn VmDiagnosticState>` via the `impl VmDiagnosticState
         // for SharedVm` in this file.
-        *shared.debug.jcmd_processor.lock() = Some(
-            crate::runtime::serviceability::JcmdProcessor::new_with_vm_state(shared.clone()),
-        );
+        *shared.debug.jcmd_processor.lock() =
+            Some(crate::runtime::serviceability::JcmdProcessor::new_with_vm_state(shared.clone()));
 
         // obsaudit D12 (2026-07-26) — `-XX:StartFlightRecording`. Before
         // this, vm-cli never called `start_recording` (see the retracted
@@ -5143,9 +5173,10 @@ impl Vm {
                 id
             };
             if jfr_cfg.dump_on_exit {
-                let filename = jfr_cfg.filename.clone().unwrap_or_else(|| {
-                    format!("./cratonvm-recording-{}.jfr", std::process::id())
-                });
+                let filename = jfr_cfg
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| format!("./cratonvm-recording-{}.jfr", std::process::id()));
                 *shared.debug.jfr_dump_on_exit.lock() = Some((recording_id, filename));
             }
             // obsaudit D12 — the reclamation half of the fix. Before this,

@@ -606,6 +606,7 @@ pub(crate) mod test_support {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         };
         let id = store.add(class);
         (store, id)

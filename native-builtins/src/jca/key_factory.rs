@@ -1877,6 +1877,15 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // ---------------------------------------------------------------------------
 
 fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // All three `getInstance` overloads share this native, so the
+    // `(algorithm, String provider)` form's provider argument has to be
+    // validated here — real JDK resolves the provider before the algorithm.
+    crate::jca::provider_chain::check_named_provider_arg(
+        ctx,
+        args,
+        1,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     let alg = read_string(ctx, args, 0);
     let idx = kf_algo_idx(&alg);
     // `KeyFactory.getInstance` must reject an unrecognised name. In

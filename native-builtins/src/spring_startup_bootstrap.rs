@@ -1663,6 +1663,13 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // No-op the listener entirely; metadata reader caching is purely an
     // optimization and skipping cleanup is harmless. Also no-op `destroy()`
     // so the bean's lifecycle teardown path doesn't NPE the same way.
+    //
+    // KEEP (deliberate no-ops), re-audited 2026-07-27. Both method bodies do
+    // nothing but `metadataReaderFactory.clearCache()`; the field is null
+    // under CratonVM's partial bootstrap, and skipping a cache eviction has
+    // no observable effect on anything but memory. The right end state is to
+    // DELETE these two once `setMetadataReaderFactory` is actually reached
+    // during context refresh — not to reimplement them here.
     const SMRF_BEAN: &str = "org/springframework/boot/autoconfigure/\
          SharedMetadataReaderFactoryContextInitializer\
          $SharedMetadataReaderFactoryBean";
@@ -2650,7 +2657,23 @@ fn try_build_method_injection(
             skip_verification: true,
             ..Default::default()
         };
-        if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+        // Define into the SUPERCLASS's own loader, exactly as `cce_enhance`
+        // does for `@Configuration` subclasses. A generated subclass must
+        // share its superclass's runtime package `(defining loader, package
+        // name)` or `same_runtime_package` (JVMS 5.4.4) rejects every
+        // package-private override it declares -- the override then gets a
+        // fresh vtable slot instead of replacing the inherited one and
+        // virtual dispatch keeps landing on the (abstract) superclass method.
+        // A `@Lookup` method may legally be package-private, and a
+        // fork-loaded configuration class is not app-loaded, so hardcoding
+        // the application loader here was the same latent defect documented in
+        // `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`.
+        // No-op for the common app-loaded case (id 2 decodes to `Application`).
+        let super_loader_id = ctx.loader_id_of_class(super_cid).max(0) as u32;
+        if ctx
+            .define_class_full(&new_name, &bytes, super_loader_id, opts)
+            .is_err()
+        {
             return None;
         }
         lookup_override_subclass_cache()
@@ -3084,7 +3107,14 @@ fn try_build_replace_override(
             skip_verification: true,
             ..Default::default()
         };
-        if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+        // Same-loader define as the lookup-override subclass above -- see the
+        // comment there for why the superclass's own loader is required for
+        // package-private overrides to actually override.
+        let super_loader_id = ctx.loader_id_of_class(super_cid).max(0) as u32;
+        if ctx
+            .define_class_full(&new_name, &bytes, super_loader_id, opts)
+            .is_err()
+        {
             return None;
         }
         replace_override_subclass_cache()

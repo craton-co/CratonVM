@@ -578,6 +578,34 @@ pub(crate) fn register_annotation_overrides(registry: &mut NativeMethodRegistry)
     // to the Copier / BootstrapDirectory phase. Paired with the
     // `check_override` allow-list entry in `vm/src/vm/vm_exec.rs` that
     // forces native dispatch over the JDK bytecode.
+    //
+    // KEEP (no-op, justified but MASKING): this is the one constant in this
+    // file that suppresses a real validation rather than reproducing JDK
+    // behaviour. It is load-bearing only for the underlying HashMap-visibility
+    // bug described above; once that is fixed this registration must be
+    // DELETED, not kept, or a genuinely unreadable meta.properties will pass
+    // verification silently.
+    //
+    // Provenance, so a future reader can check the premise instead of trusting
+    // it. Introduced by commit 2f128a915 ("Round 74: ... MetaPropertiesEnsemble
+    // .verify no-op (Kafka past log-dir verify)"):
+    //     git log --oneline -S MetaPropertiesEnsemble -- native-builtins/src/
+    // Both halves of the workaround are found by:
+    //     git grep -n MetaPropertiesEnsemble
+    // which must return exactly two live sites — this registration and the
+    // `check_override` allow-list entry in `vm/src/vm/vm_exec.rs`. Delete both
+    // together or neither; the allow-list entry alone does nothing and this
+    // registration alone is not reached.
+    //
+    // HOW TO FALSIFY THE PREMISE (it is a claim about CratonVM's HashMap, not
+    // about Kafka): the assertion is that a `HashMap` which has had entries
+    // `put` into it reports `size()==0` / `isEmpty()==true` on read-back
+    // through `AbstractMap`. That is a self-contained probe — put a few
+    // entries, then read `size()`/`isEmpty()` via the AbstractMap-inherited
+    // path — and needs no Kafka at all. If that probe now passes, remove both
+    // sites and re-run `KafkaRaftServer.initializeLogDirs`; the expected
+    // failure if the bug IS fixed and this is left in place is silence, which
+    // is exactly why it must not be left in place.
     registry.register(
         "org/apache/kafka/metadata/properties/MetaPropertiesEnsemble",
         "verify",

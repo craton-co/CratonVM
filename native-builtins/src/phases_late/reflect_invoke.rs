@@ -30,9 +30,13 @@ pub(crate) fn register_phase55_reflect(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 2)))
     });
-    r.register(param, "isNamePresent", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    });
+    // `isNamePresent` is deliberately NOT registered here. The constant `true`
+    // that used to occupy this slot claimed a real parameter name even for the
+    // JDK's synthesized `arg0`/`arg1` placeholders — exactly the predicate
+    // Spring's `StandardReflectionParameterNameDiscoverer` branches on.
+    // `lang_reflect::native_parameter_is_name_present` (installed earlier, in
+    // BOTH run modes, via `register_annotation_overrides` ->
+    // `register_wp2_1_natives`) answers it correctly from the stored name.
     r.register(param, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
@@ -210,6 +214,35 @@ pub(crate) fn vh_get(ctx: &dyn NativeContext, vh: ObjectRef, target: Option<Obje
         };
         ctx.get_field(obj, field_idx)
     }
+}
+
+/// Resolve the `(holder object, field slot)` a non-static VarHandle points at,
+/// so a caller can use the real `compare_and_swap_field` primitive instead of
+/// a `vh_get` / `vh_set` pair with a race between them.
+///
+/// Returns `None` for static VarHandles (no static-field CAS primitive exists)
+/// and for the legacy array-backed convention that `vh_get` falls back to
+/// (`object_num_fields(vh) < VH_NUM_FIELDS`), both of which keep the old path.
+pub(crate) fn vh_instance_slot(
+    ctx: &dyn NativeContext,
+    vh: ObjectRef,
+    target: Option<ObjectRef>,
+) -> Option<(ObjectRef, usize)> {
+    if ctx.object_num_fields(vh) < VH_NUM_FIELDS {
+        return None;
+    }
+    if ctx.get_field(vh, VH_IS_STATIC).as_int().unwrap_or(0) != 0 {
+        return None;
+    }
+    let field_idx = ctx.get_field(vh, VH_FIELD_INDEX).as_int().unwrap_or(0) as usize;
+    let obj = target.or_else(|| {
+        if let Value::Object(o) = ctx.get_field(vh, VH_CLASS_OR_TARGET) {
+            o
+        } else {
+            None
+        }
+    })?;
+    Some((obj, field_idx))
 }
 
 /// Write the value a VarHandle points to (instance or static).
@@ -967,11 +1000,14 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             };
             let expected = args.get(3).copied().unwrap_or(Value::Object(None));
             let new_val = args.get(4).copied().unwrap_or(Value::Object(None));
-            let current = ctx.get_array_element(arr, idx);
-            let success = values_equal(&current, &expected);
-            if success {
-                ctx.set_array_element(arr, idx, new_val);
-            }
+            // `compare_and_swap_field` special-cases array receivers and does
+            // the read/compare/write under the per-object CAS lock. The old
+            // `get_array_element` + `set_array_element` pair had nothing
+            // between the two, so two threads could both observe `expected`
+            // and both report success -- a `compareAndSet` that provides no
+            // mutual exclusion. Same defect the atomic-array natives carried
+            // (see `util_concurrent_ext::atomic_array_cas`, 2026-07-27).
+            let success = ctx.compare_and_swap_field(arr, idx, expected, new_val);
             return Ok(Some(Value::Int(if success { 1 } else { 0 })));
         }
         let is_static = ctx.get_field(this, VH_IS_STATIC).as_int().unwrap_or(0) != 0;
@@ -992,6 +1028,14 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
                 args.get(3).copied().unwrap_or(Value::Object(None)),
             )
         };
+        // Instance fields go through the real CAS primitive; the plain
+        // read-then-write this used to do let two threads both win the same
+        // compareAndSet. Statics keep the old shape: there is no static-field
+        // CAS on `NativeContext` to route them through.
+        if let Some((holder, field_idx)) = vh_instance_slot(ctx, this, target) {
+            let success = ctx.compare_and_swap_field(holder, field_idx, expected, new_val);
+            return Ok(Some(Value::Int(if success { 1 } else { 0 })));
+        }
         let current = vh_get(ctx, this, target);
         let success = values_equal(&current, &expected);
         if success {
@@ -1434,12 +1478,20 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 5)))
         },
     );
+    // KEEP (constant, justified): `Package.getPackage` above mints a 6-slot
+    // synthetic whose specification-version slot is always null. Real JDK
+    // `isCompatibleWith` throws NumberFormatException on a null spec version;
+    // an optimistic `true` is what the WildFly/JBoss-modules boot scan that
+    // motivated the `getPackages` override expects, and turning it into the
+    // spec'd throw would regress that boot with no compatible answer available.
     r.register(
         pkg,
         "isCompatibleWith",
         "(Ljava/lang/String;)Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
     );
+    // KEEP (constant, justified): the synthetic Package carries no sealBase,
+    // and an unsealed package is exactly what `isSealed()` reports for one.
     r.register(pkg, "isSealed", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -1577,18 +1629,33 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     // StackFrame.getMethodType() — we don't yet wire real MethodType
     // reconstruction; return null to match JDK's UnsupportedOperationException
     // fallback without throwing, which keeps bootstrap probes quiet.
+    // KEEP (constant, justified): the 7-slot StackFrame carries className /
+    // methodName / fileName / lineNumber / bci / declaringClass — no method
+    // DESCRIPTOR — so there is literally nothing here to build a MethodType
+    // from. And `register_p59_stackwalker` is on the ESSENTIAL path (called
+    // from `register_essential_natives_with_shims`), so this is live in
+    // real-JDK mode too: swapping the null for the spec'd
+    // UnsupportedOperationException would turn quiet bootstrap probes into
+    // throws. Fixing it properly means storing the descriptor at
+    // `populate_stack_frame` time.
     r.register(
         sf,
         "getMethodType",
         "()Ljava/lang/invoke/MethodType;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
-    r.register(sf, "isNativeMethod", "()Z", |_ctx, args| {
+    r.register(sf, "isNativeMethod", "()Z", |ctx, args| {
         // Native iff lineNumber == -2 (per StackTraceElement convention).
-        if let Some(Value::Object(Some(this))) = args.first() {
-            let _ = this; // keep arg shape; reading through ctx would require &mut
-        }
-        Ok(Some(Value::Int(0)))
+        // This used to be a hard `false` with a dead `let _ = this;` and a
+        // comment claiming the read "would require &mut" — `get_field` takes
+        // `&self` and the callback already receives `&mut dyn NativeContext`,
+        // so slot 3 (lineNumber, populated by `populate_stack_frame`) is
+        // readable right here.
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let line = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        Ok(Some(Value::Int(if line == -2 { 1 } else { 0 })))
     });
     // `StackFrame.toString()`. The JDK's `StackFrameInfo.toString()` returns
     // `toStackTraceElement().toString()`; this synthetic carrier is not a real
@@ -2366,24 +2433,74 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(param, "getType", "()Ljava/lang/Class;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    // NOTE on the `Parameter` layout: the header above is stale.
+    // `lang_reflect::build_parameter_array` is the only builder; it writes the
+    // REAL JDK named fields (`name`/`modifiers`/`executable`/`index`) when the
+    // real class is loaded and otherwise falls back to the 4-slot synthetic
+    // layout [0]=name, [1]=modifiers, [2]=TYPE mirror, [3]=executable.
+    //
+    // `getType` is deliberately NOT re-registered here: this phase runs AFTER
+    // `register_phase55_reflect`, whose slot-2 read is the correct answer for
+    // that layout, and the constant null that used to sit here shadowed it.
     r.register(
         param,
         "getDeclaringExecutable",
         "()Ljava/lang/reflect/Executable;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 2)))
+            // Slot 3, not 2 — slot 2 is the parameter TYPE mirror, so the old
+            // read handed callers a `Class` where an `Executable` is required
+            // (JUnit 5's `ParameterContext` shim in `lib.rs` invokes this).
+            match ctx.get_field_by_name(this, "executable") {
+                Value::Object(Some(e)) => Ok(Some(Value::Object(Some(e)))),
+                _ => Ok(Some(ctx.get_field(this, 3))),
+            }
         },
     );
-    r.register(param, "isVarArgs", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // `Parameter.isVarArgs()` is true only for the LAST parameter of a varargs
+    // executable (JDK: `executable.isVarArgs() && index == parameterCount-1`).
+    // The constant `false` this replaces made every varargs tail look like an
+    // ordinary array parameter to reflective callers.
+    r.register(param, "isVarArgs", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // The 4-slot synthetic fallback carries no `index`, so it genuinely
+        // cannot answer this and keeps the conservative `false`.
+        let Value::Int(index) = ctx.get_field_by_name(this, "index") else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let exec = match ctx.get_field_by_name(this, "executable") {
+            Value::Object(Some(e)) => e,
+            _ => match ctx.get_field(this, 3) {
+                Value::Object(Some(e)) => e,
+                _ => return Ok(Some(Value::Int(0))),
+            },
+        };
+        // `invoke_virtual` can allocate and safepoint — pin `exec` across it.
+        let pin = ctx.pin_native_root(exec);
+        let varargs = matches!(
+            ctx.invoke_virtual(exec, "isVarArgs", "()Z", &[]),
+            Ok(Some(Value::Int(v))) if v != 0
+        );
+        if !varargs {
+            ctx.unpin_native_roots(pin);
+            return Ok(Some(Value::Int(0)));
+        }
+        let exec = ctx.read_native_pin(pin, exec);
+        let count = match ctx.invoke_virtual(exec, "getParameterCount", "()I", &[]) {
+            Ok(Some(Value::Int(c))) => c,
+            _ => 0,
+        };
+        ctx.unpin_native_roots(pin);
+        Ok(Some(Value::Int(if count > 0 && index == count - 1 {
+            1
+        } else {
+            0
+        })))
     });
-    r.register(param, "isNamePresent", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    });
+    // `isNamePresent` is deliberately NOT registered here — see the matching
+    // note in `register_phase55_reflect`. The constant `true` that used to sit
+    // at this site shadowed `lang_reflect::native_parameter_is_name_present`,
+    // which this phase runs after.
     r.register(
         param,
         "getAnnotations",
@@ -2405,17 +2522,22 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
 
     // --- Executable base methods ---
     let exec = "java/lang/reflect/Executable";
-    r.register(
-        exec,
-        "getParameters",
-        "()[Ljava/lang/reflect/Parameter;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
-    r.register(exec, "getParameterCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // `getParameters` is deliberately NOT registered here. The empty array it
+    // used to return shadowed `lang_reflect::native_executable_get_parameters`
+    // (installed earlier, via `register_annotation_overrides` ->
+    // `register_wp2_1_natives`), so under `--synthetic-jdk` every
+    // `Executable.getParameters()` answered "this method takes no parameters".
+    r.register(exec, "getParameterCount", "()I", |ctx, args| {
+        // Was a constant 0. Count the descriptor's parameters instead — a
+        // `Method`/`Constructor` mirror carries its descriptor in the metadata
+        // tail these two readers know how to locate.
+        let this = obj_arg(args, 0)?;
+        let descriptor = match crate::lang_class::read_method_descriptor(ctx, this) {
+            Some(desc) => desc,
+            None => crate::lang_class::read_constructor_descriptor(ctx, this).unwrap_or_default(),
+        };
+        let (params, _) = crate::lang_class::parse_descriptor_param_and_return(&descriptor);
+        Ok(Some(Value::Int(params.len() as i32)))
     });
     r.register(
         exec,
@@ -2529,22 +2651,15 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
     );
 
     // --- Constructor annotation methods ---
-    let ctor = "java/lang/reflect/Constructor";
-    r.register(
-        ctor,
-        "getAnnotations",
-        "()[Ljava/lang/annotation/Annotation;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
-    r.register(
-        ctor,
-        "getAnnotation",
-        "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // Deliberately EMPTY now. This phase used to re-register
+    // `Constructor.getAnnotations` as an empty array and
+    // `Constructor.getAnnotation` as a constant null. Because phase 61 runs
+    // AFTER `register_annotation_overrides`, those two constants shadowed the
+    // real `native_method_get_annotations` / `native_method_get_annotation`
+    // bindings — the ones that exist precisely so Jackson can see an
+    // `@JsonCreator` constructor (see their comment in
+    // `reflect_annotations.rs`). Leaving the slots alone lets the real
+    // implementations stand in synthetic-jdk mode too.
     r.set_category(__prev_cat);
 }
 
@@ -2659,12 +2774,15 @@ pub(crate) fn register_p65_stream_map_multi(r: &mut NativeMethodRegistry) {
 pub(crate) fn register_p66_constant_desc(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // Constable interface
+    // Constable interface. `describeConstable()` returns an `Optional`, never
+    // null — the constant null this replaces NPE'd every `.isPresent()` /
+    // `.orElseThrow()` caller. We have no nominal descriptor to hand back, so
+    // answer the spec-legal negative: `Optional.empty()`.
     r.register(
         "java/lang/constant/Constable",
         "describeConstable",
         "()Ljava/util/Optional;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p60_empty_optional,
     );
 
     // ConstantDesc interface
@@ -2735,12 +2853,41 @@ pub(crate) fn register_p66_constant_desc(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
-    r.register(cd, "isArray", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(cd, "isPrimitive", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // This synthetic `ClassDesc` is a 1-field wrapper whose slot 0 holds the
+    // string handed to `of`/`ofDescriptor`. Classify from that string instead
+    // of answering three constants — the old `isPrimitive` was hard-`false`
+    // even for `ClassDesc.ofDescriptor("I")`, and `isClassOrInterface` was
+    // hard-`true` even for an array descriptor.
+    fn cd_text(ctx: &mut dyn NativeContext, args: &[Value]) -> String {
+        match args.first() {
+            Some(Value::Object(Some(this))) => match ctx.get_field(*this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
+            _ => String::new(),
+        }
+    }
+    fn cd_is_primitive(text: &str) -> bool {
+        // Only a bare single-character FIELD descriptor is primitive; a binary
+        // name such as `java.lang.Integer` is not.
+        text.len() == 1
+            && matches!(
+                text.as_bytes()[0],
+                b'B' | b'C' | b'D' | b'F' | b'I' | b'J' | b'S' | b'Z' | b'V'
+            )
+    }
+    r.register(cd, "isArray", "()Z", |ctx, args| {
+        let text = cd_text(ctx, args);
+        Ok(Some(Value::Int(if text.starts_with('[') { 1 } else { 0 })))
     });
-    r.register(cd, "isClassOrInterface", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    r.register(cd, "isPrimitive", "()Z", |ctx, args| {
+        let text = cd_text(ctx, args);
+        Ok(Some(Value::Int(if cd_is_primitive(&text) { 1 } else { 0 })))
+    });
+    r.register(cd, "isClassOrInterface", "()Z", |ctx, args| {
+        let text = cd_text(ctx, args);
+        let is_cls = !text.is_empty() && !text.starts_with('[') && !cd_is_primitive(&text);
+        Ok(Some(Value::Int(if is_cls { 1 } else { 0 })))
     });
 
     // MethodTypeDesc
@@ -2902,6 +3049,13 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
 pub(crate) fn register_p69_switch_bootstraps(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // KEEP (constants, justified): the `invokedynamic` opcode never reaches
+    // these. `vm/src/runtime/invokedynamic.rs` recognises SwitchBootstraps and
+    // ObjectMethods by name and bootstraps them inside the VM, so the only way
+    // into these registrations is an explicit reflective call to the bootstrap
+    // method itself — for which HotSpot's own contract is "the caller does not
+    // get a usable CallSite". `vm/src/vm.rs::switch_bootstraps_stub_p69` pins
+    // the null return, so changing it to a throw needs that test updated too.
     let sb = "java/lang/runtime/SwitchBootstraps";
     r.register(sb, "typeSwitch",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",

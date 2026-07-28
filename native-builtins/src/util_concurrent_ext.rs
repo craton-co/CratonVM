@@ -3137,10 +3137,14 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
     );
 
     let flow_sub = "java/util/concurrent/Flow$Subscription";
-    registry.register(flow_sub, "request", "(J)V", |_ctx, _args| {
-        // No-op for default subscription
-        Ok(None)
-    });
+    // SUPERSEDED — do not "fix" this in place. `streams::register_stream_overrides`
+    // is called from lib.rs IMMEDIATELY after `register_concurrent_natives`
+    // (in both run modes) precisely to replace this no-op with
+    // `native_flow_request`, a real saturating-add demand counter; a unit test
+    // (`register_stream_overrides_installs_flow_subscription_request`) asserts
+    // that override is installed. The no-op below never runs. It is kept so the
+    // triple exists even if a caller registers only this module.
+    registry.register(flow_sub, "request", "(J)V", |_ctx, _args| Ok(None));
     registry.register(flow_sub, "cancel", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -4742,10 +4746,20 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
         native_fut_get_timed,
     );
     registry.register(fut, "isDone", "()Z", native_fut_is_done);
-    registry.register(fut, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    registry.register(fut, "isCancelled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    // Real cancel/isCancelled over the shared future layout (field
+    // FUT_FIELD_DONE: 0=pending, 1=normal, 2=exceptional, 3=cancelled) — the
+    // same encoding `cf.cancel`/`cf.isCancelled` above use. The previous
+    // constant `false` made every `Future.cancel(..)` fail and every
+    // `isCancelled()` deny a cancellation that had in fact happened, so
+    // `while (!f.isCancelled())` loops never terminated.
+    //
+    // NOTE (registration order): `register_phase55_executors`
+    // (phases_late/concurrent.rs) re-registers all three of
+    // `java/util/concurrent/Future`'s isDone/isCancelled/cancel LATER in
+    // `register_synthetic_overrides`, so on the interface triple that one wins.
+    // These stay correct-by-construction in case that order changes.
+    registry.register(fut, "cancel", "(Z)Z", native_fut_cancel);
+    registry.register(fut, "isCancelled", "()Z", native_fut_is_cancelled);
 
     // FutureTask
     registry.register(ft, "get", "()Ljava/lang/Object;", native_fut_get);
@@ -4756,10 +4770,14 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
         native_fut_get_timed,
     );
     registry.register(ft, "isDone", "()Z", native_fut_is_done);
-    registry.register(ft, "cancel", "(Z)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
-    registry.register(ft, "isCancelled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    // Synthetic FutureTask uses the same (result=0, done=1) layout — see the
+    // `alloc_concurrent_synthetic(.., "java/util/concurrent/FutureTask", 2)`
+    // call sites in phases_late/net_channels.rs. Nothing else registers
+    // FutureTask.cancel/isCancelled, so the old constant `false` pair was the
+    // live answer: `FutureTask.cancel(true)` could never succeed and a
+    // cancelled task still reported `isCancelled() == false`.
+    registry.register(ft, "cancel", "(Z)Z", native_fut_cancel);
+    registry.register(ft, "isCancelled", "()Z", native_fut_is_cancelled);
 
     // CompletableFuture timed get
     registry.register(
@@ -4768,6 +4786,44 @@ pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodReg
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         native_fut_get_timed,
     );
+}
+
+/// `Future.cancel(boolean)` / `FutureTask.cancel(boolean)` over the shared
+/// synthetic future layout. `FUT_FIELD_DONE` encodes 0=pending, 1=completed
+/// normally, 2=completed exceptionally, 3=cancelled (the encoding
+/// `CompletableFuture.cancel` already used). Per the `Future` contract this
+/// returns false when the task has already completed and true once the task is
+/// (or already was) cancelled.
+fn native_fut_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let done = match ctx.get_field(this, FUT_FIELD_DONE) {
+        Value::Int(d) => d,
+        _ => 0,
+    };
+    if done == 3 {
+        // Already cancelled — the JDK returns true for repeated cancel().
+        return Ok(Some(Value::Int(1)));
+    }
+    if done != 0 {
+        // Already completed normally/exceptionally: cannot cancel.
+        return Ok(Some(Value::Int(0)));
+    }
+    ctx.set_field(this, FUT_FIELD_DONE, Value::Int(3));
+    Ok(Some(Value::Int(1)))
+}
+
+/// `Future.isCancelled()` / `FutureTask.isCancelled()` — see
+/// [`native_fut_cancel`] for the `FUT_FIELD_DONE` encoding.
+fn native_fut_is_cancelled(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let cancelled = matches!(ctx.get_field(this, FUT_FIELD_DONE), Value::Int(3));
+    Ok(Some(Value::Int(if cancelled { 1 } else { 0 })))
 }
 
 fn native_fut_get_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6059,6 +6115,26 @@ pub(crate) fn register_atomic_extras_natives(registry: &mut NativeMethodRegistry
     registry.register(aia, "incrementAndGet", "(I)I", native_aia_inc_and_get);
     registry.register(aia, "decrementAndGet", "(I)I", native_aia_dec_and_get);
     registry.register(aia, "length", "()I", native_aia_length);
+    // The interpreter force-routes this whole method set to a native (see the
+    // "C23" block in vm_exec.rs): the real JDK bodies go through
+    // `VarHandles$Array$*`, which cannot CAS an array element here. Anything
+    // on that list without a registration silently falls back to exactly the
+    // bytecode the force-route exists to avoid, so register the full set.
+    registry.register(aia, "addAndGet", "(II)I", native_aia_add_and_get);
+    registry.register(aia, "lazySet", "(II)V", native_aia_set);
+    registry.register(aia, "setPlain", "(II)V", native_aia_set);
+    registry.register(aia, "setOpaque", "(II)V", native_aia_set);
+    registry.register(aia, "setRelease", "(II)V", native_aia_set);
+    registry.register(aia, "getPlain", "(I)I", native_aia_get);
+    registry.register(aia, "getOpaque", "(I)I", native_aia_get);
+    registry.register(aia, "getAcquire", "(I)I", native_aia_get);
+    registry.register(aia, "weakCompareAndSet", "(III)Z", native_aia_cas);
+    registry.register(aia, "weakCompareAndSetPlain", "(III)Z", native_aia_cas);
+    registry.register(aia, "weakCompareAndSetAcquire", "(III)Z", native_aia_cas);
+    registry.register(aia, "weakCompareAndSetRelease", "(III)Z", native_aia_cas);
+    registry.register(aia, "compareAndExchange", "(III)I", native_aia_cae);
+    registry.register(aia, "compareAndExchangeAcquire", "(III)I", native_aia_cae);
+    registry.register(aia, "compareAndExchangeRelease", "(III)I", native_aia_cae);
 
     // AtomicLongArray = 1-field synthetic (backing long[])
     let ala = "java/util/concurrent/atomic/AtomicLongArray";
@@ -6070,7 +6146,81 @@ pub(crate) fn register_atomic_extras_natives(registry: &mut NativeMethodRegistry
     registry.register(ala, "getAndIncrement", "(I)J", native_ala_get_and_inc);
     registry.register(ala, "incrementAndGet", "(I)J", native_ala_inc_and_get);
     registry.register(ala, "length", "()I", native_ala_length);
+    registry.register(ala, "getAndAdd", "(IJ)J", native_ala_get_and_add);
+    registry.register(ala, "addAndGet", "(IJ)J", native_ala_add_and_get);
+    registry.register(ala, "getAndDecrement", "(I)J", native_ala_get_and_dec);
+    registry.register(ala, "decrementAndGet", "(I)J", native_ala_dec_and_get);
+    registry.register(ala, "lazySet", "(IJ)V", native_ala_set);
+    registry.register(ala, "setPlain", "(IJ)V", native_ala_set);
+    registry.register(ala, "setOpaque", "(IJ)V", native_ala_set);
+    registry.register(ala, "setRelease", "(IJ)V", native_ala_set);
+    registry.register(ala, "getPlain", "(I)J", native_ala_get);
+    registry.register(ala, "getOpaque", "(I)J", native_ala_get);
+    registry.register(ala, "getAcquire", "(I)J", native_ala_get);
+    registry.register(ala, "weakCompareAndSet", "(IJJ)Z", native_ala_cas);
+    registry.register(ala, "weakCompareAndSetPlain", "(IJJ)Z", native_ala_cas);
+    registry.register(ala, "weakCompareAndSetAcquire", "(IJJ)Z", native_ala_cas);
+    registry.register(ala, "weakCompareAndSetRelease", "(IJJ)Z", native_ala_cas);
+    registry.register(ala, "compareAndExchange", "(IJJ)J", native_ala_cae);
+    registry.register(ala, "compareAndExchangeAcquire", "(IJJ)J", native_ala_cae);
+    registry.register(ala, "compareAndExchangeRelease", "(IJJ)J", native_ala_cae);
     registry.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// Atomic array element read-modify-write
+// ---------------------------------------------------------------------------
+//
+// `AtomicIntegerArray` / `AtomicLongArray` / `AtomicReferenceArray` are backed
+// by a plain Java array here, and every read-modify-write native used to be a
+// bare `get_array_element` + `set_array_element` pair with nothing in between.
+// That is not a compare-and-swap: two threads can both read the expected value
+// and both report success, so `compareAndSet` did not provide mutual exclusion
+// at all.
+//
+// H2's `TestFileSystem.testConcurrent` uses exactly that idiom as a spin lock
+// (`while (!locks.compareAndSet(pos, 0, 1)) {}`), so a writer and a reader
+// could hold the same "lock" simultaneously and the reader observed a stale
+// `expected` against freshly written file contents -- surfacing as
+// `AssertionError: Expected: 3900 actual: 3897`. It was previously attributed
+// to compiled `org/h2` code reordering across the atomic; the atomic simply
+// was not one. (2026-07-27)
+//
+// `NativeContext::compare_and_swap_field` already special-cases array
+// receivers and performs the read/compare/write under the per-object CAS lock,
+// which is what the scalar `AtomicInteger` natives have always used. Route
+// every array RMW through it.
+
+/// Atomically apply `f` to element `idx` of `arr`, retrying until the CAS wins.
+/// Returns `(previous, new)`. `f` must be side-effect free -- it can run more
+/// than once.
+pub(crate) fn atomic_array_rmw<F>(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    idx: usize,
+    mut f: F,
+) -> (Value, Value)
+where
+    F: FnMut(Value) -> Value,
+{
+    loop {
+        let current = ctx.get_array_element(arr, idx);
+        let updated = f(current);
+        if ctx.compare_and_swap_field(arr, idx, current, updated) {
+            return (current, updated);
+        }
+    }
+}
+
+/// Atomic `compareAndSet` on element `idx` of `arr`.
+pub(crate) fn atomic_array_cas(
+    ctx: &mut dyn NativeContext,
+    arr: ObjectRef,
+    idx: usize,
+    expected: Value,
+    update: Value,
+) -> bool {
+    ctx.compare_and_swap_field(arr, idx, expected, update)
 }
 
 // --- AtomicIntegerArray ---
@@ -6134,7 +6284,168 @@ fn native_aia_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
     let new_val = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| Value::Int(new_val));
+    Ok(Some(old))
+}
+
+fn native_aia_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let expected = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let update = match args.get(3) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let ok = atomic_array_cas(ctx, arr, idx, Value::Int(expected), Value::Int(update));
+    Ok(Some(Value::Int(i32::from(ok))))
+}
+
+fn native_aia_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Int(cur.as_int().unwrap_or(0).wrapping_add(1))
+    });
+    let _ = (old, new_val);
+    Ok(Some(old))
+}
+
+fn native_aia_get_and_dec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Int(cur.as_int().unwrap_or(0).wrapping_sub(1))
+    });
+    let _ = (old, new_val);
+    Ok(Some(old))
+}
+
+fn native_aia_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let delta = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let (old, _) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Int(cur.as_int().unwrap_or(0).wrapping_add(delta))
+    });
+    Ok(Some(old))
+}
+
+fn native_aia_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Int(cur.as_int().unwrap_or(0).wrapping_add(1))
+    });
+    let _ = (old, new_val);
+    Ok(Some(new_val))
+}
+
+fn native_aia_dec_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let (old, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Int(cur.as_int().unwrap_or(0).wrapping_sub(1))
+    });
+    let _ = (old, new_val);
+    Ok(Some(new_val))
+}
+
+fn native_aia_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(ctx.array_length(arr) as i32)))
+}
+
+fn native_aia_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let delta = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
@@ -6142,12 +6453,15 @@ fn native_aia_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let old = ctx.get_array_element(arr, idx);
-    ctx.set_array_element(arr, idx, Value::Int(new_val));
-    Ok(Some(old))
+    let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Int(cur.as_int().unwrap_or(0).wrapping_add(delta))
+    });
+    Ok(Some(new_val))
 }
 
-fn native_aia_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// `compareAndExchange`: like `compareAndSet` but returns the WITNESS value
+/// (the value actually found), not a boolean.
+fn native_aia_cae(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
@@ -6168,137 +6482,15 @@ fn native_aia_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if cur == expected {
-        ctx.set_array_element(arr, idx, Value::Int(update));
-        Ok(Some(Value::Int(1)))
-    } else {
-        Ok(Some(Value::Int(0)))
+    loop {
+        let current = ctx.get_array_element(arr, idx);
+        if current.as_int().unwrap_or(0) != expected {
+            return Ok(Some(current));
+        }
+        if atomic_array_cas(ctx, arr, idx, current, Value::Int(update)) {
+            return Ok(Some(current));
+        }
     }
-}
-
-fn native_aia_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_array_element(arr, idx, Value::Int(cur + 1));
-    Ok(Some(Value::Int(cur)))
-}
-
-fn native_aia_get_and_dec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_array_element(arr, idx, Value::Int(cur - 1));
-    Ok(Some(Value::Int(cur)))
-}
-
-fn native_aia_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let delta = match args.get(2) {
-        Some(Value::Int(v)) => *v,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_array_element(arr, idx, Value::Int(cur + delta));
-    Ok(Some(Value::Int(cur)))
-}
-
-fn native_aia_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_array_element(arr, idx, Value::Int(cur + 1));
-    Ok(Some(Value::Int(cur + 1)))
-}
-
-fn native_aia_dec_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
-        _ => 0,
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_array_element(arr, idx, Value::Int(cur - 1));
-    Ok(Some(Value::Int(cur - 1)))
-}
-
-fn native_aia_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    Ok(Some(Value::Int(ctx.array_length(arr) as i32)))
 }
 
 // --- AtomicLongArray ---
@@ -6362,16 +6554,15 @@ fn native_ala_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    let new_val = match args.get(2) {
-        Some(Value::Long(v)) => *v,
-        _ => 0,
-    };
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let old = ctx.get_array_element(arr, idx);
-    ctx.set_array_element(arr, idx, Value::Long(new_val));
+    let new_val = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| Value::Long(new_val));
     Ok(Some(old))
 }
 
@@ -6384,6 +6575,10 @@ fn native_ala_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
     let expected = match args.get(2) {
         Some(Value::Long(v)) => *v,
         _ => 0,
@@ -6392,20 +6587,8 @@ fn native_ala_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let arr = match ctx.get_field(this, 0) {
-        Value::Object(Some(o)) => o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    if cur == expected {
-        ctx.set_array_element(arr, idx, Value::Long(update));
-        Ok(Some(Value::Int(1)))
-    } else {
-        Ok(Some(Value::Int(0)))
-    }
+    let ok = atomic_array_cas(ctx, arr, idx, Value::Long(expected), Value::Long(update));
+    Ok(Some(Value::Int(i32::from(ok))))
 }
 
 fn native_ala_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6421,12 +6604,10 @@ fn native_ala_get_and_inc(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Long(v) => v,
-        _ => 0,
-    };
-    ctx.set_array_element(arr, idx, Value::Long(cur + 1));
-    Ok(Some(Value::Long(cur)))
+    let (old, _) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Long(cur.as_long().unwrap_or(0).wrapping_add(1))
+    });
+    Ok(Some(old))
 }
 
 fn native_ala_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6442,12 +6623,102 @@ fn native_ala_inc_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Value::Object(Some(o)) => o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let cur = match ctx.get_array_element(arr, idx) {
-        Value::Long(v) => v,
+    let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Long(cur.as_long().unwrap_or(0).wrapping_add(1))
+    });
+    Ok(Some(new_val))
+}
+
+/// Resolve `(backing array, index)` for an `AtomicLongArray` native call.
+fn ala_target(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<(ObjectRef, usize)> {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return None,
+    };
+    let idx = match args.get(1) {
+        Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
-    ctx.set_array_element(arr, idx, Value::Long(cur + 1));
-    Ok(Some(Value::Long(cur + 1)))
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => Some((o, idx)),
+        _ => None,
+    }
+}
+
+fn native_ala_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (arr, idx) = match ala_target(ctx, args) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let delta = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let (old, _) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Long(cur.as_long().unwrap_or(0).wrapping_add(delta))
+    });
+    Ok(Some(old))
+}
+
+fn native_ala_add_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (arr, idx) = match ala_target(ctx, args) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let delta = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Long(cur.as_long().unwrap_or(0).wrapping_add(delta))
+    });
+    Ok(Some(new_val))
+}
+
+fn native_ala_get_and_dec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (arr, idx) = match ala_target(ctx, args) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let (old, _) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Long(cur.as_long().unwrap_or(0).wrapping_sub(1))
+    });
+    Ok(Some(old))
+}
+
+fn native_ala_dec_and_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (arr, idx) = match ala_target(ctx, args) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+        Value::Long(cur.as_long().unwrap_or(0).wrapping_sub(1))
+    });
+    Ok(Some(new_val))
+}
+
+fn native_ala_cae(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let (arr, idx) = match ala_target(ctx, args) {
+        Some(t) => t,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let expected = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let update = match args.get(3) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    loop {
+        let current = ctx.get_array_element(arr, idx);
+        if current.as_long().unwrap_or(0) != expected {
+            return Ok(Some(current));
+        }
+        if atomic_array_cas(ctx, arr, idx, current, Value::Long(update)) {
+            return Ok(Some(current));
+        }
+    }
 }
 
 fn native_ala_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7360,7 +7631,11 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/StructuredTaskScope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
+            // Do not downgrade an already shut-down / closed scope (state 2):
+            // `shutdown(); join();` must leave isShutdown() == true.
+            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
+                ctx.set_field(this, 1, Value::Int(1));
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -7370,7 +7645,9 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         "(Ljava/time/Instant;)Ljava/util/concurrent/StructuredTaskScope;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
+            if !matches!(ctx.get_field(this, 1), Value::Int(2)) {
+                ctx.set_field(this, 1, Value::Int(1));
+            }
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -7379,7 +7656,15 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int(2));
         Ok(None)
     });
-    r.register(scope, "shutdown", "()V", |_ctx, _args| Ok(None));
+    // shutdown() must be observable by isShutdown() below (which tests
+    // field 1 == 2). The former no-op meant `scope.shutdown();
+    // scope.isShutdown()` answered false, so ShutdownOn*-style loops that
+    // poll for the shutdown flag never saw it and kept forking subtasks.
+    r.register(scope, "shutdown", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 1, Value::Int(2));
+        Ok(None)
+    });
     r.register(scope, "isShutdown", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(

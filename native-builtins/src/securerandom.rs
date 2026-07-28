@@ -880,6 +880,16 @@ pub(crate) fn native_secure_random_get_instance_with_provider(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    // The provider argument is otherwise discarded (every algorithm here is
+    // served by the OS CSPRNG regardless), but real JDK still resolves the
+    // named provider first and rejects one that was never registered — see
+    // `check_named_provider_arg`.
+    crate::jca::provider_chain::check_named_provider_arg(
+        ctx,
+        args,
+        1,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     native_secure_random_get_instance(ctx, args)
 }
 
@@ -948,6 +958,18 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
         Ok(None)
     });
     registry.register(sr, "setSeed", "(J)V", native_secure_random_set_seed);
+    // KEEP (spec-conformant, not a stub): `SecureRandom.setSeed(byte[])` is
+    // documented as SUPPLEMENTING, never replacing, the existing seed. The
+    // stream here comes from the OS CSPRNG on every draw
+    // (`native_secure_random_next_bytes`), so there is no PRNG state a caller
+    // seed could usefully be folded into — and mixing caller-controlled bytes
+    // in could only ever weaken it. Skipping the supplement is exactly what
+    // the spec permits; see `native_secure_random_set_seed` (the `(J)V`
+    // overload) for the same reasoning. Verified while auditing this file:
+    // every draw path (`nextBytes`/`nextInt`/`nextLong`/`generateSeed`) calls
+    // `os_random_bytes`/`os_random_u64` and raises `SecurityException` on
+    // entropy failure rather than returning zeros, so nothing in this module
+    // is constant-valued.
     registry.register(sr, "setSeed", "([B)V", |_ctx, _args| Ok(None));
     registry.register(sr, "nextInt", "()I", native_secure_random_next_int);
     registry.register(sr, "nextInt", "(I)I", native_secure_random_next_int_bound);

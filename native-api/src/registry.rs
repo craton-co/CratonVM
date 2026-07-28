@@ -701,6 +701,37 @@ pub trait NativeClassAccess {
     /// Get the record components (name, descriptor) for a record class.
     fn record_components(&self, class_id: ClassId) -> Vec<(String, String)>;
 
+    /// `hashCode`/`equals` fast-path metadata for `class_id`, resolved in a
+    /// single class-manager lock acquisition:
+    ///
+    /// * `.0` — a bitmask describing how instances can be hashed/compared
+    ///   without a Java dispatch:
+    ///   * bit 0 — declares the **javac-generated** (JEP 395) `hashCode()I`
+    ///   * bit 1 — declares the generated `equals(Ljava/lang/Object;)Z`
+    ///   * bit 2 — declares the generated `toString()Ljava/lang/String;`
+    ///   * bit 3 — instances have identity `hashCode`/`equals` semantics
+    ///   * bit 4 — the class is `java.lang.String`
+    ///   * bit 5 — the class is exactly `java.util.ArrayList`
+    ///
+    ///   The record bits are `0` for a non-record and for any of the three a
+    ///   record hand-writes — an explicit override must keep its own
+    ///   semantics. Bit 3 is set only for enum classes, where JLS §8.9 makes
+    ///   `Enum.hashCode`/`Enum.equals` final and identity-based. Bits 3-5 are
+    ///   mutually exclusive with the record bits and with each other.
+    /// * `.1` — the field slot of the first record component, i.e. the class's
+    ///   `first_field_index`. Always `0` for a real record (neither
+    ///   `java.lang.Record` nor `java.lang.Object` declares an instance
+    ///   field), but read rather than assumed.
+    /// * `.2` — the number of record components, `0` for a non-record.
+    ///
+    /// Consulted once per component of every nested record by the direct
+    /// record `hashCode`/`equals` implementations. Defaults to
+    /// `(0, 0, 0)` — "no fast path" — for the test doubles.
+    fn object_method_fast_path(&self, class_id: ClassId) -> (u8, usize, usize) {
+        let _ = class_id;
+        (0, 0, 0)
+    }
+
     /// Check if a class is sealed (has PermittedSubclasses attribute, JEP 409).
     fn is_sealed_class(&self, class_id: ClassId) -> bool;
 
@@ -1107,8 +1138,20 @@ pub trait NativeClassAccess {
     /// MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2)
     /// so they all dispatch to the same backend.
     ///
-    /// `loader_id == 0` means use the application loader; non-zero
-    /// values are user-defined loader namespaces.
+    /// `loader_id` is the flat wire encoding of a
+    /// [`cratonvm_types::ClassLoaderId`] — the same one
+    /// [`NativeContext::loader_id_of_class`] produces, so a loader id fetched
+    /// from an existing class can be handed straight back here to define a new
+    /// class in that *same* loader (which is exactly what the CGLIB
+    /// `@Configuration` enhancer does). Implementations MUST decode it with
+    /// `ClassLoaderId::from_native_id_or_default`: `1` is the extension
+    /// loader, `2` the application loader, anything `>= 3` a user-defined
+    /// namespace, and `0` means "unspecified — use the application loader"
+    /// (several callers pass a literal `0` for that). Decoding `2` as
+    /// `UserDefined(2)` puts the new class in a different runtime package from
+    /// its own superclass and silently breaks package-private override
+    /// detection — see
+    /// `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`.
     fn define_class_full(
         &mut self,
         name: &str,
@@ -1162,8 +1205,9 @@ pub trait NativeClassAccess {
     }
 
     /// WP2.4 — list all classes whose initiating loader was the
-    /// application loader (or, if `loader_id != 0`, the user-defined
-    /// loader with that id).
+    /// application loader (or, if `loader_id != 0`, the loader that
+    /// `loader_id` names under the same wire encoding
+    /// [`NativeContext::define_class_full`] documents).
     fn list_initiated_class_ids(&self, _loader_id: u32) -> Vec<ClassId> {
         Vec::new()
     }

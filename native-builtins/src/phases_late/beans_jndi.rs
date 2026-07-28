@@ -14,8 +14,19 @@ use super::*;
 // java.util.prefs.Preferences — 2-field synthetic (data=0 HashMap, name=1 String)
 // =============================================================================
 
+/// Synthetic `java.util.prefs.Preferences` layout:
+///   0: values   (HashMap<String,String> — the key/value store)
+///   1: name     (String — this node's simple name; "" for a root)
+///   2: parent   (Preferences — null for a root, per `Preferences.parent()`)
+///   3: children (HashMap<String,Preferences> — nodes created via `node()`)
+///
+/// Slots 2 and 3 were added in stub-removal wave 2: without a parent link
+/// `parent()` could only ever answer null, and without a child registry
+/// `nodeExists()` could only ever answer false — and `node("x")` minted a
+/// fresh detached node on every call, so `node("x").put(k,v)` followed by
+/// `node("x").get(k, d)` silently returned the default.
 pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 2);
+    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 4);
     // Pin across the map/string allocs below — a moving young GC there would
     // relocate them (native stale-local family).
     let prefs_pin = ctx.pin_native_root(prefs);
@@ -28,8 +39,36 @@ pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
     let name_str = ctx.create_string("");
     let prefs = ctx.read_native_pin(prefs_pin, prefs);
     ctx.set_field(prefs, 1, Value::Object(Some(name_str)));
+    // Roots have no parent; the child registry is created lazily by
+    // `p72_prefs_children` on the first `node()` call.
+    ctx.set_field(prefs, 2, Value::Object(None));
+    ctx.set_field(prefs, 3, Value::Object(None));
     ctx.unpin_native_roots(prefs_pin);
     prefs
+}
+
+/// The child-node registry of `this`, created on demand in slot 3.
+///
+/// Mirrors `p72_prefs_map`'s lazy-init shape (including its pinning), so a
+/// `Preferences` built before slots 2/3 existed still works.
+pub(crate) fn p72_prefs_children(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(this) < 4 {
+        return None;
+    }
+    if let Value::Object(Some(m)) = ctx.get_field(this, 3) {
+        return Some(m);
+    }
+    // Pin across the map alloc/init below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    let this = ctx.read_native_pin(this_pin, this);
+    let map = ctx.read_native_pin(map_pin, map);
+    ctx.set_field(this, 3, Value::Object(Some(map)));
+    ctx.unpin_native_roots(this_pin);
+    Some(map)
 }
 
 pub(crate) fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
@@ -109,25 +148,87 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let name_str = ctx.create_string("");
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(this, 1, Value::Object(Some(name_str)));
+            // Slots 2 (parent) and 3 (child registry) — see the layout note on
+            // `p72_alloc_prefs`. Guarded because a receiver constructed against
+            // an older/foreign layout may have fewer slots.
+            if ctx.object_num_fields(this) > 3 {
+                ctx.set_field(this, 2, Value::Object(None));
+                ctx.set_field(this, 3, Value::Object(None));
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         });
+        // node(path) — resolve, CREATING if absent, and remember the result.
+        //
+        // This used to mint a brand-new detached `Preferences` on every call
+        // and drop `this` on the floor, so nothing written through one
+        // `node("x")` was visible through the next, and the returned node had
+        // neither a parent nor an entry anywhere its owner could find. Now the
+        // child is memoised in the parent's slot-3 registry and back-linked
+        // through slot 2, which is what makes `parent()` and `nodeExists()`
+        // below able to answer truthfully.
         r.register(
             cls,
             "node",
             "(Ljava/lang/String;)Ljava/util/prefs/Preferences;",
             |ctx, args| {
+                let this = obj_arg(args, 0)?;
                 let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
-                // Pin across the prefs alloc below — a moving young GC there
-                // would relocate it (native stale-local family).
-                let name_pin = pinned_object_value(ctx, name_val);
-                let p = p72_alloc_prefs(ctx);
-                let name_val = read_pinned_object_value(ctx, name_pin, name_val);
-                ctx.set_field(p, 1, name_val);
-                if let Some((h, _)) = name_pin {
-                    ctx.unpin_native_roots(h);
+                // Per the Preferences spec the empty path names THIS node.
+                let name_txt = match name_val {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if name_txt.is_empty() {
+                    return Ok(Some(Value::Object(Some(this))));
                 }
-                Ok(Some(Value::Object(Some(p))))
+                let Some(children) = p72_prefs_children(ctx, this) else {
+                    // Pre-wave-2 layout (no child registry): fall back to the
+                    // old detached-node behaviour rather than failing.
+                    let name_pin = pinned_object_value(ctx, name_val);
+                    let p = p72_alloc_prefs(ctx);
+                    let name_val = read_pinned_object_value(ctx, name_pin, name_val);
+                    ctx.set_field(p, 1, name_val);
+                    if let Some((h, _)) = name_pin {
+                        ctx.unpin_native_roots(h);
+                    }
+                    return Ok(Some(Value::Object(Some(p))));
+                };
+                // Pin everything carried across the map calls and the child
+                // allocation below — each can trigger a moving young GC
+                // (native stale-local family).
+                let this_pin = ctx.pin_native_root(this);
+                let children_pin = ctx.pin_native_root(children);
+                let name_pin = pinned_object_value(ctx, name_val);
+                let existing = cratonvm_native_collections::native_map_get_pub(
+                    ctx,
+                    &[Value::Object(Some(children)), name_val],
+                )?;
+                if let Some(v @ Value::Object(Some(_))) = existing {
+                    ctx.unpin_native_roots(this_pin);
+                    return Ok(Some(v));
+                }
+                let child = p72_alloc_prefs(ctx);
+                let child_pin = ctx.pin_native_root(child);
+                let name_val = read_pinned_object_value(ctx, name_pin, name_val);
+                let child = ctx.read_native_pin(child_pin, child);
+                ctx.set_field(child, 1, name_val);
+                let this = ctx.read_native_pin(this_pin, this);
+                let child = ctx.read_native_pin(child_pin, child);
+                ctx.set_field(child, 2, Value::Object(Some(this)));
+                let children = ctx.read_native_pin(children_pin, children);
+                let child = ctx.read_native_pin(child_pin, child);
+                cratonvm_native_collections::native_map_put_pub(
+                    ctx,
+                    &[
+                        Value::Object(Some(children)),
+                        name_val,
+                        Value::Object(Some(child)),
+                    ],
+                )?;
+                let child = ctx.read_native_pin(child_pin, child);
+                ctx.unpin_native_roots(this_pin);
+                Ok(Some(Value::Object(Some(child))))
             },
         );
         r.register(
@@ -376,14 +477,54 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 1)))
         });
+        // parent() — the node that created this one via `node()`, or null for
+        // a root (`userRoot`/`systemRoot`/`*NodeForPackage`), which is exactly
+        // what the spec says a root must return. Was an unconditional null, so
+        // every node looked like a root and `absolutePath()`-style upward walks
+        // terminated immediately.
         r.register(
             cls,
             "parent",
             "()Ljava/util/prefs/Preferences;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                if ctx.object_num_fields(this) > 2 {
+                    if let v @ Value::Object(Some(_)) = ctx.get_field(this, 2) {
+                        return Ok(Some(v));
+                    }
+                }
+                Ok(Some(Value::Object(None)))
+            },
         );
-        r.register(cls, "nodeExists", "(Ljava/lang/String;)Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
+        // nodeExists(path) — was an unconditional false, which contradicted
+        // `node(path)` on the very next line: creating a child and then being
+        // told it does not exist. Answers from the slot-3 child registry now.
+        // The empty path names this node, which exists unless it was removed
+        // (we have no removeNode, so it always does).
+        r.register(cls, "nodeExists", "(Ljava/lang/String;)Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
+            let name_txt = match name_val {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if name_txt.is_empty() {
+                return Ok(Some(Value::Int(1)));
+            }
+            if ctx.object_num_fields(this) < 4 {
+                return Ok(Some(Value::Int(0)));
+            }
+            // Read slot 3 directly rather than through `p72_prefs_children`:
+            // a pure query must not create the registry as a side effect.
+            let Value::Object(Some(children)) = ctx.get_field(this, 3) else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let found = cratonvm_native_collections::native_map_contains_key_pub(
+                ctx,
+                &[Value::Object(Some(children)), name_val],
+            )?;
+            let exists = matches!(found, Some(Value::Int(n)) if n != 0);
+            Ok(Some(Value::Int(if exists { 1 } else { 0 })))
         });
         r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
             let this = obj_arg(args, 0)?;
@@ -1243,6 +1384,13 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // makes perfectly ordinary callers (including Introspector's superclass
     // merge) dispatch to the abstract declaration and fail with
     // AbstractMethodError.
+    //
+    // The four constants below are not placeholders: they are the bodies of
+    // `java.beans.SimpleBeanInfo`, the JDK's own do-nothing BeanInfo, verbatim
+    // — `getDefaultPropertyIndex()`/`getDefaultEventIndex()` return -1 ("no
+    // default"), `getAdditionalBeanInfo()` and `getIcon(int)` return null. A
+    // descriptor synthesised by reflection has no designer metadata to report,
+    // so -1/null IS the right answer, not an unimplemented one.
     r.register(bi, "getDefaultPropertyIndex", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(-1)))
     });
@@ -2617,7 +2765,11 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         "javax/naming/NameAlreadyBoundException",
         "javax/naming/NoInitialContextException",
     ] {
-        r.register(cls, "<init>", "()V", |_ctx, _args| Ok(None));
+        // No-arg ctor: the fields are already null (correct), but a bare no-op
+        // ALSO skips `fillInStackTrace()`, so `new NamingException()` came back
+        // with an empty `getStackTrace()`. Same defect — and same fix — as the
+        // `java/io/StreamCorruptedException` ctor in `serialization.rs`.
+        r.register(cls, "<init>", "()V", crate::native_exception_init_empty);
         r.register(cls, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
             if let Some(Value::Object(Some(this))) = args.first().copied() {
                 let msg = args.get(1).copied().unwrap_or(Value::Object(None));
@@ -2710,7 +2862,13 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(ctx_iface, "close", "()V", |_ctx, _args| {
-        // Default interface implementation — concrete classes override.
+        // Reached only by a receiver whose `close()` resolves on the interface
+        // itself (see the note above); `InitialContext` carries its own real
+        // `close`. Doing nothing is right rather than convenient: the bindings
+        // this interface fallback operates on live in an in-memory map on the
+        // receiver, with no socket, file handle or provider connection to
+        // release — unlike `ObjectInput.close`, which wave 1 deleted precisely
+        // because a no-op there leaked the underlying stream.
         Ok(None)
     });
     r.set_category(__prev_cat);

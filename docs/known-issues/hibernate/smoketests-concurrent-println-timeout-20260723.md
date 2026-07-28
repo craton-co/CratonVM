@@ -1,172 +1,232 @@
-# Hibernate SmokeTests concurrent `println` timeout
+# Hibernate `SmokeTests#testQueryConcurrency` — 120 s JUnit timeout
 
-**Status:** OPEN (2026-07-23)
+**Status:** OPEN (2026-07-23; re-diagnosed 2026-07-28). Not closable by
+incremental tuning — see "What closure actually requires".
 
-`org.hibernate.orm.test.sql.exec.SmokeTests#testQueryConcurrency` executes
-20,000 HQL queries through five workers. On the real-JDK JIT runner it times
-out at Hibernate's 120-second method limit while the remaining 16 tests pass.
+`org.hibernate.orm.test.sql.exec.SmokeTests#testQueryConcurrency` runs 50 forks x
+400 iterations (20 000 transactions, 3 HQL queries each) on a 5-thread pool. It
+hits Hibernate's 120-second per-method limit while the other 16 tests in the
+class pass.
 
-The standard test resources enable JDBC bind/extract TRACE logging, but this
-is only a contributing cost: suppressing both Hibernate SQL output and the
-JDBC TRACE logger still times out. The actual workload remains an
-interpreter-throughput problem in the concurrent H2/Hibernate query path.
+## The number the doc never stated
 
-The package-wide Hibernate JIT quarantine is justified by a deterministic
-miscompile in `TransactionUtil.wrapInTransaction(SharedSessionContract,Object,
-Consumer)`: after its interface callback returns, pc 30 resumes with an
-underflowed operand stack and leaks all five H2 connections. A hard per-method
-JIT exclusion removes that corruption. With the rest of Hibernate admitted
-for diagnosis, SmokeTests improves from 164.7s to 135.6s, but still misses the
-120-second test limit. H2, Log4j/JBoss logging, ANTLR, Java collections,
-synthetic AQS, earlier C2, virtual-call IR, and main-method inlining either do
-not help or regress. The remaining top interpreter methods are the Log4j
-enablement chain and H2 accessors.
+Run alone with the cap lifted (`-Djunit.jupiter.execution.timeout.default=3600s`,
+`MethodRunner`), the test **passes**:
 
-The current HotSpot baseline passes all 17 methods in 9281 ms while CratonVM
-reliably reaches 16/17 and times out only in `testQueryConcurrency`. Pending
-closure requires a bytecode-equivalent acceleration of the remaining logging
-enablement/H2 hot path, then release-binary validation of `InPredicateTest`,
-`SmokeTests`, and `LockTest` in JIT and `--nojit` modes.
+| | CratonVM | HotSpot JDK 25 | ratio |
+|---|---:|---:|---:|
+| `testQueryConcurrency` alone | **614 608 ms** | **15 943 ms** | **38.6x** |
 
-Further targeted experiments retained the same result and were reverted:
+So this is not a hang, a deadlock, or a correctness bug — it is throughput, and
+**closing it needs ~5.2x**, not a few percent. That single fact retires the
+entire history of ±10–30% experiments recorded in the older revisions of this
+doc: none of them could ever have closed it.
 
-- preserving real `ReadLock`/`WriteLock` view layout while routing the public
-  operations to the native RWL backend: 16/17, 170.2 s;
-- replacing the global CAS-lock registry lookup with 256 fixed lock stripes:
-  16/17, 165.7 s;
-- enabling Hibernate-only JIT admission at threshold 100: 16/17, 152.8 s;
-- replacing the JIT-excluded `TransactionUtil.wrapInTransaction` Consumer
-  wrapper with an exact pinned native begin/callback/commit-or-rollback path:
-  correct lifecycle but 16/17, 174.4 s.
+## Reproduce it in 90 seconds, not 10 minutes
 
-The allocator diagnostic produced no TLAB refill-failure samples during the
-workload, so guarded TLAB refill is not the responsible throughput cliff.
+`apps/hib-suite-runner/SmokeConcProbe.java` runs the identical unit of work (same
+three HQL queries, same two annotated entities, same in-memory H2) with
+fork/iteration/thread counts on the command line, after a warm-up, and reports
+steady-state throughput plus the extrapolated cost of the real test body:
 
-An independent JIT correctness defect was fixed during this investigation:
-the precise deopt snapshot emitted after an invoke retained the invoke BCI
-even though code generation had already consumed the receiver and arguments.
-Resuming that frame re-executed the invoke with an empty operand stack,
-causing `TransactionUtil.wrapInTransaction(...Consumer)` to panic at PC 30
-and leak pool connections. Resuming at the invoke successor eliminates the
-panic and the pool leak. With the wrapper admitted for this diagnostic,
-`SmokeTests` completed 16/17 in 144.3 seconds; the remaining issue is solely
-the unchanged `testQueryConcurrency` 120-second throughput limit.
+```bash
+cd C:/craton/CratonVM/apps/hib-suite-runner
+# forks iterations threads warmupForks [mode]
+<cratonvm> --java-home "<jdk25>" --Xmx 1500m @common.args SmokeConcProbe 6 400 5 2
+"<jdk25>/bin/java.exe" -Xmx1500m @common.args SmokeConcProbe 6 400 5 2
+```
 
-Latest local evidence (2026-07-27): the runner still reports `16/17` with
-`testQueryConcurrency` timing out after 120 seconds (`@@RESULT ... ms=145915`).
-`CRATONVM_DBG_GCPAUSE` emitted no collection pause of 100 ms or greater, so a
-stop-the-world GC pause is not responsible for the timeout. An inline-cache
-repair reduced forced-native virtual cache misses from roughly 20.2 million to
-10.6 million, but did not materially lower the end-to-end time; a guarded
-ASCII `Character.isJavaIdentifierPart` experiment regressed and was removed.
+Baseline: `PROJECTED_TEST_MS` ~502 000 (CratonVM) vs ~11 900 (HotSpot) — it
+reproduces the 40x faithfully in ~90 s per data point. Absolute numbers on this
+shared box drift up to ~50% with peer load, so always A/B back-to-back.
 
-After merging current `origin/dev` (2026-07-27), a fresh task-specific
-full-LTO release binary reproduced the same residual in both modes:
-`--nojit` reported `found=17 started=17 ok=16 failed=1` in 164391 ms and
-normal JIT reported the same count in 156152 ms. In both runs the sole failure
-was the JUnit 120-second timeout in `testQueryConcurrency`. A diagnostic
-H2-only JIT lift did compile `ParserBase.readIf(String)`,
-`ExpressionColumn.isEverything`, and `JdbcStatement.checkClosed`, but did not
-reduce the end-to-end timeout; it is therefore not a candidate delivery fix.
+## Measured decomposition (this is where the older framing was wrong)
 
-The later runtime-architecture merge (`origin/dev` at `ed93c79a8`) was also
-built in the same isolated release target and re-run uncontended. Its
-`--nojit` result remained `found=17 started=17 ok=16 failed=1`, with the same
-sole JUnit timeout in `testQueryConcurrency` (`ms=172665`). This establishes
-that the architecture merge is compatible with the class, but does not close
-the throughput residual.
+The doc used to call this "an interpreter-throughput problem in the concurrent
+H2/Hibernate query path" and chased AQS/RRWL CAS cost, logging I/O, and
+monitor-table caching. Measured:
 
-On that merged runtime, the diagnostic opt-out `CRATONVM_ROOTSNAP_CACHE=0`
-reduced the runner time to `ms=162190`, but still produced the same `16/17`
-timeout. The cache therefore contributes to the regression but cannot be
-disabled as a closure for this test.
+| lever | effect |
+|---|---|
+| quiet the JDBC bind/extract TRACE logging | 502 s -> 452 s (**~10%**) |
+| `--nojit` (compile nothing) | 502 s -> 524 s (**JIT is worth 4%**) |
+| `CRATONVM_JIT_ALLOW_PACKAGES=org/hibernate/` | 502 s -> **1104 s (2.2x WORSE)** |
+| `CRATONVM_JIT_VIRTUAL_TIERUP=0` | **neutral** (43 vs 41 txn/s) |
 
-The real-JDK `ParserBase.testToken(String, Token)` native was then rewritten
-to take its common IdentifierToken path directly through the token fields and
-the VM's exact native String equality routines. The release `--nojit` run
-remained functionally correct and improved to `ms=157048`, but still timed out
-in the same sole method. It is retained as a measured improvement, not a
-closure; the remaining gap is too large to be explained by parser-token
-dispatch alone.
+`CRATONVM_JIT_VIRTUAL_TIERUP=0` was previously the best known lever (+31%); that
+machinery has since been fixed and the switch no longer does anything. Any
+reference to it as a live lever is stale.
 
-Removing the old rate-limited `Unsafe.compareAndSetLong` failed-CAS diagnostic
-was also rejected: it changed the contention behavior and regressed the same
-run to `ms=195348`. The probe was restored; it is not a simple logging cost to
-remove. The next root-cause target is the monitor-backed linearizable CAS
-implementation used by the real AQS/RRWL state path.
+Per-subsystem, same 1600 transactions, `SmokeConcProbe <forks> 400 5 2 <mode>`:
 
-Additional rejected diagnostics/experiments (2026-07-27):
+| mode | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| `txn` — empty transaction | 28 ms | 4335 ms | **155x** |
+| `session` — session open/close, no JDBC | 9 ms | 1022 ms | **114x** |
+| `parse` — 3x `createQuery`, no execution | 77 ms | 7457 ms | 97x |
+| `jdbc` — raw H2 connect/begin/commit/close | 106 ms | 8516 ms | 80x |
+| `exec` — one query executed | 407 ms | 13 518 ms | 33x |
+| `full` — the real test body | 777 ms | 33 973 ms | 44x |
 
-- letting the real `Trace.isDebugEnabled()` bytecode replace its registered
-  native bridge produced the same sole `testQueryConcurrency` timeout
-  (`found=17 started=17 ok=16 failed=1`, `ms=176342`);
-- an exact allocation-free native mirror of `QueryParameterNamedImpl.hashCode()`
-  likewise retained the sole timeout (`found=17 started=17 ok=16 failed=1`,
-  `ms=273632` on a contended host), so it was removed rather than delivered as
-  an unproven micro-optimization;
-- root-snapshot telemetry did not reach its first 200,000-call report during
-  the timed workload, and GC-pause telemetry produced no pause at or above
-  100 ms. Neither collector-boundary path explains the missing throughput.
+Note the shape: the *cheapest* units of work have the *worst* ratios. There is no
+single hot spot to remove — the gap is uniform-to-worse across every layer,
+which is the signature of general interpreted execution, not of one pathology.
+(HotSpot's C2 also elides more of the trivial cases, which inflates the small-unit
+ratios; the point is the absence of an outlier, not the exact multiplier.)
 
-The remaining actionable design is to avoid the repeated sharded map lookup
-and `Arc` churn in `MonitorTable::with_cas_lock` for the same AQS state object,
-without weakening per-object linearizability or retaining stale locks across a
-moving collection. A candidate must invalidate any thread-local lock handle
-on the heap collection epoch and preserve the existing SATB pre-barrier and
-post-write barrier ordering before it can be measured.
+## What closure actually requires
 
-That epoch-invalidated per-thread handle cache was implemented and measured:
-it preserved the existing mutex linearization point and completed normally,
-but the runner again reported only `ok=16 failed=1` with the sole
-`testQueryConcurrency` timeout (`ms=235932` on the shared host). It was
-therefore removed. The cache does not remove enough of the actual AQS/RRWL
-cost to be a delivery fix; further work must target the primitive state access
-itself while preserving moving-GC and SATB semantics.
+A ~40x gap for interpreted bytecode against C2-compiled code is unremarkable.
+The anomaly is the third row of the lever table: **compiling Hibernate makes it
+1.5–2.2x slower**, and that result is steady state, not compile-time cost — it
+survives an 8-fork (3200-transaction) warm-up (18 txn/s compiled vs 27 txn/s
+interpreted).
 
-The follow-up cache keeps the same registry-owned mutex but caches only its
-raw pointer for the current OS thread and a monitor-table epoch. The epoch is
-bumped under stop-the-world before a GC re-key or exact-dead prune can remove
-the owning `Arc`, so the fast path cannot dereference a stale lock. On the
-current shared-host reproduction it improved the no-JIT runner from
-`ms=275110` to `ms=226606`, but both runs still reported `ok=16 failed=1`
-with the same 120-second `testQueryConcurrency` timeout. It is therefore a
-measured partial improvement, not a closure. The remaining hot path includes
-the concrete JBoss/Log4j2 native log emission performed for every explicitly
-enabled Hibernate JDBC TRACE event; any further change must preserve the
-actual backend's enabled state and Java-level output-capture semantics.
+So the JIT is currently a net negative on dispatch-heavy ORM code. Until that is
+fixed, the only way to run this workload is interpreted, and interpreted cannot
+reach 120 s. Closure is therefore gated on the tiered-manager work
+(`project_wire_tiered_manager`), not on anything local to this test. Do not
+spend more effort on per-call micro-optimisations here; the measurements above
+bound what they can possibly buy.
 
-The framework-log `printed_lines` mirror was temporarily removed as a
-behavior-preserving allocation hypothesis. A fresh full-LTO `--nojit` runner
-still reported only `found=17 started=17 ok=16 failed=1` (`ms=216360`) with
-the same 120-second `testQueryConcurrency` timeout. Since the canonical
-direct-fd logging path relies on that mirror for internal output capture, the
-change was reverted rather than weakening the logging contract for an
-insufficient gain. The remaining target is the primitive implementation of
-the repeated RRWL/AQS state CAS itself, not framework-log retention.
+### The workload is essentially never compiled
 
-The RRWL/AQS CAS path was then changed to hold the collector's volatile-slot
-stripe once across its mutex-linearized read/compare/write, replacing two
-separate volatile accesses and four fences with one stripe acquisition and
-one full-fence pair. It preserved functional behavior and improved the same
-no-JIT class to `ms=158369`, but still timed out at 16/17. The class emitted
-roughly 136,000 TRACE lines during that run. The canonical logging path had
-already built the full line buffer but discarded it, then took the fd/stdio
-locks twice to write text and its separator. The next candidate writes that
-same complete buffer once; it preserves bytes, ordering, and line atomicity
-while removing the redundant per-line lock/write operation.
+`CRATONVM_DBG=jit-method-stats` on `SmokeConcProbe 2 200 5 1 full` (note the
+spelling — a bare `CRATONVM_DBG_JIT_METHOD_STATS=1` is rejected with a warning
+and does nothing):
 
-That one-write logging variant also failed to close the class: the fresh
-no-JIT runner again reported `found=17 started=17 ok=16 failed=1`, with the
-same `testQueryConcurrency` timeout (`ms=190802` on the shared host). It was
-reverted rather than retained as an unproven I/O micro-optimization. The
-single-stripe CAS improvement remains the only retained throughput change;
-the next investigation must reduce RRWL/AQS contention itself rather than
-individual output writes.
+```
+1642 distinct methods tracked, 1638 ever invoked, 4277121 total invocations
+still-interpreted=1535  c1=32  full-profile=0  c2=75
+compiles: c1=107 c2=77 osr=4 deopts=0 c2_bailouts=0 total_compile_time_ms=1
+c1_threshold=500  hot_but_stuck_in_interpreter=1531
+```
 
-The follow-up that removed the monitor-table CAS mutex for non-array slots
-and used only the volatile stripe as the CAS linearization point was also
-rejected.  Its fresh full-LTO `--nojit` run reported the same sole
-`testQueryConcurrency` timeout (`found=17 started=17 ok=16 failed=1`,
-`ms=211476`).  The previous CAS-mutex plus single-stripe implementation was
-restored: the direct-stripe variant neither established enough throughput nor
-provided a compelling reason to weaken the existing per-object CAS contract.
+**1531 of 1642 hot methods never compile**, and the entire process spends
+**1 ms** compiling. Every one of the top 30 stuck methods carried
+`tier_fail_count=3` — the `MAX_TIER_FAIL_RETRIES` permanent ban
+(`jit/src/tiered.rs`). They are trivial accessors called tens of thousands of
+times: `SessionLocal.isClosed()Z` (55 348), `JdbcConnection.checkClosed()V`
+(44 468), `SessionImpl.isClosed()Z`, `AbstractQueuedSynchronizer.getState()I`.
+Same shape as the `action.queue` doc's root cause 2 and tomcat doc 30.
+
+**That reading was misleading, and the admission accounting has since been
+fixed** (commit `7f894b4da`). `tier_fail_count` was charged both for a compile
+that ran and failed *and* for a method the VM declined on policy, so a
+permanently-ineligible method was enqueued and declined three times before the
+counter saturated — and the resulting `tier_fail_count=3` was indistinguishable
+from genuinely broken codegen. The two are now separate, and the same line reads:
+
+```
+hot_but_stuck_in_interpreter=1519 (of which ineligible-by-policy=1513, compile-failures=6)
+```
+
+So **99.6% of the "never compiles" population is banned by design**, not by a
+compiler bug: `org/hibernate/` wholesale (HIB-TEMPORAL.1), `org/h2/`
+(HIB-LONGTAIL.1, `vm/src/jit/skip_list.rs`), and the
+`AbstractQueuedSynchronizer` `getState`/`setState`/`compareAndSetState` family.
+Those bans stand on their own correctness grounds; they are the reason this
+workload is interpreted, and they are what would have to change.
+
+The genuinely broken minority is **six methods**, now listed under their own
+`COMPILE FAILED (not policy — these are bugs)` heading in the same dump
+(they never appeared in the top 30, which is ranked by invocation count):
+
+| method | tier_fail_count |
+|---|---|
+| `java/time/Instant.create(JI)` | 3 |
+| `org/antlr/v4/runtime/atn/ATNSimulator.getCachedContext` | 3 |
+| `org/antlr/v4/runtime/atn/ATNDeserializer.stateFactory(II)` | 3 |
+| `java/util/IdentityHashMap.clone()` | 3 |
+| `java/util/concurrent/LinkedBlockingQueue.take()` | 2 |
+| `java/util/concurrent/LinkedBlockingQueue.offer(Object)` | 2 |
+
+These are the actionable JIT bugs this workload exposes. Fixing all six would
+not close this class — they are a rounding error against the 5.2x requirement —
+but they are real and they are now visible.
+
+The enqueue-churn mechanism, via `CRATONVM_DBG=jitc`: the tier manager kept
+re-enqueueing methods the skip list rejects, and `background_compile_task`
+declined each *before* its trace point, so **78 of 92 enqueued methods never
+produced a `bg-compile` line** — enqueued at `invoc_count=500`, again at 564,
+again at 628, then banned. Post-fix a decline is recorded on the first attempt.
+
+Checked and rejected as the cause: a global `any_class_redefined()` latch
+disabling all background compilation. `bg-compile` lines continue to the end of
+the run, so compilation is not shut off process-wide.
+
+Two concrete sub-defects are worth fixing on the way, both independent of the
+main gap:
+
+1. **The JIT code buffer overflows compiling large Hibernate methods.** With
+   `CRATONVM_JIT_ALLOW_PACKAGES=org/hibernate/`, a short run emits ~380
+   `JIT try_patch_byte/try_patch_i32: offset out of bounds; marking buffer
+   overflowed` warnings across a handful of distinct buffers (`len=6238`,
+   `len=15519`). Those methods silently never compile. It is not a compile
+   storm and not the cause of the 2.2x regression, but it means the biggest
+   Hibernate methods are permanently un-compilable.
+2. **The JIT's array-allocation path does not scale across threads** (see
+   below). The interpreter's does now; the JIT's still shows flat aggregate
+   throughput.
+
+## Fixed on this investigation (does not close this doc)
+
+`AllocScaleProbe.java` showed **array allocation was fully serialised**:
+aggregate `new long[16]` throughput was flat from 1 to 4 threads while
+`new Object()` scaled, because `gc_alloc_array` had no TLAB path at all and
+`try_alloc_young_initialized` holds the global `young_from` mutex across the
+bump, the zeroing, *and* the header init — so hold time scales with allocation
+size. Fixed in commit `7888b80b6` (arrays now share the object path's hardened
+refill machinery; `is_humongous` no longer locks). Interpreter array allocation
+gained **+36% aggregate at 4 threads**; bt18 canary showed no collapse and an
+unchanged checksum (68332206); Hibernate 20-class family 117/117.
+
+Measurement warning for bt18 specifically: its absolute time on this shared box
+swings roughly **2100–4200 ms** with peer build load. A later interleaved A/B
+(4 rounds, control built from the same tree with only the changed files
+reverted) put two binaries at 3989 ms vs 3965 ms while single samples taken
+hours apart had read 2264 ms and 3790 ms — i.e. an apparent "63% regression"
+that was entirely host state. Never compare bt18 numbers across sessions; only
+interleaved A/B on one host state means anything.
+
+Effect on this test: **~3%** (382.9 s -> 372.6 s). Recorded here so nobody
+re-derives it: allocation scaling was real and worth fixing, but it is not what
+dominates this workload.
+
+## Probes left behind
+
+All in `apps/hib-suite-runner/`, all usable on any VM build:
+
+- `SmokeConcProbe.java` — this workload, tunable, with `txn`/`session`/`jdbc`/
+  `parse`/`exec`/`full` decomposition modes.
+- `AllocScaleProbe.java` — allocation throughput vs thread count, `Object` and
+  `long[16]`, reports aggregate scaling.
+- `PrimCostProbe.java` — per-op cost of the JDK primitives a session
+  open/close leans on, 1-thread vs N-thread, so a merely-slow primitive can be
+  told apart from one that fails to scale.
+
+Caveat for whoever picks this up: `PrimCostProbe`'s `ConcurrentHashMap.get` row
+is confounded by `Integer` autoboxing and a native->Java `hashCode` re-entry —
+do not read it as a CHM cost. The allocation rows are clean.
+
+## Ruled out (do not re-investigate)
+
+- Stop-the-world GC pauses — `CRATONVM_DBG_GCPAUSE` shows no pause >= 100 ms.
+- Lock convoying as the primary cost — the process sustains ~4.2–4.5 of 5
+  worker threads busy throughout the timing window. (Spinning on a contended
+  mutex also presents as CPU-busy, so this rules out *blocking*, not all
+  contention; the allocator serialisation found below was exactly such a case.)
+- Logging as the driver — ~10%, quantified above.
+- The Hibernate JIT ban as the cause — lifting it makes things worse, and the
+  ban's own justification (HIB-TEMPORAL.1, a `DdlTypeImpl.getRawTypeName` JIT
+  corruption from 2026-07-08) is a correctness guard, not a throughput one.
+- `CRATONVM_JIT_VIRTUAL_TIERUP` — no longer a lever.
+
+## Prior investigation
+
+The pre-2026-07-28 revision of this doc recorded a long series of rejected
+experiments (RRWL/AQS CAS stripe caching, monitor-table handle caches,
+one-write logging, `ParserBase.testToken` natives, framework-log mirror
+removal, `CRATONVM_ROOTSNAP_CACHE=0`). All landed within ±30% and none closed
+the class; the 5.2x requirement above explains why, and they are not repeated
+here. See git history for the detail if a specific one needs revisiting.

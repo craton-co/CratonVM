@@ -868,9 +868,12 @@ impl DenseIntEntries {
 
 #[cfg(test)]
 mod dense_int_entries_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn object(address: usize) -> ObjectRef {
         // The entry store treats refs as opaque values; these aligned sentinels
@@ -6102,6 +6105,50 @@ fn native_map_init_capacity_load(ctx: &mut dyn NativeContext, args: &[Value]) ->
     native_map_init_capacity(ctx, args)
 }
 
+/// Keep explicit-capacity Hashtable instances on the native backing used by
+/// the rest of the Hashtable bridge. Letting the real constructor initialise
+/// its JDK entry table strands mappings when native `put`/`get` later resize
+/// their separate representation (observed as a missing PKCS#9 contentType
+/// while verifying signed Spring Boot jars).
+fn native_hashtable_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let capacity = match args.get(1) {
+        Some(Value::Int(value)) => *value,
+        _ => MAP_DEFAULT_CAPACITY as i32,
+    };
+    if capacity < 0 {
+        return Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: format!("Illegal Capacity: {capacity}"),
+            }
+            .into(),
+        );
+    }
+    if let Some(Value::Float(load_factor)) = args.get(2) {
+        if !load_factor.is_finite() || *load_factor <= 0.0 {
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("Illegal Load: {load_factor}"),
+                }
+                .into(),
+            );
+        }
+    }
+    native_map_init(ctx, &[Value::Object(Some(this))])?;
+    ensure_hashtable_load_factor(ctx, this, "java/util/Hashtable");
+    Ok(None)
+}
+
+fn native_hashtable_init_capacity_load(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_hashtable_init_capacity(ctx, args)
+}
+
 // Public wrappers for cross-module access (EnumMap, IdentityHashMap, WeakHashMap)
 pub fn native_map_put_pub(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_map_put(ctx, args)
@@ -6849,7 +6896,9 @@ fn native_hashmap_get_string_fast(
     let mut node_value = ctx.get_array_element(buckets, map_bucket_index(hash, cap));
     const CHAIN_WALK_LIMIT: usize = 4096;
     for _ in 0..CHAIN_WALK_LIMIT {
-        let Value::Object(Some(node)) = node_value else { return Some(Ok(Some(Value::Object(None)))); };
+        let Value::Object(Some(node)) = node_value else {
+            return Some(Ok(Some(Value::Object(None))));
+        };
         if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
             if ctx.read_string(node_key).as_deref() == Some(key_text.as_str()) {
                 ctx.hashmap_string_node_cache_put(this, &key_text, node);
@@ -6858,9 +6907,12 @@ fn native_hashmap_get_string_fast(
         }
         node_value = ctx.get_field(node, NODE_FIELD_NEXT);
     }
-    Some(Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-        message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
-    }.into()))
+    Some(Err(
+        cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+        }
+        .into(),
+    ))
 }
 
 /// Exact-class HashMap get entry used after a receiver-ClassId guard.
@@ -34035,7 +34087,11 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
         from_key = read_pinned_elem(ctx, from_key_pin, from_key);
         to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        let below = if from_inclusive { cmp_lo < 0 } else { cmp_lo <= 0 };
+        let below = if from_inclusive {
+            cmp_lo < 0
+        } else {
+            cmp_lo <= 0
+        };
         if below {
             continue;
         }
@@ -34044,7 +34100,11 @@ fn native_tm_sub_map_inclusive(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         comparator = read_pinned_elem(ctx, comparator_pin, comparator);
         from_key = read_pinned_elem(ctx, from_key_pin, from_key);
         to_key = read_pinned_elem(ctx, to_key_pin, to_key);
-        let above = if to_inclusive { cmp_hi > 0 } else { cmp_hi >= 0 };
+        let above = if to_inclusive {
+            cmp_hi > 0
+        } else {
+            cmp_hi >= 0
+        };
         if above {
             break;
         }
@@ -38747,6 +38807,8 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     // Also register under Hashtable (Properties extends Hashtable)
     let ht = "java/util/Hashtable";
     registry.register(ht, "<init>", "()V", native_map_init);
+    registry.register(ht, "<init>", "(I)V", native_hashtable_init_capacity);
+    registry.register(ht, "<init>", "(IF)V", native_hashtable_init_capacity_load);
     registry.register(
         ht,
         "put",
@@ -41455,18 +41517,39 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let target = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let mut target = args.get(1).cloned().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, coll);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(Some(Value::Int(0))),
+    // Stub-removal wave 2 (2026-07-28): `al_state` only understands the
+    // ArrayList shape (field 0 = backing array, field 1 = size). EVERY other
+    // Collection — `Arrays.asList` (an `Arrays$ArrayList`), `HashSet`,
+    // `LinkedList`, any user Collection — fell into the `None` arm and
+    // reported frequency 0, i.e. "this element does not occur", for a
+    // collection full of matches. Measured against HotSpot 25:
+    // Arrays.asList 3 -> 0, HashSet 1 -> 0, LinkedList 2 -> 0.
+    // Drive the receiver's own `toArray()` instead; every Collection has one.
+    let (data, size) = match data {
+        Some(d) => (d, size),
+        None => {
+            let coll_pin = ctx.pin_native_root(coll);
+            let target_pin = pin_value(ctx, target);
+            let arr = ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])?;
+            target = read_pinned_elem(ctx, target_pin, target);
+            ctx.unpin_native_roots(coll_pin);
+            match arr {
+                Some(Value::Object(Some(a))) => {
+                    let n = ctx.array_length(a) as i32;
+                    (a, n)
+                }
+                _ => return Ok(Some(Value::Int(0))),
+            }
+        }
     };
     // Family-1 fix (cce0079): pinned scan (counts every match, so no
     // early-exit helper).
     let data_pin = ctx.pin_native_root(data);
     let th = pin_value(ctx, target);
     let mut data = data;
-    let mut target = target;
+
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
@@ -45069,6 +45152,16 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     );
 
     // --- ForkJoinPool.awaitQuiescence ---
+    //
+    // KEEP (W2 stub sweep). `true` means "the pool became quiescent within the
+    // timeout", and that is unconditionally the truth for CratonVM's
+    // ForkJoinPool: `phases_early`'s `register_forkjoin_natives` AND its
+    // real-JDK twin `register_real_jdk_forkjoin_essentials` both override
+    // `fork`/`invoke`/`submit`/`join` to run `compute()` INLINE on the calling
+    // thread, so no task is ever outstanding in a worker by the time any thread
+    // can observe the pool. It is consistent with the `getActiveThreadCount()
+    // == 0` / `getQueuedTaskCount() == 0` pair in that same file. Waiting or
+    // returning false here would only ever be a wait for nothing.
     let pool = "java/util/concurrent/ForkJoinPool";
     r.register(
         pool,
@@ -46791,9 +46884,12 @@ pub fn __test_ts_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: us
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     // Unit tests for helper functions only.
     // Integration tests are in vm.rs since they need the full VM.
@@ -48292,11 +48388,14 @@ mod tests {
     // ===================================================================
 
     mod lbq_blocking_tests {
-        #[allow(unused_imports)]
-        use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
         use super::super::*;
         use cratonvm_native_api::{
             AnnotationData, AnnotationElementValue, FieldMetadata, MethodMetadata, StackTraceEntry,
+        };
+        #[allow(unused_imports)]
+        use cratonvm_native_api::{
+            NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+            NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
         };
         use cratonvm_types::error::MethodCallFailed;
         use std::collections::HashMap;
@@ -48508,8 +48607,6 @@ mod tests {
         }
 
         impl cratonvm_native_api::NativeClassAccess for MockCtx {
-
-
             // --- default stubs for everything else ---------------------
             fn load_class(&mut self, _n: &str) -> MethodCallResult {
                 Ok(None)
@@ -48665,7 +48762,6 @@ mod tests {
         }
 
         impl cratonvm_native_api::NativeInvokeAccess for MockCtx {
-
             fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
                 Ok(None)
             }
@@ -48681,7 +48777,6 @@ mod tests {
         }
 
         impl cratonvm_native_api::NativeHeapAccess for MockCtx {
-
             // Pre-existing test-fixture gap (unrelated to this session's fix):
             // `c812b622` added this trait method with no default impl but
             // never updated this inline mock, breaking `cargo test -p
@@ -48837,8 +48932,6 @@ mod tests {
         }
 
         impl cratonvm_native_api::NativeThreadAccess for MockCtx {
-
-
             // --- monitor primitives (the load-bearing bit) -------------
             fn thread_id(&self) -> u64 {
                 self.thread_id
@@ -48921,7 +49014,6 @@ mod tests {
         }
 
         impl cratonvm_native_api::NativeExceptionAccess for MockCtx {
-
             fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> {
                 Vec::new()
             }
@@ -48930,12 +49022,9 @@ mod tests {
             }
         }
 
-        impl cratonvm_native_api::NativeGpuAccess for MockCtx {
-
-        }
+        impl cratonvm_native_api::NativeGpuAccess for MockCtx {}
 
         impl cratonvm_native_api::NativeSystemAccess for MockCtx {
-
             fn record_printed_value(&mut self, _v: Value) {}
             fn record_printed_line(&mut self, _t: String) {}
             fn get_system_stream(&self, _n: &str) -> Option<ObjectRef> {
@@ -48987,9 +49076,6 @@ mod tests {
                 None
             }
         }
-
-
-
 
         #[test]
         fn unbox_wrapper_requires_jdk_wrapper_class() {

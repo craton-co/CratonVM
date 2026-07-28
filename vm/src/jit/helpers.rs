@@ -693,6 +693,17 @@ pub(crate) fn stash_jit_pending_exception(exc: ObjectRef) {
     set_jit_pending_exception(exc);
 }
 
+/// Forget the `athrow` bci carried by the pending exception, keeping the
+/// exception itself.
+///
+/// Called when a dispatch helper hands a CALLEE's pending exception back to its
+/// compiled caller: from that point the bci names a method that is no longer on
+/// the stack, and the caller's drain would range-check its own exception table
+/// against it. See `JitSignals::athrow_bci`.
+pub(crate) fn clear_jit_athrow_bci() {
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
+}
+
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
 /// taken pending-NPE flag. See `stash_jit_pending_exception` for the OSR
 /// drain-without-route rationale.
@@ -1633,6 +1644,12 @@ unsafe fn route_implicit_exc_through_callee(
     if rc != i64::MIN {
         return rc;
     }
+    // The callee has returned. Any `athrow` bci the pending exception carries is
+    // ITS bci, and every path out of here either re-runs the callee interpreted
+    // (which regenerates the exception) or hands the sentinel to the compiled
+    // CALLER, whose drain would treat that bci as its own. See
+    // `clear_jit_athrow_bci`.
+    clear_jit_athrow_bci();
     if rbc6_dbg() {
         eprintln!(
             "[rbc6-dbg] route_implicit_exc_through_callee ENTER {}.{}{} has_last_deopt={} pending_exc={} pending_npe_or_aioobe_unread=?",
@@ -1728,6 +1745,12 @@ unsafe fn route_implicit_exc_through_callee(
                     }
                 }
                 let _ = take_jit_pending_exception();
+                // The callee is about to be re-executed from its entry in the
+                // interpreter, which regenerates and routes the exception
+                // itself. Any exceptional frame its compiled body published
+                // describes the abandoned attempt — drop it with the stashed
+                // exception rather than leave it to be mis-claimed.
+                cratonvm_jit::deopt::clear_exceptional_frame();
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
                 if rbc6_dbg() {
                     eprintln!(
@@ -1746,6 +1769,9 @@ unsafe fn route_implicit_exc_through_callee(
     // Re-execute the callee in the interpreter so the implicit exception routes
     // through the callee's own exception table.
     if let Some((thread, _guard)) = jit_thread_mut() {
+        // Same reasoning as the general-exception arm above: the re-run replaces
+        // the abandoned compiled attempt, so its exceptional frame is stale.
+        cratonvm_jit::deopt::clear_exceptional_frame();
         let bail_args = decode_dispatch_values(vm, info, args_slice);
         return bail_to_interpreter(vm, thread, info, &bail_args);
     }
@@ -8776,6 +8802,7 @@ impl DeoptimizationController {
                 cratonvm_jit::deopt::DeoptReason::NotCompiled => "NotCompiled",
                 cratonvm_jit::deopt::DeoptReason::UnreachedCode => "UnreachedCode",
                 cratonvm_jit::deopt::DeoptReason::OsrExit => "OsrExit",
+                cratonvm_jit::deopt::DeoptReason::PendingException => "PendingException",
             };
             let action_static: &'static str = match action {
                 cratonvm_jit::deopt::DeoptAction::Reinterpret => "Reinterpret",

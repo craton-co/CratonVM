@@ -1198,6 +1198,17 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // provider verification/policy setup succeeded without performing it. The
     // nested register_cipher_dispatch/keygen/param_specs are real (Bridge) and
     // set their own category.
+    //
+    // KEEP, re-audited in wave 2 (flagged in that sweep's hardcoded-pass
+    // list because `canUseProvider` and `getVerificationResult` are literally
+    // verification predicates pinned to "passed"). What they gate is the JCE
+    // *jar-signing* check — whether a provider JAR carries Oracle's
+    // code-signing certificate — not any cryptographic or authorization
+    // decision. CratonVM's crypto dispatch is native and never routes through
+    // a loaded `ProviderList`, so no key, certificate, signature or
+    // permission is validated by these methods; and `isRestricted()=>false`
+    // matches the JDK's own default since Java 9 (unlimited crypto policy).
+    // They remain `SyntheticStub` so strict no-stubs mode drops them.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // `javax/crypto/Cipher.<clinit>` itself.  Static fields (`debug`,
@@ -1503,6 +1514,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
+            // Real `Cipher.getInstance(String, String)` resolves the provider
+            // name first (and capitalises both of its messages, unlike the
+            // shared `GetInstance` path) — see `check_named_provider_arg`.
+            crate::jca::provider_chain::check_named_provider_arg(
+                ctx,
+                args,
+                1,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             check_transformation_supported(ctx, &algo_str)?;
@@ -1797,31 +1817,48 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(cipher, "getBlockSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16)))
-    });
-
-    r.register(cipher, "getOutputSize", "(I)I", |ctx, args| {
+    // STUB-REMOVAL (wave 2): this returned a hard-coded 16 for every Cipher.
+    // `getBlockSize()` is contractually 0 for a stream cipher or an
+    // asymmetric/"not a block cipher" transformation, and 8 for the 64-bit
+    // block ciphers — a caller that sizes a buffer or aligns a loop on 16 for
+    // DESede/Blowfish/RC2 silently mis-frames its data, and one that tests
+    // `getBlockSize() == 0` to detect a stream cipher takes the wrong branch
+    // for RC4/ChaCha20/RSA. Derive it from the transformation actually
+    // configured at `init` time.
+    r.register(cipher, "getBlockSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let input_len = args[1].as_int().unwrap_or(0);
         let tkey = obj_key(ctx, this);
-        let (algo, mode) = with_table_read(|t| {
+        let algo = with_table_read(|t| {
             t.get(&tkey)
-                .map(|s| (s.algorithm.clone(), s.mode))
+                .map(|s| s.algorithm.clone())
                 .unwrap_or_default()
         });
-        let upper = algo.to_uppercase();
-        if upper.contains("GCM") {
-            if mode == 1 {
-                Ok(Some(Value::Int(input_len + 16)))
-            } else {
-                Ok(Some(Value::Int((input_len - 16).max(0))))
-            }
-        } else {
-            let out = ((input_len + 15) / 16) * 16;
-            Ok(Some(Value::Int(out)))
-        }
+        let (cipher_name, _mode, _pad) = parse_transformation(&algo);
+        let block = match cipher_name.to_ascii_uppercase().as_str() {
+            // 64-bit block ciphers.
+            "DES" | "DESEDE" | "TRIPLEDES" | "BLOWFISH" | "RC2" | "IDEA" => 8,
+            // Stream ciphers and asymmetric transformations have no block.
+            "RC4" | "ARCFOUR" | "CHACHA20" | "CHACHA20-POLY1305" | "RSA" | "ECIES" => 0,
+            // AES and everything else this module can actually service.
+            _ if algo.is_empty() => 0,
+            _ => 16,
+        };
+        Ok(Some(Value::Int(block)))
     });
+
+    // STUB-REMOVAL (wave 2), competing registration: `getOutputSize(I)I` was
+    // registered TWICE on `javax/crypto/Cipher` inside this one function — the
+    // documented, GCM/RSA/PKCS-padding-aware implementation ~80 lines above,
+    // and a second, cruder copy right here. The registry is last-writer-wins,
+    // so the crude copy was the one that ran, and it was wrong in three ways
+    // that all silently truncate or oversize a caller's buffer: it ignored
+    // bytes already buffered by `update()` (so a streaming caller under-sized
+    // its output array), it treated every non-GCM transformation as a
+    // 16-byte-block cipher (wrong for RSA, whose output is the modulus size),
+    // and its `((len + 15) / 16) * 16` rounding returns `len` unchanged for an
+    // exact block multiple where PKCS#7 requires a whole extra padding block.
+    // It also indexed `args[1]` directly, which panics on a short arg list.
+    // Removed; the earlier registration is now the live one.
 
     r.register(cipher, "getIV", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
