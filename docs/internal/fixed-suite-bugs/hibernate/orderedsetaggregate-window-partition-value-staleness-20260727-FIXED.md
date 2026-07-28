@@ -12,6 +12,15 @@
 > The historical investigation below is preserved as written; note that its own
 > root-cause speculation (a generic iteration/GC defect in shared substrate) was
 > wrong — CratonVM does intercept H2 at this call.
+>
+> **Re-verified 2026-07-28 on dev `d0a6c7987`.** Both of this doc's queries were
+> re-run without Hibernate, straight through the real `h2-2.4.240.jar`
+> (`../../repros/h2-groupdata-window-20260728/H2OsaWindowProbe.java`), and CratonVM's
+> extracted values are byte-identical to real HotSpot JDK 25 on all 16 shapes that
+> probe covers. `CriteriaOrderedSetAggregateTest` itself is **10/10**, which also
+> disposes of the "separate, independent `OFFSET` bug" this doc hands off to below —
+> there was never a second bug. The 20-class family re-runs 117/117 on both VMs.
+> Details in the re-verification section of the consolidated write-up.
 
 **Status: OPEN, genuine CratonVM bug.** Confirmed via HotSpot diff (fails on CratonVM,
 100% clean on real HotSpot JDK 25, exact same SQL text and bound parameters both sides),
