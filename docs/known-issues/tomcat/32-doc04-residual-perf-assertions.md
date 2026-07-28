@@ -2,8 +2,8 @@
 
 **Status:** OPEN, low priority. Carved out of known-issue 04 on 2026-07-27
 when that group was retired. These are the residual items that are **not**
-webapp-deploy throughput (that is
-[31](31-synchronized-code-never-jit-compiled.md)) — each is one test whose
+webapp-deploy throughput (formerly
+[31](../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md)) — each is one test whose
 assertion is about speed, with its own separate reason.
 
 HotSpot reference for all four, same host, same day: all PASS.
@@ -101,8 +101,9 @@ essentially every call and the miss path *is* what is being measured.
 `SimpleDateFormat.format` only **2.1×** — the signature of a call chain whose
 hot methods never compile. `SimpleDateFormat.format` runs through
 `StringBuffer` (every method `synchronized`) and `DecimalFormat`, so this is
-most likely a consumer of [31](31-synchronized-code-never-jit-compiled.md);
-confirm with `CRATONVM_DBG_JITC` before treating it as its own bug.
+previously looked like a consumer of [31](../../internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md).
+That admission defect is fixed; confirm the current compiled call chain with
+`CRATONVM_DBG_JITC` before treating it as its own bug.
 
 ---
 
