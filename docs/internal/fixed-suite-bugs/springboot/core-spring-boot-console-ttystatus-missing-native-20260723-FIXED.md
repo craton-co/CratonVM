@@ -1,8 +1,17 @@
-# `java/io/Console.ttyStatus()I` has no native registration — `Console.<clinit>` fails under Mockito instrumentation
+# FIXED — `java/io/Console.ttyStatus()I` native registration — `Console.<clinit>` under Mockito instrumentation
 
-**Status: OPEN — found 2026-07-23**
+**Status: FIXED 2026-07-28.**
 
 ## Symptom
+
+## Superseding closure — FIXED 2026-07-28
+
+`native-builtins/src/lib.rs` now registers `java/io/Console.ttyStatus()I`
+and returns the non-interactive status. The sole affected class,
+`DefaultLogbackConfigurationTests`, now passes its complete 7-test class in
+fresh CratonVM JIT and `--nojit` processes, with a matching HotSpot control.
+This was revalidated as part of the fixed
+`core-spring-boot-uncategorized-residuals-20260723` aggregate.
 
 ```
 org.mockito.exceptions.base.MockitoException:
@@ -41,7 +50,7 @@ explicitly forces class initialization before retransforming
 (`InlineBytecodeGenerator.assureInitialization`), which surfaces the
 `UnsatisfiedLinkError` as a hard `MockitoException` instead.
 
-**Fix direction (not applied — investigation only):** register
+**Historical fix direction (now applied):** register
 `java/io/Console.ttyStatus()I` alongside the existing `istty()Z` — same
 non-interactive-embedding rationale, likely just returning a fixed
 "not a tty" status code.
