@@ -38323,17 +38323,28 @@ fn background_compile_task(
     task: &crate::jit::tiered::CompilationTask,
 ) -> crate::jit::tiered::CompileOutcome {
     use crate::jit::tiered::CompileOutcome;
-    let fail = |compile_time_ms: u64| CompileOutcome {
-        compile_time_ms,
-        published: false,
-        c2_upgrade_candidate: false,
-    };
+    // A compile that RAN and failed — spends one of the method's retries.
+    let fail = CompileOutcome::failed;
+    // The method was refused on grounds that cannot change while this process
+    // lives (the skip list and the OSR-denial set are pure functions of the
+    // loaded method), so the tier manager records the verdict once instead of
+    // burning the retry budget re-asking. Keeping these apart is what makes
+    // `tier_fail_count` mean "codegen is broken" rather than "banned by
+    // policy" — see `MethodState::ineligible`.
+    let declined = CompileOutcome::declined;
     let shared = match weak_vm.upgrade() {
         Some(s) => s,
-        None => return fail(0), // VM dropped (teardown) — nothing to compile.
+        // VM dropped (teardown) — nothing to compile, and nothing to learn
+        // about this method. Charge it to neither counter.
+        None => return fail(0),
     };
     if crate::classloading::any_class_redefined() {
-        return fail(0);
+        // Global latch, never reset: once any class is redefined this returns
+        // for EVERY subsequent task. Charging it to `tier_fail_count` would
+        // have banned every hot method in the process after three attempts
+        // apiece, regardless of whether the method itself was compilable.
+        // It is permanent, so record it as the permanent decline it is.
+        return declined(0);
     }
     // Keep asynchronous tiering aligned with the foreground admission paths.
     // Without this gate, methods rejected by the conservative skip list are
@@ -38364,10 +38375,10 @@ fn background_compile_task(
     )
     .is_some()
     {
-        return fail(0);
+        return declined(0);
     }
     if task.osr_bci.is_some() && crate::jit::tiered::is_osr_denied(&task.method_key) {
-        return fail(0);
+        return declined(0);
     }
     let optimized = crate::jit::tiered::tier_uses_optimized_backend(task.target_tier)
         || (task.osr_bci.is_none() && promote_scalar_selfrec_to_ir(&shared, &task.method_key));
@@ -38443,6 +38454,9 @@ fn background_compile_task(
             // OSR artifacts serve loop entry; the invocation path re-tiers
             // separately, so an OSR task never seeds a C2 upgrade.
             c2_upgrade_candidate: false,
+            // A codegen attempt actually ran here; a non-publish is a real
+            // failure, not a policy verdict.
+            declined_permanently: false,
         };
     }
     let start = std::time::Instant::now();
@@ -38516,6 +38530,7 @@ fn background_compile_task(
         compile_time_ms: start.elapsed().as_millis() as u64,
         published,
         c2_upgrade_candidate,
+        declined_permanently: false,
     }
 }
 
