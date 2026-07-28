@@ -175,6 +175,23 @@ host load:
 Within noise; no regression. The `invoke_virtual` into `Row.getValue(int)` dominates
 this native, so two extra field lookups do not move it.
 
+The other half of the trade-off is real but small: for grouped/windowed queries the
+native now *delegates*, giving up the fast path entirely. Measured with
+`H2GroupedThroughputProbe.java` over a 3300-row table, same A/B pair:
+
+| query | pre-fix | post-fix |
+|---|---:|---:|
+| `select id, v, row_number() over() from T` | 1855 / 1821 ms | 1932 / 1901 ms (**+4 %**) |
+| `select grp, max(id), max(v) from T group by grp` | 9 / 9 ms | 8 / 8 ms |
+| `select id, rank() over(partition by grp order by v) from T` | **throws** | 3247 / 3234 ms |
+
+~4 % on a large window query, nothing on `GROUP BY`. Note the pre-fix checksums for
+the window query are *wrong* (`92540250` vs the correct `48993450`) — it was "fast"
+partly because it kept re-reading one row — and the `PARTITION BY` case could not
+execute at all pre-fix (H2's unreachable-by-design `"Feature not supported: Window
+function"` fallback, symptom 1 of the `windowfunction-partition-rowid-lookup-miss-shift`
+doc, reproduced here without Hibernate).
+
 That pre-fix binary also serves as the A/B correctness control — it reproduces the
 window and `GROUP BY` corruption exactly, on the same commit and toolchain, confirming
 this change (and nothing else on `dev`) is what fixes it:
@@ -184,6 +201,33 @@ pre-fix : select (id+20), row_number() over() from Doctor -> 30/1 30/2 ... 30/10
 pre-fix : select (id+20) from Doctor group by id          -> 22 23 ... 30 30
 post-fix: both match HotSpot
 ```
+
+## Residual (not this bug): `OracleInlineMutationStrategyIdTest` is timeout-marginal
+
+Re-running the 21 classes after merging `origin/dev` (17 commits) on a heavily loaded
+host, 20/21 were clean and this one reported `ok=5 failed=1` — **not** a wrong value:
+
+```
+run 1: TimeoutException: setUp(SessionFactoryScope) timed out after 120 seconds
+run 2: TimeoutException: testDeleteFromPerson(...)  timed out after 120 seconds
+```
+
+A *different* method each run, i.e. wall-clock roulette against JUnit's 120 s
+per-method limit — not a deterministic failure. Both runs contain **zero**
+`ConstraintViolationException` / `key:3300`, and `testInsertSelect` (this doc's actual
+defect) passes in both.
+
+It is the heaviest class in the set: `@BeforeEach` persists 6600 rows one at a time,
+six times over (HotSpot runs the whole class in 5.3 s; CratonVM needs ~15 min), so
+every method sits near the limit. It passed **6/6** on the pre-merge build with this
+same fix (864 s) on a quieter box; the failing runs were 922–1007 s while peer VMs on
+this shared host were burning thousands of CPU-seconds.
+
+Attribution: **not caused by this change.** The class's cost is 6600 plain single-row
+inserts with no grouped or windowed query in the fixture, and the measurements above
+put this change at +4 % on window queries and 0 % elsewhere — nowhere near enough to
+move a 15-minute class. It belongs to the general interpreter-throughput bucket, not
+here.
 
 ## Other verification
 
