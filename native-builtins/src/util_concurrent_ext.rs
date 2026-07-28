@@ -5625,6 +5625,9 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sl, "tryOptimisticRead", "()J", native_stamped_optimistic);
     registry.register(sl, "unlockRead", "(J)V", native_stamped_unlock_read);
     registry.register(sl, "unlockWrite", "(J)V", native_stamped_unlock_write);
+    // See `native_stamped_unlock_by_stamp` — ported from the phase-62
+    // imitation so that block can be deleted without losing `unlock(J)V`.
+    registry.register(sl, "unlock", "(J)V", native_stamped_unlock_by_stamp);
     registry.register(
         sl,
         "unstampedUnlockRead",
@@ -5781,6 +5784,9 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let stamp = crate::stamped_lock::stamped_write_lock(addr);
     ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
+        eprintln!("[SL-DBG] writeLock addr={addr:#x} stamp={stamp}");
+    }
     Ok(Some(Value::Long(stamp)))
 }
 
@@ -5949,6 +5955,63 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+/// `StampedLock.unlock(long stamp)` — the stamp-dispatching release.
+///
+/// Added 2026-07-28. `unlock(J)V` was the one method of the real
+/// `StampedLock` surface that NO registrar provided — it threw
+/// `NoSuchMethodError` in both run modes. Added here alongside disabling
+/// `native-collections`' rival StampedLock block (see the comment at its
+/// call site), which was silently destroying mutual exclusion.
+///
+/// For anyone tracing history: `register_p62_stamped_lock` in
+/// `phases_late/concurrent.rs` looks like the culprit and is NOT — it is
+/// dead code, never called from anywhere in the tree. The live shadower was
+/// `native-collections`, which wins by running after `register_builtins`.
+///
+/// Spec: release whichever mode the stamp represents, and throw
+/// `IllegalMonitorStateException` if the stamp does not match the lock's
+/// current state. Our backend encodes a write hold as the low bit of the
+/// stamp (`STAMPED_ORIGIN` is even), so an odd stamp is a write stamp and
+/// an even non-zero stamp is a read stamp — mirroring the JDK's own
+/// `WBIT` test without depending on the JDK's exact bit layout.
+fn native_stamped_unlock_by_stamp(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(None);
+    };
+    let stamp = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        // The verifier guarantees a long here; anything else means the call
+        // did not come through `unlock(J)V`, so refuse rather than guess.
+        _ => {
+            return Err(RuntimeError::IllegalMonitorStateException {
+                message: "unlock: missing stamp argument".to_string(),
+            }
+            .into())
+        }
+    };
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let released = if stamp == 0 {
+        // Stamp 0 is the JDK's "acquisition failed" sentinel and can never
+        // name a held lock.
+        false
+    } else if stamp & 1 != 0 {
+        crate::stamped_lock::stamped_try_unstamped_unlock_write(addr)
+    } else {
+        crate::stamped_lock::stamped_try_unstamped_unlock_read(addr)
+    };
+    if !released {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: format!("unlock: stamp {stamp} does not hold this lock"),
+        }
+        .into());
+    }
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(None)
+}
+
 fn native_stamped_unstamped_unlock_read(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6043,9 +6106,11 @@ fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(i32::from(
-        crate::stamped_lock::stamped_is_write_locked(addr),
-    ))))
+    let held = crate::stamped_lock::stamped_is_write_locked(addr);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
+        eprintln!("[SL-DBG] isWriteLocked addr={addr:#x} held={held}");
+    }
+    Ok(Some(Value::Int(i32::from(held))))
 }
 
 fn native_stamped_is_read_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
