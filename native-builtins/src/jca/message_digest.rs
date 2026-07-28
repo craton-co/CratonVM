@@ -154,14 +154,18 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         .into());
     }
     if !algorithm_supported(&algo_raw) {
-        // The JDK throws NoSuchAlgorithmException; cratonvm's nearest
-        // mapping is SecurityException (we don't carry NSAE).  Use an
-        // illegal-argument message that spells out the bad algorithm so
-        // callers see a useful trace.
-        return Err(RuntimeError::SecurityException {
-            message: format!("{algo_raw} MessageDigest not available"),
-        }
-        .into());
+        // Real JDK throws `NoSuchAlgorithmException`, which every caller
+        // catches by name. This used to raise `SecurityException` on the
+        // premise that "we don't carry NSAE" — but the crate does construct a
+        // genuine `java/security/NoSuchAlgorithmException` (see
+        // `provider_chain::throw_no_such_algorithm`, which `KeyFactory`
+        // already uses), and `SecurityException` is unchecked, so it sailed
+        // straight past every `catch (NoSuchAlgorithmException)` handler
+        // instead of being handled. Message text was already correct.
+        return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+            ctx,
+            &format!("{algo_raw} MessageDigest not available"),
+        ));
     }
     let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 4);
     let algo_str = ctx.create_string(&algo_raw);
@@ -184,6 +188,44 @@ fn md_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // instance was never seen by getInstance" (orphan lookup).
     write_accumulator(ctx, md, &[]);
     Ok(Some(Value::Object(Some(md))))
+}
+
+/// `MessageDigest.getInstance(String, String|Provider)` → `MessageDigest`.
+///
+/// Same digest as the single-argument form; the provider argument only decides
+/// whether the call is legal at all. Real JDK resolves the named provider
+/// before the algorithm, so an unregistered name is `NoSuchProviderException`
+/// and an empty one is `IllegalArgumentException` — see
+/// `provider_chain::check_named_provider_arg`.
+fn md_get_instance_with_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    crate::jca::provider_chain::check_named_provider_arg(
+        ctx,
+        args,
+        1,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
+    // Once a provider has been named, an unsupported algorithm is reported
+    // against THAT provider ("no such algorithm: X for provider Y"), not with
+    // the provider-less "X MessageDigest not available" wording the
+    // single-argument form uses. Verified against HotSpot 25.
+    let algo = match args.first() {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if !algo.is_empty() && !algorithm_supported(&algo) {
+        if let Some(Value::Object(Some(p))) = args.get(1) {
+            if let Some(provider) = ctx.read_string(*p) {
+                return Err(crate::jca::provider_chain::throw_no_such_algorithm_public(
+                    ctx,
+                    &format!("no such algorithm: {algo} for provider {provider}"),
+                ));
+            }
+        }
+    }
+    md_get_instance(ctx, args)
 }
 
 /// Read the algorithm name back from a MessageDigest receiver.  Tries
@@ -508,6 +550,26 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljava/security/MessageDigest;",
         md_get_instance,
+    );
+    // The two-argument overloads used to be left to real JDK bytecode, which
+    // reaches `Security.getImpl` → `getinstance_instance_provider` → the
+    // provider-chain SERVICE TABLE. No `MessageDigest` service is registered
+    // under "SUN" there, so `MessageDigest.getInstance("SHA-256", "SUN")` —
+    // ordinary, correct application code — threw NoSuchAlgorithmException
+    // while the single-argument form of the very same digest worked. Route
+    // them at the same intrinsic instead, after validating the provider
+    // argument the way real JDK does.
+    r.register(
+        md,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/MessageDigest;",
+        md_get_instance_with_provider,
+    );
+    r.register(
+        md,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/MessageDigest;",
+        md_get_instance_with_provider,
     );
     r.register(md, "update", "([B)V", md_update_bytes);
     r.register(md, "update", "(B)V", md_update_byte);
