@@ -7,10 +7,8 @@
  * separable. These bodies are as close to empty as Java allows, so the
  * difference between them IS the monitor pair (plus two bytecodes).
  *
- * Neither variant is JIT-compiled on this VM today (ACC_SYNCHRONIZED is an
- * unconditional skip; a `synchronized` block is refused by RBC.6), so this
- * measures the INTERPRETER's monitor path — which is what a webapp deploy
- * pays, since deploy code never gets hot enough to compile anyway.
+ * Both synchronized forms are JIT-eligible. This remains useful to separate
+ * the cost of the monitor operations from the body of a hot method.
  *
  * `lockUnlock` is the same question for `java.util.concurrent.locks`, the
  * other form JDK 25's `BufferedInputStream.read()` can take.

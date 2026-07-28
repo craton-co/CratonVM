@@ -17074,6 +17074,12 @@ impl Compiler {
                     {
                         let val_slot = self.pop_stack();
                         let obj_slot = self.pop_stack();
+                        // Make a null receiver a real Java NPE before either
+                        // the inline store or a legacy helper can turn it into
+                        // a silent no-op. Protected sites retain their precise
+                        // exceptional frame for javac monitor cleanup.
+                        self.load_slot_to_reg(RAX, obj_slot);
+                        self.emit_precise_null_check_field_store();
                         if type_tag == b'L' || type_tag == b'[' {
                             let compact_offset = site
                                 .compact_field_info
@@ -17864,6 +17870,33 @@ impl Compiler {
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
         self.null_check_store_stubs.push((action, patch_offset));
+    }
+
+    /// Null check for `putfield` inside a protected range whose handler needs
+    /// a precise frame. Unlike the generic array stub this records the frame
+    /// at the trapping bytecode, then routes the NPE through that frame so a
+    /// javac monitor-cleanup handler retains its synthetic monitor local.
+    fn emit_precise_null_check_field_store(&mut self) {
+        let bci = self.dbg_last_pc;
+        if !self.precise_exception_frames || !self.pc_is_protected(bci) {
+            self.emit_null_check_array_store(npe_action::NONE);
+            return;
+        }
+        if !self.exc_frame_box_ptr_by_bci.contains_key(&bci) {
+            let box_ptr = self.build_and_record_deopt_point(
+                bci,
+                crate::deopt::DeoptReason::PendingException,
+            );
+            self.exc_frame_box_ptr_by_bci.insert(bci, box_ptr);
+        }
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
+        self.buf.emit(&[0x0F, 0x84]); // JZ rel32 -> precise NPE stub
+        let patch_offset = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        // Reason 10 is a locally-detected pending NPE. The common reason-9
+        // path already has an exception from a helper; this one creates it in
+        // the out-of-line frame-deopt stub before the router consumes it.
+        self.deopt_stubs.push((patch_offset, bci, 10));
     }
 
     /// Round-11 HIGH-2: variant of `emit_null_check_array_store` that
@@ -18731,7 +18764,7 @@ impl Compiler {
             // indy-trap artifact (no helper there could resolve it). Repro:
             // scratch-min/IndyReplay.java (nested shape: 30000/30000 calls
             // corrupted side effects before these fixes, 0 after).
-            let frame_box_ptr = if crate::deopt_real_enabled() || matches!(reason, 8 | 9) {
+            let frame_box_ptr = if crate::deopt_real_enabled() || matches!(reason, 8 | 9 | 10) {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     // Step 6: String-intrinsic and call-site type-check guards
@@ -18749,7 +18782,7 @@ impl Compiler {
                     // `emit_post_invoke_exception_check`) and lives in its own
                     // map, because it is consumed by the interpreter's exception
                     // route rather than by any resume sink.
-                    9 => self.exc_frame_box_ptr_by_bci.get(&bci).copied(),
+                    9 | 10 => self.exc_frame_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
             } else {
@@ -18793,6 +18826,18 @@ impl Compiler {
                 for n in 0u8..16 {
                     // Cast: value to i32 (encoding immediate/displacement)
                     self.emit_movq_mem_rbp_from_xmm(base - 128 - (n as i32) * 8, n);
+                }
+                if reason == 10 {
+                    // A locally-detected putfield null has no helper return
+                    // value to carry its exception. Publish it after saving
+                    // the trapping registers, before materializing the
+                    // precise exceptional frame.
+                    #[cfg(target_os = "windows")]
+                    self.buf.emit_byte(0xB9); // MOV ECX, imm32
+                    #[cfg(not(target_os = "windows"))]
+                    self.buf.emit_byte(0xBF); // MOV EDI, imm32
+                    self.buf.emit(&(npe_action::NONE as u32).to_le_bytes());
+                    self.emit_call_absolute(self.helpers.jit_npe_with_action);
                 }
                 // 2) Args (extern "C"): arg0 = &DeoptimizationPoint (baked imm64),
                 //    arg1 = rbp (live, never clobbered until the epilogue),
