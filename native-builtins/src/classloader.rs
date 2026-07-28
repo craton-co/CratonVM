@@ -5124,8 +5124,17 @@ pub fn builtin_classloader_find_resource_as_stream(
     resource_stream_for_last_string_arg(ctx, args)
 }
 
-fn cl_get_defined_package(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+/// Synthetic-JDK `ClassLoader.getDefinedPackage(String)`.
+///
+/// Delegates to the real-JDK implementation rather than answering an
+/// unconditional `null`: that stub is what made every package-name
+/// `SpringApplication` source fail as `IllegalArgumentException: Invalid
+/// source '<pkg>'` (`BeanDefinitionLoader.findPackage` returns exactly this
+/// probe's result), and there is no reason for the two boot modes to disagree.
+/// `getDefinedPackages`/`getPackages` below stay empty — see the note on
+/// `lang_class::i2_classloader_get_defined_packages`.
+fn cl_get_defined_package(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    crate::lang_class::i2_classloader_get_defined_package(ctx, args)
 }
 
 fn cl_get_defined_packages(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -5927,6 +5936,77 @@ fn fetch_http_resource(
         }
     }
     None
+}
+
+/// True when `loader` is a `URLClassLoader`-shaped loader whose constructor URL
+/// set we positively recorded (see [`record_ucl_urls`]) — i.e. its own URL view
+/// is authoritative, and an EMPTY view genuinely means "this loader owns
+/// nothing", not "we failed to observe its URLs".
+///
+/// The recorded set is either the synthetic-JDK `UCL_URLS_ARRAY` slot or the
+/// real-JDK `ucp` placeholder our constructor shim installs; the presence of
+/// EITHER is the proof. Same signal [`loader_local_resource_urls`] already
+/// trusts for receiver-local resource lookup, so a loader this returns `false`
+/// for is one whose local lookups are already going through the global path.
+///
+/// Requires an actual `java.net.URLClassLoader` (or subclass) receiver: those
+/// raw slot indices only mean "URLs" on that shape. Probing them on, say, a
+/// bare synthetic `java/lang/ClassLoader` reads an unrelated field — the same
+/// out-of-bounds-slot hazard `is_user_defined_loader` guards against.
+fn loader_has_recorded_url_set(ctx: &mut dyn NativeContext, loader: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(loader);
+    let is_url_loader = ctx
+        .class_id_by_name("java/net/URLClassLoader")
+        .is_some_and(|ucl| cid == ucl || ctx.is_subclass(cid, ucl));
+    if !is_url_loader {
+        return false;
+    }
+    matches!(ctx.get_field(loader, UCL_URLS_ARRAY), Value::Object(Some(_)))
+        || matches!(ctx.get_field_by_name(loader, "ucp"), Value::Object(Some(_)))
+}
+
+/// Is a package with class files under `class_glob` (e.g.
+/// `com/example/pkg/*.class`) visible **to this specific loader**?
+///
+/// `ClassLoader.getDefinedPackage` is non-delegating in the JDK, so answering it
+/// from the VM-global classpath makes every loader — including a deliberately
+/// isolated one — claim every package on the process classpath. That is the
+/// loader-identity gap behind
+/// `docs/internal/fixed-suite-bugs/springboot/*-beandefinitionloader-package-scan-empty-FIXED.md`:
+/// `new URLClassLoader("empty", new URL[0], null).getDefinedPackage(p)` answered
+/// with a `Package` where HotSpot answers `null`.
+///
+/// Resolution order, deliberately failing back to the historical global answer
+/// whenever the receiver's own view is not knowable:
+/// 1. built-in loaders (bootstrap/platform/application) — they ARE the global
+///    classpath, so the global probe is the right one;
+/// 2. a loader with its own recorded URLs — probe exactly those (already
+///    pathing-jar aware via [`loader_local_resource_urls`]);
+/// 3. a loader with a positively-recorded but EMPTY URL set — nothing is
+///    visible, matching HotSpot;
+/// 4. anything else (a custom loader we have no URL view of) — global probe,
+///    i.e. unchanged from before this function existed.
+pub(crate) fn package_class_files_visible_to_loader(
+    ctx: &mut dyn NativeContext,
+    loader: Option<ObjectRef>,
+    class_glob: &str,
+) -> bool {
+    let Some(loader) = loader else {
+        return !ctx.find_all_resource_urls(class_glob).is_empty();
+    };
+    let is_builtin = ctx
+        .class_name_of_id(ctx.class_id_of_object(loader))
+        .is_some_and(|n| n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$"));
+    if is_builtin {
+        return !ctx.find_all_resource_urls(class_glob).is_empty();
+    }
+    if !loader_local_resource_urls(ctx, loader, class_glob).is_empty() {
+        return true;
+    }
+    if loader_has_recorded_url_set(ctx, loader) {
+        return false;
+    }
+    !ctx.find_all_resource_urls(class_glob).is_empty()
 }
 
 fn loader_local_resource_urls(
