@@ -306,6 +306,10 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let u = "sun/misc/Unsafe";
+    // `registerNatives` only asks the VM to bind this class's JNI entry points.
+    // CratonVM binds them at registry-build time, so there is nothing left to
+    // do — an empty body is what HotSpot's own `Unsafe_RegisterNatives` amounts
+    // to once the table is already populated.
     r.register(u, "registerNatives", "()V", native_noop);
     r.register(u, "<clinit>", "()V", |ctx, _args| {
         let class_name = "sun/misc/Unsafe";
@@ -700,6 +704,8 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
 
     // Also register under jdk/internal/misc/Unsafe (the modern API, same implementations)
     let u2 = "jdk/internal/misc/Unsafe";
+    // Same as the `sun/misc/Unsafe` entry above: JNI binding is done at
+    // registry-build time, so the method genuinely has no work to do.
     r.register(u2, "registerNatives", "()V", native_noop);
     r.register(u2, "<clinit>", "()V", |ctx, _args| {
         let class_name = "jdk/internal/misc/Unsafe";
@@ -1097,7 +1103,7 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(JJ)J",
         native_unsafe_allocate_memory_realloc,
     );
-    r.register(u, "freeMemory", "(J)V", native_noop_with_this);
+    r.register(u, "freeMemory", "(J)V", native_unsafe_free_memory_ext);
     r.register(u2, "allocateMemory0", "(J)J", native_unsafe_allocate_memory);
     r.register(
         u2,
@@ -1105,32 +1111,33 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(JJ)J",
         native_unsafe_allocate_memory_realloc,
     );
-    r.register(u2, "freeMemory0", "(J)V", native_noop_with_this);
+    r.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory_ext);
 
-    // monitorEnter / monitorExit — manual synchronization
+    // monitorEnter / monitorExit — manual synchronization. These take the
+    // VM's real monitor, not a no-op: see `native_unsafe_monitor_enter`.
     r.register(
         u,
         "monitorEnter",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_enter,
     );
     r.register(
         u,
         "monitorExit",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_exit,
     );
     r.register(
         u2,
         "monitorEnter",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_enter,
     );
     r.register(
         u2,
         "monitorExit",
         "(Ljava/lang/Object;)V",
-        native_noop_with_this,
+        native_unsafe_monitor_exit,
     );
 
     // throwException — throws a checked exception without declaring it
@@ -1191,7 +1198,19 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
 
     // defineClass — define a class from byte array (delegate to ClassLoader)
     // jdk.internal.misc.CDS: CratonVM does not support HotSpot CDS archives.
-    // Return disabled for all query natives and no-op archive hooks.
+    // Class Data Sharing is an OPTIONAL HotSpot feature, and every native
+    // below is spec-correct for a VM that does not offer it — a stock HotSpot
+    // run with `-Xshare:off` answers exactly the same way. The three
+    // `is*0()Z` queries report "not dumping / not sharing"; the archive hooks
+    // (`logLambdaFormInvoker`, `initializeFromArchive`, `defineArchivedModules`,
+    // `dumpClassList`, `dumpDynamicArchive`) have nothing to record or write
+    // because no archive exists, and every caller in `java.base` is written to
+    // tolerate that. These are therefore permanent KEEPs, not unimplemented
+    // stubs. NOTE: identical registration sets also exist in `lib.rs`
+    // (register_essential_natives_with_shims) and
+    // `phases_early.rs::register_core_stdlib_extras`, both of which run AFTER
+    // this one in their respective registration worlds — see the duplication
+    // note in the stub-removal report.
     let cds_cls = "jdk/internal/misc/CDS";
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
@@ -3803,6 +3822,75 @@ pub(crate) fn native_unsafe_allocate_memory(
     // Allocate a byte array on the managed heap to simulate off-heap memory
     let arr = ctx.new_ref_array(ClassId::new(0), size.max(1));
     Ok(Some(Value::Long(arr.as_ptr() as i64)))
+}
+
+/// `Unsafe.freeMemory(long)` / `freeMemory0(long)` — release an off-heap block.
+///
+/// This was `native_noop_with_this`, i.e. every block handed out by
+/// `allocateMemory` stayed live for the lifetime of the process. All off-heap
+/// addressing in this VM is consolidated onto the arena store (see the V5
+/// SECURITY FIX note in `unsafe_natives.rs`): `unsafe_arena_free` removes the
+/// whole `[base, base+len)` entry from the store's `BTreeMap`, and that map IS
+/// the bookkeeping table — dropping the entry both releases the bytes and
+/// makes every later access to the address fail the liveness check, which is
+/// what turns a use-after-free into an `IllegalArgumentException` instead of a
+/// silent read of recycled memory.
+///
+/// `freeMemory(0)` is a no-op by contract (`Unsafe` mirrors C `free(NULL)`),
+/// and an address the arena never handed out — e.g. a real
+/// `ByteBuffer.allocateDirect` pointer, which does not carry the arena tag —
+/// is left alone rather than reported as an error, matching the consolidated
+/// `unsafe_natives::native_unsafe_free_memory` handler.
+pub(crate) fn native_unsafe_free_memory_ext(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] is the `Unsafe` receiver; args[1] is the address.
+    let addr = match args.get(1) {
+        Some(Value::Long(a)) => *a,
+        Some(Value::Int(a)) => *a as i64,
+        _ => return Ok(None),
+    };
+    if addr == 0 {
+        return Ok(None);
+    }
+    unsafe_arena_free(addr);
+    Ok(None)
+}
+
+/// `Unsafe.monitorEnter(Object)` — acquire the argument's monitor.
+///
+/// This was `native_noop_with_this`, which meant a caller that locks through
+/// `Unsafe` rather than the `monitorenter` bytecode got NO mutual exclusion:
+/// every thread "acquired" the monitor simultaneously and the critical section
+/// ran concurrently. CratonVM already has a working monitor implementation —
+/// `NativeThreadAccess::monitor_enter`/`monitor_exit`, the same pair that backs
+/// `java/lang/Object.wait`/`notify`/`notifyAll` — so route to it.
+///
+/// A null argument is an NPE in HotSpot; `obj_arg` produces exactly that.
+/// Plain `monitor_enter` (not `monitor_enter_gc_safe`) is correct here: the
+/// receiver is not touched after the acquire, so a relocation during a blocked
+/// enter cannot leave a stale reference behind.
+pub(crate) fn native_unsafe_monitor_enter(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] is the `Unsafe` receiver; args[1] is the object to lock.
+    let obj = obj_arg(args, 1)?;
+    ctx.monitor_enter(obj);
+    Ok(None)
+}
+
+/// `Unsafe.monitorExit(Object)` — release the argument's monitor.
+/// Counterpart of [`native_unsafe_monitor_enter`]; see its doc for why the
+/// previous no-op was a correctness bug.
+pub(crate) fn native_unsafe_monitor_exit(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let obj = obj_arg(args, 1)?;
+    ctx.monitor_exit(obj);
+    Ok(None)
 }
 
 /// Unsafe.reallocateMemory(long, long) — simulate reallocation.

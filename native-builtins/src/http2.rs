@@ -10,7 +10,7 @@
 //! Implements Java HTTP Client API (java.net.http) introduced in Java 11,
 //! with HTTP/2 (RFC 7540) and HPACK header compression (RFC 7541) stubs.
 
-use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
+use crate::{alloc_concurrent_synthetic, obj_arg};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::RuntimeError;
 use cratonvm_types::{ObjectRef, Value};
@@ -559,8 +559,38 @@ const WS_INPUT_CLOSED: usize = 3;
 // Allocation helpers
 // ---------------------------------------------------------------------------
 
+// Each `alloc_*` below is paired with an `init_*_fields` that establishes the
+// object's starting state. The split exists because these classes are also
+// reachable through their registered `<init>` native, and a receiver that
+// arrives there has every slot at its untyped default — not the typed zero the
+// accessors expect. Both entry points must produce the same object, so they
+// share one initializer.
+
+/// True when `obj`'s class IS `class_name` — i.e. it is the CratonVM synthetic
+/// this file's slot indices describe, not a real JDK type that merely inherits
+/// from it.
+///
+/// Every `<init>` native below has to ask this first. Native dispatch is keyed
+/// on the DECLARING class of the resolved method, and `HttpClient` /
+/// `HttpRequest` are abstract CLASSES in the real JDK — so a real
+/// `jdk.internal.net.http.HttpClientImpl` running `super()` resolves to
+/// `HttpClient.<init>()V` and lands here too, carrying its own field layout.
+/// The indices these initializers write are meaningful only for the synthetic
+/// shape; writing them into a real instance would clobber that instance's
+/// fields. For the real types the JDK constructor body is empty anyway
+/// (`protected HttpClient() {}`), so declining to write anything is exactly
+/// the faithful behaviour.
+fn is_synthetic_shape(ctx: &dyn NativeContext, obj: ObjectRef, class_name: &str) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj)).as_deref() == Some(class_name)
+}
+
 fn alloc_http_client(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient", 10);
+    init_http_client_fields(ctx, obj);
+    obj
+}
+
+fn init_http_client_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, CLIENT_VERSION, Value::Int(HTTP_VERSION_2));
     ctx.set_field(obj, CLIENT_REDIRECT, Value::Int(REDIRECT_NEVER));
     ctx.set_field(obj, CLIENT_CONNECT_TIMEOUT, Value::Long(0));
@@ -571,11 +601,18 @@ fn alloc_http_client(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, CLIENT_HAS_COOKIE, Value::Int(0));
     ctx.set_field(obj, CLIENT_FOLLOW_REDIR, Value::Int(0));
     ctx.set_field(obj, CLIENT_POOL_SIZE, Value::Int(DEFAULT_POOL_SIZE));
-    obj
 }
 
 fn alloc_http_client_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpClient$Builder", 8);
+    init_http_client_builder_fields(ctx, obj);
+    obj
+}
+
+/// A `Builder` accumulates into the same 8 slots `build()` later copies out
+/// wholesale, so every one of them has to start at a defined value — a slot
+/// the caller never touched is still read and copied into the client.
+fn init_http_client_builder_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, 0, Value::Int(HTTP_VERSION_2));
     ctx.set_field(obj, 1, Value::Int(REDIRECT_NEVER));
     ctx.set_field(obj, 2, Value::Long(0));
@@ -584,11 +621,19 @@ fn alloc_http_client_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, 5, Value::Int(0));
     ctx.set_field(obj, 6, Value::Int(0));
     ctx.set_field(obj, 7, Value::Int(0));
-    obj
 }
 
 fn alloc_http_request(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest", 8);
+    init_http_request_fields(ctx, obj);
+    obj
+}
+
+/// Shared by `HttpRequest` and `HttpRequest$Builder`: both carry the same 8
+/// slots (the builder's `build()` copies them across one-for-one), so an
+/// unset `REQ_TIMEOUT` / `REQ_BODY_LEN` would be copied into the request as a
+/// non-`Long` and read back through the `()J` accessors.
+fn init_http_request_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, REQ_METHOD, Value::Int(METHOD_GET));
     ctx.set_field(obj, REQ_URI, Value::Object(None));
     ctx.set_field(obj, REQ_HAS_BODY, Value::Int(0));
@@ -597,24 +642,21 @@ fn alloc_http_request(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, REQ_EXPECT_100, Value::Int(0));
     ctx.set_field(obj, REQ_HDR_COUNT, Value::Int(0));
     ctx.set_field(obj, REQ_BODY_LEN, Value::Long(0));
-    obj
 }
 
 fn alloc_http_request_builder(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$Builder", 8);
-    ctx.set_field(obj, REQ_METHOD, Value::Int(METHOD_GET));
-    ctx.set_field(obj, REQ_URI, Value::Object(None));
-    ctx.set_field(obj, REQ_HAS_BODY, Value::Int(0));
-    ctx.set_field(obj, REQ_TIMEOUT, Value::Long(0));
-    ctx.set_field(obj, REQ_VERSION, Value::Int(0));
-    ctx.set_field(obj, REQ_EXPECT_100, Value::Int(0));
-    ctx.set_field(obj, REQ_HDR_COUNT, Value::Int(0));
-    ctx.set_field(obj, REQ_BODY_LEN, Value::Long(0));
+    init_http_request_fields(ctx, obj);
     obj
 }
 
 fn alloc_http_response(ctx: &mut dyn NativeContext, status: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpResponse", 7);
+    init_http_response_fields(ctx, obj, status);
+    obj
+}
+
+fn init_http_response_fields(ctx: &mut dyn NativeContext, obj: ObjectRef, status: i32) {
     ctx.set_field(obj, RESP_STATUS, Value::Int(status));
     ctx.set_field(obj, RESP_VERSION, Value::Int(HTTP_VERSION_2));
     ctx.set_field(obj, RESP_BODY_LEN, Value::Long(0));
@@ -622,7 +664,6 @@ fn alloc_http_response(ctx: &mut dyn NativeContext, status: i32) -> ObjectRef {
     ctx.set_field(obj, RESP_METHOD, Value::Int(METHOD_GET));
     ctx.set_field(obj, RESP_HAS_SSL, Value::Int(0));
     ctx.set_field(obj, RESP_BODY_OBJ, Value::Object(None));
-    obj
 }
 
 fn alloc_http_headers(
@@ -632,19 +673,33 @@ fn alloc_http_headers(
     has_cl: i32,
 ) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpHeaders", 3);
+    init_http_headers_fields(ctx, obj, count, has_ct, has_cl);
+    obj
+}
+
+fn init_http_headers_fields(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    count: i32,
+    has_ct: i32,
+    has_cl: i32,
+) {
     ctx.set_field(obj, HDR_COUNT, Value::Int(count));
     ctx.set_field(obj, HDR_HAS_CT, Value::Int(has_ct));
     ctx.set_field(obj, HDR_HAS_CL, Value::Int(has_cl));
-    obj
 }
 
 fn alloc_websocket(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/WebSocket", 4);
+    init_websocket_fields(ctx, obj);
+    obj
+}
+
+fn init_websocket_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, WS_STATE, Value::Int(WS_OPEN));
     ctx.set_field(obj, WS_SUBPROTOCOL, Value::Int(0));
     ctx.set_field(obj, WS_OUTPUT_CLOSED, Value::Int(0));
     ctx.set_field(obj, WS_INPUT_CLOSED, Value::Int(0));
-    obj
 }
 
 // ---------------------------------------------------------------------------
@@ -920,9 +975,13 @@ fn decode_chunked(input: &str) -> String {
 
 fn alloc_body_publisher(ctx: &mut dyn NativeContext, len: i64) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/net/http/HttpRequest$BodyPublisher", 2);
+    init_body_publisher_fields(ctx, obj, len);
+    obj
+}
+
+fn init_body_publisher_fields(ctx: &mut dyn NativeContext, obj: ObjectRef, len: i64) {
     ctx.set_field(obj, 0, Value::Long(len));
     ctx.set_field(obj, 1, Value::Int(0)); // type idx
-    obj
 }
 
 fn alloc_body_handler(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
@@ -939,7 +998,19 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpClient";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // `HttpClient` is an ABSTRACT class in the real JDK, whose protected
+    // no-arg constructor really is empty — but CratonVM's `HttpClient` is a
+    // 10-slot synthetic that `send()` reads by index, and a receiver reaching
+    // here has none of those slots written. Establish the same defaults the
+    // factory (`newHttpClient()`) produces. See `is_synthetic_shape` for why
+    // the real-subclass case must be left alone.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/HttpClient") {
+            init_http_client_fields(ctx, this);
+        }
+        Ok(None)
+    });
 
     // static newHttpClient() -> HttpClient
     r.register(
@@ -1282,7 +1353,20 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpClient$Builder";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // `HttpClient.Builder` is an interface in the real JDK, so this runs only
+    // for a CratonVM synthetic receiver — and for a builder the all-defaults
+    // state is definitely NOT correct: `build()` below copies all 8 slots into
+    // the client unconditionally, so any slot the caller did not configure
+    // (the common case — nobody calls all nine setters) would arrive at the
+    // client as an untyped default rather than as `HTTP_2` / `NEVER` / a
+    // `Long` connect timeout.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/HttpClient$Builder") {
+            init_http_client_builder_fields(ctx, this);
+        }
+        Ok(None)
+    });
 
     // version(HttpClient$Version) -> Builder
     r.register(
@@ -1469,7 +1553,18 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // `HttpRequest` is an ABSTRACT class whose protected no-arg constructor is
+    // empty in the real JDK; CratonVM's is an 8-slot synthetic that
+    // `HttpClient.send()` reads by index (method, URI, header count, body
+    // length). Seed it the way `newBuilder().build()` would — but only for the
+    // synthetic shape; see `is_synthetic_shape`.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/HttpRequest") {
+            init_http_request_fields(ctx, this);
+        }
+        Ok(None)
+    });
 
     // static newBuilder() -> HttpRequest$Builder
     r.register(
@@ -1600,7 +1695,17 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest$Builder";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface in the real JDK; synthetic receivers only. Same reasoning as
+    // `HttpClient$Builder`: `build()` copies slots 0..7 verbatim, and the
+    // header-count accumulator (`header()`, `setHeader()`) increments whatever
+    // it reads, so an unseeded `REQ_HDR_COUNT` never starts counting.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/HttpRequest$Builder") {
+            init_http_request_fields(ctx, this);
+        }
+        Ok(None)
+    });
 
     // uri(URI) -> Builder
     r.register(
@@ -1824,7 +1929,19 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpResponse";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface in the real JDK; synthetic receivers only. Status 0 is the
+    // same "no exchange happened" value the error paths in
+    // `HttpClient.send()` construct, so a directly-constructed response is
+    // indistinguishable from one that never reached the wire — rather than
+    // one whose `statusCode()` silently falls through to the hard-coded 200
+    // fallback below.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/HttpResponse") {
+            init_http_response_fields(ctx, this, 0);
+        }
+        Ok(None)
+    });
 
     // statusCode() -> int
     r.register(cls, "statusCode", "()I", |ctx, args| {
@@ -1944,7 +2061,20 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpHeaders";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // `HttpHeaders` is a FINAL class in the real JDK (constructed only via
+    // `HttpHeaders.of(...)`), so this too runs only for synthetic receivers.
+    // Its backing state here is three counters rather than a map, and
+    // `allValues`/`firstValue`/`map` all read them expecting an `Int`; seed
+    // them to the empty-headers shape (no headers, no content-type, no
+    // content-length) so those reads are answered by real state instead of by
+    // each accessor's private `_ => 0` fallback.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/HttpHeaders") {
+            init_http_headers_fields(ctx, this, 0, 0, 0);
+        }
+        Ok(None)
+    });
 
     // allValues(String name) -> List<String>
     r.register(
@@ -2068,7 +2198,19 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest$BodyPublisher";
     let bps = "java/net/http/HttpRequest$BodyPublishers";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // `BodyPublisher` is an interface in the real JDK; synthetic receivers
+    // only. Slot 0 is the content length, read back through `contentLength()`
+    // (`()J`), so it must start as a `Long`. Zero is the correct default: a
+    // publisher with nothing pushed into it is `BodyPublishers.noBody()`,
+    // whose contract is a known length of 0 (NOT the -1 "unknown length" the
+    // streaming publishers use).
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/HttpRequest$BodyPublisher") {
+            init_body_publisher_fields(ctx, this, 0);
+        }
+        Ok(None)
+    });
 
     // BodyPublishers.ofString(String) -> BodyPublisher
     r.register(
@@ -2293,7 +2435,17 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "java/net/http/WebSocket";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface in the real JDK; synthetic receivers only. All-defaults is
+    // wrong here in a way that inverts behaviour: `WS_STATE` starts at the
+    // untyped default rather than at `WS_OPEN`, and the close-flag reads that
+    // gate `sendText`/`sendClose`/`isInputClosed` would answer from it.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if is_synthetic_shape(ctx, this, "java/net/http/WebSocket") {
+            init_websocket_fields(ctx, this);
+        }
+        Ok(None)
+    });
 
     // sendText(CharSequence, boolean last) -> CompletableFuture<WebSocket>
     r.register(

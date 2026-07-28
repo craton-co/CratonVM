@@ -471,6 +471,145 @@ pub(crate) fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, eve
     ctx.unpin_native_roots(listeners_pin);
 }
 
+/// Whether `failure` is a `java.beans.PropertyVetoException` — the one
+/// exception `fireVetoableChange` treats as "the change was refused" rather
+/// than as a listener malfunction to propagate untouched.
+fn vcs_is_property_veto(ctx: &dyn NativeContext, failure: &MethodCallFailed) -> bool {
+    let MethodCallFailed::ExceptionThrown(exc) = failure else {
+        return false;
+    };
+    let thrown = ctx.class_id_of_object(*exc);
+    if ctx.class_name_of_id(thrown).as_deref() == Some("java/beans/PropertyVetoException") {
+        return true;
+    }
+    match ctx.class_id_by_name("java/beans/PropertyVetoException") {
+        Some(veto) => ctx.is_subclass(thrown, veto),
+        None => false,
+    }
+}
+
+/// Build a `PropertyChangeEvent` from a `VetoableChangeSupport` receiver, and
+/// return the (possibly GC-forwarded) receiver alongside it.
+///
+/// Split out because a veto has to build a SECOND event — the reverted one —
+/// after listener bytecode has already run and moved everything around.
+fn vcs_event(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    prop_name: Value,
+    old_val: Value,
+    new_val: Value,
+) -> (ObjectRef, ObjectRef) {
+    // Pin across the event alloc below — a moving young GC there would
+    // relocate them (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let prop_pin = pinned_object_value(ctx, prop_name);
+    let old_pin = pinned_object_value(ctx, old_val);
+    let new_pin = pinned_object_value(ctx, new_val);
+    let source = ctx.get_field(this, 0);
+    let source_pin = pinned_object_value(ctx, source);
+    let event = alloc_concurrent_synthetic(ctx, "java/beans/PropertyChangeEvent", 4);
+    ctx.set_field(event, 0, read_pinned_object_value(ctx, source_pin, source));
+    ctx.set_field(event, 1, read_pinned_object_value(ctx, prop_pin, prop_name));
+    ctx.set_field(event, 2, read_pinned_object_value(ctx, old_pin, old_val));
+    ctx.set_field(event, 3, read_pinned_object_value(ctx, new_pin, new_val));
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    (this, event)
+}
+
+/// Deliver `event` to every listener in VCS field 1 (ArrayList).
+///
+/// The vetoable twin of [`pcs_dispatch`], with the one difference that makes a
+/// vetoable change vetoable: a listener failure STOPS the round and is handed
+/// back to the caller instead of being swallowed.
+fn vcs_dispatch(
+    ctx: &mut dyn NativeContext,
+    vcs_this: ObjectRef,
+    event: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let listeners = match ctx.get_field(vcs_this, 1) {
+        Value::Object(Some(listeners)) => listeners,
+        _ => return Ok(()),
+    };
+    // Pin across the listener callbacks below — a moving young GC there would
+    // relocate `listeners`/`event` (native stale-local family).
+    let listeners_pin = ctx.pin_native_root(listeners);
+    let event_pin = ctx.pin_native_root(event);
+    let size =
+        match cratonvm_native_collections::native_al_size(ctx, &[Value::Object(Some(listeners))]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => 0,
+        };
+    let mut outcome = Ok(());
+    for i in 0..size {
+        let listeners = ctx.read_native_pin(listeners_pin, listeners);
+        let listener_val = match cratonvm_native_collections::native_al_get(
+            ctx,
+            &[Value::Object(Some(listeners)), Value::Int(i)],
+        ) {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        if let Value::Object(Some(listener)) = listener_val {
+            let event = ctx.read_native_pin(event_pin, event);
+            if let Err(failure) = ctx.invoke_virtual(
+                listener,
+                "vetoableChange",
+                "(Ljava/beans/PropertyChangeEvent;)V",
+                &[Value::Object(Some(event))],
+            ) {
+                outcome = Err(failure);
+                break;
+            }
+        }
+    }
+    ctx.unpin_native_roots(listeners_pin);
+    outcome
+}
+
+/// `VetoableChangeSupport.fireVetoableChange` for all three overloads.
+///
+/// On a veto the JDK re-fires the REVERTED event (old/new swapped) to the whole
+/// listener list so listeners that already accepted can undo, ignores any veto
+/// of that revert, and then rethrows the original `PropertyVetoException`.
+/// Anything else a listener throws propagates untouched, with no revert.
+fn vcs_fire(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    prop_name: Value,
+    old_val: Value,
+    new_val: Value,
+) -> MethodCallResult {
+    // Same short-circuit as PropertyChangeSupport: no change, no event.
+    if pcs_values_equal(&old_val, &new_val) {
+        return Ok(None);
+    }
+    // The revert pass rebuilds an event from these values AFTER listener
+    // bytecode has run, so they must survive a moving collection.
+    let base_pin = ctx.pin_native_root(this);
+    let prop_pin = pinned_object_value(ctx, prop_name);
+    let old_pin = pinned_object_value(ctx, old_val);
+    let new_pin = pinned_object_value(ctx, new_val);
+    let (fired_this, event) = vcs_event(ctx, this, prop_name, old_val, new_val);
+    let result = match vcs_dispatch(ctx, fired_this, event) {
+        Ok(()) => Ok(None),
+        Err(failure) => {
+            if vcs_is_property_veto(ctx, &failure) {
+                let this = ctx.read_native_pin(base_pin, this);
+                let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
+                let old_val = read_pinned_object_value(ctx, old_pin, old_val);
+                let new_val = read_pinned_object_value(ctx, new_pin, new_val);
+                let (revert_this, revert) = vcs_event(ctx, this, prop_name, new_val, old_val);
+                let _ = vcs_dispatch(ctx, revert_this, revert);
+            }
+            Err(failure)
+        }
+    };
+    ctx.unpin_native_roots(base_pin);
+    result
+}
+
 pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -798,15 +937,21 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
 
-    // PropertyChangeListener interface
+    // PropertyChangeListener / VetoableChangeListener are INTERFACES, and the
+    // dispatcher deliberately ignores a native registered on an interface
+    // instance method (`class_name_for_override` is built from the resolved
+    // method's DECLARING class, then dropped when that class is an interface —
+    // vm_exec.rs / interpreter.rs, "bridges for synthetic receivers with no
+    // real class hierarchy"). So these do NOT shadow a user listener body: they
+    // are only reached by a synthetic receiver that has no `propertyChange`/
+    // `vetoableChange` bytecode at all, and for a listener callback with no
+    // subscriber state to update, doing nothing IS the correct behaviour.
     r.register(
         "java/beans/PropertyChangeListener",
         "propertyChange",
         "(Ljava/beans/PropertyChangeEvent;)V",
         native_noop_with_this,
     );
-
-    // VetoableChangeListener interface
     r.register(
         "java/beans/VetoableChangeListener",
         "vetoableChange",
@@ -852,25 +997,98 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         vcs,
         "removeVetoableChangeListener",
         "(Ljava/beans/VetoableChangeListener;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let listener = args.get(1).copied().unwrap_or(Value::Object(None));
+            if let Value::Object(Some(lst)) = ctx.get_field(this, 1) {
+                cratonvm_native_collections::native_al_remove_obj(
+                    ctx,
+                    &[Value::Object(Some(lst)), listener],
+                )
+                .ok();
+            }
+            Ok(None)
+        },
     );
     r.register(
         vcs,
         "fireVetoableChange",
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let prop_name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let old_val = args.get(2).copied().unwrap_or(Value::Object(None));
+            let new_val = args.get(3).copied().unwrap_or(Value::Object(None));
+            vcs_fire(ctx, this, prop_name, old_val, new_val)
+        },
     );
     r.register(
         vcs,
         "fireVetoableChange",
         "(Ljava/lang/String;II)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let prop_name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let old_i = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let new_i = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            // Compare the primitives, not the boxes: two freshly boxed
+            // Integers are never reference-equal, so `pcs_values_equal` on
+            // them would fire even for an unchanged value.
+            if old_i == new_i {
+                return Ok(None);
+            }
+            // Pin across the box allocs below — a moving young GC there would
+            // relocate them (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let prop_pin = pinned_object_value(ctx, prop_name);
+            let old_box = pcs_box_int(ctx, old_i);
+            let old_box_pin = ctx.pin_native_root(old_box);
+            let new_box = pcs_box_int(ctx, new_i);
+            let this = ctx.read_native_pin(this_pin, this);
+            let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
+            let old_box = ctx.read_native_pin(old_box_pin, old_box);
+            let result = vcs_fire(
+                ctx,
+                this,
+                prop_name,
+                Value::Object(Some(old_box)),
+                Value::Object(Some(new_box)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            result
+        },
     );
     r.register(
         vcs,
         "fireVetoableChange",
         "(Ljava/lang/String;ZZ)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let prop_name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let old_b = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let new_b = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            // See the (String,I,I) overload: compare before boxing.
+            if old_b == new_b {
+                return Ok(None);
+            }
+            let this_pin = ctx.pin_native_root(this);
+            let prop_pin = pinned_object_value(ctx, prop_name);
+            let old_box = pcs_box_bool(ctx, old_b);
+            let old_box_pin = ctx.pin_native_root(old_box);
+            let new_box = pcs_box_bool(ctx, new_b);
+            let this = ctx.read_native_pin(this_pin, this);
+            let prop_name = read_pinned_object_value(ctx, prop_pin, prop_name);
+            let old_box = ctx.read_native_pin(old_box_pin, old_box);
+            let result = vcs_fire(
+                ctx,
+                this,
+                prop_name,
+                Value::Object(Some(old_box)),
+                Value::Object(Some(new_box)),
+            );
+            ctx.unpin_native_roots(this_pin);
+            result
+        },
     );
     r.register(vcs, "hasListeners", "(Ljava/lang/String;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1874,6 +2092,96 @@ pub(crate) fn decapitalize(s: &str) -> String {
 // javax.naming — JNDI stubs
 // =============================================================================
 
+/// The binding map behind a naming context — slot 0, the layout
+/// `InitialContext.<init>` (and `createSubcontext`) establishes.
+///
+/// The ONE accessor for that store: the `javax/naming/InitialContext` natives
+/// and the `javax/naming/Context` interface fallbacks both go through slot 0,
+/// so a bind through either is visible to a lookup through the other. Keep it
+/// that way — two stores that disagree is worse than either being wrong.
+///
+/// `None` for a receiver that does not carry one, which is the conservative
+/// answer for the interface fallbacks: those can in principle be handed a
+/// receiver of any shape, and writing a map operation into some unrelated
+/// object's slot 0 would be far worse than not binding.
+fn jndi_bindings_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(this) == 0 {
+        return None;
+    }
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(bindings)) => Some(bindings),
+        _ => None,
+    }
+}
+
+/// `javax.naming.NameAlreadyBoundException` for a `bind` over a live name.
+/// Built as the real class so `catch (NameAlreadyBoundException)` — and the
+/// `NamingException` supertype every JNDI caller catches — match it.
+fn jndi_name_already_bound(ctx: &mut dyn NativeContext, name: Value) -> MethodCallFailed {
+    let detail = match name {
+        Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let message = ctx.create_string(&detail);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "javax/naming/NameAlreadyBoundException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(message))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::IllegalStateException {
+        message: format!("name already bound: {detail}"),
+    }
+    .into()
+}
+
+/// `Context.bind`: store `val` under `key`, refusing to displace a live
+/// binding. Shared verbatim by `javax/naming/InitialContext.bind` and the
+/// `javax/naming/Context` interface fallback so the two cannot drift — a
+/// `bind` that silently overwrote was the original defect on both.
+///
+/// `rebind` is the overwriting form and deliberately does NOT come through
+/// here; per the JNDI spec it replaces whatever is there.
+fn jndi_bind_unique(
+    ctx: &mut dyn NativeContext,
+    bindings: ObjectRef,
+    key: Value,
+    val: Value,
+) -> MethodCallResult {
+    // Unlike the single-op siblings, this does TWO map ops, and the first
+    // dispatches Java hashCode()/equals() that can allocate — pin the map and
+    // both operands across it (native stale-local family).
+    let bindings_pin = ctx.pin_native_root(bindings);
+    let key_pin = pinned_object_value(ctx, key);
+    let val_pin = pinned_object_value(ctx, val);
+    let taken = cratonvm_native_collections::native_map_contains_key_pub(
+        ctx,
+        &[Value::Object(Some(bindings)), key],
+    );
+    let bindings = ctx.read_native_pin(bindings_pin, bindings);
+    let key = read_pinned_object_value(ctx, key_pin, key);
+    let val = read_pinned_object_value(ctx, val_pin, val);
+    let taken = match taken {
+        Ok(taken) => taken,
+        Err(err) => {
+            ctx.unpin_native_roots(bindings_pin);
+            return Err(err);
+        }
+    };
+    if matches!(taken, Some(Value::Int(1))) {
+        ctx.unpin_native_roots(bindings_pin);
+        return Err(jndi_name_already_bound(ctx, key));
+    }
+    let stored = cratonvm_native_collections::native_map_put_pub(
+        ctx,
+        &[Value::Object(Some(bindings)), key, val],
+    );
+    ctx.unpin_native_roots(bindings_pin);
+    stored?;
+    Ok(None)
+}
+
 pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1943,13 +2251,10 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let val = args.get(2).copied().unwrap_or(Value::Object(None));
-            if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
-                cratonvm_native_collections::native_map_put_pub(
-                    ctx,
-                    &[Value::Object(Some(bindings)), key, val],
-                )?;
-            }
-            Ok(None)
+            let Some(bindings) = jndi_bindings_map(ctx, this) else {
+                return Ok(None);
+            };
+            jndi_bind_unique(ctx, bindings, key, val)
         },
     );
     r.register(
@@ -1960,12 +2265,14 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let key = args.get(1).copied().unwrap_or(Value::Object(None));
             let val = args.get(2).copied().unwrap_or(Value::Object(None));
-            if let Value::Object(Some(bindings)) = ctx.get_field(this, 0) {
-                cratonvm_native_collections::native_map_put_pub(
-                    ctx,
-                    &[Value::Object(Some(bindings)), key, val],
-                )?;
-            }
+            // `rebind` is the overwriting form — no occupancy check, by spec.
+            let Some(bindings) = jndi_bindings_map(ctx, this) else {
+                return Ok(None);
+            };
+            cratonvm_native_collections::native_map_put_pub(
+                ctx,
+                &[Value::Object(Some(bindings)), key, val],
+            )?;
             Ok(None)
         },
     );
@@ -2119,37 +2426,78 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         });
     }
 
-    // Context interface stub (javax/naming/Context)
+    // Context interface fallbacks (javax/naming/Context).
+    //
+    // Note: Context is an interface, so the dispatcher skips these whenever the
+    // resolved method declares on a concrete class — a user Context impl runs
+    // its own bytecode, and CratonVM's synthetic receiver runs the
+    // `javax/naming/InitialContext` natives above. They are only reached by a
+    // receiver whose resolved `bind`/`lookup` declares on the interface itself,
+    // i.e. one with no implementation at all. Even so, the trio below now
+    // agrees with itself against the same field-0 binding map `InitialContext`
+    // uses, so a bind here is observable by a later lookup instead of vanishing.
     let ctx_iface = "javax/naming/Context";
     r.register(
         ctx_iface,
         "lookup",
         "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let Some(bindings) = jndi_bindings_map(ctx, this) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let found = cratonvm_native_collections::native_map_get_pub(
+                ctx,
+                &[Value::Object(Some(bindings)), key],
+            )?;
+            Ok(Some(found.unwrap_or(Value::Object(None))))
+        },
     );
     r.register(
         ctx_iface,
         "bind",
         "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val = args.get(2).copied().unwrap_or(Value::Object(None));
+            let Some(bindings) = jndi_bindings_map(ctx, this) else {
+                return Ok(None);
+            };
+            jndi_bind_unique(ctx, bindings, key, val)
+        },
     );
     r.register(
         ctx_iface,
         "rebind",
         "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
-    );
-    // Note: Context is an interface — these are fallback defaults. Real implementations
-    // are on javax/naming/InitialContext which will be dispatched via virtual lookup first.
-    r.register(
-        ctx_iface,
-        "unbind",
-        "(Ljava/lang/String;)V",
-        |_ctx, _args| {
-            // Default interface implementation — concrete classes override.
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = args.get(1).copied().unwrap_or(Value::Object(None));
+            let val = args.get(2).copied().unwrap_or(Value::Object(None));
+            let Some(bindings) = jndi_bindings_map(ctx, this) else {
+                return Ok(None);
+            };
+            cratonvm_native_collections::native_map_put_pub(
+                ctx,
+                &[Value::Object(Some(bindings)), key, val],
+            )?;
             Ok(None)
         },
     );
+    r.register(ctx_iface, "unbind", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key = args.get(1).copied().unwrap_or(Value::Object(None));
+        let Some(bindings) = jndi_bindings_map(ctx, this) else {
+            return Ok(None);
+        };
+        cratonvm_native_collections::native_map_remove_pub(
+            ctx,
+            &[Value::Object(Some(bindings)), key],
+        )?;
+        Ok(None)
+    });
     r.register(ctx_iface, "close", "()V", |_ctx, _args| {
         // Default interface implementation — concrete classes override.
         Ok(None)

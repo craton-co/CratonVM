@@ -26,7 +26,10 @@ in-process `ToolProvider.getSystemJavaCompiler()` compilations per run
 (plain classes, inner classes, `@Deprecated` methods without an explicit
 annotation value, generics/collections — deliberately excluding
 `@SuppressWarnings("...")`, which hits a separate, already-documented,
-unrelated bug: `suppresswarnings-annotation-duplicate-value-bug-20260726.md`).
+unrelated bug -- the `LinkedHashSet.remove` defect written up as
+`suppresswarnings-annotation-duplicate-value-bug-20260726`, since FIXED
+2026-07-27; the probe then gained a fifth source kind covering
+`@SuppressWarnings("deprecation")` under `-Xlint:deprecation -Werror`).
 
 Baseline (all 8 bans active): 100/100 compilations succeed, 0 failures.
 
