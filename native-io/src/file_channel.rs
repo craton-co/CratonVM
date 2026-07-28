@@ -1065,6 +1065,10 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
         "(Ljava/io/FileDescriptor;[J)V",
         native_filekey_init_longs,
     );
+    // KEEP: `FileKey.initIDs()` only caches the jfieldIDs for `st_dev`/`st_ino`
+    // (`dwVolumeSerialNumber`/`nFileIndex*` on Windows) that `init` writes.
+    // We resolve those fields by name in `native_filekey_init*`, so an empty
+    // body is the faithful implementation, not a stub.
     r.register("sun/nio/ch/FileKey", "initIDs", "()V", |_ctx, _args| {
         Ok(None)
     });

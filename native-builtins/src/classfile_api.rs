@@ -32,6 +32,15 @@ fn classfile_unsupported(method: &str) -> MethodCallResult {
     }))
 }
 
+/// Build a synthetic `Optional.empty()`. Several model accessors declare an
+/// `Optional` return; handing back a bare null there NPEs at the call site the
+/// moment the caller does the obligatory `isPresent()`/`orElse(...)`.
+fn empty_optional(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    ctx.set_field(opt, 0, Value::Object(None));
+    opt
+}
+
 // ---------------------------------------------------------------------------
 // Class file version constants
 // ---------------------------------------------------------------------------
@@ -162,6 +171,9 @@ fn register_classfile(r: &mut NativeMethodRegistry) {
     });
 
     // latestMinorVersion() -> int
+    // KEEP: spec-correct constant. Every class file format from 45.3 onward
+    // uses minor version 0 (only the preview-feature marker 65535 differs, and
+    // that is not "latest"), so the real JDK also returns 0 here.
     r.register(cf, "latestMinorVersion", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -261,8 +273,17 @@ fn register_class_model(r: &mut NativeMethodRegistry) {
         },
     );
 
-    r.register(cm, "isModuleInfo", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0))) // false
+    // A class file describes a module iff ACC_MODULE (0x8000) is set in its
+    // access flags. Read the model's real flags word (field 2, the same slot
+    // `flags()` above exposes) instead of answering a blanket false.
+    r.register(cm, "isModuleInfo", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let flags = match ctx.get_field(this, 2) {
+            Value::Int(n) => n,
+            _ => 0,
+        };
+        let is_module = (flags & i32::from(ACC_MODULE)) != 0;
+        Ok(Some(Value::Int(if is_module { 1 } else { 0 })))
     });
 
     r.register(cm, "className", "()Ljava/lang/String;", |ctx, _args| {
@@ -375,8 +396,12 @@ fn register_method_model(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(list))))
     });
 
-    r.register(mm, "parent", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // MethodModel.parent() -> Optional<ClassModel>. These synthetic models are
+    // fabricated standalone (no ClassModel owns them), so the honest answer is
+    // Optional.empty() — never a bare null, which the declared type forbids.
+    r.register(mm, "parent", "()Ljava/util/Optional;", |ctx, _args| {
+        let opt = empty_optional(ctx);
+        Ok(Some(Value::Object(Some(opt))))
     });
 }
 
@@ -445,8 +470,11 @@ fn register_field_model(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(list))))
     });
 
-    r.register(fm, "parent", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // FieldModel.parent() -> Optional<ClassModel>; unattached synthetic model,
+    // so Optional.empty() rather than a bare null (see MethodModel.parent).
+    r.register(fm, "parent", "()Ljava/util/Optional;", |ctx, _args| {
+        let opt = empty_optional(ctx);
+        Ok(Some(Value::Object(Some(opt))))
     });
 }
 
@@ -489,8 +517,11 @@ fn register_code_model(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(list))))
     });
 
-    r.register(code, "parent", "()Ljava/util/Optional;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // CodeModel.parent() -> Optional<MethodModel>; unattached synthetic model,
+    // so Optional.empty() rather than a bare null (see MethodModel.parent).
+    r.register(code, "parent", "()Ljava/util/Optional;", |ctx, _args| {
+        let opt = empty_optional(ctx);
+        Ok(Some(Value::Object(Some(opt))))
     });
 }
 

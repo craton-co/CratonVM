@@ -1016,13 +1016,16 @@ pub fn register_plain_socket_real(r: &mut NativeMethodRegistry) {
     register_impl_surface(r, NIO_SOCKET_IMPL);
     register_impl_surface(r, PLAIN_SERVER_SOCKET_IMPL);
 
-    // The genuine `java.net.Socket` / `java.net.ServerSocket` natives the
-    // public API still calls (per OpenJDK source). The richer `<init>` /
-    // `connect` / etc. overloads on those public classes are owned by
-    // `net_phase_e.rs::register_re1_socket` / `register_re2_server_socket`.
-    // Here we register only the static `init` symbols their <clinit>
-    // touches in real-JDK; calling the wrong one would shadow the rich
-    // surface in net_phase_e (forbidden file).
+    // KEEP as no-ops: same JNI-field-ID-caching family as the `initProto`/
+    // `init` pair above — no observable effect, registered so a `<clinit>`
+    // that references the symbol does not die with UnsatisfiedLinkError.
+    // Note (wave-3 sweep): modern OpenJDK `java.net.Socket`/`ServerSocket` may
+    // not declare `init()V` at all, in which case these two are inert rather
+    // than load-bearing; that could not be verified without a JDK to read, and
+    // they shadow nothing (no real method of that name/descriptor exists to
+    // intercept). The richer `<init>` / `connect` / etc. overloads on those
+    // public classes are owned by `net_phase_e.rs::register_re1_socket` /
+    // `register_re2_server_socket`; only the static `init` symbols belong here.
     r.register("java/net/Socket", "init", "()V", |_ctx, _args| Ok(None));
     r.register("java/net/ServerSocket", "init", "()V", |_ctx, _args| {
         Ok(None)

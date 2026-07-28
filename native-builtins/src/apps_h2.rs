@@ -80,19 +80,23 @@ pub(crate) fn register_apps_h2_overrides(registry: &mut NativeMethodRegistry) {
         thread_state_runnable,
     );
 
-    // Thread.getPriority() reads `this.holder.priority`.  Return NORM_PRIORITY.
-    registry.register("java/lang/Thread", "getPriority", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(5)))
-    });
-
-    // Thread.isDaemon() reads `this.holder.daemon`.
-    registry.register("java/lang/Thread", "isDaemon", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-
-    registry.register("java/lang/Thread", "setDaemon", "(Z)V", |_ctx, _args| {
-        Ok(None)
-    });
+    // STUB-REMOVAL (wave 3) — DELETED: `Thread.getPriority()I` -> 5,
+    // `Thread.isDaemon()Z` -> false and `Thread.setDaemon(Z)V` -> no-op.
+    //
+    // Proof they were dead: `register_apps_h2_overrides` has exactly one
+    // reference in the tree, `let _ = apps_h2::register_apps_h2_overrides;`
+    // (lib.rs ~8904), which takes the fn item to silence dead-code and never
+    // calls it. So the registrations existed in neither real-JDK nor
+    // synthetic-JDK mode.
+    //
+    // Why they are not merely restored on a future re-enable: they were keyed
+    // on the CONCRETE class `java/lang/Thread`, so a registered native shadows
+    // the bytecode for EVERY thread in the VM, not just H2's — the blast
+    // radius of an app shim was the whole runtime. `setDaemon` was the worst
+    // of the three: swallowing it leaves a thread non-daemon, which keeps the
+    // JVM from exiting. All three are recoverable from `holder:FieldHolder`,
+    // which `NativeContextImpl::current_thread_object` now populates, so the
+    // real bytecode answers them correctly and no override is warranted.
     registry.set_category(__prev_cat);
 }
 

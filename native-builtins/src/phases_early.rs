@@ -1963,27 +1963,19 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     });
 
     // --- String.toUpperCase(Locale) / toLowerCase(Locale) ---
+    // Share the locale-aware implementation rather than folding with Rust's
+    // root-locale mapping and dropping `args[1]` on the floor (DIV-001).
     r.register(
         s,
         "toUpperCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let val = ctx.read_string(this).unwrap_or_default();
-            let s = ctx.create_string(&val.to_uppercase());
-            Ok(Some(Value::Object(Some(s))))
-        },
+        crate::lang_string::native_string_to_upper_case_uncached,
     );
     r.register(
         s,
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let val = ctx.read_string(this).unwrap_or_default();
-            let s = ctx.create_string(&val.to_lowercase());
-            Ok(Some(Value::Object(Some(s))))
-        },
+        crate::lang_string::native_string_to_lower_case_uncached,
     );
 
     // --- String.getBytes(String charsetName) ---
@@ -8716,8 +8708,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     // RecursiveTask — done+result tracked in `fjp_state` side-table.
     // WP4.3 fix: switched off field-index access (broken in real-JDK mode).
     let rt = "java/util/concurrent/RecursiveTask";
+    // KEEP: genuinely empty, same as the `RecursiveAction` ctor below. The real
+    // `RecursiveTask()` constructor has an empty body, and this model keeps all
+    // task state in the `fjp_state` side table, which starts empty for an
+    // unseen key — so there is nothing to initialise here.
     r.register(rt, "<init>", "()V", |_ctx, _args| {
-        // No field initialization — side-table starts empty for this task.
         Ok(Some(Value::Object(None)))
     });
     // Lazy fork — see ForkJoinTask.fork above for rationale.
@@ -13176,10 +13171,18 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, CIPHER_ALGO)))
         },
     );
-    // getBlockSize() -> int
-    r.register(cipher, "getBlockSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16))) // AES block size
-    });
+    // getBlockSize() -> int: REMOVED, it was a dead duplicate. This copy
+    // answered a hard-coded 16 for every transformation (wrong for the DES
+    // family, and for the stream/asymmetric ciphers whose contract is 0), but
+    // it could never run: `register_synthetic_overrides` calls
+    // `register_phase53_natives` (which calls this one) and then
+    // `jca::cipher::register_cipher_clinit_shim` → `register_cipher_dispatch`,
+    // which re-registers the same class+method+descriptor with a
+    // transformation-aware implementation, and the registry is
+    // last-write-wins. In real-JDK mode this function is not called at all and
+    // only the `jca::cipher` entry exists. Deleted rather than fixed in place
+    // so the two cannot drift apart again; the live one is
+    // `jca/cipher.rs::register_cipher_dispatch`.
     // getOutputSize(int inputLen) -> int
     r.register(cipher, "getOutputSize", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -20184,11 +20187,22 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
     // lookup and is disproportionately expensive under the moving collector.
     // Reuse the String-level implementation, which preserves the unchanged
     // receiver and alternates distinct cached results for changed ASCII input.
+    //
+    // The static signature is `(String this, byte[] value, Locale locale)`, so
+    // the receiver is `args[0]` and the locale `args[2]`; both are forwarded —
+    // passing only `args[..1]` made this (JIT-reachable) path root-locale-only.
     r.register(
         c,
         "toLowerCase",
         "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| native_string_to_lower_case(ctx, &args[..1]),
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let locale = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_string_to_lower_case(ctx, &[this, locale])
+        },
     );
 
     // static char getChar(byte[] val, int index)

@@ -535,14 +535,38 @@ pub(crate) fn native_random_next_gaussian(
 // java.security.SecureRandom natives — OS-CSPRNG-backed
 // ---------------------------------------------------------------------------
 
+/// Shared body of `SecureRandom.<init>()V` and `SecureRandom.<init>([B)V`.
+///
+/// There is no per-instance RNG state to build — every draw pulls fresh
+/// entropy from the OS (see the module header) — but the ctor is NOT
+/// side-effect-free: the JDK's `getDefaultPRNG` records the selected
+/// algorithm on the instance, and `SecureRandom.getAlgorithm()` is plain
+/// bytecode reading that field (no native overrides it — grep `"getAlgorithm"`).
+///
+/// STUB-REMOVAL (wave 3): both ctors used to be pure no-ops, so `algorithm`
+/// stayed null and `getAlgorithm()` handed back null — a caller doing
+/// `sr.getAlgorithm().equals(…)` or logging it got an NPE instead of a name.
+/// Record the same name the `getInstanceStrong()` factory already stamps via
+/// `make_secure_random`, so every construction route agrees.
+fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return;
+    };
+    // `create_string` can move the heap; pin `this` across it.
+    let pin = ctx.pin_native_root(this);
+    let algo = ctx.create_string("OS-CSPRNG");
+    let this = ctx.read_native_pin(pin, this);
+    ctx.set_field_by_name(this, "algorithm", Value::Object(Some(algo)));
+    ctx.unpin_native_roots(pin);
+}
+
 pub(crate) fn native_secure_random_init(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    // No per-instance state — every operation pulls fresh entropy from
-    // the OS.  Per JDK SecureRandom contract, the no-arg ctor selects
-    // a default provider; we always select "OS-CSPRNG", which is the
-    // strongest possible source.
+    // Per the JDK SecureRandom contract the no-arg ctor selects a default
+    // provider; we always select "OS-CSPRNG", the strongest source available.
+    secure_random_record_algorithm(ctx, args);
     Ok(None)
 }
 
@@ -950,13 +974,26 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     // when they ask for cryptographic randomness.
     let sr = "java/security/SecureRandom";
     registry.register(sr, "<init>", "()V", native_secure_random_init);
-    registry.register(sr, "<init>", "([B)V", |_ctx, _args| {
-        // SecureRandom(byte[]) takes a seed.  Per JDK, this is a
-        // "supplemental" seed — the stream itself is still drawn
-        // from the OS CSPRNG.  No-op is spec-compliant; we never
-        // weaken the stream by mixing user bytes in.
-        Ok(None)
-    });
+    // `SecureRandom(byte[] seed)`: the seed argument is DISCARDED, and that is
+    // spec-conformant here rather than merely convenient. The JDK ctor delivers
+    // the argument through `getDefaultPRNG(true, seed)` →
+    // `secureRandomSpi.engineSetSeed(seed)`, and `engineSetSeed` is documented
+    // as SUPPLEMENTING, never replacing, the existing seed ("repeated calls are
+    // guaranteed never to reduce randomness"). This implementation keeps NO
+    // PRNG state for a supplement to fold into: every draw
+    // (`nextBytes`/`nextInt`/`nextLong`/`nextDouble`/`nextFloat`/`nextBoolean`/
+    // `nextGaussian`/`generateSeed`) reads `os_random_bytes`/`os_random_u64`
+    // directly and raises SecurityException on entropy failure rather than
+    // returning zeros. So there is no stream a caller seed could weaken, and
+    // skipping the supplement is exactly what the spec permits. Same reasoning
+    // as `setSeed([B)V` / `native_secure_random_set_seed` below. The ctor is
+    // NOT a no-op though — it records `algorithm` like the no-arg form.
+    //
+    // NOTE for callers porting tests: `new SecureRandom(seed)` is NOT
+    // reproducible here. It is not reproducible on HotSpot either — the JDK
+    // only guarantees replay for `java.util.Random`, which this module
+    // implements exactly (LCG, above).
+    registry.register(sr, "<init>", "([B)V", native_secure_random_init);
     registry.register(sr, "setSeed", "(J)V", native_secure_random_set_seed);
     // KEEP (spec-conformant, not a stub): `SecureRandom.setSeed(byte[])` is
     // documented as SUPPLEMENTING, never replacing, the existing seed. The

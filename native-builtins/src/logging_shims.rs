@@ -2690,41 +2690,47 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
         slf4j_trace_msg,
     );
-    registry.register(log4j_lg, "debug", "(Ljava/lang/String;)V", slf4j_log_msg);
+    // Each level goes through its own threshold-gated emitter (the same ones
+    // the SLF4J `Logger` block above uses), so the `is*Enabled` guards further
+    // down can be answered from that threshold without the guard and the
+    // emitter ever disagreeing.
+    registry.register(log4j_lg, "debug", "(Ljava/lang/String;)V", slf4j_debug_msg);
     registry.register(
         log4j_lg,
         "debug",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_debug_msg,
     );
-    registry.register(log4j_lg, "info", "(Ljava/lang/String;)V", slf4j_log_msg);
+    registry.register(log4j_lg, "info", "(Ljava/lang/String;)V", slf4j_info_msg);
     registry.register(
         log4j_lg,
         "info",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_info_msg,
     );
-    registry.register(log4j_lg, "warn", "(Ljava/lang/String;)V", slf4j_log_msg);
+    registry.register(log4j_lg, "warn", "(Ljava/lang/String;)V", slf4j_warn_msg);
     registry.register(
         log4j_lg,
         "warn",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_warn_msg,
     );
-    registry.register(log4j_lg, "error", "(Ljava/lang/String;)V", slf4j_log_msg);
+    registry.register(log4j_lg, "error", "(Ljava/lang/String;)V", slf4j_error_msg);
     registry.register(
         log4j_lg,
         "error",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        slf4j_log_msg,
+        slf4j_error_msg,
     );
     registry.register(
         log4j_lg,
         "error",
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
-        slf4j_log_msg,
+        slf4j_error_msg,
     );
-    registry.register(log4j_lg, "fatal", "(Ljava/lang/String;)V", slf4j_log_msg);
+    // Log4j FATAL has no SLF4J counterpart; it sits above ERROR, so only
+    // `defaultLogLevel=off` suppresses it — that is what `slf4j_error_msg` does.
+    registry.register(log4j_lg, "fatal", "(Ljava/lang/String;)V", slf4j_error_msg);
     registry.register(log4j_lg, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
@@ -2738,26 +2744,22 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
             0
         })))
     });
-    // Constant `true` here is the CORRECT guard for these emitters, not a
-    // convenience: `debug`/`info`/`warn`/`error` above are all bound to
-    // `slf4j_log_msg`, which applies no threshold and always publishes. A
-    // threshold-derived `false` would tell callers a record would be dropped
-    // that the very next line then prints — precisely the guard/emitter
-    // disagreement this pass exists to remove. (The Log4j `debug` binding is
-    // therefore ungated where the SLF4J `debug` binding is gated; that
-    // asymmetry is deliberate-by-omission and is reported as an open item, but
-    // it must be changed on BOTH sides at once or not at all.)
-    registry.register(log4j_lg, "isDebugEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
+    // Previously constant `true` on the grounds that the emitters applied no
+    // threshold — which made `org.slf4j.simpleLogger.defaultLogLevel` inert for
+    // Log4j callers and forced every framework down its "logging is on" path.
+    // Both sides moved together: the emitters above are now the level-gated
+    // ones, so these guards can read the same threshold and stay truthful.
+    registry.register(log4j_lg, "isDebugEnabled", "()Z", |ctx, _| {
+        slf4j_level_enabled(ctx, SLF4J_DEBUG)
     });
-    registry.register(log4j_lg, "isInfoEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
+    registry.register(log4j_lg, "isInfoEnabled", "()Z", |ctx, _| {
+        slf4j_level_enabled(ctx, SLF4J_INFO)
     });
-    registry.register(log4j_lg, "isWarnEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
+    registry.register(log4j_lg, "isWarnEnabled", "()Z", |ctx, _| {
+        slf4j_level_enabled(ctx, SLF4J_WARN)
     });
-    registry.register(log4j_lg, "isErrorEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(1)))
+    registry.register(log4j_lg, "isErrorEnabled", "()Z", |ctx, _| {
+        slf4j_level_enabled(ctx, SLF4J_ERROR)
     });
 
     // --- Logback (ch.qos.logback) ---
@@ -3105,6 +3107,44 @@ fn slf4j_debug_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(None);
     }
     slf4j_log_msg(ctx, args)
+}
+
+/// `info(...)` behind the same threshold filter as `slf4j_debug_msg`, so the
+/// `isInfoEnabled()` guard above it stays truthful once the level property
+/// raises the threshold (`...defaultLogLevel=warn|error|off`).
+fn slf4j_info_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if slf4j_threshold(ctx) > SLF4J_INFO {
+        return Ok(None);
+    }
+    slf4j_log_msg(ctx, args)
+}
+
+/// `warn(...)` behind the threshold filter; see `slf4j_info_msg`.
+fn slf4j_warn_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if slf4j_threshold(ctx) > SLF4J_WARN {
+        return Ok(None);
+    }
+    slf4j_log_msg(ctx, args)
+}
+
+/// `error(...)` (and Log4j's `fatal(...)`, which has no separate SLF4J level)
+/// behind the threshold filter; only `defaultLogLevel=off` suppresses these.
+fn slf4j_error_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if slf4j_threshold(ctx) > SLF4J_ERROR {
+        return Ok(None);
+    }
+    slf4j_log_msg(ctx, args)
+}
+
+/// `is<Level>Enabled()` for the shim loggers, answered from the one threshold
+/// source the emitters use — a guard can then never disagree with the emitter
+/// it guards.
+fn slf4j_level_enabled(ctx: &mut dyn NativeContext, level: i32) -> MethodCallResult {
+    Ok(Some(Value::Int(if slf4j_threshold(ctx) <= level {
+        1
+    } else {
+        0
+    })))
 }
 
 fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
