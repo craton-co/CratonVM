@@ -5227,13 +5227,24 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "readAttributes",
         "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
         |ctx, args| {
-            // Delegate to the canonical 5-field BasicFileAttributes builder
-            // (creation=0, lastAccess=1, lastMod=2, isDir=3, size=4). The old
-            // inline build used a 4-field layout (size@0, isDir@1, …) which the
-            // BasicFileAttributes.isDirectory() native — reading slot 3 — saw as
-            // the symlink flag (always 0) → every dir looked like a non-dir.
+            #[cfg(windows)]
+            {
+                let requested_type = obj_arg(args, 2)
+                    .ok()
+                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
+                    .unwrap_or_default();
+                if !windows_supports_file_attributes_type(&requested_type) {
+                    return Err(RuntimeError::UnsupportedOperationException {
+                        message: format!(
+                            "File attribute type {requested_type} is not supported on Windows"
+                        ),
+                    }
+                    .into());
+                }
+            }
             let path_obj = obj_arg(args, 1)?;
-            p59_files_read_attributes(ctx, &[Value::Object(Some(path_obj))])
+            let options = args.get(3).copied().unwrap_or(Value::Object(None));
+            p59_files_read_attributes(ctx, &[Value::Object(Some(path_obj)), options])
         },
     );
 
@@ -12393,25 +12404,35 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         ctx.invoke_virtual(inst, "toString", "()Ljava/lang/String;", &[])
     });
 
-    // Files.readAttributes
-    r.register("java/nio/file/Files", "readAttributes",
-        "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
-        p59_files_read_attributes);
-    // Windows has no POSIX attribute view.  The real `Files` bytecode would
-    // otherwise ask the Windows provider for attributes and then checkcast
-    // the returned WindowsFileAttributes to PosixFileAttributes, producing a
-    // VM-only ClassCastException.  Match the JDK contract so callers such as
-    // Spring Boot's ApplicationPid can take their documented fallback.
-    #[cfg(windows)]
+    // The native bridge supplies the concrete attributes object directly, so
+    // it must preserve the provider's requested-type contract itself. In
+    // particular, Windows cannot manufacture a `PosixFileAttributes` object:
+    // returning `WindowsFileAttributes` makes generic callers observe a
+    // successful read (or a later bad cast) instead of the JDK's documented
+    // `UnsupportedOperationException` fallback.
     r.register(
         "java/nio/file/Files",
-        "getPosixFilePermissions",
-        "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/util/Set;",
-        |_ctx, _args| {
-            Err(RuntimeError::UnsupportedOperationException {
-                message: "POSIX file permissions are not supported on Windows".into(),
+        "readAttributes",
+        "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
+        |ctx, args| {
+            #[cfg(windows)]
+            {
+                let requested_type = obj_arg(args, 1)
+                    .ok()
+                    .and_then(|class| crate::lang_class::mirror_class_name(ctx, class))
+                    .unwrap_or_default();
+                if !windows_supports_file_attributes_type(&requested_type) {
+                    return Err(RuntimeError::UnsupportedOperationException {
+                        message: format!(
+                            "File attribute type {requested_type} is not supported on Windows"
+                        ),
+                    }
+                    .into());
+                }
             }
-            .into())
+            let path = args.first().copied().unwrap_or(Value::Object(None));
+            let options = args.get(2).copied().unwrap_or(Value::Object(None));
+            p59_files_read_attributes(ctx, &[path, options])
         },
     );
     r.register(
@@ -12777,6 +12798,17 @@ pub(crate) fn system_time_to_millis(t: std::time::SystemTime) -> i64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Attribute interfaces backed by the Windows attributes object that this VM
+/// can actually construct. Other requested interfaces must fail at the
+/// provider boundary, matching the JDK instead of relying on a caller cast.
+#[cfg(windows)]
+fn windows_supports_file_attributes_type(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/nio/file/attribute/BasicFileAttributes" | "java/nio/file/attribute/DosFileAttributes"
+    )
 }
 
 pub(crate) fn p59_files_read_attributes(

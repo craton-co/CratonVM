@@ -30043,28 +30043,88 @@ pub fn compile_with_param_slots(
         .enumerate()
         .filter(|(_, a)| a.is_some())
         .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // The mask must name the dead locals that are actually *hazardous*, not
+    // every dead local. `osr_enter` declines any entry whose mask is non-zero
+    // (a deliberate 2026-07-04 conservatism: the trampoline's skip-the-load
+    // avoided clobbering the live owner, but the resulting coalesced state
+    // transition was not proven safe -- see
+    // docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
+    // hazard that argument rests on is *sharing*: a dead local whose register
+    // is also some live local's home. A dead local that owns its register
+    // outright has no coalesced state to reconstruct -- nothing reads it before
+    // the loop redefines it -- so flagging it only costs OSR entries.
+    //
+    // The blanket form cost a lot of them. `org/h2/compress/CompressLZF.
+    // compress(Ljava/nio/ByteBuffer;I[BI)I` -- the single hottest method in
+    // H2's `TestFileSystem` `nioMemLZF:` case -- was refused at its main loop
+    // header (`entry_pc=220`, mask `0x201`: `this` and one temporary, neither
+    // sharing a register with anything live) and so never ran compiled at all
+    // (2026-07-27).
+    //
+    // Set CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1 to restore the old
+    // flag-every-dead-local behaviour.
+    let blanket_dead_mask =
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET").is_some();
+    let resident = reg_resident | xmm_resident;
+    // `local <-> home register` lookup, GPR and XMM kept apart: they are
+    // different register files and can never alias each other.
+    let gpr_home = |i: usize| osr_local_assignments.get(i).copied().flatten();
+    let xmm_home = |i: usize| osr_xmm_assignments.get(i).copied().flatten();
     let mut osr_dead_mask = vec![0u64; code_len + 1];
     for &(pc, live_in) in &compiler.osr_block_live_in {
-        if pc < osr_dead_mask.len() {
-            osr_dead_mask[pc] = (reg_resident | xmm_resident) & !live_in;
+        if pc >= osr_dead_mask.len() {
+            continue;
         }
+        let dead = resident & !live_in;
+        if blanket_dead_mask || dead == 0 {
+            osr_dead_mask[pc] = dead;
+            continue;
+        }
+        let live_resident = resident & live_in;
+        let mut hazardous = 0u64;
+        for i in 0..64 {
+            if (dead >> i) & 1 == 0 {
+                continue;
+            }
+            let (dg, dx) = (gpr_home(i), xmm_home(i));
+            for j in 0..64 {
+                if (live_resident >> j) & 1 == 0 {
+                    continue;
+                }
+                let shares = (dg.is_some() && dg == gpr_home(j))
+                    || (dx.is_some() && dx == xmm_home(j));
+                if shares {
+                    hazardous |= 1u64 << i;
+                    break;
+                }
+            }
+        }
+        osr_dead_mask[pc] = hazardous;
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_META").is_some() {
-        let masked: Vec<(usize, u64)> = compiler
-            .osr_block_live_in
-            .iter()
-            .filter_map(|&(pc, live_in)| {
-                let m = (reg_resident | xmm_resident) & !live_in;
-                if m != 0 {
-                    Some((pc, m))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !masked.is_empty() {
+        // Report the mask that is actually published, alongside the blanket
+        // "every dead register-resident local" set it is refined from, so the
+        // two can be compared directly. Printing a separately recomputed
+        // blanket value made this diagnostic silently disagree with the real
+        // metadata once the refinement landed.
+        let mut blanket: Vec<(usize, u64)> = Vec::new();
+        let mut published: Vec<(usize, u64)> = Vec::new();
+        for &(pc, live_in) in &compiler.osr_block_live_in {
+            let b = (reg_resident | xmm_resident) & !live_in;
+            if b != 0 {
+                blanket.push((pc, b));
+            }
+            let p = osr_dead_mask.get(pc).copied().unwrap_or(0);
+            if p != 0 {
+                published.push((pc, p));
+            }
+        }
+        if !blanket.is_empty() || !published.is_empty() {
             eprintln!(
-                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} masked_entries={masked:x?}"
+                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} \
+                 blanket_entries={blanket:x?} published_entries={published:x?} \
+                 unblocked={}",
+                blanket.len() - published.len()
             );
         }
     }

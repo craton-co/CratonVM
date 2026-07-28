@@ -4192,11 +4192,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         use cratonvm_types::ClassLoaderId;
         let cm = self.shared.classes.class_manager.read();
         match cm.get_loader_id(class_id) {
-            Some(ClassLoaderId::Bootstrap) => 0,
-            Some(ClassLoaderId::Extension) => 1,
-            Some(ClassLoaderId::Application) => 2,
-            Some(ClassLoaderId::UserDefined(id)) => id as i32,
-            None => 2, // default to app loader
+            // The canonical encode lives on `ClassLoaderId` next to its two
+            // decoders so the pair cannot drift again — hand-written copies of
+            // this table at the `define_class_*` / `class_id_*_loader` sites
+            // below are exactly what produced the CGLIB `@Configuration`
+            // `UserDefined(2)`-vs-`Application` mistagging.
+            Some(id) => id.to_native_id() as i32,
+            None => ClassLoaderId::Application.to_native_id() as i32,
         }
     }
 
@@ -5537,18 +5539,11 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         loader_id: u32,
     ) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        // See `define_class_full`'s matching fix for why this must be the
-        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
-        // 1=Extension, 2=Application, else=UserDefined) rather than only
-        // special-casing one value -- a loader id round-tripped from
-        // `loader_id_of_class(Application)` (which returns 2) must decode
-        // back to `Application`, not `UserDefined(2)`.
-        let cl_id = match loader_id {
-            0 => ClassLoaderId::Bootstrap,
-            1 => ClassLoaderId::Extension,
-            2 => ClassLoaderId::Application,
-            other => ClassLoaderId::UserDefined(other),
-        };
+        // Inverse of `loader_id_of_class`'s encoding, under the native-API
+        // boundary's default-sentinel convention (`0` == "unspecified, use
+        // the application namespace"). See
+        // `ClassLoaderId::from_native_id_or_default`.
+        let cl_id = ClassLoaderId::from_native_id_or_default(loader_id);
         let mut cm = self.shared.classes.class_manager_write();
         match cm.define_class(name, bytes, cl_id) {
             Ok(cid) => {
@@ -5577,36 +5572,18 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        // See `define_class_full`'s matching fix for why this must be the
-        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
-        // 1=Extension, 2=Application, else=UserDefined) rather than only
-        // special-casing one value -- a loader id round-tripped from
-        // `loader_id_of_class(Application)` (which returns 2) must decode
-        // back to `Application`, not `UserDefined(2)`.
-        let cl_id = match loader_id {
-            0 => ClassLoaderId::Bootstrap,
-            1 => ClassLoaderId::Extension,
-            2 => ClassLoaderId::Application,
-            other => ClassLoaderId::UserDefined(other),
-        };
+        // Same decode as `define_class_full` — see
+        // `ClassLoaderId::from_native_id_or_default`.
+        let cl_id = ClassLoaderId::from_native_id_or_default(loader_id);
         let cm = self.shared.classes.class_manager.read();
         cm.find_class_by_name_in_loader(name, cl_id)
     }
 
     fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        // See `define_class_full`'s matching fix for why this must be the
-        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
-        // 1=Extension, 2=Application, else=UserDefined) rather than only
-        // special-casing one value -- a loader id round-tripped from
-        // `loader_id_of_class(Application)` (which returns 2) must decode
-        // back to `Application`, not `UserDefined(2)`.
-        let cl_id = match loader_id {
-            0 => ClassLoaderId::Bootstrap,
-            1 => ClassLoaderId::Extension,
-            2 => ClassLoaderId::Application,
-            other => ClassLoaderId::UserDefined(other),
-        };
+        // Same decode as `define_class_full` — see
+        // `ClassLoaderId::from_native_id_or_default`.
+        let cl_id = ClassLoaderId::from_native_id_or_default(loader_id);
         let cm = self.shared.classes.class_manager.read();
         cm.class_defined_by_loader_exact(name, cl_id)
     }
@@ -5623,16 +5600,18 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // MethodHandles.Lookup.defineClass, ClassLoader.defineClass1/2).
         use cratonvm_classloading::{CodeSource, DefineClassOptions};
         use cratonvm_types::ClassLoaderId;
-        // Must be the exact inverse of `loader_id_of_class`'s encoding
-        // (Bootstrap=0, Extension=1, Application=2, UserDefined(id)=id).
-        // This used to only special-case `0` (as Application, the
-        // pre-existing default-sentinel convention some callers rely on)
-        // and fell through everything else -- including `2` -- to
-        // `UserDefined(loader_id)`. A caller that round-trips a REAL
-        // loader id via `loader_id_of_class` (e.g. the CGLIB
-        // `@Configuration` enhancer fetching its superclass's own loader
-        // so the generated subclass is defined by the SAME loader) got
-        // `UserDefined(2)` back for the Application loader instead of
+        // Must be the inverse of `loader_id_of_class`'s encoding
+        // (Bootstrap=0, Extension=1, Application=2, UserDefined(id)=id),
+        // modulo the boundary's documented `0` == "unspecified, use the
+        // application namespace" sentinel. Both directions now live on
+        // `ClassLoaderId` (`to_native_id` / `from_native_id_or_default`)
+        // precisely so they cannot drift again: this site used to
+        // special-case only `0` and fall through everything else --
+        // including `2` -- to `UserDefined(loader_id)`. A caller that
+        // round-trips a REAL loader id via `loader_id_of_class` (e.g. the
+        // CGLIB `@Configuration` enhancer fetching its superclass's own
+        // loader so the generated subclass is defined by the SAME loader)
+        // got `UserDefined(2)` back for the Application loader instead of
         // `Application` -- a different `ClassLoaderId` that
         // `same_runtime_package`'s `loader_id` equality check correctly
         // treats as a DIFFERENT runtime package from the superclass's
@@ -5646,12 +5625,7 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // inter-method singleton-sharing (calling one `@Bean` method from
         // another on `this` re-ran the real factory body instead of
         // returning the container's cached instance).
-        let cl_id = match loader_id {
-            0 => ClassLoaderId::Application,
-            1 => ClassLoaderId::Extension,
-            2 => ClassLoaderId::Application,
-            other => ClassLoaderId::UserDefined(other),
-        };
+        let cl_id = ClassLoaderId::from_native_id_or_default(loader_id);
         let code_source =
             if opts.code_source_url.is_none() && opts.code_source_certificates.is_empty() {
                 None
@@ -5731,18 +5705,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
 
     fn list_initiated_class_ids(&self, loader_id: u32) -> Vec<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        // See `define_class_full`'s matching fix for why this must be the
-        // exact inverse of `loader_id_of_class`'s encoding (0=Bootstrap,
-        // 1=Extension, 2=Application, else=UserDefined) rather than only
-        // special-casing one value -- a loader id round-tripped from
-        // `loader_id_of_class(Application)` (which returns 2) must decode
-        // back to `Application`, not `UserDefined(2)`.
-        let cl_id = match loader_id {
-            0 => ClassLoaderId::Bootstrap,
-            1 => ClassLoaderId::Extension,
-            2 => ClassLoaderId::Application,
-            other => ClassLoaderId::UserDefined(other),
-        };
+        // Same decode as `define_class_full`. `0` MUST stay the
+        // application namespace here: the sole caller,
+        // `Instrumentation.getInitiatedClasses` (see
+        // `vm/src/runtime/instrument.rs`), always passes `0` and documents
+        // that it wants the application-loader classes -- decoding it as
+        // `Bootstrap` would hand back the JDK's own classes instead.
+        let cl_id = ClassLoaderId::from_native_id_or_default(loader_id);
         let cm = self.shared.classes.class_manager.read();
         cm.class_store
             .iter()
@@ -5766,7 +5735,11 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
         // Application namespace, so `new Country` resolved the *un-enhanced* copy
         // → `ClassCastException`/`PersistentAttributeInterceptable`. Starting at 3
         // guarantees every allocated namespace is a genuine `UserDefined` id.
-        static NEXT_LOADER_ID: AtomicU32 = AtomicU32::new(3);
+        // The boundary itself is `ClassLoaderId::NATIVE_FIRST_USER_DEFINED`,
+        // which the codec (`to_native_id` / `from_native_id*`) is defined
+        // against — take it from there rather than repeating the literal.
+        static NEXT_LOADER_ID: AtomicU32 =
+            AtomicU32::new(cratonvm_types::ClassLoaderId::NATIVE_FIRST_USER_DEFINED);
         NEXT_LOADER_ID.fetch_add(1, Ordering::Relaxed)
     }
 }
@@ -22359,6 +22332,7 @@ mod tests {
             code_source: None,
             array_info: None,
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            record_object_methods: std::sync::atomic::AtomicU8::new(0),
         });
         cm.register_class_name(ClassLoaderId::Application, class_name, id);
         (id, num_fields)

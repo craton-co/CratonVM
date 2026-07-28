@@ -40,8 +40,8 @@ Confirmed by re-running both affected classes on an unmodified `origin/dev`
 build (`ccf774db3`): **`Base64ProtocolResolverTests` 3/3 and
 `JksSslStoreBundleTests` 14/14 pass, JIT and `--nojit`.** The doc was stale,
 not wrong. `JksSslStoreBundleTests`'s two other failures (the sibling doc
-`core-spring-boot-keystore-provider-name-swallowed-20260723.md`) are green in
-the same runs.
+`core-spring-boot-keystore-provider-name-swallowed-20260723-FIXED.md`, retired
+the same day) are green in the same runs.
 
 ### 2. The residuals — fixed here
 
