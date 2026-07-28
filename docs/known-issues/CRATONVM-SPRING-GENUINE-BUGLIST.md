@@ -2,9 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | OPEN — **9 residual classes** (was 19 at the start of this session, 57 the session before, 127 the one before that). Thirteen VM bugs closed here; every one has a standalone HotSpot-vs-CratonVM probe. |
+| **Status** | OPEN — **3 residual classes**, all AOT (was 9 after the third session, 19 before it, 57 before that, 127 before that). Thirteen VM bugs closed in the third session, seven more in the fourth; every one has a standalone HotSpot-vs-CratonVM probe. |
 | **Captured** | 2026-07-27 (third session), branch `fix/spring-buglist-final-20260727` merged into `origin/dev` at `1f538bf76`, Azure host `20.83.144.174`, real JDK 25, worktree `/data/data/wt-sprbuglist-20260727`, binaries `localbin/cratonvm-sprfinal-v*.bin`. Every number below was measured with the class run **in isolation** (`apps/spring-suite-runner/onea.sh <fqcn>`), not from a sharded batch — the shared host runs at load 25–100 and batch runs emit spurious FAIL/TIMEOUT rows. |
-| **History** | Everything before this session is archived in [`../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md`](../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md). Its conclusions are superseded by the entries below wherever the two disagree. |
+| **Fourth session** | 2026-07-28, branch `fix/spring-nonaot-20260727` merged into `origin/dev`, worktree `/data/data/wt-spr-nonaot-20260727`, binaries `localbin/cratonvm-nonaot-v*.bin`. Took the five non-AOT residuals from LOADERR/0/2/2/6/26-27/165-170 to **fully green**, and turned the sixth (`RequestMappingMessageConversionIntegrationTests`) out to be a heap-sizing artifact rather than a linkage bug. See *Closed in the fourth session* below. |
+| **History** | Everything before the third session is archived in [`../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md`](../internal/fixed-suite-bugs/spring/CRATONVM-SPRING-GENUINE-BUGLIST-history-20260727.md). Its conclusions are superseded by the entries below wherever the two disagree. |
 
 ## Closed this session
 
@@ -148,48 +149,154 @@ the last two bugs slow to find: `CRATONVM_DBG_LINKAGE_BT=1` now also fires at
 `linkage_throwable`), and `CRATONVM_DBG_STUB_BT` also covers
 `ensure_synthetic_class`.
 
-## What is left (9 classes)
+## Closed in the fourth session (2026-07-28)
 
-Verified in isolation against `cratonvm-sprfinal-v15.bin` (branch merged to
-`origin/dev` `1f538bf76`).
+The five non-AOT residuals, plus one that was never a VM bug.
+
+| class | before | after |
+|---|--:|--:|
+| `beans.PropertyDescriptorUtilsPropertyResolutionTests` | LOADERR | **42/42** |
+| `orm.jpa.support.PersistenceInjectionTests` | 26/27 | **27/27** |
+| `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | 0/2 | **2/2** |
+| `web.reactive.result.view.FragmentViewResolutionResultHandlerTests` | 2/6 | **6/6** |
+| `web.reactive.function.client.WebClientIntegrationTests` | 165/170 | **169 + 1 skip, 0 fail** (HotSpot parity) |
+| `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests` | LOADERR | **160/160** at a 6 GB heap — see below |
+
+### The seven fixes
+
+1. **`ForkJoinTask` dispatch invoked `compute()` blind.** The eager-inline
+   Bridge policy tried `compute()Ljava/lang/Object;` and then `compute()V`,
+   which covers exactly `RecursiveTask` and `RecursiveAction` and nothing
+   else. The protocol method every concrete `ForkJoinTask` implements is
+   `exec()Z`, and JUnit Platform's
+   `ForkJoinPoolHierarchicalTestExecutorService$ExclusiveTask` extends
+   `ForkJoinTask` directly — so both invokes raised `NoSuchMethodError`, both
+   were swallowed, and a nested engine in `CONCURRENT` mode executed ZERO
+   tests (*"started ==> expected: 13 but was: 0"*). Pick the entry point from
+   the receiver's runtime class instead of from a failed speculative invoke.
+
+2. **`ConcurrentHashMap` serialised as EMPTY.** CratonVM keeps CHM entries in
+   a segmented native layout, so the real JDK `writeObject` — which walks the
+   always-null `table` — wrote no entries, and `readObject` rebuilt a `table`
+   our natives never read. A two-entry map round-tripped to `size() == 0`
+   (`probes/ChmSerProbe.java`); `HashMap`, `ConcurrentLinkedQueue` and
+   `CopyOnWriteArrayList` were all fine. Spring's
+   `PersistenceAnnotationBeanPostProcessor` tracks extended `EntityManager`s
+   in a CHM, so after a `SimpleMapScope` round-trip there was nothing left to
+   close. Added natives for both hooks that emit/consume the JDK's serial
+   form, plus the `force_native_over_real_jdk_bytecode` entry they need to
+   beat the real bytecode through `ObjectStreamClass`'s reflective
+   `Method.invoke`.
+
+3. **`find_unique_class_by_name` was a full linear scan** of `loaded_classes`
+   with a string compare per entry. A `perf` profile of a Jython module parse
+   put it at **55% of ALL CPU samples** (its `memcmp` another 3.8%). The JIT's
+   own callers memoize their answers, but `try_compile_direct_dispatcher`
+   deliberately does not cache a miss (a not-yet-loaded class can load later),
+   so every unresolvable name paid a fresh whole-map scan. Now backed by an
+   incrementally maintained `name -> {ClassId: refcount}` index; the linear
+   scan survives as the executable spec a new test asserts the index against.
+
+4. **JIT-compiled JDK dynamic-proxy trampolines.** Every `$ProxyN` method is a
+   `super.h.invoke(this, mN, args)` trampoline whose semantics CratonVM
+   implements at DISPATCH, not in that bytecode — a compiled body is a third
+   path that bypasses annotation-member coercion and the `equals` delegation
+   to a foreign proxy that fix #4 of the third session had to add. The symptom
+   was `OutOfMemoryError` after ~100 s of GCs reclaiming almost nothing, at
+   512 MB, 2 GB and 8 GB heaps alike, while `--nojit` ran clean. Package
+   bisection over eight configurations pinned it to `jdk/proxy` exactly:
+   every configuration with it JIT-eligible died, every configuration without
+   it passed — including one with `org/springframework/, org/junit/, java/,
+   org/assertj/, net/bytebuddy/` all compiled. Compiling a trampoline buys no
+   throughput, so it is now skipped unconditionally.
+
+5. **The native `Introspector.getBeanInfo` reported ERASED property types**
+   for anything inherited from a generic supertype. `Person extends
+   BaseEntity<Long>`, whose `getId()` erases to `Number`, answered
+   `propertyType=Number` where HotSpot answers `Long`; and
+   `PersonWithOverriddenGetter` — a `Long getId()` override over the inherited
+   `setId(Number)` — lost its WRITE METHOD outright, because the
+   setter-selection walk seeds from the getter's type and `Number` is not
+   assignable to `Long` (`probes/BridgeProbe.java`, Spring gh-36019). Resolve
+   accessor types against the BEAN class through the JDK's own public
+   `com.sun.beans.TypeResolver`.
+
+6. **...and the resolved type had nowhere to live.** `PropertyDescriptor`'s
+   public `(String, Method, Method)` ctor derives `propertyType` against
+   `getClass0()`, which that ctor leaves null until `setReadMethod` sets it to
+   the READ METHOD'S DECLARING class — `BaseEntity`, not `Person`. HotSpot's
+   `Introspector` never takes that path (it builds descriptors from
+   `com.sun.beans.introspect.PropertyInfo`; JDK 25 dropped the package-private
+   `(Class, String, Method, Method)` ctor that used to be the shortcut), so
+   the resolved type is now stamped on explicitly.
+
+7. **...and it inherited properties into sub-INTERFACES**, which
+   `java.beans.Introspector` does not: `getBeanInfo(GenericService)` reports
+   the `id` property, `getBeanInfo(SubGenericService extends GenericService)`
+   reports nothing. The superinterface walk exists for interface DEFAULT
+   methods reached through an implementing CLASS (jakarta.el's
+   `TestBeanELResolver.testGetDefaultValue`), so it is now gated on the target
+   not being an interface.
+
+Plus one pure-throughput fix that closed two more classes on its own:
+**`JitCache::invalidate_matching` did the full job even when nothing
+matched.** It runs on EVERY class define, and almost no define invalidates a
+CHA assumption — but with an empty match set it still made a whole-cache pass
+computing the transitive reverse closure, walked every compiled method's
+inline-cache slots to retarget them against an empty set, and CLONED all 128
+shard maps only to drop them again. That was ~31% of total CPU on
+`BeanRegistrationsAotContributionTests` (`invalidate_cached_targets` 12.8%,
+`HashMap::clone` 8.0%, `drop_in_place<JitKey>` 5.6%,
+`invalidate_for_class_change` 3.4%). Measured after: `GroovyScriptFactoryTests`
+215 s → 82 s, `AutowiredAnnotationBeanRegistrationAotContributionTests`
+188 s → 54 s, `core.io.ResourceTests` 12 s → 5 s.
+
+**`FragmentViewResolutionResultHandlerTests` was never a correctness bug.**
+Its failures were the cold Jython module parse overrunning the test's own
+60 s `block(...)` deadline: `import string` (which pulls in `re`,
+`sre_compile`, `sre_parse`, `codecs`, …) took **154 s against HotSpot's
+0.275 s** — a 560× gap — and `--nojit` measured 178 s, i.e. the JIT was
+contributing ~14% because only 4 of ~100 `PythonParser` rule methods compile
+(they all carry exception tables). Fix #3 took the class 2/6 → 5/6 and the
+JIT-cache fix took it 5/6 → 6/6. `probes/JythonProbe.java` is the standalone
+measurement.
+
+**One new debug lever: `CRATONVM_DBG_CLINIT_FAIL=1`** names the class AND the
+exception the first time a `<clinit>` parks a class in `InitializationError`.
+Every later use then raises a fresh `NoClassDefFoundError` from
+`ensure_class_initialized_shared`, and that is all `CRATONVM_DBG_LINKAGE_BT`
+can show — it names the consumer, never the original failure. It paid for
+itself immediately on the `ExceptionUtils` mystery below.
+
+## What is left (3 classes)
+
+All three are AOT. Verified in isolation against
+`localbin/cratonvm-nonaot-v12.bin` (branch `fix/spring-nonaot-20260727`,
+merged to `origin/dev`).
 
 | class | state | note |
 |---|---|---|
-| `beans.PropertyDescriptorUtilsPropertyResolutionTests` | LOADERR | `OutOfMemoryError` after ~100s. The Java stack is a repeating cycle — `ClassTemplateTestDescriptor.execute` → `TemplateExecutor.execute` → `TestMethodTestDescriptor.cleanUp` → `invokeTestInstancePreDestroyCallbacks` → `CallbackSupport.invokeAfterCallbacks` → `AutoCloseExtension.preDestroyTestInstance` → `AutoCloseExtension.closeFields` → back to `ClassTemplateTestDescriptor.execute` — which is not a call graph JUnit has: a functional-interface dispatch is landing on the wrong target and looping. Reproduces at 2 GB and 8 GB heap, so it is a genuine allocation blow-up, not host pressure. The class is a JUnit 5 `@ParameterizedClass` + `@FieldSource` with `@Nested` children |
-| `orm.jpa.support.PersistenceInjectionTests` | 26/27 | `publicExtendedPersistenceContextSetterWithSerialization`. NOT plain proxy serialization: a JDK dynamic proxy with a `Serializable` handler round-trips correctly and still dispatches to its handler (`probes/ProxySerProbe.java` matches HotSpot). The gap is narrower — a `SimpleMapScope` destruction callback wrapping an `ExtendedEntityManagerCreator` proxy must survive Java serialization and still invoke `close()` |
-| `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | 0/2 | Both are JUnit-parallel-execution × Spring `ApplicationEvents`. `rejectTestsInParallelWithInstancePerClassAndRecordApplicationEvents` runs a nested `EngineTestKit` engine with `CONCURRENT` mode and expects exactly one FAILED event; CratonVM produces zero, i.e. the guard Spring is supposed to trip never fires — most likely because the nested engine is not actually executing concurrently |
-| `web.reactive.result.view.FragmentViewResolutionResultHandlerTests` | 2/6 | All four failures are the `FluxSubscribeOn` variants; the two non-flux ones pass. `renderFragmentStream` alone: HotSpot passes, CratonVM times out on the 60 s `block(...)`, identically with `--nojit`. Reactor's schedulers themselves are fine (`probes/BoundedElasticProbe.java` — `parallel`/`single`/`boundedElastic` all match HotSpot), so the hang is in the SSE render path executed on the elastic worker, not in the scheduler. **Was 5/6 in the previous session's baseline and was already 2/6 in this session's pre-fix baseline — a regression from `origin/dev` drift, not from these fixes** |
-| `web.reactive.function.client.WebClientIntegrationTests` | 165/170 | Four `VerifySubscriber timed out` across the Reactor-Netty / JDK / Jetty parameterisations. Needs a re-measure on a quiet host before being treated as a VM defect — the host ran at load 25–100 throughout |
 | `test.context.aot.AotIntegrationTests` | 1/4 (1 fail, 2 skipped) | **Not a hang — the 1500 s ceiling was simply too low.** Re-measured at 3600 s: it completes. The array-identity `IllegalArgumentException` that used to end it at ~589 s is gone; what is left is `endToEndTestsForBeanOverrides`, which drives 175 test classes through a forked loader and reports `MultipleFailuresError` with **8** sub-failures — four bare `AssertionFailedError`s and four `BeanCreationException: Could not inject field …MockitoSpyBeanAndSpring…`. That is the same bean-override family the archived history tracks (13 failures at follow-up 10, Family A fixed at follow-up 11), now down to 8. Give it a ceiling above 1500 s or it reports a spurious TIMEOUT |
 | `context.aot.ApplicationContextAotGeneratorTests` | TIMEOUT | measured: no `RESULT` line at a 1500 s ceiling |
-| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | no `RESULT` line at a 1500 s ceiling. The separately tracked ~227×-vs-HotSpot interpreter throughput defect; it SIGSEGV'd under batch load the same day, so treat a crash there as a symptom of that slowness rather than a second bug |
-| `web.reactive.result.method.annotata second bug.
-- `web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`
-  — LOADERR after 948 s: `NoClassDefFoundError:
-  org/junit/platform/commons/util/ExceptionUtils`, a core JUnit-Platform class
-  that is unconditionally on the classpath. The archived history guessed
-  memory pressure; that is now ruled out. Re-run under
-  `CRATONVM_DBG_LINKAGE_BT=1` against `cratonvm-sprfinal-v16.bin` (so it
-  carries every fix above), it reproduces, and the raise site is:
+| `beans.factory.aot.BeanRegistrationsAotContributionTests` | TIMEOUT | no `RESULT` line at ceilings of 2400 s and 3000 s, across three builds (HotSpot: 14/14 in 25.8 s). This is the separately tracked interpreter-throughput defect, not a discrete bug. The JIT-cache fix above removed the one algorithmic hotspot it had — a re-profile is now flat: interpreter execution ~9%, jimage/classpath resource lookup ~9%, allocator ~8%, nothing above 6.3%. It SIGSEGV'd under batch load earlier, so treat a crash there as a symptom of the slowness rather than a second bug |
 
-  ```
-  raise_no_class_def_found            runtime/exceptions.rs:1795
-  ensure_class_initialized_shared     vm/vm_util.rs:499
-  execute_invokestatic                runtime/interpreter.rs:32060
-  ```
-
-  i.e. an ordinary `invokestatic` whose target class fails to INITIALISE —
-  not to be found. So the next question is what `ensure_class_initialized`
-  is unhappy about for a class that is plainly on the classpath (a `<clinit>`
-  that threw and was swallowed into a load failure is the obvious candidate);
-  the raise fires repeatedly through the run, so a breakpoint there catches it
-  immediately.
+`web.reactive.result.method.annotation.RequestMappingMessageConversionIntegrationTests`
+is **off this list**: it passes **160/160** at a 6 GB heap. The long-standing
+`NoClassDefFoundError: org/junit/platform/commons/util/ExceptionUtils` — "a
+core JUnit-Platform class that is unconditionally on the classpath" — was an
+`OutOfMemoryError` inside that class's `<clinit>`, which parked the class in
+`InitializationError` so every later use raised `NoClassDefFoundError` from
+`ensure_class_initialized_shared`. `CRATONVM_DBG_CLINIT_FAIL=1` named it in one
+run. The archived history's guess of memory pressure was right after all; what
+was wrong was ruling it out. The residual question is footprint, not linkage:
+HotSpot runs this class under its default heap and CratonVM needs ~3× the
+runner's 2 GB default.
 
 ## Reproducing
 
 ```bash
-cd /data/data/wt-sprbuglist-20260727/apps/spring-suite-runner
-CRATONVM_BIN=/data/data/wt-sprbuglist-20260727/localbin/cratonvm-sprfinal-v15.bin ./onea.sh <fqcn>
+cd /data/data/spr-nonaot-runner   # a copy of apps/spring-suite-runner
+CRATONVM_BIN=/data/data/wt-spr-nonaot-20260727/localbin/cratonvm-nonaot-v12.bin ./onea.sh <fqcn>
 ```
 
 `onea.sh` runs one class and prints every failure (`KRUN_STACK=1` adds stacks);
