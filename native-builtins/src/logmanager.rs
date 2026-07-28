@@ -1489,6 +1489,19 @@ fn native_jboss_log_context_get_logger(
 /// class is already resolvable, then fall back to a numeric parse — only
 /// throwing the real `IllegalArgumentException` when none of those match,
 /// same as the genuine JDK contract.
+/// `java/util/logging/Level.findLevel(String)` — `parse`'s non-throwing
+/// sibling. Same resolution as `parse`, but an unknown name yields `null`
+/// instead of an `IllegalArgumentException`, which is precisely the contract
+/// `LogManager.getLevelProperty` relies on to fall back to its default.
+fn native_level_find_level(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match native_level_parse(ctx, args) {
+        Ok(v) => Ok(v),
+        // `parse` throws for an unresolvable name (and NPEs on null); the
+        // findLevel contract is to report that as `null`.
+        Err(_) => Ok(Some(Value::Object(None))),
+    }
+}
+
 fn native_level_parse(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.first() {
         Some(Value::Object(Some(s))) => *s,
@@ -3105,6 +3118,29 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             _ => None,
         })
         .unwrap_or_else(|| "INFO".to_string());
+    // Whether the fine-grained levels reach the console is decided by the
+    // logger's CONFIGURED level, not by the level name alone.
+    //
+    // This used to be a flat `"FINE" | "FINER" | "FINEST" => never console`
+    // arm. That silently defeated the whole per-logger level configuration
+    // surface: JULI's `DirectJDKLog` gates on `logger.isLoggable(level)` and
+    // then emits through `logp(...)` — exactly this native — so once a user
+    // set e.g. `org.apache.coyote.http2.level = FINEST` in
+    // `conf/logging.properties`, `isLoggable` correctly returned true (it
+    // consults `jul_ancestor_explicit_level`) and `logp` then threw the
+    // record away anyway. Tomcat produced 268 FINE/FINER lines on HotSpot and
+    // 0 on CratonVM for the same config, which made `FINE`-level diagnosis of
+    // any Tomcat issue impossible.
+    //
+    // Gate on the same effective threshold `native_jul_logger_is_loggable`
+    // uses. With no explicit level configured anywhere on the logger's
+    // ancestry the threshold stays at the JDK root default of INFO, so the
+    // default-quiet console behaviour this arm was written for is unchanged.
+    let level_value =
+        jul_standard_level_value(&level_name).unwrap_or(800);
+    let console_threshold = jul_ancestor_explicit_level(&logger_name).unwrap_or(800);
+    let console_allows_fine = level_value >= console_threshold;
+
     // Map JUL level names to the same compact tags log_simple uses so
     // grep-able output is consistent across the JUL native surface.
     let tag = match level_name.as_str() {
@@ -3112,10 +3148,12 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         "WARNING" => "WARN",
         "INFO" => "INFO",
         "CONFIG" => "INFO",
-        // Keep fine-grained messages off the console, but do publish them to
-        // explicitly installed handlers. Tomcat's LogCapture sets a logger to
-        // FINE specifically to assert a recoverable handshake underflow.
-        "FINE" | "FINER" | "FINEST" => {
+        // Below the configured threshold: keep it off the console, but still
+        // publish to explicitly installed handlers. Tomcat's LogCapture sets a
+        // logger to FINE specifically to assert a recoverable handshake
+        // underflow, and that path must keep working even when the console
+        // stays quiet.
+        "FINE" | "FINER" | "FINEST" if !console_allows_fine => {
             publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
             let this = this_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
             let level_obj = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
@@ -4172,13 +4210,35 @@ fn native_jul_logger_severe(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 fn native_jul_logger_fine(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Keep fine/finer/finest quiet on the console by default (real JUL's
-    // root level is INFO), but honor an ancestor level raised to
-    // DEBUG/FINE-or-finer (e.g. Spring Boot's `LoggingSystem.setLogLevel`)
-    // and explicit JUL handlers (for example Tomcat's LogCapture) must
-    // still receive the record -- see `publish_jul_convenience`'s
-    // `isLoggable` gate.
-    publish_jul_convenience(ctx, args, "FINE")?;
+    jul_logger_fine_family(ctx, args, "FINE")
+}
+fn native_jul_logger_finer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jul_logger_fine_family(ctx, args, "FINER")
+}
+fn native_jul_logger_finest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jul_logger_fine_family(ctx, args, "FINEST")
+}
+
+/// `Logger.fine/finer/finest(String)`.
+///
+/// `finer`/`finest` used to share `fine`'s body and therefore reported
+/// themselves as `FINE`, so a record emitted by `finest()` was published to
+/// handlers at level 500 instead of 300 — a `FINEST`-only handler never saw
+/// it, and a `FINE`-level one saw records it should have filtered out.
+///
+/// Console policy matches `native_jul_logger_logp`: quiet unless the logger's
+/// configured (ancestor-inherited) level admits this level. Handlers are
+/// always offered the record and apply their own `isLoggable` gate.
+fn jul_logger_fine_family(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    level_name: &str,
+) -> MethodCallResult {
+    // `log_simple` applies the ancestor-aware `isLoggable` gate itself, so a
+    // logger with no configured fine level stays console-quiet exactly as
+    // before.
+    log_simple(ctx, args, level_name);
+    publish_jul_convenience(ctx, args, level_name)?;
     Ok(None)
 }
 
@@ -4233,6 +4293,10 @@ fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
     let jul_level_name = match level {
         "WARN" => "WARNING",
         "ERROR" => "SEVERE",
+        // The fine-grained levels must be gated as THEMSELVES, not collapsed
+        // into INFO — otherwise a `finest()` call is level-checked at 800 and
+        // sails through any threshold at or below INFO.
+        "SEVERE" | "WARNING" | "CONFIG" | "FINE" | "FINER" | "FINEST" => level,
         _ => "INFO",
     };
     if let Some(logger) = this {
@@ -4288,7 +4352,70 @@ fn native_jboss_logger_detach(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }))
 }
 
+/// Lazily seed `parsed_log_properties` from the configuration file the
+/// application itself named in `java.util.logging.config.file`.
+///
+/// WHY THIS IS NEEDED. `getProperty` is not only an application-facing API —
+/// the JDK's own logging bytecode calls it. `StreamHandler.configure()` (run
+/// from `new ConsoleHandler()`) does
+/// `setLevel(manager.getLevelProperty(cname + ".level", Level.INFO))`. That
+/// inner lookup lands on THIS native, which consulted a map that only
+/// `readConfiguration(InputStream)` ever populated — so it returned null and
+/// the handler silently fell back to the `Level.INFO` default. Under Tomcat,
+/// whose JULI `ClassLoaderLogManager` reads the file itself and so never calls
+/// `readConfiguration(InputStream)`, that meant a `ConsoleHandler` configured
+/// `= ALL` came up at `INFO` and dropped every FINE/FINER record — the
+/// "`org.apache.coyote.http2.level = FINEST` has no effect" symptom.
+/// (`getProperty` called from *application* code returned the right value all
+/// along, because that dispatches to JULI's own override — which is exactly
+/// what made this so confusing to pin down.)
+///
+/// SCOPE. This only fills the property MAP, from the path the application
+/// explicitly configured. It deliberately does NOT apply the entries
+/// (`apply_jul_config_entries`) — instantiating handler/formatter classes
+/// named by the file is the part worth being conservative about, and under a
+/// real `LogManager` implementation that work is the manager's own job. So the
+/// original "never instantiate from a filesystem config" posture is kept while
+/// the JDK's own property reads start answering correctly.
+fn ensure_config_file_properties_loaded(ctx: &mut dyn NativeContext) {
+    static LOADED: OnceLock<()> = OnceLock::new();
+    if LOADED.get().is_some() {
+        return;
+    }
+    // Only the app-supplied path; no `$java.home/conf/logging.properties`
+    // fallback, so a process that configures nothing keeps today's behaviour
+    // exactly (empty map, CratonVM's own tracing sink governs visibility).
+    //
+    // Do NOT latch `LOADED` when the property isn't visible yet: JUL bootstraps
+    // early and the very first `getProperty` can land before the system
+    // properties are populated. Latching there would cache "no configuration"
+    // forever and silently defeat the whole fix (which is exactly what the
+    // first cut of this function did — `ConsoleHandler` still came up at INFO).
+    let Some(path) = ctx
+        .get_system_property("java.util.logging.config.file")
+        .filter(|p| !p.trim().is_empty())
+    else {
+        return;
+    };
+    // A path exists: this is our one real attempt, success or not.
+    let _ = LOADED.set(());
+    let Ok(bytes) = std::fs::read(path.trim()) else {
+        return;
+    };
+    let entries = crate::properties_sidetable::parse_properties_pub(&bytes);
+    let mut props = parsed_log_properties()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (k, v) in entries {
+        // A value already present came from an explicit
+        // `readConfiguration(InputStream)` call, which is more specific than
+        // the startup file — don't clobber it.
+        props.entry(k).or_insert(v);
+    }
+}
+
 fn native_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    ensure_config_file_properties_loaded(ctx);
     // We never load a filesystem-backed configuration (see
     // `native_read_configuration_no_arg`), but a prior `readConfiguration
     // (InputStream)` call (Spring Boot's `JavaLoggingSystem`) does populate
@@ -4511,6 +4638,29 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "parse",
         "(Ljava/lang/String;)Ljava/util/logging/Level;",
         native_level_parse,
+    );
+    // `Level.findLevel` is `parse`'s non-throwing, package-private sibling —
+    // and it is the one the JDK's OWN logging bytecode uses. `LogManager
+    // .getLevelProperty(name, default)` is literally
+    // `getProperty(name)` -> `Level.findLevel(val.trim())` -> `?: default`,
+    // and `Handler`'s `configure()` (run from `new ConsoleHandler()`) applies
+    // its configured level through exactly that call.
+    //
+    // With `parse` overridden but `findLevel` left to real bytecode, the two
+    // disagreed: the real `findLevel` resolves names through `Level`'s
+    // internal `KnownLevel` registry, which our natively-created `Level`
+    // instances are never entered into, so it returned null and every
+    // `getLevelProperty` silently fell back to its default. Observable as
+    // `java.util.logging.ConsoleHandler.level = ALL` in `conf/logging.properties`
+    // producing a handler at `INFO`, which then dropped every FINE/FINER
+    // record — while `getProperty` and `Level.parse` both returned `ALL`
+    // when called directly, which is what made it look like a level-config
+    // bug rather than a handler-config one.
+    registry.register(
+        CLS_JUL_LEVEL,
+        "findLevel",
+        "(Ljava/lang/String;)Ljava/util/logging/Level;",
+        native_level_find_level,
     );
     // ---------------- java.util.logging.LogManager ----------------
     registry.register(
@@ -5112,13 +5262,13 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         CLS_JUL_LOGGER,
         "finer",
         "(Ljava/lang/String;)V",
-        native_jul_logger_fine,
+        native_jul_logger_finer,
     );
     registry.register(
         CLS_JUL_LOGGER,
         "finest",
         "(Ljava/lang/String;)V",
-        native_jul_logger_fine,
+        native_jul_logger_finest,
     );
     // `logp(Level, sourceClass, sourceMethod, msg)` and the 5-arg
     // variant with a trailing Throwable. JULI's DirectJDKLog routes
