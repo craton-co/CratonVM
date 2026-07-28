@@ -100,8 +100,12 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 // is compiled-to-compiled virtual dispatch could not reproduce during a
 // default-OFF run, because the dispatch it guards was inert. JASPER-JDT.2/.3
 // (`org/eclipse/jdt/internal/compiler/parser/` and `ast/`) were removed on
-// 2026-07-26 on exactly such runs and had to be restored -- see their entry in
-// `skip_list.rs`. Re-verify any similar removal with this ON.
+// 2026-07-26 on exactly such runs and had to be restored on 2026-07-27, when
+// turning this on brought the miscompile straight back. They were only removed
+// for good on 2026-07-28, after the defect behind them was root-caused (the
+// LICM / speculative pre-header bypass fixed in `613b10f4c`) and re-measured
+// with this ON -- see their entry in `skip_list.rs`. Re-verify any similar
+// removal with this ON.
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

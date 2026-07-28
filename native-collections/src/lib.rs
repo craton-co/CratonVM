@@ -22969,18 +22969,44 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         _ => return Ok(None),
     };
     let ois_cls = "java/io/ObjectInputStream";
+    // Pin BEFORE the first GC-capable call: `defaultReadObject` already
+    // replays this map's own serialized fields, so it allocates and can
+    // collect just like the per-entry `readObject`s below.
+    let this_pin = ctx.pin_native_root(this);
+    let ois_pin = ctx.pin_native_root(ois);
+    let mut this = this;
+    let mut ois = ois;
     ctx.invoke(
         ois_cls,
         "defaultReadObject",
         "()V",
         &[Value::Object(Some(ois))],
     )?;
+    ois = ctx.read_native_pin(ois_pin, ois);
     // buckets (ignored — capacity is recomputed from size)
     let _ = ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])?;
+    ois = ctx.read_native_pin(ois_pin, ois);
     let n = match ctx.invoke(ois_cls, "readInt", "()I", &[Value::Object(Some(ois))])? {
         Some(Value::Int(v)) => v,
         _ => 0,
     };
+    ois = ctx.read_native_pin(ois_pin, ois);
+    this = ctx.read_native_pin(this_pin, this);
+    // GC-safety: each `readObject` below replays an arbitrary nested object
+    // graph, so it allocates and can collect. `this` and `ois` were captured
+    // into bare Rust locals at entry and are invisible to the collector's root
+    // scan; a collection that relocates them — the "non-moving" young sweep
+    // still SELECTIVELY PROMOTES survivors into old gen — leaves both locals
+    // addressing reclaimed young memory.
+    //
+    // Both stale locals were observed crashing
+    // `TestGroupChannelSenderConnections`: a stale `ois` is passed as the
+    // receiver of the NEXT `readObject`, and the interpreter's getfield
+    // receiver barrier then faults reading a reclaimed header
+    // (`VmHeap::load_and_forward`); a stale `this` faults in
+    // `native_map_put_evict`'s `object_num_fields`. Pin both across the whole
+    // replay and re-read after every GC-capable call. `key` has to survive the
+    // second `readObject` too, so it is pinned across it.
     for _ in 0..n {
         let key = ctx
             .invoke(
@@ -22990,6 +23016,8 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 &[Value::Object(Some(ois))],
             )?
             .unwrap_or(Value::Object(None));
+        ois = ctx.read_native_pin(ois_pin, ois);
+        let key_pin = pin_value(ctx, key);
         let value = ctx
             .invoke(
                 ois_cls,
@@ -22998,6 +23026,9 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 &[Value::Object(Some(ois))],
             )?
             .unwrap_or(Value::Object(None));
+        ois = ctx.read_native_pin(ois_pin, ois);
+        let key = read_pinned_elem(ctx, key_pin, key);
+        this = ctx.read_native_pin(this_pin, this);
         // evict=false mirrors HotSpot's `HashMap.readObject`, which calls
         // `putVal(hash, key, value, false, false)`: the trailing `evict=false`
         // suppresses `afterNodeInsertion`'s `removeEldestEntry` callback while
@@ -23009,7 +23040,17 @@ fn native_hashmap_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         // `NullPointerException: Cannot invoke
         // "...removeEldestEntry(...)" because "this.this$0" is null`.
         native_map_put_evict(ctx, &[Value::Object(Some(this)), key, value], false)?;
+        // `native_map_put_evict` itself runs bytecode (hashCode/equals on the
+        // key, plus table growth), so refresh the pinned receiver once more
+        // before the next iteration reuses it.
+        this = ctx.read_native_pin(this_pin, this);
+        ois = ctx.read_native_pin(ois_pin, ois);
+        if key_pin != usize::MAX {
+            ctx.unpin_native_roots(key_pin);
+        }
     }
+    ctx.unpin_native_roots(ois_pin);
+    ctx.unpin_native_roots(this_pin);
     Ok(None)
 }
 
