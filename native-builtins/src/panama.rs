@@ -1330,11 +1330,196 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+// --- Scope validity: refuse access through a closed Arena ---
+//
+// `phases_late::foreign_ffm` gives every synthetic `Arena` a *session* object
+// and `Arena.close()` now genuinely closes it and runs its close actions — so
+// the off-heap block a segment points at is really freed. The raw load/store
+// below would then read or write freed memory; HotSpot raises
+// `IllegalStateException` instead, and so must we.
+//
+// The two layouts are `foreign_ffm`'s. They are MIRRORED here rather than
+// shared because those helpers are private to that module, and the one public
+// resolver it does expose (`p67_receiver_session`) mints a fresh — therefore
+// always-open — session when it finds nothing, which would make every check
+// below trivially pass:
+//
+//   Arena   : [0] = open (Int), [1] = session
+//   session : [0] = state (Int; 0 = closed), [1] = acquires, [2] = owner,
+//             [3] = close actions
+//
+// Both are `alloc_concurrent_synthetic` objects, so their class names are
+// exactly the two constants below. Every step of the resolution is gated on
+// those names, which is what makes it self-validating rather than
+// shape-guessing: a miss answers "no resolvable scope" (access proceeds
+// unchanged) and never "closed".
+const PE_ARENA_CLASS: &str = "java/lang/foreign/Arena";
+const PE_SESSION_CLASS: &str = "jdk/internal/foreign/MemorySessionImpl";
+const PE_ARENA_SESSION_FIELD: usize = 1;
+const PE_SESSION_STATE_FIELD: usize = 0;
+const PE_SESSION_SLOTS: usize = 4;
+/// Slot 2 of a synthetic segment names the arena that allocated it — this
+/// file's own convention (see the `// no arena` writes in `ofAddress` and
+/// `asSlice`), which `foreign_ffm`'s 3-field segments adopted as well.
+///
+/// The slot is REUSED by `ofArray` segments to retain the Java backing array
+/// ([`SEG_BACKING_ARRAY_FIELD`]), and on a real-JDK segment it is whatever
+/// field happens to sit at index 2 — hence the class-name gate in
+/// [`pe_arena_session`]: we must never follow a non-Arena object's slots.
+const PE_SEGMENT_ARENA_FIELD: usize = 2;
+
+/// Single-entry positive/negative memo for an exact class-name test.
+///
+/// The test itself is what makes the resolution safe — unlike a field-shape
+/// probe it cannot mistake a primitive array, whose raw slots decode to
+/// arbitrary `Value`s, for an object we modelled — but `class_name_of_id`
+/// takes the class-manager lock and allocates a `String`, and this runs on
+/// every FFM load/store. Class ids are process-stable and each site sees
+/// exactly two shapes (the arena / the `ofArray` backing array), so one
+/// remembered hit id and one remembered miss id keep the steady state at an
+/// integer compare.
+struct PeClassMemo {
+    hit: std::sync::atomic::AtomicU32,
+    miss: std::sync::atomic::AtomicU32,
+}
+
+impl PeClassMemo {
+    /// `u32::MAX` is the "nothing remembered" sentinel; no real class id
+    /// reaches it.
+    const fn new() -> Self {
+        Self {
+            hit: std::sync::atomic::AtomicU32::new(u32::MAX),
+            miss: std::sync::atomic::AtomicU32::new(u32::MAX),
+        }
+    }
+
+    fn matches(&self, ctx: &dyn NativeContext, obj: ObjectRef, expected: &str) -> bool {
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        let class_id = ctx.class_id_of_object(obj);
+        let raw = class_id.as_u32();
+        if raw == self.hit.load(relaxed) {
+            return true;
+        }
+        if raw == self.miss.load(relaxed) {
+            return false;
+        }
+        let matched = ctx.class_name_of_id(class_id).as_deref() == Some(expected);
+        if matched {
+            self.hit.store(raw, relaxed);
+        } else {
+            self.miss.store(raw, relaxed);
+        }
+        matched
+    }
+}
+
+static PE_ARENA_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
+static PE_SESSION_CLASS_MEMO: PeClassMemo = PeClassMemo::new();
+
+/// Whether `session` carries the layout `foreign_ffm` writes. Anything else —
+/// a real JDK `ConfinedSession`/`SharedSession`, or an object that merely
+/// happens to sit in the session slot — is left strictly alone.
+fn pe_session_modelled(ctx: &dyn NativeContext, session: ObjectRef) -> bool {
+    ctx.object_num_fields(session) >= PE_SESSION_SLOTS
+        && PE_SESSION_CLASS_MEMO.matches(ctx, session, PE_SESSION_CLASS)
+        && matches!(ctx.get_field(session, PE_SESSION_STATE_FIELD), Value::Int(_))
+}
+
+/// The session stored on a synthetic `Arena`, if `arena` is one.
+///
+/// Rejects [`register_pe_arena`]'s rival 4-slot arena, whose slot 1 is an
+/// int-array of allocation ids rather than a session: the array fails
+/// [`pe_session_modelled`]'s class-name test, so the arena resolves to `None`
+/// (no scope) instead of to a bogus "closed" session. That shape is the one
+/// that wins under `--synthetic-jdk`, where a false throw here would break
+/// every FFM access.
+fn pe_arena_session(ctx: &dyn NativeContext, arena: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(arena) <= PE_ARENA_SESSION_FIELD
+        || !PE_ARENA_CLASS_MEMO.matches(ctx, arena, PE_ARENA_CLASS)
+    {
+        return None;
+    }
+    match ctx.get_field(arena, PE_ARENA_SESSION_FIELD) {
+        Value::Object(Some(session)) if pe_session_modelled(ctx, session) => Some(session),
+        _ => None,
+    }
+}
+
+/// The session governing `seg`'s lifetime, or `None` when the segment has no
+/// scope we can resolve — `MemorySegment.ofAddress`, `asSlice`, `ofArray`, the
+/// global arena and every segment this file allocates outside an arena. Those
+/// must keep working exactly as before, so an unresolvable scope is NOT an
+/// error.
+///
+/// Allocation-free and safepoint-free by construction (plain field/class
+/// reads only), so no caller has to pin `seg` across the check.
+fn pe_segment_session(ctx: &dyn NativeContext, seg: ObjectRef) -> Option<ObjectRef> {
+    // Fast path: our own slot-2 convention. One field read decides it for the
+    // overwhelmingly common shapes — an arena-allocated segment resolves here,
+    // and an explicit `Object(None)` is the "no arena" marker this file writes,
+    // which needs no further lookup.
+    if ctx.object_num_fields(seg) > PE_SEGMENT_ARENA_FIELD {
+        match ctx.get_field(seg, PE_SEGMENT_ARENA_FIELD) {
+            Value::Object(None) => return None,
+            Value::Object(Some(owner)) => {
+                if let Some(session) = pe_arena_session(ctx, owner) {
+                    return Some(session);
+                }
+                // Tolerate a segment stamped with the session directly.
+                if pe_session_modelled(ctx, owner) {
+                    return Some(owner);
+                }
+                // Not our convention (an `ofArray` backing array, or a real
+                // segment's own reference field) — fall through.
+            }
+            // A primitive there means this is not our layout at all.
+            _ => {}
+        }
+    }
+    // A real-JDK segment carries its session in `AbstractMemorySegmentImpl
+    // .scope`, and that field holds one of OUR sessions because the
+    // `createConfined`/`createShared` factories are force-dispatched into
+    // `foreign_ffm`. A real session we did not build is an honest miss: we
+    // cannot read its state word without guessing its encoding, so we let the
+    // access through rather than throw on a shape we misread.
+    match ctx.get_field_by_name(seg, "scope") {
+        Value::Object(Some(scope)) if pe_session_modelled(ctx, scope) => Some(scope),
+        _ => None,
+    }
+}
+
+/// Raise `IllegalStateException` if `seg`'s scope has already been closed.
+///
+/// This is the single choke point for `get`/`set`/`getAtIndex`/`setAtIndex`:
+/// all four reach [`pe_segment_access_addr`], which calls this before it
+/// computes an address.
+fn pe_segment_check_scope(
+    ctx: &dyn NativeContext,
+    seg: ObjectRef,
+) -> Result<(), MethodCallFailed> {
+    let Some(session) = pe_segment_session(ctx, seg) else {
+        return Ok(());
+    };
+    if matches!(
+        ctx.get_field(session, PE_SESSION_STATE_FIELD),
+        Value::Int(0)
+    ) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "Already closed".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Validate a single-element access (get/set) against the segment's declared
 /// size and compute the target address with checked arithmetic.
 ///
 /// Mirrors the bounds/overflow checks the `copy`/`fill` paths perform, and
 /// throws the same `IllegalStateException` on violation. Rejects:
+///   - access through a scope that has been closed (`arena.close()` really
+///     frees the block, so this is a use-after-FREE guard, not a cosmetic
+///     one) — see [`pe_segment_check_scope`],
 ///   - zero-size segments (a 0-size segment — as produced by `ofAddress`
 ///     before `reinterpret` — is not accessible, matching JDK semantics),
 ///   - negative `offset`,
@@ -1351,6 +1536,10 @@ fn pe_segment_access_addr(
     offset: i64,
     width: i64,
 ) -> Result<usize, MethodCallFailed> {
+    // Liveness before bounds, as HotSpot checks it: a closed scope means the
+    // block is gone, so nothing about its size or address is meaningful.
+    pe_segment_check_scope(ctx, seg)?;
+
     let ptr = crate::panama_libffi::segment_address(ctx, seg);
     let size = crate::panama_libffi::segment_byte_size(ctx, seg);
 

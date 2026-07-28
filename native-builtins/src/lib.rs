@@ -6890,6 +6890,20 @@ fn populate_real_thread_holder(
 
 /// Compatibility wrapper for embedders and tests that explicitly request the
 /// historical all-packs surface.
+/// Allocate the default name for a `Thread` constructed without one.
+///
+/// `Thread()` / `Thread(Runnable)` / `Thread(ThreadGroup, Runnable)` are
+/// specified as `Thread(group, target, "Thread-" + nextThreadNum(), 0)`, and
+/// application code does depend on the distinctness — thread dumps, log MDCs
+/// and `ThreadFactory` wrappers that decorate `t.getName()` all collapse when
+/// every thread is literally called "Thread". Our constructors used to hand
+/// out that one constant string; number them the way the JDK does.
+fn thread_default_name(ctx: &mut dyn NativeContext) -> ObjectRef {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ctx.create_string(&format!("Thread-{n}"))
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     register_essential_natives_with_shims(registry, app_shims::ShimSelection::ALL);
 }
@@ -9823,6 +9837,11 @@ pub fn register_essential_natives_with_shims(
     // initialize. The `_with_this` form documents that we receive a
     // `this` argument and deliberately ignore it. (NEW-6)
     registry.register("java/lang/Object", "<init>", "()V", native_noop_with_this);
+    // `registerNatives()` only binds JNI symbols into a method table HotSpot
+    // builds at class-init time. CratonVM resolves natives through this
+    // registry instead, so there is nothing to bind: a no-op is the correct
+    // implementation, not a stub. (Same for every other `registerNatives`
+    // below.)
     registry.register("java/lang/Object", "registerNatives", "()V", native_noop);
     registry.register(
         "java/lang/Object",
@@ -9879,6 +9898,7 @@ pub fn register_essential_natives_with_shims(
     });
 
     // --- java.lang.System (native methods) ---
+    // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register("java/lang/System", "registerNatives", "()V", native_noop);
     registry.register(
         "java/lang/System",
@@ -10308,18 +10328,40 @@ pub fn register_essential_natives_with_shims(
     // `canUse(connectionString)` returns true. On cratonvm bootstrap runs the
     // connection string can be transiently null/partially materialized, which
     // leaves both built-in providers rejected and `channelProcessorFactory`
-    // null. Force both built-ins to accept the bootstrap connection string.
+    // null.
+    //
+    // That was previously handled by forcing BOTH built-ins to `true`, which
+    // also made them accept each other's scheme — two providers claiming the
+    // same channel, with only registration order deciding. Answer honestly for
+    // a recognised scheme (`pipe://` = legacy, `tcp://` = modern) and keep the
+    // accept-anyway behaviour only for the blank/unrecognised case that the
+    // workaround actually exists for.
+    fn surefire_channel_can_use(
+        ctx: &mut dyn NativeContext,
+        args: &[Value],
+        scheme: &str,
+    ) -> MethodCallResult {
+        // Instance method: args[0] = this, args[1] = the connection string.
+        let config = match args.get(1) {
+            Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let config = config.trim();
+        let recognised = config.starts_with("pipe://") || config.starts_with("tcp://");
+        let accept = !recognised || config.starts_with(scheme);
+        Ok(Some(Value::Int(i32::from(accept))))
+    }
     registry.register(
         "org/apache/maven/surefire/booter/spi/LegacyMasterProcessChannelProcessorFactory",
         "canUse",
         "(Ljava/lang/String;)Z",
-        native_return_true,
+        |ctx, args| surefire_channel_can_use(ctx, args, "pipe://"),
     );
     registry.register(
         "org/apache/maven/surefire/booter/spi/SurefireMasterProcessChannelProcessorFactory",
         "canUse",
         "(Ljava/lang/String;)Z",
-        native_return_true,
+        |ctx, args| surefire_channel_can_use(ctx, args, "tcp://"),
     );
     // Surefire diagnostics: ensure bootstrap throwables become visible even
     // when surefire's dump file plumbing is only partially functional.
@@ -11131,9 +11173,16 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- jdk/internal/util/Preconditions overrides ---
-    // The real <clinit> uses invokedynamic + LambdaMetafactory which we don't
-    // fully support yet. Skip <clinit> and provide native implementations for
-    // the bounds-check methods that JDK String.charAt etc. depend on.
+    // The only state `Preconditions.<clinit>` creates is the set of
+    // `BiFunction` exception formatters, built with invokedynamic +
+    // LambdaMetafactory. EVERY method that reads them
+    // (checkIndex/checkFromToIndex/checkFromIndexSize, both the plain and the
+    // BiFunction-taking overloads) is natively implemented immediately below
+    // and formats its own exception, so the statics are never observed. That
+    // matters because this class is initialized from `String.charAt` at the
+    // very bottom of bootstrap — before `java.lang.invoke` is usable — so
+    // running the real <clinit> there would be a bootstrap-ordering hazard for
+    // no behavioural gain. Suppressing it is therefore spec-neutral here.
     registry.register(
         "jdk/internal/util/Preconditions",
         "<clinit>",
@@ -11542,6 +11591,7 @@ pub fn register_essential_natives_with_shims(
     }
 
     // --- java.lang.Class (native methods) ---
+    // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register("java/lang/Class", "registerNatives", "()V", native_noop);
     registry.register(
         "java/lang/Class",
@@ -12985,6 +13035,7 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- java.lang.Thread (native methods) ---
+    // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
     registry.register(
         "java/lang/Thread",
@@ -13093,30 +13144,13 @@ pub fn register_essential_natives_with_shims(
             Ok(None)
         },
     );
-    registry.register(
-        "java/lang/Thread",
-        "setUncaughtExceptionHandler",
-        "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
-        native_noop_with_this,
-    );
-    registry.register(
-        "java/lang/Thread",
-        "getUncaughtExceptionHandler",
-        "()Ljava/lang/Thread$UncaughtExceptionHandler;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    registry.register(
-        "java/lang/Thread",
-        "setDefaultUncaughtExceptionHandler",
-        "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
-        native_noop,
-    );
-    registry.register(
-        "java/lang/Thread",
-        "getDefaultUncaughtExceptionHandler",
-        "()Ljava/lang/Thread$UncaughtExceptionHandler;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // Thread.{set,get}[Default]UncaughtExceptionHandler — the real
+    // implementation lives in `uncaught_handlers`, which stores the handler in
+    // a GC-rooted side table that `vm_exec.rs::thread_start` consults when a
+    // thread dies with an uncaught exception. It used to be preceded here by
+    // noop/null-returning placeholders for all four methods; because
+    // `register` is last-wins those were pure dead weight (the very next line
+    // overwrote them) while reading as if handlers were silently dropped.
     crate::uncaught_handlers::register_uncaught_handler_natives(registry);
     registry.register(
         "java/lang/Thread",
@@ -13197,7 +13231,7 @@ pub fn register_essential_natives_with_shims(
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let name = Value::Object(Some(ctx.create_string("Thread")));
+        let name = Value::Object(Some(thread_default_name(ctx)));
         if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
             populate_real_thread_holder(ctx, this, Value::Object(None), Value::Object(None), name);
             return Ok(None);
@@ -13216,7 +13250,7 @@ pub fn register_essential_natives_with_shims(
                 _ => return Ok(None),
             };
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
-            let name = Value::Object(Some(ctx.create_string("Thread")));
+            let name = Value::Object(Some(thread_default_name(ctx)));
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 populate_real_thread_holder(ctx, this, Value::Object(None), target, name);
                 return Ok(None);
@@ -13238,7 +13272,7 @@ pub fn register_essential_natives_with_shims(
             };
             let name = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 populate_real_thread_holder(
@@ -13267,7 +13301,7 @@ pub fn register_essential_natives_with_shims(
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 populate_real_thread_holder(ctx, this, Value::Object(None), target, name);
@@ -13290,7 +13324,7 @@ pub fn register_essential_natives_with_shims(
             };
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
-            let name_val = Value::Object(Some(ctx.create_string("Thread")));
+            let name_val = Value::Object(Some(thread_default_name(ctx)));
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 populate_real_thread_holder(ctx, this, group, target, name_val);
                 return Ok(None);
@@ -13314,7 +13348,7 @@ pub fn register_essential_natives_with_shims(
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !is_synthetic_thread_layout(ctx.object_num_fields(this)) {
                 populate_real_thread_holder(ctx, this, group, Value::Object(None), name_val);
@@ -13344,7 +13378,7 @@ pub fn register_essential_natives_with_shims(
                 let name_val = args
                     .get(3)
                     .cloned()
-                    .unwrap_or_else(|| Value::Object(Some(ctx.create_string("Thread"))));
+                    .unwrap_or_else(|| Value::Object(Some(thread_default_name(ctx))));
                 populate_real_thread_holder(ctx, this, group, target, name_val);
                 return Ok(None);
             }
@@ -13353,7 +13387,7 @@ pub fn register_essential_natives_with_shims(
             let name_val = args
                 .get(3)
                 .cloned()
-                .unwrap_or_else(|| Value::Object(Some(ctx.create_string("Thread"))));
+                .unwrap_or_else(|| Value::Object(Some(thread_default_name(ctx))));
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
             ctx.set_field(this, 2, group);
@@ -13375,7 +13409,7 @@ pub fn register_essential_natives_with_shims(
                 let target = args.get(2).cloned().unwrap_or(Value::Object(None));
                 let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
                     Value::Object(Some(s)) => Value::Object(Some(s)),
-                    _ => Value::Object(Some(ctx.create_string("Thread"))),
+                    _ => Value::Object(Some(thread_default_name(ctx))),
                 };
                 populate_real_thread_holder(ctx, this, group, target, name_val);
                 return Ok(None);
@@ -13384,7 +13418,7 @@ pub fn register_essential_natives_with_shims(
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
@@ -13407,7 +13441,7 @@ pub fn register_essential_natives_with_shims(
                 let target = args.get(2).cloned().unwrap_or(Value::Object(None));
                 let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
                     Value::Object(Some(s)) => Value::Object(Some(s)),
-                    _ => Value::Object(Some(ctx.create_string("Thread"))),
+                    _ => Value::Object(Some(thread_default_name(ctx))),
                 };
                 populate_real_thread_holder(ctx, this, group, target, name_val);
                 return Ok(None);
@@ -13416,7 +13450,7 @@ pub fn register_essential_natives_with_shims(
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
@@ -13468,6 +13502,16 @@ pub fn register_essential_natives_with_shims(
     // Thread.run: synthetic-JDK reads slot 3 = target. Real-JDK Thread.run
     // reads `holder.task` from FieldHolder. For real-JDK we resolve the
     // `target` field by name so we invoke the user's Runnable correctly.
+    //
+    // The `?` on the delegating call is load-bearing: it used to be
+    // `let _ = ...`, which discarded `Err(ExceptionThrown)` and returned
+    // `Ok(None)`. Since this shim is force-listed for `Thread.run()V` (see
+    // `runtime/interpreter.rs`) it sits on `super.run()` for EVERY Thread
+    // subclass, so that swallowed every uncaught exception thrown by every
+    // Runnable in the VM: `vm_exec.rs::thread_start`'s `if let Err(e)` guard
+    // never fired, which is why neither the UncaughtExceptionHandler nor even
+    // the default `Exception in thread "..."` stderr report ever ran.
+    // `Thread.run()` catches nothing in HotSpot — propagate.
     registry.register("java/lang/Thread", "run", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -13477,7 +13521,7 @@ pub fn register_essential_natives_with_shims(
         if is_synthetic_thread_layout(num_fields) {
             if num_fields >= 4 {
                 if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
-                    let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                    ctx.invoke_virtual(target, "run", "()V", &[])?;
                 }
             }
         } else {
@@ -13491,7 +13535,7 @@ pub fn register_essential_natives_with_shims(
                 }
             }
             if let Value::Object(Some(target)) = target_val {
-                let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                ctx.invoke_virtual(target, "run", "()V", &[])?;
             }
         }
         Ok(None)
@@ -13996,6 +14040,8 @@ pub fn register_essential_natives_with_shims(
 
     // --- I/O essential natives ---
     registry.register("java/io/File", "<clinit>", "()V", native_file_clinit);
+    // The three `registerNatives` below are JNI symbol binding only — see
+    // java/lang/Object.registerNatives.
     registry.register(
         "java/io/FileInputStream",
         "registerNatives",
@@ -14042,16 +14088,42 @@ pub fn register_essential_natives_with_shims(
         "(I)Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
-    // FileDescriptor.sync0()V — fsync. We rely on the host OS's buffer
-    // cache for write durability; a true fsync would require the VM to
-    // expose `RWFile::sync_all` through `fd_table`, which is not yet
-    // wired. Treating it as a no-op matches what Lucene's
-    // `FSDirectory.sync` needs (a successful return from the FileDescriptor
-    // sync path so the IndexWriter commit completes), and is consistent
-    // with how the synthetic stream natives have always handled `flush`.
-    registry.register("java/io/FileDescriptor", "sync0", "()V", native_noop);
+    // FileDescriptor.sync0()V — fsync. `this` carries the fd id that `open0`
+    // stored in the Windows `handle` long / POSIX `fd` int slot.
+    //
+    // The durability loss a no-op here actually causes is the *userspace*
+    // buffer: our writable fds sit behind a `BufWriter`, so bytes a caller
+    // believes are on disk (Lucene `FSDirectory.sync`, an H2 log commit) may
+    // still be in VM memory. Push those to the OS first, then ask for a real
+    // `sync_all`. `rw_sync` only accepts random-access entries, so the
+    // buffered-stream case stops at the flush — errors are deliberately
+    // swallowed, matching `FileDescriptor.sync`'s contract of throwing only
+    // `SyncFailedException` (which we have no way to raise from a path that
+    // never had a durable handle to begin with).
+    registry.register("java/io/FileDescriptor", "sync0", "()V", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(None);
+        };
+        let fd = match ctx.get_field_by_name(this, "handle") {
+            Value::Long(v) if v > 2 && v < u32::MAX as i64 => Some(v as u32),
+            _ => match ctx.get_field_by_name(this, "fd") {
+                Value::Int(v) if v > 2 => Some(v as u32),
+                _ => None,
+            },
+        };
+        if let Some(fd) = fd {
+            let _ = ctx.fd_table().flush(fd);
+            let _ = ctx.fd_table().rw_sync(fd, false);
+        }
+        Ok(None)
+    });
 
     // --- jdk/internal/misc/VM (needed by IntegerCache, LongCache, etc.) ---
+    // `VM.initialize()` is libjava's one-shot hook for caching the JVM handle
+    // it later makes `JVM_*` calls through. CratonVM dispatches those entry
+    // points from this registry, and the JVM's own bootstrap state machine is
+    // driven separately by `set_init_level` (see `initLevel` right below), so
+    // there is no handle to cache and no state to flip here.
     registry.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);
     // WP1.3: VM.initLevel() and VM.awaitInitLevel(int) track the JVM
     // bootstrap state machine (mirroring HotSpot's `VM::_init_level`):
@@ -14195,6 +14267,12 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- jdk/internal/misc/CDS (needed by IntegerCache, StringUTF16, etc.) ---
+    // Class Data Sharing is an OPTIONAL HotSpot feature, and the JDK's own
+    // callers are written for a JVM that does not have it: with sharing
+    // disabled (`isSharingEnabled()` → false, below) the spec-correct
+    // behaviour of `initializeFromArchive` / `dumpClassList` /
+    // `dumpDynamicArchive` / `logLambdaFormInvoker` is precisely to do
+    // nothing. These are no-ops in HotSpot too whenever no archive is mapped.
     registry.register(
         "jdk/internal/misc/CDS",
         "initializeFromArchive",
@@ -14299,6 +14377,10 @@ pub fn register_essential_natives_with_shims(
         "(I)Ljava/nio/ByteBuffer;",
         lang_system::native_perf_attach0,
     );
+    // Perf.detach(ByteBuffer) releases the mapping that `attach` handed out.
+    // Our `attach`/`create*` return ordinary heap-backed direct ByteBuffers
+    // (lang_system::native_perf_*), not an mmap of a hsperfdata file, so there
+    // is nothing to unmap — the buffer is reclaimed by GC like any other.
     registry.register(
         "jdk/internal/perf/Perf",
         "detach",
@@ -14575,6 +14657,10 @@ pub fn register_essential_natives_with_shims(
         "()[[B",
         native_process_environment_environ,
     );
+    // ProcessImpl.init() is the JNI field-ID cache (the `initIDs` idiom under a
+    // different name): it looks up the jfieldIDs the native process code later
+    // pokes `handle`/`exitcode` through. Our ProcessBuilder/Process surface is
+    // implemented in Rust against named fields, so there are no IDs to cache.
     registry.register("java/lang/ProcessImpl", "init", "()V", native_noop);
     // java/lang/ProcessEnvironment (Windows) — environmentBlock returns the
     // process's env vars as a null-separated string.  Build it from Rust.
@@ -14677,7 +14763,42 @@ pub fn register_essential_natives_with_shims(
         "([Ljava/lang/Object;)Ljava/lang/Object;",
         lang_class::native_constructor_new_instance,
     );
-    registry.register("jdk/internal/misc/ScopedMemoryAccess", "closeScope0", "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V", native_noop);
+    // ScopedMemoryAccess.closeScope0(session, error) is the VM half of
+    // `MemorySessionImpl.justClose()`: HotSpot handshakes every thread to
+    // prove none is inside a scoped access on `session`, then marks the
+    // session closed. We have no scoped-access handshake (there are no
+    // interruptible scoped-access stubs to unwind), but the *marking* half is
+    // reachable and is what callers observe — leaving it undone meant a closed
+    // Arena kept reporting itself alive, so use-after-close went undetected.
+    //
+    // Two session shapes exist: the real-JDK `MemorySessionImpl` with its
+    // `state` int (`CLOSED == -1`), and the one-slot synthetic session built
+    // by `phases_late::foreign_ffm::p67_memory_session` whose slot 0 is an
+    // alive flag (and which `Arena.close` already zeroes). Write whichever is
+    // present; `set_field_by_name` is a no-op for a layout without `state`.
+    // The FFM-side accessors (`isAlive`, `checkValidState`) are owned by
+    // `phases_late/foreign_ffm.rs`.
+    registry.register(
+        "jdk/internal/misc/ScopedMemoryAccess",
+        "closeScope0",
+        "(Ljdk/internal/foreign/MemorySessionImpl;Ljdk/internal/misc/ScopedMemoryAccess$ScopedAccessError;)V",
+        |ctx, args| {
+            // Static native: args[0] is the session, not a receiver.
+            let Some(Value::Object(Some(session))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let class_id = ctx.class_id_of_object(session);
+            if ctx
+                .resolve_field_index_by_class_id(class_id, "state")
+                .is_some()
+            {
+                ctx.set_field_by_name(session, "state", Value::Int(-1));
+            } else if ctx.object_num_fields(session) > 0 {
+                ctx.set_field(session, 0, Value::Int(0));
+            }
+            Ok(None)
+        },
+    );
     let scoped_memory_access = "jdk/internal/misc/ScopedMemoryAccess";
     for name in ["getByte", "getByteInternal"] {
         registry.register(
@@ -15216,7 +15337,15 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/Object;JCZ)V",
         native_unsafe_put_char_mb,
     );
-    // Cache line writeback (no-ops — our VM doesn't have a hardware cache model)
+    // Unsafe.writeback0(addr) flushes one cache line towards persistent
+    // memory. It is only ever reached through `Unsafe.writebackMemory`, which
+    // the JDK gates on `isWritebackEnabled()` — false unless the CPU exposes
+    // CLWB/CLFLUSHOPT *and* the VM supports NVM mappings. CratonVM has no
+    // persistent-memory mapping at all: every "durable" address it hands out
+    // is ordinary heap or an mmap'd file whose durability is the OS page
+    // cache's problem. With nothing to write back, a no-op is the correct
+    // implementation (the surrounding fences are still real — see the two
+    // `native_unsafe_fence` registrations below).
     registry.register(u2, "writeback0", "(J)V", native_noop_with_this);
     registry.register(u2, "writebackPreSync0", "()V", native_unsafe_fence);
     registry.register(u2, "writebackPostSync0", "()V", native_unsafe_fence);
@@ -15247,6 +15376,7 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- java/lang/ClassLoader ---
+    // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register(
         "java/lang/ClassLoader",
         "registerNatives",
@@ -15676,7 +15806,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/ref/Reference",
         "clear0",
         "()V",
-        native_noop_with_this,
+        native_reference_clear0,
     );
     registry.register(
         "java/lang/ref/Reference",
@@ -15725,7 +15855,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/ref/PhantomReference",
         "clear0",
         "()V",
-        native_noop_with_this,
+        native_reference_clear0,
     );
     registry.register(
         "java/lang/ref/PhantomReference",
@@ -15821,6 +15951,7 @@ pub fn register_essential_natives_with_shims(
         "(Ljava/lang/invoke/MemberName;)Ljava/lang/Object;",
         lang_invoke::native_mhn_get_member_vm_info,
     );
+    // JNI symbol binding only — see java/lang/Object.registerNatives above.
     registry.register(mhn, "registerNatives", "()V", native_noop);
 
     // C33: InvokerBytecodeGenerator bypass — register the three entry points
@@ -15935,7 +16066,7 @@ pub fn register_essential_natives_with_shims(
         "java/lang/StackTraceElement",
         "initStackTraceElement",
         "(Ljava/lang/StackTraceElement;Ljava/lang/StackFrameInfo;)V",
-        native_noop_with_this,
+        native_init_stack_trace_element,
     );
     // `initStackTraceElements` MUST populate the array — real-JDK
     // `Throwable.getOurStackTrace()` calls `StackTraceElement.of(backtrace,
@@ -15994,6 +16125,15 @@ pub fn register_essential_natives_with_shims(
     );
 
     // --- jdk/internal/misc/Signal ---
+    // `Signal.raise0(sig)` re-raises a signal so the registered handler chain
+    // runs. There is no chain to run: `findSignal0` above reports every signal
+    // name as 0 and `handle0` returns 0 (= "was SIG_DFL, nothing displaced"),
+    // so no `Signal.Handler` is ever installed and the JDK's own dispatcher
+    // thread has nothing to dequeue. Actually raising the host signal would be
+    // strictly wrong — it would take the default action (terminate) on a
+    // process whose Java-side handler was silently never registered. Left as a
+    // no-op deliberately; implementing it requires a real signal-dispatch
+    // subsystem (findSignal0/handle0 first), not a change here.
     registry.register("jdk/internal/misc/Signal", "raise0", "(I)V", native_noop);
 
     // --- java/util/TimeZone ---
@@ -17405,6 +17545,10 @@ pub fn register_essential_natives_with_shims(
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
     );
+    // The setter's only effect is to flip the flag the getter above reports,
+    // and that getter is pinned to `true` unconditionally (see the rationale
+    // immediately above). With the state it would write already forced, the
+    // setter has nothing left to do.
     registry.register(
         "jdk/internal/misc/VM",
         "setJavaLangInvokeInited",
@@ -19925,6 +20069,9 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     );
 
     // --- java.lang.System ---
+    // JNI symbol binding only — nothing to bind, see the essential-natives
+    // registration of java/lang/Object.registerNatives. Same for the
+    // Class/Thread ones below.
     registry.register("java/lang/System", "registerNatives", "()V", native_noop);
     registry.register(
         "java/lang/System",
@@ -20145,8 +20292,15 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- java.lang.Thread ---
     registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
-    // Thread constructors
-    registry.register("java/lang/Thread", "<init>", "()V", native_noop_with_this);
+    // Thread constructors.
+    //
+    // The no-arg and `(String)` forms used to be registered here as
+    // `native_noop_with_this`, i.e. a Thread whose name/priority slots stayed
+    // null/0. They were already unreachable: the "store name/target into
+    // fields for later start()" block further down this same function
+    // re-registers both descriptors, and `NativeMethodRegistry::register` is
+    // last-registration-wins. Dropped rather than kept as decoy stubs — the
+    // populating versions below are the live implementations.
     registry.register(
         "java/lang/Thread",
         "<init>",
@@ -20162,12 +20316,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             }
             Ok(None)
         },
-    );
-    registry.register(
-        "java/lang/Thread",
-        "<init>",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
     );
     registry.register(
         "java/lang/Thread",
@@ -20191,18 +20339,127 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     );
     registry.register("java/lang/Thread", "sleep", "(J)V", native_thread_sleep);
     registry.register("java/lang/Thread", "isAlive", "()Z", native_thread_is_alive);
-    registry.register("java/lang/Thread", "getPriority", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(5)))
+    // getPriority/setPriority + isDaemon/setDaemon. These used to be a
+    // constant 5, a constant false, and two no-ops, so `setPriority(MAX)`
+    // followed by `getPriority()` disagreed with itself and `setDaemon(true)`
+    // was unobservable.
+    //
+    // Three layouts have to be serviced from one native: the real-JDK Thread
+    // (values live on `holder`, a `Thread$FieldHolder`), a Thread that
+    // declares the field itself, and the synthetic 8-slot Thread whose
+    // priority is slot 1 (written as 5 by every constructor above). The
+    // synthetic layout has no daemon slot at all — see the note in
+    // `setDaemon` below.
+    fn thread_holder(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+        match ctx.get_field_by_name(this, "holder") {
+            Value::Object(Some(holder)) => Some(holder),
+            _ => None,
+        }
+    }
+    // Read an int attribute, preferring `holder.<name>`, then a same-named
+    // field on the Thread itself, then `synthetic_slot` (when the object is
+    // the synthetic shape). Returns `default` when none is present.
+    fn thread_int_attr(
+        ctx: &dyn NativeContext,
+        this: ObjectRef,
+        name: &str,
+        synthetic_slot: Option<usize>,
+        default: i32,
+    ) -> i32 {
+        if let Some(holder) = thread_holder(ctx, this) {
+            if let Value::Int(v) = ctx.get_field_by_name(holder, name) {
+                return v;
+            }
+        }
+        let class_id = ctx.class_id_of_object(this);
+        if ctx
+            .resolve_field_index_by_class_id(class_id, name)
+            .is_some()
+        {
+            if let Value::Int(v) = ctx.get_field_by_name(this, name) {
+                return v;
+            }
+        }
+        if let Some(slot) = synthetic_slot {
+            if ctx.object_num_fields(this) > slot {
+                if let Value::Int(v) = ctx.get_field(this, slot) {
+                    return v;
+                }
+            }
+        }
+        default
+    }
+    // Mirror of `thread_int_attr`. Writes every location that exists, so a
+    // later read finds the value whichever layout the reader assumes.
+    fn set_thread_int_attr(
+        ctx: &dyn NativeContext,
+        this: ObjectRef,
+        name: &str,
+        synthetic_slot: Option<usize>,
+        value: i32,
+    ) {
+        if let Some(holder) = thread_holder(ctx, this) {
+            ctx.set_field_by_name(holder, name, Value::Int(value));
+        }
+        // No-op when the field is absent, so this is safe to call blind.
+        ctx.set_field_by_name(this, name, Value::Int(value));
+        if let Some(slot) = synthetic_slot {
+            if ctx.object_num_fields(this) > slot {
+                ctx.set_field(this, slot, Value::Int(value));
+            }
+        }
+    }
+    registry.register("java/lang/Thread", "getPriority", "()I", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Int(5)));
+        };
+        Ok(Some(Value::Int(thread_int_attr(
+            ctx,
+            this,
+            "priority",
+            Some(1),
+            5,
+        ))))
     });
-    registry.register("java/lang/Thread", "isDaemon", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    registry.register("java/lang/Thread", "setPriority", "(I)V", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(None);
+        };
+        let requested = match args.get(1) {
+            Some(Value::Int(v)) => *v,
+            _ => return Ok(None),
+        };
+        // `Thread.setPriority` rejects out-of-range values with
+        // IllegalArgumentException; we have no bytecode arg-check in front of
+        // this native, so clamp to MIN_PRIORITY..=MAX_PRIORITY rather than
+        // storing a value `getPriority()` could never legally return.
+        set_thread_int_attr(ctx, this, "priority", Some(1), requested.clamp(1, 10));
+        Ok(None)
     });
-    registry.register(
-        "java/lang/Thread",
-        "setDaemon",
-        "(Z)V",
-        native_noop_with_this,
-    );
+    registry.register("java/lang/Thread", "isDaemon", "()Z", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let daemon = thread_int_attr(ctx, this, "daemon", None, 0);
+        Ok(Some(Value::Int(i32::from(daemon != 0))))
+    });
+    registry.register("java/lang/Thread", "setDaemon", "(Z)V", |ctx, args| {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(None);
+        };
+        let on = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+        // NOTE (residual): the synthetic Thread layout
+        // (class_manager.rs: name/priority/tid/target/virtualFlag + the three
+        // JBoss-reflected slots) has no daemon field, and `virtualFlag` is
+        // spoken for. So on a pure synthetic Thread this write lands nowhere
+        // and `isDaemon()` still reports false. That is also what the VM
+        // assumes — `vm_exec.rs::read_thread_daemon_flag` documents "synthetic
+        // Thread without a daemon field" as `None` → treat as non-daemon — so
+        // no join/shutdown decision changes. Giving synthetic Threads a real
+        // daemon slot is a class_manager change, not a native one.
+        set_thread_int_attr(ctx, this, "daemon", None, i32::from(on));
+        Ok(None)
+    });
     // NOTE: do NOT register a `getThreadGroup` shim that returns null.
     // In real-JDK mode the Thread class has a Java implementation
     // (`return holder.group`) and shadowing it with a null-returning
@@ -20233,12 +20490,8 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    registry.register(
-        "java/lang/Thread",
-        "setPriority",
-        "(I)V",
-        native_noop_with_this,
-    );
+    // (`setPriority` is registered with `getPriority` above — a second, no-op
+    // registration used to sit here and, being later, silently won.)
     registry.register(
         "java/lang/Thread",
         "isInterrupted",
@@ -20262,7 +20515,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let name = ctx.create_string("Thread");
+        let name = thread_default_name(ctx);
         ctx.set_field(this, 0, Value::Object(Some(name)));
         ctx.set_field(this, 1, Value::Int(5)); // default priority
         Ok(None)
@@ -20277,7 +20530,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
-            let name = ctx.create_string("Thread");
+            let name = thread_default_name(ctx);
             ctx.set_field(this, 0, Value::Object(Some(name)));
             ctx.set_field(this, 1, Value::Int(5));
             ctx.set_field(this, 3, target);
@@ -20296,7 +20549,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let target = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
@@ -20315,7 +20568,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             };
             let name_val = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
@@ -20333,7 +20586,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             };
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
-            let name = ctx.create_string("Thread");
+            let name = thread_default_name(ctx);
             ctx.set_field(this, 0, Value::Object(Some(name)));
             ctx.set_field(this, 1, Value::Int(5));
             ctx.set_field(this, 2, group);
@@ -20353,7 +20606,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
@@ -20375,7 +20628,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let name_val = args
                 .get(3)
                 .cloned()
-                .unwrap_or_else(|| Value::Object(Some(ctx.create_string("Thread"))));
+                .unwrap_or_else(|| Value::Object(Some(thread_default_name(ctx))));
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
             ctx.set_field(this, 2, group);
@@ -20396,7 +20649,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
@@ -20418,7 +20671,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let target = args.get(2).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(3).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             ctx.set_field(this, 0, name_val);
             ctx.set_field(this, 1, Value::Int(5));
@@ -20439,7 +20692,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let group = args.get(1).cloned().unwrap_or(Value::Object(None));
             let name_val = match args.get(2).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             let prio = match args.get(3) {
                 Some(Value::Int(p)) => *p,
@@ -20464,7 +20717,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             };
             let name_val = match args.get(1).cloned().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             let prio = match args.get(2) {
                 Some(Value::Int(p)) => *p,
@@ -20542,7 +20795,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        let name = Value::Object(Some(ctx.create_string("Thread")));
+        let name = Value::Object(Some(thread_default_name(ctx)));
         if !has_real_jdk_thread_layout(ctx, this) {
             ctx.set_field(this, 0, name);
             ctx.set_field(this, 1, Value::Int(5));
@@ -20562,7 +20815,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             };
             let name = match args.get(1).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
@@ -20589,7 +20842,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             let target = args.get(1).copied().unwrap_or(Value::Object(None));
-            let name = Value::Object(Some(ctx.create_string("Thread")));
+            let name = Value::Object(Some(thread_default_name(ctx)));
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
@@ -20612,7 +20865,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let target = args.get(1).copied().unwrap_or(Value::Object(None));
             let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
@@ -20635,7 +20888,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             };
             let group = args.get(1).copied().unwrap_or(Value::Object(None));
             let target = args.get(2).copied().unwrap_or(Value::Object(None));
-            let name = Value::Object(Some(ctx.create_string("Thread")));
+            let name = Value::Object(Some(thread_default_name(ctx)));
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
@@ -20659,7 +20912,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let group = args.get(1).copied().unwrap_or(Value::Object(None));
             let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
@@ -20684,7 +20937,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let target = args.get(2).copied().unwrap_or(Value::Object(None));
             let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
@@ -20710,7 +20963,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let target = args.get(2).copied().unwrap_or(Value::Object(None));
             let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
@@ -20736,7 +20989,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let target = args.get(2).copied().unwrap_or(Value::Object(None));
             let name = match args.get(3).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
@@ -20761,7 +21014,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let group = args.get(1).copied().unwrap_or(Value::Object(None));
             let name = match args.get(2).copied().unwrap_or(Value::Object(None)) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
-                _ => Value::Object(Some(ctx.create_string("Thread"))),
+                _ => Value::Object(Some(thread_default_name(ctx))),
             };
             let prio = match args.get(3) {
                 Some(Value::Int(p)) => *p,
@@ -20781,6 +21034,9 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     );
     // Thread.run() delegates to the target Runnable stored either in the
     // synthetic slot layout or in real JDK 25's Thread$FieldHolder.task.
+    // Exceptions propagate (`?`, not `let _ =`) so `vm_exec.rs::thread_start`
+    // sees the failure and can run the uncaught-exception path — see the
+    // longer note on the essential-natives registration of this same method.
     registry.register("java/lang/Thread", "run", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -20790,7 +21046,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         if !has_real_jdk_thread_layout(ctx, this) {
             if num_fields >= 4 {
                 if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
-                    let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                    ctx.invoke_virtual(target, "run", "()V", &[])?;
                 }
             }
         } else {
@@ -20801,7 +21057,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 }
             }
             if let Value::Object(Some(target)) = target_val {
-                let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
+                ctx.invoke_virtual(target, "run", "()V", &[])?;
             }
         }
         Ok(None)
@@ -21159,8 +21415,18 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintWriter;",
         native_printwriter_printf,
     );
-    registry.register("java/io/PrintWriter", "flush", "()V", native_noop_with_this);
-    registry.register("java/io/PrintWriter", "close", "()V", native_noop_with_this);
+    registry.register(
+        "java/io/PrintWriter",
+        "flush",
+        "()V",
+        native_printwriter_flush,
+    );
+    registry.register(
+        "java/io/PrintWriter",
+        "close",
+        "()V",
+        native_printwriter_close,
+    );
     registry.register(
         "java/io/PrintWriter",
         "write",
@@ -22039,16 +22305,38 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     register_reflect_proxy_natives(registry);
 
     // --- java.lang.reflect.AccessibleObject ---
-    // setAccessible — instance setter; CratonVM's reflection layer
-    // ignores the accessible flag (all reflection is effectively
-    // `setAccessible(true)` already, matching JEP 403 relaxation).
-    // NEW-6: documented intentional no-op.
+    // setAccessible — instance setter. CratonVM's reflection layer does not
+    // *enforce* the flag (all reflection behaves as `setAccessible(true)`
+    // already, matching the JEP 403 relaxation), but the flag is still
+    // readable: `isAccessible()` is plain bytecode over the `override` field,
+    // and callers do round-trip it (`boolean prev = m.isAccessible();
+    // m.setAccessible(true); …; m.setAccessible(prev);`). Dropping the write
+    // made that read a lie. Store it — same slot the essential-natives
+    // registration for Method/Field/Constructor writes.
     registry.register(
         "java/lang/reflect/AccessibleObject",
         "setAccessible",
         "(Z)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let flag = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            // No-op when the layout has no `override` field, e.g. a synthetic
+            // Field/Method built with positional slots only.
+            ctx.set_field_by_name(this, "override", Value::Int(flag));
+            Ok(None)
+        },
     );
+    // canAccess(obj) — `true` is the consistent answer, not a stub: the JDK
+    // returns true whenever the override flag is set OR the member passes the
+    // module/visibility check, and CratonVM performs no access checks at all
+    // (every reflective member behaves as `setAccessible(true)`, matching the
+    // JEP 403 relaxation this VM adopts). Reporting `false` for anything would
+    // contradict what the very next `Method.invoke` / `Field.get` will do.
     registry.register(
         "java/lang/reflect/AccessibleObject",
         "canAccess",
@@ -24446,6 +24734,112 @@ fn native_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// `native_printwriter_init_outputstream`).  Returns `None` when the sink is a
 /// `BufferedWriter` (the JDK-wrapping chain for `PrintWriter(OutputStream)` →
 /// those still belong to the fd-table path) or when no Writer backing is found.
+/// The sink a `PrintWriter` writes through, whatever kind it is: the real-JDK
+/// `out` field when the layout has one, else the synthetic `field 0 = stream`
+/// slot. Unlike [`printwriter_get_backing_writer`] this does NOT filter to
+/// non-`BufferedWriter` `Writer`s — flush/close must reach an `OutputStream`
+/// or a `BufferedWriter` sink too.
+fn printwriter_sink(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(out)) = ctx.get_field_by_name(this, "out") {
+        return Some(out);
+    }
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(out)) => Some(out),
+        _ => None,
+    }
+}
+
+/// `PrintWriter.flush()` — push buffered output at both layers.
+///
+/// A no-op here loses output outright: a `PrintWriter` over a `StringWriter`
+/// or a file never hands its bytes on, and callers that flush precisely
+/// because they are about to read the sink (test captures, a log file checked
+/// by the harness, `printStackTrace` before an abort) see nothing. Two sinks
+/// have to be pushed because writes can take either route — the Java-side
+/// sink object for `write`/`printf`-through-`out`, and the VM fd for the
+/// print natives that address stdout/stderr through `fd_table` directly.
+fn native_printwriter_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let sink = printwriter_sink(&*ctx, this);
+    let console_fd = stream_fd(ctx, args);
+    if let Some(sink) = sink {
+        let _ = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+    }
+    if let Some(fd) = console_fd {
+        let _ = ctx.fd_table().flush(fd);
+    }
+    Ok(None)
+}
+
+/// Does the wrapper chain hanging off `start` bottom out at `System.out` /
+/// `System.err`? Used by [`native_printwriter_close`] to refuse to close the
+/// process console. Walks the three link fields a print sink can use — the
+/// real-JDK `out`, `OutputStreamWriter`'s `se`, and our synthetic
+/// `field 0 = stream` slot — with a small bound, since these chains are at
+/// most `PrintWriter → BufferedWriter → OutputStreamWriter → StreamEncoder →
+/// PrintStream` deep.
+fn sink_reaches_system_stream(ctx: &dyn NativeContext, start: ObjectRef) -> bool {
+    let out = ctx.get_system_stream("out");
+    let err = ctx.get_system_stream("err");
+    let mut cur = start;
+    for _ in 0..6 {
+        for known in [&out, &err].into_iter().flatten() {
+            if std::ptr::eq(cur.as_ptr(), known.as_ptr()) {
+                return true;
+            }
+        }
+        let next = match ctx.get_field_by_name(cur, "out") {
+            Value::Object(Some(n)) => Some(n),
+            _ => match ctx.get_field_by_name(cur, "se") {
+                Value::Object(Some(n)) => Some(n),
+                _ => match ctx.get_field(cur, 0) {
+                    Value::Object(Some(n)) => Some(n),
+                    _ => None,
+                },
+            },
+        };
+        match next {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    false
+}
+
+/// `PrintWriter.close()` — flush, then close the underlying sink.
+///
+/// Two deliberate departures from the JDK:
+///   * stdout/stderr are never actually closed (same rule as
+///     `native_printstream_close`) — a library closing its `PrintWriter` must
+///     not take the process's console with it.
+///   * `out` is NOT nulled. The JDK uses `out == null` as its closed marker,
+///     but our `print*`/`write` natives read a null `out` as "this is a
+///     console stream" and fall back to the fd table — so nulling it would
+///     redirect a closed writer's output to stdout instead of dropping it.
+///     Closing the sink is what makes further writes fail, which is the
+///     observable part.
+fn native_printwriter_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let sink = printwriter_sink(&*ctx, this);
+    let console_fd = stream_fd(ctx, args);
+    let is_console =
+        console_fd.is_some() || sink.is_some_and(|sink| sink_reaches_system_stream(&*ctx, sink));
+    if let Some(sink) = sink {
+        let _ = ctx.invoke_virtual(sink, "flush", "()V", &[]);
+        if !is_console {
+            let _ = ctx.invoke_virtual(sink, "close", "()V", &[]);
+        }
+    }
+    if let Some(fd) = console_fd {
+        let _ = ctx.fd_table().flush(fd);
+    }
+    Ok(None)
+}
+
 fn printwriter_get_backing_writer(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -25625,6 +26019,118 @@ fn native_classloader_find_loaded_class(
 }
 
 /// Reference.refersTo0 — check if a Reference's referent is the given object.
+/// `Reference.clear0()` (and the `PhantomReference` redeclaration of it) —
+/// the JDK-25 native that `Reference.clear()` delegates to. It must null the
+/// `referent` slot; leaving it set kept a cleared Weak/Soft/Phantom reference
+/// reporting a live referent forever, and — because the GC's reference
+/// processor treats a non-null referent as a discovered edge — kept the
+/// referent itself alive, defeating every explicit `clear()`-based cache
+/// eviction.
+///
+/// Mirror image of `native_reference_refers_to` below, but resolving the slot
+/// the way `reference::ref_init_impl` writes it: real-JDK `Reference` declares
+/// `referent` at an order we must not assume, while the two-slot synthetic
+/// shape keeps it at `REF_FIELD_REFERENT`.
+fn native_reference_clear0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let class_id = ctx.class_id_of_object(this);
+    if ctx
+        .resolve_field_index_by_class_id(class_id, "referent")
+        .is_some()
+    {
+        ctx.set_field_by_name(this, "referent", Value::Object(None));
+    } else if ctx.object_num_fields(this) > REF_FIELD_REFERENT {
+        ctx.set_field(this, REF_FIELD_REFERENT, Value::Object(None));
+    }
+    Ok(None)
+}
+
+/// Read a String-valued field by name, or `None` when the field is absent or
+/// not a String. Helper for [`native_init_stack_trace_element`].
+fn ste_field_string(ctx: &dyn NativeContext, obj: ObjectRef, name: &str) -> Option<String> {
+    match ctx.get_field_by_name(obj, name) {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Same, by slot index — covers the four-slot synthetic `StackTraceElement`
+/// shape, which has no named fields at all.
+fn ste_slot_string(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Option<String> {
+    if ctx.object_num_fields(obj) <= idx {
+        return None;
+    }
+    match ctx.get_field(obj, idx) {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// `StackTraceElement.initStackTraceElement(StackTraceElement, StackFrameInfo)`
+/// — the static native behind `StackFrameInfo.toStackTraceElement()`, i.e.
+/// every `StackWalker`-derived element. It must populate declaringClass /
+/// methodName / fileName / lineNumber on the freshly allocated, all-null
+/// element it is handed; as a no-op the caller got a blank element back and
+/// rendered it as `null.null(Unknown Source)`.
+///
+/// The frame itself only carries class + method + bci, so prefer the fully
+/// populated element `lang_stackwalker::populate_sfi` already cached in the
+/// frame's `ste` slot — that is where the source file and line survive. Fall
+/// back to reading the frame directly (`className`/`name`) for frames built by
+/// some other path.
+fn native_init_stack_trace_element(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Static native: args[0] is the element to fill, args[1] the frame.
+    let Some(Value::Object(Some(ste))) = args.first().copied() else {
+        return Ok(None);
+    };
+    let Some(Value::Object(Some(sfi))) = args.get(1).copied() else {
+        return Ok(None);
+    };
+    let source = match ctx.get_field_by_name(sfi, "ste") {
+        Value::Object(Some(cached)) if cached != ste => cached,
+        _ => sfi,
+    };
+
+    let class_dotted = ste_field_string(&*ctx, source, "declaringClass")
+        .or_else(|| ste_field_string(&*ctx, source, "className"))
+        .or_else(|| ste_slot_string(&*ctx, source, 0));
+    let method = ste_field_string(&*ctx, source, "methodName")
+        .or_else(|| ste_field_string(&*ctx, source, "name"))
+        .or_else(|| ste_slot_string(&*ctx, source, 1));
+    let file = ste_field_string(&*ctx, source, "fileName")
+        .or_else(|| ste_slot_string(&*ctx, source, 2));
+    let line = match ctx.get_field_by_name(source, "lineNumber") {
+        Value::Int(l) => l,
+        _ => match ctx.get_field(source, 3) {
+            Value::Int(l) => l,
+            _ => -1,
+        },
+    };
+
+    // Nothing identifiable on the frame — leave the element as the caller
+    // allocated it rather than writing an empty class name over it.
+    let Some(class_dotted) = class_dotted else {
+        return Ok(None);
+    };
+    let method = method.unwrap_or_default();
+    let class_slashed = class_dotted.replace('.', "/");
+    crate::lang_misc::fill_stack_trace_element(
+        ctx,
+        ste,
+        &class_slashed,
+        &class_dotted,
+        &method,
+        file.as_deref(),
+        line,
+    );
+    Ok(None)
+}
+
 fn native_reference_refers_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0]=this Reference, args[1]=Object to compare
     let this = match args.first() {
@@ -30182,6 +30688,10 @@ fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lib, "initialize", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // `Library.terminate()` tears down the APR pools + tcnative globals that
+    // `initialize()` allocated. We never allocate them — `initialize()` above
+    // just reports success — so there is nothing to tear down, and the JNI
+    // entry point it would call does not exist in this process.
     registry.register(lib, "terminate", "()V", native_noop);
 
     // Tomcat 9.x `OS.<clinit>` calls native `is(int)` for every `IS_*` flag.
@@ -30193,6 +30703,10 @@ fn register_tomcat_jni_natives(registry: &mut NativeMethodRegistry) {
     // fault with `STATUS_ACCESS_VIOLATION` immediately after Spring
     // `ConfigurationClassEnhancer` work (see `applogs/letsgo_windows_access_violation_analysis.txt`).
     let ssl = "org/apache/tomcat/jni/SSL";
+    // `SSL.randSet(path)` points OpenSSL's PRNG at an entropy file. There is
+    // no OpenSSL here (the whole `org/apache/tomcat/jni/SSL` surface is a
+    // shim), and nothing in this process consumes that PRNG, so seeding it is
+    // a no-op rather than a dropped security control.
     registry.register(ssl, "randSet", "(Ljava/lang/String;)V", native_noop);
     registry.register(ssl, "initialize", "(Ljava/lang/String;)I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
@@ -34250,10 +34764,6 @@ fn register_functional_extras_natives(_registry: &mut NativeMethodRegistry) {
     // synthetic-stub removed: java.util.function defaults defer to real JDK bytecode
 }
 
-fn native_noop_return_this(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    Ok(args.first().copied())
-}
-
 fn native_identity_function(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     // Return a proxy that returns its argument (identity)
     // Simplified: return null (callers will handle null identity specially)
@@ -34335,7 +34845,21 @@ fn register_enterprise_natives(registry: &mut NativeMethodRegistry) {
         proc,
         "destroyForcibly",
         "()Ljava/lang/Process;",
-        native_noop_return_this,
+        |ctx, args| {
+            // Same 3-field synthetic Process as `destroy()` above, and the same
+            // "mark it terminated" job — `destroyForcibly` used to only return
+            // `this`, so `exitValue()` afterwards still read slot 0 and reported
+            // the process as a clean exit 0. 137 (128 + SIGKILL) rather than
+            // destroy()'s 143 (128 + SIGTERM): that is the difference the two
+            // methods exist to express, and shell-convention exit codes are what
+            // callers compare against.
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            ctx.set_field(this, 0, Value::Int(137));
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
 
     // Thread enhancements
@@ -34590,18 +35114,19 @@ fn register_java_lang_extras_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/Class;",
         native_classloader_load_class,
     );
-    registry.register(
-        cl,
-        "getParent",
-        "()Ljava/lang/ClassLoader;",
-        native_return_null,
-    );
-    registry.register(
-        cl,
-        "getResource",
-        "(Ljava/lang/String;)Ljava/net/URL;",
-        native_return_null,
-    );
+    // `getParent` / `getResource` used to be registered here as
+    // `native_return_null` — "every loader is the bootstrap loader" and "no
+    // resource exists anywhere". Both were already dead registrations, in BOTH
+    // modes, and removing them changes no behaviour:
+    //   * this registrar is only ever called from `register_synthetic_overrides`
+    //     (its single call site), so it does not exist in real-JDK mode at all;
+    //   * within that same function, and unconditionally, a later
+    //     `classloader::register_classloader_natives(registry)` re-registers
+    //     both triples with the real `cl_get_parent` / `cl_get_resource`
+    //     implementations, and `NativeMethodRegistry::register` is
+    //     last-registration-wins.
+    // They are dropped rather than reimplemented precisely so there is one
+    // implementation of each, not two that can drift.
     registry.register(
         cl,
         "toString",

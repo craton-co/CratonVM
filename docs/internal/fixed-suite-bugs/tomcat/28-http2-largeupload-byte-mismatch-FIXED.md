@@ -147,8 +147,8 @@ baseline (`apps/tomcat/.suite/clsrun/{h2tls-craton-fix,h2tls-hotspot}`):
     rejection. `TestSsl`'s hang was **verified pre-existing**: a control binary
     built without this fix hangs at the identical point,
     `testSimpleSsl[OpenSSL]` (the tomcat-native/APR stub path).
-  * `TestXxxEndpoint` — doc [27](27-xxxendpoint-unix-domain-socket-init-failure.md),
-    `LifecycleException: Protocol handler initialization failed`.
+  * `TestXxxEndpoint` — doc [27](27-xxxendpoint-unix-domain-socket-init-failure-FIXED.md),
+    `LifecycleException: Protocol handler initialization failed` (since FIXED).
   * `TestLargeClientHello` — `NoClassDefFoundError: org/bouncycastle/asn1/…`;
     BouncyCastle missing from the fixture classpath, fails on both VMs.
   * `TestPQC`, `TestOcspEnabled` — FAIL on HotSpot too.

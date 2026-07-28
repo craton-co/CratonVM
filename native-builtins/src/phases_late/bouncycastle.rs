@@ -6701,6 +6701,15 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
         "org/bouncycastle/crypto/engines/AESLightEngine",
         "org/bouncycastle/crypto/engines/AESFastEngine",
     ] {
+        // Verified trivial constructor. BouncyCastle's block ciphers carry all
+        // their state in fields that `init(boolean, CipherParameters)` writes —
+        // here `bc_aes_native_init` (registered a few lines below for this same
+        // class) sets `ROUNDS`, `WorkingKey`, `forEncryption` and `s`. The
+        // no-arg constructor itself declares no field initializers and only
+        // chains to `Object.<init>`, and `bc_aes_native_process_block` refuses
+        // to run on an object whose `WorkingKey` is still unset
+        // ("AES engine not initialised"), so the real initialiser is provably
+        // on the use path and an empty constructor body loses nothing. KEEP.
         r.register(aes_impl, "<init>", "()V", native_noop);
         r.register(aes_impl, "encryptBlock", desc, bc_aes_native_encrypt_block);
         r.register(aes_impl, "decryptBlock", desc, bc_aes_native_decrypt_block);
