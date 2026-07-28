@@ -684,27 +684,66 @@ fn should_skip_jit_internal(
     // javac emits no deprecation warning at all when
     // `s.outermostClass() == other.outermostClass()`.
     //
-    // Narrowed with `AnnotationEffectProbe2`/`AnnotationEffectProbe3` (extra
-    // oracles run in the same process the moment suppression flips):
-    // annotation ATTRIBUTION stays intact -- `@FunctionalInterface` on a
-    // two-abstract-method interface, `@Override` on a non-overriding method
-    // and `@SafeVarargs` on a non-varargs method all still report their
-    // errors -- and the loss is not deprecation-specific, since
-    // `@SuppressWarnings("rawtypes")` fails the same way. So this is
-    // annotation-derived `Lint` being consulted too early, not attribution
-    // stopping. Sharpest unexplained lead: the one oracle that still
-    // suppresses correctly differs only in NOT passing `-Werror`, and that
-    // is not an ordering artifact (3/3 runs, and re-running the whole
-    // oracle set in reverse order inside the same process reproduces it
-    // exactly). Remaining suspect for whoever picks this up: this method's
-    // own compiled tail, which brackets its work in
-    // `Annotate.blockAnnotations()`/`unblockAnnotationsNoFlush()` inside a
-    // catch-all `finally` and then ends with
-    // `if (!reader.filling) annotate.flush();` -- delaying that flush past
-    // the point where javac replays deferred lint gives exactly this
-    // signature. Also worth knowing before theorising: this method IS
-    // JIT-compiled despite carrying a non-empty exception table (measured
-    // with `CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are
+    // ROOT-CAUSED 2026-07-28. Symptom (a) is not an arithmetic or lowering
+    // defect in this method at all -- it is a JIT-compiled `finally` that
+    // never runs. `[PUTFIELD-WATCH]` on `Annotate.blockCount`
+    // (`CRATONVM_DBG_FIELD_WATCH=Annotate.blockCount`) shows the healthy
+    // compilations pairing `blockAnnotations()` (counter++) with
+    // `unblockAnnotationsNoFlush()` (counter--) and returning to 0, and the
+    // first failing compilation running five `blockAnnotations()` with no
+    // matching unblock, ending at 4. `complete` brackets its body in
+    // `try { annotate.blockAnnotations(); ... } finally {
+    // annotate.unblockAnnotationsNoFlush(); dependencies.pop(); }`, so a
+    // skipped `finally` leaves annotations blocked and `Annotate.flush()` a
+    // no-op for the rest of that compilation -- and javac throws
+    // `CompletionFailure` through `complete` constantly while resolving
+    // cross-compilation-unit references, which is exactly why the standalone
+    // reproducer needs the deprecated type in a separate `.class` file.
+    //
+    // Reduced to a 3-second, javac-free witness --
+    // `try { n++; thrower(); } finally { n--; }` in a loop where `thrower`
+    // throws every 7th call leaks one count per throw under JIT and zero
+    // under `--nojit` / HotSpot (`FinallyBalanceProbe`, `FinallyShapeProbe`,
+    // `FinallyThrowSiteProbe`, `CallPathProbe`, all committed at
+    // docs/known-issues/repros/jitban-remaining-20260726/). Only a catch-all
+    // (`catch_type == 0`) leaks; typed `catch`, `catch (Throwable)` and
+    // catch-and-rethrow are unaffected, because a catch-all has nothing but
+    // the pc range to match on.
+    //
+    // Three independent escape routes were found. TWO ARE FIXED (2026-07-28,
+    // this commit):
+    //
+    //   1. Foreign throw pc. `JitSignals::athrow_bci` was left holding the
+    //      bci that the CALLEE's compiled `athrow` lowering stashed, and the
+    //      interpreter range-checked that foreign pc against THIS method's
+    //      exception table. Fixed by stamping the invoke's own bci in the
+    //      post-invoke exception-check stub (`JitRuntimeHelpers::set_throw_bci`,
+    //      `emit_exception_check_stub` now emits one pad per distinct bci).
+    //   2. Whole-method re-execution. When a compiled caller invoked a
+    //      compiled callee that threw, `route_implicit_exc_through_callee`
+    //      answered by re-running the callee from its entry -- duplicating
+    //      every side effect the compiled attempt had already performed
+    //      before the throw. Fixed by resuming the callee AT its handler
+    //      instead (`interpreter::run_jit_callee_handler`).
+    //
+    // The THIRD is still open and is why this ban stays: a compiled method
+    // reached through LAMBDA / method-reference dispatch
+    // (`try_lambda_dispatch` -> `invoke_shared` / `invoke_on_class_shared*`,
+    // not the invoke-cache `CachedInvokeTarget::Jit` path) escapes without
+    // any drain consulting its exception table -- no
+    // `route_jit_signal_exception` and no `route_implicit_exc_through_callee`
+    // fires for it. `CallPathProbe` isolates this precisely: with both fixes
+    // in place `STATIC-direct`, `IFACE-class-inline` and
+    // `IFACE-class-delegating` are clean while `LAMBDA-methodref` and
+    // `LAMBDA-body` still leak. `ClassFinder`'s completer is
+    // `Completer thisCompleter = this::complete;` -- a method reference --
+    // so javac takes exactly that route, and the ban is still load-bearing:
+    // AutowiredAnnotationBeanRegistrationAotContributionTests is 9/14 with it
+    // lifted and 14/14 with it active.
+    //
+    // Also measured, contradicting a common assumption: this method IS
+    // JIT-compiled despite carrying a non-empty exception table
+    // (`CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are
     // never admitted" rule of thumb does not apply here.
     if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
         return Some(SkipReason::ClassFinderComplete);
@@ -3448,7 +3487,15 @@ mod tests {
     }
 
     #[test]
-    fn elasticsearch_vector_diskbbq_hang_cluster_stays_interpreted_by_default() {
+    fn elasticsearch_vector_diskbbq_cluster_jit_eligible_after_es_fragile_cluster_1_lift() {
+        // ES-FRAGILE-CLUSTER.1 (the blanket `org/elasticsearch/` ban) was
+        // removed 2026-07-27 -- see its removal comment above
+        // `should_skip_jit_internal` for the re-verification evidence. This
+        // test previously asserted the opposite (that these classes stay
+        // interpreted) and was left behind by that removal, failing on `dev`
+        // ever since; it is now the post-lift regression witness, matching
+        // `hamcrest_matchers_are_jit_eligible_after_es_hamcrest_1_removal`
+        // and `rxjava3_package_jit_eligible_after_kc26_rx1_lift`.
         for class_name in [
             "org/elasticsearch/index/codec/vectors/diskbbq/DocIdsWriterTests",
             "org/elasticsearch/index/codec/vectors/diskbbq/ES920DiskBBQVectorsFormatTests",
@@ -3458,34 +3505,13 @@ mod tests {
             "org/elasticsearch/index/codec/vectors/es93/ES93HnswBitVectorsFormatTests",
             "org/elasticsearch/search/vectors/IVFKnnFloatSlicedVectorQueryTests",
         ] {
-            assert_eq!(
-                check(
-                    class_name,
-                    "testBody",
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                ),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name} must stay interpreted under the conservative policy"
-            );
-            assert_eq!(
-                check(class_name, "testBody", false, true, SkipPolicy::Aggressive),
-                None,
-                "aggressive policy must still lift {class_name} for bisection"
-            );
-            assert_eq!(
-                check_with(
-                    class_name,
-                    "testBody",
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                    &["org/elasticsearch/"],
-                ),
-                None,
-                "CRATONVM_JIT_ALLOW_PACKAGES=org/elasticsearch/ must lift {class_name}"
-            );
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, "testBody", false, true, policy),
+                    None,
+                    "{class_name} must be JIT-eligible now that ES-FRAGILE-CLUSTER.1 is removed"
+                );
+            }
         }
 
         assert_eq!(
@@ -3497,9 +3523,7 @@ mod tests {
                 SkipPolicy::Conservative,
             ),
             None,
-            "Lucene is JIT-admitted at the skip-list level since 117d2d906 \
-             retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED \
-             methods are gated in the interpreter, not here)"
+            "Lucene is JIT-admitted at the skip-list level since 117d2d906              retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED              methods are gated in the interpreter, not here)"
         );
     }
 
