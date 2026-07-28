@@ -948,6 +948,18 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
         Ok(None)
     });
     registry.register(sr, "setSeed", "(J)V", native_secure_random_set_seed);
+    // KEEP (spec-conformant, not a stub): `SecureRandom.setSeed(byte[])` is
+    // documented as SUPPLEMENTING, never replacing, the existing seed. The
+    // stream here comes from the OS CSPRNG on every draw
+    // (`native_secure_random_next_bytes`), so there is no PRNG state a caller
+    // seed could usefully be folded into — and mixing caller-controlled bytes
+    // in could only ever weaken it. Skipping the supplement is exactly what
+    // the spec permits; see `native_secure_random_set_seed` (the `(J)V`
+    // overload) for the same reasoning. Verified while auditing this file:
+    // every draw path (`nextBytes`/`nextInt`/`nextLong`/`generateSeed`) calls
+    // `os_random_bytes`/`os_random_u64` and raises `SecurityException` on
+    // entropy failure rather than returning zeros, so nothing in this module
+    // is constant-valued.
     registry.register(sr, "setSeed", "([B)V", |_ctx, _args| Ok(None));
     registry.register(sr, "nextInt", "()I", native_secure_random_next_int);
     registry.register(sr, "nextInt", "(I)I", native_secure_random_next_int_bound);

@@ -179,7 +179,7 @@ the file, then `expected`, then released the lock. That points at compiled
 `org/h2` code reordering across `AtomicIntegerArray.set`/`compareAndSet`, and it
 is the thing to root-cause before lifting this ban is worth attempting again.
 
-## The flip's own fallout: two Eclipse JDT bans had to be RESTORED
+## The flip's own fallout: two Eclipse JDT bans had to be RESTORED (since fixed)
 
 Turning the dispatch flag on regressed one Tomcat class:
 `jakarta.el.TestOptionalELResolverInJsp` went PASS -> FAIL, reproducibly (3/3
@@ -207,51 +207,24 @@ reproduced the defect whatever its state. Same shadowing shape this module
 already annotates for other removed bans, just hidden behind a flag instead of
 behind another rule.
 
-Both are restored. `parser/` is directly re-confirmed by the bisection above;
-`ast/` is restored on the shadowing argument alone — its own repro
-(`TestFormAuthenticatorA`) has not been re-run under the flag, and leaving it
-out would assert something no measurement supports. With both back,
-`TestOptionalELResolverInJsp` is 3/3 PASS with the flag on.
+Both were restored on 2026-07-27. `parser/` is directly re-confirmed by the
+bisection above; `ast/` was restored on the shadowing argument alone.
 
-**The rule this leaves behind:** any ban whose mechanism is compiled-to-compiled
-virtual dispatch must be re-verified with
-`CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` **on**, or it verifies
-nothing. That flag was default-OFF for the entire period in which the
-2026-07-25/26 ban sweep did its removals.
-
-## The flip's own fallout: two Eclipse JDT bans had to be RESTORED
-
-Turning the dispatch flag on regressed one Tomcat class:
-`jakarta.el.TestOptionalELResolverInJsp` went PASS -> FAIL, reproducibly (3/3
-with the flag on, 3/3 PASS with it off, same binary, run in isolation). Its JSP
-compile dies inside the Eclipse JDT compiler with
-
-```
-ClassCastException: org.eclipse.jdt.internal.compiler.ast.QualifiedTypeReference
-  cannot be cast to org.eclipse.jdt.internal.compiler.ast.FieldDeclaration
-  -> JasperException: Unable to compile class for JSP  -> HTTP 500
-```
-
-`CRATONVM_JIT_DENY` bisection puts it in
-`org/eclipse/jdt/internal/compiler/parser/` — denying that one package restores
-PASS, while denying `ast/`, `lookup/` or `util/` does not.
-
-That package is **JASPER-JDT.2**, and it was REMOVED on 2026-07-26 as "no longer
-reproduces on current dev", along with its sibling JASPER-JDT.3 (`ast/`). Both
-removals were careful — four repeat runs each, real Tomcat fixtures — and both
-are void, because every one of those runs was made while the virtual
-direct-entry path was default-OFF. With that flag off a compiled caller never
-reaches a compiled callee at all, so the compiled-to-compiled dispatch these
-bans guard was *inert during the verification*: those runs could not have
-reproduced the defect whatever its state. Same shadowing shape this module
-already annotates for other removed bans, just hidden behind a flag instead of
-behind another rule.
-
-Both are restored. `parser/` is directly re-confirmed by the bisection above;
-`ast/` is restored on the shadowing argument alone — its own repro
-(`TestFormAuthenticatorA`) has not been re-run under the flag, and leaving it
-out would assert something no measurement supports. With both back,
-`TestOptionalELResolverInJsp` is 3/3 PASS with the flag on.
+**UPDATE 2026-07-28 — both bans are now REMOVED again, and this time the defect
+is root-caused rather than assumed stale.** Bisected across the 150 commits from
+the restore point to `dev` (two runs per step, both packages allowed, direct-entry
+path ON) to `613b10f4c`, "fix(jit): LICM/speculative pre-header bypassed by a
+branch into the loop header", and confirmed causally on a single current-`dev`
+binary carrying an env-gated revert of that guard — pre-fix behaviour 2/2 FAIL
+with the identical `ClassCastException`, shipping behaviour 2/2 PASS. So the
+`CRATONVM_JIT_DENY=org/eclipse/jdt/internal/compiler/parser/` bisection recorded
+above was pointing at the *victim* package, not at a JDT-specific defect: the
+bypassed pre-header is a general x64 backend bug that ECJ's `Parser`/AST code
+happens to hit hard. Re-verified with the bans deleted:
+`TestOptionalELResolverInJsp` 3/3, `TestFormAuthenticatorA/B/C` 2/2 each,
+`TestCompiler` 2/2, 167 parser + 29 ast methods compiling per run. Full evidence
+in the retired `jasper-jdt-2-3-fixed-licm-preheader-20260728` write-up. None of
+this changes the H2 verdicts on this page.
 
 **The rule this leaves behind:** any ban whose mechanism is compiled-to-compiled
 virtual dispatch must be re-verified with
@@ -311,8 +284,9 @@ re-runs.
 
 ## Related
 
-- `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment and the restored
-  `JASPER-JDT.2`/`.3` entries.
+- `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment and the
+  `JASPER-JDT.2`/`.3` removal comment (restored 2026-07-27, removed again
+  2026-07-28 once root-caused).
 - `vm/src/jit/helpers.rs` — `direct_virtual_compiled_callee_entry_enabled`.
 - `docs/known-issues/jit-bans/jit-ban-sweep-consolidated-status-20260726.md` — the sweep this came out of.
 - `docs/known-issues/jit-bans/full-ban-inventory-status-20260726.md` — the cross-session ban tracker.

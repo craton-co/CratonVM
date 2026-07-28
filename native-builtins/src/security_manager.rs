@@ -283,11 +283,46 @@ pub fn set_active_policy(policy: Option<Policy>) {
     *g = policy;
 }
 
+/// The path [`load_policy_file`] most recently loaded from, so
+/// `java.security.Policy.refresh()` can genuinely re-read it. `None` when no
+/// policy file was ever loaded (the allow-all default), in which case there is
+/// nothing to reload.
+static ACTIVE_POLICY_PATH: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
+
 /// Load and install the policy from a file path.
 pub fn load_policy_file<P: AsRef<Path>>(path: P) -> Result<(), PolicyError> {
-    let policy = Policy::from_file(path)?;
+    let path = path.as_ref().to_path_buf();
+    let policy = Policy::from_file(&path)?;
     set_active_policy(Some(policy));
+    {
+        let mut slot = ACTIVE_POLICY_PATH
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *slot = Some(path);
+    }
     Ok(())
+}
+
+/// Re-read and reinstall the policy from the file [`load_policy_file`] last
+/// used. Returns `false` when no policy file is configured (nothing to
+/// refresh) and leaves the active policy untouched if the re-read fails — the
+/// JDK's `Policy.refresh()` likewise keeps the previous configuration when a
+/// reload cannot be completed rather than falling open.
+pub fn refresh_active_policy() -> bool {
+    let path = ACTIVE_POLICY_PATH
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(path) = path else {
+        return false;
+    };
+    match Policy::from_file(&path) {
+        Ok(policy) => {
+            set_active_policy(Some(policy));
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Query: is the given (permission_class, target, actions) granted under the
@@ -1322,13 +1357,26 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // refresh()V — no-op: cratonvm has no Policy provider to reload.
-    r.register(p, "refresh", "()V", |_ctx, _args| Ok(None));
+    // refresh()V — STUB-REMOVAL (wave 2): this claimed "cratonvm has no Policy
+    // provider to reload", which stopped being true once `load_policy_file`
+    // started parsing a real `java.policy` and `implies(...)` started
+    // enforcing it. A no-op `refresh()` means an operator who edits the policy
+    // file and calls `Policy.getPolicy().refresh()` keeps running under the
+    // OLD grants with no indication — silently stale authorization. Re-read
+    // the file that was actually loaded; a VM with no policy file configured
+    // (the allow-all default) genuinely has nothing to reload, and a failed
+    // re-read keeps the previous policy rather than falling open.
+    r.register(p, "refresh", "()V", |_ctx, _args| {
+        refresh_active_policy();
+        Ok(None)
+    });
 
-    // <init>()V — Policy is abstract in real JDK so `new Policy()` would
-    // never compile, but JBoss Modules subclasses it and the subclass
-    // ctor invokes `super.<init>()`. Provide an empty body so the
-    // invokespecial path doesn't fall through to the missing-method
+    // <init>()V — KEEP (genuinely empty): Policy is abstract in real JDK so
+    // `new Policy()` would never compile, but JBoss Modules subclasses it and
+    // the subclass ctor invokes `super.<init>()`. Real
+    // `java.security.Policy()`'s body IS empty (the class holds only static
+    // state), so an empty native is exact, not a stub — it exists purely so
+    // the invokespecial path doesn't fall through to the missing-method
     // branch.
     r.register(p, "<init>", "()V", |_ctx, _args| Ok(None));
 }

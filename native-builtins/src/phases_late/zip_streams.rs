@@ -300,7 +300,13 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let name_pin = pinned_object_value(ctx, name_val);
             let this_pin = ctx.pin_native_root(this);
-            let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 2);
+            // 4 fields, not 2: `register_p62_zip_entry` (phase 62) re-registers
+            // every `ZipEntry` accessor AFTER the 2-field block in phase 58, so
+            // last-writer-wins makes the 4-field (name, size, csize, crc) layout
+            // the one that is actually read. A 2-field entry left
+            // `getCompressedSize()`/`getCrc()` reading past the object, and
+            // `getSize()` returning an `Int` from a `()J` accessor.
+            let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
             let name_val = read_pinned_object_value(ctx, name_pin, name_val);
             let this = ctx.read_native_pin(this_pin, this);
             if let Some((h, _)) = name_pin {
@@ -309,13 +315,16 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                 ctx.unpin_native_roots(this_pin);
             }
             ctx.set_field(ze, 0, name_val); // name
-                                            // Set size from data array
+            ctx.set_field(ze, 1, Value::Long(-1));
+            ctx.set_field(ze, 2, Value::Long(-1));
+            ctx.set_field(ze, 3, Value::Long(-1));
+            // Set size from data array
             if let Value::Object(Some(data_arr)) = ctx.get_field(this, 2) {
                 if let Value::Object(Some(entry_data)) =
                     ctx.get_array_element(data_arr, idx as usize)
                 {
                     let size = ctx.array_length(entry_data);
-                    ctx.set_field(ze, 1, Value::Int(size as i32));
+                    ctx.set_field(ze, 1, Value::Long(size as i64));
                 }
             }
             Ok(Some(Value::Object(Some(ze))))
@@ -523,23 +532,27 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
     });
 
     // InflaterInputStream / DeflaterOutputStream (abstract bases)
-    r.register(
-        "java/util/zip/InflaterInputStream",
-        "read",
-        "()I",
-        |_ctx, _args| Ok(Some(Value::Int(-1))),
-    );
+    //
+    // `read()`/`read([BII)`/`available()` were unconditional EOF/0. Because
+    // `InflaterInputStream` is the concrete superclass of `ZipInputStream` and
+    // `GZIPInputStream`, ANY user subclass — or any of those two on a path
+    // they do not override themselves — silently saw an empty stream instead
+    // of the inflated payload. That is the read-side twin of the
+    // `DeflaterOutputStream` write-side no-ops fixed below. These are now a
+    // real ZLIB/raw-deflate bridge (`iis_*` + `IIS_STREAM_STATE`), matching
+    // the eager-drain idiom the rest of this module already uses.
+    r.register("java/util/zip/InflaterInputStream", "read", "()I", iis_read);
     r.register(
         "java/util/zip/InflaterInputStream",
         "read",
         "([BII)I",
-        |_ctx, _args| Ok(Some(Value::Int(-1))),
+        iis_read_bytes,
     );
     r.register(
         "java/util/zip/InflaterInputStream",
         "available",
         "()I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        iis_available,
     );
     // `InflaterInputStream.close()` — NOT a blanket no-op. Real bytecode is
     // `if (!closed) { if (usesDefaultInflater) inf.end(); in.close(); closed
@@ -564,11 +577,23 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         "close",
         "()V",
         |ctx, args| {
-            eprintln!("[IIS_CLOSE_DBG] native InflaterInputStream.close invoked");
             let this = obj_arg(args, 0)?;
             if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
                 return Ok(None);
             }
+            // Mark closed and drop the inflated payload BEFORE dispatching the
+            // nested `inf.end()`/`in.close()`: those run arbitrary Java, and a
+            // moving young GC there can relocate `this`, stranding a write made
+            // afterwards against a stale reference (the wave-1
+            // `Reader.close`/`StringReader.close` lesson). Pin `this` so the
+            // post-dispatch reads still resolve.
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            let key = zo_buf_key(ctx, this);
+            iis_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            let this_pin = ctx.pin_native_root(this);
             if matches!(
                 ctx.get_field_by_name(this, "usesDefaultInflater"),
                 Value::Int(1)
@@ -577,10 +602,11 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
                     let _ = ctx.invoke_virtual(inf, "end", "()V", &[]);
                 }
             }
+            let this = ctx.read_native_pin(this_pin, this);
             if let Value::Object(Some(underlying)) = ctx.get_field_by_name(this, "in") {
                 let _ = ctx.invoke_virtual(underlying, "close", "()V", &[]);
             }
-            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
     );
@@ -899,6 +925,187 @@ pub(crate) fn zo_write_zip(
     // Reset count to prevent double-write
     ctx.set_field(this, 4, Value::Int(0));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// InflaterInputStream (synthetic-JDK bridge)
+//
+// The read-side mirror of the `DeflaterOutputStream` bridge below. Like every
+// other input stream in this module the whole payload is inflated eagerly on
+// first read and served from a Rust-side buffer, because `InflaterInputStream`
+// has no `<init>` bridge here — the receivers that reach these natives are
+// always subclasses whose slot layout belongs to the subclass, so there is no
+// object field we may claim for streaming state.
+// ---------------------------------------------------------------------------
+
+/// Per-stream inflated payload, keyed by identity hash.
+pub(crate) struct IisState {
+    /// Fully inflated bytes of the wrapped stream.
+    data: Vec<u8>,
+    /// Index of the next byte to hand out.
+    pos: usize,
+}
+
+pub(crate) static IIS_STREAM_STATE: std::sync::OnceLock<StdMutex<ZoHashMap<u64, IisState>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn iis_state() -> &'static StdMutex<ZoHashMap<u64, IisState>> {
+    IIS_STREAM_STATE.get_or_init(|| StdMutex::new(ZoHashMap::new()))
+}
+
+/// Resolve the stream this `InflaterInputStream` wraps. Real layout inherits
+/// `in` from `FilterInputStream`; the synthetic stream layouts in this module
+/// keep their source in slot 0 instead.
+fn iis_underlying(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Object(Some(o)) = ctx.get_field_by_name(this, "in") {
+        return Some(o);
+    }
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// True for the bounded-inflate "compression bomb" refusal raised by
+/// `inflate_bounded`, which must surface as an `IOException` rather than being
+/// retried under a different wrapper.
+fn iis_is_bomb(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("compression bomb")
+}
+
+/// Inflate the wrapped stream once, memoized under this object's identity
+/// hash. Identity hashing (rather than the raw pointer) is required for the
+/// same reason `zo_buf_key` documents: the drain below re-enters Java and a
+/// moving young GC can relocate `this` mid-flight.
+fn iis_fill(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+    let key = zo_buf_key(ctx, this);
+    if iis_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&key)
+    {
+        return Ok(());
+    }
+    let underlying = iis_underlying(ctx, this);
+    let raw = match underlying {
+        Some(u) => drain_input_stream_bulk(ctx, u),
+        None => Vec::new(),
+    };
+    let cap = gzip_max_inflated_bytes();
+    let data = if raw.is_empty() {
+        Vec::new()
+    } else {
+        use flate2::read::{DeflateDecoder, ZlibDecoder};
+        // `new InflaterInputStream(in)` uses a default (ZLIB-wrapped)
+        // Inflater; `ZipInputStream`/`JarInputStream` build theirs with
+        // `nowrap = true` (raw DEFLATE). Try the wrapped form first, fall
+        // back to raw, and only then admit failure.
+        match inflate_bounded(ZlibDecoder::new(&raw[..]), cap) {
+            Ok(b) => b,
+            Err(e) if iis_is_bomb(&e) => {
+                return Err(RuntimeError::IOException {
+                    message: format!("InflaterInputStream: {e}"),
+                }
+                .into())
+            }
+            Err(_) => match inflate_bounded(DeflateDecoder::new(&raw[..]), cap) {
+                Ok(b) => b,
+                Err(e) if iis_is_bomb(&e) => {
+                    return Err(RuntimeError::IOException {
+                        message: format!("InflaterInputStream: {e}"),
+                    }
+                    .into())
+                }
+                // Neither wrapper decodes: the previous code answered EOF and
+                // the caller saw a silently empty stream. Real
+                // `InflaterInputStream` throws a `ZipException` (an
+                // `IOException`) here, so say so.
+                Err(e) => {
+                    return Err(RuntimeError::IOException {
+                        message: format!("InflaterInputStream: invalid compressed data: {e}"),
+                    }
+                    .into())
+                }
+            },
+        }
+    };
+    iis_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, IisState { data, pos: 0 });
+    Ok(())
+}
+
+pub(crate) fn iis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    iis_fill(ctx, this)?;
+    let key = zo_buf_key(ctx, this);
+    let mut states = iis_state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(st) = states.get_mut(&key) else {
+        return Ok(Some(Value::Int(-1)));
+    };
+    if st.pos >= st.data.len() {
+        return Ok(Some(Value::Int(-1)));
+    }
+    let b = st.data[st.pos];
+    st.pos += 1;
+    Ok(Some(Value::Int(b as i32)))
+}
+
+pub(crate) fn iis_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let dst = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    // Validate the signed off/len against the destination BEFORE widening —
+    // a negative len would sign-extend into a huge usize, and
+    // `InputStream.read([BII)` contractually throws here.
+    let off = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+    let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+    let arr_len = ctx.array_length(dst) as i64;
+    if off < 0 || len < 0 || (off as i64) + (len as i64) > arr_len {
+        return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+            index: if off < 0 { off } else { off.wrapping_add(len) },
+        }
+        .into());
+    }
+    if len == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    iis_fill(ctx, this)?;
+    let key = zo_buf_key(ctx, this);
+    let chunk = {
+        let mut states = iis_state().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(st) = states.get_mut(&key) else {
+            return Ok(Some(Value::Int(-1)));
+        };
+        if st.pos >= st.data.len() {
+            return Ok(Some(Value::Int(-1)));
+        }
+        let end = (st.pos + len as usize).min(st.data.len());
+        let out = st.data[st.pos..end].to_vec();
+        st.pos = end;
+        out
+    };
+    // `write_byte_array_from` is a memcpy intrinsic — no allocation, so `dst`
+    // cannot move underneath us here.
+    ctx.write_byte_array_from(dst, off as usize, &chunk);
+    Ok(Some(Value::Int(chunk.len() as i32)))
+}
+
+/// Real `InflaterInputStream.available()` is `reachEOF ? 0 : 1` — it never
+/// reports a byte count, and it must not force I/O. Answer 1 until we have
+/// actually inflated the payload and run off its end.
+pub(crate) fn iis_available(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = zo_buf_key(ctx, this);
+    let states = iis_state().lock().unwrap_or_else(|e| e.into_inner());
+    let more = match states.get(&key) {
+        Some(st) => st.pos < st.data.len(),
+        None => true,
+    };
+    Ok(Some(Value::Int(if more { 1 } else { 0 })))
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,6 +1496,98 @@ pub(crate) fn p71_init_infl(
     Ok(None)
 }
 
+/// Read a synthetic `java/util/zip/ZipFile`'s backing archive path (slot 0).
+fn zf_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Real `ZipFile` accessors throw `IllegalStateException("zip file closed")`
+/// after `close()`; slot 1 is the closed flag. Previously every accessor
+/// answered "empty" whether the file was open, closed, or missing.
+fn zf_check_open(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+    if matches!(ctx.get_field(this, 1), Value::Int(1)) {
+        return Err(RuntimeError::IllegalStateException {
+            message: "zip file closed".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// `CheckedInputStream` slot 2 is the closed flag. Reading after `close()`
+/// throws, matching the wave-1 `Reader.close`/`StringReader.close` convention
+/// (`IOException("Stream closed")`) rather than silently answering EOF.
+fn cis_check_open(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+    if matches!(ctx.get_field(this, 2), Value::Int(1)) {
+        return Err(RuntimeError::IOException {
+            message: "Stream closed".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn zf_open(path: &str) -> Option<zip::ZipArchive<std::fs::File>> {
+    let file = std::fs::File::open(path).ok()?;
+    zip::ZipArchive::new(file).ok()
+}
+
+/// `(name, size, compressedSize, crc)` for one entry, copied out so the
+/// archive borrow ends before the caller allocates on the Java heap.
+fn zf_entry_meta(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+) -> Option<(String, i64, i64, i64)> {
+    let e = archive.by_name(name).ok()?;
+    Some((
+        e.name().to_string(),
+        e.size() as i64,
+        e.compressed_size() as i64,
+        e.crc32() as i64,
+    ))
+}
+
+fn zf_entry_meta_at(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    index: usize,
+) -> Option<(String, i64, i64, i64)> {
+    let e = archive.by_index(index).ok()?;
+    Some((
+        e.name().to_string(),
+        e.size() as i64,
+        e.compressed_size() as i64,
+        e.crc32() as i64,
+    ))
+}
+
+/// Allocate the 4-field `ZipEntry` (`name`, `size`, `csize`, `crc`) that
+/// `register_p62_zip_entry` expects. That registration runs in phase 62, AFTER
+/// the 2-field one in `register_p58_gzip_streams` (phase 58), so — last
+/// registration wins — its accessors are the ones that actually run.
+fn zip_entry_alloc(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+    size: i64,
+    csize: i64,
+    crc: i64,
+) -> ObjectRef {
+    let ze = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipEntry", 4);
+    // Pin across `create_string` — a moving young GC there would relocate the
+    // fresh entry (native stale-local family).
+    let ze_pin = ctx.pin_native_root(ze);
+    let s = ctx.create_string(name);
+    let ze = ctx.read_native_pin(ze_pin, ze);
+    ctx.set_field(ze, 0, Value::Object(Some(s)));
+    ctx.set_field(ze, 1, Value::Long(size));
+    ctx.set_field(ze, 2, Value::Long(csize));
+    ctx.set_field(ze, 3, Value::Long(crc));
+    ctx.unpin_native_roots(ze_pin);
+    ze
+}
+
 pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1371,20 +1670,90 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int(0));
         Ok(None)
     });
+    // `getEntry`/`entries`/`size` were "no such entry" / empty / 0 for EVERY
+    // archive — a caller could not tell an absent entry from a present one and
+    // would happily conclude a perfectly good jar was empty. Slot 0 already
+    // holds the archive path, so answer from the real file.
     r.register(
         zf,
         "getEntry",
         "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            zf_check_open(ctx, this)?;
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let path = match zf_path(ctx, this) {
+                Some(p) => p,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            let mut archive = match zf_open(&path) {
+                Some(a) => a,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            // Directory entries are stored with a trailing '/'; real
+            // `ZipFile.getEntry` retries with one appended before reporting
+            // "absent".
+            let mut found = zf_entry_meta(&mut archive, &name);
+            if found.is_none() && !name.ends_with('/') {
+                found = zf_entry_meta(&mut archive, &format!("{name}/"));
+            }
+            match found {
+                Some((n, size, csize, crc)) => Ok(Some(Value::Object(Some(zip_entry_alloc(
+                    ctx, &n, size, csize, crc,
+                ))))),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
-    r.register(zf, "entries", "()Ljava/util/Enumeration;", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        let itr = alloc_concurrent_synthetic(ctx, "java/util/zip/ZipFile$Itr", 2);
+    r.register(zf, "entries", "()Ljava/util/Enumeration;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        zf_check_open(ctx, this)?;
+        let metas: Vec<(String, i64, i64, i64)> = match zf_path(ctx, this).and_then(|p| zf_open(&p))
+        {
+            Some(mut a) => {
+                let n = a.len();
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    if let Some(m) = zf_entry_meta_at(&mut a, i) {
+                        out.push(m);
+                    }
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, metas.len());
+        // Pin across the per-entry ZipEntry/String allocs below — a moving
+        // young GC there would relocate the array (native stale-local family).
+        let arr_pin = ctx.pin_native_root(arr);
+        for (i, (n, size, csize, crc)) in metas.iter().enumerate() {
+            let ze = zip_entry_alloc(ctx, n, *size, *csize, *crc);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_array_element(arr, i, Value::Object(Some(ze)));
+        }
+        // `java/util/zip/ZipFile$Itr` (what this used to allocate) has no
+        // natives registered anywhere in the tree, so the returned object had
+        // neither `hasMoreElements` nor `nextElement`. `Enumeration$Impl` is
+        // the pre-registered (array=0, index=1) helper every other enumeration
+        // site in this VM uses.
+        let itr = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+        let arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_field(itr, 0, Value::Object(Some(arr)));
         ctx.set_field(itr, 1, Value::Int(0));
+        ctx.unpin_native_roots(arr_pin);
         Ok(Some(Value::Object(Some(itr))))
     });
-    r.register(zf, "size", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(zf, "size", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        zf_check_open(ctx, this)?;
+        let n = zf_path(ctx, this)
+            .and_then(|p| zf_open(&p))
+            .map_or(0, |a| a.len());
+        Ok(Some(Value::Int(n as i32)))
+    });
     r.register(zf, "getName", "()Ljava/lang/String;", |ctx, args| {
         Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
     });
@@ -1407,9 +1776,75 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    r.register(cis, "read", "()I", |_ctx, _args| Ok(Some(Value::Int(-1))));
-    r.register(cis, "read", "([BII)I", |_ctx, _args| {
-        Ok(Some(Value::Int(-1)))
+    // Both reads were unconditional EOF, so a `CheckedInputStream` wrapper
+    // silently swallowed the entire payload AND left its `Checksum` at the
+    // initial value — a caller comparing that checksum would "verify" data it
+    // never saw. Delegate to the wrapped stream (slot 0) and feed the
+    // `Checksum` (slot 1), which is what the real class does.
+    r.register(cis, "read", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        cis_check_open(ctx, this)?;
+        let stream = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => s,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        // Pin `this` across the nested read — it runs arbitrary Java and a
+        // moving young GC there would strand the later field reads.
+        let this_pin = ctx.pin_native_root(this);
+        let b = match ctx.invoke_virtual(stream, "read", "()I", &[]) {
+            Ok(Some(Value::Int(v))) => v,
+            Ok(_) => -1,
+            Err(e) => {
+                ctx.unpin_native_roots(this_pin);
+                return Err(e);
+            }
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        if b >= 0 {
+            if let Value::Object(Some(cs)) = ctx.get_field(this, 1) {
+                let _ = ctx.invoke_virtual(cs, "update", "(I)V", &[Value::Int(b)]);
+            }
+        }
+        ctx.unpin_native_roots(this_pin);
+        Ok(Some(Value::Int(b)))
+    });
+    r.register(cis, "read", "([BII)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        cis_check_open(ctx, this)?;
+        let stream = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => s,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let off = args.get(2).copied().unwrap_or(Value::Int(0));
+        let len = args.get(3).copied().unwrap_or(Value::Int(0));
+        // The destination array must be pinned too: the nested read can move
+        // it, and we hand the SAME array to `Checksum.update` afterwards.
+        // `unpin_native_roots` releases from a handle ONWARD, so the release
+        // must name the EARLIEST handle taken (same idiom as `getNextEntry`).
+        let buf_pin = pinned_object_value(ctx, args.get(1).copied().unwrap_or(Value::Object(None)));
+        let this_pin = ctx.pin_native_root(this);
+        let release = match buf_pin {
+            Some((h, _)) => h,
+            None => this_pin,
+        };
+        let buf = read_pinned_object_value(ctx, buf_pin, Value::Object(None));
+        let n = match ctx.invoke_virtual(stream, "read", "([BII)I", &[buf, off, len]) {
+            Ok(Some(Value::Int(v))) => v,
+            Ok(_) => -1,
+            Err(e) => {
+                ctx.unpin_native_roots(release);
+                return Err(e);
+            }
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        if n > 0 {
+            let buf = read_pinned_object_value(ctx, buf_pin, Value::Object(None));
+            if let Value::Object(Some(cs)) = ctx.get_field(this, 1) {
+                let _ = ctx.invoke_virtual(cs, "update", "([BII)V", &[buf, off, Value::Int(n)]);
+            }
+        }
+        ctx.unpin_native_roots(release);
+        Ok(Some(Value::Int(n)))
     });
     r.register(
         cis,

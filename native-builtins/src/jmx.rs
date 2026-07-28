@@ -12,6 +12,11 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
+// The live-thread helpers live in `crate::phases_late::management` rather than
+// here: this module is gated on the `experimental-jmx` feature, that one is
+// not, and both register the same `ThreadMXBean` triples. One copy is what
+// stops the two registrations from drifting apart again.
+use crate::phases_late::management::{daemon_thread_count, live_thread_ids};
 
 /// Construct a Java `IOException` with the given message — the standard
 /// way to surface a connection-style failure to JDK callers.
@@ -76,6 +81,81 @@ fn vm_start_epoch_ms() -> u64 {
 
 fn uptime_ms() -> u64 {
     vm_start().elapsed().as_millis() as u64
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide verbose flags
+//
+// `-verbose:gc` / `-verbose:class` are JVM-wide switches in HotSpot, not
+// per-bean state, and the JMM contract is that `setVerbose(b)` is observable
+// through `isVerbose()`. Both round-trips used to be broken: the setters
+// (`MemoryImpl.setVerboseGC`, `ClassLoadingImpl.setVerboseClass`) discarded
+// their argument and the getters (`MemoryImpl.isVerbose`,
+// `VMManagementImpl.getVerboseGC`/`getVerboseClass`) answered a hard-coded
+// `false`, so `setVerbose(!isVerbose())` left the bean unchanged.
+//
+// CratonVM has no GC/class-load tracing to actually switch on, so the flags
+// are state-only. That is the same trade-off `ClassLoadingMXBean.isVerbose`
+// already documents further down this file, and a smaller lie than dropping
+// the caller's write entirely.
+// ---------------------------------------------------------------------------
+
+/// `-verbose:class`. Written by `ClassLoadingImpl.setVerboseClass`, read back
+/// by `VMManagementImpl.getVerboseClass` (which is what the real
+/// `ClassLoadingImpl.isVerbose()` bytecode calls through `this.jvm`).
+static VERBOSE_CLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `-verbose:gc`. Deliberately the SAME cell the synthetic-mode
+/// `MemoryMXBean.setVerbose`/`isVerbose` pair in `phases_late::management`
+/// uses, so a write through either surface is visible from the other.
+fn verbose_gc_flag() -> &'static std::sync::atomic::AtomicBool {
+    &crate::phases_late::management::MEMORY_MX_VERBOSE
+}
+
+fn verbose_gc_get() -> bool {
+    verbose_gc_flag().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn verbose_gc_set(on: bool) {
+    verbose_gc_flag().store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the `boolean` argument of a `(Z)V` setter.
+///
+/// Deliberately position-independent. `MemoryImpl.setVerboseGC` and
+/// `ClassLoadingImpl.setVerboseClass` are declared STATIC in the JDK (the
+/// instance `setVerbose` wrappers are what call them), so the flag is arg 0 —
+/// but a CratonVM synthetic receiver can reach the same native with `this`
+/// prepended, putting it at arg 1. The first `Value::Int` is the flag under
+/// either convention, because a receiver is always a `Value::Object`. Reading
+/// a fixed index would silently store `false` under the other one.
+fn bool_flag_arg(args: &[Value]) -> bool {
+    args.iter()
+        .find_map(|v| match v {
+            Value::Int(v) => Some(*v != 0),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+/// The 1-minute system load average, or the JMM's `-1.0` "not available"
+/// sentinel on platforms that do not publish one.
+///
+/// `OperatingSystemMXBean.getSystemLoadAverage()` returned a flat `-1.0`
+/// everywhere even though Linux exposes the real number in `/proc/loadavg`
+/// (the sibling `phases_late::management` registration already read it).
+fn system_load_average() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") {
+            if let Some(first) = loadavg.split_whitespace().next() {
+                if let Ok(avg) = first.parse::<f64>() {
+                    return avg;
+                }
+            }
+        }
+    }
+    -1.0
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,9 +1147,8 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // `false` is exactly what the spec wants for an unsupported feature —
     // and it keeps the corresponding `get*` natives below honest (a caller
     // that sees `isThreadCpuTimeSupported()==false` never calls
-    // `getThreadCpuTime`). `getVerboseClass`/`getVerboseGC` are likewise
-    // genuinely off. Done as a batch; the consumer iterates a static const
-    // list at clinit time.
+    // `getThreadCpuTime`). Done as a batch; the consumer iterates a static
+    // const list at clinit time.
     let false_zero: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Int(0))); // false / 0
     for name in [
@@ -1087,11 +1166,24 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "isCompilationTimeMonitoringSupported",
         "isRemoteDiagnosticCommandsSupported",
         "isGcNotificationSupported",
-        "getVerboseClass",
-        "getVerboseGC",
     ] {
         r.register(cls, name, "()Z", false_zero);
     }
+
+    // `getVerboseClass` / `getVerboseGC` used to sit in the batch above, which
+    // made them constants — but they are NOT feature-support queries, they are
+    // the read side of a documented round-trip. The real
+    // `ClassLoadingImpl.isVerbose()` / `MemoryImpl.isVerbose()` bytecode is
+    // literally `return jvm.getVerboseClass()` / `return jvm.getVerboseGC()`,
+    // so a constant here silently discarded every `setVerbose(true)` a JMX
+    // client made. Read the process-wide flags the setters now write.
+    r.register(cls, "getVerboseClass", "()Z", |_ctx, _args| {
+        let on = VERBOSE_CLASS.load(std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(Value::Int(i32::from(on))))
+    });
+    r.register(cls, "getVerboseGC", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(i32::from(verbose_gc_get()))))
+    });
 
     // -- VMManagementImpl long-typed counters / timers --
     //
@@ -1118,9 +1210,8 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // gains JIT-time / safepoint / per-class-phase accounting, wire here.
     for name in [
         "getTotalCompileTime",               // no JIT compile-time accounting
-        "getUnloadedClassCount",             // we never unload classes
         "getLoadedClassSize",                // no per-class byte-size tracking
-        "getUnloadedClassSize",              // we never unload classes
+        "getUnloadedClassSize",              // no per-class byte-size tracking
         "getClassLoadingTime",               // no class-load timer
         "getMethodDataSize",                 // no profiling method-data area
         "getInitializedClassCount",          // not tracked separately from loaded
@@ -1137,6 +1228,14 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // (`loaded_class_count`) as ClassLoadingMXBean.getTotalLoadedClassCount.
     r.register(cls, "getTotalClassCount", "()J", |ctx, _args| {
         Ok(Some(Value::Long(ctx.loaded_class_count() as i64)))
+    });
+    // (b) REAL: classes reclaimed by class-loader unloading. This was in the
+    // FLAGGED-0 batch above under "we never unload classes", but the VM does
+    // track it — `unloaded_class_count()` is the same accessor
+    // `ClassLoadingMXBean.getUnloadedClassCount` already reads — so the 0 was
+    // stale, not honest.
+    r.register(cls, "getUnloadedClassCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.unloaded_class_count() as i64)))
     });
     // (b) REAL: cumulative started-thread count. We don't keep a historical
     // high-water "ever started" counter, so the closest honest value is the
@@ -1165,11 +1264,13 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     r.register(cls, "getPeakThreadCount", "()I", |ctx, _args| {
         Ok(Some(Value::Int(ctx.active_thread_count())))
     });
-    // FLAGGED-0: daemon-thread count is not tracked separately by the VM
-    // (we don't carry the daemon flag through to a JMM-visible counter).
-    // Leave 0 rather than fake a split of the live count.
-    r.register(cls, "getDaemonThreadCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // REAL: daemon-thread count. The previous FLAGGED-0 ("not tracked
+    // separately by the VM") was wrong — the flag IS carried, on
+    // `Thread.holder.daemon`, which is exactly where the VM's own shutdown
+    // logic reads it (`vm_exec.rs::read_thread_daemon_flag`). Counting the
+    // live threads that carry it is a measurement, not a fabricated split.
+    r.register(cls, "getDaemonThreadCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(daemon_thread_count(ctx))))
     });
     // Reset peak counter — no peak state to reset; accept and ignore.
     r.register(cls, "resetPeakThreadCount", "()V", |_ctx, _args| Ok(None));
@@ -1243,8 +1344,13 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
-    // setVerboseGC(boolean) — accept and ignore.
-    r.register(memory_impl, "setVerboseGC", "(Z)V", |_ctx, _args| Ok(None));
+    // setVerboseGC(boolean) — the write side of the `-verbose:gc` round-trip.
+    // Accepting and ignoring made `MemoryMXBean.setVerbose(b)` unobservable
+    // through `isVerbose()`, which the JMM contract requires.
+    r.register(memory_impl, "setVerboseGC", "(Z)V", |_ctx, args| {
+        verbose_gc_set(bool_flag_arg(args));
+        Ok(None)
+    });
     // isVerbose()Z — `alloc_memory_mxbean` allocates this bean as a real
     // `sun/management/MemoryImpl` (not a purely-synthetic interface stamp,
     // unlike e.g. `ClassLoadingMXBean`), so the real-JDK bytecode
@@ -1259,10 +1365,12 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // this.jvm is null") the moment anything calls `isVerbose()` — Tomcat's
     // manager webapp status page does, via `MemoryMXBean.isVerbose()`
     // (TestManagerWebapp.testServlets: expected 200 got 500). Register
-    // directly on the concrete class so it wins dispatch, matching
-    // `setVerboseGC`'s always-off convention.
+    // directly on the concrete class so it wins dispatch — and answer from
+    // the same process-wide flag `setVerboseGC` writes, which is what the
+    // NPE'ing bytecode (`return jvm.getVerboseGC()`) would have produced.
+    // The previous hard-coded 0 made the setter's write invisible.
     r.register(memory_impl, "isVerbose", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+        Ok(Some(Value::Int(i32::from(verbose_gc_get()))))
     });
     // getMemoryUsage0(boolean heap) — for the HEAP case we have REAL sources
     // for every field: `initial_heap_bytes()`/`heap_allocated_bytes()` (the
@@ -1806,9 +1914,16 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/ClassLoadingImpl";
 
-    // setVerboseClass(Z)V — accept and ignore (synthetic verbose flag is
-    // already false in VMManagementImpl).
-    r.register(cls, "setVerboseClass", "(Z)V", |_ctx, _args| Ok(None));
+    // setVerboseClass(Z)V — the write side of the `-verbose:class` round-trip.
+    // The real `ClassLoadingImpl.isVerbose()` bytecode reads it straight back
+    // via `jvm.getVerboseClass()`, so accepting and ignoring made
+    // `ClassLoadingMXBean.setVerbose(b)` unobservable — the JMM contract says
+    // it must not be. CratonVM has no class-load tracing to switch on, so the
+    // flag is state-only; see `VERBOSE_CLASS`.
+    r.register(cls, "setVerboseClass", "(Z)V", |_ctx, args| {
+        VERBOSE_CLASS.store(bool_flag_arg(args), std::sync::atomic::Ordering::Relaxed);
+        Ok(None)
+    });
 
     // <init>(Lsun/management/VMManagement;)V — mirror the real
     // `ClassLoadingImpl(VMManagement vm) { this.jvm = vm; }`. Dropping the
@@ -1840,6 +1955,22 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
 fn init_memory_manager_fields(ctx: &mut dyn NativeContext, this: ObjectRef, name: Value) {
     ctx.set_field_by_name(this, "name", name);
     ctx.set_field_by_name(this, "isValid", Value::Int(1));
+}
+
+/// `MemoryManagerImpl.isValid()` / `MemoryPoolImpl.isValid()`.
+///
+/// Reads the per-instance flag the constructors above establish
+/// (`init_memory_manager_fields`, `MemoryPoolImpl.<init>`), defaulting to
+/// `true` for a receiver whose layout carries no such field. The previous
+/// blanket `Ok(Some(Value::Int(1)))` made that stored flag dead state: a bean
+/// could never report itself invalid, so `ManagementFactoryHelper`'s validity
+/// filter had nothing to filter on.
+fn native_manager_is_valid(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(match ctx.get_field_by_name(this, "isValid") {
+        Value::Int(v) => Value::Int(i32::from(v != 0)),
+        _ => Value::Int(1),
+    }))
 }
 
 /// Read a `long` constructor/method argument. Callers reaching a native
@@ -1938,10 +2069,15 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
 
-    // gc()V — GarbageCollectorImpl exposes a manual-trigger entry point
-    // mirroring MemoryMXBean.gc(). No-op is fine; we don't proxy through
-    // to the real GC here (MemoryMXBean.gc() does that elsewhere).
-    r.register(cls, "gc", "()V", |_ctx, _args| Ok(None));
+    // gc()V — GarbageCollectorImpl's manual-trigger entry point, the same
+    // request `MemoryMXBean.gc()` makes. Run the collector instead of
+    // silently doing nothing: a caller asking for a collection and getting a
+    // no-op has no way to tell, and the sibling `MemoryMXBean.gc()` native
+    // already calls `force_gc()`.
+    r.register(cls, "gc", "()V", |ctx, _args| {
+        ctx.force_gc();
+        Ok(None)
+    });
     r.set_category(__prev_cat);
 }
 
@@ -1975,7 +2111,7 @@ pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
 
-    r.register(cls, "isValid", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(cls, "isValid", "()Z", native_manager_is_valid);
 
     // getMemoryPools0()[Ljava/lang/management/MemoryPoolMXBean; — return
     // an empty array so the synthetic accessor doesn't trip on a missing
@@ -2050,7 +2186,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field_by_name(this, "name")))
     });
 
-    r.register(cls, "isValid", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(cls, "isValid", "()Z", native_manager_is_valid);
 
     r.register(
         cls,
@@ -2262,11 +2398,18 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     // `/sys/fs/cgroup` file parsing we don't implement). Real JDK takes
     // this exact path under `-XX:-UseContainerSupport` or outside a
     // container, and `ManagementFactory`'s callers already handle a null
-    // `Metrics` instance. Reporting container support as off is honest —
-    // CratonVM genuinely does no cgroup accounting — not a fabricated
-    // value, and it was an unregistered native (UnsatisfiedLinkError)
-    // that aborted `ManagementFactory.getPlatformMBeanServer()` before
-    // this fix.
+    // `Metrics` instance. It was an unregistered native (UnsatisfiedLinkError)
+    // that aborted `ManagementFactory.getPlatformMBeanServer()` before this
+    // fix.
+    //
+    // KEEP, with one caveat worth stating precisely: CratonVM's *launcher*
+    // does honour a cgroup CPU quota (`available_processor_count()` prefers
+    // `VmConfig::container_effective_processors`), so "no cgroup awareness at
+    // all" would be too strong. What is genuinely absent is the
+    // `CgroupSubsystem` SPI this method gates — answering `true` would send
+    // `Metrics.getInstance()` into `CgroupSubsystemFactory.create()` and its
+    // unimplemented `/sys/fs/cgroup` parsing. `false` is the reachable
+    // truth; a `true` here would be a claim we cannot back.
     r.register(
         "jdk/internal/platform/CgroupMetrics",
         "isUseContainerSupport",
@@ -2286,10 +2429,18 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/HotSpotDiagnostic";
 
-    // dumpHeap0(String, Z)V — heap dumping is a major separate effort;
-    // accept arguments and no-op.
+    // dumpHeap0(String, Z)V — CratonVM has no HPROF writer, so nothing is
+    // ever written to `outputFile`. The previous no-op RETURNED NORMALLY,
+    // which tells the caller a dump was produced and leaves it to discover
+    // the missing file later (or not at all). `dumpHeap0` is declared
+    // `throws IOException` and its public wrapper
+    // `HotSpotDiagnosticMXBean.dumpHeap` propagates that, so failing here is
+    // both spec-legal and the honest answer. BEHAVIOUR CHANGE: a caller that
+    // previously "succeeded" now sees an IOException.
     r.register(cls, "dumpHeap0", "(Ljava/lang/String;Z)V", |_ctx, _args| {
-        Ok(None)
+        Err(jmx_ioex(
+            "heap dump unavailable: CratonVM has no HPROF writer",
+        ))
     });
 
     // getDiagnosticOptions()Ljava/util/List; — empty ArrayList matches
@@ -2373,6 +2524,14 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/String;[Lcom/sun/management/internal/Flag;I)I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // KEEP: the four setters below are unreachable through the public API, so
+    // a no-op cannot silently swallow a caller's write.
+    // `HotSpotDiagnostic.setVMOption(name, value)` first resolves the flag via
+    // `getFlags` above, which reports zero flags for every name, and throws
+    // `IllegalArgumentException("VM option \"name\" does not exist")` before
+    // any of these is called. The honest failure a caller sees therefore
+    // already comes from real bytecode; adding a throw here would only
+    // duplicate it on a path nothing takes.
     r.register(
         internal_cls,
         "setLongValue",
@@ -2685,6 +2844,11 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // KEEP: false is the truth and it keeps `getBootClassPath()` above honest.
+    // CratonVM has no boot class path to report (the JDK 9+ module image
+    // replaced it), and the spec says `getBootClassPath()` may only be called
+    // when this returns true — so reporting false is what stops a caller from
+    // ever seeing the empty string above and mistaking it for a real answer.
     r.register(cls, "isBootClassPathSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -2728,6 +2892,57 @@ fn alloc_logging_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     alloc_concurrent_synthetic(ctx, "java/lang/management/PlatformLoggingMXBean", 0)
 }
 
+/// The live `java.util.logging.LogManager` singleton.
+///
+/// `logmanager.rs` registers `LogManager.getLogManager()` for both run modes,
+/// so this is the same object real bytecode would obtain. `None` when that
+/// surface is unreachable — every caller below then falls back to its previous
+/// answer rather than throwing, so wiring these up cannot make a currently
+/// working call start failing.
+fn jul_log_manager(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    match ctx.invoke(
+        "java/util/logging/LogManager",
+        "getLogManager",
+        "()Ljava/util/logging/LogManager;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(mgr)))) => Some(mgr),
+        _ => None,
+    }
+}
+
+/// Resolve a logger by name through the live `LogManager`.
+///
+/// `None` is JMX's "no such logger" case, which the `PlatformLoggingMXBean`
+/// accessors map to a `null` return — deliberately distinct from the empty
+/// string, which means "this logger exists but has no level of its own".
+fn jul_logger_by_name(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    let mgr = jul_log_manager(ctx)?;
+    // `create_string` allocates, which can relocate the manager.
+    let pin = ctx.pin_native_root(mgr);
+    let key = ctx.create_string(name);
+    let mgr = ctx.read_native_pin(pin, mgr);
+    let logger = ctx.invoke_virtual(
+        mgr,
+        "getLogger",
+        "(Ljava/lang/String;)Ljava/util/logging/Logger;",
+        &[Value::Object(Some(key))],
+    );
+    ctx.unpin_native_roots(pin);
+    match logger {
+        Ok(Some(Value::Object(Some(logger)))) => Some(logger),
+        _ => None,
+    }
+}
+
+/// Read a `String` argument, or `None` when the slot is absent/null.
+fn opt_string_arg(ctx: &dyn NativeContext, args: &[Value], index: usize) -> Option<String> {
+    match args.get(index) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    }
+}
+
 fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -2738,34 +2953,142 @@ fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
     // live `LogManager` rather than from per-instance state, so there is
     // nothing a constructor could establish.
     r.register(cls, "<init>", "()V", native_noop_with_this);
-    r.register(
-        cls,
-        "getLoggerNames",
-        "()Ljava/util/List;",
-        |ctx, _args| match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
+    // REAL: the live LogManager's logger names. `Collections.list` does the
+    // Enumeration walk in one call, so no unpinned reference is held across
+    // the allocations that walk performs. Falls back to the previous empty
+    // list when either surface is unreachable (synthetic-JDK mode).
+    r.register(cls, "getLoggerNames", "()Ljava/util/List;", |ctx, _args| {
+        if let Some(mgr) = jul_log_manager(ctx) {
+            let names = ctx.invoke_virtual(mgr, "getLoggerNames", "()Ljava/util/Enumeration;", &[]);
+            if let Ok(Some(Value::Object(Some(enumeration)))) = names {
+                let listed = ctx.invoke(
+                    "java/util/Collections",
+                    "list",
+                    "(Ljava/util/Enumeration;)Ljava/util/ArrayList;",
+                    &[Value::Object(Some(enumeration))],
+                );
+                if let Ok(Some(v @ Value::Object(Some(_)))) = listed {
+                    return Ok(Some(v));
+                }
+            }
+        }
+        match ctx.new_object_initialized("java/util/ArrayList", "()V", &[]) {
             Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
             _ => Ok(Some(Value::Object(None))),
-        },
-    );
+        }
+    });
+    // REAL: the named logger's own level, read through the live LogManager.
+    // The three answers are distinct and callers branch on all three:
+    //   null   — no such logger
+    //   ""     — the logger exists but inherits its level from its parent
+    //   "INFO" — the level's name
+    // The previous flat `null` told every caller that no logger in the whole
+    // process existed, which is the one answer that is never true.
     r.register(
         cls,
         "getLoggerLevel",
         "(Ljava/lang/String;)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let Some(name) = opt_string_arg(ctx, args, 1) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(logger) = jul_logger_by_name(ctx, &name) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            // `getLevel()` / `getName()` allocate; keep the logger rooted.
+            let pin = ctx.pin_native_root(logger);
+            let level = ctx.invoke_virtual(logger, "getLevel", "()Ljava/util/logging/Level;", &[]);
+            let named = match level {
+                Ok(Some(Value::Object(Some(level)))) => ctx
+                    .invoke_virtual(level, "getName", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            ctx.unpin_native_roots(pin);
+            Ok(Some(match named {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => Value::Object(Some(ctx.create_string(""))),
+            }))
+        },
     );
+    // REAL: apply the level to the named logger. Dropping the call made every
+    // JMX-driven log-level change silently ineffective — the caller has no
+    // way to detect that, and `getLoggerLevel` above would have reported the
+    // change as applied once it started answering truthfully.
+    // A null/empty level name clears the logger's level (inherit), matching
+    // the MXBean contract.
     r.register(
         cls,
         "setLoggerLevel",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let Some(name) = opt_string_arg(ctx, args, 1) else {
+                return Ok(None);
+            };
+            let level_name = opt_string_arg(ctx, args, 2);
+            let Some(logger) = jul_logger_by_name(ctx, &name) else {
+                // The spec's answer is IllegalArgumentException, but a logger
+                // this VM has not materialised yet is a CratonVM gap rather
+                // than a caller error — stay quiet rather than fail a call a
+                // real JVM would have accepted.
+                return Ok(None);
+            };
+            // `Level.parse` allocates and can relocate the logger.
+            let pin = ctx.pin_native_root(logger);
+            let level = match level_name {
+                Some(ref text) if !text.is_empty() => {
+                    let key = ctx.create_string(text);
+                    ctx.invoke(
+                        "java/util/logging/Level",
+                        "parse",
+                        "(Ljava/lang/String;)Ljava/util/logging/Level;",
+                        &[Value::Object(Some(key))],
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or(Value::Object(None))
+                }
+                _ => Value::Object(None),
+            };
+            let logger = ctx.read_native_pin(pin, logger);
+            let _ =
+                ctx.invoke_virtual(logger, "setLevel", "(Ljava/util/logging/Level;)V", &[level]);
+            ctx.unpin_native_roots(pin);
+            Ok(None)
+        },
     );
+    // REAL: the named logger's parent name.
+    //   null — no such logger
+    //   ""   — this IS the root logger (JUL's root logger is itself named "")
+    // The previous body answered `""` for every name, telling anything that
+    // builds a logger tree that every logger was the root.
     r.register(
         cls,
         "getParentLoggerName",
         "(Ljava/lang/String;)Ljava/lang/String;",
-        |ctx, _args| {
-            let s = ctx.create_string("");
-            Ok(Some(Value::Object(Some(s))))
+        |ctx, args| {
+            let Some(name) = opt_string_arg(ctx, args, 1) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(logger) = jul_logger_by_name(ctx, &name) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let pin = ctx.pin_native_root(logger);
+            let parent =
+                ctx.invoke_virtual(logger, "getParent", "()Ljava/util/logging/Logger;", &[]);
+            let parent_name = match parent {
+                Ok(Some(Value::Object(Some(parent)))) => ctx
+                    .invoke_virtual(parent, "getName", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            ctx.unpin_native_roots(pin);
+            Ok(Some(match parent_name {
+                Some(v @ Value::Object(Some(_))) => v,
+                _ => Value::Object(Some(ctx.create_string(""))),
+            }))
         },
     );
     r.set_category(__prev_cat);
@@ -2920,6 +3243,11 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // KEEP: 0 is the measurement, not a placeholder. CratonVM runs no
+    // finalizer thread and maintains no finalization queue, so the number of
+    // objects "pending finalization" is genuinely zero at every instant — the
+    // same value a HotSpot with an idle finalizer queue reports. There is no
+    // richer datum to wire this to.
     r.register(
         cls,
         "getObjectPendingFinalizationCount",
@@ -2931,10 +3259,15 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
         ctx.force_gc();
         Ok(None)
     });
-    // isVerbose() -- not one of the 6 synthetic fields; matches
-    // ClassLoadingMXBean.isVerbose's fixed-sentinel style.
+    // isVerbose() -- not one of the 6 synthetic fields, so it answers from the
+    // process-wide `-verbose:gc` flag rather than per-instance state. This
+    // registration WINS over the sibling `MemoryMXBean.isVerbose` in
+    // `phases_late::management` (jmx.rs registers later — see
+    // `register_synthetic_overrides`), so while it returned a fixed 0 the
+    // `setVerbose` half of that pair had nothing reading its writes and the
+    // JMM's setVerbose/isVerbose round-trip was dead in both run modes.
     r.register(cls, "isVerbose", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+        Ok(Some(Value::Int(i32::from(verbose_gc_get()))))
     });
     r.set_category(__prev_cat);
 }
@@ -3366,10 +3699,13 @@ fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// the same bean.
 fn init_thread_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     let thread_count = ctx.active_thread_count();
+    // daemonThreadCount (real): counted from `Thread.holder.daemon`, the same
+    // flag the VM's own shutdown logic reads. Was a hard-coded 0.
+    let daemon_count = daemon_thread_count(ctx);
     ctx.set_field(obj, 0, Value::Int(thread_count)); // threadCount (real)
     ctx.set_field(obj, 1, Value::Int(thread_count)); // peakThreadCount (real)
     ctx.set_field(obj, 2, Value::Long(thread_count as i64)); // totalStartedThreadCount (real)
-    ctx.set_field(obj, 3, Value::Int(0)); // daemonThreadCount
+    ctx.set_field(obj, 3, Value::Int(daemon_count)); // daemonThreadCount (real)
     ctx.set_field(obj, 4, Value::Long(-1)); // currentThreadCpuTime (not supported)
     ctx.set_field(obj, 5, Value::Long(-1)); // currentThreadUserTime
 }
@@ -3402,6 +3738,15 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
     });
+    // KEEP: -1 is the spec's own "measurement is off" answer, not a
+    // placeholder. `ThreadMXBean.getCurrentThreadCpuTime()` is defined to
+    // return -1 when CPU-time measurement is disabled, and
+    // `isThreadCpuTimeEnabled()` below reports exactly that — so the pair is
+    // self-consistent and a caller can tell measurement apart from a real 0.
+    // CratonVM has no per-thread CPU accounting to wire in; deliberately NOT
+    // converted to the spec's UnsupportedOperationException, because Tomcat's
+    // Diagnostics formats these unguarded for every thread in a dump and a
+    // throw would turn a working page into a 500.
     r.register(cls, "getCurrentThreadCpuTime", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(-1)))
     });
@@ -3417,6 +3762,9 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     r.register(cls, "getThreadUserTime", "(J)J", |_ctx, _args| {
         Ok(Some(Value::Long(-1)))
     });
+    // KEEP: false IS the measurement. CratonVM implements no per-thread CPU
+    // accounting, and an unsupported optional JMM feature is exactly what
+    // `false` means here — it is also what keeps the -1 answers above legible.
     r.register(cls, "isThreadCpuTimeSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -3460,10 +3808,21 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // REAL: every live thread's own `tid`. The previous body returned a
+    // hard-coded `[1]` regardless of how many threads were running, and the
+    // ids it handed out were not guaranteed to resolve: `getThreadInfo(long)`
+    // below looks a thread up by matching that same `tid` field, so a
+    // fabricated id yields a null ThreadInfo. Enumerating for real makes the
+    // pair consistent — every id returned here resolves.
     r.register(cls, "getAllThreadIds", "()[J", |ctx, _args| {
         use cratonvm_types::ArrayElementType;
-        let arr = ctx.new_array(ArrayElementType::Long, 1);
-        ctx.set_array_element(arr, 0, Value::Long(1)); // main thread
+        // Ids are collected as plain i64 first: `new_array` can GC, and the
+        // thread references backing them are not pinned.
+        let ids = live_thread_ids(ctx);
+        let arr = ctx.new_array(ArrayElementType::Long, ids.len());
+        for (i, id) in ids.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Long(*id));
+        }
         Ok(Some(Value::Object(Some(arr))))
     });
     r.register(
@@ -3538,6 +3897,14 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    // KEEP: `null` is the JMM's "no deadlocked threads" answer (these methods
+    // return null, not an empty array, when nothing is deadlocked), so callers
+    // that null-check behave correctly. FLAGGED, deliberately: CratonVM runs
+    // no deadlock detector, so this is "we found none" rather than "we
+    // checked and there are none". Answering otherwise would require a real
+    // wait-for-graph walk over the monitor and AQS ownership tables — a
+    // separate piece of work, not a constant to swap out. The same null is
+    // registered on `sun.management.ThreadImpl`'s `*0` natives.
     r.register(cls, "findDeadlockedThreads", "()[J", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -3711,7 +4078,10 @@ fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     // Container-aware processor count (cgroup CPU quota under container support).
     let cpus = ctx.available_processor_count();
     ctx.set_field(obj, 3, Value::Int(cpus));
-    ctx.set_field(obj, 4, Value::Double(-1.0));
+    // Slot 4 = system load average. `getSystemLoadAverage()` answers live
+    // rather than from this slot, but seed it with the same real value so a
+    // direct slot read is not the only place still reporting -1.0.
+    ctx.set_field(obj, 4, Value::Double(system_load_average()));
 }
 
 fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
@@ -3742,8 +4112,12 @@ fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
     });
+    // REAL where the platform publishes it: Linux's `/proc/loadavg`. The flat
+    // -1.0 was a fabricated "unavailable" on the one platform that does have
+    // the number (and the sibling registration in `phases_late::management`
+    // already read it). Non-Linux keeps the spec's -1.0 sentinel.
     r.register(cls, "getSystemLoadAverage", "()D", |_ctx, _args| {
-        Ok(Some(Value::Double(-1.0)))
+        Ok(Some(Value::Double(system_load_average())))
     });
     r.set_category(__prev_cat);
 }
@@ -3925,6 +4299,12 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 3)))
         },
     );
+    // KEEP: this synthetic bean has no `isValid` slot to read (the 4 fields
+    // are name/count/time/poolNames), and it only ever exists because
+    // `alloc_gc_mxbean` just built it — a collector bean handed out by the
+    // factory is valid by construction. The concrete `sun.management`
+    // manager/pool beans, which DO carry the flag, read it instead (see
+    // `native_manager_is_valid`).
     r.register(cls, "isValid", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
     r.set_category(__prev_cat);
 }

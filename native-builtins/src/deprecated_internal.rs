@@ -277,12 +277,15 @@ fn register_beans_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // isDesignTime() -> boolean
+    // isDesignTime() / isGuiAvailable() — statements of fact, not placeholders.
+    // Their only mutators are `Beans.setDesignTime`/`setGuiAvailable`, which
+    // this module does not register at all, so no caller can put the VM into a
+    // state either of these would then be misreporting. CratonVM is always a
+    // headless runtime with no BeanBox-style design environment.
     r.register(beans, "isDesignTime", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0))) // never in design time
     });
 
-    // isGuiAvailable() -> boolean
     r.register(beans, "isGuiAvailable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0))) // no GUI in headless JVM
     });
@@ -319,7 +322,9 @@ fn register_rmi_natives(r: &mut NativeMethodRegistry) {
 fn register_activation_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // Activatable.<init>()V — no-op so the class can load
+    // Activatable.<init>()V — genuinely empty; see the note on
+    // `ActivationGroup.<init>` below for why every `<init>` in this module is a
+    // real no-op rather than a suppressed body.
     r.register(
         "java/rmi/activation/Activatable",
         "<init>",
@@ -344,15 +349,27 @@ fn register_activation_natives(r: &mut NativeMethodRegistry) {
         activation_throws,
     );
 
-    // ActivationGroup.getSystem() -> ActivationSystem (returns null)
+    // ActivationGroup.getSystem() -> ActivationSystem
+    //
+    // Was a constant null, which contradicted every other method in this
+    // module: `register`/`exportObject` above tell the caller plainly that
+    // `java.rmi.activation` was removed in JDK 17, while `getSystem()` handed
+    // back a null that the caller could only discover by NPE-ing on it several
+    // frames later.  Real `getSystem()` throws when no system is set, so
+    // throwing here is BOTH spec-shaped and the honest answer.
     r.register(
         "java/rmi/activation/ActivationGroup",
         "getSystem",
         "()Ljava/rmi/activation/ActivationSystem;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        activation_throws,
     );
 
-    // ActivationGroup.<init>()V
+    // The two `<init>()V` no-ops below are genuinely empty: `java.rmi
+    // .activation` was removed in JDK 17, so in real-JDK mode these classes do
+    // not exist at all and the registrations are inert, while in synthetic-JDK
+    // mode the stub class has no state to initialise. They exist only so a
+    // `new` reaches the caller's next call — which is one of the throwing
+    // methods above, i.e. the point at which the caller learns the truth.
     r.register(
         "java/rmi/activation/ActivationGroup",
         "<init>",
@@ -360,13 +377,11 @@ fn register_activation_natives(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
-    // ActivationSystem — marker interface, register <init> so class can load
-    r.register(
-        "java/rmi/activation/ActivationSystem",
-        "<init>",
-        "()V",
-        |_ctx, _args| Ok(None),
-    );
+    // `java/rmi/activation/ActivationSystem.<init>()V` REMOVED: `ActivationSystem`
+    // is an INTERFACE, so no bytecode can ever contain `new ActivationSystem()`
+    // / `invokespecial ActivationSystem.<init>` — the registration was
+    // unreachable in both run modes, and it is not in
+    // `deprecated_verify`'s manifest or checklist.
     r.set_category(__prev_cat);
 }
 
@@ -940,16 +955,35 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // fails, cascading into the "Cannot invoke loadModule on null" NPE.
     //
     // HotSpot returns the unexpanded ACC_PUBLIC|FINAL|INTERFACE|ABSTRACT
-    // bitmask.  We don't plumb full access-flag tracking into Class yet; a
-    // pragmatic stub returns PUBLIC (0x0001) so the JDK's downstream checks
-    // see the class as accessible.  This is correct for almost every
-    // classloading path and can be refined later.
+    // bitmask.  This used to be a hardcoded PUBLIC (0x0001) for EVERY class,
+    // which is not a conservative default but an active misstatement: an
+    // interface was not reported as ACC_INTERFACE, an abstract class not as
+    // ACC_ABSTRACT, and a package-private class was reported public — so every
+    // JDK access/assignability check reading these flags silently saw the same
+    // answer regardless of the class it asked about.  CratonVM DOES track the
+    // class-file access flags (`NativeClassAccess::class_access_flags`); report
+    // them.  The 0x0001 fallback is kept for the case where the argument is not
+    // a resolvable class mirror, so no caller that works today starts failing.
     r.register(
         refl2,
         "getClassAccessFlags",
         "(Ljava/lang/Class;)I",
-        |_ctx, _args| Ok(Some(Value::Int(0x0001))),
+        |ctx, args| {
+            let flags = match args.first() {
+                Some(Value::Object(Some(mirror))) => ctx
+                    .class_id_from_mirror(*mirror)
+                    .map(|cid| i32::from(ctx.class_access_flags(cid)))
+                    .filter(|flags| *flags != 0),
+                _ => None,
+            };
+            Ok(Some(Value::Int(flags.unwrap_or(0x0001))))
+        },
     );
+    // `Reflection.ensureNativeAccess` enforces the JEP 442 restricted-method
+    // policy (`--enable-native-access`).  A no-op is CratonVM's actual policy,
+    // not a dropped check: this VM grants native access to every module
+    // unconditionally, and there is no counterpart query that would report
+    // otherwise.  It returns void, so nothing can disagree with it.
     r.register(
         refl2,
         "ensureNativeAccess",
@@ -1529,8 +1563,12 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// `ActivationGroup.getSystem()` used to answer a constant null, which the
+    /// caller could only discover by NPE-ing on it several frames later. It now
+    /// throws like its `register`/`exportObject` siblings — `java.rmi.activation`
+    /// was removed in JDK 17 and there is no activation system to return.
     #[test]
-    fn test_activation_group_get_system_null() {
+    fn test_activation_group_get_system_throws() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
@@ -1542,7 +1580,7 @@ mod tests {
             "()Ljava/rmi/activation/ActivationSystem;",
             &[],
         );
-        assert_eq!(result.unwrap(), Some(Value::Object(None)));
+        assert!(result.is_err(), "getSystem must not answer a silent null");
     }
 
     #[test]

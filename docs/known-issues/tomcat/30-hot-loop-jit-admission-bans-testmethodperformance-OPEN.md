@@ -3,8 +3,9 @@
 **Status:** 🔴 **OPEN.** Residual of
 [24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) (whose `OutOfMemoryError` is FIXED).
 This is a *throughput* residual, in the family of
-[04](04-embedded-server-throughput-wall-OPEN.md) and
-[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) — but unlike those it
+[31](31-synchronized-code-never-jit-compiled.md) (and of the retired
+[04](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md) /
+[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md)) — but unlike those it
 is root-caused here to three **specific, named** admission gates, all of which
 were added deliberately to close real silent-corruption bugs.
 

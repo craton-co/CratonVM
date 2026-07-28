@@ -1936,6 +1936,13 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     // JDK NIO buffer views consult JavaNioAccess.scaleShifts(Buffer) to compute
     // element-size shifts. Heap/direct buffers used by the Spring STOMP/Netty
     // path are byte-addressed in CratonVM, so zero is the safe default.
+    // KEEP (constant, justified) — and deliberately conservative: this is a
+    // BOOT-PATH accessor (`SharedSecrets`/`JavaNioAccess` is consulted during
+    // early NIO init), and CratonVM addresses every Buffer in bytes, so a
+    // non-zero shift derived from the view's element type would MIS-SCALE the
+    // byte-addressed reads rather than fix them. The approximation is only
+    // wrong for a caller that wants the view's logical element width, and no
+    // such caller exists on our paths today.
     registry.register(
         owner,
         "scaleShifts",

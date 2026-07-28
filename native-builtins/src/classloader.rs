@@ -8204,6 +8204,9 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int(pos + skipped as i32));
         Ok(Some(Value::Long(skipped)))
     });
+    // KEEP (constant, justified): `ByteArrayInputStream.close()` is documented
+    // as having no effect — the real JDK body is empty too, so this is the
+    // behaviour, not a stub.
     r.register(bais, "close", "()V", |_ctx, _args| Ok(None));
     r.register(bais, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -8217,6 +8220,9 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 2, Value::Int(pos)); // mark = pos
         Ok(None)
     });
+    // KEEP (constant, justified): `ByteArrayInputStream.markSupported()` is
+    // `return true` in the real JDK, and the `mark`/`reset` natives registered
+    // just above genuinely implement it against slot 2.
     r.register(bais, "markSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -8742,6 +8748,9 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // KEEP (constant, justified): `BufferedInputStream.markSupported()` is
+    // `return true` in the real JDK, and the `mark`/`reset` natives registered
+    // just above genuinely implement it against `markpos`/`marklimit`.
     r.register(bis, "markSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });

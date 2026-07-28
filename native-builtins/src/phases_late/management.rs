@@ -14,10 +14,91 @@ use super::*;
 // java.lang.management — ManagementFactory, MemoryMXBean, ThreadMXBean,
 //                         RuntimeMXBean, OperatingSystemMXBean
 // =============================================================================
+//
+// DISPATCH NOTE (measured, not assumed — read the call sites before editing):
+// almost every triple registered below is registered AGAIN by
+// `crate::jmx::register_jmx_natives`, and LAST REGISTRATION WINS. In
+// `register_synthetic_overrides` (native-builtins/src/lib.rs) this module runs
+// via `register_phase59_natives` and `register_jmx_natives` runs afterwards,
+// so the `jmx.rs` version is the one that dispatches. In real-JDK mode this
+// module is not registered at all (`register_synthetic_overrides` is skipped),
+// while `register_jmx_natives` IS called from `vm/src/vm/vm_init.rs`.
+// `experimental-jmx` is a DEFAULT feature, so both paths are the normal build.
+//
+// Consequence: fixing a value here alone changes nothing. The `jmx.rs`
+// counterpart has to be fixed too — that is why `MEMORY_MX_VERBOSE` below is
+// shared with `jmx.rs` rather than private to this module.
 
 /// Global flag for MemoryMXBean.setVerbose / isVerbose.
+///
+/// Shared with `crate::jmx`, which registers the winning `isVerbose` for the
+/// `MemoryMXBean` interface as well as the `sun.management.MemoryImpl`
+/// `setVerboseGC`/`isVerbose` pair the real-JDK bytecode routes through. One
+/// cell keeps every one of those surfaces reporting the same `-verbose:gc`
+/// state; while `jmx.rs` answered a hard-coded 0, the `setVerbose` below wrote
+/// a flag nothing read.
 pub(crate) static MEMORY_MX_VERBOSE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a live `java.lang.Thread` is a daemon.
+///
+/// Real-JDK 25 keeps the flag on `Thread.holder` (a `FieldHolder`) — the same
+/// place `vm_exec.rs::read_thread_daemon_flag` reads it from for the VM's own
+/// shutdown decisions. A synthetic `Thread` has neither field and is treated
+/// as non-daemon, exactly as that helper does. Field reads only: nothing here
+/// allocates, so the caller's `ObjectRef`s cannot move underneath it.
+pub(crate) fn thread_is_daemon(ctx: &dyn NativeContext, thread: ObjectRef) -> bool {
+    if let Value::Object(Some(holder)) = ctx.get_field_by_name(thread, "holder") {
+        if let Value::Int(v) = ctx.get_field_by_name(holder, "daemon") {
+            return v != 0;
+        }
+    }
+    matches!(ctx.get_field_by_name(thread, "daemon"), Value::Int(v) if v != 0)
+}
+
+/// Live daemon-thread count — the real datum behind
+/// `ThreadMXBean.getDaemonThreadCount()`, which both this module and `jmx.rs`
+/// answered with a hard-coded 0, making every JVM look like it was running no
+/// daemon threads at all.
+pub(crate) fn daemon_thread_count(ctx: &dyn NativeContext) -> i32 {
+    let mut count = 0i32;
+    for thread in ctx.enumerate_threads(usize::MAX) {
+        if thread_is_daemon(ctx, thread) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Ids of the live threads, read from each `java.lang.Thread`'s own `tid`.
+///
+/// That is the identity `getThreadInfo(long)` resolves against, so the two
+/// agree — a caller can feed any id from here straight back into
+/// `getThreadInfo` and get a real `ThreadInfo`. Ids come back as plain `i64`
+/// so the caller can allocate its result array afterwards: `new_array` can GC
+/// and the thread references are not pinned.
+pub(crate) fn live_thread_ids(ctx: &mut dyn NativeContext) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for thread in ctx.enumerate_threads(usize::MAX) {
+        match ctx.get_field_by_name(thread, "tid") {
+            Value::Long(id) if id > 0 => ids.push(id),
+            Value::Int(id) if id > 0 => ids.push(id as i64),
+            _ => {}
+        }
+    }
+    if ids.is_empty() {
+        // The calling thread is alive by definition, so an empty answer would
+        // break the JMM invariant. Read its real `tid` rather than inventing
+        // one; if that is unreadable too, an empty array is the honest answer.
+        let current = ctx.current_thread_object();
+        if let Value::Long(id) = ctx.get_field_by_name(current, "tid") {
+            if id > 0 {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
 
 pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -76,6 +157,9 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/management/MemoryUsage;",
         p59_nonheap_usage,
     );
+    // KEEP: 0 is the measurement, not a placeholder — CratonVM runs no
+    // finalizer thread and keeps no finalization queue, so nothing is ever
+    // pending. Same justification as the winning `jmx.rs` registration.
     r.register(
         mem,
         "getObjectPendingFinalizationCount",
@@ -123,21 +207,31 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     r.register(tmx, "getTotalStartedThreadCount", "()J", |ctx, _args| {
         Ok(Some(Value::Long(ctx.active_thread_count().max(1) as i64)))
     });
-    r.register(tmx, "getDaemonThreadCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // REAL: count the live threads carrying `Thread.holder.daemon` — the same
+    // flag the VM's own shutdown logic reads. The hard-coded 0 made every JVM
+    // look like it ran no daemon threads at all. Shares `jmx.rs`'s helper so
+    // both registrations of this triple agree.
+    r.register(tmx, "getDaemonThreadCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(daemon_thread_count(ctx))))
     });
+    // REAL thread ids. The previous body allocated one slot per live thread
+    // but then filled them with the loop INDEX (`i + 1`) rather than the
+    // thread's id, so the array's contents were fabricated even though its
+    // length was real — and `getThreadInfo(long)` resolves threads by matching
+    // `Thread.tid`, so those ids did not round-trip. Read the real `tid`.
     r.register(tmx, "getAllThreadIds", "()[J", |ctx, _args| {
-        let threads = ctx.enumerate_threads(256);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, threads.len().max(1));
-        if threads.is_empty() {
-            ctx.set_array_element(arr, 0, Value::Long(1));
-        } else {
-            for (i, _tid) in threads.iter().enumerate() {
-                ctx.set_array_element(arr, i, Value::Long((i + 1) as i64));
-            }
+        // Ids are collected as plain i64 first: `new_array` can GC, and the
+        // thread references behind them are not pinned.
+        let ids = live_thread_ids(ctx);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, ids.len());
+        for (i, id) in ids.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Long(*id));
         }
         Ok(Some(Value::Object(Some(arr))))
     });
+    // KEEP: false is the measurement. CratonVM implements no per-thread CPU
+    // accounting, and `false` is exactly what the spec wants for an
+    // unsupported optional JMM feature.
     r.register(tmx, "isThreadCpuTimeSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -150,6 +244,8 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // KEEP: false is the measurement — CratonVM does no contention timing, and
+    // "not enabled" is the state a HotSpot boots in anyway.
     r.register(
         tmx,
         "isThreadContentionMonitoringEnabled",
@@ -236,8 +332,16 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Double(-1.0))) // unsupported on non-Linux
     });
+    // REAL: the `os.version` system property the VM populates at startup —
+    // the same source the winning `jmx.rs` registration reads. The old "1.0"
+    // was a fabricated version string that matched no operating system.
+    // "unknown" only when the VM itself never learned the version.
     r.register(osx, "getVersion", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("1.0");
+        let version = ctx
+            .get_system_property("os.version")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| String::from("unknown"));
+        let s = ctx.create_string(&version);
         Ok(Some(Value::Object(Some(s))))
     });
 
@@ -261,6 +365,12 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("CratonVM Native Compiler");
         Ok(Some(Value::Object(Some(s))))
     });
+    // KEEP, as a self-consistent pair. The JIT keeps no cumulative wall-clock
+    // compile timer, and per the JMX spec `getTotalCompilationTime()` is only
+    // meaningful when monitoring is supported — so reporting `false` below is
+    // what keeps the 0 above legible as "not measured" rather than "measured
+    // and zero". FLAGGED for follow-up if the JIT gains compile-time
+    // accounting.
     r.register(cmx, "getTotalCompilationTime", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });

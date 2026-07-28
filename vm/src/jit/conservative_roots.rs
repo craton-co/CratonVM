@@ -1664,6 +1664,22 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 // `remap_active_jit_frames`.
                 let parent_rbp = unsafe { (child_rbp as *const usize).read() };
                 let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                // A link read out of the stack is NOT yet a frame base. Both
+                // helpers below dereference `[parent_rbp - sp_id_slot_off]`
+                // (and `remap_one_jit_frame` WRITES every slot its oop map
+                // names), so the link must be validated BEFORE it is used, not
+                // after: a zero/garbage word faulted at `0 - sp_id_slot_off`
+                // while walking a json-smart chain. Same order and same
+                // predicate as the other rbp-chain walks in this file
+                // (`scan_active_oop_map_at_rbp`'s walk and the two conservative
+                // band walks).
+                if parent_rbp <= child_rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp < scanner_sp
+                    || parent_rbp >= entry.entry_sp
+                {
+                    break;
+                }
                 let Some(cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
                     break;
                 };
@@ -1680,9 +1696,6 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                         cratonvm_gc::gc_quiescence::incomplete_reason::PARENT_FRAME_MAP,
                     );
                     complete = false;
-                }
-                if parent_rbp <= child_rbp {
-                    break;
                 }
                 child_rbp = parent_rbp;
             }
@@ -2443,6 +2456,22 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                 // + 8]` the return address into the caller.
                 let parent_rbp = unsafe { (child_rbp as *const usize).read() };
                 let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                // A link read out of the stack is NOT yet a frame base. Both
+                // helpers below dereference `[parent_rbp - sp_id_slot_off]`
+                // (and `remap_one_jit_frame` WRITES every slot its oop map
+                // names), so the link must be validated BEFORE it is used, not
+                // after: a zero/garbage word faulted at `0 - sp_id_slot_off`
+                // while walking a json-smart chain. Same order and same
+                // predicate as the other rbp-chain walks in this file
+                // (`scan_active_oop_map_at_rbp`'s walk and the two conservative
+                // band walks).
+                if parent_rbp <= child_rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp < scanner_sp
+                    || parent_rbp >= entry_sp
+                {
+                    break;
+                }
                 // Resolve the PARENT frame's CompiledMethod from the return
                 // address that points into it.
                 match cratonvm_jit::lookup_jit_code_range(ret_addr) {
@@ -2461,9 +2490,6 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                         dbg_examined.set(dbg_examined.get() + examined);
                     }
                     None => break, // parent is the interpreter / Rust boundary
-                }
-                if parent_rbp <= child_rbp {
-                    break; // stack must ascend (grows downward); else garbage
                 }
                 child_rbp = parent_rbp;
             }
