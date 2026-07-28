@@ -670,6 +670,40 @@ fn char_chunk_parts(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectR
     Some((buff, start, end))
 }
 
+/// The `isSet` half of `AbstractChunk.isNull()` (`end > 0 ? false : !isSet`).
+///
+/// The "no data" state is NOT the same as "no buffer". `AbstractChunk
+/// ::recycle()` clears `isSet`/`start`/`end` but deliberately keeps `buff`
+/// alive for reuse, so a recycled chunk still has a non-null buffer while
+/// being `isNull()`. Any native reproducing a Tomcat method's null-vs-empty
+/// contract must consult this rather than the `buff == null` test in
+/// [`char_chunk_parts`].
+///
+/// Callers must short-circuit on `end > 0` themselves before calling this, so
+/// that the extra field read stays off the non-empty (hot) path — see
+/// [`native_char_chunk_to_string`].
+fn char_chunk_is_set(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.get_field_by_name(this, "isSet").as_int().unwrap_or(0) != 0
+}
+
+/// Whether the chunk's `buff` field is non-null.
+///
+/// `CharChunk`'s comparison methods all start with `char[] c = buff;` and
+/// treat `c == null` as "no match" — a weaker condition than `isNull()`, and
+/// the one that decides whether a null String argument reaches `s.length()`.
+fn char_chunk_has_buffer(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(ctx.get_field_by_name(this, "buff"), Value::Object(Some(_)))
+}
+
+fn char_chunk_null_arg_npe(method: &str) -> MethodCallFailed {
+    RuntimeError::NullPointerException {
+        message: Some(format!(
+            "Cannot invoke \"String.length()\" because \"s\" is null (CharChunk.{method})"
+        )),
+    }
+    .into()
+}
+
 fn char_chunk_char_at(ctx: &dyn NativeContext, buff: ObjectRef, index: usize) -> u16 {
     ctx.get_array_element(buff, index).as_int().unwrap_or(0) as u16
 }
@@ -853,6 +887,15 @@ fn mapping_match_static(ctx: &mut dyn NativeContext, name: &str) -> Option<Objec
     }
 }
 
+/// Per-char lowercase exactly as `Mapper.compareIgnoreCase` does it:
+/// `c > 0xFF ? Character.toLowerCase(c) : Ascii.toLower(c)`, decided
+/// independently for each side of the comparison. `Ascii.toLower` is an
+/// ASCII-only table (`A`-`Z` only), so Latin-1 letters like `À` are
+/// deliberately left alone.
+///
+/// NOTE: `CharChunk.equalsIgnoreCase`/`startsWithIgnoreCase` use a *paired*
+/// branch instead (`if (c1 > 0xFF || c2 > 0xFF)`), which is not the same
+/// function — use [`char_chunk_chars_equal_ignore_case`] for those.
 fn ascii_lower_char(ch: u16) -> u16 {
     if ch <= 0xff {
         let b = ch as u8;
@@ -862,10 +905,36 @@ fn ascii_lower_char(ch: u16) -> u16 {
             ch
         }
     } else {
-        char::from_u32(ch as u32)
-            .and_then(|c| c.to_lowercase().next())
-            .map(|c| c as u32 as u16)
-            .unwrap_or(ch)
+        unicode_lower_char(ch)
+    }
+}
+
+/// `Character.toLowerCase(char)` for a single UTF-16 unit.
+fn unicode_lower_char(ch: u16) -> u16 {
+    char::from_u32(ch as u32)
+        .and_then(|c| c.to_lowercase().next())
+        .map(|c| c as u32 as u16)
+        .unwrap_or(ch)
+}
+
+/// Case-insensitive char equality as `CharChunk.equalsIgnoreCase` and
+/// `CharChunk.startsWithIgnoreCase` define it:
+///
+/// ```java
+/// if (c1 > 0xFF || c2 > 0xFF) {
+///     if (Character.toLowerCase(c1) != Character.toLowerCase(c2)) { return false; }
+/// } else if (Ascii.toLower(c1) != Ascii.toLower(c2)) { return false; }
+/// ```
+///
+/// The `||` matters: one side being non-Latin-1 pulls the *other* side onto
+/// `Character.toLowerCase` too. Lowering each side independently (the
+/// `Mapper` rule, [`ascii_lower_char`]) makes e.g. `U+212B ANGSTROM SIGN`
+/// vs `U+00C5 Å` compare unequal, where Tomcat folds both to `U+00E5 å`.
+fn char_chunk_chars_equal_ignore_case(c1: u16, c2: u16) -> bool {
+    if c1 > 0xff || c2 > 0xff {
+        unicode_lower_char(c1) == unicode_lower_char(c2)
+    } else {
+        ascii_lower_char(c1) == ascii_lower_char(c2)
     }
 }
 
@@ -885,7 +954,7 @@ fn char_chunk_equals_string(
     for (i, expected) in units.iter().enumerate() {
         let actual = char_chunk_char_at(ctx, buff, start + i);
         if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+            if !char_chunk_chars_equal_ignore_case(actual, *expected) {
                 return false;
             }
         } else if actual != *expected {
@@ -912,7 +981,7 @@ fn char_chunk_starts_with(
     for (i, expected) in units.iter().enumerate() {
         let actual = char_chunk_char_at(ctx, buff, start + pos + i);
         if ignore_case {
-            if ascii_lower_char(actual) != ascii_lower_char(*expected) {
+            if !char_chunk_chars_equal_ignore_case(actual, *expected) {
                 return false;
             }
         } else if actual != *expected {
@@ -1034,20 +1103,63 @@ fn native_response_to_absolute(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// The method is already listed as a force-native hot path, but previously
 /// had no matching registration and consequently paid StringCache plus Java
 /// bytecode dispatch for every response URL. Dynamic output stays uninterned.
+///
+/// The Java body this replaces is a three-way decision, not a two-way one:
+///
+/// ```java
+/// if (isNull()) { return null; }
+/// else if (end - start == 0) { return ""; }
+/// return StringCache.toString(this);
+/// ```
+///
+/// and `isNull()` is `end > 0 ? false : !isSet` — a *state* test, not a
+/// buffer-null test. `recycle()` clears `isSet`/`start`/`end` but keeps
+/// `buff`, so keying "null" off `buff == null` alone reported a recycled
+/// chunk as empty-but-set and returned `""` where Tomcat returns `null`
+/// (`TestCharChunk.testToString`,
+/// `docs/internal/fixed-suite-bugs/tomcat/25-charchunk-tostring-null-vs-empty.md`).
+///
+/// PERF: `end` is tested first and `isSet` is read **only** when `end == 0`,
+/// so the ordinary non-empty path still performs exactly three
+/// `get_field_by_name` lookups (`end`, `buff`, `start`) — the same count as
+/// before the null-vs-empty fix. This method is hot enough (every response
+/// URL) that adding an unconditional fourth name-keyed field lookup here
+/// would be a measurable regression, so do not hoist the `isSet` read.
 fn native_char_chunk_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let Some((buff, start, end)) = char_chunk_parts(ctx, this) else {
-        return Ok(Some(Value::Object(None)));
+    let end = ctx
+        .get_field_by_name(this, "end")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    if end == 0 {
+        // `isNull()` reduces to `!isSet` here. A never-set or recycled chunk
+        // is null; a chunk that IS set but holds no characters is "".
+        return Ok(Some(if char_chunk_is_set(ctx, this) {
+            Value::Object(Some(ctx.create_string("")))
+        } else {
+            Value::Object(None)
+        }));
+    }
+    // `end > 0` => not `isNull()`, so from here every outcome is a String.
+    let buff = match ctx.get_field_by_name(this, "buff") {
+        Value::Object(Some(o)) => o,
+        _ => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
     };
-    let mut units = Vec::with_capacity(end.saturating_sub(start));
+    let start = ctx
+        .get_field_by_name(this, "start")
+        .as_int()
+        .unwrap_or(0)
+        .max(0) as usize;
+    if end <= start {
+        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
+    }
+    let mut units = Vec::with_capacity(end - start);
     for i in start..end {
         units.push(ctx.get_array_element(buff, i).as_int().unwrap_or(0) as u16);
-    }
-    if units.is_empty() {
-        return Ok(Some(Value::Object(Some(ctx.create_string("")))));
     }
     let text = String::from_utf16_lossy(&units);
     Ok(Some(Value::Object(Some(ctx.create_string_uninterned_gc_safe(&text)))))
@@ -1063,7 +1175,18 @@ fn native_char_chunk_equals_string(
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // `equals(String)` computes `len` from the chunk first and then
+        // short-circuits on `c == null || len != s.length()`: a null
+        // argument is silently `false` when there is no buffer, but an NPE
+        // once there is one. Returning `false` unconditionally swallowed a
+        // real NPE the Tomcat bytecode raises.
+        _ => {
+            return if char_chunk_has_buffer(ctx, this) {
+                Err(char_chunk_null_arg_npe("equals"))
+            } else {
+                Ok(Some(Value::Int(0)))
+            }
+        }
     };
     Ok(Some(Value::Int(
         if char_chunk_equals_string(ctx, this, &s, false) {
@@ -1084,7 +1207,14 @@ fn native_char_chunk_equals_ignore_case(
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // Same short-circuit shape as `equals(String)` above.
+        _ => {
+            return if char_chunk_has_buffer(ctx, this) {
+                Err(char_chunk_null_arg_npe("equalsIgnoreCase"))
+            } else {
+                Ok(Some(Value::Int(0)))
+            }
+        }
     };
     Ok(Some(Value::Int(
         if char_chunk_equals_string(ctx, this, &s, true) {
@@ -1102,7 +1232,10 @@ fn native_char_chunk_starts_with(ctx: &mut dyn NativeContext, args: &[Value]) ->
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // Unlike `equals`, `startsWith` reads `s.length()` into a local
+        // BEFORE the `c == null` test, so a null argument always NPEs —
+        // buffer or no buffer.
+        _ => return Err(char_chunk_null_arg_npe("startsWith")),
     };
     Ok(Some(Value::Int(
         if char_chunk_starts_with(ctx, this, &s, 0, false) {
@@ -1123,7 +1256,8 @@ fn native_char_chunk_starts_with_ignore_case(
     };
     let s = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-        _ => return Ok(Some(Value::Int(0))),
+        // Same pre-null-check `s.length()` as `startsWith` above.
+        _ => return Err(char_chunk_null_arg_npe("startsWithIgnoreCase")),
     };
     let pos = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
     Ok(Some(Value::Int(
