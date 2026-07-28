@@ -9,7 +9,7 @@ closure merged as `2f8249c36` on 2026-07-24. The original report remained in
 `docs/known-issues` after that delivery, so it was stale rather than an
 active residual.
 
-On a fresh release build from current `dev` (`b695d468f`), using Eclipse
+On a fresh release build from the initial `dev` snapshot (`b695d468f`), using Eclipse
 Temurin 25.0.3.9 and the real `apps/spring-boot` fixture, the full six-test
 `OracleUcpDataSourcePoolMetadataTests` class passed on every fresh VM process:
 
@@ -22,6 +22,11 @@ The JIT runs completed in 7.8 s, 6.9 s, and 6.6 s; the interpreter runs
 completed in 6.8 s, 6.6 s, and 5.7 s. This directly covers the historically
 timing-sensitive first on-demand borrow in `getPoolSizeOneConnection` in both
 execution modes.
+
+After merging current `origin/dev` into the delivery branch, a second fresh
+fat-LTO release build also passed the full class with JIT (6/6, 5.8 s) and
+`--nojit` (6/6, 6.5 s), so the retirement is validated on the final integrated
+runtime as well.
 
 The broader 52-class `spring-boot-jdbc` run could not be repeated on this
 host because the supplied fixture has an incomplete, untracked Gradle tree:
