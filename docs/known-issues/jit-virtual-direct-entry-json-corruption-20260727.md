@@ -1,4 +1,4 @@
-# JIT: rare json-smart parse corruption on the compiled-callee direct-call path — needs a MOVING young generation
+# JIT: rare json-smart parse corruption reached through the compiled-callee direct-call path (RESOLVED)
 
 > **RESOLVED later the same day — the corruption is gone once the RBC.6
 > precise-handler-frame relaxation is gated off.** A `git bisect` over the
@@ -15,6 +15,57 @@
 > The analysis below (especially the `CRATONVM_MOVING_YOUNG=0` row and the
 > refutations) is what made that reading possible — it is kept as written.
 
+
+> **CORRECTION 2026-07-28 — the "needs a MOVING young generation" reading is
+> backwards, and the RESOLVED banner above leans on it.** That conclusion came
+> from a `CRATONVM_MOVING_YOUNG=0` arm in the table below. `types/src/flags.rs`
+> sets `DEFAULT_MOVING_YOUNG = false` and parses `CRATONVM_MOVING_YOUNG` with
+> `present()`, which never reads the value — so `=0` turns the compacting young
+> generation **ON**, and the opt-out is `CRATONVM_NO_MOVING_YOUNG`. That arm
+> therefore measured the moving collector, not the absence of one. Re-measured
+> on one binary with the correct spellings:
+>
+> | config (`-Xmx1g`) | ops | errors |
+> |---|---|---|
+> | `CRATONVM_NO_MOVING_YOUNG=1` (i.e. the default) | 4,150,000 | **4** |
+> | `CRATONVM_MOVING_YOUNG=1` (compacting young) | 4,120,000 | **0** |
+>
+> The corruption belongs to the **default, non-moving** mark-sweep young
+> generation: a live object whose only root the marker cannot see is swept and
+> its memory reused. That is still perfectly consistent with the bisect to
+> `83e078aa5` and with a reconstructed handler frame dropping live locals — a
+> dropped root is invisible to a *marking* collector, which is the default one.
+> Only the "it needs relocation" inference is wrong. Every other measurement in
+> this doc (the `POISON_FREE` refutation, `DIRECT_CALLEE_CALLS=0`,
+> `DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0`, the heap-size rows) was taken at the
+> default and stands.
+
+> **A second, independent defect was found underneath this and is fixed
+> separately (2026-07-28).** The conservative backstop that should have caught
+> a dropped-local root was itself mis-aimed. A `JIT_ENTRY_CHAIN` entry records
+> `(compiled_method, exact_rbp)` for a Rust→JIT boundary, but every compiled
+> prologue publishes its own RBP into the innermost-RBP mirror, and two
+> generated-code paths reach a compiled callee with **no guard at all**: the
+> inline MIC/PIC cascade and `runtime_lowering::emit_hashed_vtable_stub` (the
+> hashed megamorphic table, which is *not* gated by
+> `direct_jit_callee_calls_enabled()` — which is why
+> `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` never stopped this). After such a call
+> the entry names the caller while `exact_rbp` names the callee's frame, so
+> `scan_one_frame_precise` read the safepoint id from an unrelated slot,
+> published the *caller's* oop-map offsets against the *callee's* frame, and
+> sized the innermost conservative band with the caller's `osr_frame_size` —
+> under-covering that frame while returning `true`, which suppressed the
+> whole-band fallback that would have covered it. The same mis-attribution sat
+> in `refresh_moving_young_coverage_for_current_thread` and
+> `remap_active_jit_frames`; it is measurably reached (12 of 40 coverage checks
+> in a 30,000-op probe run under `CRATONVM_MOVING_YOUNG=1`).
+>
+> Fixing it alone also takes the probe to **0 errors in 6,000,000 ops** on a
+> build that does **not** contain the `83e078aa5` gate, against 4 errors in
+> 4,150,000 for the same source without it — i.e. the two fixes are independent
+> and either one closes this symptom, which is what you would expect from a
+> missing root plus the backstop that should have contained it. `dev` with only
+> the `83e078aa5` gate is likewise 0 in 6,000,000.
 
 **Status: OPEN**, but re-characterized on 2026-07-27. It is **not** a stale
 inline-cache entry and **not** the NodeConnections SIGSEGV; both of those
