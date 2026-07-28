@@ -151,7 +151,9 @@ C:/craton/CratonVM-bulkid-insertselect-20260727/target/release/cratonvm-bulkid-h
 | 5 | `jpa.compliance.CriteriaFunctionParametersBindingTest` | 1/2 | **2/2** | 2/2 |
 | 6 | `query.hql.instantiation.DynamicInstantiationWithJoinAndGroupAndOrderByByTest` | 0/1 | **1/1** | 1/1 |
 
-**Total: 118/118 passing, zero failures — identical to HotSpot.**
+**Total: 123/123 passing, zero failures — identical to HotSpot** (82/123 before the
+fix; the per-class column above sums to 123, an earlier revision of this line said 118
+by an arithmetic slip).
 
 Doc 7 (`parameterized-offset-ignored-groupby-having`) was diagnosed as an
 independent `OFFSET ? ROWS` binding bug. It is not: the query's
