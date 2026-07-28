@@ -17,10 +17,21 @@ import java.io.PrintWriter;
 // itself): inner classes (readInnerClasses), annotations (readAttrs /
 // SPRING-TESTCOMPILER.3's suppression-annotation symptom), and generics /
 // deprecation (Lower.boxIfNeeded's original trigger).
+//
+// 2026-07-27: kind 4 (@SuppressWarnings("deprecation") compiled under
+// -Xlint:deprecation -Werror) was added once the unrelated
+// "duplicate element 'value' in annotation @SuppressWarnings" defect this
+// probe originally had to route around was fixed: LinkedHashSet.remove
+// deleted the element but returned false, and javac's
+// Annotate.attributeAnnotation reports exactly that error when
+// members.remove(method) answers false (see the retired
+// suppresswarnings-annotation-duplicate-value-bug-20260726 write-up).
+// That kind is also the standalone form of SPRING-TESTCOMPILER.3's
+// documented symptom (a).
 public class JavacConsolidationProbe {
 
     private static String sourceFor(int i) {
-        int kind = i % 4;
+        int kind = i % 5;
         switch (kind) {
             case 0:
                 return "@Deprecated class Trivial" + i + " { public int x() { return " + i + "; } }";
@@ -30,15 +41,18 @@ public class JavacConsolidationProbe {
                         + "static class Inner { int v = " + i + "; } "
                         + "public int x() { return new Inner().v; } }";
             case 2:
-                // Annotation on a member -- exercises readAttrs. Uses only
-                // @Deprecated (single, no explicit value argument) since
-                // @SuppressWarnings("...") hits an unrelated, separately
-                // documented bug (see
-                // suppresswarnings-annotation-duplicate-value-bug-20260726.md)
-                // that would contaminate this consolidation test.
+                // Annotation on a member -- exercises readAttrs. Bare
+                // @Deprecated, no explicit annotation value.
                 return "class Trivial" + i + " { "
                         + "@Deprecated public int old() { return " + i + "; } "
                         + "public int x() { return old(); } }";
+            case 4:
+                // Single-element annotation with the `value = ` shorthand,
+                // whose suppression must actually be honored under -Werror
+                // (see the header note): SPRING-TESTCOMPILER.3 symptom (a).
+                return "class Trivial" + i + " { "
+                        + "@Deprecated public int old() { return " + i + "; } "
+                        + "@SuppressWarnings(\"deprecation\") public int x() { return old(); } }";
             default:
                 // Generics -- exercises erasure-heavy symbol completion.
                 return "import java.util.*; class Trivial" + i + " { "
@@ -64,13 +78,18 @@ public class JavacConsolidationProbe {
                 pw.print(source);
             }
             ByteArrayOutputStream errOut = new ByteArrayOutputStream();
-            int rc = compiler.run(null, null, errOut,
-                    "-d", tmpDir.getAbsolutePath(),
-                    "-Xlint:-deprecation",
-                    srcFile.getAbsolutePath());
+            int rc = (i % 5 == 4)
+                    ? compiler.run(null, null, errOut,
+                            "-d", tmpDir.getAbsolutePath(),
+                            "-Xlint:deprecation", "-Werror",
+                            srcFile.getAbsolutePath())
+                    : compiler.run(null, null, errOut,
+                            "-d", tmpDir.getAbsolutePath(),
+                            "-Xlint:-deprecation",
+                            srcFile.getAbsolutePath());
             if (rc != 0) {
                 failures++;
-                System.out.println("RESULT: FAIL at iteration " + i + " (kind " + (i % 4)
+                System.out.println("RESULT: FAIL at iteration " + i + " (kind " + (i % 5)
                         + ") -- javac exit " + rc + ", stderr:\n" + errOut.toString());
                 if (failures > 3) {
                     System.out.println("RESULT: too many failures (" + failures + "), stopping early");

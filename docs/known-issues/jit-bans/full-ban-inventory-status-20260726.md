@@ -320,8 +320,28 @@ Hibernate/ES/Keycloak false negatives were.
    any source containing `@SuppressWarnings("...")` fails in-process
    javac compilation under CratonVM ("duplicate element 'value'") —
    reproduces on the first-ever compile, with JIT fully disabled, so it's
-   NOT part of the javac-JIT-miscompile family at all. Not root-caused.
-   `docs/known-issues/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
+   NOT part of the javac-JIT-miscompile family at all.
+   **RESOLVED 2026-07-27** — root cause was `LinkedHashSet.remove(Object)`
+   deleting the element but returning `false` (javac's
+   `Annotate.attributeAnnotation` reports exactly that error when
+   `members.remove(method)` answers false); fixed in `native-collections` /
+   `native-builtins`, and the write-up retired out of `known-issues`. The
+   follow-up it raised — whether `SPRING-TESTCOMPILER.3`'s symptom (a) was
+   really that bug rather than a JIT miscompile — was tested and refuted;
+   see item 6.
+
+6. **`SPRING-TESTCOMPILER.3` re-verified 2026-07-27, stays.** With the
+   `@SuppressWarnings` defect above fixed, `ClassFinder.complete` was
+   un-banned in an env-gated build (all other bans active) and re-measured:
+   `AutowiredAnnotationBeanRegistrationAotContributionTests` 14/14 → 9/14
+   (exactly the 5 `DeprecationTests`, symptom (a) verbatim) and
+   `BeanDefinitionMethodGeneratorTests` 34/34 → 32/34; both are 100% with the
+   ban active, matching HotSpot JDK 25. That round also produced the
+   Spring-free standalone reproducer the ban never had —
+   `DeprecationSuppressionProbe.java` in
+   `docs/known-issues/repros/jitban-remaining-20260726/`, reproducing symptom
+   (a) at iteration ~21 in ~2 minutes. Details and the narrowed mechanism are
+   in the `SPRING-TESTCOMPILER.3` comment in `vm/src/jit/skip_list.rs`.
 
 **Net this round:** 1 real VM bug fixed (classloader delegation), 1 ban
 removed (TOMCAT-DOHEAD-JUNIT-ITERATOR.1), 1 prior overclaim corrected
