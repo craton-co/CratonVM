@@ -58,6 +58,21 @@ pub(crate) mod jdbc_registry {
         sql: String,
         params: HashMap<usize, ParamValue>,
         batch: Vec<HashMap<usize, ParamValue>>,
+        /// `CallableStatement.registerOutParameter(int, …)` registrations,
+        /// keyed by the 1-based parameter index.
+        out_params: HashMap<usize, OutParam>,
+        /// The same, for the `registerOutParameter(String, …)` overloads.
+        out_params_by_name: HashMap<String, OutParam>,
+    }
+
+    /// One `CallableStatement.registerOutParameter` registration: the
+    /// `java.sql.Types` code the caller asked for plus the optional scale /
+    /// SQL type name carried by the three-argument overloads.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct OutParam {
+        pub sql_type: i32,
+        pub scale: i32,
+        pub type_name: Option<String>,
     }
 
     #[derive(Clone)]
@@ -358,6 +373,8 @@ pub(crate) mod jdbc_registry {
                 sql: sql.to_string(),
                 params: HashMap::new(),
                 batch: Vec::new(),
+                out_params: HashMap::new(),
+                out_params_by_name: HashMap::new(),
             },
         );
         id
@@ -400,6 +417,84 @@ pub(crate) mod jdbc_registry {
         if let Some(ps) = reg.prepared.get_mut(&ps_id) {
             ps.params.clear();
         }
+    }
+
+    // --- CallableStatement OUT-parameter registrations ---
+    //
+    // JDBC requires the driver to REMEMBER the type a caller registers for an
+    // OUT parameter — it is the only record that the parameter is an OUT at
+    // all. SQLite has no stored procedures, so nothing executes against the
+    // registration yet, but the state below is real, survives to
+    // `free_prepared`, and is readable through `out_parameter*`; and an
+    // unknown statement id / illegal index is now reported instead of being
+    // silently swallowed.
+
+    /// Record a `registerOutParameter(int parameterIndex, …)` registration.
+    pub fn register_out_parameter(
+        ps_id: i64,
+        index: usize,
+        sql_type: i32,
+        scale: i32,
+        type_name: Option<String>,
+    ) -> Result<(), String> {
+        if index == 0 {
+            return Err("registerOutParameter: parameter index is 1-based".to_string());
+        }
+        let mut reg = registry().lock();
+        let ps = reg
+            .prepared
+            .get_mut(&ps_id)
+            .ok_or_else(|| "Prepared statement not found".to_string())?;
+        ps.out_params.insert(
+            index,
+            OutParam {
+                sql_type,
+                scale,
+                type_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record a `registerOutParameter(String parameterName, …)` registration.
+    pub fn register_out_parameter_named(
+        ps_id: i64,
+        name: &str,
+        sql_type: i32,
+    ) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("registerOutParameter: parameter name is empty".to_string());
+        }
+        let mut reg = registry().lock();
+        let ps = reg
+            .prepared
+            .get_mut(&ps_id)
+            .ok_or_else(|| "Prepared statement not found".to_string())?;
+        ps.out_params_by_name.insert(
+            name.to_string(),
+            OutParam {
+                sql_type,
+                scale: 0,
+                type_name: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// The registration made for a 1-based parameter index, if any.
+    pub fn out_parameter(ps_id: i64, index: usize) -> Option<OutParam> {
+        let reg = registry().lock();
+        reg.prepared
+            .get(&ps_id)
+            .and_then(|ps| ps.out_params.get(&index).cloned())
+    }
+
+    /// The registration made for a named parameter, if any.
+    pub fn out_parameter_named(ps_id: i64, name: &str) -> Option<OutParam> {
+        let reg = registry().lock();
+        reg.prepared
+            .get(&ps_id)
+            .and_then(|ps| ps.out_params_by_name.get(name).cloned())
     }
 
     /// Execute a prepared query. Returns (stmt_id, row_count).
@@ -2917,39 +3012,95 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
 
     // NEW-14.N1 — CallableStatement output parameter support.
     //
-    // `registerOutParameter(int, int)` / `registerOutParameter(int, int, int)`
-    // / `registerOutParameter(String, int)` record the caller's intent but
-    // our rusqlite backend doesn't expose true stored-procedure OUT
-    // parameters — rusqlite is a pure SQLite binding and SQLite's CALL
-    // mechanism is limited. The natives below mark the registration as
-    // a no-op (which is spec-legal: a CallableStatement that registers
-    // an OUT parameter but never reads it is valid per JDBC §4.2), and
-    // `wasNull()` / `getObject(int)` fall through to the inherited
-    // PreparedStatement implementation which returns the corresponding
-    // ResultSet column value.
+    // These were no-ops until 2026-07-28, justified by the claim that
+    // `wasNull()` / `getObject(int)` "fall through to the inherited
+    // PreparedStatement implementation". That claim was false: `getObject` /
+    // `wasNull` are registered on `java/sql/ResultSet` only, and the
+    // `alias_class` calls above copy Statement/PreparedStatement onto
+    // CallableStatement — not ResultSet. So the registration was simply
+    // dropped, with nothing downstream to compensate.
     //
-    // KEEP (deliberate no-ops) — re-confirmed 2026-07-27. The registration
-    // itself carries no state SQLite could honour; the values a caller
-    // subsequently reads come from the ResultSet path above, so recording the
-    // requested SQL type here would change nothing that is ever read back.
+    // SQLite has no stored procedures, so we still cannot *execute* an OUT
+    // parameter; what a driver can and must do is REMEMBER the registration
+    // (JDBC §4.3.2 — the registered type is the only record that a parameter
+    // is an OUT at all). `jdbc_registry::register_out_parameter*` stores it on
+    // the PreparedState, `out_parameter*` reads it back, and an unknown
+    // statement id or a 0 index is now reported rather than swallowed.
     let cstmt = "java/sql/CallableStatement";
-    r.register(cstmt, "registerOutParameter", "(II)V", |_ctx, _args| {
+    r.register(cstmt, "registerOutParameter", "(II)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        jdbc_registry::register_out_parameter(ps_id, idx, sql_type, 0, None)
+            .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         Ok(None)
     });
-    r.register(cstmt, "registerOutParameter", "(III)V", |_ctx, _args| {
+    r.register(cstmt, "registerOutParameter", "(III)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let scale = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        jdbc_registry::register_out_parameter(ps_id, idx, sql_type, scale, None)
+            .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         Ok(None)
     });
+    // Descriptor fix: the three-argument type-name overload is
+    // `registerOutParameter(int, int, String)` — `(IILjava/lang/String;)V`.
+    // This was registered as `(ILjava/lang/String;)V`, which names no method
+    // on `java.sql.CallableStatement` at all, so the entry could never be
+    // reached by any call site in either run mode.
     r.register(
         cstmt,
         "registerOutParameter",
-        "(ILjava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        "(IILjava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let type_name = match args.get(3) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
+            };
+            jdbc_registry::register_out_parameter(ps_id, idx, sql_type, 0, type_name)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
     );
     r.register(
         cstmt,
         "registerOutParameter",
         "(Ljava/lang/String;I)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            jdbc_registry::register_out_parameter_named(ps_id, &name, sql_type)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
     );
     r.set_category(__prev_cat);
 }
@@ -3251,5 +3402,48 @@ pub(crate) mod new14_jdbc_tests {
         );
         assert_eq!(jdbc_registry::driver_name(), "CratonVM JDBC");
         assert_eq!(jdbc_registry::driver_version(), "1.0");
+    }
+
+    // ---- NEW-14.N1 CallableStatement OUT-parameter registration ----
+
+    /// `registerOutParameter` must keep the registration (it used to be a
+    /// no-op that dropped it), reject an unknown statement, and disappear
+    /// with the statement.
+    #[test]
+    fn new14_register_out_parameter_round_trips() {
+        let conn = jdbc_registry::open_connection(":memory:").unwrap();
+        let ps = jdbc_registry::prepare(conn, "SELECT ?");
+
+        // (int, int) — java.sql.Types.INTEGER.
+        jdbc_registry::register_out_parameter(ps, 1, 4, 0, None).unwrap();
+        let p = jdbc_registry::out_parameter(ps, 1).expect("registration recorded");
+        assert_eq!(p.sql_type, 4);
+        assert_eq!(p.scale, 0);
+        assert_eq!(p.type_name, None);
+
+        // (int, int, int) — Types.DECIMAL with a scale.
+        jdbc_registry::register_out_parameter(ps, 2, 3, 4, None).unwrap();
+        assert_eq!(jdbc_registry::out_parameter(ps, 2).unwrap().scale, 4);
+
+        // (int, int, String) — Types.STRUCT with a SQL type name.
+        jdbc_registry::register_out_parameter(ps, 3, 2002, 0, Some("MY_TYPE".to_string())).unwrap();
+        let p3 = jdbc_registry::out_parameter(ps, 3).expect("registration recorded");
+        assert_eq!(p3.sql_type, 2002);
+        assert_eq!(p3.type_name.as_deref(), Some("MY_TYPE"));
+
+        // (String, int) — named parameter.
+        jdbc_registry::register_out_parameter_named(ps, "total", 4).unwrap();
+        let named = jdbc_registry::out_parameter_named(ps, "total").expect("named registration");
+        assert_eq!(named.sql_type, 4);
+
+        // Nothing was registered for index 9.
+        assert!(jdbc_registry::out_parameter(ps, 9).is_none());
+        // A 1-based index of 0 and an unknown statement are both errors.
+        assert!(jdbc_registry::register_out_parameter(ps, 0, 4, 0, None).is_err());
+        assert!(jdbc_registry::register_out_parameter(ps + 9999, 1, 4, 0, None).is_err());
+
+        jdbc_registry::free_prepared(ps);
+        assert!(jdbc_registry::out_parameter(ps, 1).is_none());
+        jdbc_registry::close_connection(conn);
     }
 }

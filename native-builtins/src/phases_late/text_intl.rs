@@ -504,16 +504,33 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    // KEEP. `beginIndex == endIndex == 0` is the real JDK's "the requested
-    // field was not found in the formatted output" state, and it is what this
-    // carrier consistently reports: the 2-field layout has no beginIndex slot,
-    // and the `getEndIndex` sibling below reads slot 1, which `<init>` zeroes
-    // and no formatter in this tree ever updates. A caller doing
-    // `out.substring(fp.getBeginIndex(), fp.getEndIndex())` therefore gets the
-    // correct empty string. (Residual, not a stub: the `format(...,
-    // FieldPosition)` natives further down do not populate field positions at
-    // all — fixing that, not this getter, is what would make them non-zero.)
-    r.register(fp, "getBeginIndex", "()I", |_ctx, _args| {
+    // `java.text.FieldPosition` is a CONCRETE class, so this native also
+    // intercepts REAL FieldPosition receivers — and the real JDK declares
+    // `int field; int endIndex; int beginIndex; Format.Field attribute;`
+    // in that order. That is exactly why the synthetic layout above is
+    // (field=0, endIndex=1) and why `getEndIndex` below reads slot 1
+    // unguarded: the first two slots already line up with the real class.
+    // beginIndex is then slot 2 on a real receiver, and the flat `0` this
+    // returned until 2026-07-28 discarded it — after a real
+    // `format(obj, buf, pos)` wrote both indices,
+    // `out.substring(fp.getBeginIndex(), fp.getEndIndex())` sliced from 0
+    // instead of from the field start.
+    //
+    // Guarded exactly like `ParsePosition.getErrorIndex` above. On the 2-field
+    // synthetic there is no beginIndex slot and 0 stays correct: it is the
+    // JDK's "requested field not found" state, and it agrees with the slot-1
+    // endIndex that `<init>` zeroes and no formatter in this tree updates.
+    r.register(fp, "getBeginIndex", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Slot 2 is only read when it really is an int — a receiver whose
+        // third slot is a reference (a layout that does not match the one
+        // described above) falls back to the "field not found" 0 rather than
+        // returning an object from an `()I` native.
+        if ctx.object_num_fields(this) > 2 {
+            if let Value::Int(begin) = ctx.get_field(this, 2) {
+                return Ok(Some(Value::Int(begin)));
+            }
+        }
         Ok(Some(Value::Int(0)))
     });
     r.register(fp, "getEndIndex", "()I", |ctx, args| {

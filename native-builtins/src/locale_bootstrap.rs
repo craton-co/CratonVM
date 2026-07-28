@@ -577,8 +577,27 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // non-null value to synthesise for a provider class this VM does not
     // implement — the honest choices are null or that InternalError, and the
     // JDK's own callers (`LocaleServiceProviderPool.findAdapter`) are written
-    // to skip a null adapter and try the next one. Registered only on the
-    // synthetic path.
+    // to skip a null adapter and try the next one.
+    //
+    // Wave-3 CORRECTION — the wave-2 note ended "Registered only on the
+    // synthetic path", and that is FALSE. `locale_bootstrap::register` has a
+    // single caller, `lib.rs::register_essential_natives_with_shims`, which is
+    // the REAL-JDK path (`vm/src/vm/vm_init.rs`). So this native shadows real
+    // `JRELocaleProviderAdapter` bytecode in the default run mode, and the
+    // blanket null therefore also suppresses the switch's SUCCESS arms — the
+    // ~12 SPI classes real JDK does answer (`DateFormatProvider`,
+    // `DecimalFormatSymbolsProvider`, `BreakIteratorProvider`, …), not just the
+    // unknown ones that would have hit the InternalError.
+    //
+    // Still a KEEP, but now for the honest reason: the faithful fix is to
+    // switch on `c.getSimpleName()` and delegate to the matching real
+    // `get*Provider()` getter, answering null ONLY on the default arm. That
+    // was NOT done here because those getters instantiate the adapter's inner
+    // provider classes off the JDK resource bundles — precisely the chain this
+    // C20 override exists to bypass for Jackson/H2/`Locale.getDefault()`
+    // formatting — and it cannot be landed without running those suites.
+    // Anyone doing it must re-run them; do not "simplify" it to a delegation
+    // on the strength of the switch alone.
     registry.register(
         "sun/util/locale/provider/JRELocaleProviderAdapter",
         "getLocaleServiceProvider",

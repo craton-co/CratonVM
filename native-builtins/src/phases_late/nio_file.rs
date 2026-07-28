@@ -1499,18 +1499,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // `getOwner`/`setOwner` (from the `FileOwnerAttributeView` supertype) —
     // not exercised by the H2 tests this view was added for, but left
     // unregistered would AbstractMethodError for any other caller now that
-    // this view is reachable. `Files.getOwner`/`setOwner` (registered
-    // elsewhere in this file) already treat owner lookup as unsupported
-    // (null/no-op); match that rather than inventing a UserPrincipal.
-    // `getOwner` KEEP-as-null is deliberate and matches the `Files.getOwner`
-    // native: this VM has no `UserPrincipalLookupService`, so there is no
-    // principal object to hand back, and inventing one would be worse than
-    // null (callers `equals`-compare principals).
+    // this view is reachable.
+    //
+    // `getOwner` was `null`, which `Files.getOwner`'s contract never permits —
+    // it throws instead — so every caller NPE'd on the result. There IS a real
+    // principal to return: `p59_files_read_attributes` fills `st_uid`, and
+    // `native-io` registers `UnixNativeDispatcher.getpwuid`, so the real JDK's
+    // own `UnixFileAttributes.owner()` bytecode resolves it. Delegate to it.
     r.register(
         "java/nio/file/attribute/PosixFileAttributeView",
         "getOwner",
         "()Ljava/nio/file/attribute/UserPrincipal;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path_value = ctx.get_field(this, 0);
+            nio_owner_principal(ctx, path_value)
+        },
     );
     // `setOwner` was a silent no-op that reported success while leaving the
     // file's owner untouched — the worst outcome for a caller doing a
@@ -1588,12 +1592,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(ctx.get_field(this, 4)))
         });
-        // KEEP: `null` is the documented JDK answer when a file key is
-        // unavailable (the JDK's own Windows provider returns null on
-        // FAT-class volumes and network shares), and `FileTreeWalker.wouldLoop`
-        // — the only JDK consumer — handles it by skipping its identity check.
-        r.register(dfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| {
-            Ok(Some(Value::Object(None)))
+        // Was an unconditional `null`, so `FileTreeWalker.wouldLoop` could never
+        // detect a symlink cycle and no two paths could ever be recognised as
+        // the same file. `readAttributes` records the backing path in slot 5 —
+        // ask the OS for the real identity (see `file_identity_key_for_path`);
+        // `null` survives only as the genuine "unavailable" answer.
+        r.register(dfa, "fileKey", "()Ljava/lang/Object;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let p = dos_attrs_path(ctx, this);
+            match file_identity_key_for_path(&p) {
+                Some(key) => {
+                    let s = ctx.create_string(&key);
+                    Ok(Some(Value::Object(Some(s))))
+                }
+                None => Ok(Some(Value::Object(None))),
+            }
         });
         r.register(dfa, "isReadOnly", "()Z", |ctx, args| {
             let this = obj_arg(args, 0)?;
@@ -1705,8 +1718,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         // throws `UnsupportedOperationException` (only OS-specific subclasses
         // override it) — ES's `FsDirectoryFactory.blockSize` calls this
         // directly, so give a real answer instead of matching that throw.
-        r.register(fs_store, "getBlockSize", "()J", |_ctx, _args| {
-            Ok(Some(Value::Long(4096)))
+        //
+        // It was a hardcoded 4096, which is a guess: `FsDirectoryFactory` uses
+        // the value to decide whether the store is a rotational disk needing
+        // `preload`/`MMapDirectory` tuning, and a 512-byte-sector or 64 KiB-
+        // cluster volume was silently described as a 4 KiB one. Field 0 holds
+        // the store's mount root, so ask the volume (same query the JDK's own
+        // `Unix/WindowsFileStore` issues) and keep 4096 only as the fallback.
+        r.register(fs_store, "getBlockSize", "()J", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let block = file_store_block_size(&path).unwrap_or(4096);
+            Ok(Some(Value::Long(block as i64)))
         });
         // Both overloads used to answer `true` for EVERY view — including
         // `acl` on Linux and `posix` on Windows, neither of which this VM can
@@ -5316,14 +5342,36 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // nothing to release. (Contrast the `InflaterInputStream.close` case,
     // which really did hold a wrapped stream open.)
     r.register(ds, "close", "()V", |_ctx, _args| Ok(None));
+    // Was `null`, which is not a legal answer for anything: `DirectoryStream`
+    // extends `Iterable`, whose `spliterator()` default body returns
+    // `Spliterators.spliteratorUnknownSize(iterator(), 0)` — never null — so
+    // `StreamSupport.stream(ds.spliterator(), false)` (and every for-each that
+    // the compiler routes through it) NPE'd instead of "falling back to
+    // iterator()". `newDirectoryStream` already materialised the whole listing
+    // into the Object[] in slot 0, so hand back the same 3-field
+    // (array, pos, fence) synthetic Spliterator the `Spliterator.*` natives and
+    // `Spliterators.spliteratorUnknownSize` already build.
     r.register(
         ds,
         "spliterator",
         "()Ljava/util/Spliterator;",
-        |_ctx, _args| {
-            // Spliterator API is rarely walked for DirectoryStream; return null
-            // so callers that probe it fall back to iterator().
-            Ok(Some(Value::Object(None)))
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = match ctx.get_field(this, 0) {
+                Value::Object(Some(a)) => a,
+                _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+            };
+            let len = ctx.array_length(arr) as i32;
+            // Pin across the allocation below — a moving young GC there would
+            // relocate the listing array (native stale-local family).
+            let arr_pin = ctx.pin_native_root(arr);
+            let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(len));
+            ctx.unpin_native_roots(arr_pin);
+            Ok(Some(Value::Object(Some(spl))))
         },
     );
 
@@ -6646,12 +6694,21 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(if exists { 1 } else { 0 })))
         });
 
+        // Was a flat 255. Unix can answer this exactly the way the JDK's own
+        // `UnixFileSystem.getNameMax0` does — `pathconf(_PC_NAME_MAX)` — and
+        // that is not always 255 (an eCryptfs mount reports 143, and callers
+        // like Lucene/H2 use the value to decide how long a generated file name
+        // may be, so an over-long name fails at create time instead).
         r.register(
             fs_cls,
             "getNameMax0",
             "(Ljava/lang/String;)I",
-            |_ctx, _args| {
-                Ok(Some(Value::Int(255))) // NTFS/ext4 max name length
+            |ctx, args| {
+                let path = match args.get(1) {
+                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                Ok(Some(Value::Int(file_system_name_max(&path))))
             },
         );
 
@@ -10657,6 +10714,161 @@ pub(crate) fn file_disk_space_bytes(path: &str) -> Option<(u64, u64, u64)> {
     }
 }
 
+/// `FileStore.getBlockSize()` — the volume's allocation/transfer unit, i.e.
+/// `statvfs.f_frsize` on Unix and `GetDiskFreeSpaceW`'s bytes-per-sector on
+/// Windows (exactly what the JDK's `UnixFileStore`/`WindowsFileStore` report).
+/// `None` when the volume cannot be queried; callers fall back to 4 KiB.
+#[cfg(windows)]
+pub(crate) fn file_store_block_size(path: &str) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let full = win_get_full_path_name(path).unwrap_or_else(|| path.to_string());
+    // Build the volume root (`C:\`, `\\server\share\`) GetDiskFreeSpaceW wants.
+    let mut root = String::new();
+    for comp in std::path::Path::new(&full).components() {
+        match comp {
+            std::path::Component::Prefix(prefix) => {
+                root.push_str(&prefix.as_os_str().to_string_lossy());
+            }
+            std::path::Component::RootDir => root.push('\\'),
+            _ => break,
+        }
+    }
+    if root.is_empty() {
+        return None;
+    }
+    if !root.ends_with('\\') {
+        root.push('\\');
+    }
+    extern "system" {
+        fn GetDiskFreeSpaceW(
+            lpRootPathName: *const u16,
+            lpSectorsPerCluster: *mut u32,
+            lpBytesPerSector: *mut u32,
+            lpNumberOfFreeClusters: *mut u32,
+            lpTotalNumberOfClusters: *mut u32,
+        ) -> i32;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(&root)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut sectors_per_cluster: u32 = 0;
+    let mut bytes_per_sector: u32 = 0;
+    let mut free_clusters: u32 = 0;
+    let mut total_clusters: u32 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceW(
+            wide.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    };
+    if ok == 0 || bytes_per_sector == 0 {
+        return None;
+    }
+    Some(u64::from(bytes_per_sector))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn file_store_block_size(path: &str) -> Option<u64> {
+    let c_path = std::ffi::CString::new(path).ok()?;
+    // SAFETY: `stat` is a POD out-parameter and `c_path` is NUL-terminated and
+    // live for the call.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        let block_size = stat.f_frsize as u64;
+        if block_size == 0 {
+            None
+        } else {
+            Some(block_size)
+        }
+    }
+}
+
+/// `FileSystem.getNameMax0(path)` — the longest single name component the
+/// volume holding `path` accepts. Unix answers with `pathconf(_PC_NAME_MAX)`,
+/// exactly like the JDK's `UnixFileSystem`. Every Windows volume type
+/// (NTFS/FAT32/exFAT) reports 255, which is also the fallback when the query
+/// fails or the path does not exist.
+pub(crate) fn file_system_name_max(path: &str) -> i32 {
+    #[cfg(unix)]
+    {
+        let probe = if path.is_empty() { "/" } else { path };
+        if let Ok(c_path) = std::ffi::CString::new(probe) {
+            // SAFETY: `c_path` is NUL-terminated and live for the call;
+            // `pathconf` writes nothing back.
+            let n = unsafe { libc::pathconf(c_path.as_ptr(), libc::_PC_NAME_MAX) } as i64;
+            if n > 0 {
+                return n.min(i64::from(i32::MAX)) as i32;
+            }
+        }
+    }
+    255
+}
+
+/// Windows file identity — `(dwVolumeSerialNumber, nFileIndexHigh,
+/// nFileIndexLow)` from `GetFileInformationByHandle`, i.e. what the JDK's
+/// `WindowsFileKey` wraps. `FILE_FLAG_BACKUP_SEMANTICS` is what lets a
+/// DIRECTORY be opened, and directories are exactly where `fileKey()` matters
+/// (`FileTreeWalker.wouldLoop`'s symlink-loop check). `dwDesiredAccess = 0` is
+/// enough for a metadata query and does not need read rights on the file.
+#[cfg(windows)]
+fn win_file_identity(path: &str) -> Option<(u32, u32, u32)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct WinFiletime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+    /// Mirror of Win32 `BY_HANDLE_FILE_INFORMATION` (ABI-fixed field order).
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: WinFiletime,
+        ft_last_access_time: WinFiletime,
+        ft_last_write_time: WinFiletime,
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            h_file: *mut std::ffi::c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    // SAFETY: `info` is POD and fully written by the OS on success; the handle
+    // is owned by `file` and outlives the call.
+    let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info) };
+    if ok == 0 {
+        return None;
+    }
+    Some((
+        info.dw_volume_serial_number,
+        info.n_file_index_high,
+        info.n_file_index_low,
+    ))
+}
+
 /// Allocate a new File synthetic with the given path.
 pub(crate) fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/io/File", 1);
@@ -12335,18 +12547,26 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             Ok(Some(Value::Long(basic_file_attributes_size(ctx, this))))
         });
-        // `fileKey()` returns an object that uniquely identifies the file, or
-        // `null` if a file key is not available. The JDK Windows file system
-        // returns null when running on FAT-class volumes / network shares; we
-        // return null unconditionally — this is the documented JDK contract,
-        // not a fabricated value, and it lets `FileTreeWalker.wouldLoop`
-        // (the only `fileKey` consumer in the JDK walker) skip its identity
-        // comparison instead of throwing `AbstractMethodError`.
+        // Was an unconditional `null` — legal on paper (the JDK returns null on
+        // FAT-class volumes / network shares) but it meant NO file this VM ever
+        // described had an identity, so `FileTreeWalker.wouldLoop` could never
+        // detect a symlink cycle and `Files.isSameFile`-style checks had nothing
+        // to compare. `p59_files_read_attributes` now records the real OS
+        // identity; see `basic_file_attributes_file_key`.
         r.register(
             attrs_class,
             "fileKey",
             "()Ljava/lang/Object;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            |ctx, args| {
+                let this = obj_arg(args, 0)?;
+                match basic_file_attributes_file_key(ctx, this) {
+                    Some(key) => {
+                        let s = ctx.create_string(&key);
+                        Ok(Some(Value::Object(Some(s))))
+                    }
+                    None => Ok(Some(Value::Object(None))),
+                }
+            },
         );
     }
 
@@ -12697,6 +12917,113 @@ pub(crate) fn basic_file_attributes_is_regular(ctx: &dyn NativeContext, attrs: O
         Value::Int(v) if v & UNIX_S_IFMT == UNIX_S_IFREG)
 }
 
+/// Shared body for `Files.getOwner` / `FileOwnerAttributeView.getOwner`.
+///
+/// Reads the path's attributes and asks the resulting attributes object for its
+/// `owner()`. On a real-JDK Unix build that lands in
+/// `UnixFileAttributes.owner()` -> `UnixUserPrincipals.fromUid(st_uid)`, both of
+/// which are already wired (`p59_files_read_attributes` fills `st_uid`;
+/// `native-io` registers `UnixNativeDispatcher.getpwuid`). Anywhere the owner
+/// genuinely cannot be produced we raise the exception the JDK specifies for a
+/// provider without a `FileOwnerAttributeView` — returning `null`, which is what
+/// this used to do, is not a legal outcome of `getOwner` and only moves the
+/// failure to the caller's next dereference.
+fn nio_owner_principal(ctx: &mut dyn NativeContext, path_value: Value) -> MethodCallResult {
+    let unsupported = || -> MethodCallFailed {
+        RuntimeError::UnsupportedOperationException {
+            message: "getOwner: file owner is not available for this path".into(),
+        }
+        .into()
+    };
+    let attrs = match p59_files_read_attributes(ctx, &[path_value])? {
+        Some(Value::Object(Some(attrs))) => attrs,
+        _ => return Err(unsupported()),
+    };
+    match ctx.invoke_virtual(
+        attrs,
+        "owner",
+        "()Ljava/nio/file/attribute/UserPrincipal;",
+        &[],
+    ) {
+        Ok(Some(owner @ Value::Object(Some(_)))) => Ok(Some(owner)),
+        _ => Err(unsupported()),
+    }
+}
+
+/// Same identity key as `basic_file_attributes_file_key`, but computed straight
+/// from a host path — for attribute objects that record their backing path
+/// instead of the raw `stat` fields (`DosFileAttributes`, slot 5).
+pub(crate) fn file_identity_key_for_path(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(format!(
+            "(dev={},ino={})",
+            meta.dev() as i64,
+            meta.ino() as i64
+        ))
+    }
+    #[cfg(windows)]
+    {
+        let (volume, high, low) = win_file_identity(path)?;
+        let index = (u64::from(high) << 32) | u64::from(low);
+        Some(format!("(volume={volume},file={index})"))
+    }
+}
+
+/// The file-identity string behind `BasicFileAttributes.fileKey()`.
+///
+/// `fileKey()` used to be a hardcoded `null`, which silently disabled every
+/// identity check built on it — most importantly `FileTreeWalker.wouldLoop`,
+/// the JDK walker's ONLY symlink-loop guard (`Files.walk(.., FOLLOW_LINKS)`
+/// over a directory that links back to an ancestor recursed until it ran out
+/// of depth), plus hardlink identity.
+///
+/// `p59_files_read_attributes` now records the OS identity on the attributes
+/// object (`st_dev`/`st_ino` on Unix, the `GetFileInformationByHandle` triple
+/// on Windows), so the key is a real answer rather than a fabricated one. We
+/// hand back a `String` in the JDK's own `UnixFileKey.toString()` shape: the
+/// declared return type is `Object`, and every consumer only ever
+/// `equals`/`hashCode`-compares the value, both of which `String` gives us for
+/// free (the JDK's own key classes are package-private in `sun.nio.fs`, so no
+/// caller can name the concrete type). `None` -> `null`, which stays the
+/// documented answer when the identity is unavailable.
+pub(crate) fn basic_file_attributes_file_key(
+    ctx: &dyn NativeContext,
+    attrs: ObjectRef,
+) -> Option<String> {
+    if basic_file_attributes_is_windows(ctx, attrs) {
+        let field = |name: &str| match ctx.get_field_by_name(attrs, name) {
+            Value::Int(v) => Some(v as u32),
+            Value::Long(v) => Some(v as u32),
+            _ => None,
+        };
+        let volume = field("volSerialNumber")?;
+        let high = field("fileIndexHigh")?;
+        let low = field("fileIndexLow")?;
+        if volume == 0 && high == 0 && low == 0 {
+            return None;
+        }
+        let index = (u64::from(high) << 32) | u64::from(low);
+        return Some(format!("(volume={volume},file={index})"));
+    }
+    let field = |name: &str| match ctx.get_field_by_name(attrs, name) {
+        Value::Long(v) => Some(v),
+        Value::Int(v) => Some(i64::from(v)),
+        _ => None,
+    };
+    let dev = field("st_dev")?;
+    let ino = field("st_ino")?;
+    if dev == 0 && ino == 0 {
+        return None;
+    }
+    Some(format!("(dev={dev},ino={ino})"))
+}
+
 pub(crate) fn basic_file_attributes_size(ctx: &dyn NativeContext, attrs: ObjectRef) -> i64 {
     let field = if basic_file_attributes_is_windows(ctx, attrs) {
         "size"
@@ -12944,6 +13271,30 @@ pub(crate) fn p59_files_read_attributes(
                 use std::os::unix::fs::MetadataExt;
                 ctx.set_field_by_name(bfa, "st_uid", Value::Int(meta.uid() as i32));
                 ctx.set_field_by_name(bfa, "st_gid", Value::Int(meta.gid() as i32));
+                // `st_dev`/`st_ino` ARE the file's identity — both our
+                // `fileKey()` native and the real JDK's own
+                // `UnixFileAttributes.fileKey()` build a key out of them.
+                // Never populated before, which is why `fileKey()` had nothing
+                // to report and returned null for every file.
+                ctx.set_field_by_name(bfa, "st_dev", Value::Long(meta.dev() as i64));
+                ctx.set_field_by_name(bfa, "st_ino", Value::Long(meta.ino() as i64));
+            }
+            // Windows equivalent of the `st_dev`/`st_ino` identity above: the
+            // `(volume serial, file index)` triple `WindowsFileAttributes`
+            // carries. Unlike the Unix fields this needs a second handle open,
+            // so restrict it to directories and links — `FileTreeWalker`'s
+            // loop check (the reason `fileKey()` has to be real) only ever asks
+            // about those, and a tree walk over a large source tree should not
+            // pay an extra CreateFile per ordinary file.
+            #[cfg(windows)]
+            {
+                if meta.is_dir() || meta.file_type().is_symlink() {
+                    if let Some((volume, high, low)) = win_file_identity(&path_str) {
+                        ctx.set_field_by_name(bfa, "volSerialNumber", Value::Int(volume as i32));
+                        ctx.set_field_by_name(bfa, "fileIndexHigh", Value::Int(high as i32));
+                        ctx.set_field_by_name(bfa, "fileIndexLow", Value::Int(low as i32));
+                    }
+                }
             }
         }
         // NIO contract: `Files.readAttributes` must raise `IOException`
@@ -13364,16 +13715,57 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(i32::from(name.contains(':')))))
     });
-    r.register(ni, "getHardwareAddress", "()[B", |ctx, _args| {
-        // Return a dummy MAC address (00:00:00:00:00:00) — real MAC requires platform APIs
-        let mac = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 6);
-        for i in 0..6 {
-            ctx.set_array_element(mac, i, Value::Int(0));
-        }
-        Ok(Some(Value::Object(Some(mac))))
+    // STUB-REMOVAL (wave 3). This used to hand back a FABRICATED all-zero MAC
+    // (00:00:00:00:00:00) because "real MAC requires platform APIs". That is
+    // strictly worse than admitting we don't know: 00:00:00:00:00:00 is a
+    // syntactically valid address, so callers that derive a node ID from it
+    // (UUID v1 generators, cluster member identity, licence fingerprints) get
+    // a plausible-looking constant instead of a signal to fall back — and
+    // every host in a cluster gets the SAME one.
+    //
+    // `null` is the spec'd answer: getHardwareAddress returns null when the
+    // address does not exist or is not accessible. It is also what HotSpot 25
+    // returns for the loopback interface, verified on Windows, and loopback is
+    // the interface `p61_build_network_interfaces` always synthesizes.
+    r.register(ni, "getHardwareAddress", "()[B", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
     });
-    r.register(ni, "getMTU", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1500))) // standard ethernet MTU
+    // Was a flat 1500 for every interface — wrong for the loopback interface on
+    // every platform (Linux `lo` is 65536), which is the one interface
+    // `p61_build_network_interfaces` ALWAYS synthesizes. Linux publishes the
+    // real per-interface MTU as a plain file, the same number `SIOCGIFMTU`
+    // returns, so read it; elsewhere fall back to the loopback/Ethernet
+    // defaults rather than one constant for both.
+    r.register(ni, "getMTU", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if !name.is_empty() && !name.contains('/') && !name.contains('\\') {
+            if let Ok(text) = std::fs::read_to_string(format!("/sys/class/net/{name}/mtu")) {
+                if let Ok(mtu) = text.trim().parse::<i32>() {
+                    return Ok(Some(Value::Int(mtu)));
+                }
+            }
+        }
+        // Fallback when /sys is unavailable. The loopback MTU is PLATFORM
+        // SPECIFIC, not a universal 65536: Linux `lo` is 65536, but Windows
+        // loopback reports 1500 and macOS lo0 reports 16384. Measured against
+        // HotSpot 25 on Windows, which answers 1500 — so a flat 65536 here
+        // would diverge from the reference JVM on that host, which the
+        // previous flat 1500 happened to match.
+        let loopback = ctx.get_field(this, 4).as_int().unwrap_or(0) & 2 != 0;
+        let mtu = if !loopback {
+            1500
+        } else if cfg!(target_os = "linux") {
+            65536
+        } else if cfg!(target_os = "macos") {
+            16384
+        } else {
+            1500
+        };
+        Ok(Some(Value::Int(mtu)))
     });
     r.register(
         ni,
@@ -15115,15 +15507,21 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(p57_alloc_file_store(ctx, &p)))))
         },
     );
-    // KEEP: same reasoning as `PosixFileAttributeView.getOwner` — this VM has
-    // no `UserPrincipalLookupService`, so there is no principal object to
-    // return, and synthesizing one would break the `equals` comparisons every
-    // caller performs on the result.
+    // Was `null`. `Files.getOwner` is specified to return a principal or throw
+    // (`UnsupportedOperationException` when the path's provider has no
+    // `FileOwnerAttributeView`, `IOException` on failure) — never null — so
+    // every caller dereferences it. Same delegation as
+    // `PosixFileAttributeView.getOwner`: the real
+    // `UnixFileAttributes.owner()` bytecode turns the `st_uid` we record into a
+    // proper `UnixUserPrincipal` via the wired `getpwuid` native.
     r.register(
         f,
         "getOwner",
         "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/UserPrincipal;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let path_value = args.first().copied().unwrap_or(Value::Object(None));
+            nio_owner_principal(ctx, path_value)
+        },
     );
     r.register(
         f,

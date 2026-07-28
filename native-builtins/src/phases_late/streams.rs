@@ -4109,12 +4109,11 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             ctx.set_field(this, 1, Value::Int((pos + 1) as i32));
             // Invoke consumer.accept(elem)
             if let Some(Value::Object(Some(consumer))) = args.get(1) {
-                let _ = ctx.invoke_virtual(
-                    *consumer,
-                    "accept",
-                    "(Ljava/lang/Object;)V",
-                    &[Value::Object(Some(*consumer)), elem],
-                );
+                // `invoke_virtual` takes the receiver SEPARATELY from `args`
+                // (see every other callback in this file, e.g. `&[v]` at ~489 /
+                // ~584). Passing the consumer again as args[0] made
+                // `Consumer.accept` receive the CONSUMER instead of the element.
+                let _ = ctx.invoke_virtual(*consumer, "accept", "(Ljava/lang/Object;)V", &[elem]);
             }
             Ok(Some(Value::Int(1)))
         },
@@ -4195,12 +4194,9 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 let arr = ctx.read_native_pin(arr_pin, arr);
                 let consumer = ctx.read_native_pin(consumer_pin, consumer);
                 let elem = ctx.get_array_element(arr, pos);
-                let _ = ctx.invoke_virtual(
-                    consumer,
-                    "accept",
-                    "(Ljava/lang/Object;)V",
-                    &[Value::Object(Some(consumer)), elem],
-                );
+                // Receiver is passed separately — see the same fix in
+                // `tryAdvance` above.
+                let _ = ctx.invoke_virtual(consumer, "accept", "(Ljava/lang/Object;)V", &[elem]);
                 pos += 1;
             }
             let this = ctx.read_native_pin(this_pin, this);

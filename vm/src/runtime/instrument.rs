@@ -1793,10 +1793,22 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
     );
     // Constructor `<init>(JLjava/lang/String;ZZ)V` — JDK's
     // `sun.instrument.InstrumentationImpl(jvmtienv, agentArgs, isRedefine,
-    // isRetransform)`. Since our `agent_loader::build_instrumentation_mirror`
-    // wants to instantiate this from native code, register a no-op ctor that
-    // accepts and discards the args (the Instrumentation Java object's
-    // observable behavior comes from the natives we register above).
+    // isRetransform)`; called from `native_self_attach_load_agent` above (the
+    // `-javaagent:` path in `agent_loader::build_instrumentation_mirror` skips
+    // the ctor entirely and hands back a bare allocation).
+    //
+    // KEEP (empty body, justified): the real ctor's only durable effects are
+    // the `mNativeAgent` / `mEnvironmentSupports*` fields and a
+    // `TransformerManager`, and NONE of them is readable here — every method
+    // that would consult them (`addTransformer`, `retransformClasses`,
+    // `redefineClasses`, `isRetransformClassesSupported`,
+    // `isRedefineClassesSupported`, `isNativeMethodPrefixSupported`,
+    // `isModifiableClass`, `getObjectSize`, `getAllLoadedClasses`) is
+    // registered natively above and answers from `TRANSFORMER_CHAIN` and the
+    // VM's own class tables. There is no JVMTI env to record, so an empty
+    // body IS the implementation. This registration also appears in
+    // `interpreter.rs`'s force-native-override table so it beats the real
+    // bytecode, which would otherwise enter VM-private init we cannot honour.
     r.register(
         impl_class,
         "<init>",

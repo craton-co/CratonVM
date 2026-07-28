@@ -60,8 +60,14 @@ mod tests {
     /// the intended early-warning that dispatch could diverge from the slow
     /// path. Behavioral parity (NPE / ArrayStoreException /
     /// ArrayIndexOutOfBoundsException, overlap handling, partial-commit) is
-    /// covered end-to-end by the heap-backed `tests_extracted.rs` cases and the
-    /// differential harness in `vm/tests/intrinsic_diff.rs`.
+    /// covered end-to-end by the differential harness in
+    /// `vm/tests/intrinsic_diff.rs`.
+    ///
+    /// This used to also credit "the heap-backed `tests_extracted.rs` cases".
+    /// That file was never wired into the crate — no `mod tests_extracted;`
+    /// existed anywhere in the tree — so it was never compiled and those cases
+    /// never ran. It was deleted in the wave-3 stub sweep; the claim is removed
+    /// with it rather than left pointing at coverage that did not exist.
     #[test]
     fn delegates_to_registered_native() {
         let delegate: NativeCallback = crate::lang_system::native_system_arraycopy;

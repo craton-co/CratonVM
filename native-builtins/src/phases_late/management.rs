@@ -70,6 +70,39 @@ pub(crate) fn daemon_thread_count(ctx: &dyn NativeContext) -> i32 {
     count
 }
 
+/// Process-wide high-water mark of the live-thread count.
+///
+/// Zero-initialised and only ever raised by [`peak_thread_count`] or set
+/// outright by [`reset_peak_thread_count`], so it is meaningful from the first
+/// read regardless of which surface asks first.
+static PEAK_THREAD_COUNT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The JMM peak live-thread count — a real high-water mark, sampled on every
+/// read.
+///
+/// Every surface used to answer `getPeakThreadCount()` with the CURRENT live
+/// count, which meant the "peak" could go DOWN when threads exited (a peak may
+/// never do that) and made `resetPeakThreadCount()` unobservable — it had
+/// nothing to reset. Sampling here is monotone by construction and is still a
+/// lower bound on the true peak (a spike between two reads is missed), which is
+/// exactly what the old code claimed to be but was not.
+pub(crate) fn peak_thread_count(ctx: &dyn NativeContext) -> i32 {
+    let live = ctx.active_thread_count();
+    PEAK_THREAD_COUNT
+        .fetch_max(live, std::sync::atomic::Ordering::Relaxed)
+        .max(live)
+}
+
+/// `ThreadMXBean.resetPeakThreadCount()` — "resets the peak thread count to
+/// the current number of live threads" (JMM). A real write now: the previous
+/// no-op silently discarded the call on every JMX surface.
+pub(crate) fn reset_peak_thread_count(ctx: &dyn NativeContext) {
+    PEAK_THREAD_COUNT.store(
+        ctx.active_thread_count(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Ids of the live threads, read from each `java.lang.Thread`'s own `tid`.
 ///
 /// That is the identity `getThreadInfo(long)` resolves against, so the two
@@ -157,9 +190,15 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/management/MemoryUsage;",
         p59_nonheap_usage,
     );
-    // KEEP: 0 is the measurement, not a placeholder — CratonVM runs no
-    // finalizer thread and keeps no finalization queue, so nothing is ever
-    // pending. Same justification as the winning `jmx.rs` registration.
+    // FLAGGED-0 (was justified as spec-correct on a false premise): CratonVM
+    // DOES finalize — `SharedVm::register_finalizable` feeds
+    // `ref_processor.finalization_queue`, which `drain_finalizers` hands to a
+    // real `FinalizerThread` — and `ReferenceProcessor::pending_finalization_count()`
+    // (gc/src/reference.rs) is the exact datum this method wants. It is simply
+    // not reachable: `NativeContext` exposes no accessor for it. 0 is therefore
+    // a floor, not a measurement. Needs a one-line `NativeContext` accessor to
+    // fix — out of scope for a native-builtins-only change. Same situation as
+    // the winning `jmx.rs` registration.
     r.register(
         mem,
         "getObjectPendingFinalizationCount",
@@ -200,9 +239,11 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     r.register(tmx, "getThreadCount", "()I", |ctx, _args| {
         Ok(Some(Value::Int(ctx.active_thread_count() as i32)))
     });
+    // REAL: a monotone high-water mark (see `peak_thread_count`), not the
+    // instantaneous live count the previous body returned — which could go
+    // DOWN and left `resetPeakThreadCount()` with nothing to reset.
     r.register(tmx, "getPeakThreadCount", "()I", |ctx, _args| {
-        // Peak is at least current
-        Ok(Some(Value::Int(ctx.active_thread_count().max(1) as i32)))
+        Ok(Some(Value::Int(peak_thread_count(ctx))))
     });
     r.register(tmx, "getTotalStartedThreadCount", "()J", |ctx, _args| {
         Ok(Some(Value::Long(ctx.active_thread_count().max(1) as i64)))
@@ -229,12 +270,19 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(arr))))
     });
-    // KEEP: false is the measurement. CratonVM implements no per-thread CPU
-    // accounting, and `false` is exactly what the spec wants for an
-    // unsupported optional JMM feature.
+    // KEEP: false is the measurement, and it is specifically about OTHER
+    // threads. `isThreadCpuTimeSupported()` promises `getThreadCpuTime(id)`
+    // works for an arbitrary id, which needs an OS handle for a thread we are
+    // not running on — CratonVM's thread table carries no such handle. (The
+    // CURRENT thread's CPU time IS readable and the winning `jmx.rs`
+    // registration now reports it; the spec explicitly allows exactly this
+    // asymmetry, and this interface registers no current-thread getter at all.)
     r.register(tmx, "isThreadCpuTimeSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    // KEEP: false is the measurement — CratonVM times no monitor contention, so
+    // `getThreadInfo(..).getBlockedTime()` has no source and the spec's answer
+    // for an unsupported optional feature is exactly `false`.
     // ES-FAIL-05 — `HotThreads.initializeRuntimeMonitoring()` (ESTestCase.<clinit>)
     // calls isThreadContentionMonitoringSupported(); unregistered → AbstractMethodError
     // blocking ~every server test. Report false (HotThreads then no-ops).

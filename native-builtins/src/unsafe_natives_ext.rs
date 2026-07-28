@@ -1253,11 +1253,15 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     // `dumpClassList`, `dumpDynamicArchive`) have nothing to record or write
     // because no archive exists, and every caller in `java.base` is written to
     // tolerate that. These are therefore permanent KEEPs, not unimplemented
-    // stubs. NOTE: identical registration sets also exist in `lib.rs`
-    // (register_essential_natives_with_shims) and
-    // `phases_early.rs::register_core_stdlib_extras`, both of which run AFTER
-    // this one in their respective registration worlds — see the duplication
-    // note in the stub-removal report.
+    // stubs. NOTE: overlapping registration sets also exist in `lib.rs`
+    // (register_essential_natives_with_shims), `phases_early.rs::
+    // register_core_stdlib_extras` and `cds.rs::register_cds_natives`, all of
+    // which run AFTER this one. DO NOT delete this block as a pure duplicate:
+    // `isSharingEnabled0` and `defineArchivedModules` are registered here and
+    // NOWHERE ELSE on the real-JDK path (the `lib.rs` block registers
+    // `isSharingEnabled`, without the `0`, and no `defineArchivedModules`;
+    // `phases_early`/`cds.rs` only run under the `synthetic-jdk` feature), so
+    // those two are live. The other seven are shadowed in both modes.
     let cds_cls = "jdk/internal/misc/CDS";
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);

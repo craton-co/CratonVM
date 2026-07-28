@@ -3081,7 +3081,11 @@ pub(crate) fn register_p70_constant_bootstraps(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cb = "java/lang/invoke/ConstantBootstraps";
 
-    // nullConstant — returns null (correct as-is)
+    // KEEP (constant, justified): `ConstantBootstraps.nullConstant` is SPEC'D
+    // to produce null — that is the whole method, not a placeholder. The condy
+    // opcode never reaches here anyway (`interpreter.rs` resolves
+    // `ConstantBootstraps.nullConstant` in-VM, ~19367); this only serves an
+    // explicit reflective call, where null is still the right answer.
     r.register(cb, "nullConstant",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
         |_ctx, _args| Ok(Some(Value::Object(None))));
