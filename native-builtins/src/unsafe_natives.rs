@@ -1076,7 +1076,16 @@ pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRe
 // tracked to honour a user-provided loader once multi-loader
 // namespaces are ready for production traffic.
 
-fn native_unsafe_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+// `pub(crate)` for the same reason as `native_unsafe_static_field_base`:
+// `unsafe_natives_ext::register_unsafe_natives` used to register an
+// always-null `defineClass` closure here. It happened to be overwritten again
+// by `register_unsafe_define_class`, but only by ordering luck — point the
+// earlier registration at the real implementation so the outcome no longer
+// depends on which registrar happens to run last.
+pub(crate) fn native_unsafe_define_class(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args: [this, name(String|null), bytes(byte[]), off(int), len(int),
     //        loader(ClassLoader|null), pd(ProtectionDomain|null)]
     //
@@ -1449,7 +1458,13 @@ fn unix_loadavg() -> [f64; 3] {
 // returned null (breaking `VarHandle.staticField*`). Read the
 // field's declaring class and hand back its mirror.
 
-fn native_unsafe_static_field_base(
+// `pub(crate)`: also wired from `unsafe_natives_ext::register_unsafe_natives`,
+// which runs a SECOND time in synthetic mode (inside
+// `register_synthetic_overrides`) AFTER `register_unsafe_wp1_2` below. Before
+// that call site pointed here it re-registered an always-null closure, so
+// synthetic mode silently lost this real implementation. See the stub-removal
+// wave-2 report ("competing registration").
+pub(crate) fn native_unsafe_static_field_base(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {

@@ -8347,6 +8347,12 @@ fn try_compile_inner(
                         if let Some((entry, callee_needs_ctx)) = direct_target {
                             ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
                             ir_direct_callee_entries.push(entry);
+                        } else if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                            .is_some()
+                        {
+                            eprintln!(
+                                "[cratonvm-jitc] ir-direct-call MISSED {cn}.{mn}{desc} @pc={pc} ir_direct={ir_direct} static={is_static} special={is_special}"
+                            );
                         }
                         // IR inline caches (jit-inlining-and-ir-calls). A
                         // virtual / interface site is NOT statically bound, so
@@ -9059,6 +9065,13 @@ fn try_compile_inner(
                                 ));
                                 inline_sites.insert(pc, site);
                                 planned_inline = true;
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC")
+                                    .is_some()
+                                {
+                                    eprintln!(
+                                        "[cratonvm-jitc] inline-planned {class_name}.{method_name}{descriptor} @pc={pc}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -9217,6 +9230,64 @@ fn try_compile_inner(
                             },
                         ));
                         continue;
+                    }
+                } else if direct_jit_callee_calls_enabled {
+                    // INLINE-BAIL FALLBACK (tomcat doc 04, 2026-07-27).
+                    //
+                    // A site planned for inlining used to get NO direct call,
+                    // because the whole direct-call ladder sits inside
+                    // `!planned_inline`. The codegen tries `try_emit_inline`
+                    // first and ROLLS BACK on any unsupported bytecode
+                    // (`x64.rs` 0xb8 arm), and its fall-through order is
+                    // direct_calls → invoke_info — so a bailed inline landed on
+                    // the generic `jit_invoke_dispatch` helper, the SLOWEST of
+                    // the three options, for the life of the compiled body.
+                    //
+                    // That is not a corner case: `try_jit_compile_callee_slow`
+                    // (the tiered BACKGROUND worker, which compiles nearly
+                    // every hot method) always passes an inline resolver, while
+                    // the mutator path gates its own on the default-OFF
+                    // `CRATONVM_JIT_MAIN_INLINE`. So background-compiled bodies
+                    // planned inlining for every small static/special callee
+                    // and, whenever codegen declined it, paid ~196 ns per call
+                    // instead of the ~5 ns a raw CALL costs (measured with
+                    // `apps/tomcat-suite-runner/probes/CallCostProbe.java`,
+                    // same binary, `CRATONVM_BG_COMPILE=0` as the control).
+                    //
+                    // Planning a direct call ALONGSIDE the inline site costs
+                    // nothing when the inline succeeds (codegen checks
+                    // `inline_sites` first and `continue`s), and turns the bail
+                    // into a raw CALL instead of a helper round trip. No
+                    // `continue` here, so the RBC.3 `JitInvokeInfo` fallback is
+                    // still registered below as the last resort.
+                    if let Some(compiler) = callee_compiler.as_ref() {
+                        if let Some((entry, callee_needs_ctx)) =
+                            compiler(&class_name, &method_name, &descriptor)
+                        {
+                            if jit_direct_call_requires_dispatch(
+                                &class_name,
+                                &method_name,
+                                &descriptor,
+                            ) {
+                                needs_heap = true;
+                                mark_current_jit_compile_method_recursive_cycle();
+                            } else {
+                                if callee_needs_ctx {
+                                    needs_heap = true;
+                                }
+                                direct_callee_entries.push(entry);
+                                direct_calls.push((
+                                    pc,
+                                    JitDirectCall {
+                                        entry,
+                                        needs_context: callee_needs_ctx,
+                                        num_params,
+                                        return_type: ret_type,
+                                        guard_class_id: 0,
+                                    },
+                                ));
+                            }
+                        }
                     }
                 } // end !planned_inline (RBC.3)
             }

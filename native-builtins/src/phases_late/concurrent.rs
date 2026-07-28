@@ -1830,8 +1830,12 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
         "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
         p58_sq_poll_timed,
     );
-    // A SynchronousQueue is always empty (zero capacity) — peek never returns
-    // an element, contains is always false, size is always 0.
+    // KEEP (all five constants below): these are not stubs, they are the
+    // SynchronousQueue contract. The javadoc states outright that the queue
+    // has zero capacity, so `peek()` always returns null, `size()` is always
+    // 0, `isEmpty()` is always true, `contains(o)` is always false and
+    // `remainingCapacity()` is always 0. A state-reading implementation would
+    // be wrong, not better.
     r.register(sq, "peek", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -1858,8 +1862,43 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     r.register(sq, "remainingCapacity", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
-    r.register(sq, "drainTo", "(Ljava/util/Collection;)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // drainTo(c) is NOT constant-zero even for a zero-capacity queue: the JDK
+    // implements it as `while ((e = poll()) != null) { c.add(e); ++n; }`, so it
+    // harvests every item a blocked producer is currently offering. Returning 0
+    // silently left those producers parked and told the caller there was
+    // nothing to consume.
+    r.register(sq, "drainTo", "(Ljava/util/Collection;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let coll = match args.get(1) {
+            Some(Value::Object(Some(c))) => *c,
+            // drainTo(null) is an NPE in the JDK; keep the existing lenient
+            // "nothing drained" answer for a null sink rather than throwing
+            // from a path that used to be total.
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        // Pin across `Collection.add` — it allocates and can safepoint, which
+        // would relocate `this`/`coll` (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
+        let coll_pin = ctx.pin_native_root(coll);
+        let mut drained = 0i32;
+        let result = loop {
+            let this_cur = ctx.read_native_pin(this_pin, this);
+            let item = match p58_sq_poll(ctx, &[Value::Object(Some(this_cur))]) {
+                // Mirrors the JDK's `while ((e = poll()) != null)` loop: a null
+                // poll means no producer is waiting, so the drain is complete.
+                Ok(Some(v)) if !matches!(v, Value::Object(None)) => v,
+                Ok(_) => break Ok(()),
+                Err(e) => break Err(e),
+            };
+            let coll_cur = ctx.read_native_pin(coll_pin, coll);
+            if let Err(e) = ctx.invoke_virtual(coll_cur, "add", "(Ljava/lang/Object;)Z", &[item]) {
+                break Err(e);
+            }
+            drained += 1;
+        };
+        ctx.unpin_native_roots(this_pin);
+        result?;
+        Ok(Some(Value::Int(drained)))
     });
     r.set_category(__prev_cat);
 }
@@ -2439,7 +2478,9 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // Flow constants
+    // Flow constants — KEEP: `Flow.defaultBufferSize()` is specified to return
+    // a fixed 256 in the JDK ("the default value for Publisher buffering"),
+    // so the constant IS the implementation.
     let flow = "java/util/concurrent/Flow";
     r.register(flow, "defaultBufferSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(256)))
@@ -3144,8 +3185,32 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(stpe, "getPoolSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // getPoolSize(): a hardcoded 0 made every pool look like it had never
+    // started a thread, which is the wrong branch for callers that gate on
+    // `getPoolSize() > 0` (health checks, "is the scheduler up?" probes) and
+    // contradicted getCorePoolSize() right below.
+    //
+    // A receiver with a real `workers` set IS a real ThreadPoolExecutor
+    // (`executor_has_real_workers`, the same per-instance probe the
+    // ExecutorService natives use) — hand those to the real bytecode, which
+    // counts the real workers. `invoke_virtual_bytecode_only` skips the
+    // native-override check so this does not re-enter itself.
+    //
+    // Otherwise the receiver is CratonVM's synthetic STPE, whose scheduled
+    // work is driven by `crate::scheduled_pump` rather than by a worker set.
+    // Report the configured core pool size: that is the number of threads the
+    // pool is modelled as owning, and it matches getCorePoolSize().
+    r.register(stpe, "getPoolSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if crate::executor_has_real_workers(ctx, this) {
+            return ctx.invoke_virtual_bytecode_only(this, "getPoolSize", "()I", &[]);
+        }
+        let core = match ctx.get_field_by_name(this, "corePoolSize") {
+            Value::Int(value) => value,
+            // Synthetic STPE objects have only the historical slot layout.
+            _ => ctx.get_field(this, 0).as_int().unwrap_or(0),
+        };
+        Ok(Some(Value::Int(core.max(0))))
     });
     r.register(stpe, "getCorePoolSize", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3298,6 +3363,8 @@ pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry)
         ctx.set_field(this, 1, Value::Int(0));
         Ok(None)
     });
+    // KEEP: PriorityBlockingQueue is unbounded, and the JDK's own
+    // `remainingCapacity()` is literally `return Integer.MAX_VALUE;`.
     r.register(pbq, "remainingCapacity", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(i32::MAX)))
     });
@@ -3439,9 +3506,162 @@ pub(crate) fn p65_compare_values(a: Value, b: Value) -> i32 {
 }
 
 // =============================================================================
-// DelayQueue = 2-field (queue=0 ArrayList, size=1)
-// Simplified: just an ordered queue, no actual delay semantics
+// DelayQueue = 2-field (elements=0 Object[], size=1)
+//
+// The previous model stored NOTHING: `put`/`offer` only bumped a counter and
+// `take`/`poll`/`peek` were hardcoded to null. `size()` therefore reported a
+// non-empty queue that could never yield an element — a producer/consumer pair
+// silently exchanged nulls (BlockingQueue.take() is specified never to return
+// null, so callers NPE far away from the cause) or spun forever in
+// `while (!q.isEmpty()) consume(q.take())`.
+//
+// Elements now live in a real Reference[] held in field 0, so they are a GC
+// root and are remapped by a moving collector. Delay ordering is honoured by
+// asking each element for its remaining delay (`Delayed.getDelay(NANOSECONDS)`)
+// at poll time instead of maintaining a heap: DelayQueue is a low-traffic API
+// here and a scan keeps the invariants trivially correct even when an element's
+// delay changes after insertion.
 // =============================================================================
+
+/// Remaining delay of `elem` in nanoseconds, via `Delayed.getDelay(TimeUnit)`.
+///
+/// Returns `None` when the delay cannot be determined (no `TimeUnit` class,
+/// null element, or the call fails). Callers treat `None` as "available now",
+/// which degrades DelayQueue to a plain FIFO rather than to the old
+/// never-yields-anything behaviour.
+fn dq_delay_nanos(ctx: &mut dyn NativeContext, elem: ObjectRef) -> Option<i64> {
+    let cid = ctx
+        .ensure_class_initialized("java/util/concurrent/TimeUnit")
+        .ok()?;
+    let idx = ctx.static_field_index_by_name(cid, "NANOSECONDS")?;
+    let unit = match ctx.get_static_field(cid, idx) {
+        Value::Object(Some(u)) => u,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(
+        elem,
+        "getDelay",
+        "(Ljava/util/concurrent/TimeUnit;)J",
+        &[Value::Object(Some(unit))],
+    ) {
+        Ok(Some(Value::Long(n))) => Some(n),
+        Ok(Some(Value::Int(n))) => Some(n as i64),
+        _ => None,
+    }
+}
+
+/// Live `(elements array, size)` of a DelayQueue, clamped to the array length.
+fn dq_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, usize)> {
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return None,
+    };
+    let size = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize;
+    Some((arr, size.min(ctx.array_length(arr))))
+}
+
+/// Index of the element with the smallest remaining delay, plus that delay.
+/// `None` when the queue is empty.
+///
+/// Returns the receiver alongside the answer: `Delayed.getDelay` is user
+/// bytecode, so it allocates and can safepoint, and a moving young GC there
+/// relocates both `this` and the backing array (native stale-local family).
+/// `this` is pinned for the scan and the array is re-read from the pinned
+/// receiver on every iteration; callers must use the returned receiver.
+fn dq_head(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, Option<(usize, i64)>) {
+    let this_pin = ctx.pin_native_root(this);
+    let mut cur = this;
+    let mut best: Option<(usize, i64)> = None;
+    let mut i = 0usize;
+    loop {
+        cur = ctx.read_native_pin(this_pin, cur);
+        let Some((arr, size)) = dq_state(ctx, cur) else {
+            break;
+        };
+        if i >= size {
+            break;
+        }
+        let delay = match ctx.get_array_element(arr, i) {
+            Value::Object(Some(e)) => dq_delay_nanos(ctx, e).unwrap_or(0),
+            // A null slot has no delay to ask for; treat it as available so a
+            // queue seeded with nulls (the legacy `put(null)` path) still
+            // drains instead of wedging.
+            _ => 0,
+        };
+        if best.is_none_or(|(_, b)| delay < b) {
+            best = Some((i, delay));
+        }
+        i += 1;
+    }
+    cur = ctx.read_native_pin(this_pin, cur);
+    ctx.unpin_native_roots(this_pin);
+    (cur, best)
+}
+
+/// Remove and return the element at `index`, shifting the tail down.
+fn dq_remove_at(ctx: &mut dyn NativeContext, this: ObjectRef, index: usize) -> Value {
+    let Some((arr, size)) = dq_state(ctx, this) else {
+        return Value::Object(None);
+    };
+    if index >= size {
+        return Value::Object(None);
+    }
+    let item = ctx.get_array_element(arr, index);
+    for i in index..size.saturating_sub(1) {
+        let next = ctx.get_array_element(arr, i + 1);
+        ctx.set_array_element(arr, i, next);
+    }
+    ctx.set_array_element(arr, size - 1, Value::Object(None));
+    ctx.set_field(this, 1, Value::Int((size - 1) as i32));
+    item
+}
+
+/// Append `elem`, growing the backing array when it is full.
+fn dq_append(ctx: &mut dyn NativeContext, this: ObjectRef, elem: Value) {
+    let size = ctx.get_field(this, 1).as_int().unwrap_or(0).max(0) as usize;
+    // `this` and the incoming element must survive every allocation below
+    // (native stale-local family): one base pin covers the seed array and the
+    // growth copy.
+    let base_pin = ctx.pin_native_root(this);
+    let elem_pin = pinned_object_value(ctx, elem);
+    let mut this = this;
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => {
+            let fresh = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
+            this = ctx.read_native_pin(base_pin, this);
+            ctx.set_field(this, 0, Value::Object(Some(fresh)));
+            fresh
+        }
+    };
+    let cap = ctx.array_length(arr);
+    let arr = if size >= cap {
+        let grown = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap * 2 + 8);
+        this = ctx.read_native_pin(base_pin, this);
+        // Re-read the old array through the (possibly moved) receiver.
+        let old = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => grown,
+        };
+        for i in 0..size.min(ctx.array_length(old)) {
+            let v = ctx.get_array_element(old, i);
+            ctx.set_array_element(grown, i, v);
+        }
+        ctx.set_field(this, 0, Value::Object(Some(grown)));
+        grown
+    } else {
+        arr
+    };
+    let elem = read_pinned_object_value(ctx, elem_pin, elem);
+    ctx.set_array_element(arr, size, elem);
+    ctx.set_field(this, 1, Value::Int((size + 1) as i32));
+    ctx.unpin_native_roots(base_pin);
+}
+
+/// Longest single park inside `DelayQueue.take()`. The loop re-checks the head
+/// after every slice, so a shorter cap only costs wakeups — it bounds how long
+/// this thread stays inside one blocking region.
+const DQ_TAKE_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
 pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -3449,11 +3669,13 @@ pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
     let dq = "java/util/concurrent/DelayQueue";
     r.register(dq, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        ctx.set_field(al, 0, Value::Object(None));
-        ctx.set_field(al, 1, Value::Int(0));
-        ctx.set_field(this, 0, Value::Object(Some(al)));
+        // Pin `this` across the array alloc — see `dq_append`.
+        let this_pin = ctx.pin_native_root(this);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.set_field(this, 0, Value::Object(Some(arr)));
         ctx.set_field(this, 1, Value::Int(0));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.register(
@@ -3462,11 +3684,8 @@ pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Delayed;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let size = match ctx.get_field(this, 1) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            ctx.set_field(this, 1, Value::Int(size + 1));
+            let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            dq_append(ctx, this, elem);
             Ok(None)
         },
     );
@@ -3476,31 +3695,82 @@ pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Delayed;)Z",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let size = match ctx.get_field(this, 1) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            ctx.set_field(this, 1, Value::Int(size + 1));
+            let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+            dq_append(ctx, this, elem);
+            // DelayQueue is unbounded — offer never fails.
             Ok(Some(Value::Int(1)))
         },
     );
+    // take(): blocks until the head element's delay has elapsed, per
+    // BlockingQueue. BEHAVIOUR CHANGE — this used to return null immediately.
+    // The wait runs inside the VM's blocking region so a GC safepoint does not
+    // stall behind this thread, and `this` is re-read from the pin after each
+    // slice because a moving young GC can relocate the receiver while parked.
     r.register(
         dq,
         "take",
         "()Ljava/util/concurrent/Delayed;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let mut this = obj_arg(args, 0)?;
+            loop {
+                let (refreshed, head) = dq_head(ctx, this);
+                this = refreshed;
+                if let Some((index, delay)) = head {
+                    if delay <= 0 {
+                        return Ok(Some(dq_remove_at(ctx, this, index)));
+                    }
+                    let wait =
+                        std::time::Duration::from_nanos(delay.max(0) as u64).min(DQ_TAKE_SLICE);
+                    let mut blocked_refs = [Value::Object(Some(this))];
+                    ctx.begin_blocking_region();
+                    std::thread::sleep(wait);
+                    ctx.end_blocking_region_refs(&mut blocked_refs);
+                    if let Value::Object(Some(cur)) = blocked_refs[0] {
+                        this = cur;
+                    }
+                    continue;
+                }
+                // Empty: wait for a producer on another thread.
+                let mut blocked_refs = [Value::Object(Some(this))];
+                ctx.begin_blocking_region();
+                std::thread::sleep(DQ_TAKE_SLICE);
+                ctx.end_blocking_region_refs(&mut blocked_refs);
+                if let Value::Object(Some(cur)) = blocked_refs[0] {
+                    this = cur;
+                }
+            }
+        },
     );
     r.register(
         dq,
         "poll",
         "()Ljava/util/concurrent/Delayed;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (this, head) = dq_head(ctx, this);
+            match head {
+                // poll() is non-blocking: null unless the head has expired.
+                Some((index, delay)) if delay <= 0 => Ok(Some(dq_remove_at(ctx, this, index))),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(
         dq,
         "peek",
         "()Ljava/util/concurrent/Delayed;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // peek() returns the head whether or not its delay has expired.
+            let (this, head) = dq_head(ctx, this);
+            let Some((index, _)) = head else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some((arr, _)) = dq_state(ctx, this) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            Ok(Some(ctx.get_array_element(arr, index)))
+        },
     );
     r.register(dq, "size", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3516,9 +3786,18 @@ pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
     });
     r.register(dq, "clear", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Drop the element references too, so a cleared queue does not keep
+        // its former contents reachable.
+        if let Some((arr, size)) = dq_state(ctx, this) {
+            for i in 0..size {
+                ctx.set_array_element(arr, i, Value::Object(None));
+            }
+        }
         ctx.set_field(this, 1, Value::Int(0));
         Ok(None)
     });
+    // KEEP: DelayQueue is unbounded; the JDK's `remainingCapacity()` is
+    // literally `return Integer.MAX_VALUE;`.
     r.register(dq, "remainingCapacity", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(i32::MAX)))
     });
@@ -3527,7 +3806,240 @@ pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
 
 // =============================================================================
 // ExecutorCompletionService = 2-field (executor=0, completionQueue=1)
+//
+// The completion queue in field 1 is a plain Reference[] whose LENGTH is the
+// queue size — no separate count slot exists on the 2-field synthetic, and the
+// traffic here is a handful of futures, so push/pop reallocate rather than
+// carry a cursor. The array is a heap object, so the queued futures are a GC
+// root and are remapped by a moving collector.
+//
+// Before this, submit() never ran the task and never recorded anything: it
+// handed back a CompletableFuture already "completed" with null. take()
+// fabricated a second such future out of thin air and poll() was hardcoded to
+// null, so `submit(c); take().get()` answered null instead of c.call()'s
+// result and poll() could never see a completion. Nothing failed loudly.
 // =============================================================================
+
+/// Append `fut` to an ExecutorCompletionService's completion queue (field 1).
+fn ecs_queue_push(ctx: &mut dyn NativeContext, this: ObjectRef, fut: Value) {
+    // Pin `this` and the future across the array allocation below — it can
+    // safepoint and relocate both (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let fut_pin = match fut {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let old = match ctx.get_field(this, 1) {
+        Value::Object(Some(a)) => Some(a),
+        _ => None,
+    };
+    let old_len = match old {
+        Some(a) => ctx.array_length(a),
+        None => 0,
+    };
+    let grown = ctx.new_array(cratonvm_types::ArrayElementType::Reference, old_len + 1);
+    let this = ctx.read_native_pin(this_pin, this);
+    if let Value::Object(Some(old)) = ctx.get_field(this, 1) {
+        for i in 0..old_len.min(ctx.array_length(old)) {
+            let v = ctx.get_array_element(old, i);
+            ctx.set_array_element(grown, i, v);
+        }
+    }
+    let fut = match fut_pin {
+        Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        None => fut,
+    };
+    ctx.set_array_element(grown, old_len, fut);
+    ctx.set_field(this, 1, Value::Object(Some(grown)));
+    ctx.unpin_native_roots(this_pin);
+}
+
+/// Remove and return the head of the completion queue, or `None` when empty.
+fn ecs_queue_pop(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<Value> {
+    let old = match ctx.get_field(this, 1) {
+        Value::Object(Some(a)) => a,
+        _ => return None,
+    };
+    let len = ctx.array_length(old);
+    if len == 0 {
+        return None;
+    }
+    let head = ctx.get_array_element(old, 0);
+    // Pin across the shrink allocation.
+    let this_pin = ctx.pin_native_root(this);
+    let head_pin = match head {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let shrunk = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len - 1);
+    let this = ctx.read_native_pin(this_pin, this);
+    if let Value::Object(Some(old)) = ctx.get_field(this, 1) {
+        for i in 1..len.min(ctx.array_length(old)) {
+            let v = ctx.get_array_element(old, i);
+            ctx.set_array_element(shrunk, i - 1, v);
+        }
+    }
+    ctx.set_field(this, 1, Value::Object(Some(shrunk)));
+    let head = match head_pin {
+        Some((h, o)) => Value::Object(Some(ctx.read_native_pin(h, o))),
+        None => head,
+    };
+    ctx.unpin_native_roots(this_pin);
+    Some(head)
+}
+
+/// Run a `Callable`/`Runnable` task inline, wrap its result in a completed
+/// future and record that future in the completion queue.
+///
+/// Execution is inline on the calling thread, matching the rest of CratonVM's
+/// synthetic executor model (`ExecutorService.submit`, `ForkJoinPool.invoke`).
+/// A task that throws propagates out of `submit` rather than being buried in
+/// the returned future: our `CompletableFuture` synthetic has no exceptional
+/// slot that `Future.get()` would rethrow from, so capturing it would hand the
+/// caller a future whose `get()` silently answers the Throwable as a value.
+fn ecs_run_and_record(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    task: Value,
+    runnable_result: Option<Value>,
+) -> MethodCallResult {
+    let this_pin = ctx.pin_native_root(this);
+    let outcome = match task {
+        Value::Object(Some(t)) => {
+            let t_pin = ctx.pin_native_root(t);
+            // The caller's `result` argument survives the task callback below
+            // only if it is pinned: run()/call() is user bytecode and a moving
+            // young GC there relocates it (native stale-local family).
+            let result_pin = match runnable_result {
+                Some(v) => pinned_object_value(ctx, v),
+                None => None,
+            };
+            match runnable_result {
+                // submit(Runnable, V): run() then report the caller's value.
+                Some(v) => {
+                    let ran = ctx.invoke_virtual(t, "run", "()V", &[]);
+                    match ran {
+                        Ok(_) => Ok(read_pinned_object_value(ctx, result_pin, v)),
+                        Err(err) => Err(err),
+                    }
+                }
+                // submit(Callable<V>): call() supplies the value. Fall back to
+                // run() for a receiver that is really a Runnable.
+                None => match ctx.invoke_virtual(t, "call", "()Ljava/lang/Object;", &[]) {
+                    Ok(v) => Ok(v.unwrap_or(Value::Object(None))),
+                    Err(err) => {
+                        let t = ctx.read_native_pin(t_pin, t);
+                        match ctx.invoke_virtual(t, "run", "()V", &[]) {
+                            Ok(_) => Ok(Value::Object(None)),
+                            // Neither shape worked — surface the original
+                            // Callable failure, not the Runnable retry's.
+                            Err(_) => Err(err),
+                        }
+                    }
+                },
+            }
+        }
+        // A null task is a NullPointerException in the JDK. Keep the historical
+        // lenient answer — a completed future with the caller's result — but do
+        // NOT record it: there was no completion to report, and enqueuing a
+        // phantom would make the next take()/poll() hand back a future for work
+        // that never existed.
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            let value = runnable_result.unwrap_or(Value::Object(None));
+            let cf = p58_new_cf(ctx, value, true);
+            return Ok(Some(Value::Object(Some(cf))));
+        }
+    };
+    let value = match outcome {
+        Ok(v) => v,
+        Err(err) => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(err);
+        }
+    };
+    let value_pin = pinned_object_value(ctx, value);
+    // Read the forwarded value out FIRST: inlining this into the call below
+    // borrows `ctx` immutably (`read_pinned_object_value`) inside a call that
+    // already borrows it mutably (`p58_new_cf`).
+    let forwarded = read_pinned_object_value(ctx, value_pin, value);
+    let cf = p58_new_cf(ctx, forwarded, true);
+    if let Some((h, _)) = value_pin {
+        ctx.unpin_native_roots(h);
+    }
+    let cf_pin = ctx.pin_native_root(cf);
+    let this = ctx.read_native_pin(this_pin, this);
+    let cf = ctx.read_native_pin(cf_pin, cf);
+    ecs_queue_push(ctx, this, Value::Object(Some(cf)));
+    let cf = ctx.read_native_pin(cf_pin, cf);
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(Some(cf))))
+}
+
+/// Longest single park inside `CompletionService.take()` — see
+/// [`DQ_TAKE_SLICE`].
+const ECS_TAKE_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// `CompletionService.take()` — pop a completed future, blocking until one is
+/// available. Submissions run inline, so the queue is already populated in the
+/// canonical `for (..) submit(..); for (..) take();` shape; the wait only
+/// matters when another thread is the submitter.
+fn ecs_take(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mut this = obj_arg(args, 0)?;
+    loop {
+        if let Some(head) = ecs_queue_pop(ctx, this) {
+            return Ok(Some(head));
+        }
+        let mut blocked_refs = [Value::Object(Some(this))];
+        ctx.begin_blocking_region();
+        std::thread::sleep(ECS_TAKE_SLICE);
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        if let Value::Object(Some(cur)) = blocked_refs[0] {
+            this = cur;
+        }
+    }
+}
+
+/// `CompletionService.poll()` — non-blocking pop; null when nothing has
+/// completed yet.
+fn ecs_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    Ok(Some(
+        ecs_queue_pop(ctx, this).unwrap_or(Value::Object(None)),
+    ))
+}
+
+/// `CompletionService.poll(long, TimeUnit)` — pop within the deadline, else
+/// null. Unlike `take()` this never waits indefinitely.
+fn ecs_poll_timed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mut this = obj_arg(args, 0)?;
+    let raw = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        // A generic stack pop can type-erase Long into a Double bit pattern
+        // (see the schedule() natives above).
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let timeout_ms = scheduled_convert_to_millis(ctx, raw, args.get(2)).max(0) as u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(head) = ecs_queue_pop(ctx, this) {
+            return Ok(Some(head));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(Some(Value::Object(None)));
+        }
+        let mut blocked_refs = [Value::Object(Some(this))];
+        ctx.begin_blocking_region();
+        std::thread::sleep(remaining.min(ECS_TAKE_SLICE));
+        ctx.end_blocking_region_refs(&mut blocked_refs);
+        if let Value::Object(Some(cur)) = blocked_refs[0] {
+            this = cur;
+        }
+    }
+}
 
 pub(crate) fn register_p65_completion_service(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -3548,9 +4060,10 @@ pub(crate) fn register_p65_completion_service(r: &mut NativeMethodRegistry) {
         ecs,
         "submit",
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
-        |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true);
-            Ok(Some(Value::Object(Some(cf))))
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let task = args.get(1).copied().unwrap_or(Value::Object(None));
+            ecs_run_and_record(ctx, this, task, None)
         },
     );
     r.register(
@@ -3558,31 +4071,21 @@ pub(crate) fn register_p65_completion_service(r: &mut NativeMethodRegistry) {
         "submit",
         "(Ljava/lang/Runnable;Ljava/lang/Object;)Ljava/util/concurrent/Future;",
         |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let task = args.get(1).copied().unwrap_or(Value::Object(None));
             let result = args.get(2).copied().unwrap_or(Value::Object(None));
-            let cf = p58_new_cf(ctx, result, true);
-            Ok(Some(Value::Object(Some(cf))))
+            ecs_run_and_record(ctx, this, task, Some(result))
         },
     );
-    r.register(
-        ecs,
-        "take",
-        "()Ljava/util/concurrent/Future;",
-        |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true);
-            Ok(Some(Value::Object(Some(cf))))
-        },
-    );
-    r.register(
-        ecs,
-        "poll",
-        "()Ljava/util/concurrent/Future;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    r.register(ecs, "take", "()Ljava/util/concurrent/Future;", ecs_take);
+    r.register(ecs, "poll", "()Ljava/util/concurrent/Future;", ecs_poll);
+    // Timed poll: the completion queue is filled by submit() on some thread,
+    // so honour the timeout instead of answering null on the spot.
     r.register(
         ecs,
         "poll",
         "(JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/Future;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        ecs_poll_timed,
     );
 
     // CompletionService interface
@@ -3591,26 +4094,14 @@ pub(crate) fn register_p65_completion_service(r: &mut NativeMethodRegistry) {
         cs,
         "submit",
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
-        |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true);
-            Ok(Some(Value::Object(Some(cf))))
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let task = args.get(1).copied().unwrap_or(Value::Object(None));
+            ecs_run_and_record(ctx, this, task, None)
         },
     );
-    r.register(
-        cs,
-        "take",
-        "()Ljava/util/concurrent/Future;",
-        |ctx, _args| {
-            let cf = p58_new_cf(ctx, Value::Object(None), true);
-            Ok(Some(Value::Object(Some(cf))))
-        },
-    );
-    r.register(
-        cs,
-        "poll",
-        "()Ljava/util/concurrent/Future;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    r.register(cs, "take", "()Ljava/util/concurrent/Future;", ecs_take);
+    r.register(cs, "poll", "()Ljava/util/concurrent/Future;", ecs_poll);
     r.set_category(__prev_cat);
 }
 
@@ -3841,6 +4332,89 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
 // 3-field: owner=0 (Long threadId), shutdown=1 (Int 0/1), result=2 (Object)
 // =============================================================================
 
+/// `jdk.incubator.concurrent.StructuredTaskScope$Subtask` state values, mirroring
+/// the enum the `state()` native renders.
+const INCUBATOR_SUBTASK_UNAVAILABLE: i32 = 0;
+const INCUBATOR_SUBTASK_SUCCESS: i32 = 2;
+const INCUBATOR_SUBTASK_FAILED: i32 = 3;
+
+/// Wrap `value` in a synthetic `java.util.Optional` (1 field; null == empty).
+/// `Optional`-returning methods must never hand back a bare null — callers
+/// immediately dereference the result with `isPresent()`/`orElse(..)`.
+fn sts_optional_of(ctx: &mut dyn NativeContext, value: Value) -> ObjectRef {
+    // Pin the payload across the Optional allocation (native stale-local family).
+    let value_pin = pinned_object_value(ctx, value);
+    let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
+    let value = read_pinned_object_value(ctx, value_pin, value);
+    ctx.set_field(opt, 0, value);
+    if let Some((h, _)) = value_pin {
+        ctx.unpin_native_roots(h);
+    }
+    opt
+}
+
+/// The Throwable behind a failed call, when the failure was a Java exception
+/// rather than an internal VM error.
+fn thrown_object(err: &MethodCallFailed) -> Value {
+    match err {
+        MethodCallFailed::ExceptionThrown(obj) => Value::Object(Some(*obj)),
+        _ => Value::Object(None),
+    }
+}
+
+/// Fork one incubator-`StructuredTaskScope` subtask: run the callable inline
+/// and record the outcome in a 3-field Subtask (state=0, result=1,
+/// exception=2). Slot 2 is new — the failure Throwable used to be dropped on
+/// the floor, which is why `Subtask.exception()` could only ever answer null.
+///
+/// Returns `(scope, subtask)` because `Callable.call()` is user bytecode: it
+/// allocates and can safepoint, and a moving young GC there relocates both the
+/// scope and the fresh subtask (native stale-local family). Callers must use
+/// the returned handles.
+fn incubator_fork_subtask(
+    ctx: &mut dyn NativeContext,
+    scope: Option<ObjectRef>,
+    callable: Option<ObjectRef>,
+) -> (Option<ObjectRef>, ObjectRef) {
+    let subtask = alloc_concurrent_synthetic(
+        ctx,
+        "jdk/incubator/concurrent/StructuredTaskScope$Subtask",
+        3,
+    );
+    ctx.set_field(subtask, 0, Value::Int(INCUBATOR_SUBTASK_UNAVAILABLE));
+    ctx.set_field(subtask, 1, Value::Object(None));
+    ctx.set_field(subtask, 2, Value::Object(None));
+    let Some(callable) = callable else {
+        return (scope, subtask);
+    };
+    let base = ctx.pin_native_root(subtask);
+    let scope_pin = match scope {
+        Some(s) => Some((ctx.pin_native_root(s), s)),
+        None => None,
+    };
+    // `invoke_virtual` prepends the receiver itself — passing it again in
+    // `args` (as this code used to) duplicates it.
+    let outcome = ctx.invoke_virtual(callable, "call", "()Ljava/lang/Object;", &[]);
+    let subtask = ctx.read_native_pin(base, subtask);
+    let scope = match scope_pin {
+        Some((h, s)) => Some(ctx.read_native_pin(h, s)),
+        None => None,
+    };
+    match outcome {
+        Ok(value) => {
+            ctx.set_field(subtask, 0, Value::Int(INCUBATOR_SUBTASK_SUCCESS));
+            ctx.set_field(subtask, 1, value.unwrap_or(Value::Object(None)));
+        }
+        Err(err) => {
+            ctx.set_field(subtask, 0, Value::Int(INCUBATOR_SUBTASK_FAILED));
+            ctx.set_field(subtask, 1, Value::Object(None));
+            ctx.set_field(subtask, 2, thrown_object(&err));
+        }
+    }
+    ctx.unpin_native_roots(base);
+    (scope, subtask)
+}
+
 pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3870,36 +4444,11 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
         "fork",
         "(Ljava/util/concurrent/Callable;)Ljdk/incubator/concurrent/StructuredTaskScope$Subtask;",
         |ctx, args| {
-            // Create a Subtask = 2-field (state=0 Int, result=1 Object)
-            let subtask = alloc_concurrent_synthetic(
-                ctx,
-                "jdk/incubator/concurrent/StructuredTaskScope$Subtask",
-                2,
-            );
-            // Eagerly call the callable
             let callable = match args.get(1) {
-                Some(Value::Object(Some(c))) => *c,
-                _ => return Ok(Some(Value::Object(Some(subtask)))),
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
             };
-            match ctx.invoke_virtual(
-                callable,
-                "call",
-                "()Ljava/lang/Object;",
-                &[Value::Object(Some(callable))],
-            ) {
-                Ok(Some(result)) => {
-                    ctx.set_field(subtask, 0, Value::Int(2)); // SUCCESS
-                    ctx.set_field(subtask, 1, result);
-                }
-                Ok(None) => {
-                    ctx.set_field(subtask, 0, Value::Int(2));
-                    ctx.set_field(subtask, 1, Value::Object(None));
-                }
-                Err(_) => {
-                    ctx.set_field(subtask, 0, Value::Int(3)); // FAILED
-                    ctx.set_field(subtask, 1, Value::Object(None));
-                }
-            }
+            let (_, subtask) = incubator_fork_subtask(ctx, None, callable);
             Ok(Some(Value::Object(Some(subtask))))
         },
     );
@@ -3972,12 +4521,26 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
             )
         },
     );
-    r.register(
-        sub,
-        "exception",
-        "()Ljava/lang/Throwable;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // exception(): the JDK contract is "the exception of a FAILED subtask;
+    // IllegalStateException if the subtask is not in the FAILED state". The
+    // constant null broke both halves — a FAILED subtask reported no cause
+    // (callers NPE'd on `subtask.exception().getMessage()`), and calling it on
+    // a SUCCESS subtask silently succeeded instead of failing. `fork` now
+    // stores the Throwable in slot 2 (see `incubator_fork_subtask`).
+    r.register(sub, "exception", "()Ljava/lang/Throwable;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if !matches!(ctx.get_field(this, 0), Value::Int(s) if s == INCUBATOR_SUBTASK_FAILED) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Subtask did not complete with an exception".into(),
+            }
+            .into());
+        }
+        if ctx.object_num_fields(this) > 2 {
+            Ok(Some(ctx.get_field(this, 2)))
+        } else {
+            Ok(Some(Value::Object(None)))
+        }
+    });
 
     // ShutdownOnSuccess = 3-field (owner=0, shutdown=1, result=2) — same as base
     let sos = "jdk/incubator/concurrent/StructuredTaskScope$ShutdownOnSuccess";
@@ -3999,37 +4562,19 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljdk/incubator/concurrent/StructuredTaskScope$Subtask;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let subtask = alloc_concurrent_synthetic(
-                ctx,
-                "jdk/incubator/concurrent/StructuredTaskScope$Subtask",
-                2,
-            );
             let callable = match args.get(1) {
-                Some(Value::Object(Some(c))) => *c,
-                _ => return Ok(Some(Value::Object(Some(subtask)))),
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
             };
-            match ctx.invoke_virtual(
-                callable,
-                "call",
-                "()Ljava/lang/Object;",
-                &[Value::Object(Some(callable))],
-            ) {
-                Ok(Some(result)) => {
-                    ctx.set_field(subtask, 0, Value::Int(2));
-                    ctx.set_field(subtask, 1, result);
-                    // ShutdownOnSuccess captures first successful result
-                    if matches!(ctx.get_field(this, 2), Value::Object(None)) {
-                        ctx.set_field(this, 2, result);
-                        ctx.set_field(this, 1, Value::Int(1)); // auto-shutdown
-                    }
-                }
-                Ok(None) => {
-                    ctx.set_field(subtask, 0, Value::Int(2));
-                    ctx.set_field(subtask, 1, Value::Object(None));
-                }
-                Err(_) => {
-                    ctx.set_field(subtask, 0, Value::Int(3));
-                    ctx.set_field(subtask, 1, Value::Object(None));
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            // ShutdownOnSuccess captures the first successful result.
+            if let Some(this) = this {
+                let succeeded =
+                    matches!(ctx.get_field(subtask, 0), Value::Int(s) if s == INCUBATOR_SUBTASK_SUCCESS);
+                if succeeded && matches!(ctx.get_field(this, 2), Value::Object(None)) {
+                    let result = ctx.get_field(subtask, 1);
+                    ctx.set_field(this, 2, result);
+                    ctx.set_field(this, 1, Value::Int(1)); // auto-shutdown
                 }
             }
             Ok(Some(Value::Object(Some(subtask))))
@@ -4061,9 +4606,17 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 2, Value::Object(None)); // exception
         Ok(None)
     });
-    r.register(sof, "exception", "()Ljava/util/Optional;", |_ctx, _args| {
-        // No failure → empty Optional
-        Ok(Some(Value::Object(None)))
+    // exception(): returns an Optional, never null — the old constant NULL made
+    // `scope.exception().isPresent()` NPE instead of answering, and it could
+    // never report a failure now that `fork` records the cause in slot 2.
+    r.register(sof, "exception", "()Ljava/util/Optional;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let exc = if ctx.object_num_fields(this) > 2 {
+            ctx.get_field(this, 2)
+        } else {
+            Value::Object(None)
+        };
+        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
     });
     r.register(sof, "throwIfFailed", "()V", |ctx, args| {
         // If the scope captured an exception (field 2), wrap it in ExecutionException and throw.
@@ -4101,34 +4654,26 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljdk/incubator/concurrent/StructuredTaskScope$Subtask;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let subtask = alloc_concurrent_synthetic(
-                ctx,
-                "jdk/incubator/concurrent/StructuredTaskScope$Subtask",
-                2,
-            );
             let callable = match args.get(1) {
-                Some(Value::Object(Some(c))) => *c,
-                _ => return Ok(Some(Value::Object(Some(subtask)))),
+                Some(Value::Object(Some(c))) => Some(*c),
+                _ => None,
             };
-            match ctx.invoke_virtual(
-                callable,
-                "call",
-                "()Ljava/lang/Object;",
-                &[Value::Object(Some(callable))],
-            ) {
-                Ok(Some(result)) => {
-                    ctx.set_field(subtask, 0, Value::Int(2));
-                    ctx.set_field(subtask, 1, result);
-                }
-                Ok(None) => {
-                    ctx.set_field(subtask, 0, Value::Int(2));
-                    ctx.set_field(subtask, 1, Value::Object(None));
-                }
-                Err(_) => {
-                    ctx.set_field(subtask, 0, Value::Int(3));
-                    ctx.set_field(subtask, 1, Value::Object(None));
-                    // Auto-shutdown on first failure
+            let (this, subtask) = incubator_fork_subtask(ctx, Some(this), callable);
+            if let Some(this) = this {
+                let failed =
+                    matches!(ctx.get_field(subtask, 0), Value::Int(s) if s == INCUBATOR_SUBTASK_FAILED);
+                if failed {
+                    // Auto-shutdown on first failure, and retain the cause so
+                    // throwIfFailed()/exception() can report it. Previously the
+                    // Throwable was discarded, so the scope's exception slot
+                    // stayed null and throwIfFailed() never fired.
                     ctx.set_field(this, 1, Value::Int(1));
+                    if ctx.object_num_fields(this) > 2
+                        && matches!(ctx.get_field(this, 2), Value::Object(None))
+                    {
+                        let exc = ctx.get_field(subtask, 2);
+                        ctx.set_field(this, 2, exc);
+                    }
                 }
             }
             Ok(Some(Value::Object(Some(subtask))))
@@ -4557,12 +5102,28 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
             )
         },
     );
-    r.register(
-        sub,
-        "exception",
-        "()Ljava/lang/Throwable;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // SUPERSEDED, kept correct-by-construction: `jdk25_concurrency::
+    // register_jdk25_concurrency_natives` re-registers the whole
+    // `java/util/concurrent/StructuredTaskScope$Subtask` surface (get/state/
+    // exception/task) over its canonical 8-field layout and runs LAST in
+    // `register_synthetic_overrides`, so the live `exception()` is that one.
+    // The constant null here is still wrong on its own terms — the JDK throws
+    // IllegalStateException unless the subtask FAILED — so it is fixed rather
+    // than left as a landmine for a future ordering change.
+    r.register(sub, "exception", "()Ljava/lang/Throwable;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if !matches!(ctx.get_field(this, 0), Value::Int(s) if s == J25_SUBTASK_STATE_FAILED) {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Subtask did not complete with an exception".into(),
+            }
+            .into());
+        }
+        if ctx.object_num_fields(this) > 2 {
+            Ok(Some(ctx.get_field(this, 2)))
+        } else {
+            Ok(Some(Value::Object(None)))
+        }
+    });
 
     // ShutdownOnSuccess
     let sos = "java/util/concurrent/StructuredTaskScope$ShutdownOnSuccess";
@@ -4598,9 +5159,19 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
         "Ljava/util/concurrent/StructuredTaskScope$ShutdownOnFailure;",
         "Ljava/util/concurrent/StructuredTaskScope$Subtask;",
     );
-    r.register(sof, "exception", "()Ljava/util/Optional;", |_ctx, _args| {
-        // Synthetic: null == Optional.empty().
-        Ok(Some(Value::Object(None)))
+    // exception(): an Optional-returning method must not answer bare null —
+    // `scope.exception().isPresent()` NPEs on it. Report the scope's captured
+    // cause (J25_STS_EXCEPTION) wrapped in a synthetic Optional; an empty
+    // Optional when there was no failure. (Also superseded by
+    // `jdk25_concurrency` — see the Subtask note above.)
+    r.register(sof, "exception", "()Ljava/util/Optional;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let exc = if ctx.object_num_fields(this) > J25_STS_EXCEPTION {
+            ctx.get_field(this, J25_STS_EXCEPTION)
+        } else {
+            Value::Object(None)
+        };
+        Ok(Some(Value::Object(Some(sts_optional_of(ctx, exc)))))
     });
     r.register(sof, "throwIfFailed", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -4830,9 +5401,18 @@ pub(crate) fn register_p69_submission_publisher(r: &mut NativeMethodRegistry) {
     // one (`methods.insert`), and the old no-op/zero stubs would clobber the
     // working delivery path. Only add methods genuinely absent from Phase 60.
     let sp = "java/util/concurrent/SubmissionPublisher";
+    // KEEP: the only SubmissionPublisher constructor CratonVM registers is the
+    // no-arg one, which in the JDK means `Flow.defaultBufferSize()` == 256.
+    // There is no configurable capacity to read back, so 256 is the value, not
+    // a placeholder.
     r.register(sp, "getMaxBufferCapacity", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(256)))
     });
+    // KEEP: `getClosedException()` reports the Throwable passed to
+    // `closeExceptionally(Throwable)`, and null when the publisher was closed
+    // normally or is still open. `closeExceptionally` is not registered
+    // anywhere in the tree (checked), so no code path can ever set one — null
+    // is the accurate answer for every reachable state.
     r.register(
         sp,
         "getClosedException",
@@ -5490,8 +6070,16 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // activeGroupCount() is "an estimate of the number of active groups in this
+    // group AND ITS SUBGROUPS" — it does not count the receiver. CratonVM keeps
+    // no subgroup registry (`parent` is the only link and it points upward), so
+    // no group here has known children and 0 is the honest estimate. Reporting
+    // 1 made the standard
+    //   ThreadGroup[] gs = new ThreadGroup[g.activeGroupCount()]; g.enumerate(gs);
+    // idiom size an array for a subgroup that does not exist and then read a
+    // null slot back out of it.
     r.register(tg, "activeGroupCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(0)))
     });
     r.register(tg, "parentOf", "(Ljava/lang/ThreadGroup;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;

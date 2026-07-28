@@ -89,6 +89,10 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
     );
 
     // --- Stream.isParallel() → boolean ---
+    // KEEP: constant false is the truth for this stream model, not a stub.
+    // `parallel()` above returns the receiver unchanged and no synthetic
+    // stream operation ever splits, so every synthetic stream really is
+    // sequential. Reporting true would be the lie.
     r.register(stream, "isParallel", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -1595,7 +1599,20 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- IntSummaryStatistics ---
     let iss = "java/util/IntSummaryStatistics";
-    r.register(iss, "<init>", "()V", |_ctx, _args| Ok(None));
+    // The no-arg ctor must seed the identity values, not leave the slots at
+    // their allocation default. The JDK starts min at Integer.MAX_VALUE and
+    // max at Integer.MIN_VALUE so the first accept() wins both comparisons.
+    // With an all-default object `accept()`'s `min.min(val)` folded against a
+    // stale 0 and `getMin()` on an empty statistics answered 0 instead of
+    // Integer.MAX_VALUE — e.g. `IntStream.of(5, 7)` reported min 0.
+    r.register(iss, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(0));
+        ctx.set_field(this, STATS_FIELD_SUM, Value::Long(0));
+        ctx.set_field(this, STATS_FIELD_MIN, Value::Int(i32::MAX));
+        ctx.set_field(this, STATS_FIELD_MAX, Value::Int(i32::MIN));
+        Ok(None)
+    });
     r.register(iss, "getCount", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, STATS_FIELD_COUNT)))
@@ -1693,7 +1710,15 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 
     // --- LongSummaryStatistics ---
     let lss = "java/util/LongSummaryStatistics";
-    r.register(lss, "<init>", "()V", |_ctx, _args| Ok(None));
+    // Identity seeding — see the IntSummaryStatistics ctor above.
+    r.register(lss, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(0));
+        ctx.set_field(this, STATS_FIELD_SUM, Value::Long(0));
+        ctx.set_field(this, STATS_FIELD_MIN, Value::Long(i64::MAX));
+        ctx.set_field(this, STATS_FIELD_MAX, Value::Long(i64::MIN));
+        Ok(None)
+    });
     r.register(lss, "getCount", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, STATS_FIELD_COUNT)))
@@ -1791,7 +1816,16 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
 
     // --- DoubleSummaryStatistics ---
     let dss = "java/util/DoubleSummaryStatistics";
-    r.register(dss, "<init>", "()V", |_ctx, _args| Ok(None));
+    // Identity seeding — see the IntSummaryStatistics ctor above. The JDK
+    // seeds min/max with +/-Infinity for the double flavour.
+    r.register(dss, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, STATS_FIELD_COUNT, Value::Long(0));
+        ctx.set_field(this, STATS_FIELD_SUM, Value::Double(0.0));
+        ctx.set_field(this, STATS_FIELD_MIN, Value::Double(f64::INFINITY));
+        ctx.set_field(this, STATS_FIELD_MAX, Value::Double(f64::NEG_INFINITY));
+        Ok(None)
+    });
     r.register(dss, "getCount", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, STATS_FIELD_COUNT)))
@@ -3029,6 +3063,22 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 // Spliterator = 2-field synthetic (array=0, cursor=1)
 // =============================================================================
 
+/// `java.util.Spliterator.SORTED`.
+pub(crate) const P59_SPLITERATOR_SORTED: i32 = 0x04;
+
+/// Characteristics bitset of a Spliterator receiver, obtained by dispatching
+/// `characteristics()I` on it so an overriding implementation (real JDK
+/// bytecode or a later native) answers for itself. Falls back to 0 ("nothing
+/// guaranteed") when the call is unavailable — the conservative answer, since
+/// every `hasCharacteristics` query then reports false only for bits nobody
+/// claimed.
+pub(crate) fn p59_spliterator_characteristics(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.invoke_virtual(this, "characteristics", "()I", &[]) {
+        Ok(Some(v)) => v.as_int().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3048,17 +3098,49 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Long(-1)))
         }
     });
+    // getComparator(): the JDK contract is three-way — return the Comparator if
+    // the source is SORTED by one, null if SORTED in natural order, and throw
+    // IllegalStateException otherwise. Answering null unconditionally told
+    // every caller "sorted, natural order", so callers that trust it (e.g. a
+    // merge that assumes pre-sorted input) skipped their own sort and produced
+    // silently unordered results. Our synthetic spliterators are never SORTED,
+    // so this now throws — the spec'd answer for an unsorted source.
     r.register(
         spl,
         "getComparator",
         "()Ljava/util/Comparator;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ch = p59_spliterator_characteristics(ctx, this);
+            if (ch & P59_SPLITERATOR_SORTED) != 0 {
+                // SORTED but no comparator recorded => natural ordering.
+                return Ok(Some(Value::Object(None)));
+            }
+            Err(RuntimeError::IllegalStateException {
+                message: "Spliterator source is not SORTED".into(),
+            }
+            .into())
+        },
     );
-    r.register(spl, "hasCharacteristics", "(I)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // hasCharacteristics(c) is defined as `(characteristics() & c) == c`.
+    // The constant `false` contradicted characteristics() (which reports
+    // ORDERED|SIZED), so callers took the "unordered / unsized" branch and
+    // e.g. discarded encounter order or refused a sized short-circuit.
+    r.register(spl, "hasCharacteristics", "(I)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let wanted = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let ch = p59_spliterator_characteristics(ctx, this);
+        Ok(Some(Value::Int(if (ch & wanted) == wanted {
+            1
+        } else {
+            0
+        })))
     });
 
-    // Spliterator constants
+    // Spliterator constants — KEEP: these are `public static final int` fields
+    // of java.util.Spliterator surfaced as descriptor-"I" natives. The values
+    // are the JLS-visible constants themselves, so a constant body is the
+    // correct (and only possible) implementation.
     r.register(spl, "ORDERED", "I", |_ctx, _args| {
         Ok(Some(Value::Int(0x10)))
     });
@@ -3906,6 +3988,12 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         },
     );
     // Gatherer.defaultInitializer / defaultFinisher
+    // KEEP: null IS the sentinel this Gatherer model uses for "no initializer
+    // / no finisher". `Gatherer.of(..)` above stores null in slots 0 and 2,
+    // and the gather engine (`pd_gather_fold` / `pd_gather_scan` /
+    // `pd_gather_custom` in lib.rs) branches on `Value::Object(Some(_))` and
+    // skips the stage when it is null. Handing back a synthetic Supplier /
+    // BiConsumer here would be a value the engine then has to call.
     r.register(
         g,
         "defaultInitializer",
@@ -4031,13 +4119,16 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(1)))
         },
     );
+    // KEEP: `trySplit()` returning null is the spec'd answer for a spliterator
+    // that "cannot be split" — it is not an error path, and every caller
+    // already has to handle it (`Spliterators`, `AbstractTask`). This
+    // spliterator is a single cursor over one array and never splits, so null
+    // is the truthful reply, and it is consistent with `isParallel() == false`.
     r.register(
         sp,
         "trySplit",
         "()Ljava/util/Spliterator;",
-        |_ctx, _args| {
-            Ok(Some(Value::Object(None))) // simplified: no splitting
-        },
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
     r.register(sp, "estimateSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -4051,6 +4142,12 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Long((fence - pos).max(0))))
     });
+    // KEEP: this describes the ONE spliterator shape these natives implement —
+    // a cursor (pos=1, fence=2) over an Object[] (elements=0). That is ORDERED
+    // (array index order) and SIZED (`estimateSize()` is exact). It is not
+    // DISTINCT/SORTED/NONNULL/IMMUTABLE/CONCURRENT, and not SUBSIZED because
+    // `trySplit()` never produces children. `hasCharacteristics(c)` is derived
+    // from this value rather than hardcoded.
     r.register(sp, "characteristics", "()I", |_ctx, _args| {
         // ORDERED | SIZED
         Ok(Some(Value::Int(0x10 | 0x40)))
@@ -4113,7 +4210,10 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Spliterator constants
+    // Spliterator constants — KEEP: `public static final int` fields of
+    // java.util.Spliterator surfaced as descriptor-"I" natives; the constant
+    // IS the value. (Duplicate of the p59 block, same values; the later
+    // registration simply overwrites the identical earlier one.)
     r.register(sp, "ORDERED", "I", |_ctx, _args| Ok(Some(Value::Int(0x10))));
     r.register(sp, "DISTINCT", "I", |_ctx, _args| {
         Ok(Some(Value::Int(0x01)))

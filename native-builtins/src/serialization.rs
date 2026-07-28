@@ -2054,7 +2054,17 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // writeFields()V
+    // writeFields()V — flushes the `PutField` accumulator returned by
+    // `putFields()` into the stream.
+    //
+    // KEPT as a no-op, with the reason recorded rather than assumed: the
+    // accumulator is empty BY CONSTRUCTION. `putFields()` below hands back a
+    // 2-slot `ObjectOutputStream$PutField` whose only `put*` entry points are
+    // the abstract JDK declarations — no `PutField.put(String, …)` native is
+    // registered anywhere in the tree — so nothing is ever buffered for this
+    // method to emit. Writing a zero-length field block would be exactly as
+    // empty as writing nothing. The gap to close is `PutField.put*`, not this
+    // method; recorded as an open residual in the wave-2 report.
     r.register(cls, "writeFields", "()V", |_ctx, _args| Ok(None));
 
     // putFields() -> ObjectOutputStream.PutField
@@ -2070,8 +2080,20 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // writeStreamHeader()V
-    r.register(cls, "writeStreamHeader", "()V", |_ctx, _args| Ok(None));
+    // writeStreamHeader()V — emit STREAM_MAGIC (0xACED) + STREAM_VERSION (5).
+    //
+    // Was a no-op. `<init>` already calls `write_stream_header` directly, so
+    // the constructor path was fine, but this method is `protected` precisely
+    // so a subclass (or `reset()`-style re-priming code) can re-emit the
+    // header — and those callers silently produced a stream with no magic,
+    // which the matching `ObjectInputStream` then rejects as corrupt. Writing
+    // the real four bytes costs nothing on the constructor path because that
+    // path does not route through here.
+    r.register(cls, "writeStreamHeader", "()V", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        write_stream_header(this.as_ptr() as usize);
+        Ok(None)
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3030,6 +3052,11 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // `readObjectOverride()` is `protected Object readObjectOverride() { return
+    // null; }` in the real `ObjectInputStream` — a hook that exists only to be
+    // overridden by a subclass built with the protected no-arg constructor.
+    // Returning null is the JDK body verbatim, not a stub; a subclass that
+    // overrides it resolves to its own declaring class and never reaches here.
     r.register(
         cls,
         "readObjectOverride",
@@ -4092,13 +4119,69 @@ fn register_object_stream_field(r: &mut NativeMethodRegistry) {
     });
 
     // isUnshared() -> boolean
-    r.register(cls, "isUnshared", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    //
+    // Was a hard `false`. The real `ObjectStreamField` carries a `boolean
+    // unshared` set by the `(String, Class, boolean)` constructor and by
+    // `ObjectStreamClass`'s `serialPersistentFields` walk; an unconditional
+    // `false` tells `writeObject`/`readObject` to use the shared handle table
+    // for a field a class explicitly declared unshared, which silently aliases
+    // two logically distinct objects. Read the named field so the real-JDK
+    // layout answers truthfully; our 4-slot synthetic has no such field and
+    // `get_field_by_name` reports `Object(None)` for it, which falls through to
+    // `false` — the same answer as before for synthetic-built descriptors.
+    r.register(cls, "isUnshared", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let unshared = match ctx.get_field_by_name(this, "unshared") {
+            Value::Int(v) => v != 0,
+            _ => false,
+        };
+        Ok(Some(Value::Int(if unshared { 1 } else { 0 })))
     });
 
     // compareTo(Object) -> int
-    r.register(cls, "compareTo", "(Ljava/lang/Object;)I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    //
+    // Was a constant 0, i.e. "every field compares equal". `ObjectStreamClass`
+    // sorts its `ObjectStreamField[]` with this comparator before writing the
+    // class descriptor and before matching a received descriptor against the
+    // local class, so a constant 0 left the field order at whatever the
+    // reflection walk happened to produce. Two JVMs that enumerate declared
+    // fields in different orders then disagree on the stream layout and
+    // deserialisation reads each value into the wrong field.
+    //
+    // Real JDK body: primitives sort before object fields; within a group,
+    // by field name.
+    r.register(cls, "compareTo", "(Ljava/lang/Object;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let other = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            // `compareTo(null)` is a NullPointerException in the JDK; our
+            // callers only ever pass real descriptors, so treat anything else
+            // as "sorts after" rather than unwinding mid-sort.
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let this_prim = type_code_is_primitive(ctx.get_field(this, 1).as_int().unwrap_or(0));
+        let other_prim = type_code_is_primitive(ctx.get_field(other, 1).as_int().unwrap_or(0));
+        if this_prim != other_prim {
+            return Ok(Some(Value::Int(if this_prim { -1 } else { 1 })));
+        }
+        // No allocation happens between these reads, so the raw refs are safe.
+        let this_name = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let other_name = match ctx.get_field(other, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        // Java's String.compareTo is UTF-16 code-unit order. Field names are
+        // Java identifiers (ASCII in every practical case), for which Rust's
+        // byte-wise Ord agrees exactly.
+        let ord = match this_name.cmp(&other_name) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+        Ok(Some(Value::Int(ord)))
     });
 }
 
@@ -4971,6 +5054,10 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
         },
     );
+    // `flush()` is inherited from `OutputStream`, whose body is empty, and
+    // `ByteArrayOutputStream.close()` is documented as having no effect (the
+    // buffer stays readable afterwards). Both no-ops match the JDK exactly —
+    // this stream has no sink to push to and no descriptor to release.
     r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
 }

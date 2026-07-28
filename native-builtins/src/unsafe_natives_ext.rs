@@ -21,6 +21,42 @@ pub(crate) fn unsafe_offset_is_heap_slot(
     offset < ctx.object_num_fields(obj) && offset < 64
 }
 
+/// `Unsafe.pageSize()` — the host OS virtual-memory page size.
+///
+/// Was a hard-coded `4096`. That is right on x86-64 Linux/Windows but wrong on
+/// an Apple-silicon host (16 KiB) and on Linux/aarch64 kernels built with 16 K
+/// or 64 K pages, where callers that size a buffer from `pageSize()` (Netty's
+/// `PlatformDependent`, LMAX Disruptor padding, `DirectByteBuffer` alignment)
+/// would under-align. `sysconf(_SC_PAGESIZE)` is the same source HotSpot uses.
+/// Windows has no `sysconf`; its page size is 4 KiB on every architecture the
+/// VM builds for, so the constant stays there and is documented as such.
+pub(crate) fn native_unsafe_page_size(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    #[cfg(unix)]
+    let size: i32 = {
+        // `sysconf` returns -1 on failure; fall back to the 4 KiB default.
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        i32::try_from(raw).ok().filter(|n| *n > 0).unwrap_or(4096)
+    };
+    #[cfg(not(unix))]
+    let size: i32 = 4096;
+    Ok(Some(Value::Int(size)))
+}
+
+/// `Unsafe.addressSize()` — the width of a native pointer in bytes.
+///
+/// Derived from the host pointer width rather than hard-coded to 8, so it
+/// agrees with `jdk/internal/misc/Unsafe.addressSize0()` (unsafe_jdk25.rs) and
+/// stays correct if the VM is ever built for a 32-bit target.
+pub(crate) fn native_unsafe_address_size(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(std::mem::size_of::<usize>() as i32)))
+}
+
 pub(crate) fn native_unsafe_ensure_class_initialized(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -693,14 +729,9 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;JJB)V",
         native_unsafe_set_memory,
     );
-    // pageSize
-    r.register(u, "pageSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(4096)))
-    });
-    // addressSize
-    r.register(u, "addressSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(8)))
-    });
+    // pageSize / addressSize — queried from the host rather than hard-coded.
+    r.register(u, "pageSize", "()I", native_unsafe_page_size);
+    r.register(u, "addressSize", "()I", native_unsafe_address_size);
 
     // Also register under jdk/internal/misc/Unsafe (the modern API, same implementations)
     let u2 = "jdk/internal/misc/Unsafe";
@@ -1085,12 +1116,8 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
         unsafe_natives::native_unsafe_copy_memory_consolidated,
     );
-    r.register(u2, "pageSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(4096)))
-    });
-    r.register(u2, "addressSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(8)))
-    });
+    r.register(u2, "pageSize", "()I", native_unsafe_page_size);
+    r.register(u2, "addressSize", "()I", native_unsafe_address_size);
 
     // --- Remaining Unsafe methods (Phase 44) ---
 
@@ -1154,7 +1181,19 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_unsafe_throw_exception,
     );
 
-    // shouldBeInitialized — check if class needs initialization
+    // shouldBeInitialized(Class) — "is this class still uninitialized?".
+    //
+    // KEPT as a constant `false`, deliberately: `NativeContext` exposes no
+    // initialization-state query (only `ensure_class_initialized`, which acts
+    // rather than reports), so there is nothing truthful to read. `false` is
+    // the correct answer on the dominant JDK call path —
+    // `DirectMethodHandle$EnsureInitialized.computeValue` calls
+    // `ensureClassInitialized(type)` (our real implementation) and only THEN
+    // asks `shouldBeInitialized(type)`; by that point the class genuinely is
+    // initialized. Answering `true` there would make the JDK conclude it is
+    // executing inside `<clinit>` and pin the `<clinit>` barrier on the method
+    // handle for the process lifetime. Revisit if a real
+    // `is_class_initialized` query is ever added to the native API.
     r.register(
         u,
         "shouldBeInitialized",
@@ -1168,18 +1207,26 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
 
-    // staticFieldBase — returns base object for static field access
+    // staticFieldBase — returns the declaring class's mirror, which is what the
+    // matching `staticFieldOffset` above encodes against.
+    //
+    // These two used to be always-null closures. In essential-natives mode that
+    // was invisible (`unsafe_natives::register_unsafe_wp1_2` runs later and
+    // re-registers the real impl), but synthetic mode calls THIS function a
+    // second time from `register_synthetic_overrides` — i.e. AFTER wp1.2 — so
+    // the null closure won and every `staticFieldBase(Field)` in synthetic mode
+    // returned null. Point both at the real implementation instead.
     r.register(
         u,
         "staticFieldBase",
         "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        unsafe_natives::native_unsafe_static_field_base,
     );
     r.register(
         u2,
         "staticFieldBase",
         "(Ljava/lang/reflect/Field;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        unsafe_natives::native_unsafe_static_field_base,
     );
 
     // ensureClassInitialized — trigger class initialization
@@ -1233,6 +1280,10 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)V",
         native_noop,
     );
+    // `getRandomSeedForDumping()` feeds the CDS archive's identity-hash
+    // randomisation. With no archive ever produced there is nothing to seed;
+    // HotSpot itself returns 0 here unless `-Xshare:dump` is active. Part of
+    // the permanent-KEEP CDS set documented above.
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
@@ -1249,8 +1300,15 @@ pub(crate) fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_noop,
     );
 
-    r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
-    r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", |_ctx, _args| Ok(Some(Value::Object(None))));
+    // defineClass / defineClass0 — real `define_class_full`-routed impl. These
+    // were always-null closures whose only saving grace was that
+    // `unsafe_natives::register_unsafe_define_class` runs last on both the
+    // essential and the synthetic path and overwrote them. Registering the real
+    // function here removes that ordering dependency: ByteBuddy's class
+    // injection no longer silently gets `null` back if a future registrar lands
+    // after this one.
+    r.register(u, "defineClass", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", unsafe_natives::native_unsafe_define_class);
+    r.register(u2, "defineClass0", "(Ljava/lang/String;[BIILjava/lang/ClassLoader;Ljava/security/ProtectionDomain;)Ljava/lang/Class;", unsafe_natives::native_unsafe_define_class);
 
     // defineAnonymousClass — legacy API for defining hidden classes (used by old Lambda/invoke)
     // Signature: defineAnonymousClass(Class<?> hostClass, byte[] data, Object[] cpPatches) -> Class<?>

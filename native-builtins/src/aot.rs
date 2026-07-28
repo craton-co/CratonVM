@@ -1491,11 +1491,28 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
     // --- @Stable annotation natives (noops) ---
     let stable = "jdk/internal/vm/annotation/Stable";
     r.register(stable, "<init>", "()V", stable_annotation_noop);
+    // annotationType() must return the annotation interface itself — it is the
+    // discriminator every `java.lang.annotation.Annotation` consumer keys on
+    // (`Annotation.equals`/`hashCode`, `AnnotatedElement.getAnnotation`,
+    // Spring's `AnnotationUtils`, and the JDK's own `AnnotationInvocationHandler`
+    // all call it first). Returning null made a `@Stable` instance claim to have
+    // no annotation type at all, which NPEs the moment anything inspects it.
+    // Falls back to null only if the class is not loaded, which is the same
+    // answer as before.
     r.register(
         stable,
         "annotationType",
         "()Ljava/lang/Class;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| {
+            let class_id = ctx.class_id_by_name("jdk/internal/vm/annotation/Stable");
+            match class_id {
+                Some(cid) => {
+                    let mirror = ctx.get_class_mirror(cid);
+                    Ok(Some(Value::Object(Some(mirror))))
+                }
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
     );
 
     // --- java.lang.reflect.Method annotation query ---

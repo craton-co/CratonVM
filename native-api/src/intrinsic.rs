@@ -60,4 +60,18 @@ pub enum InterpIntrinsic {
     MathMinLong,
     MathMaxLong,
     MathSqrt,
+    // Records (JEP 395) — the javac-generated `hashCode`/`equals` bodies.
+    //
+    // Unlike every other variant these are NOT keyed on a fixed
+    // `(class, name, descriptor)` triple: they apply to any record class whose
+    // body is the generated `invokedynamic ObjectMethods.bootstrap` shape, so
+    // `lookup` never returns them. The interpreter installs them directly from
+    // its own record check at inline-cache fill time (one call site per record
+    // class, and the entry carries the same receiver-class guard as every
+    // other virtual intrinsic). Without this the bodies stay interpreter-only
+    // forever — the x64 backend lowers `invokedynamic` to an unconditional
+    // deopt — which makes every `HashMap`/`HashSet` operation keyed by a
+    // record three orders of magnitude slower than HotSpot.
+    RecordHashCode,
+    RecordEquals,
 }

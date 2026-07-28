@@ -252,6 +252,16 @@ pub(crate) struct SsSide {
     pub backlog: i32,
     pub closed: i32,
     pub listener_id: i32,
+    /// SO_REUSEADDR as last requested through `setReuseAddress`. Java allows
+    /// the option to be set on an UNBOUND `ServerSocket` (that is in fact the
+    /// only ordering where it changes bind behaviour), and there is no OS
+    /// handle to hold it before `re2_bind_listener` runs — so the requested
+    /// value is retained here and the getter falls back to it whenever the
+    /// live listener cannot answer. `-1` = never set by the caller.
+    pub reuse_address: i32,
+    /// SO_RCVBUF as last requested through `setReceiveBufferSize`; same
+    /// before-bind rationale as `reuse_address`. `-1` = never set.
+    pub recv_buffer_size: i32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -376,17 +386,25 @@ fn probe_restrictions() -> &'static Mutex<HashMap<NativeObjKey, ProbeRestriction
 /// True when `this` is a probe socket (created during probe mode and never
 /// connected) — the setters below then record rather than reconnect.
 fn is_probe_socket(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    probe_restrictions().lock().contains_key(&native_obj_key(ctx, this))
+    probe_restrictions()
+        .lock()
+        .contains_key(&native_obj_key(ctx, this))
 }
 
 fn record_probe_ciphers(ctx: &dyn NativeContext, this: ObjectRef, ciphers: Vec<String>) {
-    if let Some(e) = probe_restrictions().lock().get_mut(&native_obj_key(ctx, this)) {
+    if let Some(e) = probe_restrictions()
+        .lock()
+        .get_mut(&native_obj_key(ctx, this))
+    {
         e.0 = ciphers;
     }
 }
 
 fn record_probe_protocols(ctx: &dyn NativeContext, this: ObjectRef, protocols: Vec<String>) {
-    if let Some(e) = probe_restrictions().lock().get_mut(&native_obj_key(ctx, this)) {
+    if let Some(e) = probe_restrictions()
+        .lock()
+        .get_mut(&native_obj_key(ctx, this))
+    {
         e.1 = protocols;
     }
 }
@@ -396,7 +414,9 @@ pub(crate) fn take_probe_restrictions(
     ctx: &dyn NativeContext,
     this: ObjectRef,
 ) -> Option<ProbeRestrictions> {
-    probe_restrictions().lock().remove(&native_obj_key(ctx, this))
+    probe_restrictions()
+        .lock()
+        .remove(&native_obj_key(ctx, this))
 }
 
 /// Transfer an accepted plain Socket's TCP stream to a TLS layer.
@@ -521,26 +541,27 @@ pub(crate) fn sock_set_for_create_with_local_port(
     });
 }
 
-fn ss_get(ctx: &dyn NativeContext, this: ObjectRef) -> SsSide {
-    let key = ctx.identity_hash_code(this);
-    let t = ss_side_table().lock();
-    t.get(&key).copied().unwrap_or(SsSide {
+fn ss_default() -> SsSide {
+    SsSide {
         port: -1,
         backlog: 50,
         closed: 0,
         listener_id: -1,
-    })
+        reuse_address: -1,
+        recv_buffer_size: -1,
+    }
+}
+
+fn ss_get(ctx: &dyn NativeContext, this: ObjectRef) -> SsSide {
+    let key = ctx.identity_hash_code(this);
+    let t = ss_side_table().lock();
+    t.get(&key).copied().unwrap_or_else(ss_default)
 }
 
 fn ss_set<F: FnOnce(&mut SsSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
     let key = ctx.identity_hash_code(this);
     let mut t = ss_side_table().lock();
-    let entry = t.entry(key).or_insert(SsSide {
-        port: -1,
-        backlog: 50,
-        closed: 0,
-        listener_id: -1,
-    });
+    let entry = t.entry(key).or_insert_with(ss_default);
     f(entry);
 }
 
@@ -559,6 +580,10 @@ pub(crate) struct DsSide {
     pub closed: i32,  // 0 = open, 1 = closed (was DS_CLOSED)
     pub timeout: i32, // SO_TIMEOUT ms (was DS_TIMEOUT)
     pub fd: i32,      // udp fd handle; -1 = closed/unset (was DS_FD)
+    /// SO_REUSEADDR as last requested through `setReuseAddress`. The option is
+    /// pushed to the real UDP fd as well, but `FileDescriptorTable` exposes no
+    /// read-back for it, so the getter answers from here. `-1` = never set.
+    pub reuse_address: i32,
 }
 
 fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
@@ -566,27 +591,100 @@ fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// `javax.net.ssl.SSLSessionContext` cache tuning, as configured through
+/// `setSessionCacheSize`/`setSessionTimeout`. Side-tabled for the same reason
+/// as the socket state above, and one more: the carrier is an instance of the
+/// real `SSLSessionContext`, which is an INTERFACE declaring zero fields, so
+/// there are no instance slots to write at all. Both defaults are 0, which is
+/// this API's spelling of "unlimited" / "no expiry" and matches the answer the
+/// constant getters used to give.
+#[derive(Default, Debug, Clone, Copy)]
+struct SscSide {
+    cache_size: i32,
+    timeout_secs: i32,
+}
+
+/// Which logical session context a carrier stands for: the identity hash of
+/// the owning `SSLContext` plus a tag distinguishing its client context (0)
+/// from its server context (1). A carrier that never came from
+/// `get{Client,Server}SessionContext` keys off its own identity under tag 2,
+/// so it still round-trips against itself and cannot collide with a real
+/// SSLContext entry.
+type SscKey = (i32, u8);
+
+const SSC_TAG_CLIENT: u8 = 0;
+const SSC_TAG_SERVER: u8 = 1;
+const SSC_TAG_ORPHAN: u8 = 2;
+
+fn ssc_side_table() -> &'static Mutex<HashMap<SscKey, SscSide>> {
+    static T: OnceLock<Mutex<HashMap<SscKey, SscSide>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Carrier identity -> the `SscKey` it stands for. `get{Client,Server}
+/// SessionContext` allocate a FRESH carrier on every call, so without this
+/// indirection `ctx.getServerSessionContext().setSessionCacheSize(n)` followed
+/// by a second `ctx.getServerSessionContext().getSessionCacheSize()` would
+/// read a different object's (empty) entry — the exact set/get contradiction
+/// this table exists to remove. Only plain `i32`s are stored, so the table
+/// needs no GC roots and survives object relocation (identity hash codes are
+/// stable across a move).
+fn ssc_owner_table() -> &'static Mutex<HashMap<i32, SscKey>> {
+    static T: OnceLock<Mutex<HashMap<i32, SscKey>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ssc_bind(ctx: &dyn NativeContext, carrier: ObjectRef, owner: ObjectRef, tag: u8) {
+    let carrier_id = ctx.identity_hash_code(carrier);
+    let key = (ctx.identity_hash_code(owner), tag);
+    ssc_owner_table().lock().insert(carrier_id, key);
+}
+
+fn ssc_key(ctx: &dyn NativeContext, this: ObjectRef) -> SscKey {
+    let carrier_id = ctx.identity_hash_code(this);
+    ssc_owner_table()
+        .lock()
+        .get(&carrier_id)
+        .copied()
+        .unwrap_or((carrier_id, SSC_TAG_ORPHAN))
+}
+
+fn ssc_get(ctx: &dyn NativeContext, this: ObjectRef) -> SscSide {
+    let key = ssc_key(ctx, this);
+    ssc_side_table()
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn ssc_set<F: FnOnce(&mut SscSide)>(ctx: &dyn NativeContext, this: ObjectRef, f: F) {
+    let key = ssc_key(ctx, this);
+    let mut t = ssc_side_table().lock();
+    f(t.entry(key).or_default());
+}
+
+fn ds_default() -> DsSide {
+    DsSide {
+        port: 0,
+        closed: 0,
+        timeout: 0,
+        fd: -1,
+        reuse_address: -1,
+    }
+}
+
 fn ds_get(this: ObjectRef) -> DsSide {
     ds_side_table()
         .lock()
         .get(&this)
         .copied()
-        .unwrap_or(DsSide {
-            port: 0,
-            closed: 0,
-            timeout: 0,
-            fd: -1,
-        })
+        .unwrap_or_else(ds_default)
 }
 
 fn ds_set<F: FnOnce(&mut DsSide)>(this: ObjectRef, f: F) {
     let mut t = ds_side_table().lock();
-    let entry = t.entry(this).or_insert(DsSide {
-        port: 0,
-        closed: 0,
-        timeout: 0,
-        fd: -1,
-    });
+    let entry = t.entry(this).or_insert_with(ds_default);
     f(entry);
 }
 
@@ -1664,7 +1762,10 @@ fn hostname_string() -> String {
 #[cfg(test)]
 mod hostname_string_tests {
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     #[test]
     fn hostname_string_agrees_with_the_crate_wide_resolver() {
         // Two registrations of `InetAddress.getLocalHost()` exist (this phase-E
@@ -1677,7 +1778,11 @@ mod hostname_string_tests {
     fn hostname_string_is_non_empty_and_stable() {
         let first = super::hostname_string();
         assert!(!first.is_empty(), "hostname must never be empty");
-        assert_eq!(first, super::hostname_string(), "must be stable across calls");
+        assert_eq!(
+            first,
+            super::hostname_string(),
+            "must be stable across calls"
+        );
     }
 }
 
@@ -3371,6 +3476,107 @@ pub(crate) fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef
     result
 }
 
+/// Run `f` against the raw `TcpStream` backing socket-state id `sid`,
+/// whichever registry table holds it: the plain `streams` map, or a TLS
+/// socket's cloned `raw` handle (`tls_streams`). Returns `None` when the
+/// socket is not connected or not tracked, so callers can tell "applied" from
+/// "nothing to apply it to".
+///
+/// The TLS arm matters as much as the plain one: `new13_do_create_socket`'s
+/// TLS path registers its id in `tls_streams` only, and forgetting that table
+/// is exactly the bug `setSoTimeout`/`getSoTimeout` were fixed for above. The
+/// `raw` handle is used (never `entry.stream`) so a socket-option call cannot
+/// wait on the per-stream TLS mutex a blocked reader may be holding.
+///
+/// `f` must be a non-blocking operation (a `getsockopt`/`setsockopt`, or a
+/// `peek` already known to be satisfiable): the process-wide registry lock is
+/// held for its duration.
+fn re1_with_raw_stream<R>(sid: i32, f: impl FnOnce(&TcpStream) -> R) -> Option<R> {
+    if sid < 0 {
+        return None;
+    }
+    let reg = s2_registry().lock();
+    if let Some(stream) = reg.streams.get(&sid) {
+        return Some(f(&**stream));
+    }
+    if let Some(raw) = reg.tls_streams.get(&sid).and_then(|e| e.raw.as_ref()) {
+        return Some(f(raw));
+    }
+    None
+}
+
+/// Zero-timeout OS readability query for a TCP stream.
+///
+/// Used by `SocketInputStream.available()`, which must never block. A `peek`
+/// on a blocking socket with an empty receive queue would block forever, so
+/// readiness is established first with `poll(2)` / `WSAPoll` — a pure query of
+/// kernel socket state that neither consumes bytes nor flips the socket's
+/// persistent blocking mode (flipping it would race a concurrent blocking
+/// `read` on the same fd into a spurious `WouldBlock`; see the same rewrite in
+/// `native-api/src/fd_table.rs::tcp_available`). A failed probe reports
+/// not-readable, so `available()` degrades to 0 — the answer it gave
+/// unconditionally before.
+#[cfg(unix)]
+fn re1_socket_read_ready(stream: &TcpStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let mut pfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` is a single, fully-initialised `pollfd`; `nfds == 1`
+    // matches the one-element buffer; timeout 0 returns immediately.
+    let rc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1 as libc::nfds_t, 0) };
+    if rc <= 0 {
+        return false;
+    }
+    pfd.revents & libc::POLLIN != 0
+}
+
+#[cfg(windows)]
+fn re1_socket_read_ready(stream: &TcpStream) -> bool {
+    use std::os::windows::io::AsRawSocket;
+
+    // `libc` does not re-export `WSAPoll`/`WSAPOLLFD` on Windows. The layout
+    // and signature below are byte-identical to the other `WSAPoll` bindings
+    // in this crate (`servlet.rs`, `xnio_conduits.rs`) —
+    // `clashing_extern_declarations` is a deny-lint here, so any divergence
+    // would fail the build.
+    #[repr(C)]
+    struct Wsapollfd {
+        fd: usize,
+        events: i16,
+        revents: i16,
+    }
+    const WSAPOLLRDNORM: i16 = 0x0100;
+
+    #[link(name = "Ws2_32")]
+    extern "system" {
+        fn WSAPoll(fd_array: *mut Wsapollfd, fds: u32, timeout: i32) -> i32;
+    }
+
+    let mut pfd = Wsapollfd {
+        fd: stream.as_raw_socket() as usize,
+        events: WSAPOLLRDNORM,
+        revents: 0,
+    };
+    // SAFETY: single, fully-initialised WSAPOLLFD; `nfds == 1` matches the
+    // buffer length; timeout 0 returns immediately.
+    let rc = unsafe { WSAPoll(&mut pfd as *mut Wsapollfd, 1, 0) };
+    if rc <= 0 {
+        return false;
+    }
+    pfd.revents & WSAPOLLRDNORM != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn re1_socket_read_ready(_stream: &TcpStream) -> bool {
+    // No readiness primitive on this target — report not-readable so
+    // `available()` returns 0 rather than risking a blocking peek.
+    false
+}
+
 fn re1_connect_socket(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -3576,18 +3782,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
 
     r.register(sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let sid = sock_get(ctx, this).stream_id;
-        if sid >= 0 {
-            let mut reg = s2_registry().lock();
-            if let Some(stream) = reg.streams.remove(&sid) {
-                let _ = stream.shutdown(std::net::Shutdown::Both);
-            }
-        }
-        sock_set(ctx, this, |s| {
-            s.stream_id = -1;
-            s.closed = 1;
-        });
-        Ok(None)
+        re1_close_socket(ctx, this)
     });
 
     r.register(sock, "shutdownInput", "()V", |ctx, args| {
@@ -3743,6 +3938,84 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
+    // The SO_* option GETTERS, for exactly the reason `setSoTimeout`/
+    // `getSoTimeout` above were added. Unregistered, they ran real
+    // `java.net.Socket` bytecode: `getImpl().getOption(...)`. On a synthetic
+    // Socket the real `impl` field is null (this surface keeps its state in
+    // the side table and deliberately never writes instance slots), so
+    // `getImpl()` takes the `createImpl(true)` branch and manufactures a
+    // BRAND NEW OS socket — the answer then described a throwaway fd that no
+    // byte of this connection ever passes through, and leaked that fd on the
+    // way out. Read the fd this Socket actually owns instead.
+    //
+    // The matching SETTERS are deliberately NOT registered here: they would be
+    // dead code. `native-io/src/socket_channel.rs` blanket-registers
+    // `setTcpNoDelay`/`setKeepAlive`/`setReuseAddress`/`set{Send,Receive}
+    // BufferSize`/`setSoLinger` on `java/net/Socket` to a constant-`Ok(None)`
+    // `socket_opt_noop` (intended only for the `SocketChannel.socket()`
+    // adaptor, but keyed on the class so it catches every Socket), and
+    // `register_io_natives` runs AFTER `register_essential_natives_with_shims`
+    // in `vm/src/vm/vm_init.rs` — so last-writer-wins gives those no-ops the
+    // slot. Until that registration is narrowed, these getters report the
+    // socket's TRUE state, which is precisely "the option was never applied".
+    // `setSoTimeout` is unaffected: socket_channel.rs deliberately excludes it.
+    r.register(sock, "getTcpNoDelay", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = sock_get(ctx, this).stream_id;
+        let on = re1_with_raw_stream(sid, |s| s.nodelay().unwrap_or(false)).unwrap_or(false);
+        Ok(Some(Value::Int(if on { 1 } else { 0 })))
+    });
+    r.register(sock, "getKeepAlive", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = sock_get(ctx, this).stream_id;
+        let on = re1_with_raw_stream(sid, |s| {
+            socket2::SockRef::from(s).keepalive().unwrap_or(false)
+        })
+        .unwrap_or(false);
+        Ok(Some(Value::Int(if on { 1 } else { 0 })))
+    });
+    r.register(sock, "getReuseAddress", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = sock_get(ctx, this).stream_id;
+        let on = re1_with_raw_stream(sid, |s| {
+            socket2::SockRef::from(s).reuse_address().unwrap_or(false)
+        })
+        .unwrap_or(false);
+        Ok(Some(Value::Int(if on { 1 } else { 0 })))
+    });
+    r.register(sock, "getSendBufferSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = sock_get(ctx, this).stream_id;
+        // 8192 only when the socket cannot answer (unconnected): the same
+        // fallback the pre-existing phase-53 surface used.
+        let sz = re1_with_raw_stream(sid, |s| {
+            socket2::SockRef::from(s).send_buffer_size().unwrap_or(8192)
+        })
+        .unwrap_or(8192);
+        Ok(Some(Value::Int(sz as i32)))
+    });
+    r.register(sock, "getReceiveBufferSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = sock_get(ctx, this).stream_id;
+        let sz = re1_with_raw_stream(sid, |s| {
+            socket2::SockRef::from(s).recv_buffer_size().unwrap_or(8192)
+        })
+        .unwrap_or(8192);
+        Ok(Some(Value::Int(sz as i32)))
+    });
+    r.register(sock, "getSoLinger", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sid = sock_get(ctx, this).stream_id;
+        // -1 is the spec'd "SO_LINGER disabled" answer, and also the honest
+        // answer for a socket with no fd to ask.
+        let secs = re1_with_raw_stream(sid, |s| match socket2::SockRef::from(s).linger() {
+            Ok(Some(d)) => d.as_secs() as i32,
+            _ => -1,
+        })
+        .unwrap_or(-1);
+        Ok(Some(Value::Int(secs)))
+    });
+
     r.register(sock, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Int(sock_get(ctx, this).port)))
@@ -3877,12 +4150,61 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
     cratonvm_native_api::socket_input_stream_read::set_read_one(
         native_socket_input_stream_read_one,
     );
-    r.register(sis, "close", "()V", |_ctx, _args| Ok(None));
-    r.register(sis, "available", "()I", |_ctx, args| {
-        // Real BufferedReader.readLine asks via available()? No — it calls
-        // read() which blocks. Returning 0 (no peek-ahead) is fine.
-        let _ = args;
-        Ok(Some(Value::Int(0)))
+    // Closing either socket stream closes the SOCKET — that is the documented
+    // contract of `Socket.getInputStream()`/`getOutputStream()` ("Closing the
+    // returned stream will close the associated socket"), and callers rely on
+    // it: code that wraps the stream in a `BufferedReader`/`PrintWriter` and
+    // closes only the wrapper (directly, or via try-with-resources) expects
+    // the connection to go away. As a no-op it did not, so the peer stayed
+    // parked in a blocking read waiting for a FIN that never arrived and the
+    // OS fd leaked for the process lifetime.
+    r.register(sis, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        match stream_owner_get(ctx, this) {
+            Some(owner) => re1_close_socket(ctx, owner),
+            // No owner recorded (stream handed out before the side table was
+            // populated) — nothing to close, and throwing here would be worse
+            // than the historical no-op.
+            None => Ok(None),
+        }
+    });
+    r.register(sis, "available", "()I", |ctx, args| {
+        // `available()` must report bytes readable WITHOUT blocking. The old
+        // constant 0 said "nothing buffered" even on a socket with a full
+        // receive queue, so every `while (in.available() > 0) …` drain loop
+        // exited immediately and every `if (available() > 0)` fast path was
+        // dead — a silent truncation, not a hang.
+        let this = obj_arg(args, 0)?;
+        let Some(owner) = stream_owner_get(ctx, this) else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let sid = sock_get(ctx, owner).stream_id;
+        // A TLS stream id answers about CIPHERTEXT, not the plaintext this
+        // stream hands out: a readable raw socket may hold nothing but a
+        // handshake or alert record, so a non-zero answer here could send a
+        // caller into a `read()` that then blocks. Report 0 for TLS — the
+        // conservative direction, and no worse than the previous constant.
+        if sid >= crate::servlet::RUSTLS_SOCK_ID_BASE {
+            return Ok(Some(Value::Int(0)));
+        }
+        let avail = re1_with_raw_stream(sid, |stream| {
+            if !re1_socket_read_ready(stream) {
+                return 0i32;
+            }
+            // The kernel says readable, so this `peek` returns immediately
+            // and does not consume the bytes. Capped at the scratch buffer:
+            // under-reporting is permitted by the `available()` contract,
+            // over-reporting is not.
+            let mut buf = [0u8; 8192];
+            match stream.peek(&mut buf) {
+                Ok(n) => n as i32,
+                // Readiness raced away (a concurrent reader drained the
+                // queue). A snapshot estimate of 0 is correct again.
+                Err(_) => 0,
+            }
+        })
+        .unwrap_or(0);
+        Ok(Some(Value::Int(avail)))
     });
 
     let sos = "java/net/Socket$SocketOutputStream";
@@ -3919,7 +4241,46 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(sos, "close", "()V", |_ctx, _args| Ok(None));
+    // See `sis, "close"` above — closing the output stream closes the socket
+    // too, and does so AFTER flushing whatever the peer has not been sent yet
+    // (real `SocketOutputStream.close()` flushes first). Without the flush a
+    // caller that writes-then-closes could lose its last write.
+    r.register(sos, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let Some(owner) = stream_owner_get(ctx, this) else {
+            return Ok(None);
+        };
+        let sid = sock_get(ctx, owner).stream_id;
+        if sid >= 0 {
+            let mut reg = s2_registry().lock();
+            if let Some(stream) = reg.streams.get_mut(&sid) {
+                // A failed flush must not abort the close: the fd still has
+                // to be released, and `close()` is frequently called from a
+                // `finally` where a throw would mask the real error.
+                let _ = (&**stream).flush();
+            }
+        }
+        re1_close_socket(ctx, owner)
+    });
+}
+
+/// Shut down and forget the TCP stream backing `this`, and mark the socket
+/// closed in the side table. Shared by `Socket.close()` and by the two socket
+/// stream `close()` natives, which are specified to close the socket as well.
+/// Idempotent: closing an already-closed socket is a no-op, per `Socket`.
+fn re1_close_socket(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    let sid = sock_get(ctx, this).stream_id;
+    if sid >= 0 {
+        let mut reg = s2_registry().lock();
+        if let Some(stream) = reg.streams.remove(&sid) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+    sock_set(ctx, this, |s| {
+        s.stream_id = -1;
+        s.closed = 1;
+    });
+    Ok(None)
 }
 
 // ===========================================================================
@@ -4332,26 +4693,97 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // (socketLock)` on a `socketLock` the synthetic `<init>` never initialises
     // (`NullPointerException: monitorenter in ServerSocket.getImpl`). This bites
     // WildFly's managed-container port check (`isPortAvailable` →
-    // `new ServerSocket(port)` then `setReuseAddress(true)`). Service them as
-    // no-ops: the stub listener does not model SO_REUSEADDR. Default to the
-    // common `ServerSocket` value (true) for the getter.
-    r.register(ss, "setReuseAddress", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(ss, "getReuseAddress", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // `new ServerSocket(port)` then `setReuseAddress(true)`). They used to be
+    // pure no-ops with a hardcoded `true` getter, which lied twice: on Windows
+    // `TcpListener::bind` does NOT set SO_REUSEADDR, so `getReuseAddress()`
+    // claimed an option the listener did not have, and a caller that turned the
+    // option OFF (JGroups and Netty both do, to make a port conflict fail fast
+    // instead of silently sharing) was ignored and still read back `true`.
+    //
+    // Apply it to the real `TcpListener` whenever one exists, and always retain
+    // the requested value: Java permits the call on an UNBOUND ServerSocket
+    // (that is the only ordering where SO_REUSEADDR changes bind behaviour) and
+    // there is no OS handle to hold it until `re2_bind_listener` runs.
+    r.register(ss, "setReuseAddress", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        let lid = ss_get(ctx, this).listener_id;
+        if lid >= 0 {
+            let reg = s2_registry().lock();
+            if let Some(l) = reg.listeners.get(&lid) {
+                socket2::SockRef::from(l)
+                    .set_reuse_address(on)
+                    .map_err(|e| ioex(format!("setReuseAddress failed: {e}")))?;
+            }
+        }
+        ss_set(ctx, this, |s| s.reuse_address = i32::from(on));
+        Ok(None)
+    });
+    r.register(ss, "getReuseAddress", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let side = ss_get(ctx, this);
+        if side.listener_id >= 0 {
+            let reg = s2_registry().lock();
+            if let Some(l) = reg.listeners.get(&side.listener_id) {
+                if let Ok(on) = socket2::SockRef::from(l).reuse_address() {
+                    return Ok(Some(Value::Int(i32::from(on))));
+                }
+            }
+        }
+        // Unbound (or the OS refused the query): report what the caller last
+        // asked for. `1` only when nobody ever asked — the historical answer,
+        // and the platform default for a bound `ServerSocket` on Unix.
+        Ok(Some(Value::Int(if side.reuse_address < 0 {
+            1
+        } else {
+            side.reuse_address
+        })))
     });
 
     // The RE2 constructors own listener state outside the real ServerSocket
     // implementation.  JGroups configures this option before bind, where it
-    // must be accepted without entering the real getImpl() bytecode path.
-    r.register(ss, "setReceiveBufferSize", "(I)V", |_ctx, args| {
+    // must be accepted without entering the real getImpl() bytecode path — but
+    // "accepted" used to mean "discarded", with the getter answering a
+    // hardcoded 8192 regardless. The accept-side receive buffer is inherited by
+    // every accepted connection, so silently dropping a caller's sizing is a
+    // throughput setting that goes missing with no diagnostic at all.
+    r.register(ss, "setReceiveBufferSize", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
         let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if size <= 0 {
             return Err(iae(format!("negative receive buffer size: {size}")));
         }
+        let lid = ss_get(ctx, this).listener_id;
+        if lid >= 0 {
+            let reg = s2_registry().lock();
+            if let Some(l) = reg.listeners.get(&lid) {
+                socket2::SockRef::from(l)
+                    .set_recv_buffer_size(size as usize)
+                    .map_err(|e| ioex(format!("setReceiveBufferSize failed: {e}")))?;
+            }
+        }
+        ss_set(ctx, this, |s| s.recv_buffer_size = size);
         Ok(None)
     });
-    r.register(ss, "getReceiveBufferSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(8192)))
+    r.register(ss, "getReceiveBufferSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let side = ss_get(ctx, this);
+        if side.listener_id >= 0 {
+            let reg = s2_registry().lock();
+            if let Some(l) = reg.listeners.get(&side.listener_id) {
+                // Linux reports back roughly twice what was requested (kernel
+                // bookkeeping overhead). Real `ServerSocket.getReceiveBufferSize`
+                // has exactly the same behaviour, so pass it through unmodified.
+                if let Ok(sz) = socket2::SockRef::from(l).recv_buffer_size() {
+                    return Ok(Some(Value::Int(sz as i32)));
+                }
+            }
+        }
+        Ok(Some(Value::Int(if side.recv_buffer_size <= 0 {
+            8192
+        } else {
+            side.recv_buffer_size
+        })))
     });
     r.register(ss, "close", "()V", re2_server_socket_close);
 
@@ -5485,7 +5917,11 @@ fn huc_url_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// under `HUC_RESP_HEADERS`) for `key` (case-insensitive) and return its
 /// value. Shared by `getHeaderField`/`getLastModified`/`getHeaderFieldDate`
 /// so all three agree on the same real HTTP(S) response headers.
-fn huc_find_header_value(ctx: &mut dyn NativeContext, this: ObjectRef, key: &str) -> Option<String> {
+fn huc_find_header_value(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &str,
+) -> Option<String> {
     if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
         let len = ctx.array_length(arr);
         for i in 0..len {
@@ -5519,8 +5955,18 @@ fn parse_rfc1123_date_millis(s: &str) -> Option<i64> {
     let mut parts = rest.split_whitespace();
     let day: i64 = parts.next()?.parse().ok()?;
     let month = match parts.next()? {
-        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
-        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
         _ => return None,
     };
     let year: i64 = parts.next()?.parse().ok()?;
@@ -5911,7 +6357,20 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             eprintln!("[OSTR-DBG] URL.openStream: {}", url_str);
         }
 
-        // Resolve the URL to raw bytes. Handles file:, jar:file:!/, and
+        // `JarUrl` exposes Spring Boot nested archives as
+        // `jar:nested:/outer.jar/!inner.jar!/entry`. Preserve that external
+        // spelling for URL identity, but route byte access through the proven
+        // `jar:file:` nested-archive reader below: after the protocol prefix,
+        // both forms carry the identical outer-path / inner-entry grammar.
+        // Spring Boot spells only the outer boundary as `/!inner`; the generic
+        // reader spells that same boundary `!/inner`, while preserving further
+        // `!/` archive/resource separators unchanged.
+        if let Some(rest) = url_str.strip_prefix("jar:nested:") {
+            url_str = format!("jar:file:{}", rest.replacen("/!", "!/", 1));
+        }
+
+        // Resolve the URL to raw bytes. Handles file:, jar:file:!/, normalized
+        // jar:nested:!/, and
         // classpath: schemes locally; http(s): goes through the HTTP client.
         let bytes: Vec<u8> = if let Some(rest) = url_str.strip_prefix("jar:file:") {
             // jar:file:/path/to.jar!/entry  (single-level)
@@ -6422,7 +6881,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     "sun/net/www/protocol/file/FileURLConnection",
                     "<init>",
                     "(Ljava/net/URL;Ljava/io/File;)V",
-                    &[Value::Object(Some(conn)), Value::Object(Some(this)), Value::Object(Some(file))],
+                    &[
+                        Value::Object(Some(conn)),
+                        Value::Object(Some(this)),
+                        Value::Object(Some(file)),
+                    ],
                 )?;
                 return Ok(Some(Value::Object(Some(conn))));
             }
@@ -6711,6 +7174,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 
     // URLConnection.setUseCaches / setDefaultUseCaches / connect — Spring's
     // `ResourceUtils.useCachesIfNecessary` calls setUseCaches(false) on
+    // file: URLs. Avoid the real-JDK setter's uninitialised-connected check,
+    // but retain the requested per-connection value: Spring Boot's nested
+    // JarUrlConnection uses it to select its cached-empty-stream and
+    // close-on-close paths.
     // file: URLs; without these no-op natives the call would fall through
     // to the real-JDK setter, which probes the (uninitialised) connected
     // field and throws IllegalStateException. Make them no-ops on both
@@ -6762,7 +7229,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register(JRT_URL_CONNECTION, "getLastModified", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let url = huc_url_string(ctx, this);
-        Ok(Some(Value::Long(synthetic_resource_url_last_modified(&url))))
+        Ok(Some(Value::Long(synthetic_resource_url_last_modified(
+            &url,
+        ))))
     });
     r.register(
         JRT_URL_CONNECTION,
@@ -6781,7 +7250,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "java/net/URLConnection",
         "setUseCaches",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let use_caches = args.get(1).and_then(Value::as_int).unwrap_or(1);
+            ctx.set_field_by_name(this, "useCaches", Value::Int(use_caches));
+            Ok(None)
+        },
     );
     r.register(
         "java/net/URLConnection",
@@ -7317,9 +7791,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/String;)Ljava/lang/String;",
                 &[Value::Object(Some(name_obj))],
             ) {
-                Ok(Some(Value::Object(Some(s)))) => {
-                    ctx.read_string(s).and_then(|v| parse_rfc1123_date_millis(&v))
-                }
+                Ok(Some(Value::Object(Some(s)))) => ctx
+                    .read_string(s)
+                    .and_then(|v| parse_rfc1123_date_millis(&v)),
                 _ => None,
             };
             Ok(Some(Value::Long(parsed.unwrap_or(fallback))))
@@ -7577,18 +8051,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             }
             let is_liquibase = match ctx.invoke_virtual(resource, "getURL", "()Ljava/net/URL;", &[])
             {
-                Ok(Some(Value::Object(Some(url)))) => match ctx.invoke_virtual(
-                    url,
-                    "toExternalForm",
-                    "()Ljava/lang/String;",
-                    &[],
-                ) {
-                    Ok(Some(Value::Object(Some(s)))) => ctx
-                        .read_string(s)
-                        .map(|s| s.contains("liquibase-core"))
-                        .unwrap_or(false),
-                    _ => false,
-                },
+                Ok(Some(Value::Object(Some(url)))) => {
+                    match ctx.invoke_virtual(url, "toExternalForm", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx
+                            .read_string(s)
+                            .map(|s| s.contains("liquibase-core"))
+                            .unwrap_or(false),
+                        _ => false,
+                    }
+                }
                 _ => false,
             };
             if is_liquibase {
@@ -9858,7 +10329,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
-                eprintln!("[dbg-tls-auth] re6 SSLContext.init key={}", ctx.identity_hash_code(this));
+                eprintln!(
+                    "[dbg-tls-auth] re6 SSLContext.init key={}",
+                    ctx.identity_hash_code(this)
+                );
             }
             ctx.set_field(this, 1, Value::Int(1));
             // Stash the actual KeyManager objects too (may include a test
@@ -9917,7 +10391,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
-                eprintln!("[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}", ctx.identity_hash_code(this));
+                eprintln!(
+                    "[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}",
+                    ctx.identity_hash_code(this)
+                );
             }
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
@@ -10077,33 +10554,78 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         ctx_cls,
         "getClientSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
-        |ctx, _args| {
+        |ctx, args| {
+            // GC-safety: the allocation below can relocate `this`, and the
+            // identity hash we bind afterwards must be read from the live
+            // object. Pin across the alloc and read the forwarded address.
+            let this0 = obj_arg(args, 0)?;
+            let this_pin = ctx.pin_native_root(this0);
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
+            let this = ctx.read_native_pin(this_pin, this0);
+            ssc_bind(ctx, obj, this, SSC_TAG_CLIENT);
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
 
-    // getServerSessionContext() — Tomcat caches it and may set cache size /
-    // timeout; return a synthetic SSLSessionContext (setters are no-ops).
+    // getServerSessionContext() — Tomcat caches it and sets cache size /
+    // timeout on it (see the setters below).
     r.register(
         ctx_cls,
         "getServerSessionContext",
         "()Ljavax/net/ssl/SSLSessionContext;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this0 = obj_arg(args, 0)?;
+            let this_pin = ctx.pin_native_root(this0);
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
+            let this = ctx.read_native_pin(this_pin, this0);
+            ssc_bind(ctx, obj, this, SSC_TAG_SERVER);
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
-    // SSLSessionContext setters Tomcat's SSLHostConfig drives — no-op (the
-    // rustls engine manages its own session cache).
+    // SSLSessionContext cache tuning, as driven by Tomcat's `SSLHostConfig`.
+    // rustls owns its own session cache and exposes no resize/expiry hook we
+    // can drive from here, so the values genuinely do not reach the TLS stack
+    // — that part stays a documented no-op.
+    //
+    // What is NOT acceptable is the getters contradicting the setters. They
+    // used to answer a constant 0 whatever was configured, and 0 has a defined
+    // meaning in this API — "unlimited cache" / "sessions never time out" —
+    // so a caller that set a bound and read it back was told its bound had
+    // been replaced by no bound at all. Tomcat's `SSLHostConfig`/JMX round-trip
+    // does exactly that read-back. Store the configured values so the pair is
+    // self-consistent. A side table, not instance slots: this carrier is
+    // allocated against `javax/net/ssl/SSLSessionContext`, which is an
+    // INTERFACE in the real JDK and declares zero fields, so widening the
+    // allocation would produce an undersized-layout object whose field
+    // accesses the GC bounds guard rejects (see `alloc_concurrent_synthetic`).
     let ssc = "javax/net/ssl/SSLSessionContext";
-    r.register(ssc, "setSessionCacheSize", "(I)V", |_ctx, _args| Ok(None));
-    r.register(ssc, "setSessionTimeout", "(I)V", |_ctx, _args| Ok(None));
-    r.register(ssc, "getSessionCacheSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ssc, "setSessionCacheSize", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if size < 0 {
+            return Err(iae(format!("negative session cache size: {size}")));
+        }
+        ssc_set(ctx, this, |s| s.cache_size = size);
+        Ok(None)
     });
-    r.register(ssc, "getSessionTimeout", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ssc, "setSessionTimeout", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let secs = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if secs < 0 {
+            return Err(iae(format!("negative session timeout: {secs}")));
+        }
+        ssc_set(ctx, this, |s| s.timeout_secs = secs);
+        Ok(None)
+    });
+    r.register(ssc, "getSessionCacheSize", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ssc_get(ctx, this).cache_size)))
+    });
+    r.register(ssc, "getSessionTimeout", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ssc_get(ctx, this).timeout_secs)))
     });
 
     let sf = "javax/net/ssl/SSLSocketFactory";
@@ -10754,14 +11276,34 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(ds_get(this).timeout)))
     });
 
-    // Same rationale as the `ServerSocket` setReuseAddress no-op: the synthetic
+    // Same rationale as the `ServerSocket` setReuseAddress above: the synthetic
     // `DatagramSocket` has no real impl, so the JDK `setReuseAddress` bytecode
     // would NPE on uninitialised socket state. WildFly's `isPortAvailable` calls
     // `new DatagramSocket(port); setReuseAddress(true)` right after the
-    // ServerSocket check.
-    r.register(ds, "setReuseAddress", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(ds, "getReuseAddress", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // ServerSocket check. Push the option to the real UDP fd rather than
+    // dropping it (this is the option multicast receivers need in order to
+    // share a group port at all, so a silent no-op costs them every datagram),
+    // and retain the requested value: `FileDescriptorTable` has no
+    // `udp_reuse_address` read-back, so the getter has nothing else to answer
+    // from — and answering a hardcoded `true` contradicted any caller who
+    // turned it off.
+    r.register(ds, "setReuseAddress", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        let fd = ds_get(this).fd;
+        if fd >= 0 {
+            ctx.fd_table()
+                .udp_set_reuse_address(fd as u32, on)
+                .map_err(|e| ioex(format!("setReuseAddress failed: {e}")))?;
+        }
+        ds_set(this, |s| s.reuse_address = i32::from(on));
+        Ok(None)
+    });
+    r.register(ds, "getReuseAddress", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stored = ds_get(this).reuse_address;
+        // `1` only when nobody ever called the setter — the historical answer.
+        Ok(Some(Value::Int(if stored < 0 { 1 } else { stored })))
     });
 }
 
@@ -10884,6 +11426,13 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(mac))))
     });
+    // KEEP the constant. `getAll()` below hands out exactly one interface —
+    // loopback — and there is no portable Rust API for a per-interface MTU
+    // query (it needs SIOCGIFMTU / GetAdaptersAddresses per platform). 1500
+    // is the standard Ethernet MTU and the value every caller that reads this
+    // is sizing a buffer against; it is a plausible answer rather than a
+    // wrong one, and no caller branches on it the way they branch on
+    // `isUp`/`isLoopback`.
     r.register(ni, "getMTU", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1500)))
     });
@@ -11018,6 +11567,15 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    // KEEP the nulls. These three hand back a `NetworkInterface`, and the one
+    // above (`getAll`) documents at length why a synthetic 5-slot object of
+    // that class breaks the real `getInetAddresses()`/`toString()` bytecode
+    // (`arraylength null` in `NetworkInterface$1`). Building one correctly
+    // needs the package-private `(String,int,InetAddress[])` ctor plus a
+    // `childs` fix-up per interface — the work `getAll` does for the single
+    // loopback interface it returns. Null is the spec'd "no such interface"
+    // answer and every caller (`NetworkInterface.getByName` et al.) already
+    // has to handle it, so it is honest rather than silent.
     r.register(
         ni,
         "getByName0",
@@ -11030,11 +11588,37 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
         "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // `boundInetAddress0(InetAddress)` — "is this address configured on some
+    // local interface?". Unlike its `getByXxx0` siblings above, this one
+    // answers a QUESTION rather than handing back a `NetworkInterface` whose
+    // real field layout we cannot fake, so there is no reason to keep it a
+    // constant. A constant `false` is the dangerous direction: real
+    // `InetAddress.isAnyLocalAddress`/bind-validation callers read it as "that
+    // address is not mine" and reject a bind or a same-host shortcut that
+    // would have worked — for 127.0.0.1, always. Answer from the same local-IP
+    // enumeration `getAll()`/`re8_build_interfaces` use.
     r.register(
         ni,
         "boundInetAddress0",
         "(Ljava/net/InetAddress;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let Some(Value::Object(Some(addr))) = args.first().copied() else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let ip_str = inet_addr_field_string_or(ctx, addr, IA_ADDR, "");
+            let Ok(ip) = ip_str.trim_matches(&['[', ']'][..]).parse::<IpAddr>() else {
+                return Ok(Some(Value::Int(0)));
+            };
+            // Loopback and the wildcard are bound on every host by definition;
+            // the enumeration below can miss the wildcard entirely.
+            let bound = ip.is_loopback()
+                || match ip {
+                    IpAddr::V4(v) => v.is_unspecified(),
+                    IpAddr::V6(v) => v.is_unspecified(),
+                }
+                || re8_enumerate_local_ips().contains(&ip);
+            Ok(Some(Value::Int(i32::from(bound))))
+        },
     );
     r.register(
         ni,
@@ -11745,13 +12329,9 @@ fn re10_auth_result_kind(ctx: &dyn NativeContext, result: ObjectRef) -> Option<A
     // and the bound keeps a pathological/self-referential chain from spinning.
     for _ in 0..16 {
         match ctx.class_name_of_id(cid)?.as_str() {
-            "com/sun/net/httpserver/Authenticator$Success" => {
-                return Some(AuthResultKind::Success)
-            }
+            "com/sun/net/httpserver/Authenticator$Success" => return Some(AuthResultKind::Success),
             "com/sun/net/httpserver/Authenticator$Retry" => return Some(AuthResultKind::Retry),
-            "com/sun/net/httpserver/Authenticator$Failure" => {
-                return Some(AuthResultKind::Failure)
-            }
+            "com/sun/net/httpserver/Authenticator$Failure" => return Some(AuthResultKind::Failure),
             _ => {}
         }
         cid = ctx.superclass_of(cid)?;
@@ -12667,6 +13247,12 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(out))))
         },
     );
+    // KEEP as a no-op. `HttpExchange.close()` closes the request/response
+    // streams; here neither owns an OS resource — the request body is a
+    // `ByteArrayInputStream` over an already-materialised array and the
+    // response body is a chunk array the dispatcher serialises AFTER
+    // `handle()` returns (see `rb` below). Closing the connection here would
+    // be actively wrong: the bytes have not been written yet.
     r.register(hex, "close", "()V", |_ctx, _args| Ok(None));
     // `getPrincipal()` is the observable half of the authentication gate: the
     // dispatcher writes the `HttpPrincipal` carried by an
@@ -12770,6 +13356,12 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         ctx.unpin_native_roots(owner_pin);
         Ok(None)
     });
+    // KEEP as no-ops. This stream is not buffered over a socket: every
+    // `write` appends a chunk to the exchange's `chunks` array (field 6),
+    // which the serve loop drains and sends once the handler returns. There
+    // is nothing to push out on `flush`, and nothing to release on `close` —
+    // the array is ordinary heap that the exchange owns. Making either of
+    // them send would emit the response body before its status line.
     r.register(rb, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(rb, "close", "()V", |_ctx, _args| Ok(None));
 
@@ -12785,11 +13377,14 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::NativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn re1_http_parse_url_plain() {

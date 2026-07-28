@@ -544,6 +544,53 @@ fn real_logger_no_resource_bundle(ctx: &mut dyn NativeContext) -> Option<ObjectR
     }
 }
 
+/// Build a `Logger$LoggerBundle` that carries `bundle_name` (and, when it can
+/// be loaded, the resolved `ResourceBundle`).
+///
+/// Returns `None` when the real nested class isn't the one loaded — the same
+/// signal `real_logger_no_resource_bundle` uses for the compact synthetic
+/// `Logger` shape, which has no `loggerBundle` field to stamp.
+///
+/// A `MissingResourceException` from `ResourceBundle.getBundle` is deliberately
+/// swallowed rather than propagated: real JUL throws it out of
+/// `Logger.getLogger(name, bundle)`, but this native is also the path CratonVM's
+/// own internal logger creation takes, and failing logger creation outright
+/// would be a far larger behaviour change than reporting the requested NAME
+/// with an unresolved bundle. `getResourceBundleName()` therefore answers
+/// truthfully even when `getResourceBundle()` cannot.
+fn real_logger_named_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> Option<ObjectRef> {
+    let bundle_class = "java/util/logging/Logger$LoggerBundle";
+    ctx.class_id_by_name(bundle_class)?;
+    // Allocate the LoggerBundle FIRST so there is exactly one long-lived
+    // reference to keep pinned across the allocating calls that follow.
+    let lb = match ctx.new_object(bundle_class) {
+        Ok(Some(Value::Object(Some(lb)))) => lb,
+        _ => return None,
+    };
+    let lb_pin = ctx.pin_native_root(lb);
+    let name_obj = ctx.create_string(bundle_name);
+    let name_pin = ctx.pin_native_root(name_obj);
+    let name_arg = ctx.read_native_pin(name_pin, name_obj);
+    let user_bundle = match ctx.invoke(
+        "java/util/ResourceBundle",
+        "getBundle",
+        "(Ljava/lang/String;)Ljava/util/ResourceBundle;",
+        &[Value::Object(Some(name_arg))],
+    ) {
+        Ok(Some(Value::Object(Some(bundle)))) => Some(bundle),
+        _ => None,
+    };
+    // `set_field_by_name` neither allocates nor safepoints, so the references
+    // re-derived here (and `user_bundle`, returned by the call just above)
+    // stay valid for the whole write sequence.
+    let lb = ctx.read_native_pin(lb_pin, lb);
+    let name_obj = ctx.read_native_pin(name_pin, name_obj);
+    ctx.set_field_by_name(lb, "resourceBundleName", Value::Object(Some(name_obj)));
+    ctx.set_field_by_name(lb, "userBundle", Value::Object(user_bundle));
+    ctx.unpin_native_roots(lb_pin);
+    Some(lb)
+}
+
 /// Populate the real-JDK `Logger.loggerBundle` field on a Logger this module
 /// allocated natively.
 ///
@@ -837,11 +884,85 @@ fn native_jul_static_get_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Object(Some(logger))))
 }
 
+/// `Logger.getLogger(name, resourceBundleName)`.
+///
+/// This used to drop `resourceBundleName` on the floor and hand back the same
+/// bundle-less Logger as the one-arg overload — which is precisely what made
+/// `getResourceBundleName()`/`getResourceBundle()` unimplementable and left
+/// them as constant-null stubs. Record the request on the Logger the way the
+/// real constructor does, by stamping its `loggerBundle` field, so the two
+/// accessors below have something true to report.
 fn native_jul_static_get_logger_with_bundle(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    native_jul_static_get_logger(ctx, args)
+    let result = native_jul_static_get_logger(ctx, args)?;
+    let logger = match result {
+        Some(Value::Object(Some(logger))) => logger,
+        _ => return Ok(result),
+    };
+    let bundle_name = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if bundle_name.is_empty() {
+        return Ok(result);
+    }
+    // GC SAFETY: `real_logger_named_bundle` allocates (a String, the
+    // LoggerBundle, and possibly a whole ResourceBundle graph), so the Logger
+    // can move underneath us. Pin it and re-derive before the field write.
+    let logger_pin = ctx.pin_native_root(logger);
+    let bundle = real_logger_named_bundle(ctx, &bundle_name);
+    let logger = ctx.read_native_pin(logger_pin, logger);
+    if let Some(bundle) = bundle {
+        // No allocation between `real_logger_named_bundle` returning and this
+        // write, so `bundle` cannot have been relocated since.
+        ctx.set_field_by_name(logger, "loggerBundle", Value::Object(Some(bundle)));
+    }
+    ctx.unpin_native_roots(logger_pin);
+    Ok(Some(Value::Object(Some(logger))))
+}
+
+/// Read one field of a Logger's `loggerBundle` sentinel, null-safely.
+///
+/// Every step tolerates absence: the compact synthetic `Logger` shape declares
+/// no `loggerBundle` at all, and the shared `NO_RESOURCE_BUNDLE` sentinel that
+/// `allocate_logger` installs has both of its fields null. That is what keeps
+/// the WildFly `SystemExiter.logBeforeExit` path (which is what the old
+/// constant-null stubs were written for) free of the
+/// `"lb" is null` NPE, while a Logger that genuinely HAS a bundle now reports
+/// it instead of always answering null.
+fn jul_logger_bundle_field(ctx: &mut dyn NativeContext, args: &[Value], field: &str) -> Value {
+    let logger = match args.first() {
+        Some(Value::Object(Some(logger))) => *logger,
+        _ => return Value::Object(None),
+    };
+    let bundle = match ctx.get_field_by_name(logger, "loggerBundle") {
+        Value::Object(Some(bundle)) => bundle,
+        _ => return Value::Object(None),
+    };
+    match ctx.get_field_by_name(bundle, field) {
+        Value::Object(Some(value)) => Value::Object(Some(value)),
+        _ => Value::Object(None),
+    }
+}
+
+fn native_jul_logger_get_resource_bundle_name(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(jul_logger_bundle_field(
+        ctx,
+        args,
+        "resourceBundleName",
+    )))
+}
+
+fn native_jul_logger_get_resource_bundle(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(jul_logger_bundle_field(ctx, args, "userBundle")))
 }
 
 /// Test-only helper: wipe the singleton + logger registry so tests
@@ -1035,6 +1156,27 @@ fn native_read_configuration_no_arg(
     };
     let entries = crate::properties_sidetable::parse_properties_pub(&bytes);
     apply_jul_config_entries(ctx, &entries)
+}
+
+/// `LogManager.updateConfiguration(InputStream, Function)`.
+///
+/// This was a no-op, so a caller handing the manager a fully-formed
+/// configuration stream — the very thing `readConfiguration(InputStream)`
+/// already accepts and applies — silently got no level, handler or formatter
+/// change at all. Route it through the same parser: `args[1]` is the stream in
+/// both descriptors.
+///
+/// LIMITATION: the `Function<String, BiFunction<String,String,String>>` mapper
+/// (`args[2]`) is not applied. `apply_jul_config_entries` implements the
+/// null-mapper contract exactly — the new configuration replaces the old
+/// wholesale — which is both the documented default and the only behaviour a
+/// caller can get today. A non-null mapper is therefore honoured as if it were
+/// null rather than being silently dropped along with the whole update.
+fn native_update_configuration_with_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_read_configuration_with_stream(ctx, args)
 }
 
 fn native_read_configuration_with_stream(
@@ -4806,6 +4948,9 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_get_property,
     );
+    // `checkAccess()` is a genuine no-op, not a suppressed check: it existed
+    // only to consult a `SecurityManager`, and JDK 24 removed Security
+    // Manager entirely, so the real JDK 25 body has nothing left to do either.
     registry.register(CLS_JUL_LOG_MANAGER, "checkAccess", "()V", |_ctx, _args| {
         Ok(None)
     });
@@ -4818,23 +4963,35 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
             Ok(args.first().cloned())
         },
     );
+    // Add/remove are a consistent pair of no-ops rather than a dropped
+    // registration: configuration listeners fire only from
+    // `readConfiguration`/`updateConfiguration`, both of which are driven
+    // exclusively by an explicit caller-supplied stream here (see
+    // `native_read_configuration_no_arg`), and neither of those paths
+    // re-enters the listener chain. There is no state a caller could observe
+    // that `removeConfigurationListener` would have had to undo.
     registry.register(
         CLS_JUL_LOG_MANAGER,
         "removeConfigurationListener",
         "(Ljava/lang/Runnable;)V",
         |_ctx, _args| Ok(None),
     );
+    // `updateConfiguration(Function)` re-reads the DEFAULT (filesystem /
+    // `java.util.logging.config.file`) configuration — exactly the input
+    // `native_read_configuration_no_arg` refuses to parse, and for exactly the
+    // same reason. Sharing that handler keeps the two refusals from drifting
+    // apart, and keeps the rationale in ONE place.
     registry.register(
         CLS_JUL_LOG_MANAGER,
         "updateConfiguration",
         "(Ljava/util/function/Function;)V",
-        |_ctx, _args| Ok(None),
+        native_read_configuration_no_arg,
     );
     registry.register(
         CLS_JUL_LOG_MANAGER,
         "updateConfiguration",
         "(Ljava/io/InputStream;Ljava/util/function/Function;)V",
-        |_ctx, _args| Ok(None),
+        native_update_configuration_with_stream,
     );
 
     // ---------------- org.jboss.logmanager.LogManager ----------------
@@ -4892,6 +5049,9 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         CLS_JBOSS_LOG_MANAGER,
         "checkAccess",
         "()V",
+        // Same reasoning as the `java.util.logging.LogManager.checkAccess`
+        // registration above: with SecurityManager removed in JDK 24 there is
+        // no check left to perform.
         |_ctx, _args| Ok(None),
     );
 
@@ -5537,19 +5697,28 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     // `this.loggerBundle.resourceBundleName`, NPE-ing when our Logger init
     // path leaves `loggerBundle` null. WildFly's
     // `org/jboss/as/server/SystemExiter.logBeforeExit` calls this on the
-    // exit-reason logger path, killing the boot. Return null safely
-    // instead — JDK callers handle a null return per spec.
+    // exit-reason logger path, killing the boot.
+    //
+    // Both accessors used to answer a hardcoded null, which fixed that NPE by
+    // making the resource-bundle feature invisible: `Logger.getLogger(name,
+    // bundleName)` accepted a bundle name and no caller could ever read it
+    // back, so localized JUL logging silently degraded to the raw message key
+    // on every Logger, real or synthetic. `allocate_logger` now seeds
+    // `loggerBundle` and `native_jul_static_get_logger_with_bundle` stamps a
+    // named `LoggerBundle` when one was requested, so these read the real
+    // field — still null-safe at every step, so the SystemExiter path keeps
+    // its null answer and its no-NPE guarantee.
     registry.register(
         CLS_JUL_LOGGER,
         "getResourceBundleName",
         "()Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_jul_logger_get_resource_bundle_name,
     );
     registry.register(
         CLS_JUL_LOGGER,
         "getResourceBundle",
         "()Ljava/util/ResourceBundle;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_jul_logger_get_resource_bundle,
     );
 
     // ---------------- Enumeration<String> wrapper ----------------

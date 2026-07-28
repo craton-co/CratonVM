@@ -1468,12 +1468,37 @@ impl GenerationalHeap {
     /// young-gen and go straight to the old generation.
     ///
     /// Threshold = [`HUMONGOUS_YOUNG_FRACTION_PERCENT`] of one young
-    /// semi-space capacity.  Computed from a live read of the
-    /// `young_from` arena so the cap correctly tracks any in-flight
-    /// expansion (see `collect_garbage_inner`'s adaptive growth path).
+    /// semi-space capacity, which tracks any in-flight expansion (see
+    /// `collect_garbage_inner`'s adaptive growth path).
+    ///
+    /// The capacity is read from the lock-free [`region_bounds`] mirror
+    /// rather than `young_from.lock().capacity()`. `is_humongous` runs on
+    /// EVERY array allocation, so the mutex made array allocation a global
+    /// serialisation point: measured on this box with a bare
+    /// `new long[16]` loop, aggregate allocation throughput was FLAT at
+    /// ~11.4 Mops/s from 1 to 4 threads (1.01x for 4x the threads) while
+    /// `new Object()` — which never calls this — scaled 3.3x, and HotSpot
+    /// scaled ~27x. Any allocation-heavy concurrent workload was capped at
+    /// one thread's worth of array allocation. This is the same fix, for
+    /// the same reason, that [`region_bounds`] itself documents for
+    /// `is_object_address`'s old triple-lock.
+    ///
+    /// Freshness is identical to the locked read: slot 0 holds young
+    /// from-space's `[base, base + capacity)` and is republished at
+    /// construction and at the start AND end of every GC — the only points
+    /// where the young arenas swap or grow. Mutators allocate only between
+    /// GC cycles (GC is stop-the-world), so they always observe the current
+    /// capacity. A zero span means the mirror has not been published yet
+    /// (pre-construction ordering), so fall back to the authoritative
+    /// locked read rather than treat every allocation as humongous.
     #[inline]
     fn is_humongous(&self, total_size: usize) -> bool {
-        let semi = self.young_from.lock().capacity();
+        let base = self.region_bounds[0].0.load(Ordering::Acquire);
+        let end = self.region_bounds[0].1.load(Ordering::Acquire);
+        let semi = match end.checked_sub(base) {
+            Some(span) if span != 0 => span,
+            _ => self.young_from.lock().capacity(),
+        };
         // Saturating arithmetic: a tiny semi-space (e.g. 1 KiB test heap)
         // can produce a 0-byte threshold under integer truncation — clamp
         // up to at least one allocation so the humongous path doesn't fire

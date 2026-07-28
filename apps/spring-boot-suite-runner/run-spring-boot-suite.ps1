@@ -825,10 +825,9 @@ function Invoke-Mode {
     # this.socketLock is null" — see docs/known-issues (reference_server_socket_gap
     # in memory) for the full history; this is a known, already-fixed-behind-
     # a-flag issue, not something to re-report as a new bug.
-    $env:CRATONVM_REAL_NET_SOCKETS = '1'
-    $env:CRATONVM_REAL_AQS = '1'
-    $env:CRATONVM_DISABLE_DEFAULT_WATCHDOG = '1'
-    $env:CRATONVM_ROOTSNAP_CACHE = '1'
+    $env:CRATONVM_REAL = 'net-sockets,aqs'
+    $env:CRATONVM_THREADS = '-default-watchdog'
+    $env:CRATONVM_JIT = 'rootsnap-cache'
   }
 
   $run = $RunName
