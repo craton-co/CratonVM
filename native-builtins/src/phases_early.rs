@@ -8716,8 +8716,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     // RecursiveTask — done+result tracked in `fjp_state` side-table.
     // WP4.3 fix: switched off field-index access (broken in real-JDK mode).
     let rt = "java/util/concurrent/RecursiveTask";
+    // KEEP: genuinely empty, same as the `RecursiveAction` ctor below. The real
+    // `RecursiveTask()` constructor has an empty body, and this model keeps all
+    // task state in the `fjp_state` side table, which starts empty for an
+    // unseen key — so there is nothing to initialise here.
     r.register(rt, "<init>", "()V", |_ctx, _args| {
-        // No field initialization — side-table starts empty for this task.
         Ok(Some(Value::Object(None)))
     });
     // Lazy fork — see ForkJoinTask.fork above for rationale.
@@ -13176,10 +13179,18 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, CIPHER_ALGO)))
         },
     );
-    // getBlockSize() -> int
-    r.register(cipher, "getBlockSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16))) // AES block size
-    });
+    // getBlockSize() -> int: REMOVED, it was a dead duplicate. This copy
+    // answered a hard-coded 16 for every transformation (wrong for the DES
+    // family, and for the stream/asymmetric ciphers whose contract is 0), but
+    // it could never run: `register_synthetic_overrides` calls
+    // `register_phase53_natives` (which calls this one) and then
+    // `jca::cipher::register_cipher_clinit_shim` → `register_cipher_dispatch`,
+    // which re-registers the same class+method+descriptor with a
+    // transformation-aware implementation, and the registry is
+    // last-write-wins. In real-JDK mode this function is not called at all and
+    // only the `jca::cipher` entry exists. Deleted rather than fixed in place
+    // so the two cannot drift apart again; the live one is
+    // `jca/cipher.rs::register_cipher_dispatch`.
     // getOutputSize(int inputLen) -> int
     r.register(cipher, "getOutputSize", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;

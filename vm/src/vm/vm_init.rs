@@ -92,6 +92,92 @@ fn truncate_ascii(s: &str, max: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Quarkus `RunnerClassLoader.close()`
+// ---------------------------------------------------------------------------
+
+/// Real `io.quarkus.bootstrap.runner.RunnerClassLoader.close()`.
+///
+/// This was a `Ok(None)` no-op registered "until the underlying HashMap
+/// null-value issue is resolved": the Quarkus bytecode walks
+/// `resourceDirectoryMap.values()` and dereferences every entry, so a null map
+/// value made it NPE. Answering with a no-op dodged the NPE by never releasing
+/// a single jar handle. This does the real work and skips the null holes
+/// instead.
+///
+/// Quarkus points many package directories at the SAME `ClassLoadingResource`
+/// objects, so each distinct resource is closed exactly once: `JarResource`
+/// delegates to a reference-counted `JarFileReference`, and closing it once per
+/// directory entry would drive that counter negative.
+fn quarkus_runner_class_loader_close(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[cratonvm_types::Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let this = match args.first() {
+        Some(cratonvm_types::Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let map = match ctx.get_field_by_name(this, "resourceDirectoryMap") {
+        cratonvm_types::Value::Object(Some(m)) => m,
+        // Unrecognised Quarkus layout: no resource table to walk, so there is
+        // nothing to close (same observable result as the old no-op).
+        _ => return Ok(None),
+    };
+    let values = match ctx.invoke_virtual(map, "values", "()Ljava/util/Collection;", &[])? {
+        Some(cratonvm_types::Value::Object(Some(v))) => v,
+        _ => return Ok(None),
+    };
+    let table = match ctx.invoke_virtual(values, "toArray", "()[Ljava/lang/Object;", &[])? {
+        Some(cratonvm_types::Value::Object(Some(t))) => t,
+        _ => return Ok(None),
+    };
+
+    // Collection pass. `array_length`/`get_array_element` never allocate, so
+    // no GC can relocate these refs before they are pinned below.
+    let mut resources: Vec<cratonvm_types::ObjectRef> = Vec::new();
+    for i in 0..ctx.array_length(table) {
+        // A null entry here is exactly the hole the real bytecode NPEs on.
+        let entry = match ctx.get_array_element(table, i) {
+            cratonvm_types::Value::Object(Some(e)) => e,
+            _ => continue,
+        };
+        if ctx.object_is_array(entry) {
+            for j in 0..ctx.array_length(entry) {
+                if let cratonvm_types::Value::Object(Some(res)) = ctx.get_array_element(entry, j) {
+                    if !resources.contains(&res) {
+                        resources.push(res);
+                    }
+                }
+            }
+        } else if !resources.contains(&entry) {
+            // Older Quarkus maps a directory straight to one resource.
+            resources.push(entry);
+        }
+    }
+    let base = match resources.first() {
+        Some(first) => ctx.pin_native_root(*first),
+        None => return Ok(None),
+    };
+    let mut handles = Vec::with_capacity(resources.len());
+    handles.push(base);
+    for res in &resources[1..] {
+        handles.push(ctx.pin_native_root(*res));
+    }
+
+    // `close()` runs Java code, which can allocate and therefore relocate every
+    // resource still queued, so re-read each ref through its pin.
+    let mut outcome = Ok(None);
+    for (idx, handle) in handles.iter().enumerate() {
+        let res = ctx.read_native_pin(*handle, resources[idx]);
+        if let Err(e) = ctx.invoke_virtual(res, "close", "()V", &[]) {
+            outcome = Err(e);
+            break;
+        }
+    }
+    ctx.unpin_native_roots(base);
+    outcome
+}
+
+// ---------------------------------------------------------------------------
 // WP1.11 — system-property helpers
 // ---------------------------------------------------------------------------
 
@@ -1516,17 +1602,17 @@ impl SharedVm {
                 cratonvm_native_builtins::phases_early::register_string_latin1_natives(
                     &mut native_methods,
                 );
-                // KC26: RunnerClassLoader.close() — the real bytecode crashes on null
-                // map values (HashMap entries with null value field). Register a no-op
-                // until the underlying HashMap null-value issue is resolved.
-                // [SyntheticStub] no-op `Ok(None)` that suppresses the real close()
-                // logic to bypass the HashMap null-value bug. Left at the default
-                // (SyntheticStub) category intentionally — do NOT tag Bridge.
+                // KC26: RunnerClassLoader.close() — the real bytecode NPEs on null
+                // map values (HashMap entries with a null value field). This used
+                // to be a no-op, which dodged the NPE by leaking every jar handle;
+                // `quarkus_runner_class_loader_close` closes the resources for real
+                // and skips the null holes. Left at the default (SyntheticStub)
+                // category so `CRATONVM_NO_STUBS` still falls through to bytecode.
                 native_methods.register(
                     "io/quarkus/bootstrap/runner/RunnerClassLoader",
                     "close",
                     "()V",
-                    |_ctx, _args| Ok(None),
+                    quarkus_runner_class_loader_close,
                 );
                 // KC26: ClassLoader constructors — the real JDK ClassLoader.<init>
                 // is extremely complex (creates ArrayList, ProtectionDomain,
@@ -2159,14 +2245,15 @@ impl SharedVm {
             cratonvm_native_builtins::phases_early::register_string_latin1_natives(
                 &mut native_methods,
             );
-            // [SyntheticStub] no-op `Ok(None)` that suppresses the real close()
-            // logic to bypass the HashMap null-value bug. Left at the default
-            // (SyntheticStub) category intentionally — do NOT tag Bridge.
+            // Real close() (see `quarkus_runner_class_loader_close`): closes each
+            // distinct ClassLoadingResource once and skips the null map values
+            // the real bytecode NPEs on. Left at the default (SyntheticStub)
+            // category so `CRATONVM_NO_STUBS` still falls through to bytecode.
             native_methods.register(
                 "io/quarkus/bootstrap/runner/RunnerClassLoader",
                 "close",
                 "()V",
-                |_ctx, _args| Ok(None),
+                quarkus_runner_class_loader_close,
             );
             cratonvm_native_builtins::classloader_real::register_classloader_real_natives(
                 &mut native_methods,
@@ -6883,6 +6970,10 @@ mod tests {
         // for why real-JDK mode does not, as of 2026-07-14).
         let mut r = cratonvm_native_api::NativeMethodRegistry::new();
         r.set_drop_synthetic_stubs(true);
+        // Test fixture, not a VM registration: this throwaway registry never
+        // reaches a running VM and class `Test` does not exist. The two empty
+        // bodies exist only so the assertions below can observe which category
+        // `drop_synthetic_stubs` filters. KEEP.
         r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
         r.register("Test", "stub", "()V", |_ctx, _args| Ok(None));
         r.set_category(cratonvm_native_api::NativeKind::Bridge);

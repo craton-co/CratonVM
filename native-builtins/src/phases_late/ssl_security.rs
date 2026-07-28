@@ -2947,11 +2947,33 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_session,
         "getLocalPrincipal",
         "()Ljava/security/Principal;",
-        |_ctx, _args| {
-            // This client session never presents a certificate (no mTLS in
-            // this path) — null is the documented return for "no principal
-            // was sent", not an exception.
-            Ok(Some(Value::Object(None)))
+        |ctx, args| {
+            // STUB-REMOVAL (wave 3): this used to return null unconditionally,
+            // which contradicted the sibling `getLocalCertificates` just below —
+            // that one was already fixed to read the real chain out of
+            // `t27_tls::local_certs_for_session`, because a SERVER session
+            // always has its own certificate. `SSLSession.getLocalPrincipal()`
+            // is documented as "the principal that was sent to the peer", i.e.
+            // the subject of the local leaf certificate, so a session that
+            // hands back a chain from `getLocalCertificates()` yet null here
+            // was self-contradictory. Derive the principal from that same
+            // chain. Null stays correct — and is the documented answer for "no
+            // principal was sent" — when there is no local identity (a plain
+            // no-mTLS client session), so the original client behaviour is
+            // unchanged.
+            let this = obj_arg(args, 0)?;
+            let chain = crate::t27_tls::local_certs_for_session(ctx, this);
+            let Some(leaf) = chain.first() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let (subject, _issuer) = basic_der_extract_names(leaf)
+                .unwrap_or_else(|| ("CN=Unknown".into(), String::new()));
+            // Same 1-field synthetic shape `getPeerPrincipal` builds below.
+            let princ =
+                alloc_concurrent_synthetic(ctx, "javax/security/auth/x500/X500Principal", 1);
+            let s = ctx.create_string(&subject);
+            ctx.set_field(princ, 0, Value::Object(Some(s)));
+            Ok(Some(Value::Object(Some(princ))))
         },
     );
     r.register(

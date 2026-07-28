@@ -1836,6 +1836,11 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     // 0, `isEmpty()` is always true, `contains(o)` is always false and
     // `remainingCapacity()` is always 0. A state-reading implementation would
     // be wrong, not better.
+    // SHADOW NOTE: `isEmpty` below does NOT survive to runtime —
+    // `concurrent_extras::register_synchronous_queue_extras` re-registers it
+    // later (lib.rs registers concurrent_extras after phase 58) with a
+    // slot-state reader that can answer false. That override contradicts both
+    // the javadoc and the `size() == 0` kept here; see the note at that site.
     r.register(sq, "peek", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -6017,7 +6022,10 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(tg, "destroy", "()V", |_ctx, _args| {
-        // Deprecated in JDK 16+, removed in JDK 21. No-op per spec.
+        // KEEP: deprecated for removal in JDK 16 and *degraded* in JDK 20 —
+        // the method is specified to do nothing (the paired `isDestroyed()`
+        // is specified to return false). A no-op IS the JDK 21/25 behaviour,
+        // not a placeholder.
         Ok(None)
     });
     r.register(tg, "list", "()V", |ctx, args| {
@@ -6330,15 +6338,31 @@ pub(crate) fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry
         },
     );
 
-    // takeVirtualThreadListToUnblock — used by the JDK's internal scheduler
-    // service thread to poll for unblocked virtual threads. We don't run
-    // that service thread; return null so the caller's `while (vt != null)`
-    // loop terminates cleanly without crashing.
+    // takeVirtualThreadListToUnblock — the JDK's unblocker service thread
+    // calls this to collect virtual threads whose blocking operation has
+    // completed. `null` ("no list available") is the honest answer: CratonVM
+    // runs the BoundVirtualThread path, so nothing is ever posted here.
+    //
+    // The RETURN VALUE is not the whole contract though — in HotSpot this
+    // native BLOCKS until a list exists, and the JDK's caller drains it from
+    // an outer unbounded loop. Answering null instantly therefore turned that
+    // service thread into a 100%-CPU spin. Reproduce the blocking half with a
+    // bounded sleep so the loop degrades to a slow poll instead. It is
+    // declared as a timed blocking region (same contract as the other native
+    // poll loops in this crate) so a concurrent stop-the-world collector does
+    // not wait for this thread to reach an interpreter safepoint. No object
+    // refs are held across the sleep, so `end_blocking_region` needs no fixup
+    // list.
     r.register(
         vt,
         "takeVirtualThreadListToUnblock",
         "()Ljava/lang/VirtualThread;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| {
+            ctx.begin_timed_blocking_region();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            ctx.end_blocking_region();
+            Ok(Some(Value::Object(None)))
+        },
     );
     r.set_category(__prev_cat);
 }

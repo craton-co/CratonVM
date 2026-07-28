@@ -584,6 +584,9 @@ const CL_LOADER_TYPE: usize = 0;
 const CL_PARENT_REF: usize = 1;
 pub(crate) const CL_NAME_REF: usize = 2;
 const CL_CLASSES_LOADED: usize = 3;
+/// 1 = this loader is parallel-capable (the CratonVM default — see
+/// `cl_is_registered_as_parallel_capable`), 0 = not. Must stay in agreement
+/// with `registerAsParallelCapable()`, which always reports success.
 const CL_IS_PARALLEL_CAPABLE: usize = 4;
 const CL_DEFAULT_DOMAIN: usize = 5;
 /// Unique loader ID for class namespace isolation (0 = not yet assigned)
@@ -725,7 +728,7 @@ pub(crate) fn alloc_classloader(ctx: &mut dyn NativeContext, loader_type: i32) -
     ctx.set_field(obj, CL_PARENT_REF, Value::Object(None));
     ctx.set_field(obj, CL_NAME_REF, Value::Object(None));
     ctx.set_field(obj, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(0));
+    ctx.set_field(obj, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     let pd = alloc_default_protection_domain(ctx);
     let pd_pin = ctx.pin_native_root(pd);
     obj = ctx.read_native_pin(obj_pin, obj);
@@ -896,7 +899,7 @@ fn cl_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     ctx.set_field(this, CL_PARENT_REF, Value::Object(Some(sys)));
     ctx.set_field(this, CL_NAME_REF, Value::Object(None));
     ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(0));
+    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     // WP2.3: build a non-null defaultDomain so JDK preDefineClass's
     // `pd.getCodeSource()` chain doesn't NPE on the no-PD defineClass path.
     let pd = alloc_default_protection_domain(ctx);
@@ -917,7 +920,7 @@ fn cl_init_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     ctx.set_field(this, CL_PARENT_REF, parent);
     ctx.set_field(this, CL_NAME_REF, Value::Object(None));
     ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(0));
+    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
@@ -936,7 +939,7 @@ fn cl_init_name_parent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     ctx.set_field(this, CL_PARENT_REF, parent);
     ctx.set_field(this, CL_NAME_REF, name);
     ctx.set_field(this, CL_CLASSES_LOADED, Value::Int(0));
-    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(0));
+    ctx.set_field(this, CL_IS_PARALLEL_CAPABLE, Value::Int(1));
     let pd = alloc_default_protection_domain(ctx);
     ctx.set_field(this, CL_DEFAULT_DOMAIN, Value::Object(Some(pd)));
     ctx.set_field_by_name(this, "defaultDomain", Value::Object(Some(pd)));
@@ -5155,6 +5158,23 @@ fn cl_register_as_parallel_capable(
     Ok(Some(Value::Int(1)))
 }
 
+/// `ClassLoader.isRegisteredAsParallelCapable()Z`.
+///
+/// WAVE-3 FIX (found by cross-package audit): this registration WINS over the
+/// `phases_late::register_p61_classloader` copy (both are reachable only from
+/// `register_synthetic_overrides`; lib.rs calls the classloader one LAST), and
+/// it used to read a field that was written `0` at every initialiser and never
+/// written `1` anywhere. Meanwhile `registerAsParallelCapable()` (above, and
+/// `deprecated_internal.rs`, and `classloader_real.rs`) answers an
+/// unconditional `true`. A loader that had just successfully registered was
+/// then told it had not — the register/query pair contradicted itself.
+///
+/// The four `ClassLoader` initialisers now seed `CL_IS_PARALLEL_CAPABLE = 1`,
+/// which is the truthful answer for this VM: every synthetic loader IS
+/// parallel-capable, because class definition serialises on the VM's own
+/// global class-registry lock rather than on the loader object, so no loader
+/// can deadlock another by loading concurrently. The state stays in the field
+/// (not a constant) so a future per-loader model can flip it back to 0.
 fn cl_is_registered_as_parallel_capable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -5162,7 +5182,10 @@ fn cl_is_registered_as_parallel_capable(
     let this = obj_arg(args, 0)?;
     let val = match ctx.get_field(this, CL_IS_PARALLEL_CAPABLE) {
         Value::Int(v) => v,
-        _ => 0,
+        // Loader allocated without the synthetic 7-field layout (too short to
+        // carry the slot): fall back to the same `true` the registration call
+        // reports, rather than contradicting it.
+        _ => 1,
     };
     Ok(Some(Value::Int(val)))
 }
@@ -8874,7 +8897,23 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
     // .compareAndSetReference`-backed lazy `buf` allocation) and its comment
     // there asks future changes NOT to add more layout-coupled natives for
     // this class without a demonstrated regression.
-    r.register(bis, "close", "()V", |_ctx, _args| Ok(None));
+    //
+    // STUB-REMOVAL (wave 3): the no-op body is still wrong wherever this DOES
+    // win (synthetic-JDK mode, where there is no real BIS bytecode to yield
+    // to): real `BufferedInputStream.close()` closes the wrapped stream, so a
+    // no-op leaked the underlying stream/fd on every `try (var in = new
+    // BufferedInputStream(...))`. Delegate to the wrapped stream by NAME (`in`,
+    // inherited from `FilterInputStream`) so no field-index coupling is added,
+    // per the note above. `buf` is deliberately left alone — nulling it is what
+    // real JDK does, but the native-io H2 fix relies on the lazy `buf`
+    // allocation and this native must not disturb it.
+    r.register(bis, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Object(Some(inner)) = ctx.get_field_by_name(this, "in") {
+            ctx.invoke_virtual(inner, "close", "()V", &[])?;
+        }
+        Ok(None)
+    });
 
     // -----------------------------------------------------------------------
     // cglib probe — formerly short-circuited (CglibProbe.main / <clinit> /

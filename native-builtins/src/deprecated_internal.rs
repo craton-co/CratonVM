@@ -979,11 +979,25 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(flags.unwrap_or(0x0001))))
         },
     );
-    // `Reflection.ensureNativeAccess` enforces the JEP 442 restricted-method
-    // policy (`--enable-native-access`).  A no-op is CratonVM's actual policy,
-    // not a dropped check: this VM grants native access to every module
+    // `Reflection.ensureNativeAccess` is the JEP 442/472 restricted-method
+    // announce point (`--enable-native-access`).
+    //
+    // KEEP (no-op, justified) — but NOT for the reason previously recorded
+    // here. The old note claimed CratonVM "grants native access to every module
     // unconditionally, and there is no counterpart query that would report
-    // otherwise.  It returns void, so nothing can disagree with it.
+    // otherwise"; that is wrong. `panama::NativeAccessPolicy` records the
+    // `--enable-native-access` grant faithfully (`None` / `All` / per-module),
+    // defaults to `None`, and is queried by `native_access_enabled()` /
+    // `module_native_access_enabled()`.
+    //
+    // The real reason to keep the no-op is that CratonVM enforces that policy
+    // at the RESTRICTED OPERATIONS themselves rather than at this announce
+    // point: `panama::require_native_access` fails closed on every downcall and
+    // raw-address `MemorySegment` access. This callback also cannot do better
+    // than the operation-level gate — it is handed the caller `Class`, and the
+    // caller's MODULE (what the per-module query wants) is not derivable from a
+    // mirror here. Tightening this into a throw is a policy change that belongs
+    // with plumbing the caller module to the gate, not with this sweep.
     r.register(
         refl2,
         "ensureNativeAccess",

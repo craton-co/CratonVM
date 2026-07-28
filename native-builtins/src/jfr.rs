@@ -17,6 +17,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, RuntimeError};
 use cratonvm_types::{ArrayElementType, Value};
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
@@ -241,6 +242,17 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     registry.register(JVM, "isRecording", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(RECORDING.load(Ordering::Acquire) as i32)))
     });
+    // `true` here is a claim about THIS boundary, and it is one the rest of the
+    // file keeps: `JVMSupport.ensureAvailable()` only gates the lifecycle and
+    // clock surface, all of which is really implemented above. What is missing
+    // is event payload collection, and every entry point that would expose the
+    // gap already says so honestly — `emitEvent`/`isInstrumented`/
+    // `getAllowedToDoEventRetransforms` answer `false`, `newEventWriter` throws.
+    // So no caller is told "available" and then handed a fake event: it gets a
+    // working `Recording`/`RecordingStream` that reports zero events.
+    // (Answering `false` instead is not free — `JVMSupport` then makes every
+    // `jdk.jfr` entry point throw `UnsupportedOperationException`, which takes
+    // out otherwise-fine users such as Micrometer's virtual-thread binder.)
     registry.register(JVM, "createJFR", "(Z)Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -264,6 +276,10 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     registry.register(JVM, "getTicksFrequency", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(1_000_000_000)))
     });
+    // Spec-correct, not a placeholder: the factor converts `counterTime()`
+    // ticks to nanoseconds, and `counterTime()` above already returns
+    // nanoseconds (`getTicksFrequency()` == 1e9 says the same thing). Any other
+    // value would contradict those two.
     registry.register(JVM, "getTimeConversionFactor", "()D", |_ctx, _args| {
         Ok(Some(Value::Double(1.0)))
     });
@@ -417,12 +433,16 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/List;",
         |ctx, _args| ctx.new_object_initialized("java/util/ArrayList", "()V", &[]),
     );
-    // A null `EventWriter` is the JDK's own "this thread has no chunk buffer"
-    // answer, and it is unreachable rather than merely unimplemented here: the
-    // only caller is the `commit` code that `retransformClasses` bytecode
-    // weaving installs into an event class, and `retransformClasses` /
-    // `isInstrumented` above say no class is ever instrumented. Fabricating a
-    // writer over a buffer that does not exist would be strictly worse.
+    // A null `EventWriter` is the JDK's own "this thread has no chunk buffer
+    // yet" answer and `EventWriterFactory` null-checks it, so returning it is
+    // spec-correct rather than a stub. `newEventWriter` is the opposite: it is
+    // the JDK's "make me one" call and its result is used unchecked, so a null
+    // there is an NPE at a distance inside woven event bytecode. Both are in
+    // practice unreachable — their only caller is the `commit` body that
+    // `retransformClasses` weaves into an event class, and `retransform
+    // Classes`/`isInstrumented` above say no class is ever instrumented — but
+    // if that ever changes, fail by name at the actual gap instead of handing
+    // back a null the caller cannot survive.
     registry.register(
         JVM,
         "getEventWriter",
@@ -433,7 +453,16 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         JVM,
         "newEventWriter",
         "()Ljdk/jfr/internal/event/EventWriter;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |_ctx, _args| {
+            Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: "jdk.jfr.internal.JVM.newEventWriter: CratonVM has no JFR chunk \
+                              buffer; event payloads are recorded by the Rust jfr backend, not \
+                              through this boundary"
+                        .to_owned(),
+                },
+            ))
+        },
     );
     // `setConfiguration` used to report success from the blanket "return 1"
     // group while storing nothing, and `getConfiguration` answered a constant

@@ -2104,6 +2104,20 @@ fn net_is_exclusive_bind_available(
     Ok(Some(Value::Int(0)))
 }
 
+/// The `jdk/net/{Windows,Linux}SocketOptions` getters/setters below all sit
+/// behind a `*Supported0()` probe that we answer `false`, and none of them can
+/// reach the real OS socket (the `int fd` the JDK hands them is CratonVM's
+/// synthetic handle id from `register_handle`, not an OS descriptor). If a
+/// caller gets to one anyway, hand it the exception `SocketOption`/`setOption`
+/// specify for an option the platform does not support — a fabricated "0" or a
+/// silently-swallowed tuning request is strictly worse than an honest error.
+fn ext_opt_unsupported(option: &str) -> MethodCallFailed {
+    RuntimeError::UnsupportedOperationException {
+        message: format!("{option}: extended socket option not supported by CratonVM"),
+    }
+    .into()
+}
+
 // ---------------------------------------------------------------------------
 // T19.5 registration
 // ---------------------------------------------------------------------------
@@ -2368,30 +2382,47 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // `Net.getSocketOption(fd, SO_LINGER)` → `EXTENDED_OPTIONS.isOptionSupported(..)`
     // → NPE, so a real java.net.Socket cannot be closed cleanly. Report "no
     // extended keepalive options" (false) so the clinit succeeds and the
-    // keepalive getters/setters below are never exercised; the IP_DONTFRAGMENT
-    // pair returns safe defaults.
+    // keepalive getters/setters below are never exercised.
     {
         let wso = "jdk/net/WindowsSocketOptions";
+        // KEEP: this is a capability probe, and "unsupported" is a truthful
+        // answer for us — it is also what makes the JDK raise
+        // UnsupportedOperationException at the caller instead of accepting a
+        // keepalive tuning request we cannot honour.
         r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(0)))
         });
+        // IP_DONTFRAGMENT is NOT gated by a native probe — `ipDontFragmentSupported()`
+        // is plain Java returning true — so unlike the keepalive family below these
+        // two really are reachable from `DatagramSocket.setOption(IP_DONTFRAGMENT, ..)`.
+        // They used to accept the request and drop it on the floor.
         r.register(wso, "getIpDontFragment0", "(IZ)Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
         });
-        r.register(wso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
+        r.register(wso, "setIpDontFragment0", "(IZZ)V", |_c, _a| {
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+        });
         for (name, desc) in [
             ("getTcpKeepAliveProbes0", "(I)I"),
             ("getTcpKeepAliveTime0", "(I)I"),
             ("getTcpKeepAliveIntvl0", "(I)I"),
         ] {
-            r.register(wso, name, desc, |_c, _a| Ok(Some(Value::Int(0))));
+            r.register(wso, name, desc, |_c, _a| {
+                Err(ext_opt_unsupported(
+                    "TCP_KEEPCOUNT/TCP_KEEPIDLE/TCP_KEEPINTERVAL",
+                ))
+            });
         }
         for (name, desc) in [
             ("setTcpKeepAliveProbes0", "(II)V"),
             ("setTcpKeepAliveTime0", "(II)V"),
             ("setTcpKeepAliveIntvl0", "(II)V"),
         ] {
-            r.register(wso, name, desc, |_c, _a| Ok(None));
+            r.register(wso, name, desc, |_c, _a| {
+                Err(ext_opt_unsupported(
+                    "TCP_KEEPCOUNT/TCP_KEEPIDLE/TCP_KEEPINTERVAL",
+                ))
+            });
         }
     }
 
@@ -2409,8 +2440,17 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // Same "no extended options supported" policy as the Windows block:
     // report unsupported everywhere so `<clinit>` succeeds and the
     // getters/setters below are never exercised for real.
+    //
+    // SHADOWING NOTE: `native-builtins/src/lib.rs` registers a byte-for-byte
+    // twin of this block from `register_essential_natives_with_shims`. That
+    // runs BEFORE `register_io_natives` (see `vm/src/vm/vm_init.rs`), and
+    // registration is last-write-wins, so THIS copy is the one that serves.
     {
         let lso = "jdk/net/LinuxSocketOptions";
+        // KEEP (all three): capability probes. "Unsupported" is truthful here,
+        // and it is precisely what makes the JDK raise
+        // UnsupportedOperationException at the caller rather than let it queue a
+        // tuning request we cannot honour.
         r.register(lso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(0)))
         });
@@ -2420,33 +2460,54 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         r.register(lso, "incomingNapiIdSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(0)))
         });
+        // IP_DONTFRAGMENT is NOT gated by a native probe (`ipDontFragmentSupported()`
+        // is plain Java returning true), so these two are genuinely reachable and
+        // used to swallow the request silently. Say "unsupported" out loud.
         r.register(lso, "getIpDontFragment0", "(IZ)Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
         });
-        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
+        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, _a| {
+            Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+        });
         r.register(lso, "getQuickAck0", "(I)Z", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Err(ext_opt_unsupported("TCP_QUICKACK"))
         });
-        r.register(lso, "setQuickAck0", "(IZ)V", |_c, _a| Ok(None));
+        r.register(lso, "setQuickAck0", "(IZ)V", |_c, _a| {
+            Err(ext_opt_unsupported("TCP_QUICKACK"))
+        });
+        // KEEP: `-1` is this native's OWN documented failure sentinel, not a
+        // placeholder — `ExtendedSocketOptions.getSoPeerCred` decodes the long
+        // as (uid<<32)|gid and turns a -1 uid/gid into
+        // `SocketException("Not a unix domain socket")`. We have no
+        // SO_PEERCRED plumbing, so the sentinel produces exactly the observable
+        // behaviour the JDK specifies for that case.
         r.register(lso, "getSoPeerCred0", "(I)J", |_c, _a| {
             Ok(Some(Value::Long(-1)))
         });
         r.register(lso, "getIncomingNapiId0", "(I)I", |_c, _a| {
-            Ok(Some(Value::Int(0)))
+            Err(ext_opt_unsupported("SO_INCOMING_NAPI_ID"))
         });
         for (name, desc) in [
             ("getTcpKeepAliveProbes0", "(I)I"),
             ("getTcpKeepAliveTime0", "(I)I"),
             ("getTcpKeepAliveIntvl0", "(I)I"),
         ] {
-            r.register(lso, name, desc, |_c, _a| Ok(Some(Value::Int(0))));
+            r.register(lso, name, desc, |_c, _a| {
+                Err(ext_opt_unsupported(
+                    "TCP_KEEPCOUNT/TCP_KEEPIDLE/TCP_KEEPINTERVAL",
+                ))
+            });
         }
         for (name, desc) in [
             ("setTcpKeepAliveProbes0", "(II)V"),
             ("setTcpKeepAliveTime0", "(II)V"),
             ("setTcpKeepAliveIntvl0", "(II)V"),
         ] {
-            r.register(lso, name, desc, |_c, _a| Ok(None));
+            r.register(lso, name, desc, |_c, _a| {
+                Err(ext_opt_unsupported(
+                    "TCP_KEEPCOUNT/TCP_KEEPIDLE/TCP_KEEPINTERVAL",
+                ))
+            });
         }
     }
 

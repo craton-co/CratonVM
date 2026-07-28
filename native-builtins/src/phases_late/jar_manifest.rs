@@ -477,11 +477,17 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
-    // Native-backed JarFiles do not initialize the real JDK's multi-release
-    // verifier state (`res`/`jv`). They expose physical central-directory
-    // entries, so the compact bridge deliberately has no version remapping.
-    r.register(jf, "isMultiRelease", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // `JarFile.isMultiRelease()` is true iff the manifest's main section
+    // declares `Multi-Release: true` (JEP 238). The old blanket `false` was
+    // stale: the compact bridge DOES remap versioned entries — see
+    // `p59_jar_lookup_versioned_entry`, which drives `META-INF/versions/N/`
+    // resolution off the same `p59_jar_is_multi_release` helper used here.
+    // Answer from the manifest so callers agree with the entries we hand back.
+    r.register(jf, "isMultiRelease", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = p59_jar_file_path(ctx, this);
+        let multi_release = !path.is_empty() && p59_jar_is_multi_release(&path);
+        Ok(Some(Value::Int(i32::from(multi_release))))
     });
     // JarFile.stream() — Spring Boot 3 fat-jar launcher
     // (org.springframework.boot.loader.launch.JarFileArchive.getClassPathUrls)

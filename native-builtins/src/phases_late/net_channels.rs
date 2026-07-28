@@ -2985,11 +2985,17 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(ds, "disconnect", "()V", |_ctx, _args| {
-        // Disconnect the datagram socket — clear any remote association.
-        // Our UdpSocket model doesn't track connected state explicitly, so this is a logical no-op.
-        Ok(None)
-    });
+    // KEEP: there is provably nothing to undo. `connect(InetAddress,int)` above
+    // discards its arguments and never calls `fd_table().udp_connect`, so no
+    // remote association is ever established; and this class registers no
+    // `isConnected` / `getInetAddress` / `getRemoteSocketAddress` reader that
+    // could be made to disagree with the no-op. The defect is the SETTER, not
+    // this method — and it cannot be fixed alone, because `std::net::UdpSocket`
+    // (and socket2's `SockRef`) expose no portable disconnect, so a real
+    // `connect` would leave `disconnect` unable to honour its own contract.
+    // Reported as a residual: needs an `fd_table::udp_disconnect` primitive
+    // (AF_UNSPEC connect) before the pair can be implemented together.
+    r.register(ds, "disconnect", "()V", |_ctx, _args| Ok(None));
     r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
@@ -4158,8 +4164,9 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // HttpServer. We keep ONLY the HttpServerImpl alias for `create` (Phase E
     // registers `HttpServer` but not the impl class), the no-arg `create()`
     // factory (Phase E only registers the 2-arg form), executor accessors,
-    // bind, removeContext, and the HttpContext / HttpHandler / Headers
-    // helpers that Phase E does not cover.
+    // bind, and the HttpContext / HttpHandler / Headers helpers that Phase E
+    // does not cover. (`removeContext` was on that list until wave 3 found it
+    // shadowing Phase E's real one on the same key — see below.)
     let hs = "com/sun/net/httpserver/HttpServer";
     let hs_simple = "com/sun/net/httpserver/HttpServerImpl";
 
@@ -4282,28 +4289,23 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        // removeContext: `createContext(String)` above hands back a standalone
-        // 2-slot context and never files it anywhere, so on THIS layout there
-        // is genuinely nothing to unregister and the no-op is the whole
-        // operation. It is not a silent drop of live routing state — that lives
-        // in `net_phase_e::register_re10_http_server`, whose real
-        // `removeContext(String)` stays in force for servers created through
-        // `HttpServer.create(addr, backlog)` (its natives are aliased onto the
-        // concrete `sun/net/httpserver/HttpServerImpl` receiver those servers
-        // carry, and native dispatch keys on the receiver class, so these
-        // `com/sun/net/httpserver/HttpServer` entries never shadow them).
-        r.register(
-            cls,
-            "removeContext",
-            "(Ljava/lang/String;)V",
-            |_ctx, _args| Ok(None),
-        );
-        r.register(
-            cls,
-            "removeContext",
-            "(Lcom/sun/net/httpserver/HttpContext;)V",
-            |_ctx, _args| Ok(None),
-        );
+        // DELETED (wave 3) — both `removeContext` overloads used to be no-ops
+        // here, on the premise that the real ones in
+        // `net_phase_e::register_re10_http_server` are aliased onto a distinct
+        // `sun/net/httpserver/HttpServerImpl` receiver and so could not be
+        // shadowed. That premise is false: net_phase_e registers them on
+        // `com/sun/net/httpserver/HttpServer` (net_phase_e.rs `let hs = …`),
+        // the SAME key this loop used, and phase 72 runs AFTER phase E
+        // (lib.rs: `register_phase_e_networking` then `register_phase72_natives`),
+        // so last-writer-wins made the no-op shadow the real implementation for
+        // EVERY server — including the `HttpServer.create(addr, backlog)` ones
+        // whose routes it is supposed to edit (ES MultipleHosts
+        // `resetWaitHandlers`). Dropping these two restores it.
+        //
+        // Safe for the 3-slot servers this phase's own `create()` mints: phase
+        // E's body reads the server id from slot `HS_SERVER_ID`, which those
+        // never set, and ids are handed out from 1 — so the registry lookup
+        // misses and the call is the same no-op it was before.
     }
 
     // HttpContext = 2-field (path=0, handler=1)
@@ -4405,6 +4407,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // silently attribute every request to one fabricated host). Real fix needs
     // the peer address captured in `parse_http_request`, which is out of this
     // file. Reported as a residual rather than papered over.
+    //
+    // Wave-3 re-check — the fix is mechanical but lives entirely in
+    // `native-builtins/src/net_phase_e.rs`: `re10_dispatch_pending` is the only
+    // place an `HttpExchange` is allocated and it already holds the accepted
+    // `TcpStream`, so `stream.peer_addr()` / `stream.local_addr()` need two more
+    // slots (`HEX_NUM_FIELDS` 9 -> 11, alongside `HEX_PRINCIPAL`), after which
+    // these two getters become plain slot reads. Not done here because that file
+    // is outside this sweep's edit scope; the pair must land together.
     r.register(
         hex,
         "getLocalAddress",
@@ -5341,14 +5351,15 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // KEEP: the no-op IS the spec. `java.net.Socket.setPerformancePreferences`
+    // has an empty body in OpenJDK itself ("Not implemented yet" since 1.5) and
+    // there is no getter anywhere in the JDK that could read the hints back, so
+    // nothing can observe the difference between this and HotSpot.
     r.register(
         sock,
         "setPerformancePreferences",
         "(III)V",
-        |_ctx, _args| {
-            // Performance hints are advisory — accept and ignore.
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
     r.register(sock, "setTrafficClass", "(I)V", |ctx, args| {
         use crate::servlet::s2_registry;
