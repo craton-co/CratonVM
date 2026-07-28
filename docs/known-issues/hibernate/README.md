@@ -20,8 +20,8 @@ read that last source row instead of its own buffered value.
 
 Fixed by delegating to H2's own bytecode whenever `TableFilter.select.groupData` is
 non-null (or the resolver is not a `TableFilter`); the ordinary non-grouped fast path
-is untouched. Verified: all 21 affected classes, **118/118 tests passing, identical to
-HotSpot**.
+is untouched. Verified: all 21 affected classes, **82/123 → 123/123 tests passing,
+identical to HotSpot**.
 
 Retired to `docs/internal/fixed-suite-bugs/hibernate/`:
 
