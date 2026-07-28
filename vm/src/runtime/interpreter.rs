@@ -2087,10 +2087,7 @@ fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
 /// `matchesKey()`, hanging Spring Boot's Thymeleaf layout-dialect
 /// `createLayoutFromConfigClass` test). See
 /// docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
-fn gc_reference_next_slot(shared: &SharedVm, ref_obj: ObjectRef) -> usize {
-    if shared.mem.heap.num_fields(ref_obj) <= 2 {
-        return 0; // legacy synthetic 2-field shape: referent, queue only
-    }
+fn gc_reference_next_slot(shared: &SharedVm) -> usize {
     let cm = shared.classes.class_manager.read();
     cm.find_bootstrap_class_by_name("java/lang/ref/Reference")
         .and_then(|reference_cid| {
@@ -2219,6 +2216,9 @@ fn process_references_after_gc(
     // there is no reason to nest those acquisitions.
     // See `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` §2/§R1.
     let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
+    // ClassManager is rank L10 and the reference processor is L7, so resolve
+    // the JDK field before acquiring the lower-ranked processor lock.
+    let reference_next_slot = gc_reference_next_slot(shared);
     let mut ref_proc = shared.mem.ref_processor.lock();
 
     // An object is "marked" (survived GC) if:
@@ -2372,7 +2372,11 @@ fn process_references_after_gc(
             .mem
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
-        let next_slot = gc_reference_next_slot(shared, ref_obj);
+        let next_slot = if shared.mem.heap.num_fields(ref_obj) <= 2 {
+            0 // legacy synthetic 2-field shape: referent, queue only
+        } else {
+            reference_next_slot
+        };
         shared.mem.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
                                                                  // RQ_FIELD_SIZE. Slot 1 is `size` in the synthetic two-slot shape but
                                                                  // `queueLength` — a `long` — on a real JDK ReferenceQueue, whose own
@@ -4888,6 +4892,9 @@ fn g1_remark_process_references(
     // why this is allocatable headroom rather than the former hardcoded `64`,
     // and why the `0` clock argument is correct rather than a second hardcode.
     let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
+    // See `process_references_after_gc`: ClassManager must be consulted
+    // before taking the lower-ranked reference-processor lock.
+    let reference_next_slot = gc_reference_next_slot(shared);
     let mut ref_proc = shared.mem.ref_processor.lock();
     let result = ref_proc.process_references(is_marked, free_mb, 0);
 
@@ -4938,7 +4945,11 @@ fn g1_remark_process_references(
             .mem
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj)));
-        let next_slot = gc_reference_next_slot(shared, ref_obj);
+        let next_slot = if shared.mem.heap.num_fields(ref_obj) <= 2 {
+            0 // legacy synthetic 2-field shape: referent, queue only
+        } else {
+            reference_next_slot
+        };
         shared.mem.heap.set_field(ref_obj, next_slot, old_head);
         let size = match shared.mem.heap.get_field(q_obj, 1) {
             Value::Int(v) => v,
