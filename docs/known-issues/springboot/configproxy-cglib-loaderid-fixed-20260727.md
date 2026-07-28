@@ -235,6 +235,19 @@ tests that need the checker, plus rewriting the two gating tests to pin the
 real contract rather than the build profile. A release run now exercises the
 same code path a debug run does.
 
+**Consequence worth knowing about:** because release runs now enforce like
+debug runs, they also inherit debug's pre-existing flake in
+`native::jni::tests::process_vm_publish_and_resolve`, which asserts that
+dropping its own `Arc<SharedVm>` was the last strong reference. Isolated it
+passes 5/5; in a full parallel run it fails intermittently. This is **not**
+introduced here — it is enforcement-*timing*-sensitive, not code-sensitive:
+running this same release binary with `CRATONVM_LOCK_ORDER_CHECK=1` and
+`--skip runtime::lock_order` (so none of the changed tests execute) still
+fails it 2 of 4 runs, and a **debug** `cargo test -p cratonvm-vm --lib --
+--skip runtime::lock_order`, where enforcement has always been unconditional,
+fails it 2 of 6. Release runs were simply blind to it while enforcement was
+silently off — the same blind spot R4 is about.
+
 ## Residual-round verification
 
 All on the Linux build host, worktree
@@ -253,10 +266,31 @@ same-tree pre-change baseline binary built from that exact commit:
 | `cargo test --release -p cratonvm-vm --lib` | 2410 passed, 18 failed | **2428 passed, 1 failed** |
 
 The vm-lib delta is exactly the 18 `runtime::lock_order` tests moving from
-failed to passed (2410 + 18 = 2428). The one remaining failure,
+failed to passed (2410 + 18 = 2428). The one *deterministic* remaining failure,
 `jit::skip_list::tests::elasticsearch_vector_diskbbq_hang_cluster_stays_
-interpreted_by_default`, is **unrelated and pre-existing on `dev`**: commit
+interpreted_by_default`, was **unrelated and pre-existing on `dev`**: commit
 `bae30dc3c` ("remove the blanket `org/elasticsearch/` JIT ban") deleted the
-ban those class names matched, but left the test asserting they are still
-banned — `grep diskbbq vm/src/jit/skip_list.rs` now matches only the test
-itself, no ban entry. Nothing in this branch touches JIT skip-list policy.
+ban those class names matched but left the test asserting they were still
+banned. Nothing in this branch touches JIT skip-list policy; the test was
+fixed independently on `dev` (renamed to
+`elasticsearch_vector_diskbbq_cluster_is_jit_eligible_after_es_cluster_removal`)
+and the merge of `origin/dev` @ `2cdc451fb` picked that up.
+
+## Post-merge re-verification (`origin/dev` @ `2cdc451fb`)
+
+Rebuilt and re-run after merging `origin/dev` into the branch:
+
+- Spring Boot 10-scenario battery: **10/10 scenarios, 95/95 checks, 0
+  divergences**.
+- `LookupForkDiag`: **11/11 app, 11/11 fork**.
+- `cargo test --release -p cratonvm-classloading --lib`: **637 passed, 0
+  failed**.
+- `cargo test --release -p cratonvm-types --lib`: **417 passed, 0 failed**
+  (3/3 runs). One run *inside a combined multi-package invocation* failed
+  `compact_value::tests::to_value_unchecked_degrade_increments_counter`
+  (expected 3 degradations, saw 4) — a pre-existing race on that test's
+  process-global counter, in code this branch does not touch.
+- `cargo test --release -p cratonvm-vm --lib`: **2429 passed, 0 failed** on a
+  clean run; two of three runs additionally tripped the pre-existing
+  `process_vm_publish_and_resolve` flake described under R4. With
+  `--skip runtime::lock_order` the suite is **2379 passed, 0 failed, 3/3**.
