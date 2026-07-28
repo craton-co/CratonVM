@@ -1,0 +1,94 @@
+﻿basic("") => OK[]
+basic("A") => java.lang.IllegalArgumentException: Input byte[] should at least have 2 bytes for base64 bytes
+basic("AB") => OK[00]
+basic("AB=") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+basic("AB==") => OK[00]
+basic("ABC") => OK[0010]
+basic("ABC=") => OK[0010]
+basic("ABCD") => OK[001083]
+basic("ABCDE") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+basic("ABCDEF") => OK[00108310]
+basic("=") => java.lang.IllegalArgumentException: Input byte[] should at least have 2 bytes for base64 bytes
+basic("=AAA") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+basic("A=AA") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+basic("AB=C") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+basic("AB==CD") => java.lang.IllegalArgumentException: Input byte array has incorrect ending byte at 4
+basic("ABCD=") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+basic("ABCD==") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+basic("not valid base64") => java.lang.IllegalArgumentException: Illegal base64 character 20
+basic("not base 64") => java.lang.IllegalArgumentException: Illegal base64 character 20
+basic("-_") => java.lang.IllegalArgumentException: Illegal base64 character 2d
+basic("a+b/") => OK[6be6ff]
+basic("AB\r\nCD") => java.lang.IllegalArgumentException: Illegal base64 character d
+basic("AB CD") => java.lang.IllegalArgumentException: Illegal base64 character 20
+url("") => OK[]
+url("A") => java.lang.IllegalArgumentException: Input byte[] should at least have 2 bytes for base64 bytes
+url("AB") => OK[00]
+url("AB=") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+url("AB==") => OK[00]
+url("ABC") => OK[0010]
+url("ABC=") => OK[0010]
+url("ABCD") => OK[001083]
+url("ABCDE") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+url("ABCDEF") => OK[00108310]
+url("=") => java.lang.IllegalArgumentException: Input byte[] should at least have 2 bytes for base64 bytes
+url("=AAA") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+url("A=AA") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+url("AB=C") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+url("AB==CD") => java.lang.IllegalArgumentException: Input byte array has incorrect ending byte at 4
+url("ABCD=") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+url("ABCD==") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+url("not valid base64") => java.lang.IllegalArgumentException: Illegal base64 character 20
+url("not base 64") => java.lang.IllegalArgumentException: Illegal base64 character 20
+url("-_") => OK[fb]
+url("a+b/") => java.lang.IllegalArgumentException: Illegal base64 character 2b
+url("AB\r\nCD") => java.lang.IllegalArgumentException: Illegal base64 character d
+url("AB CD") => java.lang.IllegalArgumentException: Illegal base64 character 20
+mime("") => OK[]
+mime("A") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+mime("AB") => OK[00]
+mime("AB=") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+mime("AB==") => OK[00]
+mime("ABC") => OK[0010]
+mime("ABC=") => OK[0010]
+mime("ABCD") => OK[001083]
+mime("ABCDE") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+mime("ABCDEF") => OK[00108310]
+mime("=") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+mime("=AAA") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+mime("A=AA") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+mime("AB=C") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+mime("AB==CD") => java.lang.IllegalArgumentException: Input byte array has incorrect ending byte at 5
+mime("ABCD=") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+mime("ABCD==") => java.lang.IllegalArgumentException: Input byte array has wrong 4-byte ending unit
+mime("not valid base64") => OK[9e8b6f6a589d6dab1eeb]
+mime("not base 64") => java.lang.IllegalArgumentException: Last unit does not have enough valid bits
+mime("-_") => OK[]
+mime("a+b/") => OK[6be6ff]
+mime("AB\r\nCD") => OK[001083]
+mime("AB CD") => OK[001083]
+basicBytes(41428044) => java.lang.IllegalArgumentException: Illegal base64 character -80
+mimeBytes(41428044) => OK[0010]
+basicBytes(4142ff44) => java.lang.IllegalArgumentException: Illegal base64 character -1
+mimeBytes(4142ff44) => OK[0010]
+basicBytes(4142c344) => java.lang.IllegalArgumentException: Illegal base64 character -3d
+mimeBytes(4142c344) => OK[0010]
+basicBytes(41420044) => java.lang.IllegalArgumentException: Illegal base64 character 0
+mimeBytes(41420044) => OK[0010]
+basicBytes(41420944) => java.lang.IllegalArgumentException: Illegal base64 character 9
+mimeBytes(41420944) => OK[0010]
+basic("AB\u00ffD") => java.lang.IllegalArgumentException: Illegal base64 character -1
+basic("AB\u20acD") => java.lang.IllegalArgumentException: Illegal base64 character 3f
+mimeEnc(0) => len=0 []
+mimeEnc(1) => len=4 [AA==]
+mimeEnc(2) => len=4 [AAE=]
+mimeEnc(3) => len=4 [AAEC]
+mimeEnc(56) => len=76 [AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc=]
+mimeEnc(57) => len=76 [AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4]
+mimeEnc(58) => len=82 [AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4\r\nOQ==]
+mimeEnc(114) => len=154 [AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4\r\nOTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3Bx]
+mimeEnc(115) => len=160 [AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4\r\nOTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3Bx\r\ncg==]
+basicEnc(255,255) => //8=
+urlEncNoPad(255,255) => __8
+mimeRoundTrip => true
+basicRoundTrip => true

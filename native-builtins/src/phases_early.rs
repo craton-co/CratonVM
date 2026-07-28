@@ -8352,15 +8352,77 @@ pub fn gc_update_forkjoin_refs(pointer_map: &std::collections::HashMap<usize, us
     *m = remapped;
 }
 
+/// Which method actually carries a `ForkJoinTask`'s work.
+///
+/// The eager-inline Bridge policy used to invoke `compute()` blind, trying
+/// `()Ljava/lang/Object;` and then `()V`. That covers exactly the two JDK
+/// convenience subclasses -- `RecursiveTask` (`compute()Ljava/lang/Object;`)
+/// and `RecursiveAction` (`compute()V`) -- and nothing else. The method every
+/// concrete `ForkJoinTask` must implement is the protocol method `exec()Z`;
+/// subclasses that extend `ForkJoinTask` DIRECTLY have no `compute()` at all.
+///
+/// JUnit Platform's `ForkJoinPoolHierarchicalTestExecutorService$ExclusiveTask`
+/// is one such class, and it is the task type the whole parallel test executor
+/// is built on: its `submit(TestTask)` ends in `forkJoinPool.submit(task)`.
+/// The blind `compute()` invoke raised `NoSuchMethodError` twice, swallowed
+/// both, and returned null -- so a nested JUnit engine running in CONCURRENT
+/// mode executed ZERO tests (`ParallelApplicationEventsIntegrationTests` 0/2,
+/// `started ==> expected: 13 but was: 0`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FjtEntry {
+    ComputeObject,
+    ComputeVoid,
+    Exec,
+}
+
+/// Pick the entry point from the receiver's RUNTIME class rather than inferring
+/// it from whether a speculative invoke happened to fail: an exception thrown
+/// from inside a perfectly good `compute()` is indistinguishable from "no such
+/// method" at the `invoke_virtual` result, and used to trigger a bogus second
+/// invoke.
+fn fjt_entry_point(ctx: &mut dyn NativeContext, task: ObjectRef) -> FjtEntry {
+    let Some(cls) = ctx.class_name_of_id(ctx.class_id_of_object(task)) else {
+        return FjtEntry::ComputeObject;
+    };
+    if ctx.method_exists(&cls, "compute", "()Ljava/lang/Object;") {
+        FjtEntry::ComputeObject
+    } else if ctx.method_exists(&cls, "compute", "()V") {
+        FjtEntry::ComputeVoid
+    } else if ctx.method_exists(&cls, "exec", "()Z") {
+        FjtEntry::Exec
+    } else {
+        // Unknown shape -- keep the historical behaviour.
+        FjtEntry::ComputeObject
+    }
+}
+
 fn fjp_compute_object_result(ctx: &mut dyn NativeContext, task: ObjectRef) -> (ObjectRef, Value) {
     let task_pin = ctx.pin_native_root(task);
     let mut live_task = task;
-    let result = match ctx.invoke_virtual(live_task, "compute", "()Ljava/lang/Object;", &[]) {
-        Ok(Some(val)) => val,
-        _ => {
-            live_task = ctx.read_native_pin(task_pin, live_task);
+    let result = match fjt_entry_point(ctx, live_task) {
+        FjtEntry::ComputeObject => {
+            match ctx.invoke_virtual(live_task, "compute", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(val)) => val,
+                _ => {
+                    live_task = ctx.read_native_pin(task_pin, live_task);
+                    let _ = ctx.invoke_virtual(live_task, "compute", "()V", &[]);
+                    Value::Object(None)
+                }
+            }
+        }
+        FjtEntry::ComputeVoid => {
             let _ = ctx.invoke_virtual(live_task, "compute", "()V", &[]);
             Value::Object(None)
+        }
+        FjtEntry::Exec => {
+            // `exec()` runs the task and leaves any value in the task's own
+            // raw-result slot; `ForkJoinTask<Void>` subclasses answer null.
+            let _ = ctx.invoke_virtual(live_task, "exec", "()Z", &[]);
+            live_task = ctx.read_native_pin(task_pin, live_task);
+            match ctx.invoke_virtual(live_task, "getRawResult", "()Ljava/lang/Object;", &[]) {
+                Ok(Some(val)) => val,
+                _ => Value::Object(None),
+            }
         }
     };
     live_task = ctx.read_native_pin(task_pin, live_task);
@@ -8370,7 +8432,11 @@ fn fjp_compute_object_result(ctx: &mut dyn NativeContext, task: ObjectRef) -> (O
 
 fn fjp_compute_void(ctx: &mut dyn NativeContext, task: ObjectRef) -> ObjectRef {
     let task_pin = ctx.pin_native_root(task);
-    let _ = ctx.invoke_virtual(task, "compute", "()V", &[]);
+    if fjt_entry_point(ctx, task) == FjtEntry::Exec {
+        let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
+    } else {
+        let _ = ctx.invoke_virtual(task, "compute", "()V", &[]);
+    }
     let live_task = ctx.read_native_pin(task_pin, task);
     ctx.unpin_native_roots(task_pin);
     live_task

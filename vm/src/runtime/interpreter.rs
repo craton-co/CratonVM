@@ -7031,6 +7031,18 @@ pub fn execute(
                             // exception and fall through to the interpreter, which will push a
                             // frame and route through the exception table.
                             if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+                                // This legacy sink routes the exception against a
+                                // freshly pushed, method-entry frame rather than
+                                // through `route_jit_signal_exception`, so a frame
+                                // naming THIS method can never be used here — drop it
+                                // rather than leave it for a later invocation to
+                                // mis-claim. A callee's frame is left alone: its
+                                // exception is still in flight.
+                                drop_own_exceptional_frame(
+                                    &class_name_str,
+                                    method_name,
+                                    method_descriptor,
+                                );
                                 // Stash the exception in a variable visible to the interpreter
                                 // loop that runs below (after frame push).
                                 jit_early_exception = Some(exc);
@@ -11737,7 +11749,7 @@ fn route_jit_signal_exception(
     exc: ObjectRef,
     fallback_locals: &[Value],
 ) -> Result<CachedCallResult, MethodCallFailed> {
-    let precise = match cratonvm_jit::deopt::take_last_deopt() {
+    let precise = match cratonvm_jit::deopt::take_exceptional_frame() {
         Some(rframe)
             if deopt_frame_matches_method(
                 &rframe,
@@ -11752,10 +11764,15 @@ fn route_jit_signal_exception(
             };
             Some((bci, locals))
         }
-        Some(rframe) => {
-            cratonvm_jit::deopt::restash_last_deopt(rframe);
-            None
-        }
+        // A foreign exceptional frame is DROPPED, not re-stashed. Unlike an
+        // ordinary deopt frame — whose owner is still on the stack waiting to
+        // resume — an exceptional frame's owner is always the compiled body that
+        // just unwound to produce this exception, so if it does not name the
+        // method being drained here, its owner is gone and nobody can ever claim
+        // it. Re-stashing left it to be picked up by a LATER exception in the
+        // same method, which would then route with a stale bci and stale
+        // (possibly collected) object pointers.
+        Some(_foreign) => None,
         None => None,
     };
     let (throw_pc, locals) = match precise.as_ref() {
@@ -11782,6 +11799,51 @@ fn route_jit_signal_exception(
         exc,
         locals,
     )
+}
+
+/// Interpret `sig.athrow_bci` as a throw pc for `cached`, or `usize::MAX`.
+///
+/// The signal carries no method identity (see `JitSignals::athrow_bci`), so an
+/// exception athrown by a compiled callee and propagated outward arrives here
+/// still carrying the CALLEE's bci. Range-checking this method's exception
+/// table against a foreign pc silently skips its handler: measured on
+/// `JitPreciseHandlerFrame.plainStep`, whose protected range is [0,4),
+/// receiving `maybeThrow`'s athrow at bci 13 — `handler_pc=None`, and its own
+/// `catch (Boom)` never ran (5,619 of 20,000 iterations).
+///
+/// Accept the bci only when it indexes an `athrow` (0xbf) in THIS method's
+/// code. Anything else falls back to the "throw pc unknown" sentinel, which is
+/// the pre-RBC.6 behaviour: typed handlers still match by exception class, and
+/// only a narrow catch-all is skipped.
+fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
+    if athrow_bci < 0 {
+        return usize::MAX;
+    }
+    let pc = athrow_bci as usize;
+    // `cached.code` carries 2 bytes of speculative-read padding.
+    let code_len = cached.code.len().saturating_sub(2);
+    if pc < code_len && cached.code[pc] == 0xbf {
+        pc
+    } else {
+        usize::MAX
+    }
+}
+
+/// Drop a stashed pending-exception frame, but ONLY if it names this method.
+///
+/// The sinks that call this handle a JIT-raised exception without going through
+/// `route_jit_signal_exception`, so a frame naming THEIR method can never be
+/// used and would otherwise linger for a later invocation to mis-claim. A frame
+/// naming a *callee*, though, is still in flight: an OSR bail re-stashes the
+/// exception and a later drain routes it through that callee's own table, which
+/// is precisely where the frame belongs. Dropping it there made a compiled
+/// callee's handler read its non-parameter locals as null.
+fn drop_own_exceptional_frame(class_name: &str, method_name: &str, descriptor: &str) {
+    if let Some(frame) = cratonvm_jit::deopt::take_exceptional_frame() {
+        if !deopt_frame_matches_method(&frame, class_name, method_name, descriptor) {
+            cratonvm_jit::deopt::restash_exceptional_frame(frame);
+        }
+    }
 }
 
 /// Search the cached exception table and construct the interpreter handler
@@ -27840,6 +27902,20 @@ fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
+    // entries in a segmented native layout, so the real JDK `writeObject`
+    // (which walks the always-null `table`) serialised every CHM as empty and
+    // the real `readObject` rebuilt a `table` our natives never read. Both are
+    // reached through `ObjectStreamClass.invokeWriteObject`/`invokeReadObject`,
+    // i.e. reflective `Method.invoke` -- a path with no bytecode PC to key an
+    // invoke-cache entry on, so it consults this gate directly. Kept separate
+    // from the Map cluster above because HashMap/LinkedHashMap/Hashtable have
+    // no such natives and must keep running their real bodies.
+    if class_name == "java/util/concurrent/ConcurrentHashMap"
+        && matches!(method_name, "writeObject" | "readObject")
+    {
+        return true;
+    }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
     // allow-list. JarFile inherits these operations from ZipFile, so a
     // subclass `super.close()` resolves to the real ZipFile bytecode after
@@ -35061,6 +35137,12 @@ fn try_osr(
             );
         }
         crate::jit::helpers::stash_jit_pending_exception(exc);
+        // OSR is same-frame replacement: the interpreter keeps executing THIS
+        // frame, so a frame naming the OSR'd method itself can never be used and
+        // is dropped. A frame naming a CALLEE the OSR'd code invoked is a
+        // different matter — the exception is only re-stashed here and the
+        // callee's own drain routes it later, so that frame must survive.
+        drop_own_exceptional_frame(&class_name_arc, &method_name_arc, &descriptor_arc);
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
@@ -38878,11 +38960,7 @@ fn execute_jit_call(
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
             let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
-            let throw_pc = if sig.athrow_bci >= 0 {
-                sig.athrow_bci as usize
-            } else {
-                usize::MAX
-            };
+            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
                 thread,
@@ -39343,11 +39421,7 @@ fn execute_jit_call_decoded(
             // RBC.6 correctness fix — see the identical comment at
             // `execute_jit_call`'s sibling call site: use the athrow's own
             // known bci when available instead of always `usize::MAX`.
-            let throw_pc = if sig.athrow_bci >= 0 {
-                sig.athrow_bci as usize
-            } else {
-                usize::MAX
-            };
+            let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared, thread, frame_idx, cached, throw_pc, exc, args_slice,
             )

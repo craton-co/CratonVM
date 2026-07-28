@@ -8634,6 +8634,14 @@ struct Compiler {
     /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
     /// by `emit_deopt_snapshot_at_guard`.
     deopt_box_ptr_by_bci: rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
+    /// Reason-9 (`DeoptReason::PendingException`) snapshots, keyed by the
+    /// THROWING instruction's own bci. Separate from `deopt_box_ptr_by_bci`
+    /// because the two disagree about what the key means: an ordinary deopt
+    /// point resumes at its bci, an exceptional one is *thrown* at its bci and
+    /// is only ever used to pick a handler. Sharing one map let a reason-2/6
+    /// box be handed to a reason-9 stub (and vice versa).
+    exc_frame_box_ptr_by_bci:
+        rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
     /// deopt-osr Step 7: bcis (loop-boundary PCs vetted by OSR-entry) that carry
     /// an OSR-exit map in `deopt_points`/`deopt_boxes` (tagged
     /// `DeoptReason::OsrExit`). Transferred to `CompiledMethod::osr_exit_points`
@@ -9473,6 +9481,7 @@ impl Compiler {
             method_key: String::new(),
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
+            exc_frame_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_points: Vec::new(),
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_test_trigger_bci: None,
@@ -18411,24 +18420,28 @@ impl Compiler {
         // the ordinary three-byte CP form or a one-byte operation.  Keeping the
         // original PC for non-invoke operations avoids changing their exception
         // routing semantics.
-        let deopt_resume_bci = match self.dbg_last_op {
-            0xb9 | 0xba => self.dbg_last_pc.saturating_add(5),
-            0xb6 | 0xb7 | 0xb8 => self.dbg_last_pc.saturating_add(3),
-            _ => self.dbg_last_pc,
-        };
-        // The bytecode compiler has just emitted the dispatch, so its local
-        // homes still describe the point at which an exception from that call
-        // is caught. A params-only handler reconstruction is insufficient for
-        // this method; retain a typed snapshot and branch to its frame-deopt
-        // exit instead of the shared sentinel-only exit below.
-        if self.precise_exception_frames
-            && !self.deopt_box_ptr_by_bci.contains_key(&deopt_resume_bci)
-        {
+        // ...which is why an ordinary RESUME snapshot keys on the successor.
+        // A reason-9 frame is not a resume point: it is consumed by
+        // `route_jit_signal_exception`, which uses the frame's bci as the THROW
+        // pc for the handler's `[start_pc, end_pc)` range test. javac routinely
+        // ends a protected range exactly at the successor of its last invoke
+        // (`JSONValue.toJSONString`: range [8,14), invoke at pc 11), so keying
+        // this snapshot on the successor put the throw OUTSIDE the very handler
+        // that had to run and the exception escaped its own catch block. Key it
+        // on the throwing instruction itself.
+        //
+        // The frame is also only useful where this method's exception table can
+        // catch at all: outside every protected range the throw propagates to
+        // the caller, so the shared sentinel-only exit is both correct and
+        // cheaper, and the stash stays quiet on straight-line invokes.
+        let throw_bci = self.dbg_last_pc;
+        let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
             let box_ptr = self.build_and_record_deopt_point(
-                deopt_resume_bci,
-                crate::deopt::DeoptReason::ReceiverTypeChanged,
+                throw_bci,
+                crate::deopt::DeoptReason::PendingException,
             );
-            self.deopt_box_ptr_by_bci.insert(deopt_resume_bci, box_ptr);
+            self.exc_frame_box_ptr_by_bci.insert(throw_bci, box_ptr);
         }
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
@@ -18455,8 +18468,8 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x85]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
+            if precise_exc_stub {
+                self.deopt_stubs.push((patch_offset, throw_bci, 9));
             } else {
                 self.exception_check_stubs
                     .push((patch_offset, self.dbg_last_pc));
@@ -18470,8 +18483,8 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x84]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
+            if precise_exc_stub {
+                self.deopt_stubs.push((patch_offset, throw_bci, 9));
             } else {
                 self.exception_check_stubs
                     .push((patch_offset, self.dbg_last_pc));
@@ -18713,10 +18726,12 @@ impl Compiler {
                     // NOT gated behind `deopt_real_enabled()` — see the doc above.
                     8 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
                     // Reason 9 is a pending Java exception in a method whose
-                    // handler reads non-parameter locals. Its snapshot is taken
-                    // immediately after the throwing invoke, and is consumed by
-                    // the interpreter's exception route rather than normal resume.
-                    9 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
+                    // handler reads non-parameter locals. Its snapshot is keyed
+                    // on the THROWING invoke's own bci (not a resume point — see
+                    // `emit_post_invoke_exception_check`) and lives in its own
+                    // map, because it is consumed by the interpreter's exception
+                    // route rather than by any resume sink.
+                    9 => self.exc_frame_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
             } else {
@@ -29231,9 +29246,26 @@ pub fn compile_with_param_slots(
     let fp_strength_reduction_pcs =
         find_fp_strength_reductions(code, code_len, &loops, &ldc2w_info);
 
-    // Register allocation: graph-coloring allocator for locals
-    let alloc_result =
-        super::regalloc::allocate_registers(code, code_len, max_locals, num_params, &loops);
+    // Register allocation: graph-coloring allocator for locals.
+    //
+    // A method compiled with precise exceptional frames has its handler frame
+    // rebuilt from REGISTER homes, so the interference graph must know that
+    // protected code can branch to the handler — otherwise a local only the
+    // catch block reads is dead throughout the try and shares its register with
+    // something else. Every other compile passes no handlers and is unchanged.
+    let ra_handlers: &[(usize, usize, usize)] = if precise_exception_frames {
+        &exception_ranges
+    } else {
+        &[]
+    };
+    let alloc_result = super::regalloc::allocate_registers_with_handlers(
+        code,
+        code_len,
+        max_locals,
+        num_params,
+        &loops,
+        ra_handlers,
+    );
 
     // Pure-kernel GPR local homes (see `kernel_reg_locals_enabled` for the
     // full safety argument). Consume the per-compile request (set only by the
@@ -29464,6 +29496,7 @@ pub fn compile_with_param_slots(
             num_params,
             &compiler.local_assignments,
             param_oop_mask,
+            ra_handlers,
         );
         compiler.safepoint_publish = Some(safepoint_publish);
     }
@@ -42572,7 +42605,7 @@ mod flag_and_header_contracts {
         // Both locals register-homed, as the allocator would do for a hot kernel.
         let assignments = vec![Some(R12), Some(R13)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals, 0,
             "an int-only kernel has no reference locals"
@@ -42597,7 +42630,7 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![None, Some(R12)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &assignments, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals & 0b10,
             0b10,
@@ -42613,7 +42646,7 @@ mod flag_and_header_contracts {
         // already frame-resident, so nothing needs publishing.
         let spilled = vec![None, None];
         let plan_spilled =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &spilled, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &spilled, 0, &[]);
         assert!(plan_spilled.no_reference_in_registers());
         assert!(!reference_local_in_register(Some(&plan_spilled), &spilled));
     }
@@ -42629,7 +42662,7 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![Some(R12)];
         let without =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0, &[]);
         assert!(
             without.no_reference_in_registers(),
             "the bytecode scan alone cannot see an unloaded reference parameter"
@@ -42641,6 +42674,7 @@ mod flag_and_header_contracts {
             1,
             &assignments,
             0b1, // param_oop_mask: local 0 is a reference parameter
+            &[],
         );
         assert!(
             !with.no_reference_in_registers(),
@@ -42674,7 +42708,7 @@ mod flag_and_header_contracts {
         let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
         let no_homes = vec![None, None];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &no_homes, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &no_homes, 0, &[]);
         assert_eq!(
             reference_local_in_register(Some(&plan), &no_homes),
             reference_local_in_register(None, &no_homes),
@@ -42707,6 +42741,7 @@ mod flag_and_header_contracts {
             0,
             &alloc.assignments,
             0,
+            &[],
         );
         assert!(plan.no_reference_in_registers());
     }

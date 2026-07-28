@@ -4272,12 +4272,14 @@ mod http_url_connection_tests {
             response_body: b"a".to_vec(),
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         let id2 = reg.allocate(ConnState {
             status: 404,
             response_body: b"b".to_vec(),
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         assert_ne!(id1, id2);
         assert_eq!(reg.get(id1).unwrap().status, 200);
@@ -4292,6 +4294,7 @@ mod http_url_connection_tests {
             response_body: vec![],
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         assert!(reg.get(id).is_some());
         reg.remove(id);
@@ -4367,6 +4370,7 @@ mod http_url_connection_tests {
             response_body: vec![],
             response_headers: vec![],
             body_consumed: false,
+            truncated: false,
         });
         ctx.set_field(this, HUC_CONN_ID, Value::Int(id));
         ctx.set_field(this, HUC_CONNECTED, Value::Int(1));
