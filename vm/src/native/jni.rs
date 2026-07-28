@@ -6735,6 +6735,30 @@ mod tests {
     use std::ffi::CString;
     use std::sync::Arc;
 
+    /// True when the process-global `PROCESS_VM` cell still holds *this* weak
+    /// handle.
+    ///
+    /// `PROCESS_VM` is one cell for the whole process, and `Vm::new`
+    /// (`vm/src/vm/vm_init.rs`) republishes it unconditionally for every VM it
+    /// builds — deliberately, so a host thread calling `AttachCurrentThread`
+    /// can always resolve *a* live VM. Production code has no access to
+    /// [`PROCESS_VM_TEST_LOCK`], and this crate's own tests construct a `Vm` at
+    /// 60+ call sites, so a test holding that lock can still have the cell
+    /// overwritten underneath it by a concurrently running one. Assertions
+    /// about what the cell contains are therefore only meaningful while it
+    /// still refers to the VM this test published.
+    ///
+    /// `Weak::ptr_eq` compares allocations, and a live `Weak` keeps its
+    /// allocation from being reused, so this stays exact even after the strong
+    /// count reaches zero — unlike comparing raw addresses, which the allocator
+    /// is free to hand back out for the next same-sized `SharedVm`.
+    fn process_vm_cell_holds(weak: &Weak<SharedVm>) -> bool {
+        PROCESS_VM
+            .lock()
+            .as_ref()
+            .is_some_and(|published| Weak::ptr_eq(published, weak))
+    }
+
     /// Serializes tests that mutate the process-global `PROCESS_VM` cell or the
     /// foreign-attach TLS so they don't race each other under the parallel test
     /// runner (the cell and the JNI invocation table are process-wide).
@@ -6791,21 +6815,48 @@ mod tests {
         let _guard = PROCESS_VM_TEST_LOCK.lock();
         // Build a VM Arc and publish it as the process-global cell.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let our_weak = Arc::downgrade(&shared);
         set_process_vm(&shared);
-        // The attach path can now resolve the live VM from "the JavaVM*".
-        let resolved = process_vm().expect("process_vm should resolve after publish");
-        assert!(
-            Arc::ptr_eq(&shared, &resolved),
-            "process_vm must return the same SharedVm that was published"
-        );
-        // Dropping every owning Arc lets the Weak cell go dangling: process_vm
-        // then reports no live VM rather than a use-after-free.
-        drop(resolved);
+
+        // The attach path can now resolve the live VM from "the JavaVM*" —
+        // provided a concurrently running test has not republished the cell in
+        // the meantime (see `process_vm_cell_holds`). In a serial run, and in
+        // the overwhelming majority of parallel ones, it has not.
+        if process_vm_cell_holds(&our_weak) {
+            let resolved = process_vm().expect("process_vm should resolve after publish");
+            assert!(
+                Arc::ptr_eq(&shared, &resolved),
+                "process_vm must return the same SharedVm that was published"
+            );
+            drop(resolved);
+        }
+
         drop(shared);
+
+        // The property that actually matters, and the one that is fully
+        // deterministic: dropping every owning `Arc` really does destroy the
+        // VM. Nothing can hold a strong reference here — `set_process_vm`
+        // stores a `Weak`, and `SharedVm::new` runs *before* the `Arc` exists,
+        // so the threads it spawns have nothing to clone.
         assert!(
-            process_vm().is_none(),
-            "process_vm must return None once the VM has been dropped"
+            our_weak.upgrade().is_none(),
+            "dropping every owning Arc must destroy the SharedVm; a surviving \
+             strong reference would let process_vm() resurrect a dropped VM"
         );
+
+        // …and the cell must not resurrect it. This assertion is conditioned
+        // for the same reason as the one above: once our weak is dead it can
+        // never upgrade, so a `Some` from `process_vm()` is provably some OTHER
+        // test's live VM rather than ours — checking for `None` unconditionally
+        // was the flake (assertion at this line, "process_vm must return None
+        // once the VM has been dropped": 2 of 25 full debug-suite runs, and 1
+        // of 25 release runs with CRATONVM_LOCK_ORDER_CHECK=1).
+        if process_vm_cell_holds(&our_weak) {
+            assert!(
+                process_vm().is_none(),
+                "process_vm must return None once the VM has been dropped"
+            );
+        }
     }
 
     /// `DestroyJavaVM`'s teardown hook fires once and is one-shot: a registered
