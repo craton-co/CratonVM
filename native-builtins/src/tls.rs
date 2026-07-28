@@ -14,11 +14,9 @@
 #[path = "tls_impl.rs"]
 pub mod tls_impl;
 
-#[cfg(feature = "legacy-synthetic-crypto")]
-use crate::crypto::crypto_impl;
 use crate::{alloc_concurrent_synthetic, native_noop, native_noop_with_this, obj_arg};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
@@ -63,6 +61,39 @@ const ENG_PROTOCOL_IDX: usize = 4;
 const ENG_PEER_HOST: usize = 5;
 const ENG_PEER_PORT: usize = 6;
 const ENG_ALPN_PROTOCOL: usize = 7;
+// Slots 8..13 hold the TLS configuration a caller pushes at the engine. They
+// were added when `setEnabledProtocols`/`setEnabledCipherSuites`/
+// `setSSLParameters` stopped being no-ops: without somewhere to put the
+// caller's lists, an application restricting itself to TLS 1.3 (or to a safe
+// cipher set) was silently ignored and `getSSLParameters()` handed back a
+// default block that contradicted every setter that had been called. They sit
+// ABOVE the original eight so no existing slot changes meaning.
+//
+// NOTE: `phases_late.rs::register_p68_ssl` models the SAME class with a
+// DIFFERENT 7-slot layout (enabled protocols at 3, cipher suites at 4) and,
+// registering later, wins for the setter triples it also owns. The slots below
+// are deliberately disjoint from 0..7 so the two layouts cannot corrupt each
+// other; reconciling them needs an edit to phases_late.rs, which this module
+// does not own.
+const ENG_ENABLED_PROTOCOLS: usize = 8;
+const ENG_ENABLED_CIPHERS: usize = 9;
+const ENG_APP_PROTOCOLS: usize = 10;
+const ENG_NEED_CLIENT_AUTH: usize = 11;
+const ENG_WANT_CLIENT_AUTH: usize = 12;
+const ENG_ENDPOINT_ID_ALG: usize = 13;
+const ENG_FIELD_COUNT: usize = 14;
+
+// SSLParameters field indices. Slots 0/1 hold the caller's String[] once a
+// setter has run; a bare `Int(1)` is the legacy "set, contents unknown" marker
+// other modules (http2.rs, phases_late.rs) still write, and `Int(0)`/absent
+// means "never set" — which real JSSE reports as a null array.
+const PAR_PROTOCOLS: usize = 0;
+const PAR_CIPHER_SUITES: usize = 1;
+const PAR_ENDPOINT_ID_ALG: usize = 2;
+const PAR_NEED_CLIENT_AUTH: usize = 3;
+const PAR_WANT_CLIENT_AUTH: usize = 4;
+const PAR_APP_PROTOCOLS: usize = 5;
+const PAR_FIELD_COUNT: usize = 6;
 
 // SSLSession field indices
 const SES_CIPHER_SUITE: usize = 0;
@@ -109,36 +140,71 @@ fn alloc_ssl_context(ctx: &mut dyn NativeContext, protocol_idx: i32) -> ObjectRe
     obj
 }
 
-fn alloc_ssl_engine(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", 8);
+/// Establish the field state a freshly-created synthetic `SSLEngine` must
+/// have. Split out of [`alloc_ssl_engine`] so `<init>()V` can reach exactly
+/// the same state: an engine built with `new SSLEngine()` and one built with
+/// `SSLContext.createSSLEngine()` must not differ.
+fn init_ssl_engine_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, ENG_CLIENT_MODE, Value::Int(1));
     ctx.set_field(obj, ENG_HANDSHAKE_STATUS, Value::Int(HS_NOT_HANDSHAKING));
     ctx.set_field(obj, ENG_INBOUND_DONE, Value::Int(0));
     ctx.set_field(obj, ENG_OUTBOUND_DONE, Value::Int(0));
     ctx.set_field(obj, ENG_PROTOCOL_IDX, Value::Int(0)); // TLSv1.3
     ctx.set_field(obj, ENG_PEER_HOST, Value::Int(0));
+    // -1, not 0: real `SSLEngine()` reports -1 for "no peer port known", and
+    // 0 is a legal port number a caller could mistake for a real one.
     ctx.set_field(obj, ENG_PEER_PORT, Value::Int(-1));
     ctx.set_field(obj, ENG_ALPN_PROTOCOL, Value::Int(0)); // none
+
+    // Unconfigured: `getSSLParameters()` reports these as null arrays / false,
+    // which is what real JSSE reports for a parameter block nobody has set.
+    ctx.set_field(obj, ENG_ENABLED_PROTOCOLS, Value::Object(None));
+    ctx.set_field(obj, ENG_ENABLED_CIPHERS, Value::Object(None));
+    ctx.set_field(obj, ENG_APP_PROTOCOLS, Value::Object(None));
+    ctx.set_field(obj, ENG_NEED_CLIENT_AUTH, Value::Int(0));
+    ctx.set_field(obj, ENG_WANT_CLIENT_AUTH, Value::Int(0));
+    ctx.set_field(obj, ENG_ENDPOINT_ID_ALG, Value::Int(0));
+}
+
+fn alloc_ssl_engine(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngine", ENG_FIELD_COUNT);
+    init_ssl_engine_fields(ctx, obj);
     obj
 }
 
-fn alloc_ssl_session(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6);
+/// Field state of a freshly-created synthetic `SSLSession`. Shared with
+/// `SSLSession.<init>()V` — in particular the creation timestamp, which
+/// `getCreationTime()` returns verbatim and which a no-op constructor left at
+/// the slot default (reported as 0 = the epoch).
+fn init_ssl_session_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     ctx.set_field(obj, SES_CIPHER_SUITE, Value::Int(0)); // TLS_AES_256_GCM_SHA384
     ctx.set_field(obj, SES_PROTOCOL, Value::Int(0)); // TLSv1.3
     ctx.set_field(obj, SES_VALID, Value::Int(1));
     ctx.set_field(obj, SES_PEER_HOST, Value::Int(0));
     ctx.set_field(obj, SES_PEER_PORT, Value::Int(-1));
     ctx.set_field(obj, SES_CREATION_TIME, Value::Long(epoch_millis()));
+}
+
+fn alloc_ssl_session(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 6);
+    init_ssl_session_fields(ctx, obj);
     obj
 }
 
+/// Field state of a freshly-created synthetic `SSLParameters` — shared with
+/// `SSLParameters.<init>()V`.
+fn init_ssl_parameters_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
+    ctx.set_field(obj, PAR_PROTOCOLS, Value::Int(0)); // never set
+    ctx.set_field(obj, PAR_CIPHER_SUITES, Value::Int(0)); // never set
+    ctx.set_field(obj, PAR_ENDPOINT_ID_ALG, Value::Int(0));
+    ctx.set_field(obj, PAR_NEED_CLIENT_AUTH, Value::Int(0));
+    ctx.set_field(obj, PAR_WANT_CLIENT_AUTH, Value::Int(0));
+    ctx.set_field(obj, PAR_APP_PROTOCOLS, Value::Object(None));
+}
+
 fn alloc_ssl_parameters(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4);
-    ctx.set_field(obj, 0, Value::Int(0)); // protocols_set
-    ctx.set_field(obj, 1, Value::Int(0)); // cipher_suites_set
-    ctx.set_field(obj, 2, Value::Int(0)); // endpoint_identification_algorithm
-    ctx.set_field(obj, 3, Value::Int(0)); // need_client_auth
+    let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", PAR_FIELD_COUNT);
+    init_ssl_parameters_fields(ctx, obj);
     obj
 }
 
@@ -170,7 +236,22 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLContext";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — establish the same state `getInstance()` produces. A no-op
+    // left every slot at its untagged default, so `getProtocol()` fell out of
+    // its `_ => 0` arm by accident rather than by initialisation and the
+    // "initialized" flag could not be told apart from "never written" (a
+    // subsequent `init()` was the only thing that ever tagged it as an Int).
+    // Real JDK has no no-arg `SSLContext` constructor, and this file is only
+    // registered from `register_synthetic_overrides` (synthetic-JDK mode), so
+    // the receiver is always this module's 12-slot shim.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, CTX_PROTOCOL_IDX, Value::Int(0)); // "TLS"
+        ctx.set_field(this, CTX_INITIALIZED, Value::Int(0));
+        ctx.set_field(this, CTX_KM_REF, Value::Int(0));
+        ctx.set_field(this, CTX_TM_REF, Value::Int(0));
+        Ok(None)
+    });
 
     // getInstance(String protocol) -> SSLContext
     r.register(
@@ -325,7 +406,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. javax.net.ssl.SSLEngine  (8-field synthetic)
+// 2. javax.net.ssl.SSLEngine  (14-field synthetic)
 // ---------------------------------------------------------------------------
 
 fn register_ssl_engine(r: &mut NativeMethodRegistry) {
@@ -335,7 +416,16 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLEngine";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — give a directly-constructed engine the state
+    // `SSLContext.createSSLEngine()` gives one. The no-op left client-mode at
+    // 0 (so `getUseClientMode()` reported a SERVER engine, the opposite of the
+    // JSSE default and of every engine this file hands out) and peer port at 0
+    // rather than -1.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_ssl_engine_fields(ctx, this);
+        Ok(None)
+    });
 
     // wrap(ByteBuffer[] srcs, ByteBuffer dst) -> SSLEngineResult
     r.register(
@@ -502,23 +592,46 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     });
 
     // setEnabledProtocols(String[]) -> void
-    // Shadowed by phases_late.rs::register_p68_ssl (Phase L) which provides the
-    // real implementation that stores the protocol list on the engine. This
-    // registration runs first; the phases_late.rs version overrides it.
+    //
+    // Was a no-op: an application narrowing itself to TLSv1.3 (or excluding a
+    // protocol it considers unsafe) was silently ignored, and the only way to
+    // observe the engine's protocol set — `getSSLParameters()` — went on
+    // reporting the module default. Store the caller's array so
+    // `getSSLParameters().getProtocols()` reflects it.
+    //
+    // The fake wrap/unwrap state machine below does NOT consult this list:
+    // it performs no negotiation at all (it only walks NEED_WRAP/NEED_UNWRAP),
+    // so the list is configuration state, not something the handshake can
+    // honour. The genuine, protocol-enforcing engine is t27_tls.rs.
+    //
+    // Shadowed by phases_late.rs::register_p68_ssl (Phase L), which registers
+    // the same triple later and wins; this copy keeps tls.rs self-consistent
+    // (its own `getSSLParameters` reads what this writes).
     r.register(
         cls,
         "setEnabledProtocols",
         "([Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let list = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, ENG_ENABLED_PROTOCOLS, list);
+            Ok(None)
+        },
     );
 
-    // setEnabledCipherSuites(String[]) -> void
-    // Shadowed by phases_late.rs::register_p68_ssl (Phase L) — see note above.
+    // setEnabledCipherSuites(String[]) -> void — see setEnabledProtocols above
+    // for why this is stored rather than dropped, and for the phases_late.rs
+    // shadowing note.
     r.register(
         cls,
         "setEnabledCipherSuites",
         "([Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let list = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, ENG_ENABLED_CIPHERS, list);
+            Ok(None)
+        },
     );
 
     // getApplicationProtocol() -> String
@@ -543,23 +656,84 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
     );
 
     // setSSLParameters(SSLParameters) -> void
-    // Shadowed by phases_late.rs::register_p68_ssl (Phase L) which copies the
-    // parameter fields onto the engine. This stub is kept so the tls.rs module
-    // remains self-contained when the experimental-tls feature is built alone.
+    //
+    // Nothing else registers this triple on `javax/net/ssl/SSLEngine`
+    // (phases_late.rs owns the SSLSocket copy, t27_tls.rs the
+    // sun.security.ssl.SSLEngineImpl copy), so this no-op WAS the
+    // implementation: an engine configured entirely through an SSLParameters
+    // block — the way Apache HttpComponents 5 and Tomcat's NIO endpoint do it
+    // — kept the module defaults for protocols, cipher suites, ALPN and
+    // client-auth, and `getSSLParameters()` handed back a fresh default block
+    // that contradicted what had just been set.
+    //
+    // Copy field-by-field rather than retaining the caller's object: real JSSE
+    // reads the values out at this point, so a later mutation of the caller's
+    // block must not reconfigure a live engine. No allocation happens here, so
+    // neither `this` nor `params` can be moved by a collection mid-copy.
     r.register(
         cls,
         "setSSLParameters",
         "(Ljavax/net/ssl/SSLParameters;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let params = match args.get(1) {
+                Some(Value::Object(Some(p))) => *p,
+                // Real JSSE dereferences the argument unconditionally.
+                _ => {
+                    return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: Some("SSLEngine.setSSLParameters: null SSLParameters".into()),
+                    }
+                    .into())
+                }
+            };
+            let protocols = ctx.get_field(params, PAR_PROTOCOLS);
+            let ciphers = ctx.get_field(params, PAR_CIPHER_SUITES);
+            let app_protocols = ctx.get_field(params, PAR_APP_PROTOCOLS);
+            let endpoint_alg = ctx.get_field(params, PAR_ENDPOINT_ID_ALG);
+            let need_auth = ctx.get_field(params, PAR_NEED_CLIENT_AUTH);
+            let want_auth = ctx.get_field(params, PAR_WANT_CLIENT_AUTH);
+            ctx.set_field(this, ENG_ENABLED_PROTOCOLS, protocols);
+            ctx.set_field(this, ENG_ENABLED_CIPHERS, ciphers);
+            ctx.set_field(this, ENG_APP_PROTOCOLS, app_protocols);
+            ctx.set_field(this, ENG_ENDPOINT_ID_ALG, endpoint_alg);
+            ctx.set_field(this, ENG_NEED_CLIENT_AUTH, need_auth);
+            ctx.set_field(this, ENG_WANT_CLIENT_AUTH, want_auth);
+            Ok(None)
+        },
     );
 
     // getSSLParameters() -> SSLParameters
+    //
+    // Mirror of setSSLParameters: hand back a FRESH block carrying the
+    // engine's current configuration (real JSSE also returns a copy, so a
+    // caller mutating the result cannot reconfigure the engine behind its
+    // back). Previously this ignored the receiver entirely and always returned
+    // module defaults.
     r.register(
         cls,
         "getSSLParameters",
         "()Ljavax/net/ssl/SSLParameters;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // `alloc_ssl_parameters` can collect and relocate `this`; pin it
+            // and re-read the (possibly forwarded) reference before touching
+            // its fields again.
+            let pin = ctx.pin_native_root(this);
             let p = alloc_ssl_parameters(ctx);
+            let this = ctx.read_native_pin(pin, this);
+            let protocols = ctx.get_field(this, ENG_ENABLED_PROTOCOLS);
+            let ciphers = ctx.get_field(this, ENG_ENABLED_CIPHERS);
+            let app_protocols = ctx.get_field(this, ENG_APP_PROTOCOLS);
+            let endpoint_alg = ctx.get_field(this, ENG_ENDPOINT_ID_ALG);
+            let need_auth = ctx.get_field(this, ENG_NEED_CLIENT_AUTH);
+            let want_auth = ctx.get_field(this, ENG_WANT_CLIENT_AUTH);
+            ctx.unpin_native_roots(pin);
+            ctx.set_field(p, PAR_PROTOCOLS, protocols);
+            ctx.set_field(p, PAR_CIPHER_SUITES, ciphers);
+            ctx.set_field(p, PAR_APP_PROTOCOLS, app_protocols);
+            ctx.set_field(p, PAR_ENDPOINT_ID_ALG, endpoint_alg);
+            ctx.set_field(p, PAR_NEED_CLIENT_AUTH, need_auth);
+            ctx.set_field(p, PAR_WANT_CLIENT_AUTH, want_auth);
             Ok(Some(Value::Object(Some(p))))
         },
     );
@@ -587,7 +761,18 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLSession";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — `javax.net.ssl.SSLSession` is an INTERFACE, so this can only
+    // ever run for one of this module's synthetic 6-slot sessions; there is no
+    // real constructor behind it. A no-op left the session with no creation
+    // time (`getCreationTime()` returned 0 = the epoch, so any "session age"
+    // computation saw a ~56-year-old session), `isValid()` reading an untagged
+    // default instead of true, and peer port 0 instead of -1. Establish the
+    // same state `SSLEngine.getSession()` produces.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_ssl_session_fields(ctx, this);
+        Ok(None)
+    });
 
     // getCipherSuite() -> String
     r.register(
@@ -684,40 +869,82 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// 4. javax.net.ssl.SSLParameters  (4-field synthetic)
+// 4. javax.net.ssl.SSLParameters  (6-field synthetic)
 // ---------------------------------------------------------------------------
 
+/// Read one of the two `String[]`-valued SSLParameters slots.
+///
+/// Three encodings have to be understood, because more than one module
+/// allocates this synthetic class:
+///   * `Object(Some(arr))` — the array a setter in this file stored;
+///   * `Int(n != 0)` — the legacy "was set, contents not retained" marker other
+///     modules still write (`http2.rs`, `phases_late.rs`), answered with the
+///     module's canonical list;
+///   * anything else (`Int(0)`, or a slot the object is too short to have) —
+///     never set, which real JSSE reports as a null array.
+fn params_string_array(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    slot: usize,
+    legacy_default: &[&str],
+) -> MethodCallResult {
+    match ctx.get_field(this, slot) {
+        Value::Object(Some(arr)) => Ok(Some(Value::Object(Some(arr)))),
+        Value::Int(n) if n != 0 => {
+            let arr = build_string_array(ctx, legacy_default);
+            Ok(Some(Value::Object(Some(arr))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// Read a boolean-valued SSLParameters slot as a JVM `Z` (0/1). A slot the
+/// object is too short to have, or one never written, reads back as
+/// `Object(None)` and must surface as `false` rather than as a reference —
+/// returning the raw `Value` from a `()Z` native puts a non-int on the stack.
+fn params_flag(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize) -> i32 {
+    match ctx.get_field(this, slot) {
+        Value::Int(v) => i32::from(v != 0),
+        _ => 0,
+    }
+}
+
 fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
-    // SyntheticStub: 4-field synthetic parameter holder; getters return
-    // hardcoded protocol/cipher lists, setters are no-ops.
+    // SyntheticStub: 6-field synthetic parameter holder. The setters now retain
+    // what they are given (they used to drop it and, at best, flip a "was set"
+    // flag), so every getter here reports the caller's own configuration.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLParameters";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — a no-op left every slot untagged, which the getters below
+    // read as "never set"; that happened to be the right answer for the two
+    // list slots but not for the client-auth flags, whose getters return the
+    // slot verbatim as a boolean. Initialise all six explicitly.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_ssl_parameters_fields(ctx, this);
+        Ok(None)
+    });
 
     // getProtocols() -> String[]
     r.register(cls, "getProtocols", "()[Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let set = match ctx.get_field(this, 0) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        if set != 0 {
-            let arr = build_string_array(ctx, SUPPORTED_PROTOCOLS);
-            Ok(Some(Value::Object(Some(arr))))
-        } else {
-            Ok(Some(Value::Object(None)))
-        }
+        params_string_array(ctx, this, PAR_PROTOCOLS, SUPPORTED_PROTOCOLS)
     });
 
     // setProtocols(String[]) -> void
+    // Retains the caller's array. Previously only a "was set" flag was kept,
+    // so `setProtocols(["TLSv1.2"])` followed by `getProtocols()` answered
+    // ["TLSv1.3", "TLSv1.2"] — i.e. it re-enabled the protocol the caller had
+    // just excluded.
     r.register(
         cls,
         "setProtocols",
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 0, Value::Int(1));
+            let list = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, PAR_PROTOCOLS, list);
             Ok(None)
         },
     );
@@ -729,52 +956,60 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
         "()[Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let set = match ctx.get_field(this, 1) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            if set != 0 {
-                let arr = build_string_array(ctx, TLS13_CIPHERS);
-                Ok(Some(Value::Object(Some(arr))))
-            } else {
-                Ok(Some(Value::Object(None)))
-            }
+            params_string_array(ctx, this, PAR_CIPHER_SUITES, TLS13_CIPHERS)
         },
     );
 
-    // setCipherSuites(String[]) -> void
+    // setCipherSuites(String[]) -> void — see setProtocols above.
     r.register(
         cls,
         "setCipherSuites",
         "([Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 1, Value::Int(1));
+            let list = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, PAR_CIPHER_SUITES, list);
             Ok(None)
         },
     );
 
     // getApplicationProtocols() -> String[]
+    // Returns the ALPN list the caller configured. The h2/http-1.1 pair is the
+    // fallback for a block nobody has configured (and for the shorter
+    // SSLParameters objects other modules allocate, whose slot 5 does not
+    // exist) — it is what this module has always advertised.
     r.register(
         cls,
         "getApplicationProtocols",
         "()[Ljava/lang/String;",
-        |ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(arr)) = ctx.get_field(this, PAR_APP_PROTOCOLS) {
+                return Ok(Some(Value::Object(Some(arr))));
+            }
             let arr = build_string_array(ctx, &["h2", "http/1.1"]);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
 
     // setApplicationProtocols(String[]) -> void
-    // Instance setter on SSLParameters — the Phase L real impl in
-    // phases_late.rs::register_p68_ssl writes the list to the engine;
-    // this is the Phase E fallback stub for isolated experimental-tls
-    // builds. NEW-6: documented intentional no-op.
+    //
+    // Was a documented no-op, so `getApplicationProtocols()` above kept
+    // answering h2/http-1.1 no matter what ALPN list the caller asked for —
+    // including for a caller that deliberately offers only http/1.1. Store it.
+    // (t27_tls.rs::register_alpn_on_parameters registers the same triple later
+    // with a side-table implementation and wins in a full build; this copy
+    // keeps tls.rs self-consistent on its own.)
     r.register(
         cls,
         "setApplicationProtocols",
         "([Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let list = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field(this, PAR_APP_PROTOCOLS, list);
+            Ok(None)
+        },
     );
 
     // getEndpointIdentificationAlgorithm() -> String
@@ -784,7 +1019,7 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let idx = match ctx.get_field(this, 2) {
+            let idx = match ctx.get_field(this, PAR_ENDPOINT_ID_ALG) {
                 Value::Int(i) => i,
                 _ => 0,
             };
@@ -813,7 +1048,7 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
                 },
                 _ => 0,
             };
-            ctx.set_field(this, 2, Value::Int(idx));
+            ctx.set_field(this, PAR_ENDPOINT_ID_ALG, Value::Int(idx));
             Ok(None)
         },
     );
@@ -821,30 +1056,54 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
     // getNeedClientAuth() -> boolean
     r.register(cls, "getNeedClientAuth", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 3)))
+        let v = params_flag(ctx, this, PAR_NEED_CLIENT_AUTH);
+        Ok(Some(Value::Int(v)))
     });
 
     // setNeedClientAuth(boolean) -> void
+    // Per the JSSE contract the two client-auth modes are mutually exclusive:
+    // requiring a client certificate cancels merely requesting one.
     r.register(cls, "setNeedClientAuth", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = match args.get(1) {
             Some(Value::Int(b)) => *b,
             _ => 0,
         };
-        ctx.set_field(this, 3, Value::Int(v));
+        ctx.set_field(this, PAR_NEED_CLIENT_AUTH, Value::Int(v));
+        if v != 0 {
+            ctx.set_field(this, PAR_WANT_CLIENT_AUTH, Value::Int(0));
+        }
         Ok(None)
     });
 
     // getWantClientAuth() -> boolean
-    r.register(cls, "getWantClientAuth", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // Used to return a hardcoded false, which made it impossible for a caller
+    // to read back its own setWantClientAuth(true) — see below.
+    r.register(cls, "getWantClientAuth", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = params_flag(ctx, this, PAR_WANT_CLIENT_AUTH);
+        Ok(Some(Value::Int(v)))
     });
 
     // setWantClientAuth(boolean) -> void
-    // Shadowed by phases_late.rs::register_p68_ssl (Phase L) which writes the
-    // flag to SSLParameters' want-client-auth field. Stub retained for module
-    // self-containment under experimental-tls feature.
-    r.register(cls, "setWantClientAuth", "(Z)V", native_noop_with_this);
+    //
+    // Nothing else registers this triple on `javax/net/ssl/SSLParameters`
+    // (phases_late.rs and t27_tls.rs own the SSLSocket / SSLServerSocket /
+    // SSLEngineImpl copies), so the no-op WAS the implementation: a server
+    // asking for an optional client certificate had the request dropped, and
+    // the paired getter's hardcoded `false` hid that it had been dropped.
+    r.register(cls, "setWantClientAuth", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = match args.get(1) {
+            Some(Value::Int(b)) => *b,
+            _ => 0,
+        };
+        ctx.set_field(this, PAR_WANT_CLIENT_AUTH, Value::Int(v));
+        if v != 0 {
+            ctx.set_field(this, PAR_NEED_CLIENT_AUTH, Value::Int(0));
+        }
+        Ok(None)
+    });
     r.set_category(__prev_cat);
 }
 
@@ -891,7 +1150,20 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/net/ssl/TrustManagerFactory";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — slot layout is (algorithm idx, initialized, bound keystore
+    // registry id), the same three `getInstance` writes. The no-op left them
+    // untagged; `getTrustManagers()` reads slot 2 to decide which trust
+    // anchors to build, and an untagged slot is indistinguishable from a
+    // genuine "0 = system roots", so a directly-constructed factory could not
+    // be told apart from an initialised one. Real JDK has no no-arg
+    // TrustManagerFactory constructor — this only ever sees the synthetic shim.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Int(0)); // PKIX (getDefaultAlgorithm)
+        ctx.set_field(this, 1, Value::Int(0)); // not initialized
+        ctx.set_field(this, 2, Value::Int(0)); // no keystore bound
+        Ok(None)
+    });
 
     // getInstance(String algorithm) -> TrustManagerFactory
     r.register(
@@ -1037,7 +1309,17 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/KeyManagerFactory";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — same three slots `getInstance` writes (algorithm idx,
+    // initialized, keystore-present); `init()` and the shadowing phases_late
+    // copy both read slot 1 as an "initialized" boolean, which a no-op left
+    // untagged instead of a definite false.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Int(0)); // SunX509 (getDefaultAlgorithm)
+        ctx.set_field(this, 1, Value::Int(0)); // not initialized
+        ctx.set_field(this, 2, Value::Int(0)); // no keystore
+        Ok(None)
+    });
 
     // getInstance(String algorithm) -> KeyManagerFactory
     r.register(
@@ -1101,23 +1383,121 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. java.security.KeyStore  (5-field synthetic)
+// 7. java.security.KeyStore  (5-field synthetic, backed by `keystore.rs`)
 //    field 0: type_idx (0=JKS, 1=PKCS12, 2=JCEKS)
 //    field 1: loaded (0/1)
-//    field 2: entry_count
+//    field 2: entry-count MIRROR — a convenience readout kept in step with the
+//             backing store, NOT the source of truth. It used to BE the whole
+//             "store": `setCertificateEntry`/`setKeyEntry` incremented this
+//             counter and dropped the certificate/key on the floor, so
+//             `getCertificate`/`aliases`/`isKeyEntry` could never see anything
+//             the caller had put in, and `store()` had nothing to serialise.
 //    field 3: provider_idx
-//    field 4: store_id (Long — index into global KeyStore store)
+//    field 4: store id in `keystore.rs`'s process-wide `KEYSTORE_REGISTRY`
+//
+// STORAGE. Every entry-facing method below delegates to the registry-backed
+// engine surface in `keystore.rs` (`engine_load`, `engine_get_certificate`,
+// `engine_set_key_entry`, `engine_store`, …) through that module's `keystore_*`
+// wrappers, so the public `KeyStore` API and the `KeyStoreSpi` API read and
+// write ONE store and cannot disagree. Entries live in `KEYSTORE_REGISTRY` as
+// plain Rust `Vec<u8>` DER: no Java object reference is retained anywhere, so
+// there is nothing for a moving GC to strand and no `add_global_root` /
+// `register_var_handle_root` is required. The only link from a Java `KeyStore`
+// object to its entries is the integer store id, which `keystore::set_store_id`
+// records BOTH in slot 4 and in that module's identity-hash side-table
+// (`identity_hash_code` is stable across GC by contract) — the same idiom
+// `engineLoad` has always used for real-JDK `KeyStoreSpi` objects, which is why
+// a store opened through either API is visible through the other.
+//
+// An uninitialized receiver THROWS, it does not answer "empty": real
+// `java.security.KeyStore` guards each of these methods with
+// `if (!initialized) throw new KeyStoreException("Uninitialized keystore")`.
+//
+// CATEGORY. This block is `Bridge`, not `SyntheticStub` (it was the latter for
+// as long as it WAS a stub). `SyntheticStub` registrations are dropped wholesale
+// under `CRATONVM_NO_STUBS`, and the only other `java.security.KeyStore`
+// registrations in the tree are `phases_early.rs`'s rival 3-field shim, which is
+// tagged `Bridge` and survives — so leaving this block tagged `SyntheticStub`
+// meant strict no-stubs mode fell back to a keystore with a DIFFERENT slot
+// layout, no `store`/`setKeyEntry`/`isKeyEntry` at all, and (outside the
+// non-default `legacy-synthetic-crypto` feature) no entry storage whatsoever.
+// That inverts the point of the flag: the strict mode would behave WORSE than
+// the default. Every triple below is now backed by `keystore.rs`'s registry and
+// is load-bearing in that mode, with ONE deliberate exception —
+// `getDefaultType`, which is still a hardcoded constant and keeps its
+// `SyntheticStub` tag (see its own comment).
 // ---------------------------------------------------------------------------
 
+/// Raise one of the checked exceptions `java.security.KeyStore` declares.
+///
+/// `phases_early::throw_jca_exc` constructs the real exception object when the
+/// class is available and degrades to `IllegalArgumentException` when it is
+/// not; either way the caller sees a throw rather than a bogus success value.
+fn ks_throw(ctx: &mut dyn NativeContext, class_name: &str, msg: &str) -> MethodCallFailed {
+    crate::phases_early::throw_jca_exc(ctx, class_name, msg)
+}
+
+/// Enforce the `KeyStore` "must be loaded first" precondition.
+///
+/// Slot 1 is this module's `loaded` flag. Two other shapes can legitimately
+/// reach these natives and must NOT be rejected, because slot 1 means something
+/// else on them: a real `java.security.KeyStore`
+/// (`type`/`provider`/`keyStoreSpi`/`initialized`) carries the flag in its named
+/// `initialized` field, and any receiver that already has a store bound in
+/// `keystore.rs`'s registry was loaded through `engineLoad` by definition.
+/// Only a receiver that satisfies none of the three is genuinely uninitialized.
+fn ks_require_loaded(ctx: &mut dyn NativeContext, this: ObjectRef) -> Result<(), MethodCallFailed> {
+    if matches!(ctx.get_field(this, 1), Value::Int(1))
+        || matches!(ctx.get_field_by_name(this, "initialized"), Value::Int(1))
+        || crate::keystore::keystore_id_from_object(ctx, this) != 0
+    {
+        return Ok(());
+    }
+    Err(ks_throw(
+        ctx,
+        "java/security/KeyStoreException",
+        "Uninitialized keystore",
+    ))
+}
+
+/// Decode the alias argument (`args[1]`) of an alias-taking `KeyStore` method.
+fn ks_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> String {
+    match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Refresh the slot-2 entry-count mirror from the authoritative store.
+fn ks_sync_count(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
+    let n = crate::keystore::keystore_lookup(id)
+        .map(|s| s.entries.len())
+        .unwrap_or(0);
+    ctx.set_field(this, 2, Value::Int(n as i32));
+}
+
 fn register_key_store(r: &mut NativeMethodRegistry) {
-    // SyntheticStub: 5-field synthetic KeyStore. The default build's load()
-    // merely flips a "loaded" flag; the legacy-synthetic-crypto path parses
-    // real bytes but emits placeholder Key/Certificate objects (hardcoded
-    // RSA-2048 etc.). The real JKS/PKCS12 engine is keystore.rs.
     let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/security/KeyStore";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — the 5-slot layout documented above. A no-op left `loaded`
+    // and the entry count untagged, so `size()` returned a reference-typed
+    // default from a `()I` native and `isKeyEntry`/`containsAlias` could not
+    // distinguish "empty" from "never loaded". The type slot stays JKS (0),
+    // which is exactly what `getType()` already reported for an
+    // uninitialised receiver: a bare `new KeyStore()` never passed through
+    // `getInstance(String)`, so the requested type is genuinely unknown here
+    // and inventing `getDefaultType()`'s PKCS12 would change what callers
+    // observe today.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Int(0)); // JKS
+        ctx.set_field(this, 1, Value::Int(0)); // not loaded
+        ctx.set_field(this, 2, Value::Int(0)); // 0 entries
+        ctx.set_field(this, 3, Value::Int(0)); // provider idx
+        ctx.set_field(this, 4, Value::Int(0)); // no backing store yet
+        Ok(None)
+    });
 
     // getInstance(String type) -> KeyStore
     r.register(
@@ -1139,7 +1519,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
             ctx.set_field(obj, 1, Value::Int(0)); // not loaded
             ctx.set_field(obj, 2, Value::Int(0)); // 0 entries
             ctx.set_field(obj, 3, Value::Int(0)); // provider idx
-            ctx.set_field(obj, 4, Value::Long(0)); // no store yet
+            ctx.set_field(obj, 4, Value::Int(0)); // no store yet
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1160,6 +1540,14 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     });
 
     // getDefaultType() -> String (static)
+    //
+    // The one registration in this block that stays `SyntheticStub`: it hands
+    // back a hardcoded constant, where the real method reads the `keystore.type`
+    // security property (defaulting to "pkcs12"). Tagging a constant `Bridge`
+    // would claim it is load-bearing in strict no-stubs mode, which it is not —
+    // and nothing is lost by dropping it there, because `phases_early.rs`
+    // registers a byte-identical `Bridge` copy that then wins.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register(
         cls,
         "getDefaultType",
@@ -1169,81 +1557,24 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
 
     // load(InputStream, char[]) -> void
+    //
+    // Delegates to `keystore::engine_load`, the real PKCS#12 + JKS reader
+    // (format detected by magic, PKCS#12 MAC / JKS integrity tag verified,
+    // shrouded key bags decrypted with the supplied password). It registers
+    // the parsed store and stamps its id on this object, which is what makes
+    // every accessor below — and a `store()` → `load()` round-trip — see the
+    // same entries. A null `InputStream` means "create an empty store", per
+    // the JDK contract, and an unparseable stream propagates `IOException`
+    // instead of the old silent "mark loaded and forget the bytes".
     r.register(cls, "load", "(Ljava/io/InputStream;[C)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        crate::keystore::keystore_load(ctx, args)?;
         ctx.set_field(this, 1, Value::Int(1)); // mark loaded
-
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        {
-            let type_idx = match ctx.get_field(this, 0) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            let type_hint = match type_idx {
-                0 => "JKS",
-                1 => "PKCS12",
-                2 => "JCEKS",
-                _ => "auto",
-            };
-
-            // Read password from char[]
-            let password = if let Some(Value::Object(Some(pwd_arr))) = args.get(2) {
-                let len = ctx.array_length(*pwd_arr);
-                let mut pwd = Vec::with_capacity(len);
-                for i in 0..len {
-                    let c = match ctx.get_array_element(*pwd_arr, i) {
-                        Value::Int(v) => v as u8,
-                        _ => 0,
-                    };
-                    pwd.push(c);
-                }
-                pwd
-            } else {
-                Vec::new()
-            };
-
-            // Try to read data from InputStream
-            if let Some(Value::Object(Some(is_ref))) = args.get(1) {
-                // ByteArrayInputStream pattern: field 0 = byte[] buf
-                if let Value::Object(Some(buf_ref)) = ctx.get_field(*is_ref, 0) {
-                    let len = ctx.array_length(buf_ref);
-                    if len > 0 {
-                        let mut data = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let b = match ctx.get_array_element(buf_ref, i) {
-                                Value::Int(v) => v as u8,
-                                _ => 0,
-                            };
-                            data.push(b);
-                        }
-                        if let Ok(ks_data) =
-                            crypto_impl::KeyStoreData::load(&data, &password, type_hint)
-                        {
-                            let entry_count = ks_data.entries.len() as i32;
-                            let store_id = crypto_impl::keystore_next_id();
-                            crypto_impl::keystore_store(store_id, ks_data);
-                            ctx.set_field(this, 2, Value::Int(entry_count));
-                            ctx.set_field(this, 4, Value::Long(store_id as i64));
-                            return Ok(None);
-                        }
-                    }
-                }
-            } else {
-                // null InputStream = empty keystore (valid per spec)
-                let store_id = crypto_impl::keystore_next_id();
-                crypto_impl::keystore_store(
-                    store_id,
-                    crypto_impl::KeyStoreData {
-                        store_type: type_hint.to_string(),
-                        entries: std::collections::HashMap::new(),
-                    },
-                );
-                ctx.set_field(this, 4, Value::Long(store_id as i64));
-            }
-        }
-
+        let id = crate::keystore::keystore_ensure_store_id(ctx, this);
+        ks_sync_count(ctx, this, id);
         Ok(None)
     });
 
@@ -1253,48 +1584,25 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getCertificate",
         "(Ljava/lang/String;)Ljava/security/cert/Certificate;",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
-            {
-                let this = obj_arg(args, 0)?;
-                let store_id = match ctx.get_field(this, 4) {
-                    Value::Long(id) => id as u64,
-                    _ => 0,
-                };
-                if store_id > 0 {
-                    let alias = match args.get(1) {
-                        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                        if let Some(entry) = ks_data.entries.get(&alias) {
-                            let x509_cert = match entry {
-                                crypto_impl::KeyStoreEntry::TrustedCert { cert } => Some(cert),
-                                crypto_impl::KeyStoreEntry::PrivateKeyEntry {
-                                    cert_chain, ..
-                                } => cert_chain.first(),
-                                _ => None,
-                            };
-                            if let Some(cert) = x509_cert {
-                                let cert_obj = alloc_concurrent_synthetic(
-                                    ctx,
-                                    "java/security/cert/X509Certificate",
-                                    3,
-                                );
-                                let sub_str = ctx.create_string(&cert.subject_cn);
-                                let iss_str = ctx.create_string(&cert.issuer_cn);
-                                let cert_id = crypto_impl::cert_next_id();
-                                crypto_impl::cert_store(cert_id, cert.clone());
-                                ctx.set_field(cert_obj, 0, Value::Object(Some(sub_str)));
-                                ctx.set_field(cert_obj, 1, Value::Object(Some(iss_str)));
-                                ctx.set_field(cert_obj, 2, Value::Long(cert_id as i64));
-                                return Ok(Some(Value::Object(Some(cert_obj))));
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = (ctx, args);
-            Ok(Some(Value::Object(None)))
+            let this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, this)?;
+            crate::keystore::keystore_get_certificate(ctx, args)
+        },
+    );
+
+    // getCertificateChain(String alias) -> Certificate[]
+    //
+    // Companion to getCertificate/getKey: a caller copying an identity between
+    // keystores needs `setKeyEntry(alias, getKey(...), pw, getCertificateChain
+    // (alias))`, and the chain half was the piece this shim never had.
+    r.register(
+        cls,
+        "getCertificateChain",
+        "(Ljava/lang/String;)[Ljava/security/cert/Certificate;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, this)?;
+            crate::keystore::keystore_get_certificate_chain(ctx, args)
         },
     );
 
@@ -1304,58 +1612,31 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "getKey",
         "(Ljava/lang/String;[C)Ljava/security/Key;",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
-            {
-                let this = obj_arg(args, 0)?;
-                let store_id = match ctx.get_field(this, 4) {
-                    Value::Long(id) => id as u64,
-                    _ => 0,
-                };
-                if store_id > 0 {
-                    let alias = match args.get(1) {
-                        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                        if let Some(entry) = ks_data.entries.get(&alias) {
-                            match entry {
-                                crypto_impl::KeyStoreEntry::PrivateKeyEntry {
-                                    key_bytes, ..
-                                } => {
-                                    let pk = alloc_concurrent_synthetic(
-                                        ctx,
-                                        "java/security/PrivateKey",
-                                        4,
-                                    );
-                                    ctx.set_field(pk, 0, Value::Int(6)); // RSA default
-                                    ctx.set_field(pk, 1, Value::Int(2048));
-                                    ctx.set_field(pk, 2, Value::Int(key_bytes.len() as i32));
-                                    ctx.set_field(pk, 3, Value::Long(0));
-                                    return Ok(Some(Value::Object(Some(pk))));
-                                }
-                                crypto_impl::KeyStoreEntry::SecretKeyEntry {
-                                    key_bytes,
-                                    algorithm,
-                                } => {
-                                    let sk = alloc_concurrent_synthetic(
-                                        ctx,
-                                        "javax/crypto/SecretKey",
-                                        3,
-                                    );
-                                    ctx.set_field(sk, 0, Value::Int(0));
-                                    ctx.set_field(sk, 1, Value::Int((key_bytes.len() * 8) as i32));
-                                    ctx.set_field(sk, 2, Value::Int(key_bytes.len() as i32));
-                                    let _ = algorithm;
-                                    return Ok(Some(Value::Object(Some(sk))));
-                                }
-                                _ => {}
-                            }
-                        }
+            let this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, this)?;
+            let key = crate::keystore::keystore_get_key(ctx, args)?;
+            // `engine_get_key` decrypts JKS-shrouded key material with the
+            // password it was just handed. If the stored DER is STILL an
+            // `EncryptedPrivateKeyInfo` afterwards, that password was wrong —
+            // real `KeyStore.getKey` throws `UnrecoverableKeyException` there,
+            // and handing back a proxy whose `getEncoded()` is ciphertext
+            // masquerading as PKCS#8 is precisely the silent wrong answer this
+            // shim must not produce.
+            if matches!(key, Some(Value::Object(Some(_)))) {
+                let alias = ks_alias(ctx, args);
+                let id = crate::keystore::keystore_id_from_object(ctx, this);
+                if let Some((der, _)) = crate::keystore::keystore_get_private_key(id, &alias) {
+                    if crate::keystore::is_jks_encrypted_private_key(&der) {
+                        return Err(ks_throw(
+                            ctx,
+                            "java/security/UnrecoverableKeyException",
+                            "Cannot recover key: the supplied password does not \
+                             decrypt this entry's key material",
+                        ));
                     }
                 }
             }
-            let _ = (ctx, args);
-            Ok(Some(Value::Object(None)))
+            Ok(key)
         },
     );
 
@@ -1365,119 +1646,89 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "containsAlias",
         "(Ljava/lang/String;)Z",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
-            {
-                let this = obj_arg(args, 0)?;
-                let store_id = match ctx.get_field(this, 4) {
-                    Value::Long(id) => id as u64,
-                    _ => 0,
-                };
-                if store_id > 0 {
-                    let alias = match args.get(1) {
-                        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                        return Ok(Some(Value::Int(if ks_data.entries.contains_key(&alias) {
-                            1
-                        } else {
-                            0
-                        })));
-                    }
-                }
-            }
-            let _ = (ctx, args);
-            Ok(Some(Value::Int(0)))
+            let this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, this)?;
+            crate::keystore::keystore_contains_alias(ctx, args)
         },
     );
 
     // aliases() -> Enumeration<String>
+    //
+    // `keystore::engine_aliases` enumerates in INSERTION order (the backing
+    // map is an `IndexMap`), matching real JDK's `LinkedHashMap`-backed
+    // `JavaKeyStore`/`PKCS12KeyStore`. The returned
+    // `java/util/IteratorEnumeration` has `hasMoreElements`/`nextElement`
+    // registered in both modes (phases_early phase53 for synthetic-JDK,
+    // `keystore::register_keystore_real` for real-JDK).
     r.register(cls, "aliases", "()Ljava/util/Enumeration;", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        {
-            let this = obj_arg(args, 0)?;
-            let store_id = match ctx.get_field(this, 4) {
-                Value::Long(id) => id as u64,
-                _ => 0,
-            };
-            if store_id > 0 {
-                if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                    let aliases: Vec<&str> = ks_data.entries.keys().map(|s| s.as_str()).collect();
-                    if !aliases.is_empty() {
-                        // Build a Vector-backed enumeration
-                        let vec_obj = alloc_concurrent_synthetic(ctx, "java/util/Vector", 2);
-                        let arr = ctx
-                            .new_array(cratonvm_types::ArrayElementType::Reference, aliases.len());
-                        for (i, alias) in aliases.iter().enumerate() {
-                            let s = ctx.create_string(alias);
-                            ctx.set_array_element(arr, i, Value::Object(Some(s)));
-                        }
-                        ctx.set_field(vec_obj, 0, Value::Object(Some(arr)));
-                        ctx.set_field(vec_obj, 1, Value::Int(aliases.len() as i32));
-                        // Return a simple enumeration wrapping the vector
-                        let en = alloc_concurrent_synthetic(
-                            ctx,
-                            "java/util/Vector$VectorEnumeration",
-                            2,
-                        );
-                        ctx.set_field(en, 0, Value::Object(Some(vec_obj)));
-                        ctx.set_field(en, 1, Value::Int(0)); // cursor
-                        return Ok(Some(Value::Object(Some(en))));
-                    }
-                }
-            }
-        }
-        let _ = args;
-        let en = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
-        Ok(Some(Value::Object(Some(en))))
+        let this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, this)?;
+        crate::keystore::keystore_aliases(ctx, args)
     });
 
-    // size() -> int
+    // size() -> int  (a readout of the real entry count, not a counter)
     r.register(cls, "size", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        {
-            let store_id = match ctx.get_field(this, 4) {
-                Value::Long(id) => id as u64,
-                _ => 0,
-            };
-            if store_id > 0 {
-                if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                    return Ok(Some(Value::Int(ks_data.entries.len() as i32)));
-                }
-            }
-        }
-        Ok(Some(ctx.get_field(this, 2)))
+        ks_require_loaded(ctx, this)?;
+        crate::keystore::keystore_size(ctx, args)
     });
 
     // setCertificateEntry(String alias, Certificate cert) -> void
+    //
+    // Stores the certificate's DER in the backing store, so `getCertificate`,
+    // `containsAlias`, `isCertificateEntry`, `aliases`, `size` and `store` all
+    // see it. If no DER can be obtained (a `Certificate` whose `getEncoded()`
+    // yields nothing and which is not one of our own mirrors) the entry cannot
+    // be stored, and that must surface as the `KeyStoreException` the method
+    // declares — not as a successful-looking no-op.
     r.register(
         cls,
         "setCertificateEntry",
         "(Ljava/lang/String;Ljava/security/cert/Certificate;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let count = match ctx.get_field(this, 2) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            ctx.set_field(this, 2, Value::Int(count + 1));
+            ks_require_loaded(ctx, this)?;
+            let id = crate::keystore::keystore_ensure_store_id(ctx, this);
+            let alias = ks_alias(ctx, args);
+            crate::keystore::keystore_set_certificate_entry_native(ctx, args)?;
+            if !crate::keystore::keystore_has_alias(id, &alias) {
+                let msg = format!(
+                    "setCertificateEntry({alias:?}): no DER encoding available for this \
+                     certificate — nothing was stored"
+                );
+                return Err(ks_throw(ctx, "java/security/KeyStoreException", &msg));
+            }
+            ks_sync_count(ctx, this, id);
             Ok(None)
         },
     );
 
     // setKeyEntry(String alias, Key key, char[] password, Certificate[] chain) -> void
+    //
+    // Same contract as setCertificateEntry: the PKCS#8 key DER plus each chain
+    // certificate's DER go into the backing store (and, when a chain is
+    // present, the identity is also installed for the native TLS listener —
+    // see `keystore::engine_set_key_entry`). A key with no obtainable encoding
+    // (PKCS#11/HSM-backed, `getEncoded() == null`) genuinely cannot be stored
+    // here, so it throws rather than reporting success.
     r.register(
         cls,
         "setKeyEntry",
         "(Ljava/lang/String;Ljava/security/Key;[C[Ljava/security/cert/Certificate;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let count = match ctx.get_field(this, 2) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            ctx.set_field(this, 2, Value::Int(count + 1));
+            ks_require_loaded(ctx, this)?;
+            let id = crate::keystore::keystore_ensure_store_id(ctx, this);
+            let alias = ks_alias(ctx, args);
+            crate::keystore::keystore_set_key_entry_native(ctx, args)?;
+            if !crate::keystore::keystore_has_alias(id, &alias) {
+                let msg = format!(
+                    "setKeyEntry({alias:?}): the key has no PKCS#8 encoding this VM can \
+                     store (getEncoded() returned nothing) — nothing was stored"
+                );
+                return Err(ks_throw(ctx, "java/security/KeyStoreException", &msg));
+            }
+            ks_sync_count(ctx, this, id);
             Ok(None)
         },
     );
@@ -1485,26 +1736,71 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
     // deleteEntry(String alias) -> void
     r.register(cls, "deleteEntry", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let count = match ctx.get_field(this, 2) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        if count > 0 {
-            ctx.set_field(this, 2, Value::Int(count - 1));
-        }
+        ks_require_loaded(ctx, this)?;
+        let id = crate::keystore::keystore_ensure_store_id(ctx, this);
+        crate::keystore::keystore_delete_entry_native(ctx, args)?;
+        ks_sync_count(ctx, this, id);
         Ok(None)
     });
 
     // store(OutputStream, char[]) -> void
-    // KeyStore.store is an instance method that persists the store to
-    // a stream. Our synthetic KeyStore is in-memory only (no persistent
-    // backing) so store() is a no-op. NEW-6: documented.
-    r.register(
-        cls,
-        "store",
-        "(Ljava/io/OutputStream;[C)V",
-        native_noop_with_this,
-    );
+    //
+    // Nothing else registers this triple (phases_early.rs's `java.security.
+    // KeyStore` shim covers getInstance/load/getType/size/aliases but not
+    // store), so the former no-op WAS the implementation: a caller that built
+    // a keystore and asked for it to be written got an empty output stream and
+    // no error at all — the failure only surfaced much later as an unreadable
+    // or entry-less file. Its replacement threw `IOException` for every
+    // SPI-less receiver, which was honest but still useless.
+    //
+    // Both are now fixed at the root: this KeyStore HAS entries (see the
+    // storage note at the top of this section), and `keystore.rs`'s JKS
+    // serialiser (`write_jks`, driven by `engine_store`) is reachable from
+    // here. Order of preference:
+    //   1. a real `KeyStoreSpi` delegate, whose `engineStore` is the contract
+    //      `KeyStore.store` is defined in terms of;
+    //   2. this VM's own store, serialised as JKS. JKS — not the declared
+    //      type — deliberately: CV's read path detects the format by magic, so
+    //      a JKS body round-trips through `load()` whatever type string the
+    //      caller asked `getInstance` for.
+    r.register(cls, "store", "(Ljava/io/OutputStream;[C)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let out = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::IOException {
+                    message: "KeyStore.store: output stream is null".to_string(),
+                }
+                .into())
+            }
+        };
+        let password = args.get(2).copied().unwrap_or(Value::Object(None));
+        if let Value::Object(Some(spi)) = ctx.get_field_by_name(this, "keyStoreSpi") {
+            let _ = ctx.invoke_virtual(
+                spi,
+                "engineStore",
+                "(Ljava/io/OutputStream;[C)V",
+                &[Value::Object(Some(out)), password],
+            )?;
+            return Ok(None);
+        }
+        ks_require_loaded(ctx, this)?;
+        let id = crate::keystore::keystore_id_from_object(ctx, this);
+        if id == 0 {
+            // `loaded` is set, yet no store is bound: the only way to reach
+            // this is a receiver whose slot 4 / identity entry was clobbered.
+            // Writing an empty JKS here would silently truncate the caller's
+            // keystore, so refuse.
+            return Err(ks_throw(
+                ctx,
+                "java/security/KeyStoreException",
+                "KeyStore.store: this keystore has no backing store bound — \
+                 nothing was written",
+            ));
+        }
+        crate::keystore::keystore_store(ctx, args)?;
+        Ok(None)
+    });
 
     // isCertificateEntry(String alias) -> boolean
     r.register(
@@ -1512,57 +1808,18 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         "isCertificateEntry",
         "(Ljava/lang/String;)Z",
         |ctx, args| {
-            #[cfg(feature = "legacy-synthetic-crypto")]
-            {
-                let this = obj_arg(args, 0)?;
-                let store_id = match ctx.get_field(this, 4) {
-                    Value::Long(id) => id as u64,
-                    _ => 0,
-                };
-                if store_id > 0 {
-                    let alias = match args.get(1) {
-                        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                        _ => String::new(),
-                    };
-                    if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                        if let Some(crypto_impl::KeyStoreEntry::TrustedCert { .. }) =
-                            ks_data.entries.get(&alias)
-                        {
-                            return Ok(Some(Value::Int(1)));
-                        }
-                    }
-                }
-            }
-            let _ = (ctx, args);
-            Ok(Some(Value::Int(0)))
+            let this = obj_arg(args, 0)?;
+            ks_require_loaded(ctx, this)?;
+            crate::keystore::keystore_is_certificate_entry(ctx, args)
         },
     );
 
-    // isKeyEntry(String alias) -> boolean
+    // isKeyEntry(String alias) -> boolean  (true for private AND secret keys,
+    // matching both the JDK contract and what `getKey` above will hand back)
     r.register(cls, "isKeyEntry", "(Ljava/lang/String;)Z", |ctx, args| {
-        #[cfg(feature = "legacy-synthetic-crypto")]
-        {
-            let this = obj_arg(args, 0)?;
-            let store_id = match ctx.get_field(this, 4) {
-                Value::Long(id) => id as u64,
-                _ => 0,
-            };
-            if store_id > 0 {
-                let alias = match args.get(1) {
-                    Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                    _ => String::new(),
-                };
-                if let Some(ks_data) = crypto_impl::keystore_get(store_id) {
-                    if let Some(crypto_impl::KeyStoreEntry::PrivateKeyEntry { .. }) =
-                        ks_data.entries.get(&alias)
-                    {
-                        return Ok(Some(Value::Int(1)));
-                    }
-                }
-            }
-        }
-        let _ = (ctx, args);
-        Ok(Some(Value::Int(0)))
+        let this = obj_arg(args, 0)?;
+        ks_require_loaded(ctx, this)?;
+        crate::keystore::keystore_is_key_entry(ctx, args)
     });
     r.set_category(__prev_cat);
 }
@@ -1578,6 +1835,12 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLSocketFactory";
+    // <init>() — KEPT as a no-op, and it is spec-correct: real
+    // `SSLSocketFactory()` (like its `javax.net.SocketFactory` super) has an
+    // empty body and no field initialisers, and this module's 2-slot shim has
+    // no getter that reads either slot (createSocket allocates a fresh Socket,
+    // getDefault allocates a fresh factory, and the cipher-suite getters are
+    // constant). Every field legitimately starts null/0.
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // getDefault() -> SSLSocketFactory
@@ -1963,6 +2226,15 @@ fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/net/ssl/X509TrustManager";
+    // <init>() — KEPT as a no-op. `javax.net.ssl.X509TrustManager` is an
+    // INTERFACE, so there is no real constructor to shadow and this can only
+    // run for a CratonVM synthetic receiver. The one piece of state such a
+    // receiver carries is its trust-manager id, and the only reader
+    // (`read_trust_manager_id_from_obj`) already treats both an absent field
+    // and a 0 slot as "id 0", which `trust_manager_state_by_id` resolves to
+    // the platform root anchors — the correct, restrictive default for a
+    // trust manager nobody has bound a KeyStore to. Writing 0 explicitly would
+    // change nothing.
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // checkClientTrusted(X509Certificate[] chain, String authType) -> void
@@ -2006,7 +2278,19 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/security/ssl/SSLContextImpl";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — this class is an alias of the synthetic SSLContext and shares
+    // its slot layout, so give it the same initial state `getInstance` writes.
+    // `engineInit` (register_keycloak_tls_natives) reads CTX_INITIALIZED /
+    // CTX_KM_REF / CTX_TM_REF off exactly these slots, and a no-op left them
+    // untagged rather than definitely-unset.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, CTX_PROTOCOL_IDX, Value::Int(0)); // "TLS"
+        ctx.set_field(this, CTX_INITIALIZED, Value::Int(0));
+        ctx.set_field(this, CTX_KM_REF, Value::Int(0));
+        ctx.set_field(this, CTX_TM_REF, Value::Int(0));
+        Ok(None)
+    });
 
     r.register(
         cls,
@@ -2202,7 +2486,34 @@ fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLEngineResult";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // <init>() — the registered descriptor is the NO-ARG one, which the real
+    // (final) `SSLEngineResult` does not have: its only constructor is
+    // `(Status, HandshakeStatus, int, int)` and it rejects null status
+    // arguments. So `()V` here can only ever construct one of this module's
+    // synthetic int-slot results, and a no-op left both status slots holding a
+    // reference default — which `engine_result_enum_accessor` reports through
+    // its `_ => Object(None)` arm as a NULL `getStatus()`/`getHandshakeStatus()`,
+    // the one thing a real SSLEngineResult can never return.
+    //
+    // Write OK / NOT_HANDSHAKING plus zero byte counts. Code 0 means exactly
+    // that in BOTH conventions this file bridges (STATUS_OK == SR_OK == 0 and
+    // HS_NOT_HANDSHAKING == HS_NOT_HANDSHAKING_R == 0), so the result is
+    // correct whichever width the synthetic class ended up with — see
+    // `engine_result_enum_accessor`, which picks the convention from the
+    // object's slot count. Deliberately no native for the real 4-arg ctor:
+    // `t27_tls::alloc_engine_result` builds real results through it and
+    // registering over it would break that path.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Int(STATUS_OK));
+        ctx.set_field(this, 1, Value::Int(HS_NOT_HANDSHAKING));
+        // bytesConsumed / bytesProduced, present only on the 4-slot shape.
+        if ctx.object_num_fields(this) >= 4 {
+            ctx.set_field(this, 2, Value::Int(0));
+            ctx.set_field(this, 3, Value::Int(0));
+        }
+        Ok(None)
+    });
 
     // getStatus() -> SSLEngineResult$Status
     r.register(
@@ -2326,7 +2637,17 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
     // the concrete impl class so direct `SSLSessionImpl` references
     // resolve without falling back to the interpreter.
     let sess_impl = "sun/security/ssl/SSLSessionImpl";
-    r.register(sess_impl, "<init>", "()V", native_noop_with_this);
+    // <init>() — the concrete impl class is treated as an alias of the
+    // synthetic `javax/net/ssl/SSLSession` above (same 6-slot layout), so give
+    // it the same initial state: valid session, no peer, real creation
+    // timestamp. Without this a `new SSLSessionImpl()` had no creation time at
+    // all, and Keycloak's access-log correlation reads session metadata off
+    // exactly these objects.
+    r.register(sess_impl, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_ssl_session_fields(ctx, this);
+        Ok(None)
+    });
     r.register(sess_impl, "getId", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Allocate a 32-byte session id derived from the object identity.
@@ -3229,7 +3550,8 @@ mod tls_tests {
 
     #[test]
     fn test_ssl_engine_field_indices_in_range() {
-        // All field indices must be within the 8-field synthetic object
+        // The original eight stay inside the first 8 slots — modules that
+        // allocate this class with the older width must keep working.
         assert!(ENG_CLIENT_MODE < 8);
         assert!(ENG_HANDSHAKE_STATUS < 8);
         assert!(ENG_INBOUND_DONE < 8);
@@ -3238,6 +3560,32 @@ mod tls_tests {
         assert!(ENG_PEER_HOST < 8);
         assert!(ENG_PEER_PORT < 8);
         assert!(ENG_ALPN_PROTOCOL < 8);
+        // The configuration slots the setters write live above them, inside
+        // the width `alloc_ssl_engine` requests.
+        assert!(ENG_ENABLED_PROTOCOLS >= 8 && ENG_ENABLED_PROTOCOLS < ENG_FIELD_COUNT);
+        assert!(ENG_ENABLED_CIPHERS >= 8 && ENG_ENABLED_CIPHERS < ENG_FIELD_COUNT);
+        assert!(ENG_APP_PROTOCOLS >= 8 && ENG_APP_PROTOCOLS < ENG_FIELD_COUNT);
+        assert!(ENG_NEED_CLIENT_AUTH >= 8 && ENG_NEED_CLIENT_AUTH < ENG_FIELD_COUNT);
+        assert!(ENG_WANT_CLIENT_AUTH >= 8 && ENG_WANT_CLIENT_AUTH < ENG_FIELD_COUNT);
+        assert!(ENG_ENDPOINT_ID_ALG >= 8 && ENG_ENDPOINT_ID_ALG < ENG_FIELD_COUNT);
+    }
+
+    #[test]
+    fn test_ssl_parameters_field_indices_in_range_and_distinct() {
+        let indices = [
+            PAR_PROTOCOLS,
+            PAR_CIPHER_SUITES,
+            PAR_ENDPOINT_ID_ALG,
+            PAR_NEED_CLIENT_AUTH,
+            PAR_WANT_CLIENT_AUTH,
+            PAR_APP_PROTOCOLS,
+        ];
+        for (i, a) in indices.iter().enumerate() {
+            assert!(*a < PAR_FIELD_COUNT);
+            for b in indices.iter().skip(i + 1) {
+                assert_ne!(a, b, "Duplicate SSLParameters field index");
+            }
+        }
     }
 
     #[test]
@@ -3262,6 +3610,12 @@ mod tls_tests {
             ENG_PEER_HOST,
             ENG_PEER_PORT,
             ENG_ALPN_PROTOCOL,
+            ENG_ENABLED_PROTOCOLS,
+            ENG_ENABLED_CIPHERS,
+            ENG_APP_PROTOCOLS,
+            ENG_NEED_CLIENT_AUTH,
+            ENG_WANT_CLIENT_AUTH,
+            ENG_ENDPOINT_ID_ALG,
         ];
         for i in 0..indices.len() {
             for j in (i + 1)..indices.len() {

@@ -11126,6 +11126,18 @@ fn register_re9_nio_selector(r: &mut NativeMethodRegistry) {
 struct HttpHandlerEntry {
     path_prefix: String,
     handler: ObjectRef,
+    /// The `HttpContext` object `createContext` handed back to the caller.
+    ///
+    /// Kept so the request dispatcher can consult the context's
+    /// `Authenticator` before it runs the handler:
+    /// `HttpContext.setAuthenticator` stores the authenticator in a side
+    /// registry keyed by the *context object's* identity (see
+    /// `phases_late::net_channels`), so the context instance — not just its
+    /// path — has to survive here. Rooted and relocated alongside `handler`
+    /// by the two GC helpers below; without that a moving young GC would leave
+    /// this pointing at a vacated slot and the authenticator lookup would read
+    /// a foreign identity hash.
+    context: ObjectRef,
 }
 
 struct ServerState {
@@ -11177,6 +11189,11 @@ pub fn gc_scan_re10_handler_roots(out: &mut Vec<ObjectRef>) {
         let hs = state.handlers.lock();
         for e in hs.iter() {
             out.push(e.handler);
+            // Same reasoning for the context: once the application drops the
+            // reference `createContext` returned, this native map is the only
+            // thing that keeps it alive, and the dispatcher dereferences it
+            // once per request to read its authenticator.
+            out.push(e.context);
         }
     }
 }
@@ -11203,6 +11220,12 @@ pub fn gc_update_re10_handler_refs(pointer_map: &std::collections::HashMap<usize
                 // SAFETY: `new` is a relocated address produced by the collector's
                 // pointer map for this exact object; it points at a valid header.
                 e.handler = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+            let old_ctx = e.context.as_ptr() as usize;
+            if let Some(&new) = pointer_map.get(&old_ctx) {
+                debug_assert!(new != 0, "GC pointer map contains null address");
+                // SAFETY: as above — a relocated address for this exact object.
+                e.context = unsafe { ObjectRef::from_raw(new as *mut u8) };
             }
         }
     }
@@ -11679,6 +11702,157 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
     out
 }
 
+/// Slot on the synthetic `HttpExchange` holding the authenticated
+/// `HttpPrincipal` (null until an `Authenticator.Success` supplies one).
+///
+/// Slots 0..=7 are all taken by the dispatcher (method, URI, request headers,
+/// response headers, request body, status, response chunks, response-length
+/// hint), so the principal takes a ninth. That is safe here because
+/// `re10_dispatch_pending` is the ONLY place an `HttpExchange` is allocated and
+/// `alloc_concurrent_synthetic` sizes the instance from `max(requested, real)` —
+/// `class_manager`'s `instance_fields(8)` is a floor for the class, not a cap on
+/// the instance. Readers still bounds-check with `object_num_fields` so an
+/// exchange minted anywhere else simply reports "no principal" instead of
+/// running off the end of the object.
+const HEX_PRINCIPAL: usize = 8;
+const HEX_NUM_FIELDS: usize = 9;
+
+/// The three `Authenticator.Result` subclasses the `com.sun.net.httpserver`
+/// contract defines. None of them is `final` in the JDK, so results are
+/// classified by walking the receiver's ancestry rather than by an exact name
+/// match.
+enum AuthResultKind {
+    Success,
+    Retry,
+    Failure,
+}
+
+/// Verdict of the per-context authentication gate.
+enum AuthGate {
+    /// Run the handler: either the context has no authenticator at all, or the
+    /// authenticator returned `Success` (and its principal is now on the
+    /// exchange).
+    Proceed,
+    /// Answer the client with this status and an empty body; the handler is not
+    /// invoked. Covers `Retry`, `Failure`, and every way the authenticator can
+    /// fail to produce a usable verdict.
+    Reject(i32),
+}
+
+fn re10_auth_result_kind(ctx: &dyn NativeContext, result: ObjectRef) -> Option<AuthResultKind> {
+    let mut cid = ctx.class_id_of_object(result);
+    // Bounded walk: `Result` sits one or two links above the concrete subclass,
+    // and the bound keeps a pathological/self-referential chain from spinning.
+    for _ in 0..16 {
+        match ctx.class_name_of_id(cid)?.as_str() {
+            "com/sun/net/httpserver/Authenticator$Success" => {
+                return Some(AuthResultKind::Success)
+            }
+            "com/sun/net/httpserver/Authenticator$Retry" => return Some(AuthResultKind::Retry),
+            "com/sun/net/httpserver/Authenticator$Failure" => {
+                return Some(AuthResultKind::Failure)
+            }
+            _ => {}
+        }
+        cid = ctx.superclass_of(cid)?;
+    }
+    None
+}
+
+/// Run the `HttpContext`'s `Authenticator` (if any) against `ex0`.
+///
+/// `ex_pin`/`ex0` are the caller's pin handle and original address for the
+/// exchange: authenticating runs arbitrary Java bytecode (`BasicAuthenticator`
+/// allocates strings, reads the request headers and writes `WWW-Authenticate`
+/// into the response headers), so every use of the exchange here re-reads the
+/// forwarded address instead of trusting a Rust local.
+///
+/// Nothing thrown by the authenticator is allowed to escape: this runs on the
+/// dispatcher thread's accept loop, where an error would abandon the connection
+/// and take the request pump down with it. A throw is a 500, exactly as the
+/// `HttpHandler.handle` backstop treats a broken handler.
+fn re10_authenticate(
+    ctx: &mut dyn NativeContext,
+    hctx: ObjectRef,
+    ex_pin: usize,
+    ex0: ObjectRef,
+) -> AuthGate {
+    // Cheap probe first. `HttpContext.getAuthenticator` is a registered native
+    // that only looks the context up in a side table, so the no-authenticator
+    // path costs one native call and allocates nothing.
+    let auth0 = match ctx.invoke_virtual(
+        hctx,
+        "getAuthenticator",
+        "()Lcom/sun/net/httpserver/Authenticator;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return AuthGate::Proceed,
+    };
+    // Pinned from here on; `unpin_native_roots(auth_pin)` at the end releases
+    // this and the result (both pinned after the caller's batch, so the
+    // caller's handler/context/exchange pins survive).
+    let auth_pin = ctx.pin_native_root(auth0);
+    let ex = ctx.read_native_pin(ex_pin, ex0);
+    let auth = ctx.read_native_pin(auth_pin, auth0);
+    let result0 = match ctx.invoke_virtual(
+        auth,
+        "authenticate",
+        "(Lcom/sun/net/httpserver/HttpExchange;)Lcom/sun/net/httpserver/Authenticator$Result;",
+        &[Value::Object(Some(ex))],
+    ) {
+        Ok(Some(Value::Object(Some(r)))) => r,
+        // A throw, or a null `Result` (which would NPE inside the JDK's own
+        // AuthFilter) — either way the request is NOT authenticated.
+        _ => {
+            ctx.unpin_native_roots(auth_pin);
+            return AuthGate::Reject(500);
+        }
+    };
+    let result_pin = ctx.pin_native_root(result0);
+    // Classified before the match so the shared borrow of `ctx` it needs cannot
+    // overlap the mutable borrows the arms take.
+    let kind = re10_auth_result_kind(&*ctx, result0);
+    let gate = match kind {
+        Some(AuthResultKind::Success) => {
+            let result = ctx.read_native_pin(result_pin, result0);
+            let principal = match ctx.invoke_virtual(
+                result,
+                "getPrincipal",
+                "()Lcom/sun/net/httpserver/HttpPrincipal;",
+                &[],
+            ) {
+                Ok(Some(p @ Value::Object(Some(_)))) => p,
+                _ => Value::Object(None),
+            };
+            // Nothing allocates between reading the principal and storing it,
+            // so the value itself needs no pin; the exchange does.
+            let ex = ctx.read_native_pin(ex_pin, ex0);
+            if ctx.object_num_fields(ex) > HEX_PRINCIPAL {
+                ctx.set_field(ex, HEX_PRINCIPAL, principal);
+            }
+            AuthGate::Proceed
+        }
+        Some(AuthResultKind::Retry) | Some(AuthResultKind::Failure) => {
+            let result = ctx.read_native_pin(result_pin, result0);
+            // Both subclasses expose the status the same way. 401 is the
+            // fallback the JDK's own BasicAuthenticator would have produced if
+            // the accessor is unreadable.
+            let code = match ctx.invoke_virtual(result, "getResponseCode", "()I", &[]) {
+                Ok(Some(v)) => v.as_int().unwrap_or(401),
+                _ => 401,
+            };
+            AuthGate::Reject(code)
+        }
+        // A `Result` that is none of the three documented subclasses is not a
+        // pass — the JDK filter would fall through without answering at all,
+        // which here would silently serve the request unauthenticated.
+        None => AuthGate::Reject(500),
+    };
+    ctx.unpin_native_roots(auth_pin);
+    gate
+}
+
 fn re10_dispatch_pending(
     ctx: &mut dyn NativeContext,
     server_id: i32,
@@ -11701,11 +11875,11 @@ fn re10_dispatch_pending(
                 hs.iter()
                     .filter(|e| req.uri.starts_with(&e.path_prefix))
                     .max_by_key(|e| e.path_prefix.len())
-                    .map(|e| e.handler)
+                    .map(|e| (e.handler, e.context))
             })
         };
         let (status, body_bytes, resp_headers, len_hint) = match handler_info {
-            Some(h) => {
+            Some((h, hctx0)) => {
                 // GC-safety: this native dispatcher holds the handler (`h`) and
                 // the HttpExchange (`ex`) across many VM allocations below
                 // (create_string, build-headers, byte arrays, ref array, and the
@@ -11721,7 +11895,15 @@ fn re10_dispatch_pending(
                 // allocation between its create and its set), so values need no
                 // pin. `unpin_native_roots(h_pin)` releases the whole batch.
                 let h_pin = ctx.pin_native_root(h);
-                let ex0 = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpExchange", 8);
+                // The owning HttpContext rides along in the same pin batch: the
+                // authentication gate below dereferences it after every one of
+                // those allocations.
+                let hctx_pin = ctx.pin_native_root(hctx0);
+                let ex0 = alloc_concurrent_synthetic(
+                    ctx,
+                    "com/sun/net/httpserver/HttpExchange",
+                    HEX_NUM_FIELDS,
+                );
                 let ex_pin = ctx.pin_native_root(ex0);
 
                 let m = ctx.create_string(&req.method);
@@ -11759,17 +11941,50 @@ fn re10_dispatch_pending(
                 let ex = ctx.read_native_pin(ex_pin, ex0);
                 ctx.set_field(ex, 6, Value::Object(Some(resp_body_chunks)));
                 ctx.set_field(ex, 7, Value::Int(0));
+                // No principal until an `Authenticator.Success` supplies one;
+                // `HttpExchange.getPrincipal` reads this slot.
+                ctx.set_field(ex, HEX_PRINCIPAL, Value::Object(None));
 
-                // Re-read both pinned roots immediately before the invoke (the
-                // exchange-build allocations above may have relocated them).
-                let h = ctx.read_native_pin(h_pin, h);
-                let ex = ctx.read_native_pin(ex_pin, ex0);
-                let _ = ctx.invoke_virtual(
-                    h,
-                    "handle",
-                    "(Lcom/sun/net/httpserver/HttpExchange;)V",
-                    &[Value::Object(Some(ex))],
-                );
+                // com.sun.net.httpserver contract: a context with an
+                // Authenticator attached authenticates BEFORE the handler runs,
+                // and a Retry/Failure result answers the client itself without
+                // ever reaching the handler. `re10_authenticate` short-circuits
+                // to `Proceed` (one native getter call, no allocation) when the
+                // context has no authenticator, which is the overwhelmingly
+                // common case.
+                let hctx = ctx.read_native_pin(hctx_pin, hctx0);
+                let gate = re10_authenticate(ctx, hctx, ex_pin, ex0);
+                match gate {
+                    AuthGate::Proceed => {
+                        // Re-read both pinned roots immediately before the invoke
+                        // (the exchange-build allocations above, and any
+                        // authenticator bytecode, may have relocated them).
+                        let h = ctx.read_native_pin(h_pin, h);
+                        let ex = ctx.read_native_pin(ex_pin, ex0);
+                        let _ = ctx.invoke_virtual(
+                            h,
+                            "handle",
+                            "(Lcom/sun/net/httpserver/HttpExchange;)V",
+                            &[Value::Object(Some(ex))],
+                        );
+                    }
+                    AuthGate::Reject(code) => {
+                        // Same idiom as the `HttpHandler.handle` backstop in
+                        // `phases_late::net_channels`: report the status through
+                        // the exchange's own natives (`-1` = no response body)
+                        // and close it, so the serialization tail below emits it
+                        // exactly like any handler-produced response.
+                        let ex = ctx.read_native_pin(ex_pin, ex0);
+                        let _ = ctx.invoke_virtual(
+                            ex,
+                            "sendResponseHeaders",
+                            "(IJ)V",
+                            &[Value::Int(code), Value::Long(-1)],
+                        );
+                        let ex = ctx.read_native_pin(ex_pin, ex0);
+                        let _ = ctx.invoke_virtual(ex, "close", "()V", &[]);
+                    }
+                }
                 // The handler ran bytecode (allocations) — refresh `ex` before
                 // reading its populated result fields.
                 let ex = ctx.read_native_pin(ex_pin, ex0);
@@ -12256,20 +12471,33 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let path_val = args.get(1).copied().unwrap_or(Value::Object(None));
             let path = value_or_string(ctx, path_val, "/");
-            let handler = obj_arg(args, 2).map_err(|_| ioex("createContext: null handler"))?;
+            let handler0 = obj_arg(args, 2).map_err(|_| ioex("createContext: null handler"))?;
             let id = ctx.get_field(this, HS_SERVER_ID).as_int().unwrap_or(-1);
+            // The registry entry now carries the context object too, so the
+            // context has to exist before the entry is pushed. That puts the
+            // HttpContext/String allocations BEFORE the only thing that roots
+            // `handler` — pin it across them (native stale-local family) so the
+            // entry, and the context's slot 1, record the live address rather
+            // than a vacated from-space slot.
+            let h_pin = ctx.pin_native_root(handler0);
+            let hctx0 = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
+            let hctx_pin = ctx.pin_native_root(hctx0);
+            let path_s = ctx.create_string(&path);
+            let hctx = ctx.read_native_pin(hctx_pin, hctx0);
+            ctx.set_field(hctx, 0, Value::Object(Some(path_s)));
+            let handler = ctx.read_native_pin(h_pin, handler0);
+            ctx.set_field(hctx, 1, Value::Object(Some(handler)));
             if id >= 0 {
                 if let Some(state) = server_registry().lock().get(&id) {
                     state.handlers.lock().push(HttpHandlerEntry {
                         path_prefix: path.clone(),
                         handler,
+                        context: hctx,
                     });
                 }
             }
-            let hctx = alloc_concurrent_synthetic(ctx, "com/sun/net/httpserver/HttpContext", 2);
-            let path_s = ctx.create_string(&path);
-            ctx.set_field(hctx, 0, Value::Object(Some(path_s)));
-            ctx.set_field(hctx, 1, Value::Object(Some(handler)));
+            // Releases the whole batch (handler + context).
+            ctx.unpin_native_roots(h_pin);
             Ok(Some(Value::Object(Some(hctx))))
         },
     );
@@ -12440,6 +12668,24 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(hex, "close", "()V", |_ctx, _args| Ok(None));
+    // `getPrincipal()` is the observable half of the authentication gate: the
+    // dispatcher writes the `HttpPrincipal` carried by an
+    // `Authenticator.Success` into `HEX_PRINCIPAL` before it calls the handler,
+    // and the handler reads it back through here. Null for an unauthenticated
+    // context, matching the real server (whose `HttpExchangeImpl.principal` is
+    // likewise only set by the auth filter).
+    r.register(
+        hex,
+        "getPrincipal",
+        "()Lcom/sun/net/httpserver/HttpPrincipal;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= HEX_PRINCIPAL {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(ctx.get_field(this, HEX_PRINCIPAL)))
+        },
+    );
 
     let rb = "com/sun/net/httpserver/HttpExchange$ResponseBody";
     r.register(rb, "write", "([BII)V", |ctx, args| {

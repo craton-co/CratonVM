@@ -27159,6 +27159,68 @@ pub(crate) fn is_ffm_memory_layout_native_override(
         )
 }
 
+/// FFM `java.lang.foreign.Arena` — the interface-native exemption that pairs
+/// with `force_ffm_memory_segment_interface_native` (vm/src/vm/vm_exec.rs).
+///
+/// `Arena.ofConfined()/ofAuto()/ofShared()/global()` are STATIC interface
+/// methods, so their registered natives always run (the interface skip only
+/// covers instance methods) and hand back a synthetic receiver stamped with
+/// the literal interface class name `java/lang/foreign/Arena`
+/// (native-builtins/src/phases_late/foreign_ffm.rs `p67_new_arena`, which also
+/// gives the arena the session that `scope()` hands out and `close()` closes).
+/// Every lifecycle method on that receiver is a NON-STATIC method whose
+/// declaring class is an interface — exactly the shape both dispatch guards
+/// skip — so `scope()`/`close()`/`allocate(…)` would resolve to the interface's
+/// own declaration (abstract in a real JDK image, a stub body under
+/// `--synthetic-jdk`) instead of the natives that own the arena's lifetime.
+/// `MemorySegment.scope` is already force-routed for precisely this reason;
+/// without this twin the two disagree and `arena.scope() != segment.scope()`.
+///
+/// Only triples that actually have a registration are listed: `scope`, `close`,
+/// the four `allocate` overloads and `allocateFrom`/`allocateUtf8String`
+/// (foreign_ffm.rs `register_p67_foreign_memory` + panama.rs
+/// `register_pe_arena`/`register_pe2_string_marshaling`). `allocateArray` has
+/// no native behind it on any class and is deliberately absent — forcing a name
+/// with no registration would only cost a fruitless registry probe.
+///
+/// A REAL `jdk.internal.foreign.ArenaImpl` receiver is unaffected: it declares
+/// `scope()`, `close()` and `allocate(long, long)` concretely, so dispatch
+/// resolves with `jdk/internal/foreign/ArenaImpl` as the declaring class and
+/// never matches this predicate. (The session natives these bodies call do have
+/// a real-receiver escape — `p67_session_delegate`'s
+/// `invoke_virtual_bytecode_only` — but this predicate never needs it, because
+/// a real `ArenaImpl` is not routed here in the first place.)
+pub(crate) fn is_ffm_arena_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/foreign/Arena"
+        && matches!(
+            (method_name, descriptor),
+            ("scope", "()Ljava/lang/foreign/MemorySegment$Scope;")
+                | ("close", "()V")
+                | ("allocate", "(J)Ljava/lang/foreign/MemorySegment;")
+                | ("allocate", "(JJ)Ljava/lang/foreign/MemorySegment;")
+                | (
+                    "allocate",
+                    "(Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocate",
+                    "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocateFrom",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocateUtf8String",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;"
+                )
+        )
+}
+
 pub(crate) fn is_file_channel_impl_open_native_override(
     class_name: &str,
     method_name: &str,
@@ -29345,6 +29407,14 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_ffm_memory_layout_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // FFM Arena lifecycle. Reaching it from here is what wires the exemption
+    // into `try_stackless_invoke`'s step-6 interface guard (via
+    // `should_force_registered_native_over_bytecode`), so that path agrees with
+    // the explicit `force_ffm_arena_interface_native` term in
+    // `invoke_on_class_shared`. See `is_ffm_arena_native_override`.
+    if is_ffm_arena_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
@@ -44173,6 +44243,60 @@ mod tests {
             "java/lang/foreign/Linker",
             "find",
             descriptor
+        ));
+    }
+
+    #[test]
+    fn ffm_arena_force_native_covers_lifecycle() {
+        let arena = "java/lang/foreign/Arena";
+        for (name, descriptor) in [
+            ("scope", "()Ljava/lang/foreign/MemorySegment$Scope;"),
+            ("close", "()V"),
+            ("allocate", "(J)Ljava/lang/foreign/MemorySegment;"),
+            ("allocate", "(JJ)Ljava/lang/foreign/MemorySegment;"),
+            (
+                "allocate",
+                "(Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocate",
+                "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocateFrom",
+                "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocateUtf8String",
+                "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+            ),
+        ] {
+            assert!(
+                is_ffm_arena_native_override(arena, name, descriptor),
+                "Arena.{name}{descriptor} must be exempt from the interface instance-method skip"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(arena, name, descriptor),
+                "step-6 dispatch must force the Arena.{name}{descriptor} native"
+            );
+        }
+        // No native is registered for these, so they must NOT be force-routed.
+        assert!(!is_ffm_arena_native_override(
+            arena,
+            "allocateArray",
+            "(Ljava/lang/foreign/MemoryLayout;J)Ljava/lang/foreign/MemorySegment;"
+        ));
+        // A real `ArenaImpl` declares scope/close/allocate concretely, so it
+        // resolves under its own name and must never match.
+        assert!(!is_ffm_arena_native_override(
+            "jdk/internal/foreign/ArenaImpl",
+            "close",
+            "()V"
+        ));
+        assert!(!is_ffm_arena_native_override(
+            "jdk/internal/foreign/ArenaImpl",
+            "allocate",
+            "(JJ)Ljava/lang/foreign/MemorySegment;"
         ));
     }
 

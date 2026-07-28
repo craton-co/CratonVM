@@ -72,7 +72,7 @@ use std::sync::{
 };
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
@@ -469,11 +469,30 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     // Arc itself here, just the side-effect of interning the name.
     let _mirror = crate::wildfly_core::get_logger(name);
     let obj = alloc_concurrent_synthetic(ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS);
+    // GC SAFETY: every step below (`create_string`, `Level.<clinit>` via
+    // `resolve_standard_level`, the recursive parent demand-creation) can
+    // allocate and therefore move `obj`. Keep the fresh Logger rooted and
+    // re-derive it after each of those boundaries.
+    let obj_pin = ctx.pin_native_root(obj);
+    let mut obj = obj;
+    obj = populate_real_logger_bundle(ctx, obj_pin, obj);
     let name_obj = ctx.create_string(name);
+    let name_pin = ctx.pin_native_root(name_obj);
+    obj = ctx.read_native_pin(obj_pin, obj);
+    let name_obj = ctx.read_native_pin(name_pin, name_obj);
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
+    // NB: deliberately NOT also written by name. On a real-JDK Logger the
+    // by-name `name` field is slot 2 — the very slot this module uses for the
+    // parent link — so writing both aliases one over the other, and a String
+    // landing in the parent slot is what `resolve_jul_handler_list`'s legacy
+    // fallback would then mistake for a handler list
+    // (`NoSuchMethodError: java/lang/String.size()I`).
+    // `read_jul_logger_name` already falls back to slot 0 for this shape.
+    ctx.unpin_native_roots(name_pin);
     if name.is_empty() {
         ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
         let default_level = resolve_standard_level(ctx, "INFO");
+        obj = ctx.read_native_pin(obj_pin, obj);
         ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(default_level));
     } else {
         ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
@@ -482,9 +501,75 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
             None => "",
         };
         let parent = get_or_create_logger(ctx, parent_name);
+        let parent_pin = ctx.pin_native_root(parent);
+        obj = ctx.read_native_pin(obj_pin, obj);
+        let parent = ctx.read_native_pin(parent_pin, parent);
         ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(Some(parent)));
+        ctx.unpin_native_roots(parent_pin);
     }
+    obj = ctx.read_native_pin(obj_pin, obj);
+    ctx.unpin_native_roots(obj_pin);
     obj
+}
+
+/// Resolve `java.util.logging.Logger.NO_RESOURCE_BUNDLE` — the shared
+/// `Logger$LoggerBundle` sentinel the real constructor assigns to every
+/// `Logger`'s `loggerBundle` field.
+///
+/// Returns `None` when the real class body isn't the one loaded (the compact
+/// synthetic `Logger` has neither the static nor the nested class), which is
+/// the signal for the caller to skip the field write entirely.
+fn real_logger_no_resource_bundle(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let logger_class = ctx.ensure_class_initialized(CLS_JUL_LOGGER).ok()?;
+    if let Some(idx) = ctx.static_field_index_by_name(logger_class, "NO_RESOURCE_BUNDLE") {
+        if let Value::Object(Some(bundle)) = ctx.get_static_field(logger_class, idx) {
+            return Some(bundle);
+        }
+    }
+    // The static is present but still null (clinit ordering): mint an
+    // equivalent empty bundle. `LoggerBundle`'s two fields
+    // (`resourceBundleName`, `userBundle`) are BOTH null for the no-bundle
+    // case, and `isSystemBundle()` is an identity comparison against a
+    // different singleton — so a zero-initialized instance answers every read
+    // the JUL bytecode performs exactly as the sentinel does. Guard on the
+    // class actually being loaded so we never synthesize a bogus one.
+    let bundle_class = "java/util/logging/Logger$LoggerBundle";
+    ctx.class_id_by_name(bundle_class)?;
+    match ctx.new_object(bundle_class) {
+        Ok(Some(Value::Object(Some(bundle)))) => Some(bundle),
+        _ => None,
+    }
+}
+
+/// Populate the real-JDK `Logger.loggerBundle` field on a Logger this module
+/// allocated natively.
+///
+/// In real-JDK mode `alloc_concurrent_synthetic` hands back an instance with
+/// the REAL `java.util.logging.Logger` layout but no constructor run, so every
+/// reference field is null — including `loggerBundle`. Real JUL bytecode that
+/// still executes over such an instance (`throwing`, `logrb`, `doLog`,
+/// `getEffectiveLoggerBundle`) dereferences it unconditionally and dies with
+/// `NullPointerException: Cannot invoke
+/// "java.util.logging.Logger$LoggerBundle.isSystemBundle()" because "lb" is
+/// null`. Seed it with the same sentinel the real constructor uses.
+///
+/// `logger_pin` must be a live pin for `logger`; the (possibly relocated)
+/// Logger is returned.
+fn populate_real_logger_bundle(
+    ctx: &mut dyn NativeContext,
+    logger_pin: usize,
+    logger: ObjectRef,
+) -> ObjectRef {
+    let Some(bundle) = real_logger_no_resource_bundle(ctx) else {
+        return ctx.read_native_pin(logger_pin, logger);
+    };
+    let bundle_pin = ctx.pin_native_root(bundle);
+    let logger = ctx.read_native_pin(logger_pin, logger);
+    let bundle = ctx.read_native_pin(bundle_pin, bundle);
+    // No-op on the compact synthetic shape, which declares no such field.
+    ctx.set_field_by_name(logger, "loggerBundle", Value::Object(Some(bundle)));
+    ctx.unpin_native_roots(bundle_pin);
+    logger
 }
 
 /// Look up a cached logger by name; if absent, allocate one and cache
@@ -2405,9 +2490,10 @@ fn native_jul_logger_log_level_msg(
 }
 
 /// `java/util/logging/Logger.log(Level, String, Object)` — single-param
-/// sibling of `log(Level, String, Object[])` (JDK wraps `param1` in a
-/// one-element array internally before building the LogRecord). Same
-/// `loggerBundle` NPE risk without a native; reuse the `{0}` substitution.
+/// sibling of `log(Level, String, Object[])`. The JDK wraps `param1` in a
+/// one-element `Object[]` before building the LogRecord, and
+/// `LogRecord.getParameters()` must report it exactly that way, so do the same
+/// here rather than pre-formatting the text.
 fn native_jul_logger_log_param(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
@@ -2421,24 +2507,34 @@ fn native_jul_logger_log_param(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         Some(Value::Object(o)) => *o,
         _ => None,
     };
-    let param_obj = args.get(3).copied().unwrap_or(Value::Object(None));
-    let logger_name = this
-        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let tag = jul_level_tag(ctx, level_obj);
-    let template = message_obj
-        .and_then(|o| ctx.read_string(o))
-        .unwrap_or_default();
-    let rendered = match param_obj {
-        Value::Object(Some(o)) => jul_resolve_msg(ctx, o),
-        _ => String::new(),
+    let param_obj = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
     };
-    let message = template.replace("{0}", &rendered);
-    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
-    Ok(None)
+    // GC SAFETY: the `Object[]` allocation below can move every argument.
+    // Pin them all first, then re-derive each one from its pin.
+    let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
+    let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
+    let message_pin = message_obj.map(|o| (ctx.pin_native_root(o), o));
+    let param_pin = param_obj.map(|o| (ctx.pin_native_root(o), o));
+    let params = ctx.new_array(ArrayElementType::Reference, 1);
+    let params_pin = ctx.pin_native_root(params);
+    let base_pin = this_pin
+        .map(|(p, _)| p)
+        .or_else(|| level_pin.map(|(p, _)| p))
+        .or_else(|| message_pin.map(|(p, _)| p))
+        .or_else(|| param_pin.map(|(p, _)| p))
+        .unwrap_or(params_pin);
+    let param_obj = param_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let params = ctx.read_native_pin(params_pin, params);
+    ctx.set_array_element(params, 0, Value::Object(param_obj));
+    let this = this_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let level_obj = level_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let message_obj = message_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let params = ctx.read_native_pin(params_pin, params);
+    let result = jul_log_parameterized(ctx, this, level_obj, message_obj, Some(params), None);
+    ctx.unpin_native_roots(base_pin);
+    result
 }
 
 /// `java/util/logging/Logger.log(Level, String, Object[])` — the
@@ -2457,10 +2553,10 @@ fn native_jul_logger_log_param(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// warning/error Jython prints during `PySystemState` bootstrap
 /// (`initConsole` → `writeConsoleWarning`), so any embedder that boots a
 /// `PythonInterpreter`/JSR-223 `jython` engine hit this NPE before a
-/// single line of Python ever ran. Do the same `{n}`-placeholder
-/// substitution `MessageFormat` would (params are logged messages, not
-/// user format strings — a plain positional replace is sufficient here,
-/// we don't need MessageFormat's quoting/choice-format machinery).
+/// single line of Python ever ran. Build the record with the RAW pattern and
+/// the parameter array attached, exactly as HotSpot does — the `{n}`
+/// substitution belongs to the Formatter, and only the console-sink fallback
+/// (for a logger with no handler chain at all) performs it here.
 fn native_jul_logger_log_params(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(o)) => *o,
@@ -2478,32 +2574,114 @@ fn native_jul_logger_log_params(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(o)) => *o,
         _ => None,
     };
-    let logger_name = this
-        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let tag = jul_level_tag(ctx, level_obj);
-    let template = message_obj
-        .and_then(|o| ctx.read_string(o))
-        .unwrap_or_default();
-    let message = match params_arr {
-        Some(arr) => {
+    jul_log_parameterized(ctx, this, level_obj, message_obj, params_arr, None)
+}
+
+/// Shared body of the parameterized / throwable-carrying `Logger.log`
+/// overloads.
+///
+/// Builds a real `LogRecord` around the RAW message pattern plus its
+/// `parameters` array and/or `thrown`, and publishes it through the logger's
+/// handler chain (its own handlers, else the nearest ancestor's, honouring
+/// `useParentHandlers`). Only when NO handler took the record does it fall
+/// back to the console sink these natives used to write unconditionally — so
+/// output that exists today is preserved for handler-less loggers, while a
+/// logger with a handler now observes what HotSpot delivers: the untouched
+/// pattern in `getMessage()`, the arguments in `getParameters()`, and the
+/// throwable in `getThrown()`.
+fn jul_log_parameterized(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+    level_obj: Option<ObjectRef>,
+    message_obj: Option<ObjectRef>,
+    params: Option<ObjectRef>,
+    thrown: Option<ObjectRef>,
+) -> MethodCallResult {
+    // GC SAFETY: everything below (record construction, handler dispatch,
+    // `toString()` on the parameters) is GC-capable. Pin every reference up
+    // front and re-derive each one after every such boundary.
+    let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
+    let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
+    let message_pin = message_obj.map(|o| (ctx.pin_native_root(o), o));
+    let params_pin = params.map(|o| (ctx.pin_native_root(o), o));
+    let thrown_pin = thrown.map(|o| (ctx.pin_native_root(o), o));
+    let base_pin = this_pin
+        .map(|(p, _)| p)
+        .or_else(|| level_pin.map(|(p, _)| p))
+        .or_else(|| message_pin.map(|(p, _)| p))
+        .or_else(|| params_pin.map(|(p, _)| p))
+        .or_else(|| thrown_pin.map(|(p, _)| p));
+    notify_jul_logger_filter(ctx, this, level_obj, message_obj, thrown);
+    let this = this_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let level_obj = level_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let message_obj = message_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let params = params_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let thrown = thrown_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+    let delivered = match (this, level_obj, message_obj) {
+        (Some(logger), Some(level), Some(message)) => {
+            publish_to_jul_handlers_full(ctx, logger, level, message, None, None, params, thrown)
+                // A handler that threw must not turn into an application-visible
+                // exception raised from the logging call itself; fall back to the
+                // console sink instead, exactly as if there had been no handler.
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
+    if jul_dbg_enabled() {
+        eprintln!(
+            "[JUL-DBG] jul_log_parameterized: params={} thrown={} delivered_to_handler={delivered}",
+            params.is_some(),
+            thrown.is_some()
+        );
+    }
+    if !delivered {
+        let this = this_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+        let level_obj = level_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+        let message_obj = message_pin.map(|(p, o)| ctx.read_native_pin(p, o));
+        let logger_name = this
+            .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let tag = jul_level_tag(ctx, level_obj);
+        let mut text = message_obj
+            .and_then(|o| ctx.read_string(o))
+            .unwrap_or_default();
+        // The console sink has no Formatter, so substitute the placeholders
+        // here (params are logged values, not user format strings — a plain
+        // positional replace is sufficient; MessageFormat's quoting /
+        // choice-format machinery is not needed).
+        if let Some((pin, obj)) = params_pin {
+            let arr = ctx.read_native_pin(pin, obj);
             let n = ctx.array_length(arr);
-            let mut out = template;
             for i in 0..n {
+                let arr = ctx.read_native_pin(pin, obj);
                 let rendered = match ctx.get_array_element(arr, i) {
                     Value::Object(Some(o)) => jul_resolve_msg(ctx, o),
                     _ => String::new(),
                 };
-                out = out.replace(&format!("{{{i}}}"), &rendered);
+                text = text.replace(&format!("{{{i}}}"), &rendered);
             }
-            out
         }
-        None => template,
-    };
-    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
+        match thrown_pin.map(|(p, o)| ctx.read_native_pin(p, o)) {
+            Some(t) => {
+                let rendered = jul_render_throwable(ctx, t);
+                if text.is_empty() {
+                    crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {rendered}"));
+                } else {
+                    crate::emit_framework_log(
+                        ctx,
+                        &format!("{tag} [{logger_name}] {text}\n{rendered}"),
+                    );
+                }
+            }
+            None => crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {text}")),
+        }
+    }
+    if let Some(base) = base_pin {
+        ctx.unpin_native_roots(base);
+    }
     Ok(None)
 }
 
@@ -2944,10 +3122,25 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             let message_obj = message_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
             let src_cls_obj = src_cls_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
             let src_mth_obj = src_mth_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+            let throwable_obj = throwable_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
             let result = if let (Some(logger), Some(level), Some(message)) =
                 (this, level_obj, message_obj)
             {
-                publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)
+                // The 5-arg `logp` overload's Throwable belongs ON the record
+                // (`LogRecord.getThrown()`), not only in a console detail
+                // line: `Logger.throwing` is defined in terms of exactly this
+                // call, and a handler that reports the throwable saw null.
+                publish_to_jul_handlers_full(
+                    ctx,
+                    logger,
+                    level,
+                    message,
+                    src_cls_obj,
+                    src_mth_obj,
+                    None,
+                    throwable_obj,
+                )
+                .map(|_| None)
             } else {
                 Ok(None)
             };
@@ -2995,9 +3188,29 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     } else {
         crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
     }
+    // `emit_framework_log` dispatches `println` into (overridable) Java
+    // bytecode and allocates the argument String, so every reference below has
+    // to come off its pin again.
+    let this = this_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let level_obj = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let message_obj = message_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let throwable_obj = throwable_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_cls_obj = src_cls_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_mth_obj = src_mth_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
     let result = if let (Some(logger), Some(level), Some(message)) = (this, level_obj, message_obj)
     {
-        publish_to_jul_handlers_src(ctx, logger, level, message, src_cls_obj, src_mth_obj)
+        // Same as the trace-level arm above: keep the Throwable on the record.
+        publish_to_jul_handlers_full(
+            ctx,
+            logger,
+            level,
+            message,
+            src_cls_obj,
+            src_mth_obj,
+            None,
+            throwable_obj,
+        )
+        .map(|_| None)
     } else {
         Ok(None)
     };
@@ -3005,6 +3218,233 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         ctx.unpin_native_roots(base);
     }
     result
+}
+
+/// Shared body of `java/util/logging/Logger.entering` / `exiting` /
+/// `throwing`.
+///
+/// The spec defines all three purely as a FINER record carrying a fixed
+/// message ("ENTRY"/"RETURN"/"THROW"), the caller-supplied source class and
+/// method, and — for `throwing` — the Throwable. The real-JDK bytecode builds
+/// that record itself and hands it to the private `doLog`, which dereferences
+/// the private `loggerBundle` field; on a Logger this module allocated
+/// natively (no constructor run) that field is null, so `throwing` died with
+/// `NullPointerException: Cannot invoke
+/// "java.util.logging.Logger$LoggerBundle.isSystemBundle()" because "lb" is
+/// null` and the whole method-trace family was unreliable. Build and publish
+/// the record from here so the outcome no longer depends on which JUL class
+/// body is loaded.
+///
+/// `args` is `(this, sourceClass, sourceMethod[, thrown])`.
+fn jul_trace_marker(ctx: &mut dyn NativeContext, args: &[Value], marker: &str) -> MethodCallResult {
+    if jul_dbg_enabled() {
+        eprintln!("[JUL-DBG] trace-marker native reached: {marker}");
+    }
+    let this = match args.first() {
+        // No receiver: nothing to log against. A trace convenience method must
+        // never raise out of the logging path itself.
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let src_cls = match args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let src_mth = match args.get(2) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let thrown = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    // `Level.<clinit>` and `create_string` both allocate: pin everything this
+    // native holds and re-read each reference afterwards. `this` is pinned
+    // first, so one `unpin_native_roots` releases the whole group.
+    let base_pin = ctx.pin_native_root(this);
+    let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
+    let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
+    let thrown_pin = thrown.map(|o| (ctx.pin_native_root(o), o));
+    let level = resolve_standard_level(ctx, "FINER");
+    let level_pin = level.map(|o| (ctx.pin_native_root(o), o));
+    let message = ctx.create_string(marker);
+    let message_pin = ctx.pin_native_root(message);
+    let this = ctx.read_native_pin(base_pin, this);
+    let message = ctx.read_native_pin(message_pin, message);
+    let level = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_cls = src_cls_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_mth = src_mth_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let thrown = thrown_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    notify_jul_logger_filter(ctx, Some(this), level, Some(message), thrown);
+    let this = ctx.read_native_pin(base_pin, this);
+    let message = ctx.read_native_pin(message_pin, message);
+    let level = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_cls = src_cls_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let src_mth = src_mth_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    let thrown = thrown_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
+    if let Some(level) = level {
+        // No console fallback: FINER is trace-level and `logp` deliberately
+        // keeps FINE/FINER/FINEST off the console sink, so a logger with no
+        // handler chain stays as quiet here as it is there.
+        let _ =
+            publish_to_jul_handlers_full(ctx, this, level, message, src_cls, src_mth, None, thrown);
+    }
+    ctx.unpin_native_roots(base_pin);
+    Ok(None)
+}
+
+/// Real JUL keeps `useParentHandlers` inside the private
+/// `Logger$ConfigurationData` (`config`), which our natively-constructed
+/// loggers never materialize — and the compact synthetic shape has no such
+/// field at all. Read it by name and treat everything except an explicit
+/// `false` as the JDK default (`true`), so a Logger shape that simply doesn't
+/// carry the flag can never silence an ancestor's handlers.
+///
+/// Deliberately a pure field read: dispatching `getUseParentHandlers()` would
+/// re-enter real bytecode that dereferences the same unmaterialized `config`.
+fn jul_use_parent_handlers(ctx: &dyn NativeContext, logger: ObjectRef) -> bool {
+    match ctx.get_field_by_name(logger, "config") {
+        Value::Object(Some(config)) => !matches!(
+            ctx.get_field_by_name(config, "useParentHandlers"),
+            Value::Int(0)
+        ),
+        _ => true,
+    }
+}
+
+/// Resolve the handler `ArrayList` that should receive a record published for
+/// `logger`: the logger's own handlers first, then (when `useParentHandlers`
+/// allows it) the nearest dotted-name ancestor that has any.
+///
+/// GC: the ancestor walk demand-creates loggers and therefore allocates, so
+/// callers MUST re-derive every reference they still hold — including `logger`
+/// itself — from its pin after this returns.
+fn resolve_jul_handler_list(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Option<ObjectRef> {
+    if let Some(handlers) = crate::jul_logger_handlers_get(ctx, logger) {
+        return Some(handlers);
+    }
+    // Only our legacy synthetic logger stores its parent/handler
+    // fallback at raw slot 2.  On a real JDK Logger that slot is the
+    // `name` String; treating it as an ArrayList reintroduces the
+    // `java/lang/String.size()I` failure when Tomcat's
+    // ClassLoaderLogManager creates a real per-webapp logger.
+    let synthetic_layout = matches!(ctx.get_field(logger, LOGGER_FIELD_NAME),
+        Value::Object(Some(name))
+            if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                == Some("java/lang/String"));
+    if synthetic_layout {
+        // `allocate_logger` now populates this same slot with a real parent
+        // `Logger` (see ancestor walk below) rather than a handlers list --
+        // don't misread it as one.
+        if let Value::Object(Some(list)) = ctx.get_field(logger, LOGGER_FIELD_PARENT) {
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(list))
+                .as_deref()
+                != Some(CLS_JUL_LOGGER)
+            {
+                return Some(list);
+            }
+        }
+    }
+    // No handlers on the exact logger (and it isn't the legacy slot-2 layout
+    // above): walk dotted-name ancestors up to the root, mirroring real JUL's
+    // parent-handler propagation (`useParentHandlers`, on by default). Our
+    // loggers have no real object parent chain to traverse here, so walk by
+    // name instead -- covers the common case of a single ConsoleHandler
+    // installed on the root logger by `readConfiguration`.
+    let logger_name = read_jul_logger_name(ctx, logger);
+    if !jul_use_parent_handlers(ctx, logger) {
+        return None;
+    }
+    let mut candidate: &str = &logger_name;
+    loop {
+        if candidate.is_empty() {
+            return None;
+        }
+        candidate = match candidate.rfind('.') {
+            Some(idx) => &candidate[..idx],
+            None => "",
+        };
+        let ancestor = get_or_create_logger(ctx, candidate);
+        if let Some(h) = crate::jul_logger_handlers_get(ctx, ancestor) {
+            return Some(h);
+        }
+    }
+}
+
+/// Publish an ALREADY-CONSTRUCTED `LogRecord` through `logger`'s handler
+/// chain — the `Logger.log(LogRecord)` path, and the tail of the real-JDK
+/// `throwing`/`entering` bytecode when it reaches `doLog`.
+///
+/// Returns `true` when at least one handler accepted the record so the caller
+/// can keep its console-sink fallback for handler-less loggers.
+fn publish_existing_record_to_jul_handlers(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    record: ObjectRef,
+) -> bool {
+    let logger_pin = ctx.pin_native_root(logger);
+    let record_pin = ctx.pin_native_root(record);
+    let Some(handlers) = resolve_jul_handler_list(ctx, logger) else {
+        ctx.unpin_native_roots(logger_pin);
+        return false;
+    };
+    let handlers_pin = ctx.pin_native_root(handlers);
+    // The resolution above allocates (ancestor demand-creation); re-derive
+    // both pinned references before touching them again.
+    let logger = ctx.read_native_pin(logger_pin, logger);
+    let record = ctx.read_native_pin(record_pin, record);
+    // Real `Logger.log(LogRecord)` stamps the logger name onto the record
+    // before dispatch; handlers such as `SLF4JBridgeHandler` look it up and
+    // silently drop records that carry a null name.
+    if matches!(
+        ctx.get_field_by_name(record, "loggerName"),
+        Value::Object(None)
+    ) {
+        let name = read_jul_logger_name(ctx, logger);
+        let name_obj = ctx.create_string(&name);
+        let record = ctx.read_native_pin(record_pin, record);
+        ctx.set_field_by_name(record, "loggerName", Value::Object(Some(name_obj)));
+    }
+    let handlers = ctx.read_native_pin(handlers_pin, handlers);
+    let size = match ctx.invoke_virtual(handlers, "size", "()I", &[]) {
+        Ok(Some(Value::Int(size))) if size > 0 => size as usize,
+        _ => {
+            ctx.unpin_native_roots(logger_pin);
+            return false;
+        }
+    };
+    let mut delivered = false;
+    for index in 0..size {
+        let handlers = ctx.read_native_pin(handlers_pin, handlers);
+        let handler = match ctx.invoke_virtual(
+            handlers,
+            "get",
+            "(I)Ljava/lang/Object;",
+            &[Value::Int(index as i32)],
+        ) {
+            Ok(Some(Value::Object(Some(handler)))) => handler,
+            _ => continue,
+        };
+        let handler_pin = ctx.pin_native_root(handler);
+        let handler = ctx.read_native_pin(handler_pin, handler);
+        let record = ctx.read_native_pin(record_pin, record);
+        if ctx
+            .invoke_virtual(
+                handler,
+                "publish",
+                "(Ljava/util/logging/LogRecord;)V",
+                &[Value::Object(Some(record))],
+            )
+            .is_ok()
+        {
+            delivered = true;
+        }
+        let handler = ctx.read_native_pin(handler_pin, handler);
+        let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
+    }
+    ctx.unpin_native_roots(logger_pin);
+    delivered
 }
 
 /// Deliver a native-intercepted JUL call to handlers added to the synthetic
@@ -3029,78 +3469,61 @@ fn publish_to_jul_handlers_src(
     src_cls: Option<ObjectRef>,
     src_mth: Option<ObjectRef>,
 ) -> MethodCallResult {
+    publish_to_jul_handlers_full(ctx, logger, level, message, src_cls, src_mth, None, None)?;
+    Ok(None)
+}
+
+/// `publish_to_jul_handlers_src` plus the two record payloads the
+/// parameterized / throwable-carrying `Logger.log` overloads must carry:
+/// `params` (the `Object[]` behind `LogRecord.getParameters()`) and `thrown`
+/// (`LogRecord.getThrown()`).
+///
+/// `message` stays the RAW pattern (`"one={0}"`) — HotSpot substitutes the
+/// `{n}` placeholders in the *Formatter*, never in the record, so a handler
+/// that inspects `getMessage()`/`getParameters()` must observe both halves
+/// separately.
+///
+/// Returns `true` when at least one handler accepted the record, so callers
+/// can keep the console-sink fallback for loggers that have no handler chain
+/// at all instead of silently dropping the line.
+#[allow(clippy::too_many_arguments)]
+fn publish_to_jul_handlers_full(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    level: ObjectRef,
+    message: ObjectRef,
+    src_cls: Option<ObjectRef>,
+    src_mth: Option<ObjectRef>,
+    params: Option<ObjectRef>,
+    thrown: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
     let base_pin = ctx.pin_native_root(logger);
     let level_pin = ctx.pin_native_root(level);
     let message_pin = ctx.pin_native_root(message);
     // Released with base_pin below (stack discipline).
     let src_cls_pin = src_cls.map(|o| (ctx.pin_native_root(o), o));
     let src_mth_pin = src_mth.map(|o| (ctx.pin_native_root(o), o));
-    let result = (|| {
+    let params_pin = params.map(|o| (ctx.pin_native_root(o), o));
+    let thrown_pin = thrown.map(|o| (ctx.pin_native_root(o), o));
+    let result: Result<bool, MethodCallFailed> = (|| {
+        let logger = ctx.read_native_pin(base_pin, logger);
+        let Some(handlers) = resolve_jul_handler_list(ctx, logger) else {
+            return Ok(false);
+        };
+        let handlers_pin = ctx.pin_native_root(handlers);
+        // The ancestor walk inside `resolve_jul_handler_list` demand-creates
+        // loggers (and so allocates): re-derive every reference used below
+        // from its pin before touching it again.
         let logger = ctx.read_native_pin(base_pin, logger);
         let level = ctx.read_native_pin(level_pin, level);
         let message = ctx.read_native_pin(message_pin, message);
-        let handlers = crate::jul_logger_handlers_get(ctx, logger).or_else(|| {
-            // Only our legacy synthetic logger stores its parent/handler
-            // fallback at raw slot 2.  On a real JDK Logger that slot is the
-            // `name` String; treating it as an ArrayList reintroduces the
-            // `java/lang/String.size()I` failure when Tomcat's
-            // ClassLoaderLogManager creates a real per-webapp logger.
-            let synthetic_layout = matches!(ctx.get_field(logger, LOGGER_FIELD_NAME),
-                Value::Object(Some(name))
-                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
-                        == Some("java/lang/String"));
-            if synthetic_layout {
-                match ctx.get_field(logger, LOGGER_FIELD_PARENT) {
-                    // `allocate_logger` now populates this same slot with a
-                    // real parent `Logger` (see ancestor walk below) rather
-                    // than a handlers list -- don't misread it as one.
-                    Value::Object(Some(list))
-                        if ctx.class_name_of_id(ctx.class_id_of_object(list)).as_deref()
-                            != Some(CLS_JUL_LOGGER) =>
-                    {
-                        Some(list)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            }
-        }).or_else(|| {
-            // No handlers on the exact logger (and it isn't the legacy
-            // slot-2 layout above): walk dotted-name ancestors up to the
-            // root, mirroring real JUL's parent-handler propagation
-            // (`useParentHandlers`, on by default). Our loggers have no
-            // real object parent chain to traverse pre-T19.H3-fix here, so
-            // walk by name instead -- covers the common case of a single
-            // ConsoleHandler installed on the root logger by
-            // `readConfiguration`.
-            let logger_name = read_jul_logger_name(ctx, logger);
-            let mut candidate: &str = &logger_name;
-            loop {
-                if candidate.is_empty() {
-                    return None;
-                }
-                candidate = match candidate.rfind('.') {
-                    Some(idx) => &candidate[..idx],
-                    None => "",
-                };
-                let ancestor = get_or_create_logger(ctx, candidate);
-                if let Some(h) = crate::jul_logger_handlers_get(ctx, ancestor) {
-                    return Some(h);
-                }
-            }
-        });
-        let Some(handlers) = handlers else {
-            return Ok(None);
-        };
-        let handlers_pin = ctx.pin_native_root(handlers);
         let record = match ctx.new_object_initialized(
             "java/util/logging/LogRecord",
             "(Ljava/util/logging/Level;Ljava/lang/String;)V",
             &[Value::Object(Some(level)), Value::Object(Some(message))],
         )? {
             Some(Value::Object(Some(record))) => record,
-            _ => return Ok(None),
+            _ => return Ok(false),
         };
         // GC SAFETY (2026-07-21, DoHead sporadic-residuals follow-up): pin
         // `record` immediately, before any of the field sets/invokes below.
@@ -3171,6 +3594,36 @@ fn publish_to_jul_handlers_src(
             let src = ctx.read_native_pin(pin, obj);
             ctx.set_field_by_name(record, "sourceMethodName", Value::Object(Some(src)));
         }
+        // `getParameters()` / `getThrown()` are as much a part of the record's
+        // public surface as the message is: HotSpot's `log(Level, String,
+        // Object)` / `log(Level, String, Object[])` / `log(Level, String,
+        // Throwable)` all stamp them here and let the Formatter do the `{n}`
+        // substitution. Write the field directly AND drive the JDK setter, for
+        // the same reason the message/level pair above does both.
+        if let Some((pin, obj)) = params_pin {
+            let params = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "parameters", Value::Object(Some(params)));
+            let _ = ctx.invoke_virtual(
+                record,
+                "setParameters",
+                "([Ljava/lang/Object;)V",
+                &[Value::Object(Some(params))],
+            );
+        }
+        let record = ctx.read_native_pin(record_pin, record);
+        if let Some((pin, obj)) = thrown_pin {
+            let thrown = ctx.read_native_pin(pin, obj);
+            ctx.set_field_by_name(record, "thrown", Value::Object(Some(thrown)));
+            let _ = ctx.invoke_virtual(
+                record,
+                "setThrown",
+                "(Ljava/lang/Throwable;)V",
+                &[Value::Object(Some(thrown))],
+            );
+        }
+        // Both setters above are overridable bytecode and can GC.
+        let record = ctx.read_native_pin(record_pin, record);
+        let message = ctx.read_native_pin(message_pin, message);
         let _ = ctx.invoke_virtual(
             record,
             "setMessage",
@@ -3207,8 +3660,9 @@ fn publish_to_jul_handlers_src(
         let handlers = ctx.read_native_pin(handlers_pin, handlers);
         let size = match ctx.invoke_virtual(handlers, "size", "()I", &[])? {
             Some(Value::Int(size)) if size > 0 => size as usize,
-            _ => return Ok(None),
+            _ => return Ok(false),
         };
+        let mut delivered = false;
         for index in 0..size {
             let handlers = ctx.read_native_pin(handlers_pin, handlers);
             let handler = match ctx.invoke_virtual(
@@ -3223,12 +3677,17 @@ fn publish_to_jul_handlers_src(
             let handler_pin = ctx.pin_native_root(handler);
             let handler = ctx.read_native_pin(handler_pin, handler);
             let record = ctx.read_native_pin(record_pin, record);
-            let _ = ctx.invoke_virtual(
-                handler,
-                "publish",
-                "(Ljava/util/logging/LogRecord;)V",
-                &[Value::Object(Some(record))],
-            );
+            if ctx
+                .invoke_virtual(
+                    handler,
+                    "publish",
+                    "(Ljava/util/logging/LogRecord;)V",
+                    &[Value::Object(Some(record))],
+                )
+                .is_ok()
+            {
+                delivered = true;
+            }
             // FileHandler buffers output. The native publication bridge is
             // synchronous, so preserve JUL's observable completion contract
             // before the caller inspects its per-webapp log file.
@@ -3240,10 +3699,50 @@ fn publish_to_jul_handlers_src(
             let handler = ctx.read_native_pin(handler_pin, handler);
             let _ = ctx.invoke_virtual(handler, "flush", "()V", &[]);
         }
-        Ok(None)
+        Ok(delivered)
     })();
     ctx.unpin_native_roots(base_pin);
     result
+}
+
+/// `CRATONVM_DBG_JUL=1`: trace which JUL native each probe call actually
+/// reaches and what it does with the record. Same shape (and rationale) as
+/// `CRATONVM_DBG_DROPPED_STUBS` in `native-api::registry` — the JUL surface is
+/// registered from six different registrars across three crates with
+/// last-registration-wins semantics, so "which implementation ran" is not
+/// answerable by reading the source alone. Cheap/no-op when unset.
+fn jul_dbg_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JUL").is_some())
+}
+
+/// Is `o` a `java.lang.Throwable`?
+///
+/// Walks the object's OWN superclass chain comparing class NAMES, instead of
+/// first resolving `java/lang/Throwable` to a `ClassId` by name. That matters:
+/// `class_id_by_name` answers `None` both for "not loaded" and — since by-name
+/// lookup became ambiguity-strict — for "several loaders define this name",
+/// and a caller that reads `None` as "not a throwable" then silently drops the
+/// `thrown` argument of `log(Level, String, Throwable)` instead of stamping it
+/// on the record. The chain walk performs no by-name resolution and so cannot
+/// fail that way. (STANDING: None != absent.)
+fn jul_is_throwable(ctx: &dyn NativeContext, o: ObjectRef) -> bool {
+    let mut cid = ctx.class_id_of_object(o);
+    // Depth guard: a corrupt or self-referential chain must not spin here.
+    for _ in 0..64 {
+        match ctx.class_name_of_id(cid).as_deref() {
+            Some("java/lang/Throwable") => return true,
+            // `Object` terminates the chain; `None` means the id is not a
+            // real loaded class (synthetic lambda proxy, stale ref).
+            Some("java/lang/Object") | None => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(cid) {
+            Some(parent) if parent != cid => cid = parent,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Render a JUL message value: read `String`s directly, invoke `get()` only
@@ -3357,58 +3856,72 @@ pub(crate) fn native_jul_logger_log_throwable(
     };
     // `jul_resolve_msg` may invoke Java supplier code and allocate. Keep the
     // receiver/level rooted while identifying the throwable so the later
-    // Filter record never receives an old moving-GC address.
+    // record never receives an old moving-GC address.
     let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
     let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
-    let throwable_cid = ctx.class_id_by_name("java/lang/Throwable");
-    let (mut msg, mut thrown): (String, Option<ObjectRef>) = (String::new(), None);
     let mut thrown_pin: Option<(usize, ObjectRef)> = None;
+    let mut message_pin: Option<(usize, ObjectRef)> = None;
+    // One native serves three descriptors — `(Level, String, Throwable)`,
+    // `(Level, Supplier, Throwable)` and `(Level, Throwable, Supplier)` — and
+    // the callback is handed only `args`, never the descriptor it was invoked
+    // under, so the throwable has to be identified by type rather than by
+    // position. `jul_is_throwable` walks the superclass chain by name for the
+    // reason documented on it: the previous `class_id_by_name` +
+    // `is_subclass` form silently classified the throwable as "not a
+    // throwable" whenever that by-name lookup answered `None`, and the
+    // argument was then dropped on the floor (the message slot was already
+    // taken), costing the record its `thrown`.
     for slot in [2usize, 3usize] {
         if let Some(Value::Object(Some(o))) = args.get(slot) {
             let o = *o;
-            let is_throwable = throwable_cid.is_some_and(|tc| {
-                let oc = ctx.class_id_of_object(o);
-                oc == tc || ctx.is_subclass(oc, tc)
-            });
-            if is_throwable {
-                thrown = Some(o);
+            if jul_is_throwable(ctx, o) {
                 thrown_pin = Some((ctx.pin_native_root(o), o));
-            } else if msg.is_empty() {
-                msg = jul_resolve_msg(ctx, o);
+            } else if message_pin.is_none() {
+                message_pin = Some((ctx.pin_native_root(o), o));
             }
         }
     }
-    let this = this_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
-    let level_obj = level_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
-    let thrown = thrown_pin
-        .map(|(pin, obj)| ctx.read_native_pin(pin, obj))
-        .or(thrown);
-    let logger_name = this
-        .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let tag = jul_level_tag(ctx, level_obj);
-    let filter_message = ctx.create_string(&msg);
-    let this = this_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
-    let level_obj = level_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
-    let thrown = thrown_pin
-        .map(|(pin, obj)| ctx.read_native_pin(pin, obj))
-        .or(thrown);
-    notify_jul_logger_filter(ctx, this, level_obj, Some(filter_message), thrown);
-    match thrown {
-        Some(t) => {
-            let r = jul_render_throwable(ctx, t);
-            if msg.is_empty() {
-                crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {r}"));
+    if jul_dbg_enabled() {
+        eprintln!(
+            "[JUL-DBG] log(Level,?,?) native reached: message_arg={} thrown_arg={}",
+            message_pin.is_some(),
+            thrown_pin.is_some()
+        );
+    }
+    let base_pin = this_pin
+        .map(|(p, _)| p)
+        .or_else(|| level_pin.map(|(p, _)| p))
+        .or_else(|| match (message_pin, thrown_pin) {
+            (Some((a, _)), Some((b, _))) => Some(a.min(b)),
+            (Some((a, _)), None) => Some(a),
+            (None, Some((b, _))) => Some(b),
+            (None, None) => None,
+        });
+    // The `Supplier` overloads carry the message lazily. Resolve it to a real
+    // `String` so the published record's `getMessage()` is the text HotSpot
+    // would report; a plain `String` message is passed through untouched so
+    // the RAW pattern survives.
+    let message_obj = match message_pin {
+        Some((pin, obj)) => {
+            let o = ctx.read_native_pin(pin, obj);
+            if ctx.read_string(o).is_some() {
+                Some(o)
             } else {
-                crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {msg}\n{r}"));
+                let text = jul_resolve_msg(ctx, o);
+                Some(ctx.create_string(&text))
             }
         }
-        None => crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {msg}")),
+        None => None,
+    };
+    // `jul_resolve_msg`/`create_string` above allocate: re-derive the rest.
+    let this = this_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let level_obj = level_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let thrown = thrown_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let result = jul_log_parameterized(ctx, this, level_obj, message_obj, None, thrown);
+    if let Some(base) = base_pin {
+        ctx.unpin_native_roots(base);
     }
-    Ok(None)
+    result
 }
 
 /// `java/util/logging/Logger.log(Level, Supplier<String>)` — message-supplier
@@ -3452,6 +3965,30 @@ fn native_jul_logger_log_record(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let rec = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
+    };
+    // Real `Logger.log(LogRecord)` fans the record out to the logger's own
+    // handlers and then its ancestors'. Do that first — this is also the tail
+    // of the real-JDK `throwing`/`entering` bytecode (via `doLog`), so a
+    // record built by the JDK itself (carrying `thrown`, source class/method)
+    // reaches an installed Handler instead of being flattened into a console
+    // line. Only fall back to the console sink when nothing took it.
+    let (this, rec) = match this {
+        Some(logger) => {
+            let this_pin = ctx.pin_native_root(logger);
+            let rec_pin = ctx.pin_native_root(rec);
+            let delivered = publish_existing_record_to_jul_handlers(ctx, logger, rec);
+            // The publication is GC-capable and the console fallback below
+            // reuses both references: re-derive them from their pins BEFORE
+            // releasing the pin stack.
+            let logger = ctx.read_native_pin(this_pin, logger);
+            let rec = ctx.read_native_pin(rec_pin, rec);
+            ctx.unpin_native_roots(this_pin);
+            if delivered {
+                return Ok(None);
+            }
+            (Some(logger), rec)
+        }
+        None => (None, rec),
     };
     let level_obj = match ctx.get_field_by_name(rec, "level") {
         Value::Object(o) => o,
@@ -4601,6 +5138,38 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "logp",
         "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V",
         native_jul_logger_logp,
+    );
+    // `entering`/`exiting`/`throwing` — the method-trace family. The real-JDK
+    // bodies build their FINER record and push it through the private
+    // `doLog`, which dereferences `Logger.loggerBundle`; that field is null on
+    // the Logger instances `getLogger` mints here (no constructor ever ran),
+    // which is what made `throwing` raise
+    // `NullPointerException: ... "lb" is null`. `allocate_logger` now seeds
+    // the field, and these natives additionally make the whole family behave
+    // identically no matter which JUL class body is loaded — including
+    // stamping `LogRecord.thrown`, which the console-only path dropped.
+    // NOTE: `phases_late::register_p71_logging_extras` registers the same
+    // three triples, but only along the synthetic-JDK path; this registrar is
+    // the one that also runs in default real-JDK mode (via
+    // `reflect_annotations::register_annotation_overrides`) and, being
+    // registered later, wins in both.
+    registry.register(
+        CLS_JUL_LOGGER,
+        "entering",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| jul_trace_marker(ctx, args, "ENTRY"),
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "exiting",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        |ctx, args| jul_trace_marker(ctx, args, "RETURN"),
+    );
+    registry.register(
+        CLS_JUL_LOGGER,
+        "throwing",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        |ctx, args| jul_trace_marker(ctx, args, "THROW"),
     );
     // Throwable/Supplier-carrying `log` overloads. The real JDK routes these
     // through a LogRecord + handler chain the synthetic JUL doesn't wire, so

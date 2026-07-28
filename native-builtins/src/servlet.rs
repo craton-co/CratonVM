@@ -1334,7 +1334,10 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
     #[cfg(feature = "synthetic-jdk")]
     {
         // -------------------------------------------------------------------------
-        // java.io.InputStream.close() — no-op
+        // java.io.InputStream.close() — spec-correct no-op: the base class body
+        // in java.base is literally empty (`public void close() throws
+        // IOException {}`); every stream that owns a handle overrides it, and an
+        // override resolves to the subclass, not here.
         // -------------------------------------------------------------------------
         r.register("java/io/InputStream", "close", "()V", native_noop_with_this);
         r.register("java/io/InputStream", "read", "()I", |_ctx, _args| {
@@ -1378,12 +1381,23 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        r.register(
-            "java/io/InputStreamReader",
-            "close",
-            "()V",
-            native_noop_with_this,
-        );
+        // `InputStreamReader.close()` is NOT an empty base-class body: the real
+        // one closes its StreamDecoder, which closes the wrapped InputStream.
+        // The three synthetic `<init>`s above park that stream in slot 0, so
+        // propagate the close to it — a no-op here held the underlying stream
+        // (and its OS handle) open for the rest of the process. Clearing the
+        // slot keeps `close()` idempotent, as the contract requires; it happens
+        // BEFORE the nested dispatch because that call runs arbitrary Java and a
+        // moving young GC there would relocate `this`, stranding a write made
+        // afterwards (native stale-local family).
+        r.register("java/io/InputStreamReader", "close", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+                ctx.set_field(this, 0, Value::Object(None));
+                let _ = ctx.invoke_virtual(stream, "close", "()V", &[]);
+            }
+            Ok(None)
+        });
         r.register("java/io/InputStreamReader", "read", "()I", |_ctx, _args| {
             Ok(Some(Value::Int(-1)))
         });
@@ -1741,7 +1755,14 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         crate::classloader::cl_get_resource_as_stream_essential,
     );
 
-    // URLClassLoader.close() — no-op
+    // URLClassLoader.close() — nothing to release. Real `close()` shuts the
+    // JarFiles that URLClassPath keeps open, but this synthetic loader opens
+    // none: `<init>`/`addURL` hand the paths to `ctx.register_dynamic_classpath`
+    // and keep only the URL[] and parent refs. The remaining half of the
+    // contract (a closed loader must stop serving new classes/resources) needs a
+    // VM-side way to retract a dynamic-classpath entry, which does not exist —
+    // so post-close loads still succeed here. Left as-is deliberately rather
+    // than faked; see the stub-removal report.
     r.register(ucl, "close", "()V", native_noop_with_this);
 
     // =========================================================================
