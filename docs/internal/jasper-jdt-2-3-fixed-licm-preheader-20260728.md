@@ -158,10 +158,12 @@ same result from the other direction.
 
 `cargo test -p cratonvm-vm --lib skip_list`: 69 passed, 0 failed.
 
-Repeated after merging the 27 `dev` commits that landed during the session,
-on a binary rebuilt from the merged tree — 167 parser + 29 ast methods still
-compiling, `TestOptionalELResolverInJsp` 2/2, `TestFormAuthenticatorA` 1/1,
-`TestCompiler` 1/1, `cargo test -p cratonvm-vm --lib skip_list` 69/69.
+Repeated twice more against `dev` as it moved during the session (27 commits,
+then 12 more including `fix/jit-ir-exception-table-c2-20260728`), each time on a
+binary rebuilt from the merged tree: 167 parser + 29 ast methods still compiling,
+`TestOptionalELResolverInJsp` 2/2, `TestFormAuthenticatorA` 1/1 (9 tests),
+`TestCompiler` 1/1 (12 tests), `cargo test -p cratonvm-vm --lib skip_list` 69/69
+— on both merges.
 
 ## Residual: the `webresources` `checkPath` IAE
 
