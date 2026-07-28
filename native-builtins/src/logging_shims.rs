@@ -1931,14 +1931,29 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
             0
         })))
     }
-    fn slf4j_enabled(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(Some(Value::Int(1)))
+    // FIXED wave 4 (2026-07-28): these three were one shared `slf4j_enabled`
+    // returning a constant `1`, while the emitters they guard
+    // (`slf4j_info_msg`/`slf4j_warn_msg`/`slf4j_error_msg`) DO apply
+    // `slf4j_threshold`. With `org.slf4j.simpleLogger.defaultLogLevel=warn` (or
+    // `=off`) `isInfoEnabled()` answered true and `info(...)` then emitted
+    // nothing — the guard lied about the emitter it guards, which is exactly
+    // the disagreement the trace/debug guards above and the whole Log4j guard
+    // block (`slf4j_level_enabled`) were changed to avoid. Same threshold
+    // source for all five levels now.
+    fn slf4j_info_on(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        slf4j_level_enabled(ctx, SLF4J_INFO)
+    }
+    fn slf4j_warn_on(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        slf4j_level_enabled(ctx, SLF4J_WARN)
+    }
+    fn slf4j_error_on(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        slf4j_level_enabled(ctx, SLF4J_ERROR)
     }
     registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_trace_on);
     registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_debug_on);
-    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_enabled);
-    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_enabled);
-    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_enabled);
+    registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_info_on);
+    registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_warn_on);
+    registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_error_on);
     // Marker-aware variants: SLF4J `Logger` interface declares
     // `is{Trace,Debug,Info,Warn,Error}Enabled(Marker)`. Kafka (kafka.Kafka via
     // Scala) routes log calls through these overloads on first startup; the
@@ -1961,27 +1976,37 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/Logger",
         "isInfoEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_enabled,
+        slf4j_info_on,
     );
     registry.register(
         "org/slf4j/Logger",
         "isWarnEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_enabled,
+        slf4j_warn_on,
     );
     registry.register(
         "org/slf4j/Logger",
         "isErrorEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_enabled,
+        slf4j_error_on,
     );
 
     // Round 63: Keycloak — KerberosJdkProvider.isKerberosAvailable() probes the
     // JCE provider list via java.security.Provider.checkInitialized, which
     // throws IllegalStateException in our environment because the security
-    // provider isn't initialized at Profile.configure time. We have no
-    // Kerberos support anyway, so return false unconditionally and let
-    // Profile.configure() advance past the KerberosJdkProvider check.
+    // provider isn't initialized at Profile.configure time.
+    //
+    // KEEP (the constant is the true answer for this VM) — re-derived wave 4,
+    // 2026-07-28. `false` here is not "we have no data"; it is a fact about the
+    // platform: CratonVM ships no Kerberos/GSS-API support at all. A tree-wide
+    // search for `krb5` / `Kerberos` / `GSSCredential` outside this file finds
+    // exactly ZERO natives, shims or class stubs (the single hit is a vendored
+    // rustls doc comment), so `sun.security.krb5` / `javax.security.auth
+    // .kerberos` cannot function and any answer other than `false` would send
+    // Keycloak down a code path that must then fail. Implementing the probe
+    // faithfully (initialising the security providers so `checkInitialized`
+    // stops throwing) would arrive at the same `false` by a longer route.
+    // Revisit only if a Kerberos provider is ever added.
     registry.register(
         "org/keycloak/common/util/KerberosJdkProvider",
         "isKerberosAvailable",

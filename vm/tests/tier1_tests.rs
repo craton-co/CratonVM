@@ -1428,18 +1428,18 @@ fn t9_stub_audit_counts_match_census() {
     // `t9b_inline_constant_native_census` below is the whole-tree
     // counterpart; do not read this total as "stubs left in CratonVM".
     assert!(
-        total <= 57,
-        "T9 GATE: total stub count ({total}) exceeds census ceiling (57). \
+        total <= 53,
+        "T9 GATE: total stub count ({total}) exceeds census ceiling (53). \
          If you added a new stub, justify it in docs/stub-census.md. \
          If you converted stubs to real impls, LOWER the ceiling."
     );
     assert!(
-        total_noop <= 40,
-        "T9 GATE: native_noop count ({total_noop}) exceeds ceiling (40)"
+        total_noop <= 38,
+        "T9 GATE: native_noop count ({total_noop}) exceeds ceiling (38)"
     );
     assert!(
-        total_with_this <= 13,
-        "T9 GATE: native_noop_with_this count ({total_with_this}) exceeds ceiling (13)"
+        total_with_this <= 11,
+        "T9 GATE: native_noop_with_this count ({total_with_this}) exceeds ceiling (11)"
     );
     assert!(
         total_ret_false <= 3,
@@ -1544,7 +1544,7 @@ fn t9b_inline_constant_native_census() {
     // spec-correct constants that are deliberately counted, because the cheap
     // reliable thing to measure is "how much of the native surface is
     // constant-valued", not "how much of it is wrong".
-    const CEILING: usize = 463;
+    const CEILING: usize = 350;
 
     eprintln!("[t9b] Constant-valued native registrations: {total} (ceiling {CEILING})");
     for (f, n) in per_file.iter().take(15) {

@@ -1456,6 +1456,18 @@ pub(crate) fn monitor_enter_blocking(
         return obj;
     };
     let tid = thread.thread_id;
+    // JMX contention tracking. `enter_or_contend` returning `Some` is exactly
+    // the contended case, so this is the point at which the thread becomes
+    // BLOCKED_ON_MONITOR_ENTER. Publishing it here is what makes
+    // `ThreadInfo.getLockName()` / `getLockOwnerId()` and
+    // `findDeadlockedThreads()` work at all: the registry fields were being
+    // READ by `thread_jmx_snapshot` but never written by anyone, so every
+    // snapshot came back empty and the deadlock detector could not observe a
+    // single wait-for edge.
+    shared
+        .threads
+        .thread_registry
+        .set_jmx_contended_monitor(tid, obj);
     let mut ctx = NativeContextImpl { shared, thread };
     ctx.thread
         .gc_block_state
@@ -1516,6 +1528,14 @@ pub(crate) fn monitor_enter_blocking(
         .copied()
         .unwrap_or(obj);
     ctx.thread.native_pin_roots.truncate(pin_base);
+    // Acquisition succeeded: the monitor moves from "contended for" to
+    // "owned". Report the REMAPPED ref — a GC during the blocked region can
+    // move the object, and recording the pre-move address would leave a stale
+    // pointer in the owned-monitor root set.
+    shared
+        .threads
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed);
     fixed
 }
 
@@ -1539,6 +1559,16 @@ pub(crate) fn monitor_enter_synchronized_method(
     else {
         return obj;
     };
+
+    // Same JMX contention publish as `monitor_enter_blocking` — an
+    // `ACC_SYNCHRONIZED` method's monitor contends exactly as a `synchronized`
+    // block's does, and a thread blocked here is just as deadlocked. Tracking
+    // only one of the two entry points would make deadlock detection depend on
+    // which syntax the Java code happened to use.
+    shared
+        .threads
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
 
     let pin_base = thread.native_pin_roots.len();
     let monitor_pin = thread.native_pin_roots.len();
@@ -1590,6 +1620,12 @@ pub(crate) fn monitor_enter_synchronized_method(
         }
     }
     ctx.thread.native_pin_roots.truncate(pin_base);
+    // Acquired: contended -> owned, reporting the remapped ref (see the twin
+    // in `monitor_enter_blocking`).
+    shared
+        .threads
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed_monitor);
     fixed_monitor
 }
 
@@ -4452,6 +4488,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .class_manager
             .read()
             .find_unique_class_by_name(name)
+    }
+
+    /// Real initialization state, for `Unsafe.shouldBeInitialized`. Reuses the
+    /// memoised helper the interpreter itself uses, so this is a thread-local
+    /// hit plus (on a miss) one class-manager read — it does NOT run `<clinit>`.
+    fn is_class_initialized(&self, class_id: ClassId) -> bool {
+        super::vm_util::is_class_initialized_via_manager(&self.shared, class_id)
     }
 
     fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
@@ -9795,12 +9838,52 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             5 => 0x0010, // TIMED_WAITING (approximated as WAITING for this bit-field)
             _ => 0,
         };
+        // Lock ownership. This used to be `..Default::default()`, so `lock`,
+        // `lock_owner_id`, `locked_monitors` and `locked_synchronizers` were
+        // ALWAYS empty over the native API even though the registry has
+        // tracked all four for some time. Everything downstream that reads
+        // them was therefore dead by construction: `ThreadInfo.getLockName()`
+        // / `getLockOwnerId()` / `getLockedMonitors()` reported nothing, the
+        // `findDeadlockedThreads` detector could never observe an edge (it
+        // builds its wait-for graph from `lock_owner_id`), and
+        // `isObjectMonitorUsageSupported` / `isSynchronizerUsageSupported`
+        // were correct to answer false only because of this gap.
+        let (contended, waiting, locked_monitors, locked_synchronizers) = self
+            .shared
+            .threads
+            .thread_registry
+            .jmx_lock_snapshot(registry_tid)
+            .unwrap_or((None, None, Vec::new(), Vec::new()));
+        // A thread blocks on the monitor it is contending for, or waits on the
+        // one it called `wait()` on — never both, so prefer the contended one.
+        let lock = contended.or(waiting);
+        let (lock_owner_id, lock_owner_name) = match lock {
+            Some(obj) => match self.shared.threads.monitors.current_owner(obj) {
+                // A thread never reports itself as the owner it is waiting on:
+                // that is the `wait()` case, where the monitor is released.
+                Some(owner) if owner != registry_tid => (
+                    self.shared
+                        .threads
+                        .thread_registry
+                        .java_tid_of(owner)
+                        .map_or(-1, |tid| tid as i64),
+                    self.shared.threads.thread_registry.thread_name(owner),
+                ),
+                _ => (-1, None),
+            },
+            None => (-1, None),
+        };
         Some(cratonvm_native_api::ThreadJmxSnapshot {
             thread_object: Some(thread_obj),
             thread_id,
             thread_name,
             thread_status,
             stack_trace: self.thread_stack_trace(thread_obj),
+            lock,
+            lock_owner_id,
+            lock_owner_name,
+            locked_monitors,
+            locked_synchronizers,
             ..Default::default()
         })
     }
@@ -10203,6 +10286,37 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
 
     fn active_thread_count(&self) -> i32 {
         self.shared.threads.thread_registry.alive_count() as i32
+    }
+
+    /// Record an AQS synchronizer's exclusive owner, for
+    /// `ThreadInfo.getLockedSynchronizers()`.
+    ///
+    /// `native-builtins`' `setExclusiveOwnerThread` native already called
+    /// this on every AQS ownership change, but only the trait's EMPTY DEFAULT
+    /// existed — so the call did nothing and `jmx_locked_synchronizers` was
+    /// permanently empty. That is half of why `isSynchronizerUsageSupported()`
+    /// had to answer false.
+    ///
+    /// `owner: None` means the synchronizer was released; the registry writer
+    /// clears it from every thread before assigning, so a hand-off between
+    /// threads cannot leave it recorded against both.
+    fn record_jmx_owned_synchronizer(&mut self, synchronizer: ObjectRef, owner: Option<ObjectRef>) {
+        let owner_tid = owner.and_then(|o| resolve_thread_id_from_thread_obj(self.shared, o));
+        self.shared
+            .threads
+            .thread_registry
+            .set_jmx_owned_synchronizer(owner_tid, synchronizer);
+    }
+
+    /// Real finalization backlog, for `getObjectPendingFinalizationCount()`.
+    /// `try_lock` rather than `lock`: this is a monitoring read, and blocking a
+    /// JMX query behind an in-progress GC reference pass would be a worse
+    /// failure than briefly reporting the last known-safe answer.
+    fn pending_finalization_count(&self) -> i32 {
+        match self.shared.mem.ref_processor.try_lock() {
+            Some(rp) => rp.pending_finalization_count().min(i32::MAX as usize) as i32,
+            None => 0,
+        }
     }
 
     fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef> {

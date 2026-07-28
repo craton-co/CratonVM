@@ -2783,8 +2783,10 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     // `servlet::s2_tls_write`, which drives the underlying `TlsStream` and its
     // `TcpStream` synchronously — there is no Java- or Rust-side buffer between
     // the caller and the socket, so there is nothing for `flush()` to push.
-    // Real `SSLSocketImpl$AppOutputStream.flush()` is likewise a no-op once the
-    // record has been written.
+    // VERIFIED against jdk-25 (`javap -p sun.security.ssl.SSLSocketImpl
+    // $AppOutputStream`): the class declares no `flush` at all, so the real
+    // call inherits `java.io.OutputStream.flush()`, whose body is empty. The
+    // real behaviour is a no-op, not merely equivalent to one.
     r.register(ssl_os, "flush", "()V", |_ctx, _args| Ok(None));
     // See `ssl_stream_close` above — closing a socket's stream closes the
     // socket.

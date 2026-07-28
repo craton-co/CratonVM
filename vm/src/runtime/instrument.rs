@@ -1674,15 +1674,25 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         },
     );
     // setHasRetransformableTransformers(long, boolean) — JVMTI capability flag toggle.
-    // We always claim retransform support; this setter is a no-op.
-    // KEEP (constant, justified): unlike the prefix capability below, the
-    // retransform claim IS backed — `native_retransform_classes0` /
-    // `NativeContext::retransform_class` re-run the transformer chain from the
-    // preserved original bytes, and the shadow-suppression guards in
-    // `interpreter.rs` (`native_shadow_suppressed_by_redefine`, with the
-    // `redefine_immune_reflection_native` allow-list) cede a redefined class's
-    // methods to the woven bytecode. So there is no capability bit to gate on
-    // and nothing for this setter to record.
+    //
+    // KEEP (empty body, justified) — and not merely "we always claim retransform
+    // support". The datum this setter carries is ALREADY HELD, more precisely,
+    // by the transformer chain itself: `addTransformer(t, canRetransform)`
+    // records `TransformerEntry::can_retransform` per transformer, and that is
+    // exactly what the JDK's `TransformerManager` summarises into this one
+    // process-wide boolean before handing it to JVMTI. There is nothing this
+    // call could tell the VM that it does not already know at finer grain.
+    //
+    // The two effects the real JVMTI body has — adding `can_retransform_classes`
+    // to the agent's capability set, and enabling `ClassFileLoadHook` — have no
+    // CratonVM counterpart to toggle: the retransform path is unconditionally
+    // live (`native_retransform_classes0` / `NativeContext::retransform_class`
+    // re-run the chain from the preserved original bytes, and the
+    // shadow-suppression guards in `interpreter.rs` —
+    // `native_shadow_suppressed_by_redefine`, with the
+    // `redefine_immune_reflection_native` allow-list — cede a redefined class's
+    // methods to the woven bytecode), and the load hook IS the chain walk.
+    // Recording the flag would create state nothing reads.
     r.register(
         impl_class,
         "setHasRetransformableTransformers",

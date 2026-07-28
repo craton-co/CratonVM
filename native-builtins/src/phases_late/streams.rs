@@ -15,6 +15,12 @@ use super::*;
 //           Summary Statistics, Stream factories
 // ============================================================================
 
+/// REACHABILITY (traced wave 4): the only non-test call site is
+/// `native-builtins/src/lib.rs`, inside `register_synthetic_overrides`, which
+/// is `#[cfg(feature = "synthetic-jdk")]`. Everything registered from here is
+/// therefore SYNTHETIC-ONLY and does nothing in the default real-JDK build.
+/// Several entries below are correct only under that condition — see the
+/// static-interface-method note on `Gatherer.defaultInitializer`.
 pub(crate) fn register_phase56_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -93,6 +99,18 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
     // `parallel()` above returns the receiver unchanged and no synthetic
     // stream operation ever splits, so every synthetic stream really is
     // sequential. Reporting true would be the lie.
+    //
+    // Wave 4 re-derived this rather than inheriting it, because the obvious
+    // "implement it" — have `parallel()` record a requested-mode bit that
+    // `isParallel()` reads back — does not survive contact with the model: the
+    // synthetic stream carries its elements in field 0 and every intermediate
+    // op (`map`/`filter`/`peek`/...) builds a BRAND NEW synthetic stream via
+    // `p56_build_stream`, so a mode bit set on the receiver of `.parallel()`
+    // would be dropped by the next stage and `isParallel()` would then answer
+    // true or false depending on pipeline position. Constant false is the only
+    // answer that is true of every synthetic stream at every stage.
+    // (`native-builtins/src/streams.rs:195` registers the same triple with the
+    // same constant; this one wins on ordering. No behavioural conflict.)
     r.register(stream, "isParallel", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -3988,12 +4006,35 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
         },
     );
     // Gatherer.defaultInitializer / defaultFinisher
-    // KEEP: null IS the sentinel this Gatherer model uses for "no initializer
-    // / no finisher". `Gatherer.of(..)` above stores null in slots 0 and 2,
-    // and the gather engine (`pd_gather_fold` / `pd_gather_scan` /
-    // `pd_gather_custom` in lib.rs) branches on `Value::Object(Some(_))` and
-    // skips the stage when it is null. Handing back a synthetic Supplier /
-    // BiConsumer here would be a value the engine then has to call.
+    //
+    // KEEP — but the wave-3 one-liner ("null IS the Gatherer sentinel") is only
+    // half true, and the accurate version is what makes this safe. In the REAL
+    // JDK these are not null: `Gatherer.defaultInitializer()` is
+    // `Gatherers.Value.DEFAULT.initializer()`, and its javadoc pins it to
+    // "always returns the same instance" because the value is used as an
+    // IDENTITY sentinel — "Gatherers whose initializer is `defaultInitializer()`
+    // are considered to be stateless, and invoking their initializer is
+    // optional" (`java.base/java/util/stream/Gatherer.java`, @implSpec).
+    //
+    // That identity test is the only spec-defined observation, and this model
+    // passes it: `Gatherer.of(..)` above stores null in slots 0 and 2, and
+    // `initializer()`/`finisher()` hand those same slots straight back, so
+    // `g.initializer() == Gatherer.defaultInitializer()` compares null with
+    // null and answers `true` exactly where the real JDK would. The gather
+    // engine (`pd_gather_fold` / `pd_gather_scan` / `pd_gather_custom` in
+    // lib.rs) reads the same sentinel by branching on `Value::Object(Some(_))`.
+    // Manufacturing a synthetic Supplier / BiConsumer here would flip that
+    // identity test to `false` for every default gatherer AND hand the engine a
+    // value it then has to call.
+    //
+    // One reachability caveat worth leaving in writing: these are STATIC
+    // interface methods, and static interface methods DO keep the native check
+    // (only interface *instance* methods are dropped — see the carve-out in
+    // `try_stackless_invoke` step 6). So unlike the instance methods around
+    // them they would intercept in real-JDK mode and hand real `Gatherers` a
+    // null where it requires `Gatherers.Value.DEFAULT`. They are safe only
+    // because this whole registrar is synthetic-only; do not move
+    // `register_phase56_stream_extras` onto the real-JDK path with these in it.
     r.register(
         g,
         "defaultInitializer",
@@ -4118,11 +4159,30 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(1)))
         },
     );
-    // KEEP: `trySplit()` returning null is the spec'd answer for a spliterator
-    // that "cannot be split" — it is not an error path, and every caller
-    // already has to handle it (`Spliterators`, `AbstractTask`). This
-    // spliterator is a single cursor over one array and never splits, so null
-    // is the truthful reply, and it is consistent with `isParallel() == false`.
+    // `trySplit()` returning null is the spec'd answer for a spliterator that
+    // "cannot be split", so it is legal rather than an error path, and every
+    // caller has to handle it (`Spliterators`, `AbstractTask`).
+    //
+    // But wave 4 asked the sharper question — COULD it split? — and the answer
+    // is yes: this receiver is exactly the JDK's `ArraySpliterator` shape
+    // (field 0 = Object[], 1 = cursor, 2 = fence), whose real `trySplit` is the
+    // four-line `mid = (lo + fence) >>> 1; return lo >= mid ? null : new
+    // ArraySpliterator(array, lo, index = mid, chars)`. So this null is a
+    // genuine under-implementation, NOT a truthful "cannot split".
+    //
+    // It is deliberately not fixed here, because fixing it here would change
+    // nothing: this registration is SHADOWED. `native-collections/src/lib.rs`
+    // (`register_iterator_protocol_natives`) registers the identical triple
+    // `java/util/Spliterator.trySplit()Ljava/util/Spliterator;` ->
+    // `native_return_null_obj`, and `vm/src/vm/vm_init.rs` calls
+    // `register_collections_natives` AFTER `register_builtins` — so
+    // last-registration-wins hands the call to native-collections, not to this
+    // line. The fix belongs there (and `vm/src/vm.rs::spliterator_basics_p69`
+    // asserts the null, so it has to move with it). Reported as an escalation.
+    // Whoever implements it: keep native-collections'
+    // `heap_kind_of(a) == ObjectKind::Array` guard on field 0 — dispatch can
+    // route a real-JDK Spliterator subclass into these natives, and its field 0
+    // is not an array.
     r.register(
         sp,
         "trySplit",

@@ -8075,10 +8075,12 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         // `mark(I)V` was missing entirely, which made the `markSupported()`
         // below a lie and left `reset()` rewinding to 0 instead of the mark.
         registry.register(sr, "mark", "(I)V", native_sr_mark);
-        // KEEP: real `StringReader` genuinely supports mark/reset (it is
+        // KEEP: real `StringReader.markSupported()` is `return true;` (it is
         // backed by an in-memory String), so `true` is the correct answer,
         // not a placeholder — and `mark`/`reset` are now both implemented
-        // against `SR_STATE` (see `native_sr_mark`).
+        // against `SR_STATE` (see `native_sr_mark`, which stores the mark and
+        // rejects a negative read-ahead limit, and `native_sr_reset`, which
+        // rewinds to it). Re-verified wave 4, 2026-07-28.
         registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(1)))
         });
@@ -8119,6 +8121,15 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
             "()Ljava/lang/StringBuffer;",
             native_sw_get_buffer,
         );
+        // KEEP (real JDK body is empty) — audited wave 4, 2026-07-28.
+        // `java.io.StringWriter.flush()` and `close()` in java.base are
+        // literally `public void flush() {}` / `public void close() throws
+        // IOException {}`: the writer's sink is an in-memory StringBuffer, so
+        // there is nothing to push and nothing to release, and the class
+        // documents that "Closing a StringWriter has no effect" — a closed
+        // StringWriter must keep accepting writes. A no-op here is the
+        // specified behaviour, not an unimplemented one; making either throw
+        // or drop the buffer would be a spec violation.
         registry.register(sw, "flush", "()V", native_noop_void);
         registry.register(sw, "close", "()V", native_noop_void);
         registry.register(
@@ -11227,6 +11238,15 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
         registry.register(caw, "toCharArray", "()[C", native_caw_to_char_array);
         registry.register(caw, "size", "()I", native_caw_size);
         registry.register(caw, "reset", "()V", native_caw_reset);
+        // KEEP (real JDK body is empty) — audited wave 4, 2026-07-28.
+        // `java.io.CharArrayWriter.flush()` is `public void flush() {}` and
+        // `close()` is `public void close() {}` in java.base. The sink is the
+        // `char[] buf` above, so there is nothing to push or release, and the
+        // class documents that "Close the stream. This method does not release
+        // the buffer, since its contents might still be required" — a closed
+        // CharArrayWriter must keep serving `toCharArray`/`toString` AND keep
+        // accepting writes. No-op is the specified behaviour; clearing the
+        // buffer or throwing here would break `reset`-free reuse.
         registry.register(caw, "flush", "()V", native_noop_void);
         registry.register(caw, "close", "()V", native_noop_void);
     } // end #[cfg(feature = "synthetic-jdk")] synthetic CharArrayWriter natives
@@ -17174,11 +17194,50 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    // KEEP: IP ToS/DSCP. `DatagramSocket.setTrafficClass` is explicitly
-    // documented as advisory — "the underlying platform may ignore the value"
-    // — and there is no `udp_set_tos` on the fd table to apply it with, so
-    // accepting it is spec-legal rather than a silent failure.
-    r.register(dc, "setTrafficClass", "(I)V", |_ctx, _args| Ok(None));
+    // ESCALATED wave 4 (2026-07-28) — this IS implementable, but not from this
+    // crate. `socket2` (already a dependency of `native-api`, `features =
+    // ["all"]`) exposes `SockRef::set_tos(u32)`, which is exactly IP_TOS /
+    // the JDK's `setTrafficClass`. What is missing is the fd-table accessor:
+    // `native-api/src/fd_table.rs` needs
+    //
+    //     pub fn udp_set_tos(&self, fd: FdId, tos: u32) -> Result<(), io::Error>
+    //
+    // written like its neighbour `udp_set_send_buffer_size` (match
+    // `FileEntry::UdpSocket(s)` → `socket2::SockRef::from(s).set_tos(tos)`).
+    // The `FileEntry` enum and `get_entry` are both private to that module and
+    // native-io does not depend on socket2, so the option cannot be reached
+    // from here. Once the accessor lands this becomes the same three lines as
+    // `setSoTimeout` above: `if let Some(fd) = dc_fd(ctx, this) { let _ =
+    // ctx.fd_table().udp_set_tos(fd, (tc & 0xff) as u32); }`.
+    //
+    // Until then, accepting and discarding is spec-legal rather than a silent
+    // failure: `DatagramSocket.setTrafficClass` is documented as advisory
+    // ("the underlying platform may ignore the value"), and the JDK's own
+    // contract only requires an IllegalArgumentException for values outside
+    // 0..=255 — which real callers (Tomcat's `NioReceiver`) never pass.
+    //
+    // IMPLEMENTED wave 4 (2026-07-28): `FdTable::udp_set_tos` was added for
+    // exactly this, so the escalation above is resolved and the body is now
+    // the same shape as `setSoTimeout`. The advisory-ness of IP_TOS is a
+    // statement about the network, not a licence to skip the syscall — "the
+    // platform may ignore it" and "we never asked" are different claims, and
+    // only the second was true before. The spec'd IllegalArgumentException is
+    // now enforced rather than waived on the grounds that today's callers
+    // happen not to trip it.
+    r.register(dc, "setTrafficClass", "(I)V", |ctx, args| {
+        let this = obj_arg92(args, 0)?;
+        let tc = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if !(0..=255).contains(&tc) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("tc is not in range 0 -- 255: {tc}"),
+            }
+            .into());
+        }
+        if let Some(fd) = dc_fd(ctx, this) {
+            let _ = ctx.fd_table().udp_set_tos(fd, tc as u32);
+        }
+        Ok(None)
+    });
 
     // bind(SocketAddress)V — the void `DatagramSocket.bind`. Delegates to the
     // channel's own real bind (close old fd, open a fresh UDP fd bound to the

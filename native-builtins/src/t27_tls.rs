@@ -8207,29 +8207,49 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if mode { 1 } else { 0 })))
     });
 
-    // KEEP (deliberate, audited wave 2): this pair is intentionally inert AND
-    // intentionally consistent — the setter accepts nothing and the getter
-    // reports "no selector installed", so a caller probing whether JDK-style
-    // ALPN callbacks are active gets a truthful "no" rather than being handed
-    // back a selector this VM would never invoke. ALPN itself is not disabled:
-    // rustls negotiates it from `SSLParameters` and
-    // `getApplicationProtocol()` returns the real result.
+    // KNOWN DIVERGENCE, not a KEEP (wave 4 re-derivation). The wave-2/3 note
+    // called this pair "intentionally inert AND intentionally consistent" and
+    // stopped there. State it plainly instead: **a caller that installs a
+    // handshake ALPN selector here will never have it invoked.**
     //
-    // Netty configures JDK ALPN support through this concrete implementation
-    // method. A rustls-backed engine is deliberately allocated without
-    // SunJSSE's private `conContext` graph, so interpreting the real body
-    // dereferences that absent state before the native handshake starts. The
-    // callback is only used by SunJSSE's own ALPN selector; rustls performs
-    // the negotiated-protocol selection itself from `SSLParameters`.
+    // What is and is not lost:
+    //   * ALPN itself works. rustls negotiates from the protocol list on
+    //     `SSLParameters`, and `getApplicationProtocol()` returns the real
+    //     negotiated value (see `register_alpn_accessor`).
+    //   * What is lost is CUSTOM server-side selection — a `BiFunction` that
+    //     inspects the client's offered list and picks. rustls applies its own
+    //     "first of my configured list that the client offers" rule instead.
+    //     A selector that would have made the same choice is indistinguishable;
+    //     one encoding a different policy is silently overruled.
+    //
+    // Why not THROW `UnsupportedOperationException`: real
+    // `SSLEngineImpl.setHandshakeApplicationProtocolSelector` never throws, and
+    // Netty's `JdkAlpnApplicationProtocolNegotiator` calls it unconditionally
+    // while building an HTTP/2 engine — throwing would take out ALPN entirely
+    // rather than degrade one policy hook. Strictly worse.
+    //
+    // Why the getter must stay null while the setter is inert: the two are read
+    // as a pair (Netty probes the getter to decide whether JDK-style ALPN
+    // callbacks are live). Storing the selector so the getter could echo it
+    // back would advertise a callback that still never runs — a worse lie than
+    // the truthful "none installed" we report now.
+    //
+    // ESCALATION (this is the fix, and it is not local to this file): rustls
+    // CAN delegate the choice — `ServerConfig`'s cert resolver / `Acceptor`
+    // sees the `ClientHello` with its `alpn_protocols` before the server
+    // selects. Making the selector real needs (a) the handshake driver in
+    // `crate::servlet::s2_tls_*` to expose a pre-selection hook carrying the
+    // offered list, and (b) a `NativeContext` re-entry from inside that hook so
+    // the Java `BiFunction` can be applied. Both are cross-module; the engine
+    // side-table here is the natural place to park the selector once they exist.
     r.register(
         cls_impl,
         "setHandshakeApplicationProtocolSelector",
         "(Ljava/util/function/BiFunction;)V",
         |_ctx, _args| Ok(None),
     );
-    // Netty probes the paired getter when deciding whether JDK ALPN support is
-    // active.  It has the same `conContext` dependency as the setter above;
-    // rustls owns ALPN negotiation, so no Java-side selector is installed.
+    // Paired with the setter above — see its comment for why this deliberately
+    // reports "no selector installed" rather than echoing one back.
     r.register(
         cls_impl,
         "getHandshakeApplicationProtocolSelector",
@@ -9938,17 +9958,23 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // KEEP (correct constants, audited wave 2 — these are protocol limits, not
-    // placeholders).
+    // KEEP (correct constants — these are protocol limits, not placeholders).
     // Buffer sizes are layout-independent JSSE constants. The real JDK returns
-    // 16384 (max TLS plaintext record) for `getApplicationBufferSize` and 16709
-    // (16384 + TLS record overhead: 5 header + 256 padding + 68 MAC/IV) for
-    // `getPacketBufferSize`. Tomcat only needs them >= a TLS record so its
-    // network/application `ByteBuffer`s are large enough.
-    // SHADOWING (wave 3): `tls.rs::register_ssl_session` registers the same two
-    // triples with the same two values and runs LATER (lib.rs ~23041 vs
-    // ~17506), so this copy loses. Inert duplicate — kept because the values
-    // agree; if you change one, change both.
+    // 16384 (`SSLRecord.maxDataSize`, the RFC 8446 §5.1 TLSPlaintext cap) for
+    // `getApplicationBufferSize` and 16709 (`SSLRecord.maxRecordSize` = 5
+    // header + 16 IV + 16384 data + 256 padding + 48 MAC) for
+    // `getPacketBufferSize`. Real `SSLSessionImpl` varies these only via
+    // `SSLParameters.setMaximumPacketSize` and only for DTLS; CratonVM models
+    // neither (`git grep maximumPacketSize` — no hits), so the real behaviour
+    // is constant here too.
+    //
+    // SHADOWING (wave 4 correction — the wave-3 note was wrong): `tls.rs
+    // ::register_ssl_session` registers the same two triples, but its registrar
+    // `register_tls_natives` is reached ONLY from `register_synthetic_overrides`,
+    // which is `#[cfg(feature = "synthetic-jdk")]`. In the
+    // DEFAULT real-JDK build THIS copy is the live one and the tls.rs pair does
+    // not exist; under `--synthetic-jdk` tls.rs runs later and wins. The values
+    // are identical either way — if you change one, change both.
     r.register(cls, "getApplicationBufferSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(16384)))
     });

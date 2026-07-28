@@ -2871,16 +2871,24 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         provider_get_property,
     );
     // KEEP (correct constant, not a stub): this reports a CAPABILITY, not a
-    // security decision — nothing is bypassed by answering it. CratonVM has no
-    // JFR security-event subsystem, so "security logging is off" is the true
-    // answer, and the real JDK returns the same `false` whenever the JFR
-    // security events are not enabled.
-    // jdk.internal.event.EventHelper.isLoggingSecurity() — JFR security-event
+    // security decision — nothing is bypassed by answering it.
+    //
+    // jdk.internal.event.EventHelper.isLoggingSecurity() — the security-event
     // logging gate. Its real body dereferences the static `JUJA`
     // (`SharedSecrets.getJavaUtilJarAccess()`), which is null in our VM, so it
     // NPEs ("Cannot invoke isInitializing on null") on the
     // CertificateFactory.generateCertificate -> JCAUtil.tryCommitCertEvent
-    // path. We don't emit JFR security events, so report logging-off (false).
+    // path.
+    //
+    // VERIFIED against jdk-25 bytecode (`javap -c jdk.internal.event
+    // .EventHelper`): the real body lazily installs `System.getLogger(
+    // "jdk.event.security")` and stores `logger.isLoggable(LOG_LEVEL)` — i.e.
+    // it is a readout of whether DEBUG logging is enabled for that one logger
+    // name, which on a stock JDK with no logging configuration is FALSE. So
+    // `false` is both the real JDK's default answer and factually true here
+    // (CratonVM emits no security events at all). Answering `true` would be
+    // actively harmful: the caller would then go on to `logSecurityEvent`,
+    // straight back into the same null `JUJA`.
     r.register(
         "jdk/internal/event/EventHelper",
         "isLoggingSecurity",

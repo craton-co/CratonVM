@@ -3121,9 +3121,13 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
         |ctx, args| {
             // Default: immediately call onSubscribe then onComplete
             if let Some(Value::Object(Some(subscriber))) = args.get(1) {
+                // 2-field layout, matching phase 60 / SubmissionPublisher.subscribe:
+                // 0 = cancelled flag, 1 = accumulated demand (Long). The second
+                // slot is what makes `request(n)` above observable.
                 let sub =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 1);
+                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
                 ctx.set_field(sub, 0, Value::Int(0)); // cancelled flag
+                ctx.set_field(sub, 1, Value::Long(0)); // demand
                 let _ = ctx.invoke_virtual(
                     *subscriber,
                     "onSubscribe",
@@ -3137,14 +3141,45 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
     );
 
     let flow_sub = "java/util/concurrent/Flow$Subscription";
-    // SUPERSEDED — do not "fix" this in place. `streams::register_stream_overrides`
-    // is called from lib.rs IMMEDIATELY after `register_concurrent_natives`
-    // (in both run modes) precisely to replace this no-op with
-    // `native_flow_request`, a real saturating-add demand counter; a unit test
-    // (`register_stream_overrides_installs_flow_subscription_request`) asserts
-    // that override is installed. The no-op below never runs. It is kept so the
-    // triple exists even if a caller registers only this module.
-    registry.register(flow_sub, "request", "(J)V", |_ctx, _args| Ok(None));
+    // W4: the "SUPERSEDED, never runs" comment that used to sit here was WRONG
+    // for the default (real-JDK) build. `register_stream_overrides` only wins
+    // when it is registered LAST, and it is not: in real-JDK mode
+    // `vm_init.rs` calls `register_essential_natives_with_shims` (which reaches
+    // `register_stream_overrides` via `register_annotation_overrides`) and only
+    // THEN calls `register_concurrent_natives`, i.e. this module. So this
+    // registration is the live one in the default build; only in
+    // `--synthetic-jdk` mode does lib.rs order the stream overrides (and, later
+    // still, `register_p60_flow`) after it.
+    //
+    // Accumulate the demand for real instead of dropping it, using the same
+    // layout phase 60 uses and that `SubmissionPublisher.subscribe` allocates
+    // (field 0 = cancelled flag, field 1 = Long demand). Objects with fewer
+    // slots (older 1-field synthetic subscriptions) keep the no-op behaviour
+    // rather than writing out of bounds.
+    registry.register(flow_sub, "request", "(J)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let n = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
+        // Reactive-streams: a non-positive request is a protocol error; with no
+        // subscriber reference to call `onError` on, ignore it (same choice as
+        // `streams::native_flow_request`).
+        if n <= 0 || ctx.object_num_fields(this) < 2 {
+            return Ok(None);
+        }
+        let cur = match ctx.get_field(this, 1) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        ctx.set_field(this, 1, Value::Long(cur.saturating_add(n)));
+        Ok(None)
+    });
     registry.register(flow_sub, "cancel", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,

@@ -961,9 +961,20 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Empty enumeration
     let ee = "java/util/Collections$EmptyEnumeration";
-    // KEEP: the class IS the empty enumeration — `hasMoreElements` is false by
-    // definition, exactly as in the real `Collections.EmptyEnumeration`. (Its
-    // `nextElement` right below correctly throws NoSuchElementException.)
+    // KEEP — verbatim real behaviour, verified against JDK 25 source
+    // (`java.base/java/util/Collections.java`):
+    //
+    //     private static class EmptyEnumeration<E> implements Enumeration<E> {
+    //         static final EmptyEnumeration<Object> EMPTY_ENUMERATION = ...;
+    //         public boolean hasMoreElements() { return false; }
+    //         public E nextElement() { throw new NoSuchElementException(); }
+    //     }
+    //
+    // The real body is `return false;`, so there is no receiver state to read:
+    // the class IS the empty enumeration, and it is `private static` with no
+    // subclasses, so the "natives on concrete classes intercept non-overriding
+    // subclasses" hazard does not apply. (Its `nextElement` right below
+    // correctly throws NoSuchElementException, matching the second line.)
     r.register(ee, "hasMoreElements", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });

@@ -881,12 +881,19 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     // padding + 68 MAC/IV) — the same pair a stock JDK returns, and both are
     // session- and layout-independent.
     //
-    // SHADOWING (wave 3): `t27_tls::register_ssl_session_real` registers the
-    // same two triples with the same two values; `register_tls_natives` runs
-    // last (lib.rs ~23041 vs ~17506) so THIS pair wins. The values are
-    // identical, so the duplicate is behaviourally inert — t27's copy is left
-    // alone because it documents the same constants for the real-mode session
-    // shapes it owns.
+    // Real `SSLSessionImpl` varies these only via
+    // `SSLParameters.setMaximumPacketSize` and only for DTLS; CratonVM models
+    // neither (`git grep maximumPacketSize` — no hits), so the real JDK
+    // behaviour is constant here too.
+    //
+    // REACHABILITY + SHADOWING (wave 4 correction — the wave-3 note was wrong):
+    // `register_tls_natives` is reached ONLY from
+    // `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]`. So this pair does NOT exist in the
+    // default real-JDK build — there `t27_tls::register_ssl_session_real`
+    // (reached from `register_essential_natives_with_shims`) is the live copy.
+    // Under `--synthetic-jdk` this registrar runs later and wins. The values
+    // are identical either way; if you change one, change both.
     r.register(cls, "getApplicationBufferSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(16384)))
     });

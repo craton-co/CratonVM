@@ -2753,6 +2753,18 @@ impl SharedVm {
             }
         }
 
+        // `-Xshare:dump`: this run WILL write an archive at shutdown (see
+        // `SharedVm::dump_cds_archive`). Publish that as a system property so
+        // `jdk/internal/misc/CDS.isDumpingArchive0()` can report the real mode
+        // instead of a hard-coded `false`; mirrors the
+        // `jdk.internal.vm.cds.enabled` handshake above.
+        if matches!(config.cds_mode, crate::config::CdsMode::Dump) {
+            sys_props.insert(
+                "jdk.internal.vm.cds.dumping".to_string(),
+                "true".to_string(),
+            );
+        }
+
         // Build the GPU offload cache registry. With the feature off,
         // this block does not exist. The registry itself is empty until
         // the first `get_or_create` call constructs a per-device

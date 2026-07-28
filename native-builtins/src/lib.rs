@@ -13230,17 +13230,18 @@ pub fn register_essential_natives_with_shims(
             _ => Ok(Some(Value::Object(None))),
         },
     );
-    // KEEP: `true` is the self-consistent answer for this VM, not a stub.
-    // CratonVM installs no SecurityManager and no Policy provider (both are
-    // permanently disabled from JDK 24 on), so nothing anywhere enforces a
-    // permission decision. Answering `false` would only push libraries that
-    // self-check (`pd.implies(new RuntimePermission(...))`) onto a restricted
-    // path no other part of the VM honours.
+    // W4: was a hard `true`. CratonVM does have a policy core — the parsed
+    // `java.policy` grant table in `security_manager.rs` that backs both
+    // `SecurityManager.checkPermission` and `Policy.implies(pd, perm)` — so
+    // ask the same question those two ask and keep the three in lock-step.
+    // With no `-Djava.security.policy` loaded the core is allow-all, i.e.
+    // exactly the old constant; with one loaded the answer now reflects the
+    // grants instead of rubber-stamping them.
     registry.register(
         "java/security/ProtectionDomain",
         "implies",
         "(Ljava/security/Permission;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        native_protection_domain_implies,
     );
     // CodeSource.getLocation() → return field 0 (our synthetic URL)
     registry.register(
@@ -14514,15 +14515,19 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Long(handle)))
         },
     );
-    // KEEP: correct for this VM. `getAppend(fd)` reports whether the fd
-    // carries O_APPEND. CratonVM's FileOutputStream/RandomAccessFile do
-    // their appending in the Rust I/O layer rather than through an
-    // O_APPEND descriptor, so no fd we hand out is in append mode.
+    // W4: was a hard `false` on the (incorrect) grounds that CratonVM never
+    // opens an O_APPEND descriptor — `FileDescriptorTable::open_write` passes
+    // `.append(true)` straight to the OS. Ask the host for the three standard
+    // descriptors, which are the only `fd` values that are real OS descriptors
+    // here (same 0..=2 range the `getHandle` native above maps through) and
+    // the only ones the JDK's sole caller, `FileDescriptor(int)`, asks about.
+    // See `native_file_descriptor_get_append` for the escalation covering the
+    // remaining, table-id-only descriptors.
     registry.register(
         "java/io/FileDescriptor",
         "getAppend",
         "(I)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_file_descriptor_get_append,
     );
     // FileDescriptor.sync0()V — fsync. `this` carries the fd id that `open0`
     // stored in the Windows `handle` long / POSIX `fd` int slot.
@@ -15022,13 +15027,15 @@ pub fn register_essential_natives_with_shims(
         "(Z)V",
         lang_reflect::native_accessible_set_accessible,
     );
-    // KEEP: correct constant, and self-consistent with the `copy()` natives
-    // registered just below. `AccessibleObject.getRoot()` is literally
-    // `return null;` in the JDK. For Field/Method/Constructor a non-null root
-    // exists only on a *copy*, and CratonVM's `copy()` hands back the SAME
-    // object rather than minting one — so no reflective object here is ever a
-    // non-root copy, and null is the right answer for all four. It also passes
-    // ReflectionFactory's `copyField` "must be a root" check.
+    // KEEP on `AccessibleObject.getRoot()` only: that one is literally
+    // `return null;` in the JDK — the base class has no `root` field.
+    // The three subclass overrides return the receiver's `root` field, so W4
+    // reads the field instead of hard-coding null (see
+    // `native_reflect_get_root`). In practice the answer is unchanged — our
+    // `copy()` natives below hand back the SAME object rather than minting a
+    // linked copy, so `root` stays unset and `ReflectionFactory`'s "must be a
+    // root" check still passes — but a reflective object that did acquire a
+    // root now reports it instead of lying.
     // T15: Field.getRoot/getGenericSignature etc.
     registry.register(
         "java/lang/reflect/AccessibleObject",
@@ -15040,19 +15047,19 @@ pub fn register_essential_natives_with_shims(
         "java/lang/reflect/Field",
         "getRoot",
         "()Ljava/lang/reflect/Field;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_reflect_get_root,
     );
     registry.register(
         "java/lang/reflect/Method",
         "getRoot",
         "()Ljava/lang/reflect/Method;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_reflect_get_root,
     );
     registry.register(
         "java/lang/reflect/Constructor",
         "getRoot",
         "()Ljava/lang/reflect/Constructor;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_reflect_get_root,
     );
     // Our synthetic Field doesn't need a separate "copy" — reuse the same object.
     registry.register(
@@ -16675,31 +16682,32 @@ pub fn register_essential_natives_with_shims(
     // constructor (e.g. RandomizedRunner's synthetic `__randomizedtesting.
     // SeedInfo.seed(...)` frame) leave `declaringClassObject` null, so when the
     // trace is formatted the whole `getStackTrace()` NPEs — failing ~every
-    // Elasticsearch ESTestCase. Override computeFormat as a null-safe no-op:
-    // `format` stays 0, so toString renders plain `class.method(file:line)`
-    // (no module/loader prefix). Correct output, never a crash; covers every
-    // element-creation path, not just the VM-fill one.
+    // Elasticsearch ESTestCase. W4 keeps the null guard but stops being a
+    // no-op: when `declaringClassObject` IS present the two suppression bits
+    // are computed for real from the class's loader id and module name — see
+    // `native_stack_trace_element_compute_format`. Both bits only ever DROP a
+    // rendering prefix, so the null-`declaringClassObject` elements this fix
+    // was written for still render plain `class.method(file:line)`.
     registry.register(
         "java/lang/StackTraceElement",
         "computeFormat",
         "()V",
-        native_noop_with_this,
+        native_stack_trace_element_compute_format,
     );
 
     // --- java/lang/reflect/Executable + Field ---
-    // KEEP: correct constant. `null` is the JDK's own "this method has no
-    // MethodParameters attribute" encoding — `Executable.privateGetParameters`
-    // reacts by synthesizing `arg0`, `arg1`, … , which is exactly the fallback
-    // our real implementation uses. And the public `Executable/Method/
-    // Constructor.getParameters()` is separately shadowed by
-    // `lang_reflect::native_*_get_parameters`, which DOES read the attribute
-    // (via `NativeContext::method_parameters`), so this private entry point is
-    // not the one that answers reflective parameter queries.
+    // W4: was a hard `null`. Now answers with a real `Parameter[]` built from
+    // the class file's `MethodParameters` attribute when there is one, and
+    // `null` — the JDK's own "attribute absent" encoding — when there is not.
+    // Returning null in the absent case is deliberate, not a leftover:
+    // `privateGetParameters` flips `hasRealParameterData` to true for ANY
+    // non-null result, and that is what `Parameter.isNamePresent()` reports.
+    // See `native_executable_get_parameters0`.
     registry.register(
         "java/lang/reflect/Executable",
         "getParameters0",
         "()[Ljava/lang/reflect/Parameter;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_executable_get_parameters0,
     );
     // KEEP x2: correct constant. `null` (NOT an empty byte[]) is the JDK's
     // "no RuntimeVisibleTypeAnnotations" encoding —
@@ -18763,13 +18771,31 @@ pub fn register_essential_natives_with_shims(
     // no-op natives for `getName`, `isLoggable`, and the various `log`
     // overloads so JmxProperties.<clinit> + Keycloak's own logging
     // emitters don't NPE on a missing Code attribute.
-    // KEEP (the constant answers in the `System$Logger` block below): this
-    // interface native serves ONLY the deliberate no-op logger that
-    // `LazyLoggers.getLogger` / `System.getLogger` mint above — a synthetic
-    // receiver whose declaring class IS the interface. A real user
-    // implementation declares its own methods and is never intercepted.
-    // `isLoggable` -> false and `log` -> no-op are mutually consistent:
-    // callers skip building messages that would only be dropped.
+    // W4 REACHABILITY CORRECTION. The wave-3 note here said these interface
+    // natives "serve ONLY the deliberate no-op logger that
+    // `LazyLoggers.getLogger` / `System.getLogger` mint above". The first
+    // clause of that is right (a real user implementation declares its own
+    // methods and is never intercepted) but the second is not: the synthetic
+    // receiver is allocated with the INTERFACE itself as its class, so its
+    // resolved declaring class is also `java/lang/System$Logger`, and both
+    // dispatch sites drop a registered native when
+    // `declaring_is_interface && !is_static` unless the triple is force-listed
+    // (`vm/src/vm/vm_exec.rs` `override_cb`; `vm/src/runtime/interpreter.rs`
+    // `try_stackless_invoke` step 6). `java/lang/System$Logger` is in NO force
+    // list — `git grep 'System$Logger' -- vm/ classloading/` matches only unit
+    // tests in `vm.rs`, which call the callback directly and so bypass
+    // dispatch. So the instance natives below are dead on the real-JDK path,
+    // and in synthetic mode `phases_late::register_p67_misc` re-registers the
+    // same triples later (`register_builtins` = essentials then synthetic
+    // overrides, last-write-wins) and supersedes them.
+    //
+    // They are therefore left exactly as they are: flipping `isLoggable` to
+    // `true` here would change nothing observable while implying the default
+    // build now emits `System.Logger` output. The real gap — that in real-JDK
+    // mode `System.getLogger` is shadowed to hand back an object whose class is
+    // an interface, so every subsequent Logger call lands on an abstract
+    // method — is a registration-structure problem reported out of wave 4, not
+    // something a constant here can fix.
     let logger_iface = "java/lang/System$Logger";
     registry.register(
         logger_iface,
@@ -19769,18 +19795,35 @@ pub fn register_essential_natives_with_shims(
             Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
         },
     );
-    // KEEP: `null` is the JDK's own "no such zone id" encoding for
-    // `getZoneInfo0`, so every caller already null-checks it. The real zone
-    // answers come from the tzdb-backed `java.util.TimeZone` natives right
-    // below (parsed from the same `lib/tzdb.dat` the JDK reads); this entry
-    // point only exists as a safety net for frameworks that reach past them
-    // reflectively. Populating it would mean synthesizing a real
-    // `sun.util.calendar.ZoneInfo` field layout, which nothing needs today.
+    // W4: was an unconditional `null`, justified as "synthesizing a real
+    // ZoneInfo layout is work nothing needs". That work already exists —
+    // `alloc_synth_timezone` (below) builds a `sun/util/calendar/ZoneInfo`
+    // with its `ID`/`rawOffset`/`dstSavings` slots populated from the same
+    // tzdb this file parses, and the sibling public `ZoneInfoFile.getZoneInfo`
+    // native is registered against exactly that. So answer the private entry
+    // point the same way, and keep `null` for its real meaning: an id tzdb
+    // does not know. (`getZoneInfo` clones the result and re-stamps the id, so
+    // a fresh object per call is what the JDK expects here.)
     registry.register(
         "sun/util/calendar/ZoneInfoFile",
         "getZoneInfo0",
         "(Ljava/lang/String;)Lsun/util/calendar/ZoneInfo;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let Some(Value::Object(Some(id_obj))) = args.first().copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let Some(id) = ctx.read_string(id_obj) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            // JDK contract: null for an unknown zone id — the caller
+            // (`getZoneInfo`) turns that into "no such TimeZone".
+            if crate::tzdb::canonical_zone_id(ctx, &id).is_none()
+                && tz_standard_offset_seconds(&id).is_none()
+            {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(alloc_synth_timezone(ctx, &id)))
+        },
     );
     // TZDB-OFFSET (2026-07-22): java.util.TimeZone offset queries backed by
     // the real IANA tzdb data (`native_builtins::tzdb`, parsed from
@@ -23455,15 +23498,27 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     #[cfg(feature = "experimental-serialization")]
     serialization::register_serialization_natives(registry);
 
-    // `ByteArrayOutputStream` intrinsic is registered unconditionally (NOT
-    // gated behind `experimental-serialization`). It must always win over the
-    // real bytecode: the interpreter mis-resolves inherited `getfield`/
-    // `putfield` slots for `ByteArrayOutputStream` *subclasses* (e.g.
-    // `sun.security.util.DerOutputStream`), so real `write`/`toByteArray`
+    // `ByteArrayOutputStream` intrinsic. The interpreter mis-resolves inherited
+    // `getfield`/`putfield` slots for `ByteArrayOutputStream` *subclasses*
+    // (e.g. `sun.security.util.DerOutputStream`), so real `write`/`toByteArray`
     // bytecode silently drops bytes — which produced empty DER output and broke
     // ECDSA signature encoding under real JCA. The intrinsic addresses `buf`/
     // `count` by name (consistent with reflection), so it is correct for any
     // subclass.
+    //
+    // W4 CORRECTION — reachability. This call used to be annotated "registered
+    // unconditionally (NOT gated behind `experimental-serialization`) … must
+    // always win over the real bytecode". Only the first half is true: it is
+    // free of the `experimental-serialization` gate, but it sits inside
+    // `register_synthetic_overrides`, which is `#[cfg(feature =
+    // "synthetic-jdk")]` — and `synthetic-jdk` is NOT a default feature of
+    // either `cratonvm-vm` or `cratonvm-cli`. So this intrinsic is compiled out
+    // of the default real-JDK build entirely and cannot be what fixes real-JCA
+    // DER output there; on that path the `java/io/ByteArrayOutputStream` family
+    // comes from `cratonvm_native_io::register_io_natives` instead. Verifying
+    // (or re-fixing) the DerOutputStream case on the real-JDK path is a
+    // separate job — see the wave-4 report; do not "restore" the claim by
+    // moving this call without checking which registrar actually wins.
     serialization::register_byte_array_output_stream(registry);
 
     // --- Phase 14.1: CDS/AppCDS ---
@@ -23828,6 +23883,224 @@ fn jul_convenience_log(
     // Nothing allocates between the reads above and this call, so `level`,
     // `this` and `payload` are all still current.
     ctx.invoke_virtual(this, "log", desc, &[Value::Object(Some(level)), payload])?;
+    Ok(None)
+}
+
+/// `java.security.ProtectionDomain.implies(Permission)`.
+///
+/// Evaluated against the same parsed-policy core that backs
+/// `SecurityManager.checkPermission` and the `Policy.implies(pd, perm)`
+/// native (`security_manager::policy_allows_full_generic`), using the
+/// currently-active privileged frame's codeBase + signer digests so
+/// `grant codeBase "…"` / `grant signedBy "…"` clauses match the same way in
+/// all three places. When no policy file is installed the core is allow-all,
+/// so the common case still answers `true`.
+///
+/// Permission layout convention (shared with `security_manager.rs`):
+/// field 0 = name/target, field 1 = actions.
+fn native_protection_domain_implies(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Instance method: [this(ProtectionDomain), permission]. A call shape with
+    // no permission argument has nothing to evaluate — keep the historical
+    // permissive answer rather than inventing a denial.
+    if args.len() < 2 {
+        return Ok(Some(Value::Int(1)));
+    }
+    // A null permission carries no grant to satisfy: deny, matching the
+    // `Policy.implies` native's null handling (security_manager.rs).
+    let perm = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(perm))
+        .unwrap_or_default();
+    let target = match ctx.get_field(perm, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let actions = match ctx.get_field(perm, 1) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let code_base = crate::security_manager::current_privileged_code_base_arc();
+    let cert_digests = crate::security_manager::current_privileged_cert_digests_arc();
+    let allowed = crate::security_manager::policy_allows_full_generic(
+        &class_name,
+        &target,
+        &actions,
+        code_base.as_deref(),
+        &cert_digests,
+    );
+    Ok(Some(Value::Int(allowed as i32)))
+}
+
+/// Whether the given **OS** descriptor carries `O_APPEND`.
+///
+/// Only ever called for 0/1/2 — see `native_file_descriptor_get_append`.
+#[cfg(unix)]
+fn os_fd_is_append(fd: i32) -> bool {
+    // SAFETY: `F_GETFL` only reads the descriptor's status flags; it touches
+    // no memory and returns -1 (with errno set) for a closed/invalid fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && (flags & libc::O_APPEND) != 0
+}
+
+#[cfg(not(unix))]
+fn os_fd_is_append(_fd: i32) -> bool {
+    // Windows has no `O_APPEND` status flag on a HANDLE; the JDK's own Windows
+    // build tracks append mode on the stream, not on the descriptor.
+    false
+}
+
+/// `java.io.FileDescriptor.getAppend(int fd)` — static.
+///
+/// W4: was a hard `false` justified as "CratonVM never opens an O_APPEND
+/// descriptor". That was wrong — `FileDescriptorTable::open_write(path, true)`
+/// passes `.append(true)` straight to the OS. What is true is that the `fd`
+/// value handed to this native is a `fd_table` id, NOT an OS descriptor, for
+/// everything except 0/1/2 (see the `getHandle` native above, which maps
+/// exactly that range through and answers -1 otherwise). Handing a table id to
+/// `fcntl` would report the flags of an unrelated real descriptor, so only the
+/// three standard streams are queried for real — and they are the only ones
+/// the JDK asks about anyway: `FileDescriptor(int)` is the sole caller and it
+/// runs for in/out/err, where a shell's `>>` genuinely does hand us O_APPEND.
+///
+/// ESCALATION (reported, not worked around here): a faithful answer for the
+/// remaining descriptors needs `FileDescriptorTable` to record the `append`
+/// flag `open_write` already receives and expose it as
+/// `fd_table().is_append(fd) -> Option<bool>` (`native-api/src/fd_table.rs`).
+fn native_file_descriptor_get_append(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let fd = match args.first() {
+        Some(Value::Int(v)) => *v,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let append = (0..=2).contains(&fd) && os_fd_is_append(fd);
+    Ok(Some(Value::Int(append as i32)))
+}
+
+/// `Field/Method/Constructor.getRoot()` — the receiver's own `root` field.
+///
+/// W4: was a hard `null` for all three. Null is still the normal answer (our
+/// `copy()` natives hand back the SAME object rather than minting a linked
+/// copy, so nothing sets `root`), but reading the field means a reflective
+/// object that *did* acquire a root — e.g. real `AccessibleObject.copy()`
+/// bytecode running in a configuration where the `copy` native is not the
+/// winner — reports it instead of lying. `get_field_by_name` answers
+/// `Object(None)` for a layout with no such field, so synthetic Field/Method
+/// objects keep the old behaviour exactly.
+///
+/// `AccessibleObject.getRoot()` deliberately keeps its literal `null`: that IS
+/// the JDK body for the base class.
+fn native_reflect_get_root(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    match ctx.get_field_by_name(this, "root") {
+        root @ Value::Object(Some(_)) => Ok(Some(root)),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `java.lang.reflect.Executable.getParameters0()`.
+///
+/// W4: was a hard `null`. Now returns a real `Parameter[]` whenever the
+/// declaring class file actually carries a `MethodParameters` attribute
+/// (JVMS 4.7.24), and `null` otherwise.
+///
+/// The null half is load-bearing rather than a leftover stub:
+/// `Executable.privateGetParameters` sets `hasRealParameterData = true` for
+/// ANY non-null result, and that flag is what `Parameter.isNamePresent()`
+/// reports. Synthesizing `arg0`/`arg1`/… here would make `isNamePresent()`
+/// lie; returning null makes the JDK synthesize the very same names itself
+/// and correctly report them as absent.
+fn native_executable_get_parameters0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_id = match ctx.get_field_by_name(this, "clazz") {
+        Value::Object(Some(mirror)) => crate::lang_class::mirror_class_id(ctx, mirror),
+        _ => None,
+    };
+    let Some(class_id) = class_id else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // Constructor reflection objects carry no `name` field — the JDK uses
+    // `<init>` implicitly (same convention as `lang_reflect`).
+    let name = match ctx.get_field_by_name(this, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "<init>".to_string()),
+        _ => "<init>".to_string(),
+    };
+    // Method-style descriptor first, then Constructor-style (same order as
+    // `lang_reflect::native_executable_get_parameters`).
+    let descriptor = match crate::lang_class::read_method_descriptor(ctx, this) {
+        Some(d) => d,
+        None => crate::lang_class::read_constructor_descriptor(ctx, this).unwrap_or_default(),
+    };
+    if descriptor.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let meta = ctx.method_parameters(class_id, &name, &descriptor);
+    // Empty vec = no attribute; all-empty names = `name_index == 0` for every
+    // entry, which the JDK also treats as "no real parameter data".
+    if meta.is_empty() || meta.iter().all(|(n, _)| n.is_empty()) {
+        return Ok(Some(Value::Object(None)));
+    }
+    crate::lang_reflect::native_executable_get_parameters(ctx, args)
+}
+
+/// `java.lang.StackTraceElement.computeFormat()`.
+///
+/// W4: was a null-safe no-op (ES-FAIL-06 — the JDK body dereferences
+/// `declaringClassObject` with no null guard, and elements built by the public
+/// 4-arg constructor leave it null). Keep the null guard, but compute the real
+/// bits when the class object IS present:
+///
+/// * `0x1 BUILTIN_CLASS_LOADER` — `toString()` drops the class-loader name.
+///   Set for the bootstrap/platform/application loaders, which are exactly
+///   `loader_id_of_class` 0/1/2 (`ClassLoaderId::to_native_id`); a user-defined
+///   loader gets an id >= 3 and keeps its name in the rendering.
+/// * `0x2 JDK_NON_UPGRADEABLE_MODULE` — `toString()` drops the module version.
+///   Set for the `java.*` / `jdk.*` boot-layer modules.
+///
+/// Both bits only ever SUPPRESS a prefix, so an element whose
+/// `classLoaderName`/`moduleName` are null renders identically either way —
+/// this cannot regress the ES-FAIL-06 case it replaces.
+fn native_stack_trace_element_compute_format(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let class_id = match ctx.get_field_by_name(this, "declaringClassObject") {
+        Value::Object(Some(mirror)) => crate::lang_class::mirror_class_id(ctx, mirror),
+        _ => None,
+    };
+    let mut format = 0i32;
+    if let Some(class_id) = class_id {
+        if (0..=2).contains(&ctx.loader_id_of_class(class_id)) {
+            format |= 0x1;
+        }
+        if let Some(module) = ctx.module_name_of_class(class_id) {
+            if module.starts_with("java.") || module.starts_with("jdk.") {
+                format |= 0x2;
+            }
+        }
+    }
+    // No-op when the layout has no `format` field (synthetic elements).
+    ctx.set_field_by_name(this, "format", Value::Int(format));
     Ok(None)
 }
 

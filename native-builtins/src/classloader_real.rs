@@ -577,13 +577,22 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     // currently harmless; if you ever change the answer, change all three or
     // the edit will be silently shadowed.
     //
-    // Known inconsistency (NOT fixable from here — this method is STATIC and
-    // has no receiver): `classloader.rs::cl_is_registered_as_parallel_capable`
-    // reports the per-instance `CL_IS_PARALLEL_CAPABLE` field, which nothing
-    // ever SETS, so `isRegisteredAsParallelCapable()` answers false while this
-    // answers true. Real JDK records the CALLER class in a static
-    // `ParallelLoaders` set; reconciling the pair means adding that set plus a
-    // caller-class lookup, and touches `classloader.rs`.
+    // RESOLVED — the "known inconsistency" this comment used to describe is
+    // gone; re-verified wave 4 (2026-07-28). The claim was that
+    // `classloader.rs::cl_is_registered_as_parallel_capable` read a
+    // `CL_IS_PARALLEL_CAPABLE` field nothing ever SET, so the query answered
+    // false while this answers true. All four ClassLoader initialisers in
+    // `classloader.rs` (`alloc_classloader`, `cl_init`, `cl_init_parent`,
+    // `cl_init_name_parent`) now seed that slot to `Int(1)`, and the query
+    // native falls back to `1` for loaders whose layout is too short to carry
+    // the slot. Register and query therefore agree. If you ever make this
+    // return something other than 1, update `CL_IS_PARALLEL_CAPABLE`'s four
+    // writers and `cl_is_registered_as_parallel_capable`'s fallback too.
+    //
+    // Not implementable as a caller-class lookup from here in any case: the
+    // method is STATIC, so there is no receiver, and `NativeContext` exposes no
+    // caller-class / stack-walk accessor to stand in for the JDK's
+    // `Reflection.getCallerClass()` + static `ParallelLoaders` set.
     r.register(cl, "registerAsParallelCapable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });

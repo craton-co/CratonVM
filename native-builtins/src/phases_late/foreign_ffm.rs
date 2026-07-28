@@ -1981,13 +1981,28 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
     // `ofArray` segments are not native, everything else is); the arena-backed
     // carriers this file mints are all off-heap, so TRUE is this fallback's
     // correct value and the two no longer disagree.
+    //
+    // VERIFIED (wave 4): `panama.rs:720` reads `SEG_BACKING_ARRAY_FIELD` off the
+    // receiver and answers `!heap_backed`; both call sites still order
+    // foreign_ffm before panama, so panama's remains live and the two agree.
+    // Left as a constant deliberately — routing it through panama's
+    // receiver-based check would answer FALSE for the synthetic carriers here,
+    // which have no backing-array field at all, i.e. it would introduce the
+    // contradiction this note exists to record.
     r.register(ms, "isNative", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
-    // KEEP (constant, justified): "mapped" means "produced by
-    // `FileChannel.map`", and nothing constructs one of these carriers that
-    // way — every path that mints one (`Arena.allocate*`, `asSlice`,
-    // `reinterpret`, `MemorySegment.NULL`, `ofArray`) is malloc- or heap-backed.
-    // So `false` is a statement of fact about this model, not a placeholder.
-    r.register(ms, "isMapped", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    // STUB-REMOVAL (wave 4): was a flat `false`. The answer is decidable from
+    // the receiver by exactly the same rule the three impl classes use below
+    // (`MappedMemorySegmentImpl` is mapped, nothing else is), so share the
+    // helper rather than restate a constant that could drift away from it.
+    //
+    // The value does not change today: `MemorySegment` is an INTERFACE and this
+    // is a non-static instance method, so per the interface-shadowing rule this
+    // registration only ever reaches the synthetic `java/lang/foreign
+    // /MemorySegment` carriers this file mints — every one of which comes from
+    // `Arena.allocate*`/`asSlice`/`reinterpret`/`NULL`/`ofArray` and is
+    // malloc- or heap-backed, never `FileChannel.map`. It stops being a
+    // constant the moment a mapped carrier is minted.
+    r.register(ms, "isMapped", "()Z", p67_segment_impl_is_mapped);
     r.register(ms, "isReadOnly", "()Z", p67_segment_is_read_only);
     // `MemorySegment` does not override `equals` in the JDK — segment equality
     // IS reference identity. The constant `false` this used to return broke

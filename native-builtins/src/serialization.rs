@@ -2088,6 +2088,17 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
     // bytes are identical to the previous no-op. Reading the values from the
     // live object rather than the accumulator is the remaining approximation;
     // closing it means implementing `PutField.put*`, still an open residual.
+    //
+    // Wave-4 verification of that residual, since it reads like a silent
+    // wrong-answer risk and is not one: `git grep 'ObjectOutputStream$PutField'`
+    // over the tree finds only the two `putFields()` factories (here and
+    // native-collections) — there is no `put`/`write` native on the class, and
+    // the object those factories hand back is a 2-field SYNTHETIC whose class
+    // has no bytecode. So a caller that actually uses the accumulator fails
+    // loudly at the first `put(...)` and never reaches `writeFields`. The
+    // divergence is bounded to "reads live values" for callers that obtain a
+    // PutField and never write to it; a caller that writes to it cannot get
+    // here at all.
     r.register(cls, "writeFields", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let addr = this.as_ptr() as usize;
@@ -3084,11 +3095,19 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // `readObjectOverride()` is `protected Object readObjectOverride() { return
-    // null; }` in the real `ObjectInputStream` — a hook that exists only to be
-    // overridden by a subclass built with the protected no-arg constructor.
-    // Returning null is the JDK body verbatim, not a stub; a subclass that
-    // overrides it resolves to its own declaring class and never reaches here.
+    // KEEP — this is the real body, re-verified against JDK 25 source
+    // (`java.base/java/io/ObjectInputStream.java`, `readObjectOverride`):
+    //
+    //     protected Object readObjectOverride()
+    //         throws IOException, ClassNotFoundException
+    //     {
+    //         return null;
+    //     }
+    //
+    // A hook that exists only to be overridden by a subclass built with the
+    // protected no-arg constructor, and `readObject()` only routes to it when
+    // `enableOverride` is set — i.e. exactly for such a subclass, which
+    // resolves to its own declaring class and never reaches this native.
     r.register(
         cls,
         "readObjectOverride",
@@ -3901,9 +3920,18 @@ pub(crate) fn register_reflection_factory_serialization(r: &mut NativeMethodRegi
 fn register_object_stream_class(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ObjectStreamClass";
 
-    // initNative() — no-op in modern OpenJDK (legacy native state moved to Java).
-    // Must be registered so ObjectStreamClass.<clinit> succeeds; otherwise later
-    // reflection into serialVersionUID throws InternalError.
+    // KEEP, and the wave-3 phrasing ("no-op in modern OpenJDK") was too loose
+    // to check, so here is what the real one does. `ObjectStreamClass.<clinit>`
+    // calls `initNative()`, whose JNI body
+    // (`java.base/share/native/libjava/ObjectStreamClass.c`) does exactly one
+    // thing: cache a JNI global ref to `java.lang.NoSuchMethodError` for the
+    // sibling `hasStaticInitializer` native to throw. It establishes NO
+    // Java-visible state, and CratonVM's `hasStaticInitializer` (registered
+    // immediately below) needs no cached class ref because it raises through
+    // `RuntimeError`. So there is nothing a body here could set up that
+    // anything later reads — the same shape as `OperatingSystemImpl.initialize0`
+    // in `jmx.rs`. It must stay REGISTERED, though: an unregistered native
+    // fails `<clinit>` with UnsatisfiedLinkError and takes serialization down.
     r.register(cls, "initNative", "()V", |_ctx, _args| Ok(None));
 
     // hasStaticInitializer(Class, boolean) -> boolean
@@ -4735,15 +4763,21 @@ fn register_object_input(r: &mut NativeMethodRegistry) {
     // before reaching this default. Verified safe for JNDI bootstrap which
     // null-checks the return value (InitialContext.getURLOrDefaultInitCtx).
     //
-    // Wave-3 reachability check, so this is not re-litigated: both entries are
+    // Wave-3 reachability check, re-confirmed in wave 4 against
+    // `vm/src/runtime/interpreter.rs` (`try_stackless_invoke` step 6) and
+    // `vm/src/vm/vm_exec.rs`, so this is not re-litigated: both entries are
     // instance methods on an INTERFACE, and native lookup drops those unless
     // the descriptor is the `()Liface;` / `(Liface;)Liface;` default-method
-    // shape (neither is) or the triple is force-listed (neither is). So they
-    // cannot intercept a user `ObjectInput` implementor at all — the only
-    // receiver that reaches them is one whose class collapses to the bare
-    // interface, i.e. a CratonVM synthetic with no backing stream. For that
-    // receiver `null` (end of stream) and `0` (no bytes readable without
-    // blocking) are the JDK's own legal answers, not placeholders.
+    // shape (neither is — `()Ljava/lang/Object;` and `()I`) or the triple is
+    // force-listed in `should_force_registered_native_over_bytecode` (neither
+    // is). So they cannot intercept a user `ObjectInput` implementor at all —
+    // the only receiver that reaches them is one whose class collapses to the
+    // bare interface, i.e. a CratonVM synthetic with no backing stream. For
+    // that receiver `null` (end of stream) and `0` (no bytes readable without
+    // blocking) are the JDK's own legal answers, not placeholders: the
+    // interface declares both abstract, so there is no real body to match and
+    // the contract is all there is. VERDICT: KEEP, on the interface-contract
+    // ground — there is no receiver state here to read.
     r.register(cls, "readObject", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -4839,6 +4873,25 @@ fn register_stream_corrupted_exception(r: &mut NativeMethodRegistry) {
 // Registration entry point
 // ---------------------------------------------------------------------------
 
+/// REACHABILITY (traced wave 4 — read this before judging anything above).
+///
+/// This function has exactly one call site outside tests,
+/// `native-builtins/src/lib.rs`, and it is gated TWICE:
+///   * `#[cfg(feature = "experimental-serialization")]` — default-off; and
+///   * it sits inside `register_synthetic_overrides`, which is itself
+///     `#[cfg(feature = "synthetic-jdk")]`.
+/// So every registration below is dead in the default real-JDK build, and live
+/// only under `--synthetic-jdk` **plus** `experimental-serialization`. The one
+/// entry point of this module on the real-JDK path is
+/// `register_reflection_factory_serialization`, called from
+/// `register_essential_natives_with_shims` — and that call is
+/// `experimental-serialization`-gated too.
+///
+/// `register_byte_array_output_stream` is the near-exception: it is called a
+/// second time from lib.rs WITHOUT the serialization feature gate, but still
+/// from inside `register_synthetic_overrides` — so it is synthetic-only as
+/// well, despite the comment at that call site claiming it must "always win"
+/// for real-JCA DER output. That mismatch is in lib.rs, not here.
 pub(crate) fn register_serialization_natives(r: &mut NativeMethodRegistry) {
     register_object_output_stream(r);
     register_object_input_stream(r);
@@ -5096,10 +5149,18 @@ pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
         },
     );
-    // `flush()` is inherited from `OutputStream`, whose body is empty, and
-    // `ByteArrayOutputStream.close()` is documented as having no effect (the
-    // buffer stays readable afterwards). Both no-ops match the JDK exactly —
+    // KEEP — both real bodies are empty, verified against JDK 25 source:
+    //   * `ByteArrayOutputStream.close()` (ByteArrayOutputStream.java, last
+    //     method in the class) is literally
+    //     `public void close() throws IOException { }`, and its javadoc says
+    //     closing has no effect — the buffer stays readable afterwards;
+    //   * `flush()` is not declared here at all, so it is inherited from
+    //     `java.io.OutputStream`, whose body is likewise `{ }`.
+    // A no-op is therefore the real behaviour, not an approximation of it:
     // this stream has no sink to push to and no descriptor to release.
+    // Registering them at all matters because the surrounding natives own the
+    // `buf`/`count` state by name; falling through to bytecode for two empty
+    // methods would only cost a dispatch.
     r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
     r.register(cls, "close", "()V", |_ctx, _args| Ok(None));
 }
