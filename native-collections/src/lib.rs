@@ -29728,10 +29728,17 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             if let Value::Object(Some(inner)) = ctx.get_field_by_name(coll, "c") {
                 return collect_collection_elements(ctx, inner);
             }
-            // SingletonList stores the element in field `element`.
-            if let Value::Object(Some(_)) = ctx.get_field_by_name(coll, "element") {
-                let v = ctx.get_field_by_name(coll, "element");
-                return vec![v];
+            // SingletonList and SingletonSet store their sole element in
+            // `element`.  That element is allowed to be null, so its presence
+            // must be determined by the receiver class, not by its Value
+            // representation.  Treating Object(None) as an absent backing
+            // collection turned `Collections.singletonList(null)` into an
+            // empty removal set, leaving null holes in ArrayList bulk
+            // operations and downstream protobuf repeated fields.
+            if cls_name == "java/util/Collections$SingletonList"
+                || cls_name == "java/util/Collections$SingletonSet"
+            {
+                return vec![ctx.get_field_by_name(coll, "element")];
             }
         }
         // RegularEnumSet — a real-JDK class CratonVM doesn't synthetically
