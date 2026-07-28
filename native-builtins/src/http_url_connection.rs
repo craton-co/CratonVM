@@ -1122,9 +1122,13 @@ fn parse_url(url: &str) -> Result<Url1, String> {
     } else {
         return Err(format!("unsupported scheme in {url}"));
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // A query-only target has no explicit path, but HTTP origin-form still
+    // needs `/?query`; fragments never belong in an HTTP request target.
+    let (authority, path) = match rest.find(|c| matches!(c, '/' | '?' | '#')) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
+        Some(i) => (&rest[..i], "/".to_string()),
+        None => (rest, "/".to_string()),
     };
     // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
     // LAST '@' (userinfo may itself contain an encoded/raw '@').
@@ -1151,7 +1155,7 @@ fn parse_url(url: &str) -> Result<Url1, String> {
         scheme,
         host,
         port,
-        path: path.to_string(),
+        path,
         userinfo,
     })
 }
@@ -4069,6 +4073,19 @@ mod http_url_connection_tests {
     fn test_parse_url_https_with_port() {
         let p = parse_url("https://example.com:8443").unwrap();
         assert_eq!(p.scheme, "https");
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.port, 8443);
+        assert_eq!(p.path, "/");
+    }
+
+    #[test]
+    fn test_parse_url_query_only_and_fragment() {
+        let p = parse_url("http://localhost:8080?trace=false&message=false").unwrap();
+        assert_eq!(p.host, "localhost");
+        assert_eq!(p.port, 8080);
+        assert_eq!(p.path, "/?trace=false&message=false");
+
+        let p = parse_url("https://example.com:8443#client-only").unwrap();
         assert_eq!(p.host, "example.com");
         assert_eq!(p.port, 8443);
         assert_eq!(p.path, "/");
