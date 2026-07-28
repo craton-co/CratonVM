@@ -248,6 +248,32 @@ fails it 2 of 4 runs, and a **debug** `cargo test -p cratonvm-vm --lib --
 fails it 2 of 6. Release runs were simply blind to it while enforcement was
 silently off — the same blind spot R4 is about.
 
+**Now fixed (2026-07-28), and the mechanism was not what this section
+guessed.** The note above (and the follow-up task it spawned) assumed
+`SharedVm::new`'s background threads were holding `Arc` clones past the
+test's `drop`. That is impossible: `SharedVm::new` runs *before* the `Arc`
+exists, so those threads have nothing to clone. Instrumenting the assertion
+to print `Weak::upgrade().is_some()` alongside the cell's pointer showed, on
+every failing run, `our_weak_alive=false` with the cell holding a
+**different** `SharedVm` — our VM was long dead and the global cell had been
+overwritten.
+
+The real cause is the same shape as R1's: a process-global cell with partial
+lock coverage. `Vm::new` (`vm/src/vm/vm_init.rs`) republishes `PROCESS_VM`
+unconditionally for every VM it builds — deliberately, so a host thread
+calling `AttachCurrentThread` can always resolve a live VM — and it has no
+access to the test-only `PROCESS_VM_TEST_LOCK`. This crate's own tests build
+a `Vm` at 60+ call sites, so one of them running concurrently republishes the
+cell and `process_vm()` legitimately returns *that* VM. Lock-order
+enforcement only changed the scheduling that makes the overlap likely.
+
+The test now asserts the property that is actually deterministic — the
+published VM really is destroyed, via a `Weak` the test holds — and gates its
+two assertions about the *cell* on `Weak::ptr_eq` proving the cell still
+refers to that VM. Measured before/after on the 16-core host, full suite
+with `--skip runtime::lock_order`: debug **2/25 → 0/60**, release with
+`CRATONVM_LOCK_ORDER_CHECK=1` **1/25 → 0/60**.
+
 ## Residual-round verification
 
 All on the Linux build host, worktree

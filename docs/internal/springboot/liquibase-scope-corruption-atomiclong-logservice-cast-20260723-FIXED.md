@@ -1,6 +1,19 @@
-# Liquibase `Scope` per-thread state corruption: scope-id stack mismatch + `AtomicLong` misread as `LogService`
+# Liquibase `Scope` per-thread state corruption: scope-id stack mismatch + `AtomicLong` misread as `LogService` — FIXED
 
-**Status: OPEN — found 2026-07-23**
+**Status: FIXED 2026-07-28**
+
+## Resolution
+
+The original Liquibase `Scope` failures and the later
+`ConcurrentReferenceHashMap` casts were one stale-reference failure: the
+non-moving young/G1 path could reuse a live reference slot during repeated
+application-context refreshes. The moving young collector is now the default,
+with JIT root maps controlled by the same shared flag; interpreter-only runs
+also default to Generational instead of silently selecting G1. An explicit
+`-XX:+UseG1GC` remains an opt-in for callers that deliberately select it.
+
+Validation with `LiquibaseAutoConfigurationTests` passed all 43 tests in both
+JIT and `--nojit` modes with zero failures on 2026-07-28.
 
 ## Symptom
 
@@ -64,7 +77,7 @@ passing tests' Liquibase changelog INFO output, useful context showing
 `Scope`-driven changelog runs succeeding normally dozens of times in the same
 process before/around the failures).
 
-## Root cause — not confirmed at file:line precision, strong hypothesis
+## Original diagnosis (superseded)
 
 `liquibase.Scope` (third-party jar, not in this worktree's source — not
 decompiled this session) is a `ThreadLocal<Scope>`-backed nested-scope stack:
