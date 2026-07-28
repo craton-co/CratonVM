@@ -190,3 +190,25 @@ So the exception escapes the compiled body without ever reaching
 `invoke_shared` takes for a lambda target and give it the same drain the
 ordinary path has. Note DIRECT-athrow leaks too, so this is not about the bci at
 all — that shape's pc was always known.
+
+### Harness trap that caused a spurious revert of this fix
+
+This fix was landed (`e3ef0409f`), reverted (`8ea368974`), then re-landed
+(`bb966dbcc`). The revert was based on a bad measurement, not a real defect.
+
+`jit_interp_differential` **spawns `target/release/cratonvm.exe`** as a child
+process. A verification command shaped as
+
+    cargo test -p cratonvm-vm --test jit_interp_differential && cargo build --bin cratonvm
+
+therefore runs the suite against the PREVIOUS build's binary. Both the SIGSEGV
+that triggered the revert and the follow-up "baseline passes with the change
+reverted" run — which appeared to confirm it — were measuring stale binaries, in
+opposite directions. Neither attribution was valid.
+
+Re-measured with the binary built FIRST: `jit_interp_differential` 10/10, the
+three exception suites 19/11/11, and the `JitDifferential` fixture run directly
+10 times with 0 failures.
+
+**Rule: any suite that spawns the cratonvm binary must have that binary built
+before the suite runs.** `cargo build --bin cratonvm` first, then `cargo test`.
