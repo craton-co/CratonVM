@@ -704,17 +704,6 @@ pub(crate) fn clear_jit_athrow_bci() {
     JIT_SIGNALS.with(|s| s.athrow_bci.set(-1));
 }
 
-/// Read the `athrow` bci without consuming it.
-///
-/// Exists for the one consumer that must see the bci BEFORE
-/// [`clear_jit_athrow_bci`] runs: `route_implicit_exc_through_callee` routes
-/// through the CALLEE's own exception table, and the stamped bci is that
-/// callee's own throw site — precisely the pc that lookup needs. See the
-/// capture at that function's entry.
-pub(crate) fn peek_jit_athrow_bci() -> i64 {
-    JIT_SIGNALS.with(|s| s.athrow_bci.get())
-}
-
 /// Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): re-stash a previously
 /// taken pending-NPE flag. See `stash_jit_pending_exception` for the OSR
 /// drain-without-route rationale.
@@ -1660,23 +1649,6 @@ unsafe fn route_implicit_exc_through_callee(
     // (which regenerates the exception) or hands the sentinel to the compiled
     // CALLER, whose drain would treat that bci as its own. See
     // `clear_jit_athrow_bci`.
-    //
-    // CAPTURE IT FIRST. Being the callee's own bci is exactly what makes it
-    // right for the KCFULL-13 branch below, which routes through THAT callee's
-    // own exception table — the one lookup in this function for which the pc is
-    // not foreign at all. Clearing it before the branch read it left
-    // `throw_pc = usize::MAX`, so `find_jit_exception_handler` took its
-    // pc-unknown path, which deliberately skips a catch-all whose region does
-    // not span the whole method — i.e. every javac `finally`. The resume-at-
-    // handler fix (`run_jit_callee_handler`) could then never fire: measured
-    // 4213 entries to the branch and 0 handlers found, with the fall-through
-    // re-running the callee from entry and leaking one increment per throw
-    // (`CallPathProbe` IFACE-class-delegating, `FinallyBalanceProbe`).
-    //
-    // The clear itself stays, so every path that propagates outward or re-runs
-    // the callee behaves exactly as before; only the branch that consumes the
-    // bci for the callee's OWN table sees it.
-    let callee_throw_bci = peek_jit_athrow_bci();
     clear_jit_athrow_bci();
     if rbc6_dbg() {
         eprintln!(
@@ -1754,17 +1726,8 @@ unsafe fn route_implicit_exc_through_callee(
                 // (docs/known-issues/repros/jitban-remaining-20260726/).
                 let signals = take_all_jit_signals();
                 if let Some(exc) = signals.exception {
-                    // `signals.athrow_bci` is always -1 here: the entry clear
-                    // above ran before this drain. Fall back to the value
-                    // captured before it — the callee's own throw site, which
-                    // is what this lookup against the callee's own table needs.
-                    let stamped_bci = if signals.athrow_bci >= 0 {
-                        signals.athrow_bci
-                    } else {
-                        callee_throw_bci
-                    };
-                    let throw_pc = if stamped_bci >= 0 {
-                        stamped_bci as usize
+                    let throw_pc = if signals.athrow_bci >= 0 {
+                        signals.athrow_bci as usize
                     } else {
                         usize::MAX
                     };

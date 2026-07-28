@@ -11975,41 +11975,10 @@ fn route_jit_signal_exception(
 /// receiving `maybeThrow`'s athrow at bci 13 — `handler_pc=None`, and its own
 /// `catch (Boom)` never ran (5,619 of 20,000 iterations).
 ///
-/// Accept the bci when it indexes an instruction boundary in THIS method's
+/// Accept the bci only when it indexes an `athrow` (0xbf) in THIS method's
 /// code. Anything else falls back to the "throw pc unknown" sentinel, which is
 /// the pre-RBC.6 behaviour: typed handlers still match by exception class, and
 /// only a narrow catch-all is skipped.
-///
-/// **The boundary test replaced a `code[pc] == 0xbf` (athrow) test.** That
-/// opcode test dated from when a local `athrow` was the ONLY site that stamped
-/// a bci. `66548471f` then widened the PRODUCER — `emit_exception_check_stub`
-/// now emits one pad per distinct throw-site bci, each calling
-/// `JitRuntimeHelpers::set_throw_bci`, across all 19
-/// `emit_post_invoke_exception_check` sites plus `emit_post_alloc_oom_check` —
-/// but left this consumer still asserting "must be a literal athrow". The two
-/// halves then disagreed about what `athrow_bci` means, and every stamped
-/// INVOKE bci was thrown away here.
-///
-/// The observable cost was the whole `finally` family coming back:
-/// `FinallyBalanceProbe`'s `guarded` stamps bci 9 (its `invokestatic work`),
-/// this function rejected it because `code[9] != 0xbf`,
-/// `find_jit_exception_handler` took its `pc_unknown` path, and that path
-/// deliberately skips a catch-all whose region does not span the whole method —
-/// which is exactly a javac `finally`. Result: `handler_pc=None`, the `finally`
-/// never ran, and `CallPathProbe` leaked on every dispatch route.
-///
-/// The foreign-bci filter that the opcode test used to provide is replaced by a
-/// STRICTLY BETTER one: the pc must fall inside one of this method's own
-/// protected ranges (plus be a real instruction boundary). `athrow_bci` carries
-/// no method identity, so a callee's stamp can still be standing here — see the
-/// range check below and `test_compiled_callee_catches_its_own_athrow`, which
-/// pins exactly that case. Do not weaken it to a boundary test alone: a foreign
-/// bci is usually a valid boundary in this method too.
-///
-/// (A compiled method that exits through a precise-frame deopt stub instead
-/// publishes an exceptional frame, and `route_jit_signal_exception` prefers
-/// that — it is method-checked by `deopt_frame_matches_method` — over this
-/// fallback entirely.)
 fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize {
     if athrow_bci < 0 {
         return usize::MAX;
@@ -12017,39 +11986,10 @@ fn jit_local_athrow_pc(cached: &CachedBytecodeMethod, athrow_bci: i64) -> usize 
     let pc = athrow_bci as usize;
     // `cached.code` carries 2 bytes of speculative-read padding.
     let code_len = cached.code.len().saturating_sub(2);
-    if pc >= code_len {
-        return usize::MAX;
-    }
-    // The bci must land inside one of THIS method's protected ranges.
-    //
-    // This is what replaces the old opcode test as the foreign-bci filter, and
-    // it is a far better one. `JitSignals::athrow_bci` carries no method
-    // identity, so a callee's stamp can still be standing when this method's
-    // drain runs — `JitPreciseHandlerFrame.plainStep` (protected range [0,4))
-    // receives its callee `maybeThrow`'s athrow bci 13, and
-    // `test_compiled_callee_catches_its_own_athrow` exists for exactly that.
-    // 13 is a perfectly valid instruction boundary in `plainStep` too, so a
-    // boundary test alone accepts it; the range test rejects it and falls back
-    // to the pc-unknown sentinel, where a TYPED handler still matches by
-    // exception class and the `catch (Boom)` runs.
-    //
-    // Rejecting an out-of-range pc costs nothing even when the pc is genuine:
-    // `find_jit_exception_handler` would find no covering entry for it anyway,
-    // and the one case the pc-unknown path still honours — a catch-all spanning
-    // the whole method — covers every pc by definition, so honouring it there
-    // is correct.
-    let in_a_protected_range = cached.exception_table.iter().any(|e| {
-        // Widening: u16 -> usize (non-negative, fits)
-        pc >= e.start_pc as usize && pc < e.end_pc as usize
-    });
-    if !in_a_protected_range {
-        return usize::MAX;
-    }
-    // `verified_code` is the process-shared, cached decode already used by the
-    // compiler frontends, so this is a hash lookup rather than a re-decode.
-    match cratonvm_reader::verified_code(&cached.code[..code_len]) {
-        Ok(verified) if verified.is_instruction_start(pc) => pc,
-        _ => usize::MAX,
+    if pc < code_len && cached.code[pc] == 0xbf {
+        pc
+    } else {
+        usize::MAX
     }
 }
 
