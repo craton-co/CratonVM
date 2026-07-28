@@ -1,126 +1,88 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! WP3.7 — `java.nio.channels.DatagramChannel` extensions: real
-//! send/receive of payloads, multicast group membership, broadcast
-//! support.
+//! WP3.7 — `java.nio.channels.DatagramChannel` multicast group membership
+//! (`join` and the resulting `MembershipKey`), plus the outbound-policy gate
+//! shared with the UDP send path.
 //!
-//! ## Why this is a separate registry
+//! ## The registry split, and how it was resolved (2026-07-28)
 //!
-//! The pre-existing `t16_dc_*` family in `nio_native.rs` (lines
-//! 712-836) covers `open()` / `close()` / `connect()` / `isOpen` /
-//! `configureBlocking`.  It owns its own `udp_registry` keyed by an
-//! `i32` `sock_id` stashed in the channel object's slot 4.  We cannot
-//! edit `nio_native.rs` (file-scope rule for this WP), nor can we
-//! share the existing `udp_registry` since it is `fn`-private inside
-//! that module.
+//! This module used to keep its **own** `dgram_registry` of `UdpSocket`s,
+//! keyed by an id it stashed in the channel object's slot 4, because the
+//! `t16_dc_*` family in `nio_native.rs` owned a second one and a file-scope
+//! rule for the original WP forbade touching it. The module doc called
+//! unifying them a follow-up.
 //!
-//! As a result this module **maintains its own** `dgram_registry`.
-//! Channels created via the pre-existing `t16_dc_open` use the
-//! original registry; channels created via `dgram_open0` here use
-//! ours.  This is a deliberate divergence flagged in the report — a
-//! follow-up integration step in `lib.rs` can route both paths
-//! through a single registry.  In the meantime, both sets of natives
-//! work in isolation and any code that opens a channel one way stays
-//! consistent within that side.
+//! That split was not merely untidy — it left `DatagramChannel` unable to
+//! send at all:
 //!
-//! Acceptance criteria (WP3.7):
-//!   * `DatagramChannel.open()` + `bind()` + `send(buf, addr)` + a
-//!     peer's `receive(buf)` round-trips an arbitrary payload.
-//!   * `DatagramChannel.join(group, ifc)` joins a multicast group;
-//!     subsequent `receive` on a peer in the same group sees the
-//!     packet.
-//!   * `localhost` can be DNS-resolved through the natural
-//!     `InetAddress.getByName` path which already exists in `net.rs`.
-//!     We don't reimplement DNS itself — we only ensure the
-//!     `DatagramChannel` transport is healthy enough to carry
-//!     `localhost`-bound payloads.
+//!   * `nio_native.rs`'s `t16_dc_*` family and its `udp_registry` are
+//!     `#[cfg(feature = "synthetic-jdk")]`, so they are compiled out of the
+//!     real-JDK build entirely.
+//!   * The live real-JDK implementation is the `native_dc_*` family in
+//!     `lib.rs`, which keeps its socket in `ctx.fd_table()` and maps a channel
+//!     to its `FdId` through `dc_fds()`.
+//!   * Nothing ever populated *this* module's registry, so `dc_id()` always
+//!     returned `None`, and `DatagramChannel.send` — deliberately deferred
+//!     here to keep the SSRF gate — failed every call with
+//!     `IOException: send: no socket id`.
+//!
+//! There is now **one** store: `ctx.fd_table()`, reached through `lib.rs`'s
+//! `dc_fd()`. `send` moved to `native_dc_send` alongside the rest of the
+//! family and still calls this module's `check_outbound_target`; what remains
+//! here resolves a channel the same way every other DatagramChannel native
+//! does.
+//!
+//! The registrations this module used to make against
+//! `sun/nio/ch/DatagramChannelImpl` — `open0`, `bind0`, `send0`, `receive0`,
+//! `setBroadcast0`, `getBroadcast0`, `setMulticastTtl0`, `getMulticastTtl0`,
+//! `close0`, `localAddress` — were **all dead**: the real class has no such
+//! methods, and for the three names that do exist (`send0`, `receive0`,
+//! `localAddress`) the real descriptor differs, so the registry's
+//! (class, name, descriptor) key never matched. They are gone.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
+use std::sync::{OnceLock, RwLock};
+
+use cratonvm_native_api::fd_table::FdId;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
-// Local UDP registry (parallel to nio_native::udp_registry)
+// Multicast group bookkeeping (the socket itself lives in ctx.fd_table())
 // ---------------------------------------------------------------------------
 
-struct DatagramState {
-    /// Behind an `Arc` so callers can lift the socket out of the registry and
-    /// **release the registry lock before touching it** — see `dgram_socket`.
-    /// Nothing outside this module's accessors may reach it.
-    sock: Arc<UdpSocket>,
-    /// Multicast groups currently joined on this socket.  Each entry is
-    /// (group, interface).  Used by `dgram_drop` and to materialise
-    /// `MembershipKey` objects.
-    groups: Vec<(IpAddr, IpAddr)>,
+/// Groups currently joined per UDP fd, as (group, interface) pairs.
+///
+/// The socket is NOT kept here — `ctx.fd_table()` owns it, and every operation
+/// goes through the fd_table's own accessors, which clone the entry `Arc` out
+/// before touching it. This table holds plain addresses only, so nothing can
+/// block while it is locked (the hazard that
+/// `socket_channel::resolve_stream` and `net.rs`'s `NetSocketHandle::Stream`
+/// exist to avoid).
+fn joined_groups() -> &'static RwLock<HashMap<FdId, Vec<(IpAddr, IpAddr)>>> {
+    static G: OnceLock<RwLock<HashMap<FdId, Vec<(IpAddr, IpAddr)>>>> = OnceLock::new();
+    G.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-fn dgram_registry() -> &'static RwLock<HashMap<i32, DatagramState>> {
-    static R: OnceLock<RwLock<HashMap<i32, DatagramState>>> = OnceLock::new();
-    R.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-fn next_dgram_id() -> i32 {
-    static N: AtomicI32 = AtomicI32::new(1);
-    N.fetch_add(1, Ordering::Relaxed)
-}
-
-fn dgram_register(sock: UdpSocket) -> i32 {
-    let id = next_dgram_id();
-    if let Ok(mut g) = dgram_registry().write() {
-        g.insert(
-            id,
-            DatagramState {
-                sock: Arc::new(sock),
-                groups: Vec::new(),
-            },
-        );
-    }
-    id
-}
-
-fn dgram_remove(id: i32) {
-    if let Ok(mut g) = dgram_registry().write() {
-        g.remove(&id);
+fn record_join(fd: FdId, group: IpAddr, interface: IpAddr) {
+    if let Ok(mut g) = joined_groups().write() {
+        g.entry(fd).or_default().push((group, interface));
     }
 }
 
-/// Lift the socket for `id` out of the registry, **releasing the registry lock
-/// before returning it**. Every socket operation goes through here.
-///
-/// This used to be a `dgram_with(id, |s| …)` closure helper that ran the
-/// caller's body with the read lock still held, and `dgram_receive0` passed it
-/// `|s| s.sock.recv_from(&mut bytes)`. A blocking-mode `DatagramChannel`
-/// (`configureBlocking` defaults to true, per the JDK) then parked in the
-/// kernel holding the registry read lock, so:
-///
-///   * `close()` → `dgram_remove` → `.write()` blocked behind it, and
-///   * with a writer queued, every *other* reader blocked too — a second
-///     channel could not even `open()`.
-///
-/// i.e. one idle receive wedged all UDP channels, and the `close()` that
-/// should have ended the wait was precisely what could not run. Handing back
-/// an `Arc` keeps the socket alive for the syscall without keeping the map
-/// locked; a concurrent `close()` drops the map's `Arc` and the fd is released
-/// once the receiver returns. Same defect and same fix as
-/// `socket_channel::resolve_stream` (dev `cd18f9a51`) and `net.rs`'s
-/// `NetSocketHandle::Stream`.
-///
-/// The socket is deliberately NOT reachable from `dgram_with_mut`, so no future
-/// edit can reintroduce a blocking call under the lock.
-fn dgram_socket(id: i32) -> Option<Arc<UdpSocket>> {
-    Some(Arc::clone(&dgram_registry().read().ok()?.get(&id)?.sock))
-}
-
-/// Mutate a channel's non-I/O state (its multicast group list). Runs under the
-/// registry write lock, so the body must not block — see `dgram_socket`.
-fn dgram_with_mut<T, F: FnOnce(&mut DatagramState) -> T>(id: i32, f: F) -> Option<T> {
-    Some(f(dgram_registry().write().ok()?.get_mut(&id)?))
+fn record_leave(fd: FdId, group: IpAddr) {
+    if let Ok(mut g) = joined_groups().write() {
+        if let Some(list) = g.get_mut(&fd) {
+            list.retain(|(joined, _)| *joined != group);
+            if list.is_empty() {
+                g.remove(&fd);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -148,42 +110,14 @@ fn arg_int(args: &[Value], idx: usize) -> i32 {
     }
 }
 
-/// Layout — mirrors `nio_native.rs`'s synthetic DatagramChannel:
-///   slot 0: port      (Int)
-///   slot 1: open      (Int)
-///   slot 2: connected (Int)
-///   slot 3: blocking  (Int)
-///   slot 4: sock_id   (Int) — index into our registry
-///   slot 5: broadcast (Int) — extra flag for SO_BROADCAST state
-const DC_FIELD_PORT: usize = 0;
-const DC_FIELD_OPEN: usize = 1;
-const DC_FIELD_CONNECTED: usize = 2;
-const DC_FIELD_BLOCKING: usize = 3;
-const DC_FIELD_SOCK_ID: usize = 4;
-const DC_FIELD_BROADCAST: usize = 5;
-
-fn dc_id(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    if ctx.object_num_fields(this) <= DC_FIELD_SOCK_ID {
-        return None;
-    }
-    match ctx.get_field(this, DC_FIELD_SOCK_ID) {
-        Value::Int(v) if v > 0 => Some(v),
-        _ => None,
-    }
-}
-
-fn alloc_channel(ctx: &mut dyn NativeContext, port: i32, sock_id: i32) -> ObjectRef {
-    let cid = ctx
-        .ensure_class_initialized("java/nio/channels/DatagramChannel")
-        .unwrap_or_else(|_| ClassId::new(0));
-    let ch = ctx.alloc_object(cid, 6);
-    ctx.set_field(ch, DC_FIELD_PORT, Value::Int(port));
-    ctx.set_field(ch, DC_FIELD_OPEN, Value::Int(1));
-    ctx.set_field(ch, DC_FIELD_CONNECTED, Value::Int(0));
-    ctx.set_field(ch, DC_FIELD_BLOCKING, Value::Int(1));
-    ctx.set_field(ch, DC_FIELD_SOCK_ID, Value::Int(sock_id));
-    ctx.set_field(ch, DC_FIELD_BROADCAST, Value::Int(0));
-    ch
+/// The UDP fd backing this channel, resolved through the one store every
+/// DatagramChannel native uses (`lib.rs`'s `dc_fds` → `ctx.fd_table()`).
+///
+/// This replaced a `dc_id` that read an id out of the channel object's slot 4
+/// and looked it up in a registry of this module's own — a registry that
+/// nothing populated, so it always missed. See the module doc.
+fn dc_fd_of(ctx: &dyn NativeContext, this: ObjectRef) -> Option<FdId> {
+    crate::dc_fd(ctx, this)
 }
 
 /// Decode an `InetSocketAddress` Java object into a Rust SocketAddr.
@@ -297,7 +231,7 @@ fn buffer_advance(ctx: &mut dyn NativeContext, buf: ObjectRef, new_pos: i32) {
 /// `169.254.0.0/16` range, and the IPv6 link-local / AWS-metadata
 /// addresses. A denial maps to the same `IOException` the rest of this
 /// module raises (`io_error`), mirroring the TCP path's exception type.
-fn check_outbound_target(target: SocketAddr) -> Result<(), MethodCallFailed> {
+pub(crate) fn check_outbound_target(target: SocketAddr) -> Result<(), MethodCallFailed> {
     let literal = match target {
         SocketAddr::V4(_) => format!("{}:{}", target.ip(), target.port()),
         SocketAddr::V6(_) => format!("[{}]:{}", target.ip(), target.port()),
@@ -310,8 +244,27 @@ fn check_outbound_target(target: SocketAddr) -> Result<(), MethodCallFailed> {
     Ok(())
 }
 
-fn parse_inet_address(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<IpAddr> {
-    // Try IP text at slot 1 first (matches what net.rs encodes).
+fn parse_inet_address(ctx: &mut dyn NativeContext, addr: ObjectRef) -> Option<IpAddr> {
+    // Preferred: the public accessor, which works for BOTH the real-JDK
+    // `Inet4Address` — whose address lives in `holder.address` as a packed int,
+    // with no String in any low slot — and CratonVM's synthetic layout. The
+    // slot probing below misses the real one entirely, so `join` failed with
+    // "cannot parse group address" for every genuine `InetAddress`. That was
+    // invisible until the fd unification made `join` reachable at all.
+    //
+    // A non-InetAddress argument (`join`'s `NetworkInterface`) has no such
+    // method; the call fails and we fall through, which is exactly what the
+    // caller's "default to the wildcard interface" path expects.
+    if let Ok(Some(Value::Object(Some(s)))) =
+        ctx.invoke_virtual(addr, "getHostAddress", "()Ljava/lang/String;", &[])
+    {
+        if let Some(text) = ctx.read_string(s) {
+            if let Ok(ip) = text.parse::<IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+    // Fallback: IP text at slot 1 (what net.rs encodes), then slot 0.
     let text = match ctx.get_field(addr, 1) {
         Value::Object(Some(s)) => ctx.read_string(s),
         _ => match ctx.get_field(addr, 0) {
@@ -334,165 +287,12 @@ fn parse_inet_address(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<IpAddr
 // Native handlers
 // ---------------------------------------------------------------------------
 
-/// `sun.nio.ch.DatagramChannelImpl.open0()` — bind 0.0.0.0:0 and
-/// register.  Mirrors `t16_dc_open` but routes through this module's
-/// registry.
-fn dgram_open0(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| io_error(format!("bind: {e}")))?;
-    let port = sock.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-    let id = dgram_register(sock);
-    let ch = alloc_channel(ctx, port, id);
-    Ok(Some(Value::Object(Some(ch))))
-}
-
-/// `bind0(SocketAddress local) -> DatagramChannel` — explicit bind.
-fn dgram_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Err(io_error("bind: null this"));
-    };
-    let local = arg_obj(args, 1)
-        .and_then(|o| decode_isa(ctx, o))
-        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-    let new_sock = UdpSocket::bind(local).map_err(|e| io_error(format!("bind {local}: {e}")))?;
-    let port = new_sock.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-    if let Some(old_id) = dc_id(ctx, this) {
-        dgram_remove(old_id);
-    }
-    let new_id = dgram_register(new_sock);
-    if ctx.object_num_fields(this) > DC_FIELD_PORT {
-        ctx.set_field(this, DC_FIELD_PORT, Value::Int(port));
-    }
-    if ctx.object_num_fields(this) > DC_FIELD_SOCK_ID {
-        ctx.set_field(this, DC_FIELD_SOCK_ID, Value::Int(new_id));
-    }
-    Ok(Some(Value::Object(Some(this))))
-}
-
-/// `send0(ByteBuffer src, SocketAddress target) -> int` — write the
-/// buffer's `[position, limit)` slice to `target`.  Real `sendto(2)`.
-fn dgram_send0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Err(io_error("send: null this"));
-    };
-    let id = dc_id(ctx, this).ok_or_else(|| io_error("send: no socket id"))?;
-    let buf = arg_obj(args, 1).ok_or_else(|| io_error("send: null buffer"))?;
-    let target = arg_obj(args, 2)
-        .and_then(|o| decode_isa(ctx, o))
-        .ok_or_else(|| io_error("send: target SocketAddress unparsable"))?;
-    // H3a: SSRF gate. Refuse datagrams to link-local cloud-metadata /
-    // blocked ranges before the real `sendto(2)`, matching the TCP path.
-    check_outbound_target(target)?;
-    let (arr, position, limit) =
-        buffer_view(ctx, buf).ok_or_else(|| io_error("send: buffer layout"))?;
-    if position >= limit {
-        return Ok(Some(Value::Int(0)));
-    }
-    let n_to_send = (limit - position) as usize;
-    // AUDIT 2026-05-24: bulk read via NativeContext intrinsic instead
-    // of a per-byte `get_array_element` loop. Single memcpy from the
-    // heap byte[] payload.
-    let mut bytes = vec![0u8; n_to_send];
-    let n_read = ctx.read_byte_array_into(arr, position as usize, &mut bytes);
-    bytes.truncate(n_read);
-    // send_to can park on a full local socket buffer; keep it in the same
-    // GC-blocking protocol as the receive path and re-sync `buf` (used by
-    // buffer_advance below) across the region.
-    let mut held = vec![Value::Object(Some(buf))];
-    ctx.begin_blocking_region();
-    let sent_opt = dgram_socket(id).map(|s| s.send_to(&bytes, target));
-    ctx.end_blocking_region_refs(&mut held);
-    let sent = sent_opt
-        .ok_or_else(|| io_error("send: socket missing"))?
-        .map_err(|e| io_error(format!("send_to {target}: {e}")))?;
-    let buf = match held[0] {
-        Value::Object(Some(b)) => b,
-        _ => return Ok(Some(Value::Int(sent as i32))),
-    };
-    if sent > 0 {
-        buffer_advance(ctx, buf, position + sent as i32);
-    }
-    Ok(Some(Value::Int(sent as i32)))
-}
-
-/// `receive0(ByteBuffer dst) -> SocketAddress` — return the peer
-/// address that sent the next packet, and copy bytes into `dst`.
-/// Returns null if the socket is non-blocking and no packet is ready.
-fn dgram_receive0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Err(io_error("receive: null this"));
-    };
-    let id = dc_id(ctx, this).ok_or_else(|| io_error("receive: no socket id"))?;
-    let buf = arg_obj(args, 1).ok_or_else(|| io_error("receive: null buffer"))?;
-    let (arr, position, limit) =
-        buffer_view(ctx, buf).ok_or_else(|| io_error("receive: buffer layout"))?;
-    let space = (limit - position).max(0) as usize;
-    if space == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let mut bytes = vec![0u8; space];
-    // A blocking-mode DatagramChannel parks in recv_from until a packet
-    // arrives. Bracket it in the GC-blocking protocol (see the matching
-    // MulticastSocket.receive comment in net.rs) and re-sync the heap refs
-    // used after the region through `end_blocking_region_refs`.
-    let mut held = vec![Value::Object(Some(buf)), Value::Object(Some(arr))];
-    ctx.begin_blocking_region();
-    let recv_opt = dgram_socket(id).map(|s| s.recv_from(&mut bytes));
-    ctx.end_blocking_region_refs(&mut held);
-    let recv_result = recv_opt.ok_or_else(|| io_error("receive: socket missing"))?;
-    let (buf, arr) = match (held[0], held[1]) {
-        (Value::Object(Some(b)), Value::Object(Some(a))) => (b, a),
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let (n, peer) = match recv_result {
-        Ok(x) => x,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            return Ok(Some(Value::Object(None)));
-        }
-        Err(e) => return Err(io_error(format!("recv_from: {e}"))),
-    };
-    // AUDIT 2026-05-24: bulk write via NativeContext intrinsic instead
-    // of a per-byte `set_array_element` loop. Single memcpy into the
-    // heap byte[] payload.
-    ctx.write_byte_array_from(arr, position as usize, &bytes[..n]);
-    buffer_advance(ctx, buf, position + n as i32);
-    let isa = encode_isa(ctx, peer).ok_or_else(|| io_error("receive: encode peer"))?;
-    Ok(Some(Value::Object(Some(isa))))
-}
-
-/// `setBroadcast0(boolean)` — enable/disable SO_BROADCAST.
-fn dgram_set_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Ok(None);
-    };
-    let on = arg_int(args, 1) != 0;
-    if let Some(id) = dc_id(ctx, this) {
-        dgram_socket(id).map(|s| s.set_broadcast(on))
-            .transpose()
-            .map_err(|e| io_error(format!("set_broadcast: {e}")))?;
-    }
-    if ctx.object_num_fields(this) > DC_FIELD_BROADCAST {
-        ctx.set_field(this, DC_FIELD_BROADCAST, Value::Int(if on { 1 } else { 0 }));
-    }
-    Ok(None)
-}
-
-/// `getBroadcast0() -> boolean`.
-fn dgram_get_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Ok(Some(Value::Int(0)));
-    };
-    if ctx.object_num_fields(this) > DC_FIELD_BROADCAST {
-        return Ok(Some(ctx.get_field(this, DC_FIELD_BROADCAST)));
-    }
-    Ok(Some(Value::Int(0)))
-}
-
 /// `joinGroup0(InetAddress group, NetworkInterface ifc) -> MembershipKey`.
 fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(this) = arg_obj(args, 0) else {
         return Err(io_error("join: null this"));
     };
-    let id = dc_id(ctx, this).ok_or_else(|| io_error("join: no socket id"))?;
+    let fd = dc_fd_of(ctx, this).ok_or_else(|| io_error("join: channel has no UDP socket"))?;
     let group_obj = arg_obj(args, 1).ok_or_else(|| io_error("join: null group"))?;
     let group = parse_inet_address(ctx, group_obj)
         .ok_or_else(|| io_error("join: cannot parse group address"))?;
@@ -506,28 +306,28 @@ fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         });
     match (group, interface_ip) {
         (IpAddr::V4(g), IpAddr::V4(i)) => {
-            dgram_socket(id).map(|s| s.join_multicast_v4(&g, &i))
-                .ok_or_else(|| io_error("join: socket missing"))?
+            ctx.fd_table()
+                .udp_join_multicast_v4(fd, &g, &i)
                 .map_err(|e| io_error(format!("join_multicast_v4 {g} via {i}: {e}")))?;
         }
         (IpAddr::V6(g), _) => {
             // join_multicast_v6 takes an interface index (u32). Use 0
             // = system default when we don't have one.
-            dgram_socket(id).map(|s| s.join_multicast_v6(&g, 0))
-                .ok_or_else(|| io_error("join: socket missing"))?
+            ctx.fd_table()
+                .udp_join_multicast_v6(fd, &g, 0)
                 .map_err(|e| io_error(format!("join_multicast_v6 {g}: {e}")))?;
         }
         _ => return Err(io_error("join: address-family mismatch")),
     }
-    dgram_with_mut(id, |s| s.groups.push((group, interface_ip)));
-    // Build a MembershipKey: 4-field synthetic object {group, ifc, sock_id, valid}.
+    record_join(fd, group, interface_ip);
+    // Build a MembershipKey: 4-field synthetic object {group, ifc, fd, valid}.
     let mk_cid = ctx
         .ensure_class_initialized("java/nio/channels/MembershipKey")
         .unwrap_or_else(|_| ClassId::new(0));
     let mk = ctx.alloc_object(mk_cid, 4);
     ctx.set_field(mk, 0, Value::Object(Some(group_obj)));
     ctx.set_field(mk, 1, Value::Object(arg_obj(args, 2)));
-    ctx.set_field(mk, 2, Value::Int(id));
+    ctx.set_field(mk, 2, Value::Int(fd as i32));
     ctx.set_field(mk, 3, Value::Int(1)); // valid
     Ok(Some(Value::Object(Some(mk))))
 }
@@ -537,8 +337,8 @@ fn dgram_drop_membership(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let Some(mk) = arg_obj(args, 0) else {
         return Ok(None);
     };
-    let id = match ctx.get_field(mk, 2) {
-        Value::Int(v) => v,
+    let fd = match ctx.get_field(mk, 2) {
+        Value::Int(v) if v >= 0 => v as FdId,
         _ => return Ok(None),
     };
     let group_obj = match ctx.get_field(mk, 0) {
@@ -559,11 +359,11 @@ fn dgram_drop_membership(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         },
     };
     let _ = match (group, interface_ip) {
-        (IpAddr::V4(g), IpAddr::V4(i)) => dgram_socket(id).map(|s| s.leave_multicast_v4(&g, &i)),
-        (IpAddr::V6(g), _) => dgram_socket(id).map(|s| s.leave_multicast_v6(&g, 0)),
+        (IpAddr::V4(g), IpAddr::V4(i)) => Some(ctx.fd_table().udp_leave_multicast_v4(fd, &g, &i)),
+        (IpAddr::V6(g), _) => Some(ctx.fd_table().udp_leave_multicast_v6(fd, &g, 0)),
         _ => None,
     };
-    dgram_with_mut(id, |s| s.groups.retain(|(g, _)| *g != group));
+    record_leave(fd, group);
     if ctx.object_num_fields(mk) >= 4 {
         ctx.set_field(mk, 3, Value::Int(0)); // invalidate
     }
@@ -595,126 +395,23 @@ fn dgram_unblock(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(arg_obj(args, 0))))
 }
 
-/// `setMulticastTtl0(int ttl)`.
-fn dgram_set_multicast_ttl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Ok(None);
-    };
-    let ttl = arg_int(args, 1).max(0) as u32;
-    if let Some(id) = dc_id(ctx, this) {
-        dgram_socket(id).map(|s| s.set_multicast_ttl_v4(ttl))
-            .transpose()
-            .map_err(|e| io_error(format!("set_multicast_ttl: {e}")))?;
-    }
-    Ok(None)
-}
-
-/// `getMulticastTtl0() -> int`.
-fn dgram_get_multicast_ttl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Ok(Some(Value::Int(1)));
-    };
-    let ttl = dc_id(ctx, this)
-        .and_then(|id| dgram_socket(id).and_then(|s| s.multicast_ttl_v4().ok()))
-        .unwrap_or(1);
-    Ok(Some(Value::Int(ttl as i32)))
-}
-
-/// `close0()` — drop our registry entry.
-fn dgram_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Ok(None);
-    };
-    if ctx.object_num_fields(this) > DC_FIELD_OPEN {
-        ctx.set_field(this, DC_FIELD_OPEN, Value::Int(0));
-    }
-    if let Some(id) = dc_id(ctx, this) {
-        dgram_remove(id);
-        if ctx.object_num_fields(this) > DC_FIELD_SOCK_ID {
-            ctx.set_field(this, DC_FIELD_SOCK_ID, Value::Int(-1));
-        }
-    }
-    Ok(None)
-}
-
-/// `localAddress() -> SocketAddress` — what we actually bound to.
-fn dgram_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let Some(this) = arg_obj(args, 0) else {
-        return Ok(Some(Value::Object(None)));
-    };
-    let Some(id) = dc_id(ctx, this) else {
-        return Ok(Some(Value::Object(None)));
-    };
-    let addr = match dgram_socket(id).and_then(|s| s.local_addr().ok()) {
-        Some(a) => a,
-        None => return Ok(Some(Value::Object(None))),
-    };
-    Ok(Some(Value::Object(encode_isa(ctx, addr))))
-}
 
 // ---------------------------------------------------------------------------
 // Public registration
 // ---------------------------------------------------------------------------
 
-/// Register the WP3.7 DatagramChannel extensions.  Idempotent.
+/// Register the multicast-membership surface. Idempotent.
+///
+/// `open` / `bind` / `connect` / `send` / `receive` / `read` / `write` /
+/// `close` / `configureBlocking` / `getLocalAddress` all live in `lib.rs`'s
+/// `register_datagram_channel`, over `ctx.fd_table()`. This module registers
+/// only what that family does not cover, and resolves the channel through the
+/// same `dc_fd` — see the module doc for the registry split this replaced.
 pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    let dci = "sun/nio/ch/DatagramChannelImpl";
-
-    // open / bind — these use OUR registry; existing t16_dc_* in
-    // nio_native.rs use a different registry (see module docs).
-    r.register(
-        dci,
-        "open0",
-        "()Ljava/nio/channels/DatagramChannel;",
-        dgram_open0,
-    );
-    r.register(
-        dci,
-        "bind0",
-        "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
-        dgram_bind0,
-    );
-
-    // I/O
-    r.register(
-        dci,
-        "send0",
-        "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
-        dgram_send0,
-    );
-    r.register(
-        dci,
-        "receive0",
-        "(Ljava/nio/ByteBuffer;)Ljava/net/SocketAddress;",
-        dgram_receive0,
-    );
-    // Many JDK callsites use these public names too.
-    r.register(
-        "java/nio/channels/DatagramChannel",
-        "send",
-        "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
-        dgram_send0,
-    );
-    r.register(
-        "java/nio/channels/DatagramChannel",
-        "receive",
-        "(Ljava/nio/ByteBuffer;)Ljava/net/SocketAddress;",
-        dgram_receive0,
-    );
-
-    // Broadcast
-    r.register(dci, "setBroadcast0", "(Z)V", dgram_set_broadcast);
-    r.register(dci, "getBroadcast0", "()Z", dgram_get_broadcast);
 
     // Multicast
-    r.register(
-        dci,
-        "join",
-        "(Ljava/net/InetAddress;Ljava/net/NetworkInterface;)Ljava/nio/channels/MembershipKey;",
-        dgram_join_group,
-    );
     r.register(
         "java/nio/channels/DatagramChannel",
         "join",
@@ -745,17 +442,6 @@ pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
         "(Ljava/net/InetAddress;)Ljava/nio/channels/MembershipKey;",
         dgram_unblock,
     );
-
-    r.register(dci, "setMulticastTtl0", "(I)V", dgram_set_multicast_ttl);
-    r.register(dci, "getMulticastTtl0", "()I", dgram_get_multicast_ttl);
-
-    r.register(dci, "close0", "()V", dgram_close0);
-    r.register(
-        dci,
-        "localAddress",
-        "()Ljava/net/SocketAddress;",
-        dgram_local_address,
-    );
     r.set_category(__prev_cat);
 }
 
@@ -764,191 +450,86 @@ pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-pub(crate) fn guarded_send_callback_for_test() -> cratonvm_native_api::NativeCallback {
-    dgram_send0
-}
-
-#[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use std::net::Ipv4Addr;
-    use std::time::Duration;
+
+    // The socket-lifecycle tests that used to live here (`register/remove
+    // balances`, `send/receive roundtrip via registry`, `set/get broadcast via
+    // registry`, `parked receive does not block the registry`) exercised this
+    // module's own `dgram_registry`, which no longer exists — `ctx.fd_table()`
+    // owns the socket now. The behaviour they covered is exercised end-to-end
+    // by `tools/udp-probe/UdpPathProbe.java` against a real VM, which the old
+    // registry could never satisfy: nothing populated it, so `send` failed with
+    // "no socket id" on every real call.
 
     #[test]
-    fn wp37_dgram_register_remove_balances() {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let id = dgram_register(sock);
-        assert!(id > 0);
-        let port = dgram_socket(id).map(|s| s.local_addr().unwrap().port());
-        assert!(port.is_some() && port.unwrap() > 0);
-        dgram_remove(id);
-        assert!(dgram_socket(id).is_none());
-    }
+    fn multicast_group_bookkeeping_is_per_fd() {
+        let fd_a: FdId = 4001;
+        let fd_b: FdId = 4002;
+        let group = IpAddr::V4(Ipv4Addr::new(239, 1, 2, 3));
+        let other = IpAddr::V4(Ipv4Addr::new(239, 4, 5, 6));
+        let iface = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 
-    /// A parked receive must not lock other channels out of the registry.
-    ///
-    /// `dgram_socket` is the only way to reach a socket, so every I/O path
-    /// inherits this: the socket is lifted out and the registry lock released
-    /// before the syscall. The shape this guards against is the closure helper
-    /// it replaced, which ran `recv_from` with the read lock still held — one
-    /// idle blocking receive then blocked `close()` (a writer) and, behind that
-    /// queued writer, every other reader too.
-    #[test]
-    fn wp37_parked_receive_does_not_block_the_registry() {
-        let parked = UdpSocket::bind("127.0.0.1:0").unwrap();
-        // Bounded so a regression fails the assertion below rather than
-        // hanging the test run.
-        parked
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let parked_id = dgram_register(parked);
+        record_join(fd_a, group, iface);
+        record_join(fd_a, other, iface);
+        record_join(fd_b, group, iface);
+        assert_eq!(joined_groups().read().unwrap().get(&fd_a).unwrap().len(), 2);
 
-        let receiver = std::thread::spawn(move || {
-            let sock = dgram_socket(parked_id).expect("registered");
-            let mut buf = [0u8; 16];
-            // Nothing is ever sent here, so this parks until the read timeout.
-            let _ = sock.recv_from(&mut buf);
-        });
-        // Give the receiver time to actually enter the syscall.
-        std::thread::sleep(Duration::from_millis(200));
+        // Leaving one group on one fd must not touch the same group on another.
+        record_leave(fd_a, group);
+        assert_eq!(joined_groups().read().unwrap().get(&fd_a).unwrap().len(), 1);
+        assert_eq!(joined_groups().read().unwrap().get(&fd_b).unwrap().len(), 1);
 
-        // Both of these take the registry WRITE lock. With the socket held
-        // under the read lock they would queue behind the parked receive.
-        let started = std::time::Instant::now();
-        let other_id = dgram_register(UdpSocket::bind("127.0.0.1:0").unwrap());
-        dgram_remove(other_id);
-        dgram_remove(parked_id);
-        let elapsed = started.elapsed();
-
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "registry writes queued behind a parked recv_from ({elapsed:?}) — \
-             the socket is being held under the registry lock again"
-        );
-        receiver.join().unwrap();
-    }
-
-    #[test]
-    fn wp37_send_receive_roundtrip_via_registry() {
-        // Two real UdpSockets bound to loopback, registered in our
-        // registry — we exercise the same send_to/recv_from path the
-        // native handlers use, without standing up the VM.
-        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let server_addr = server.local_addr().unwrap();
-        let s_id = dgram_register(server);
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let c_id = dgram_register(client);
-
-        let payload = b"WP3.7 datagram round-trip";
-
-        let sent = dgram_socket(c_id).map(|s| s.send_to(payload, server_addr))
-            .unwrap()
-            .unwrap();
-        assert_eq!(sent, payload.len());
-
-        let mut buf = [0u8; 64];
-        let (n, peer) = dgram_socket(s_id).map(|s| s.recv_from(&mut buf))
-            .unwrap()
-            .unwrap();
-        assert_eq!(n, payload.len());
-        assert_eq!(&buf[..n], payload);
-        assert_eq!(peer.ip(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
-
-        dgram_remove(s_id);
-        dgram_remove(c_id);
-    }
-
-    #[test]
-    fn wp37_set_get_broadcast_via_registry() {
-        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let id = dgram_register(sock);
-        dgram_socket(id).map(|s| s.set_broadcast(true))
-            .unwrap()
-            .unwrap();
-        let on = dgram_socket(id).map(|s| s.broadcast()).unwrap().unwrap();
-        assert!(on);
-        dgram_remove(id);
-    }
-
-    #[test]
-    fn wp37_multicast_v4_join_leave_loopback() {
-        // 224.0.0.1 is the all-hosts well-known multicast group; safe
-        // to join/leave on most CI hosts.  If the OS rejects it we
-        // skip — multicast permission gating varies by host.
-        let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
-        let id = dgram_register(sock);
-        let group = Ipv4Addr::new(224, 0, 0, 1);
-        let iface = Ipv4Addr::UNSPECIFIED;
-        let joined = dgram_socket(id).map(|s| s.join_multicast_v4(&group, &iface));
-        if let Some(Ok(())) = joined {
-            // Only assert leave if the join actually succeeded.
-            let left = dgram_socket(id).map(|s| s.leave_multicast_v4(&group, &iface)).unwrap();
-            assert!(left.is_ok(), "leave_multicast_v4 failed: {left:?}");
-        }
-        dgram_remove(id);
+        // The last leave drops the fd's entry entirely rather than leaving an
+        // empty Vec behind for every channel that ever joined.
+        record_leave(fd_a, other);
+        assert!(!joined_groups().read().unwrap().contains_key(&fd_a));
+        record_leave(fd_b, group);
+        assert!(!joined_groups().read().unwrap().contains_key(&fd_b));
     }
 
     #[test]
     fn h3a_send_blocks_link_local_metadata_v4() {
-        // AWS IMDS and the broader 169.254.0.0/16 range must be refused
-        // before send_to. Reset to the default policy first.
-        crate::outbound_policy::reset_policy();
-        let imds: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        let metadata: SocketAddr = "169.254.169.254:80".parse().unwrap();
         assert!(
-            check_outbound_target(imds).is_err(),
-            "expected 169.254.169.254 to be denied"
+            check_outbound_target(metadata).is_err(),
+            "cloud-metadata IPv4 must stay blocked for UDP send"
         );
-        let neighbour: SocketAddr = "169.254.170.2:80".parse().unwrap();
+        let link_local: SocketAddr = "169.254.1.1:53".parse().unwrap();
         assert!(
-            check_outbound_target(neighbour).is_err(),
-            "expected 169.254.0.0/16 neighbour to be denied"
+            check_outbound_target(link_local).is_err(),
+            "link-local IPv4 must stay blocked for UDP send"
         );
     }
 
     #[test]
     fn h3a_send_blocks_link_local_metadata_v6() {
-        crate::outbound_policy::reset_policy();
-        let imds_v6: SocketAddr = "[fd00:ec2::254]:80".parse().unwrap();
+        let metadata: SocketAddr = "[fd00:ec2::254]:80".parse().unwrap();
         assert!(
-            check_outbound_target(imds_v6).is_err(),
-            "expected fd00:ec2::254 to be denied"
+            check_outbound_target(metadata).is_err(),
+            "cloud-metadata IPv6 must stay blocked for UDP send"
         );
     }
 
     #[test]
     fn h3a_send_allows_loopback() {
-        crate::outbound_policy::reset_policy();
         let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
         assert!(
             check_outbound_target(loopback).is_ok(),
-            "default policy should allow loopback"
+            "loopback must remain reachable"
         );
     }
 
     #[test]
     fn wp37_localhost_resolves_for_send() {
-        // Acceptance hook: localhost address must be parseable so DNS
-        // via DatagramChannel works.  We exercise the same parse path
-        // decode_isa would use.
-        let resolved: Vec<_> = ("localhost", 0u16)
+        // `send` accepts a hostname target; make sure the resolver used by the
+        // decode path still yields a loopback address for `localhost`.
+        let resolved: Vec<SocketAddr> = ("localhost", 0u16)
             .to_socket_addrs()
-            .expect("localhost resolves")
+            .expect("resolve localhost")
             .collect();
-        assert!(
-            !resolved.is_empty(),
-            "expected at least one address for localhost"
-        );
-        // At least one should be 127.0.0.1 or ::1 — sanity check for
-        // the resolver, not a hard requirement.
-        let any_loopback = resolved
-            .iter()
-            .any(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST) || a.ip().is_loopback());
+        let any_loopback = resolved.iter().any(|a| a.ip().is_loopback());
         assert!(any_loopback, "expected loopback in {resolved:?}");
     }
 }
