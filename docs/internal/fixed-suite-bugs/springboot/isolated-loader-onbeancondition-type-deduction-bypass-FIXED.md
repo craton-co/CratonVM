@@ -147,7 +147,7 @@ doc's `@ConditionalOnMissingBean did not specify a bean` symptom — both its
 test methods now fail with a JUnit Platform `DiscoveryIssueException`
 ("`UniqueIdSelector [...] could not be resolved`") during test *discovery*,
 before either test body runs. Root-caused as a new doc:
-[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md).
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md`](modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md).
 `OnBeanConditionTypeDeductionFailureTests` itself was not part of this
 session's assigned batch and was not re-checked.
 
