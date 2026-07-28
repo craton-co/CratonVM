@@ -13032,6 +13032,15 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Cipher",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -15571,6 +15580,15 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Signature",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
             let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 4);
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(0));

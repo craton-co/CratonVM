@@ -914,6 +914,18 @@ pub(crate) fn native_secure_random_get_instance_with_provider(
         1,
         crate::jca::provider_chain::ProviderArgWording::Shared,
     )?;
+    let algorithm = match args.first() {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    crate::jca::provider_chain::check_provider_ownership(
+        ctx,
+        args,
+        1,
+        "SecureRandom",
+        &algorithm,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     native_secure_random_get_instance(ctx, args)
 }
 

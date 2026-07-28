@@ -1887,6 +1887,14 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         crate::jca::provider_chain::ProviderArgWording::Shared,
     )?;
     let alg = read_string(ctx, args, 0);
+    crate::jca::provider_chain::check_provider_ownership(
+        ctx,
+        args,
+        1,
+        "KeyFactory",
+        &alg,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     let idx = kf_algo_idx(&alg);
     // `KeyFactory.getInstance` must reject an unrecognised name. In
     // particular, `X509Key.buildX509Key` deliberately catches
