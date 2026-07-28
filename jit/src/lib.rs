@@ -7604,7 +7604,7 @@ fn precise_exception_frame_sites_supported(
         // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
+            && !matches!(op, 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
         {
             return false;
         }

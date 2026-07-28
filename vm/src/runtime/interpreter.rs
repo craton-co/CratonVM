@@ -6024,7 +6024,6 @@ pub fn execute(
             || static_skip_reason.is_some()
             || fjp_skip
             || native_skip
-            || is_synchronized
             || gpu_gate_skip
         {
             // Method has known JIT issues — skip JIT.
@@ -6050,7 +6049,7 @@ pub fn execute(
             // call-site-dependent, not per-method-permanent, so they must NOT
             // poison this method's entry for future calls where those flags
             // may differ.
-            if static_skip_reason.is_some() || fjp_skip || native_skip || is_synchronized {
+            if static_skip_reason.is_some() || fjp_skip || native_skip {
                 shared.jit.jit_skip_set.write().insert(skip_key.clone());
             }
         } else {
@@ -12140,6 +12139,15 @@ pub(crate) fn run_jit_callee_handler(
     incoming_args: &[Value],
 ) -> Option<MethodCallResult> {
     let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
+    let synchronized_monitor = match synchronized_args.as_mut() {
+        Some(args) => match JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args) {
+            Ok(monitor) => Some(monitor),
+            Err(error) => return Some(Err(error)),
+        },
+        None => None,
+    };
+    let incoming_args = synchronized_args.as_deref().unwrap_or(incoming_args);
     thread.refill_pools_from_shared(
         &shared.mem.operand_stack_pool,
         &shared.mem.tag_pool,
@@ -12167,6 +12175,9 @@ pub(crate) fn run_jit_callee_handler(
         return None;
     }
     frame.pc = handler_pc;
+    if let Some(monitor) = synchronized_monitor {
+        monitor.transfer_to_handler_frame(&mut frame);
+    }
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
             "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={}",
@@ -12218,6 +12229,13 @@ fn route_jit_exception_through_method(
         // No matching handler — propagate to caller.
         return Err(MethodCallFailed::ExceptionThrown(exc));
     };
+
+    let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
+    let synchronized_monitor = match synchronized_args.as_mut() {
+        Some(args) => Some(JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args)?),
+        None => None,
+    };
+    let incoming_args = synchronized_args.as_deref().unwrap_or(incoming_args);
 
     // Before pushing a frame for the JIT'd method, discard the operand-stack
     // slots reserved for the callee's arguments in the caller's frame. The
@@ -12288,6 +12306,9 @@ fn route_jit_exception_through_method(
         .stack
         .push(Value::Object(Some(exc)))
         .map_err(|e| MethodCallFailed::InternalError(VmError::Runtime(e)))?;
+    if let Some(monitor) = synchronized_monitor {
+        monitor.transfer_to_handler_frame(&mut frame);
+    }
     if crate::runtime::env_cache::frame_trace() {
         eprintln!(
             "[FRAME_PUSH/jit_exc_route] depth={} {}.{}{}",
@@ -37601,6 +37622,14 @@ pub fn try_jit_compile_callee(
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
         return None;
     }
+    // This API hands a raw entry pointer to direct dispatchers. Even if the
+    // method has already been compiled for the ordinary interpreter entry,
+    // those call sites have no implicit ACC_SYNCHRONIZED monitor wrapper.
+    // Keep them on the generic invocation path; background tiering uses the
+    // separate wrapped-entry helper below.
+    if named_method_is_synchronized(shared, class_name, method_name, descriptor) {
+        return None;
+    }
     // JIT-cache probe. Deliberately BEFORE the negative cache so a method
     // compiled later through another path (interpreter invocation-count
     // upgrade, OSR) is returned even when an earlier attempt through this
@@ -37651,6 +37680,7 @@ pub fn try_jit_compile_callee(
         descriptor,
         optimize,
         &mut cache_negative,
+        false,
     );
     match res {
         None if cache_negative => slot.store(fp, Ordering::Relaxed),
@@ -37659,6 +37689,46 @@ pub fn try_jit_compile_callee(
         _ => {}
     }
     res
+}
+
+fn named_method_is_synchronized(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    let cm = shared.classes.class_manager.read();
+    let Some(class_id) = cm.get_loaded_class_id(class_name) else {
+        return false;
+    };
+    let store = cm.class_store();
+    crate::classloading::find_method_recursive(class_id, method_name, descriptor, store)
+        .is_some_and(|(method, _)| method.is_synchronized())
+}
+
+/// Background tiering publishes a body for `execute_jit_call`, whose wrapper
+/// owns the implicit synchronized-method monitor. It must not be used by raw
+/// direct-call sites; [`try_jit_compile_callee`] deliberately rejects those.
+fn try_jit_compile_wrapped_entry(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    optimize: bool,
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
+    if crate::runtime::env_cache::disable_jit() || crate::classloading::any_class_redefined() {
+        return None;
+    }
+    let mut cache_negative = false;
+    try_jit_compile_callee_slow(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        optimize,
+        &mut cache_negative,
+        true,
+    )
 }
 
 /// The full (slow) compile pipeline behind [`try_jit_compile_callee`].
@@ -37711,6 +37781,7 @@ fn try_jit_compile_callee_slow(
     // backend. Threaded into `jit::try_compile`'s trailing flag.
     optimize: bool,
     cache_negative: &mut bool,
+    allow_synchronized_wrapped_entry: bool,
 ) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     // RFJP.1 — never JIT a method whose declaring class transitively extends
     // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
@@ -37767,7 +37838,7 @@ fn try_jit_compile_callee_slow(
         store,
     )?;
     // Direct dispatcher compilation also bypasses interpreter frame creation.
-    if method.is_synchronized() {
+    if method.is_synchronized() && !allow_synchronized_wrapped_entry {
         return None;
     }
 
@@ -38744,7 +38815,7 @@ fn background_compile_task(
     // NOT be reported as success, or the tiered manager marks this tier
     // "done" despite nothing having been compiled (see
     // `jit::tiered::CompilerCore::complete_task`).
-    let published = try_jit_compile_callee(
+    let published = try_jit_compile_wrapped_entry(
         &shared,
         &task.method_key.class_name,
         &task.method_key.method_name,
@@ -39348,6 +39419,90 @@ fn jit_saved_args_to_values(
     out
 }
 
+/// Owns the implicit monitor of a JIT-entered `ACC_SYNCHRONIZED` method.
+///
+/// Compiled code has no interpreter frame on which to keep `monitor_on_exit`,
+/// so the monitor must instead be rooted explicitly for the complete native
+/// activation and released on every Rust return path. The native-pin slot is
+/// retained after acquisition because a moving collection may update it before
+/// `Drop` performs the matching implicit `monitorexit`.
+struct JitSynchronizedMonitorGuard {
+    shared: *const SharedVm,
+    thread: *mut JvmThread,
+    pin_index: usize,
+    armed: bool,
+}
+
+impl JitSynchronizedMonitorGuard {
+    fn acquire(
+        shared: &SharedVm,
+        thread: &mut JvmThread,
+        cached: &CachedBytecodeMethod,
+        args: &mut [Value],
+    ) -> Result<Self, MethodCallFailed> {
+        let monitor = if cached.is_static {
+            get_or_create_class_mirror(shared, cached.declaring_class_id)
+        } else {
+            match args.first() {
+                Some(Value::Object(Some(obj))) => *obj,
+                _ => return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: "JIT entered synchronized instance method without this".to_string(),
+                })),
+            }
+        };
+        let fixed = crate::vm::vm_exec::monitor_enter_synchronized_method(
+            shared, thread, monitor, args,
+        );
+        let pin_index = thread.native_pin_roots.len();
+        thread.native_pin_roots.push(fixed);
+        Ok(Self {
+            shared: shared as *const SharedVm,
+            thread: thread as *mut JvmThread,
+            pin_index,
+            armed: true,
+        })
+    }
+
+    fn transfer_to_handler_frame(mut self, frame: &mut crate::runtime::frame::Frame) {
+        // The native pin protects the monitor while the replacement frame is
+        // built. Once the frame owns it, normal frame unwinding performs the
+        // matching implicit monitorexit.
+        unsafe {
+            let thread = &mut *self.thread;
+            let monitor = thread.native_pin_roots[self.pin_index];
+            frame.monitor_on_exit = Some(monitor);
+            thread.native_pin_roots.truncate(self.pin_index);
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for JitSynchronizedMonitorGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: the guard is scoped to the enclosing JIT-entry function, so
+        // its drop runs before the exclusive `JvmThread` borrow ends. The pin
+        // slot remains live and contains the collector-forwarded monitor ref.
+        unsafe {
+            let shared = &*self.shared;
+            let thread = &mut *self.thread;
+            let Some(monitor) = thread.native_pin_roots.get(self.pin_index).copied() else {
+                return;
+            };
+            if let Err(error) = shared.threads.monitors.exit(monitor, thread.thread_id) {
+                tracing::warn!(thread_id = ?thread.thread_id, ?error,
+                    "implicit monitorexit after JIT synchronized method failed");
+            }
+            if !shared.threads.monitors.holds(monitor, thread.thread_id) {
+                shared.threads.thread_registry.remove_jmx_locked_monitor(thread.thread_id, monitor);
+            }
+            thread.native_pin_roots.truncate(self.pin_index);
+        }
+    }
+}
+
 /// Execute a JIT-compiled method call: pop args, call native code, push result.
 ///
 /// When `needs_heap` is true, passes a heap pointer as hidden first C argument,
@@ -39457,6 +39612,27 @@ fn execute_jit_call(
         };
     }
 
+    let mut synchronized_args = cached.is_synchronized
+        .then(|| jit_saved_args_to_values(cached, &saved_args, np));
+    let _synchronized_monitor = if let Some(args) = synchronized_args.as_mut() {
+        Some(JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args)?)
+    } else {
+        None
+    };
+    if let Some(args) = synchronized_args.as_deref() {
+        for (i, value) in args.iter().enumerate().take(np) {
+            jit_args[i] = match value {
+                Value::Int(x) => *x as i64,
+                Value::Long(x) => *x,
+                Value::Float(x) => x.to_bits() as i64,
+                Value::Double(x) => x.to_bits() as i64,
+                Value::Object(Some(obj)) => obj.as_ptr() as i64,
+                Value::Object(None) => 0,
+                _ => 0,
+            };
+        }
+    }
+
     let args_slice = &jit_args[..np];
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
 
@@ -39557,7 +39733,8 @@ fn execute_jit_call(
             // `i64::MIN`-collision fix) so it cannot leak to the next JIT
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
-            let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+            let exc_locals = synchronized_args.as_deref()
+                .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
             let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
@@ -39627,7 +39804,8 @@ fn execute_jit_call(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+                let exc_locals = synchronized_args.as_deref()
+                    .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -39665,7 +39843,8 @@ fn execute_jit_call(
             Some(&msg),
         ) {
             Ok(exc) => {
-                let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+                let exc_locals = synchronized_args.as_deref()
+                    .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -39698,7 +39877,8 @@ fn execute_jit_call(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
+                let exc_locals = synchronized_args.as_deref()
+                    .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -39966,6 +40146,26 @@ fn execute_jit_call_decoded(
             _ => 0,
         };
     }
+    let mut synchronized_args = cached.is_synchronized.then(|| args_slice.to_vec());
+    let _synchronized_monitor = if let Some(args) = synchronized_args.as_mut() {
+        Some(JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args)?)
+    } else {
+        None
+    };
+    if let Some(args) = synchronized_args.as_deref() {
+        for (i, value) in args.iter().enumerate().take(np) {
+            jit_args[i] = match value {
+                Value::Int(x) => *x as i64,
+                Value::Long(x) => *x,
+                Value::Float(x) => x.to_bits() as i64,
+                Value::Double(x) => x.to_bits() as i64,
+                Value::Object(Some(obj)) => obj.as_ptr() as i64,
+                Value::Object(None) => 0,
+                _ => 0,
+            };
+        }
+    }
+    let args_slice = synchronized_args.as_deref().unwrap_or(args_slice);
     let args_jit = &jit_args[..np];
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
 

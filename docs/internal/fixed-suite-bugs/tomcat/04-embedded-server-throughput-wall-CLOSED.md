@@ -5,9 +5,8 @@ group documented is fixed; what was left of its "residual wall" was re-derived
 from scratch and turned out to have a single, different, and now separately
 tracked owner:
 
-* **`docs/known-issues/tomcat/31-synchronized-code-never-jit-compiled.md`** —
-  the real cause of the deploy wall, with the full trace from a 245 s deploy
-  down to a 15 µs-per-byte `DataInputStream.readUnsignedByte`.
+* **`docs/internal/fixed-suite-bugs/tomcat/31-synchronized-code-never-jit-compiled-FIXED.md`** —
+  the synchronized-method JIT admission defect, fixed on 2026-07-28.
 * **`docs/known-issues/tomcat/32-doc04-residual-perf-assertions.md`** — the
   four per-test residuals that are not deploy throughput.
 

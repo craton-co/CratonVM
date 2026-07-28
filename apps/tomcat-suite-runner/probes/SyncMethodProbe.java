@@ -1,16 +1,13 @@
 /*
  * SyncMethodProbe - what does ACC_SYNCHRONIZED cost a method on this VM?
  *
- * The interpreter refuses to JIT-compile any method whose ACC_SYNCHRONIZED bit
- * is set (`vm/src/runtime/interpreter.rs`, the `is_synchronized` term in the
- * skip decision), so such a method stays interpreted for the life of the
- * process no matter how hot it gets. That covers `StringBuffer`, `Vector`,
- * `Hashtable`, `PrintStream`, `Random`, and every `synchronized` method in
- * application code.
+ * This compares the implicit `ACC_SYNCHRONIZED` form with an explicit
+ * `synchronized` block. Both forms are eligible for JIT compilation; the
+ * implicit form acquires its method monitor in the JIT entry wrapper.
  *
  * `plain` and `sync` below are byte-identical apart from the modifier, and the
- * monitor is always uncontended (single thread), so the ratio is the cost of
- * being excluded from compilation, not of locking.
+ * monitor is always uncontended (single thread), so the ratio isolates the
+ * remaining cost of the monitor implementation.
  *
  * `syncBlock` uses a `synchronized (this) { ... }` BLOCK instead: that is an
  * ordinary monitorenter/monitorexit pair in the body, which the backend does
