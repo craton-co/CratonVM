@@ -308,12 +308,46 @@ pub enum InitComplexity {
 /// Every other opcode is benign. The scan stops at the first
 /// disqualifier and returns `Complex`. If it walks the entire stream
 /// without finding one, it returns `Trivial`.
+/// Bisect knob (default OFF — no behaviour change): treat a constructor whose
+/// ONLY disqualifier is `putfield` as `Trivial`, keeping the ban for
+/// `putstatic` / `monitorenter` / `monitorexit` / `invokedynamic`.
+///
+/// Why this knob exists. `putfield` is what essentially every *real*
+/// constructor does — it is the whole point of one — so the blanket gate makes
+/// "allocate an object whose constructor assigns a field" run its constructor
+/// in the interpreter forever. Measured from C2-compiled code on the
+/// `CallRate` probe: ~2200 ns/alloc for a one-field constructor against
+/// ~130-160 ns for a field-store-free one, i.e. the gate, not allocation
+/// itself, is the dominant cost of `new` on every hot path in the VM
+/// (`new String(...)`, `new HashMap.Node(...)`, ...).
+///
+/// The ban predates the open-source import (`a6dc911ed`) and is one of the
+/// four *structural* bans; unlike the ~46 named correctness bans it carries no
+/// incident write-up — only the "field stores trigger the JIT's
+/// load-forwarding interaction" note above. Per the ban-sweep methodology in
+/// `docs/known-issues/jit-bans/jit-skip-list-open-bans-20260725.md`, the first
+/// move on an unverified ban is to make it testable at runtime rather than to
+/// delete it. Set `CRATONVM_JIT_ALLOW_PUTFIELD_INIT=1` to lift it for a
+/// measurement run.
+fn allow_putfield_init() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ALLOW_PUTFIELD_INIT").is_some()
+    })
+}
+
 pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
     use std::cmp::min;
+    let allow_putfield = allow_putfield_init();
     let mut pc = 0usize;
     while pc < bytecode.len() {
         let op = bytecode[pc];
         match op {
+            // `putfield` alone is separable from the other four: see
+            // `allow_putfield_init`. When the knob is off this arm is
+            // unreachable and the classification is byte-identical to before.
+            0xb5 if allow_putfield => {}
             0xb3 | 0xb5 | 0xc2 | 0xc3 | 0xba => return InitComplexity::Complex,
             _ => {}
         }
@@ -1262,91 +1296,60 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::JavaUtilCollection);
         }
-        // JASPER-JDT.2 -- REMOVED 2026-07-26. Originally (2026-07-08) the
-        // real Tomcat `org.apache.jasper.compiler.TestCompiler` suite hit
-        // nondeterministic parser-adjacent heap corruption/OOM (first face:
-        // `ArrayIndexOutOfBoundsException` in `Parser.parse`) that bisected
-        // to `Parser.consumeRule` and the parser package generally. Given
-        // the ban's own documented nondeterminism, re-verified with a much
-        // higher bar than a single run: the real Tomcat fixture's own
-        // `TestCompiler` class (12 real JSP-compilation test methods, each
-        // a full embedded Tomcat boot+shutdown) run twice as baseline
-        // (ban active) and twice with `CRATONVM_JIT_ALLOW_PACKAGES=
-        // org/eclipse/jdt/internal/compiler/parser/` -- all 4 runs `OK (12
-        // tests)`, 0 failures, no AIOOBE, no heap corruption. No longer
-        // reproduces on current dev. JASPER-JDT.3
-        // (org/eclipse/jdt/internal/compiler/ast/, a separate, different
-        // AST-package miscompile found via Tomcat's FORM-auth JSP tests)
-        // is NOT covered by this removal and remains banned/open -- see
-        // docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md.
-
-        // JASPER-JDT.3 -- REMOVED 2026-07-26. Originally (2026-07-10) a
-        // second, independent Eclipse JDT miscompile family (AST/flow-
-        // analysis package, distinct from JASPER-JDT.2's parser package):
-        // real Tomcat FORM-auth JSP compilation
-        // (`TestFormAuthenticatorA/B/C`) intermittently threw
-        // `JasperException` from an `ArrayIndexOutOfBoundsException`
-        // reported at `QualifiedNameReference.analyseCode` -- a trivial
-        // delegating wrapper with no array access of its own, i.e. the
-        // JIT lost/mis-attributed an inlined callee's frame. Documented
-        // as nondeterministic ("0/8 hits" under `--nojit` vs. consistent
-        // hits with JIT). Re-verified with the same repeat-run bar used
-        // for JASPER-JDT.2: the real Tomcat fixture's own
-        // `TestFormAuthenticatorA` (9 real FORM-auth JSP-compilation test
-        // methods, each a full embedded Tomcat boot+shutdown) run twice
-        // as baseline (ban active) and twice with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`
-        // -- all 4 runs `OK (9 tests)`, 0 failures, no AIOOBE. No longer
-        // reproduces on current dev, same as its sibling JASPER-JDT.2.
-        // See docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md
-        // for the full evidence for both bans.
-        // JASPER-JDT.3 -- RESTORED 2026-07-27. The removal above is sound for
-        // the configuration it was measured in, and unsound for the one that
-        // now ships. Every one of its four re-verification runs was made while
-        // `helpers::direct_virtual_compiled_callee_entry_enabled()` was
+        // JASPER-JDT.2 (`org/eclipse/jdt/internal/compiler/parser/`) and
+        // JASPER-JDT.3 (`org/eclipse/jdt/internal/compiler/ast/`) -- REMOVED
+        // 2026-07-28, this time with the defect behind them root-caused first.
+        //
+        // Both were real Eclipse-JDT (ECJ) miscompiles, found through Tomcat's
+        // use of ECJ to compile JSPs. JASPER-JDT.2 (2026-07-08): nondeterministic
+        // parser-adjacent heap corruption / OOM, first face an
+        // `ArrayIndexOutOfBoundsException` in `Parser.parse`, bisected to
+        // `Parser.consumeRule`. JASPER-JDT.3 (2026-07-10): an AIOOBE reported at
+        // `QualifiedNameReference.analyseCode` -- a delegating wrapper with no
+        // array access of its own -- during FORM-auth JSP compilation.
+        //
+        // They were removed once before, on 2026-07-26, and RESTORED on
+        // 2026-07-27. Every one of those four re-verification runs was made
+        // while `helpers::direct_virtual_compiled_callee_entry_enabled()` was
         // default-OFF, and that flag gates the only write of
-        // `mic.cached_entry_ptr` -- i.e. with it off a JIT-compiled caller's
-        // `invokevirtual` never reaches a JIT-compiled callee at all. The
-        // compiled-to-compiled virtual dispatch this family lives in was
-        // therefore inert during the re-verification: the runs could not have
-        // reproduced it whatever the state of the underlying defect. Same
-        // shadowing shape as the removals this module already annotates as
-        // no-ops, just hidden behind a flag rather than behind another rule.
-        //
-        // Turning that flag on (2026-07-27, for the H2 `TestFreeSpace` /
-        // `TestNestedJoins` residuals) brings the family straight back, with a
-        // new face: real Tomcat `jakarta.el.TestOptionalELResolverInJsp` fails
-        // 2/2 with the flag on and passes 2/2 with it off, on the same binary,
-        // its JSP compile dying with
-        // `ClassCastException: org.eclipse.jdt.internal.compiler.ast.
-        // QualifiedTypeReference cannot be cast to
-        // org.eclipse.jdt.internal.compiler.ast.FieldDeclaration`
+        // `mic.cached_entry_ptr`: with it off, a compiled caller's
+        // `invokevirtual` never reaches a compiled callee at all, so the
+        // dispatch this family lives in was inert and those runs measured
+        // nothing. With the flag on the family came straight back, with a new
+        // face -- real Tomcat `jakarta.el.TestOptionalELResolverInJsp` failing
+        // its JSP compile with `ClassCastException:
+        // org.eclipse.jdt.internal.compiler.ast.QualifiedTypeReference cannot be
+        // cast to org.eclipse.jdt.internal.compiler.ast.FieldDeclaration`
         // (`JasperException: Unable to compile class for JSP` -> HTTP 500).
-        // A wrong-type AST node reaching a cast is the same "dispatch landed on
-        // the wrong target" shape as the original AIOOBE at
-        // `QualifiedNameReference.analyseCode`.
         //
-        // Liftable for bisection with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`.
-        // Any future attempt to remove this must be measured with the virtual
-        // direct-entry path ON, or it measures nothing.
-        // JASPER-JDT.2 is restored for the same reason and is the half that is
-        // DIRECTLY re-confirmed: with the virtual direct-entry path on,
-        // `CRATONVM_JIT_DENY=org/eclipse/jdt/internal/compiler/parser/` turns
-        // the failing `TestOptionalELResolverInJsp` back to PASS, while denying
-        // `.../ast/`, `.../lookup/` or `.../util/` does not. JASPER-JDT.3
-        // (`ast/`) is restored on the shadowing argument alone -- its own repro
-        // (`TestFormAuthenticatorA`) has not been re-run under the flag, and its
-        // removal evidence is void for exactly the same reason, so leaving it
-        // out would be asserting something no measurement supports.
-        for prefix in [
-            "org/eclipse/jdt/internal/compiler/ast/",
-            "org/eclipse/jdt/internal/compiler/parser/",
-        ] {
-            if class_name.starts_with(prefix) && !package_allowed(prefix, allow_packages) {
-                return Some(SkipReason::RustJvmTestFixture);
-            }
-        }
+        // That failure is now fixed, and this removal rests on knowing by what.
+        // Bisected over the 150 commits between the restore point (`4f280090f`,
+        // 3/3 FAIL) and dev, two runs per step, both packages JIT-allowed and
+        // the direct-entry path ON throughout: the first clean commit is
+        // `613b10f4c`, "fix(jit): LICM/speculative pre-header bypassed by a
+        // branch into the loop header". Every speculative pre-header the x86-64
+        // backend emits -- LICM hoists AND speculative bounds-check-elision
+        // guards -- is emitted inline at the loop-header PC and is skipped by
+        // any forward branch that jumps straight into the header, so such a loop
+        // ran against an uninitialised hoist slot, or with bounds checks elided
+        // by a guard that never executed. ECJ's `Parser`/AST code is full of
+        // that shape, and an unchecked array read handing back the wrong live
+        // object is exactly a `QualifiedTypeReference` arriving where a
+        // `FieldDeclaration` was expected -- and exactly the AIOOBE /
+        // heap-corruption faces these two bans were originally opened for.
+        //
+        // Re-verified on the real Tomcat fixture with the direct-entry path at
+        // its default (ON) and both packages actually compiling (166 parser + 29
+        // ast methods per run, counted with `CRATONVM_DBG_DUMP_JIT=LIST`, so the
+        // lift is not a no-op): `TestOptionalELResolverInJsp`,
+        // `org.apache.jasper.compiler.TestCompiler` (12 tests) and
+        // `org.apache.catalina.authenticator.TestFormAuthenticatorA/B/C` (9/6/7
+        // tests), repeat runs, all clean.
+        //
+        // Any future re-test of this family must leave
+        // `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` at its default
+        // (on), or it measures nothing -- that is what voided the 2026-07-26
+        // removal.
 
         // ES-FRAGILE-CLUSTER.1 (blanket `org/elasticsearch/`) -- REMOVED
         // 2026-07-27. The ban's last re-verification (the retired
@@ -3342,58 +3345,43 @@ mod tests {
     }
 
     #[test]
-    fn jdt_parser_and_ast_packages_are_banned_under_conservative_after_jasper_jdt_2_3_restore() {
+    fn jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal() {
         // JASPER-JDT.2 (`org/eclipse/jdt/internal/compiler/parser/`) and
         // JASPER-JDT.3 (`org/eclipse/jdt/internal/compiler/ast/`) were removed
-        // 2026-07-26 and then RESTORED -- see the loop over those two prefixes
-        // in should_skip_jit_internal and its comment: the removal evidence was
-        // void because those runs never lifted the ban that was shadowing them,
-        // so removing them would assert something no measurement supports.
+        // 2026-07-26, RESTORED 2026-07-27 -- the removal runs had the
+        // compiled-callee direct-entry path switched off and so measured an
+        // inert dispatch -- and removed for good 2026-07-28, this time after
+        // bisecting the real Tomcat repro to the commit that fixes it
+        // (`613b10f4c`, the LICM / speculative pre-header bypass) and re-running
+        // the Tomcat JSP suites with that dispatch path ON. See the removal
+        // comment in `should_skip_jit_internal`.
         //
-        // This test previously asserted the opposite (that both packages are
-        // JIT-eligible) and was left behind by that restore, so it failed on
-        // `dev`. It now pins the restored state: banned under Conservative,
-        // eligible under Aggressive (which bypasses the whole block), and
-        // liftable per-package via the allow-list.
+        // Both packages must now be JIT-eligible under the DEFAULT Conservative
+        // policy, with no allow-list entry needed.
         let cases = [
             (
                 "org/eclipse/jdt/internal/compiler/parser/Parser",
                 "consumeRule",
-                "org/eclipse/jdt/internal/compiler/parser/",
             ),
             (
                 "org/eclipse/jdt/internal/compiler/parser/Parser",
                 "consumeTypeImportOnDemandDeclarationName",
-                "org/eclipse/jdt/internal/compiler/parser/",
             ),
             (
                 "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
                 "analyseCode",
-                "org/eclipse/jdt/internal/compiler/ast/",
             ),
         ];
-        for (class_name, method, prefix) in cases {
+        for (class_name, method) in cases {
             assert_eq!(
                 check(class_name, method, false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name}.{method} must stay interpreted under Conservative -- JASPER-JDT.2/.3 were restored",
+                None,
+                "{class_name}.{method} must be JIT-eligible under Conservative -- JASPER-JDT.2/.3 were removed 2026-07-28",
             );
             assert_eq!(
                 check(class_name, method, false, true, SkipPolicy::Aggressive),
                 None,
-                "{class_name}.{method} must be JIT-eligible under Aggressive, which bypasses the Conservative-only block",
-            );
-            assert_eq!(
-                check_with(
-                    class_name,
-                    method,
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                    &[prefix],
-                ),
-                None,
-                "{class_name}.{method} must be JIT-eligible once {prefix} is explicitly allowed",
+                "{class_name}.{method} must be JIT-eligible under Aggressive too",
             );
         }
     }
@@ -3448,7 +3436,17 @@ mod tests {
     }
 
     #[test]
-    fn elasticsearch_vector_diskbbq_hang_cluster_stays_interpreted_by_default() {
+    fn elasticsearch_vector_diskbbq_cluster_is_jit_eligible_after_es_cluster_removal() {
+        // Drive-by repair, 2026-07-28. The blanket `org/elasticsearch/` ban
+        // (ES-FRAGILE-CLUSTER.1) was removed on 2026-07-27 by `bae30dc3c` --
+        // see the removal comment above `should_skip_jit_internal` -- but this
+        // test was left asserting the ban, so `cargo test -p cratonvm-vm --lib
+        // skip_list` has been red on `dev` ever since. Exactly the shape
+        // `b8225b18c` had to repair for the JASPER-JDT test, so it is corrected
+        // here alongside the JASPER-JDT.2/.3 removal rather than left for the
+        // next session to trip over. Nothing about elasticsearch was re-measured
+        // in doing so: the assertion is simply flipped to match the ban state
+        // the lift established.
         for class_name in [
             "org/elasticsearch/index/codec/vectors/diskbbq/DocIdsWriterTests",
             "org/elasticsearch/index/codec/vectors/diskbbq/ES920DiskBBQVectorsFormatTests",
@@ -3458,34 +3456,14 @@ mod tests {
             "org/elasticsearch/index/codec/vectors/es93/ES93HnswBitVectorsFormatTests",
             "org/elasticsearch/search/vectors/IVFKnnFloatSlicedVectorQueryTests",
         ] {
-            assert_eq!(
-                check(
-                    class_name,
-                    "testBody",
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                ),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name} must stay interpreted under the conservative policy"
-            );
-            assert_eq!(
-                check(class_name, "testBody", false, true, SkipPolicy::Aggressive),
-                None,
-                "aggressive policy must still lift {class_name} for bisection"
-            );
-            assert_eq!(
-                check_with(
-                    class_name,
-                    "testBody",
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                    &["org/elasticsearch/"],
-                ),
-                None,
-                "CRATONVM_JIT_ALLOW_PACKAGES=org/elasticsearch/ must lift {class_name}"
-            );
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, "testBody", false, true, policy),
+                    None,
+                    "{class_name} must be JIT-eligible now that the blanket \
+                     org/elasticsearch/ ban is removed"
+                );
+            }
         }
 
         assert_eq!(
