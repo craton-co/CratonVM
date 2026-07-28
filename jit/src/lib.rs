@@ -673,6 +673,74 @@ fn jit_code_cache_at_capacity() -> bool {
     true
 }
 
+/// Number of JIT frames live process-wide, mirrored here from the VM's own
+/// `GLOBAL_JIT_DEPTH` (this crate cannot see that counter -- `vm` depends on
+/// `jit`, not the other way round).
+///
+/// Only [`retire_executable`] reads it, and only to decide whether unmapping a
+/// retired code buffer right now could pull the ground out from under a frame
+/// that is executing it.
+pub static LIVE_JIT_FRAMES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Mirror one JIT chain push/pop into [`LIVE_JIT_FRAMES`].
+#[inline]
+pub fn note_live_jit_frame_delta(delta: isize) {
+    if delta > 0 {
+        LIVE_JIT_FRAMES.fetch_add(delta as usize, std::sync::atomic::Ordering::Release);
+    } else if delta < 0 {
+        // Saturating: a stray pop must not wrap the counter to `usize::MAX` and
+        // pin every retired buffer for the rest of the process.
+        let _ = LIVE_JIT_FRAMES.fetch_update(
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Acquire,
+            |v| Some(v.saturating_sub((-delta) as usize)),
+        );
+    }
+}
+
+/// Code buffers whose last owner has dropped but which could not be unmapped
+/// yet because JIT frames were live. Drained by [`retire_executable`].
+fn retired_code() -> &'static Mutex<Vec<(usize, usize)>> {
+    static RETIRED: OnceLock<Mutex<Vec<(usize, usize)>>> = OnceLock::new();
+    RETIRED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Hand a dropped code buffer back to the OS -- but only when no JIT frame is
+/// live anywhere in the process.
+///
+/// `JitCache::put` REPLACES the artifact stored under a key, and
+/// `invalidate_matching` removes artifacts outright on a class define. Either
+/// can drop the last `Arc<CompiledMethod>` for a body that a thread is
+/// currently EXECUTING: `JitEntryGuard::enter_with_compiled` records only a raw
+/// `*const CompiledMethod`, and its doc comment's claim that "the compiled
+/// method itself is kept alive by the JIT cache's Arc holding" is exactly the
+/// assumption `put` breaks. Unmapping there turns the next instruction fetch in
+/// the running method into a SIGSEGV whose `pc == addr` -- observed on
+/// `BeanRegistrationsAotContributionTests` at roughly one run in three, faulting
+/// inside `com/sun/tools/javac/tree/TreeScanner.visitApply` while javac was
+/// running it.
+///
+/// So: deregister immediately (the address must stop validating as JIT code the
+/// moment it is retired), but defer the `munmap` until `LIVE_JIT_FRAMES` hits
+/// zero, then drain everything that accumulated. The committed-bytes accounting
+/// moves with the actual unmap so the code-cache cap keeps tracking real
+/// mappings.
+fn retire_executable(ptr: *mut u8, capacity: usize) {
+    let mut pending = match retired_code().lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    pending.push((ptr as usize, capacity));
+    if LIVE_JIT_FRAMES.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return;
+    }
+    for (addr, size) in pending.drain(..) {
+        COMMITTED_JIT_CODE_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+        platform::free_executable(addr as *mut u8, size);
+    }
+}
+
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         if self.ptr.is_null() {
@@ -681,8 +749,7 @@ impl Drop for ExecutableBuffer {
         if let Ok(mut regions) = jit_code_regions().lock() {
             regions.deregister(self.ptr);
         }
-        COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
-        platform::free_executable(self.ptr, self.capacity);
+        retire_executable(self.ptr, self.capacity);
     }
 }
 

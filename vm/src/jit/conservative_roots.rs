@@ -604,6 +604,9 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
+    // Mirror into the JIT crate so `retire_executable` can tell whether
+    // unmapping a dropped code buffer could hit a frame that is running it.
+    cratonvm_jit::note_live_jit_frame_delta(1);
     cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
@@ -645,6 +648,7 @@ pub fn pop_jit_entry() -> Option<usize> {
     });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
+        cratonvm_jit::note_live_jit_frame_delta(-1);
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
         Some(entry.entry_sp)
@@ -697,6 +701,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     }
     for _ in 0..pruned {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
+        cratonvm_jit::note_live_jit_frame_delta(-1);
         cratonvm_gc::gc_quiescence::leave();
         cratonvm_jit::jit_execution_leave();
     }
