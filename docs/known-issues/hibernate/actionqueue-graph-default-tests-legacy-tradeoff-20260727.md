@@ -200,3 +200,31 @@ Record semantics for the §3 fix are covered by
 `vm/tests/intrinsic_diff.rs::record_object_methods_differential` over
 `vm/tests/resources/cratonvm/IntrinsicRecordDiff.java` — 368 observations,
 identical with intrinsics ON and with `CRATONVM_DISABLE_INTRINSICS=1`.
+
+## 7. The LEGACY default also costs throughput (measured on dev, 2026-07-28)
+
+Kept from the concurrent measurement another session added to this doc, because
+it raises the value of removing the default and must not be lost: on an
+insert-heavy fixture the LEGACY queue is also substantially *slower* than the
+GRAPH default it replaces — the opposite of what the `CycleBreaker`-hang
+rationale would suggest.
+
+Measured on dev `d0a6c7987`, quiet host, one fresh process per sample,
+`OracleInlineMutationStrategyIdTest#testDeleteFromPerson` (its `@BeforeEach`
+persists 2200 JOINED-inheritance entities = 4400 INSERTs). Three samples per
+configuration, interleaved round-robin so host drift cannot favour one side:
+
+| configuration | samples (ms) | mean |
+|---|---|---:|
+| CratonVM default (LEGACY) | 255 999 / 241 995 / 216 814 | 238 269 |
+| `-Dhibernate.flush.queue.type=graph` | 168 208 / 185 606 / 159 862 | **171 225 (−28 %)** |
+
+The sample sets do not overlap, well clear of the ±8 % run-to-run spread. Full
+context:
+[`h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md`](../../internal/fixed-suite-bugs/hibernate/h2-expressioncolumn-getvalue-native-bypasses-groupdata-20260727-FIXED.md),
+residual section.
+
+So the default currently pays three times: 19 gated classes, −28 % on
+insert-heavy flushes, and a permanent divergence from upstream. It still cannot
+be removed today — §2 — but the ledger against it is larger than the original
+doc implied.
