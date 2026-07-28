@@ -7401,37 +7401,49 @@ fn local_handler_reads_unsafe_local(
 
 /// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
 ///
-/// **Default OFF (2026-07-27).** The relaxation (added by `83e078aa5`) compiles
-/// methods whose exception handler reads a local beyond the incoming
-/// parameters, on the promise that every throwing site in the protected range
-/// publishes a precise exceptional frame. Measured against that promise, the
-/// handoff still loses live values:
+/// The relaxation compiles a method whose exception handler (or code reachable
+/// from it) reads a local beyond the incoming parameters, on the promise that
+/// every throwing site in its protected ranges publishes a precise exceptional
+/// frame instead of the params-only reconstruction
+/// `route_jit_exception_through_method` can do on its own. Without it, ordinary
+/// `try`/`catch` methods stay interpreted forever — `JSONValue.toJSONString`,
+/// `org.apache.tomcat.util.buf.CharsetCache.getCharset` (~15us interpreted vs
+/// ~2us compiled), `StringCache.toString`.
 ///
-/// | build (json-smart round-trip probe, `-Xmx64m`, 200k ops/run) | first error |
-/// |---|---|
-/// | dev before `83e078aa5` | none |
-/// | dev at/after `83e078aa5` | iteration 400-5,000 |
-/// | same, with this gate closed | none |
+/// **Default OFF between 2026-07-27 and 2026-07-28**, because a json-smart
+/// round-trip probe (`docs/known-issues/repros/jsonsmart/`, `-Xmx64m`) crashed
+/// or corrupted within ~20,000 iterations whenever it was open. Four defects
+/// were behind that, all fixed; keep them in mind before changing anything
+/// here:
 ///
-/// The failures are lost-object failures, not exception-handling failures: a
-/// re-parse returns one of the document's own keys, or a
-/// `ClassCastException: java.lang.Object cannot be cast to JSONArray` — an
-/// unrelated object standing where a live one used to be, i.e. a value dropped
-/// from a reconstructed frame (and with it, from the GC's view of that frame).
-/// One input to that has been fixed separately (the liveness scan behind the
-/// snapshot had no exception edges — see
-/// `regalloc::live_locals_per_pc_with_handlers`), but the shape survives it, so
-/// the admission stays closed until the handoff itself is proven.
+/// 1. `remap_active_jit_frames` (vm) walked the JIT rbp chain and passed the
+///    *unvalidated* parent link to a helper that dereferences
+///    `[parent_rbp - sp_id_slot_off]` and rewrites every oop-map slot. A zero
+///    link faulted; a garbage one rewrote arbitrary stack. This was the actual
+///    json-smart failure and is not specific to this gate — the gate only made
+///    the chain deep enough to walk. 3 SIGSEGVs in 4 probe runs before, 0 in 10
+///    after.
+/// 2. The exceptional frame was keyed on the throwing invoke's SUCCESSOR bci,
+///    but its consumer uses that bci as the THROW pc for the handler's
+///    `[start_pc, end_pc)` test — and javac routinely ends a protected range
+///    exactly at that successor, so the exception escaped its own catch block.
+/// 3. The frame was stashed in `LAST_DEOPT`, where every other consumer treats
+///    a stash as "resume this method at `bci`" — which for an exceptional frame
+///    executes past a call that never returned. It has its own stash now
+///    (`deopt::take_exceptional_frame`) and its own `DeoptReason`.
+/// 4. Register allocation and `regalloc::plan_safepoint_publication` both built
+///    their liveness from a CFG with no exception edges, which is only sound
+///    while this gate refuses the population that reads handler-only locals.
+///    Both now model the handler ranges for this population.
 ///
-/// Set `CRATONVM_JIT_PRECISE_HANDLER_FRAMES=1` to re-open it while working on
-/// it. Repro: `docs/known-issues/repros/jsonsmart/JsonSmartProbeWarmed.java`
-/// under `-Xmx64m`; writeup:
-/// `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+/// Regression fixture: `vm/tests/resources/cratonvm/JitPreciseHandlerFrame.java`
+/// (three shapes, each returning a mismatch count that must be 0).
+/// `CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES` restores the params-only refusal.
 fn precise_handler_frames_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_PRECISE_HANDLER_FRAMES").is_some()
+        cratonvm_types::flags::runtime_var_os("CRATONVM_NO_JIT_PRECISE_HANDLER_FRAMES").is_none()
     })
 }
 

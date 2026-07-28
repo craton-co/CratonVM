@@ -91,7 +91,7 @@ really the non-moving young sweep) and the fork6 GC-stress corruption notes.
 ### Already ruled out
 
 **The RBC.6 precise-handler-frame re-gating does not fix this.** Dev's
-`f09c9dff1` / `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`
+`f09c9dff1` / the retired `jit-precise-handler-frame-drops-live-locals-20260727` write-up
 describes a very similar shape (a live local dropped from a reconstructed
 handler frame is a root the collector cannot see, JIT-only, needs a GC at the
 wrong moment) and closes the gate by default. Rebuilding on top of it changes
