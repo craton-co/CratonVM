@@ -5942,6 +5942,30 @@ impl JitCache {
             }
         }
 
+        // Nothing matched -- the overwhelmingly common outcome, because this
+        // runs on EVERY class define and almost no define invalidates a CHA
+        // assumption. Bail before the three whole-cache passes below.
+        //
+        // Each of them is a no-op in this state, but not a cheap one: the
+        // closure loop below still makes a full pass over every shard, the
+        // retarget pass walks every compiled method's inline-cache slots with
+        // an empty set, and the publication loop CLONES all 128 shard maps
+        // only to find `next.len() == old_len` and drop them again. Together
+        // they were ~31% of total CPU on
+        // `beans.factory.aot.BeanRegistrationsAotContributionTests`, which
+        // defines classes continuously (AOT codegen + in-process javac):
+        // `invalidate_cached_targets` 12.8%, `HashMap::clone` 8.0%,
+        // `drop_in_place<JitKey>` 5.6%, `invalidate_for_class_change` 3.4%.
+        //
+        // Correct by construction: the closure loop only ever adds a method
+        // whose callee is ALREADY in `remove_entries`, so an empty set stays
+        // empty; `invalidate_cached_targets` of an empty set changes nothing;
+        // and `retain` with an empty set removes nothing, so no snapshot is
+        // published and the generation counter must not move.
+        if remove_entries.is_empty() {
+            return 0;
+        }
+
         // A raw direct caller of an invalidated body is invalid too. Compute
         // the transitive reverse closure before publishing any new snapshot.
         loop {
@@ -5976,23 +6000,30 @@ impl JitCache {
             }
         }
 
+        // Copy-on-write only the shards that actually lose an entry. The
+        // clone is the expensive half of a publication, and an invalidation
+        // typically touches one or two of the 64 shards.
+        let doomed = |map: &JitCacheMap| {
+            map.values()
+                .any(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+        };
         let mut removed = 0;
         for shard in self.shards.iter() {
             let current = shard.methods.load();
-            let mut next = (**current).clone();
-            let old_len = next.len();
-            next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
-            removed += old_len - next.len();
-            if next.len() != old_len {
+            if doomed(&current) {
+                let mut next = (**current).clone();
+                let old_len = next.len();
+                next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
+                removed += old_len - next.len();
                 shard.methods.store(Arc::new(next));
             }
 
             let current = shard.osr_methods.load();
-            let mut next = (**current).clone();
-            let old_len = next.len();
-            next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
-            removed += old_len - next.len();
-            if next.len() != old_len {
+            if doomed(&current) {
+                let mut next = (**current).clone();
+                let old_len = next.len();
+                next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
+                removed += old_len - next.len();
                 shard.osr_methods.store(Arc::new(next));
             }
         }
@@ -7604,7 +7635,7 @@ fn precise_exception_frame_sites_supported(
         // unconditional deopt trap, not to a call site that publishes a frame.
         if covered(pc)
             && may_throw_without_precise_frame(op)
-            && !matches!(op, 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
+            && !matches!(op, 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xc2 | 0xc3)
         {
             return false;
         }
