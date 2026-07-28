@@ -100,6 +100,11 @@ pub enum SkipReason {
     /// Method is being invoked from an unnamed thread (typically a test
     /// harness in early init), where thread-local JIT state may not be set up.
     UnnamedThread,
+    /// A generated `java.lang.reflect.Proxy` subclass method. Its body is a
+    /// pure `super.h.invoke(this, mN, args)` trampoline whose semantics
+    /// CratonVM overrides at DISPATCH, not in the bytecode -- see
+    /// `is_jdk_dynamic_proxy_class`.
+    JdkDynamicProxyTrampoline,
     /// `MutableBigInteger` divide/normalization arithmetic has a confirmed
     /// JIT-only array-index corruption residual. Keep the implementation
     /// interpreted until the lowering defect is identified.
@@ -718,27 +723,66 @@ fn should_skip_jit_internal(
     // javac emits no deprecation warning at all when
     // `s.outermostClass() == other.outermostClass()`.
     //
-    // Narrowed with `AnnotationEffectProbe2`/`AnnotationEffectProbe3` (extra
-    // oracles run in the same process the moment suppression flips):
-    // annotation ATTRIBUTION stays intact -- `@FunctionalInterface` on a
-    // two-abstract-method interface, `@Override` on a non-overriding method
-    // and `@SafeVarargs` on a non-varargs method all still report their
-    // errors -- and the loss is not deprecation-specific, since
-    // `@SuppressWarnings("rawtypes")` fails the same way. So this is
-    // annotation-derived `Lint` being consulted too early, not attribution
-    // stopping. Sharpest unexplained lead: the one oracle that still
-    // suppresses correctly differs only in NOT passing `-Werror`, and that
-    // is not an ordering artifact (3/3 runs, and re-running the whole
-    // oracle set in reverse order inside the same process reproduces it
-    // exactly). Remaining suspect for whoever picks this up: this method's
-    // own compiled tail, which brackets its work in
-    // `Annotate.blockAnnotations()`/`unblockAnnotationsNoFlush()` inside a
-    // catch-all `finally` and then ends with
-    // `if (!reader.filling) annotate.flush();` -- delaying that flush past
-    // the point where javac replays deferred lint gives exactly this
-    // signature. Also worth knowing before theorising: this method IS
-    // JIT-compiled despite carrying a non-empty exception table (measured
-    // with `CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are
+    // ROOT-CAUSED 2026-07-28. Symptom (a) is not an arithmetic or lowering
+    // defect in this method at all -- it is a JIT-compiled `finally` that
+    // never runs. `[PUTFIELD-WATCH]` on `Annotate.blockCount`
+    // (`CRATONVM_DBG_FIELD_WATCH=Annotate.blockCount`) shows the healthy
+    // compilations pairing `blockAnnotations()` (counter++) with
+    // `unblockAnnotationsNoFlush()` (counter--) and returning to 0, and the
+    // first failing compilation running five `blockAnnotations()` with no
+    // matching unblock, ending at 4. `complete` brackets its body in
+    // `try { annotate.blockAnnotations(); ... } finally {
+    // annotate.unblockAnnotationsNoFlush(); dependencies.pop(); }`, so a
+    // skipped `finally` leaves annotations blocked and `Annotate.flush()` a
+    // no-op for the rest of that compilation -- and javac throws
+    // `CompletionFailure` through `complete` constantly while resolving
+    // cross-compilation-unit references, which is exactly why the standalone
+    // reproducer needs the deprecated type in a separate `.class` file.
+    //
+    // Reduced to a 3-second, javac-free witness --
+    // `try { n++; thrower(); } finally { n--; }` in a loop where `thrower`
+    // throws every 7th call leaks one count per throw under JIT and zero
+    // under `--nojit` / HotSpot (`FinallyBalanceProbe`, `FinallyShapeProbe`,
+    // `FinallyThrowSiteProbe`, `CallPathProbe`, all committed at
+    // docs/known-issues/repros/jitban-remaining-20260726/). Only a catch-all
+    // (`catch_type == 0`) leaks; typed `catch`, `catch (Throwable)` and
+    // catch-and-rethrow are unaffected, because a catch-all has nothing but
+    // the pc range to match on.
+    //
+    // Three independent escape routes were found. TWO ARE FIXED (2026-07-28,
+    // this commit):
+    //
+    //   1. Foreign throw pc. `JitSignals::athrow_bci` was left holding the
+    //      bci that the CALLEE's compiled `athrow` lowering stashed, and the
+    //      interpreter range-checked that foreign pc against THIS method's
+    //      exception table. Fixed by stamping the invoke's own bci in the
+    //      post-invoke exception-check stub (`JitRuntimeHelpers::set_throw_bci`,
+    //      `emit_exception_check_stub` now emits one pad per distinct bci).
+    //   2. Whole-method re-execution. When a compiled caller invoked a
+    //      compiled callee that threw, `route_implicit_exc_through_callee`
+    //      answered by re-running the callee from its entry -- duplicating
+    //      every side effect the compiled attempt had already performed
+    //      before the throw. Fixed by resuming the callee AT its handler
+    //      instead (`interpreter::run_jit_callee_handler`).
+    //
+    // The THIRD is still open and is why this ban stays: a compiled method
+    // reached through LAMBDA / method-reference dispatch
+    // (`try_lambda_dispatch` -> `invoke_shared` / `invoke_on_class_shared*`,
+    // not the invoke-cache `CachedInvokeTarget::Jit` path) escapes without
+    // any drain consulting its exception table -- no
+    // `route_jit_signal_exception` and no `route_implicit_exc_through_callee`
+    // fires for it. `CallPathProbe` isolates this precisely: with both fixes
+    // in place `STATIC-direct`, `IFACE-class-inline` and
+    // `IFACE-class-delegating` are clean while `LAMBDA-methodref` and
+    // `LAMBDA-body` still leak. `ClassFinder`'s completer is
+    // `Completer thisCompleter = this::complete;` -- a method reference --
+    // so javac takes exactly that route, and the ban is still load-bearing:
+    // AutowiredAnnotationBeanRegistrationAotContributionTests is 9/14 with it
+    // lifted and 14/14 with it active.
+    //
+    // Also measured, contradicting a common assumption: this method IS
+    // JIT-compiled despite carrying a non-empty exception table
+    // (`CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are
     // never admitted" rule of thumb does not apply here.
     if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
         return Some(SkipReason::ClassFinderComplete);
@@ -898,6 +942,13 @@ fn should_skip_jit_internal(
     }
     if !current_thread_named {
         return Some(SkipReason::UnnamedThread);
+    }
+    // SPR-PROXY.1 -- see `is_jdk_dynamic_proxy_class`. Deliberately NOT
+    // liftable by `CRATONVM_JIT_ALLOW_PACKAGES`: a compiled proxy body is a
+    // dispatch path the VM's proxy semantics do not cover, and there is no
+    // throughput to win back from a trampoline.
+    if is_jdk_dynamic_proxy_class(class_name) {
+        return Some(SkipReason::JdkDynamicProxyTrampoline);
     }
 
     // HIB-BIGINTEGER-AIOOBE.1 (2026-07-17) — the real-JDK
@@ -2657,6 +2708,44 @@ fn is_known_miscompile_clq_family(class_name: &str, method_name: &str) -> bool {
     )
 }
 
+/// True for a class generated by `java.lang.reflect.Proxy` -- JDK 9+ names
+/// them `jdk/proxy<N>/$Proxy<M>` (one package per defining loader) and puts
+/// unnamed-module proxies for non-public interfaces in the interface's own
+/// package as `<pkg>/$Proxy<M>`.
+///
+/// **Why these must never be JIT-compiled** (SPR-PROXY.1, 2026-07-28): every
+/// method a proxy class declares is the same three-line trampoline --
+/// `return (T) super.h.invoke(this, mN, args)` -- so compiling one buys
+/// nothing in throughput. What it costs is correctness: CratonVM does not
+/// implement proxy semantics in that bytecode, it implements them at DISPATCH
+/// (`vm_exec.rs`'s `proxy_invoke_handler_shared` /
+/// `proxy_annotation_handler_invoke` / `annotation_proxy_dispatch_impl`,
+/// which is where annotation-member coercion and the delegation of `equals`
+/// to a FOREIGN proxy of the same annotation type live). A compiled proxy
+/// body is a THIRD dispatch path that bypasses all of it, on top of the two
+/// the `MergedAnnotationsTests` asymmetric-`equals` fix already had to chase.
+///
+/// Measured symptom: `beans.PropertyDescriptorUtilsPropertyResolutionTests`
+/// (a JUnit `@ParameterizedClass` + `@FieldSource` with `@Nested` children,
+/// so JUnit's annotation scanning drives proxy accessors hard) died with
+/// `OutOfMemoryError: Java heap space` after ~100 s of GCs that reclaimed
+/// almost nothing -- at 512 MB, 2 GB and 8 GB heaps alike. `--nojit` runs it
+/// clean. Package bisection over eight configurations pinned it exactly:
+/// every configuration with `jdk/proxy` JIT-eligible died, every
+/// configuration without it passed, including one with `org/springframework/,
+/// org/junit/, java/, org/assertj/, net/bytebuddy/` all compiled.
+fn is_jdk_dynamic_proxy_class(class_name: &str) -> bool {
+    let Some(simple) = class_name.rsplit('/').next() else {
+        return false;
+    };
+    let Some(rest) = simple.strip_prefix("$Proxy") else {
+        return false;
+    };
+    // `$Proxy` is followed by the generator's counter and nothing else; a
+    // user class merely NAMED `$ProxyFactory` must stay compilable.
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -> bool {
     // Matched on the suffix so BOTH copies of the ANTLR 4 runtime are covered:
     // Groovy's shaded `groovyjarjarantlr4/` fork (where the equality/hash
@@ -3470,9 +3559,7 @@ mod tests {
                 SkipPolicy::Conservative,
             ),
             None,
-            "Lucene is JIT-admitted at the skip-list level since 117d2d906 \
-             retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED \
-             methods are gated in the interpreter, not here)"
+            "Lucene is JIT-admitted at the skip-list level since 117d2d906              retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED              methods are gated in the interpreter, not here)"
         );
     }
 

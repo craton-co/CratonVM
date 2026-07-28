@@ -11779,6 +11779,17 @@ fn route_jit_signal_exception(
         Some((bci, locals)) => (*bci, locals.as_slice()),
         None => (fallback_throw_pc, fallback_locals),
     };
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_signal_exception {}.{}{} precise_bci={:?} fallback_throw_pc={} chosen={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            precise.as_ref().map(|(b, _)| *b as i64),
+            fallback_throw_pc as i64,
+            throw_pc as i64,
+        );
+    }
     route_jit_exception_through_method(
         shared,
         thread,
@@ -11837,30 +11848,22 @@ fn drop_own_exceptional_frame(class_name: &str, method_name: &str, descriptor: &
 
 /// Search the cached exception table and construct the interpreter handler
 /// frame from the locals selected by `route_jit_signal_exception`.
-fn route_jit_exception_through_method(
+/// Find the exception-table entry of `cached` that catches `exc` thrown at
+/// `throw_pc`, returning its handler pc.
+///
+/// Extracted from `route_jit_exception_through_method` so the JIT-to-JIT
+/// dispatch path (`vm/src/jit/helpers.rs::route_implicit_exc_through_callee`)
+/// can run a compiled callee's own handler without re-executing the callee
+/// from its entry — see `run_jit_callee_handler`.
+pub(crate) fn find_jit_exception_handler(
     shared: &SharedVm,
-    thread: &mut JvmThread,
-    caller_frame_idx: usize,
     cached: &Arc<CachedBytecodeMethod>,
     throw_pc: usize,
     exc: ObjectRef,
-    incoming_args: &[Value],
-) -> Result<CachedCallResult, MethodCallFailed> {
-    if crate::jit::helpers::rbc6_dbg() {
-        eprintln!(
-            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
-            cached.class_name,
-            cached.method_name,
-            cached.method_descriptor,
-            throw_pc as i64,
-            cached.exception_table.len(),
-        );
-    }
-    // Fast path: no exception table at all — propagate.
+) -> Option<usize> {
     if cached.exception_table.is_empty() {
-        return Err(MethodCallFailed::ExceptionThrown(exc));
+        return None;
     }
-
     let pc_unknown = throw_pc == usize::MAX;
     // `cached.code` is padded with 2 trailing bytes for speculative reads;
     // the real bytecode length is `len() - 2`. Used to recognise a catch-all
@@ -11939,6 +11942,100 @@ fn route_jit_exception_through_method(
         }
     }
     drop(cm_guard);
+    handler_pc
+}
+
+/// Run a compiled callee's own exception handler in the interpreter, resuming
+/// AT the handler rather than re-executing the method from its entry.
+///
+/// The JIT-to-JIT dispatch path used to answer a compiled callee's escaping
+/// exception with `bail_to_interpreter`, i.e. a full re-run. That is only
+/// sound for a callee whose pre-throw prefix has no observable side effects —
+/// which a `try { counter++; mayThrow(); } finally { counter--; }` plainly
+/// does not: the compiled attempt already ran `counter++` and skipped the
+/// `finally`, and the re-run then adds a second balanced pass, leaking one
+/// count per throw. `FinallyShapeProbe`/`CallPathProbe` are the witnesses
+/// (`docs/known-issues/repros/jitban-remaining-20260726/`).
+///
+/// Resuming at the handler keeps the compiled prefix's single execution and
+/// runs only the cleanup the compiled body skipped. Locals are the callee's
+/// incoming arguments, which is the same verifier-consistent state
+/// `route_jit_exception_through_method` uses and is sound for exactly the same
+/// reason: a compiled method whose handler reads a local first assigned inside
+/// the try never passes the `local_handler_reads_unsafe_local` compile gate.
+///
+/// Returns `None` when no handler in `cached` covers `throw_pc`, leaving the
+/// caller to propagate the exception unchanged.
+pub(crate) fn run_jit_callee_handler(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: usize,
+    exc: ObjectRef,
+    incoming_args: &[Value],
+) -> Option<MethodCallResult> {
+    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc)?;
+    thread.refill_pools_from_shared(
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
+        cached.max_locals as usize,
+        (cached.max_stack as usize).max(16) + 8,
+    );
+    let mut frame = crate::runtime::frame::Frame::new_pooled(
+        cached.declaring_class_id,
+        cached.class_name.clone(),
+        cached.method_name.clone(),
+        cached.method_descriptor.clone(),
+        cached.source_file.clone(),
+        cached.code.clone(),
+        cached.exception_table.clone(),
+        cached.max_stack,
+        cached.max_locals,
+        incoming_args,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
+    );
+    // Same GC-safety ordering as `route_jit_exception_through_method`: the
+    // exception oop must live in a scanned frame slot before anything that can
+    // allocate runs.
+    if frame.stack.push(Value::Object(Some(exc))).is_err() {
+        return None;
+    }
+    frame.pc = handler_pc;
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] run_jit_callee_handler {}.{}{} throw_pc={} handler_pc={}",
+            cached.class_name, cached.method_name, cached.method_descriptor, throw_pc, handler_pc,
+        );
+    }
+    Some(execute_prebuilt_frame(shared, thread, frame))
+}
+
+fn route_jit_exception_through_method(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    caller_frame_idx: usize,
+    cached: &Arc<CachedBytecodeMethod>,
+    throw_pc: usize,
+    exc: ObjectRef,
+    incoming_args: &[Value],
+) -> Result<CachedCallResult, MethodCallFailed> {
+    if crate::jit::helpers::rbc6_dbg() {
+        eprintln!(
+            "[rbc6-dbg] route_jit_exception_through_method ENTER {}.{}{} throw_pc={} exception_table_len={}",
+            cached.class_name,
+            cached.method_name,
+            cached.method_descriptor,
+            throw_pc as i64,
+            cached.exception_table.len(),
+        );
+    }
+    // Fast path: no exception table at all — propagate.
+    if cached.exception_table.is_empty() {
+        return Err(MethodCallFailed::ExceptionThrown(exc));
+    }
+
+    let handler_pc = find_jit_exception_handler(shared, cached, throw_pc, exc);
 
     if crate::jit::helpers::rbc6_dbg() {
         eprintln!(
@@ -27803,6 +27900,20 @@ fn force_native_over_real_jdk_bytecode(
             | "keys"
             | "elements"
     ) {
+        return true;
+    }
+    // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
+    // entries in a segmented native layout, so the real JDK `writeObject`
+    // (which walks the always-null `table`) serialised every CHM as empty and
+    // the real `readObject` rebuilt a `table` our natives never read. Both are
+    // reached through `ObjectStreamClass.invokeWriteObject`/`invokeReadObject`,
+    // i.e. reflective `Method.invoke` -- a path with no bytecode PC to key an
+    // invoke-cache entry on, so it consults this gate directly. Kept separate
+    // from the Map cluster above because HashMap/LinkedHashMap/Hashtable have
+    // no such natives and must keep running their real bodies.
+    if class_name == "java/util/concurrent/ConcurrentHashMap"
+        && matches!(method_name, "writeObject" | "readObject")
+    {
         return true;
     }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
