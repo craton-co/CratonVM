@@ -27743,6 +27743,20 @@ fn force_native_over_real_jdk_bytecode(
     ) {
         return true;
     }
+    // ConcurrentHashMap's private serialization hooks. CratonVM stores CHM
+    // entries in a segmented native layout, so the real JDK `writeObject`
+    // (which walks the always-null `table`) serialised every CHM as empty and
+    // the real `readObject` rebuilt a `table` our natives never read. Both are
+    // reached through `ObjectStreamClass.invokeWriteObject`/`invokeReadObject`,
+    // i.e. reflective `Method.invoke` -- a path with no bytecode PC to key an
+    // invoke-cache entry on, so it consults this gate directly. Kept separate
+    // from the Map cluster above because HashMap/LinkedHashMap/Hashtable have
+    // no such natives and must keep running their real bodies.
+    if class_name == "java/util/concurrent/ConcurrentHashMap"
+        && matches!(method_name, "writeObject" | "readObject")
+    {
+        return true;
+    }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
     // allow-list. JarFile inherits these operations from ZipFile, so a
     // subclass `super.close()` resolves to the real ZipFile bytecode after
