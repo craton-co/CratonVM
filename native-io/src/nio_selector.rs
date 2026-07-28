@@ -162,6 +162,13 @@ enum SelectableHandle {
     Listener(TcpListener),
     Stream(TcpStream),
     Udp(UdpSocket),
+    /// A listening socket polled by raw OS handle, without the selector
+    /// owning a duplicate. Used for AF_UNIX listeners, which cannot be
+    /// `try_clone`d into a `std` type. Sound because the owning channel
+    /// deregisters its key (`deregister_fd_everywhere`, called from
+    /// `sc_close` BEFORE the registry entry that owns the socket is dropped),
+    /// so the handle is never polled after the OS could have recycled it.
+    RawListener(i64),
     /// Registered without a live handle — `kernel_select` skips it; useful
     /// for lifecycle tests that want a key in the map without a real socket.
     Dummy,
@@ -174,6 +181,8 @@ pub enum SelectableKind {
     Listener(TcpListener),
     Stream(TcpStream),
     Udp(UdpSocket),
+    /// Non-owning raw listener handle — see `SelectableHandle::RawListener`.
+    RawListener(i64),
 }
 
 impl SelectableHandle {
@@ -186,6 +195,7 @@ impl SelectableHandle {
             SelectableHandle::Listener(l) => Some(l.as_raw_fd() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_fd() as i64),
             SelectableHandle::Udp(s) => Some(s.as_raw_fd() as i64),
+            SelectableHandle::RawListener(h) => Some(*h),
             SelectableHandle::Dummy => None,
         }
     }
@@ -197,6 +207,7 @@ impl SelectableHandle {
             SelectableHandle::Listener(l) => Some(l.as_raw_socket() as i64),
             SelectableHandle::Stream(s) => Some(s.as_raw_socket() as i64),
             SelectableHandle::Udp(s) => Some(s.as_raw_socket() as i64),
+            SelectableHandle::RawListener(h) => Some(*h),
             SelectableHandle::Dummy => None,
         }
     }
@@ -209,7 +220,10 @@ impl SelectableHandle {
     }
 
     fn is_listener(&self) -> bool {
-        matches!(self, SelectableHandle::Listener(_))
+        matches!(
+            self,
+            SelectableHandle::Listener(_) | SelectableHandle::RawListener(_)
+        )
     }
 }
 
@@ -643,6 +657,10 @@ pub fn selector_register(
             let _ = s.set_nonblocking(true);
             SelectableHandle::Udp(s)
         }
+        // Non-owning handle: blocking mode is the owning channel's business
+        // (`sc_configure_blocking` applies it to the real socket), and this
+        // path must not close or reconfigure a socket it does not own.
+        Some(SelectableKind::RawListener(h)) => SelectableHandle::RawListener(h),
         None => SelectableHandle::Dummy,
     };
     let regs = selectors().read();
@@ -1640,6 +1658,13 @@ fn probe_handle(h: &SelectableHandle, interest: i32) -> (i32, Option<TcpStream>)
                 ready |= OP_WRITE;
             }
         }
+        // A raw (non-owned) listener cannot be probed by accepting: the
+        // connection would be consumed here and stashed as a `TcpStream`,
+        // which is the wrong shape for the AF_UNIX accept path in
+        // `socket_channel::ssc_accept_unix`. The kernel-wait paths report its
+        // readiness from `os_handle()`; this fallback simply never claims it
+        // is ready, so the channel's own `accept()` does the work.
+        SelectableHandle::RawListener(_) => {}
         SelectableHandle::Dummy => {}
     }
     (ready, accepted)
@@ -2057,6 +2082,9 @@ fn refresh_selector_handles(ctx: &mut dyn NativeContext, id: i32) {
             crate::socket_channel::TcpHandleClone::Stream(s) => {
                 let _ = s.set_nonblocking(true);
                 SelectableHandle::Stream(s)
+            }
+            crate::socket_channel::TcpHandleClone::UnixListenerRaw(h) => {
+                SelectableHandle::RawListener(h)
             }
         };
         let regs = selectors().read();
@@ -2502,6 +2530,9 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
             Some(SelectableKind::Listener(l))
         }
         Some(crate::socket_channel::TcpHandleClone::Stream(s)) => Some(SelectableKind::Stream(s)),
+        Some(crate::socket_channel::TcpHandleClone::UnixListenerRaw(h)) => {
+            Some(SelectableKind::RawListener(h))
+        }
         None => crate::datagram_channel_udp_clone(ctx, channel).map(SelectableKind::Udp),
     };
 
