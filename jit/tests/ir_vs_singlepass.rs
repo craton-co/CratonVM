@@ -3778,3 +3778,123 @@ fn ir_direct_call_declines_self_recursion_and_unknown_callees() {
         "an uncompilable callee must still reach the dispatch helper"
     );
 }
+
+// ── Exception tables on the optimizing tier (STUB-S8 fix) ────────────────
+//
+// The optimizing pipeline used to refuse EVERY method declaring a `try`/`catch`
+// (`cached.exception_table.is_empty()` in `try_compile_inner`), because the IR
+// builder walked handler bytecode with stale abstract state. The builder now
+// skips handler bodies — they are unreachable in a compiled frame — so the
+// table alone no longer disqualifies a method. What still does is
+// `precise_exception_frames` (RBC.6): a handler that reads a NON-parameter
+// local needs the reason-9 precise-frame handoff, which only the single-pass
+// backend emits.
+//
+// These two tests pin both sides of that line. They are the regression guard
+// for the ~7x that the blanket exclusion cost every try/catch method.
+
+/// `cached()` with a one-entry exception table covering `start..end` with its
+/// handler at `handler`.
+fn cached_with_handler(
+    name: &str,
+    descriptor: &str,
+    code: Vec<u8>,
+    max_locals: u16,
+    num_params: u16,
+    start: u16,
+    end: u16,
+    handler: u16,
+) -> CachedBytecodeMethod {
+    use cratonvm_reader::attribute::ExceptionTableEntry;
+    let mut cm = cached(name, descriptor, code, max_locals, num_params);
+    cm.exception_table = Arc::from(
+        vec![ExceptionTableEntry {
+            start_pc: start,
+            end_pc: end,
+            handler_pc: handler,
+            catch_type: 0,
+        }]
+        .as_slice(),
+    );
+    cm
+}
+
+/// `static int f(int n) { int r = n + 1; try { r = r * 2; } catch (X e) { r =
+/// -n; } return r + 3; }` — the handler reads only the parameter `n`, so RBC.6
+/// does not fire and the method belongs on the optimizing tier.
+fn try_catch_code(handler_reads: u8) -> Vec<u8> {
+    vec![
+        0x1a, // 0: iload_0
+        0x04, // 1: iconst_1
+        0x60, // 2: iadd
+        0x3c, // 3: istore_1        r = n + 1
+        0x1b, // 4: iload_1     ┐ protected range [4, 8)
+        0x05, // 5: iconst_2    │
+        0x68, // 6: imul        │
+        0x3c, // 7: istore_1    ┘  r = r * 2
+        0xa7, 0x00, 0x08, // 8: goto +8 -> 16
+        0x4d, // 11: astore_2       HANDLER: store the exception
+        handler_reads, // 12: iload_0 (param) or iload_1 (non-param local)
+        0x74, // 13: ineg
+        0x3c, // 14: istore_1
+        0x00, // 15: nop
+        0x1b, // 16: iload_1        join
+        0x06, // 17: iconst_3
+        0x60, // 18: iadd
+        0xac, // 19: ireturn        return r + 3
+    ]
+}
+
+#[test]
+fn try_catch_param_only_handler_uses_ir() {
+    let helpers = dummy_helpers();
+    // 0x1a = iload_0: the handler reads only the incoming parameter.
+    let cm = cached_with_handler("f", "(I)I", try_catch_code(0x1a), 3, 1, 4, 8, 11);
+    let ir = compile_opt(&cm, &helpers, true)
+        .expect("a try/catch method must still compile on the optimizing tier");
+    assert!(
+        ir.used_ir_backend,
+        "a method whose handler reads only parameters must reach the optimizing \
+         IR backend — the blanket `exception_table.is_empty()` exclusion cost \
+         ~7x on every try/catch method in every workload"
+    );
+
+    // …and it must compute the same thing the single-pass backend does. The
+    // handler is unreachable here (nothing in the range throws), which is
+    // precisely the point: the builder skips it, and the reachable code either
+    // side of it must be unaffected.
+    let sp = compile_opt(&cm, &helpers, false).expect("single-pass compiles");
+    for n in [0i64, 1, 7, -3, 1000] {
+        let r_ir = unsafe { ir.try_call(&[n]) }.expect("IR call");
+        let r_sp = unsafe { sp.try_call(&[n]) }.expect("single-pass call");
+        let expected = ((n as i32) + 1) * 2 + 3;
+        assert_eq!(
+            r_ir as i32, r_sp as i32,
+            "IR vs single-pass diverge for n={n}"
+        );
+        assert_eq!(r_ir as i32, expected, "wrong result for n={n}");
+    }
+}
+
+#[test]
+fn try_catch_nonparam_handler_local_stays_single_pass() {
+    let helpers = dummy_helpers();
+    // 0x1b = iload_1: the handler reads a local that is NOT a parameter, so
+    // RBC.6 fires and the compile needs precise exceptional frames.
+    let cm = cached_with_handler("g", "(I)I", try_catch_code(0x1b), 3, 1, 4, 8, 11);
+    // Whatever else happens, it must not reach the optimizing backend. Which of
+    // the two permitted outcomes occurs depends on
+    // `CRATONVM_JIT_PRECISE_HANDLER_FRAMES` (opt-in, default OFF): with the flag
+    // off RBC.6 refuses the compile outright, and with it on the method is
+    // compiled by the single-pass backend with reason-9 frames. Asserting only
+    // the shared invariant keeps the test honest under both settings.
+    match compile_opt(&cm, &helpers, true) {
+        None => { /* RBC.6 refused it — the default, flag-off behaviour. */ }
+        Some(compiled) => assert!(
+            !compiled.used_ir_backend,
+            "a handler reading a non-parameter local requires the reason-9 \
+             precise frame the IR lowerer cannot publish; it must stay on the \
+             single-pass backend or the handler would observe null/0"
+        ),
+    }
+}

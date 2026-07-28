@@ -100,8 +100,12 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
 // is compiled-to-compiled virtual dispatch could not reproduce during a
 // default-OFF run, because the dispatch it guards was inert. JASPER-JDT.2/.3
 // (`org/eclipse/jdt/internal/compiler/parser/` and `ast/`) were removed on
-// 2026-07-26 on exactly such runs and had to be restored -- see their entry in
-// `skip_list.rs`. Re-verify any similar removal with this ON.
+// 2026-07-26 on exactly such runs and had to be restored on 2026-07-27, when
+// turning this on brought the miscompile straight back. They were only removed
+// for good on 2026-07-28, after the defect behind them was root-caused (the
+// LICM / speculative pre-header bypass fixed in `613b10f4c`) and re-measured
+// with this ON -- see their entry in `skip_list.rs`. Re-verify any similar
+// removal with this ON.
 #[inline]
 fn direct_virtual_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1454,6 +1458,90 @@ unsafe fn virtual_dispatch_class(
 ///
 /// SAFETY: `vm` must be a live `SharedVm`; `info` must point to a valid
 /// `JitInvokeInfo` whose name fields are live `&str`s.
+/// Resolve the callee named by `info` to a `CachedBytecodeMethod`, so its own
+/// exception table can be consulted and its handler run without re-executing
+/// the method. Mirrors `try_resume_trapped_callee`'s resolution recipe.
+///
+/// SAFETY: same contract as `callee_has_exception_table`.
+unsafe fn resolve_callee_cached(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+) -> Option<std::sync::Arc<crate::classloading::resolution::CachedBytecodeMethod>> {
+    let cm = vm.classes.class_manager.read();
+    let class_id = if info.declaring_class_id == 0 {
+        cm.find_bootstrap_class_by_name(info.class_name)
+    } else {
+        cm.find_class_by_name_for_class(info.class_name, ClassId::new(info.declaring_class_id))
+    }?;
+    let store = cm.class_store();
+    let (method, declaring_id) =
+        crate::classloading::find_method_recursive(class_id, info.method_name, info.descriptor, store)?;
+    let code_attr = method.code()?;
+    if code_attr.exception_table.is_empty() || method.is_synchronized() {
+        return None;
+    }
+    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+    let num_params = crate::runtime::interpreter::count_method_params(info.descriptor);
+    Some(std::sync::Arc::new(
+        crate::classloading::resolution::CachedBytecodeMethod {
+            declaring_class_id: declaring_id,
+            class_name: std::sync::Arc::from(declaring_class_name),
+            method_name: std::sync::Arc::from(info.method_name),
+            method_descriptor: std::sync::Arc::from(info.descriptor),
+            source_file: store
+                .get(declaring_id)
+                .and_then(|c| c.source_file.as_deref())
+                .map(std::sync::Arc::from),
+            code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+            exception_table: std::sync::Arc::from(code_attr.exception_table.as_slice()),
+            max_stack: code_attr.max_stack,
+            max_locals: code_attr.max_locals,
+            num_params: num_params as u16,
+            is_synchronized: method.is_synchronized(),
+            is_static: method.is_static(),
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        },
+    ))
+}
+
+/// Run the compiled callee's own handler for an exception that escaped it,
+/// resuming AT the handler instead of re-running the method from entry.
+///
+/// Returns `Some(rc)` when a handler covering the throw site was found and the
+/// resumed frame completed; `None` leaves the caller's existing behaviour
+/// (propagate, or the conservative whole-method re-run) untouched. The
+/// exception is only consumed on the `Some` path.
+///
+/// SAFETY: same contract as `route_implicit_exc_through_callee`.
+unsafe fn try_run_callee_handler(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    exc: cratonvm_types::ObjectRef,
+    throw_pc: usize,
+) -> Option<i64> {
+    let cached = resolve_callee_cached(vm, info)?;
+    let args = decode_dispatch_values(vm, info, args_slice);
+    let res = crate::runtime::interpreter::run_jit_callee_handler(
+        vm, thread, &cached, throw_pc, exc, &args,
+    )?;
+    Some(match res {
+        Ok(Some(Value::Int(v))) => v as i64,
+        Ok(Some(Value::Long(v))) => v,
+        Ok(Some(Value::Float(f))) => f.to_bits() as i64,
+        Ok(Some(Value::Double(d))) => d.to_bits() as i64,
+        Ok(Some(Value::Object(Some(obj)))) => obj.as_ptr() as i64,
+        Ok(Some(Value::Object(None))) | Ok(None) => 0,
+        Ok(_) => 0,
+        Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
+    })
+}
+
 unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> bool {
     let cm = vm.classes.class_manager.read();
     let class_id = if info.declaring_class_id == 0 {
@@ -1611,6 +1699,34 @@ unsafe fn route_implicit_exc_through_callee(
         // stale stashed copy is dropped first to avoid a double-drain.
         if jit_pending_exception_is_set() && callee_has_exception_table(vm, info) {
             if let Some((thread, _guard)) = jit_thread_mut() {
+                // FIRST: resume the callee AT its own handler. The re-run below
+                // double-executes everything the compiled attempt already did
+                // before the throw -- for `try { n++; mayThrow(); } finally
+                // { n--; }` that is one leaked increment per throw, because the
+                // compiled body ran `n++` and skipped the `finally`, and the
+                // re-run then adds its own balanced pass. Witnessed by
+                // `CallPathProbe`/`FinallyShapeProbe`
+                // (docs/known-issues/repros/jitban-remaining-20260726/).
+                let signals = take_all_jit_signals();
+                if let Some(exc) = signals.exception {
+                    let throw_pc = if signals.athrow_bci >= 0 {
+                        signals.athrow_bci as usize
+                    } else {
+                        usize::MAX
+                    };
+                    if let Some(v) =
+                        try_run_callee_handler(vm, thread, info, args_slice, exc, throw_pc)
+                    {
+                        return v;
+                    }
+                    // No handler covers this throw site -- restore the signal
+                    // exactly as it was found and fall through.
+                    if throw_pc == usize::MAX {
+                        set_jit_pending_exception(exc);
+                    } else {
+                        set_jit_pending_exception_with_bci(exc, throw_pc as i64);
+                    }
+                }
                 let _ = take_jit_pending_exception();
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
                 if rbc6_dbg() {
@@ -5020,6 +5136,34 @@ pub unsafe extern "C" fn jit_throw_arithmetic() -> i64 {
 // either 0 or the heap pointer the JIT popped from the operand stack;
 // no dereference happens here — it is only wrapped and stored in a TLS.
 // `bci` is a bare immediate (no pointer semantics).
+/// Stamp the *currently executing compiled method's own* throw-site bci onto
+/// the pending-exception signal.
+///
+/// Called from the cold side of `emit_post_invoke_exception_check`, i.e. when
+/// a dispatched callee has thrown and this method is about to return the
+/// `i64::MIN` sentinel. Without it, `JitSignals::athrow_bci` still holds the
+/// bci that the CALLEE's own compiled `athrow` lowering stashed — a pc in a
+/// different method entirely. `execute_jit_call` then hands that foreign pc to
+/// `route_jit_exception_through_method` as this method's throw site, and the
+/// `[start_pc, end_pc)` range check rejects the method's own handler.
+///
+/// The observable symptom is a silently skipped `finally`: a catch-all entry
+/// is the one handler shape that cannot be rescued by the type check, so it is
+/// dropped whenever the callee's bci happens to fall outside the protected
+/// region (and spuriously honoured when it happens to fall inside). Witness:
+/// `docs/known-issues/repros/jitban-remaining-20260726/FinallyBalanceProbe.java`
+/// — `try { n++; thrower(); } finally { n--; }` leaked one count per throw
+/// under JIT and zero under `--nojit` / HotSpot.
+///
+/// Setting the bci unconditionally is safe: the sentinel is also returned for
+/// plain deopts with no exception pending, and `take_all_jit_signals` resets
+/// the field to `-1` on every drain, while `set_jit_pending_exception` resets
+/// it whenever a *new* exception is stashed.
+#[no_mangle]
+pub unsafe extern "C" fn jit_set_throw_bci(bci: i64) {
+    JIT_SIGNALS.with(|s| s.athrow_bci.set(bci));
+}
+
 pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
     // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
     // (see conservative_roots::note_jit_boundary).
@@ -10271,6 +10415,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         shadow_stack_offset_in_thread: JvmThread::shadow_stack_offset(),
         // RBC.6 — athrow lowering: stash pending exception + sentinel.
         throw_exception: jit_throw_exception as *const () as usize,
+        set_throw_bci: jit_set_throw_bci as *const () as usize,
         // JEP 358 (helpful NPE), inline-codegen path — per-action null-check
         // failure stub target. Sets the pending NPE *with* its JEP-358 action
         // code so the interpreter drain can attach the right action-only

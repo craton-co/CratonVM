@@ -1948,38 +1948,20 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
 
-    // =========================================================================
-    // UnixDomainSocketAddress — throws UnsupportedOperationException on Windows
-    // =========================================================================
-    let udsa = "java/net/UnixDomainSocketAddress";
-    r.register(
-        udsa,
-        "of",
-        "(Ljava/lang/String;)Ljava/net/UnixDomainSocketAddress;",
-        |_ctx, _args| {
-            Err(RuntimeError::UnsupportedOperationException {
-                message: "Unix domain sockets are not supported on this platform".into(),
-            }
-            .into())
-        },
-    );
-    r.register(
-        udsa,
-        "of",
-        "(Ljava/nio/file/Path;)Ljava/net/UnixDomainSocketAddress;",
-        |_ctx, _args| {
-            Err(RuntimeError::UnsupportedOperationException {
-                message: "Unix domain sockets are not supported on this platform".into(),
-            }
-            .into())
-        },
-    );
-    r.register(udsa, "getPath", "()Ljava/nio/file/Path;", |_ctx, _args| {
-        Err(RuntimeError::UnsupportedOperationException {
-            message: "Unix domain sockets are not supported on this platform".into(),
-        }
-        .into())
-    });
+    // NOTE: `java.net.UnixDomainSocketAddress.of()`/`getPath()` used to be
+    // registered here as natives that unconditionally threw
+    // `UnsupportedOperationException("Unix domain sockets are not supported on
+    // this platform")`. That override also applied in real-JDK mode, where the
+    // genuine `java.net.UnixDomainSocketAddress` is a plain (non-native) class
+    // whose bytecode works fine on CratonVM — it only needs `Path.of` and
+    // `FileSystems.getDefault()`, both of which are supported. The stub was
+    // what failed Tomcat's `TestXxxEndpoint.testUnixDomainSocket`
+    // ("Protocol handler initialization failed" from
+    // `NioEndpoint.initServerSocket`). Unix-domain sockets are now implemented
+    // for real — see `native-io/src/uds.rs` plus the `open(ProtocolFamily)` /
+    // `bind` / `accept` / `connect` handling in
+    // `native-io/src/socket_channel.rs` — so the address class is deliberately
+    // left to its own bytecode and no registration belongs here.
     r.set_category(__prev_cat);
 }
 

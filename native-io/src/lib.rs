@@ -80,6 +80,10 @@ pub mod file_channel;
 pub mod socket_channel;
 // Real non-blocking TCP connect with a pollable OS fd (ES-HANG-02 residual 1).
 pub mod nb_connect;
+// AF_UNIX stream sockets backing `*.open(StandardProtocolFamily.UNIX)` — the
+// `unixDomainSocketPath` connector shape (Tomcat `NioEndpoint`). Used by
+// `socket_channel`.
+pub mod uds;
 // WP3.2 — AsynchronousSocketChannel / AsynchronousServerSocketChannel + AsynchronousChannelGroup.
 pub mod async_socket;
 // Task #16 — SSRF outbound-policy hook + configurable connect timeout shared

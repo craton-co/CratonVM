@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
@@ -50,7 +50,10 @@ use cratonvm_types::{ClassId, ObjectRef, Value};
 // ---------------------------------------------------------------------------
 
 struct DatagramState {
-    sock: UdpSocket,
+    /// Behind an `Arc` so callers can lift the socket out of the registry and
+    /// **release the registry lock before touching it** — see `dgram_socket`.
+    /// Nothing outside this module's accessors may reach it.
+    sock: Arc<UdpSocket>,
     /// Multicast groups currently joined on this socket.  Each entry is
     /// (group, interface).  Used by `dgram_drop` and to materialise
     /// `MembershipKey` objects.
@@ -73,7 +76,7 @@ fn dgram_register(sock: UdpSocket) -> i32 {
         g.insert(
             id,
             DatagramState {
-                sock,
+                sock: Arc::new(sock),
                 groups: Vec::new(),
             },
         );
@@ -87,10 +90,35 @@ fn dgram_remove(id: i32) {
     }
 }
 
-fn dgram_with<T, F: FnOnce(&DatagramState) -> T>(id: i32, f: F) -> Option<T> {
-    Some(f(dgram_registry().read().ok()?.get(&id)?))
+/// Lift the socket for `id` out of the registry, **releasing the registry lock
+/// before returning it**. Every socket operation goes through here.
+///
+/// This used to be a `dgram_with(id, |s| …)` closure helper that ran the
+/// caller's body with the read lock still held, and `dgram_receive0` passed it
+/// `|s| s.sock.recv_from(&mut bytes)`. A blocking-mode `DatagramChannel`
+/// (`configureBlocking` defaults to true, per the JDK) then parked in the
+/// kernel holding the registry read lock, so:
+///
+///   * `close()` → `dgram_remove` → `.write()` blocked behind it, and
+///   * with a writer queued, every *other* reader blocked too — a second
+///     channel could not even `open()`.
+///
+/// i.e. one idle receive wedged all UDP channels, and the `close()` that
+/// should have ended the wait was precisely what could not run. Handing back
+/// an `Arc` keeps the socket alive for the syscall without keeping the map
+/// locked; a concurrent `close()` drops the map's `Arc` and the fd is released
+/// once the receiver returns. Same defect and same fix as
+/// `socket_channel::resolve_stream` (dev `cd18f9a51`) and `net.rs`'s
+/// `NetSocketHandle::Stream`.
+///
+/// The socket is deliberately NOT reachable from `dgram_with_mut`, so no future
+/// edit can reintroduce a blocking call under the lock.
+fn dgram_socket(id: i32) -> Option<Arc<UdpSocket>> {
+    Some(Arc::clone(&dgram_registry().read().ok()?.get(&id)?.sock))
 }
 
+/// Mutate a channel's non-I/O state (its multicast group list). Runs under the
+/// registry write lock, so the body must not block — see `dgram_socket`.
 fn dgram_with_mut<T, F: FnOnce(&mut DatagramState) -> T>(id: i32, f: F) -> Option<T> {
     Some(f(dgram_registry().write().ok()?.get_mut(&id)?))
 }
@@ -371,7 +399,7 @@ fn dgram_send0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     // buffer_advance below) across the region.
     let mut held = vec![Value::Object(Some(buf))];
     ctx.begin_blocking_region();
-    let sent_opt = dgram_with(id, |s| s.sock.send_to(&bytes, target));
+    let sent_opt = dgram_socket(id).map(|s| s.send_to(&bytes, target));
     ctx.end_blocking_region_refs(&mut held);
     let sent = sent_opt
         .ok_or_else(|| io_error("send: socket missing"))?
@@ -408,7 +436,7 @@ fn dgram_receive0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // used after the region through `end_blocking_region_refs`.
     let mut held = vec![Value::Object(Some(buf)), Value::Object(Some(arr))];
     ctx.begin_blocking_region();
-    let recv_opt = dgram_with(id, |s| s.sock.recv_from(&mut bytes));
+    let recv_opt = dgram_socket(id).map(|s| s.recv_from(&mut bytes));
     ctx.end_blocking_region_refs(&mut held);
     let recv_result = recv_opt.ok_or_else(|| io_error("receive: socket missing"))?;
     let (buf, arr) = match (held[0], held[1]) {
@@ -438,7 +466,7 @@ fn dgram_set_broadcast(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     };
     let on = arg_int(args, 1) != 0;
     if let Some(id) = dc_id(ctx, this) {
-        dgram_with(id, |s| s.sock.set_broadcast(on))
+        dgram_socket(id).map(|s| s.set_broadcast(on))
             .transpose()
             .map_err(|e| io_error(format!("set_broadcast: {e}")))?;
     }
@@ -478,14 +506,14 @@ fn dgram_join_group(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         });
     match (group, interface_ip) {
         (IpAddr::V4(g), IpAddr::V4(i)) => {
-            dgram_with(id, |s| s.sock.join_multicast_v4(&g, &i))
+            dgram_socket(id).map(|s| s.join_multicast_v4(&g, &i))
                 .ok_or_else(|| io_error("join: socket missing"))?
                 .map_err(|e| io_error(format!("join_multicast_v4 {g} via {i}: {e}")))?;
         }
         (IpAddr::V6(g), _) => {
             // join_multicast_v6 takes an interface index (u32). Use 0
             // = system default when we don't have one.
-            dgram_with(id, |s| s.sock.join_multicast_v6(&g, 0))
+            dgram_socket(id).map(|s| s.join_multicast_v6(&g, 0))
                 .ok_or_else(|| io_error("join: socket missing"))?
                 .map_err(|e| io_error(format!("join_multicast_v6 {g}: {e}")))?;
         }
@@ -531,8 +559,8 @@ fn dgram_drop_membership(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         },
     };
     let _ = match (group, interface_ip) {
-        (IpAddr::V4(g), IpAddr::V4(i)) => dgram_with(id, |s| s.sock.leave_multicast_v4(&g, &i)),
-        (IpAddr::V6(g), _) => dgram_with(id, |s| s.sock.leave_multicast_v6(&g, 0)),
+        (IpAddr::V4(g), IpAddr::V4(i)) => dgram_socket(id).map(|s| s.leave_multicast_v4(&g, &i)),
+        (IpAddr::V6(g), _) => dgram_socket(id).map(|s| s.leave_multicast_v6(&g, 0)),
         _ => None,
     };
     dgram_with_mut(id, |s| s.groups.retain(|(g, _)| *g != group));
@@ -574,7 +602,7 @@ fn dgram_set_multicast_ttl(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let ttl = arg_int(args, 1).max(0) as u32;
     if let Some(id) = dc_id(ctx, this) {
-        dgram_with(id, |s| s.sock.set_multicast_ttl_v4(ttl))
+        dgram_socket(id).map(|s| s.set_multicast_ttl_v4(ttl))
             .transpose()
             .map_err(|e| io_error(format!("set_multicast_ttl: {e}")))?;
     }
@@ -587,7 +615,7 @@ fn dgram_get_multicast_ttl(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         return Ok(Some(Value::Int(1)));
     };
     let ttl = dc_id(ctx, this)
-        .and_then(|id| dgram_with(id, |s| s.sock.multicast_ttl_v4().ok()).flatten())
+        .and_then(|id| dgram_socket(id).and_then(|s| s.multicast_ttl_v4().ok()))
         .unwrap_or(1);
     Ok(Some(Value::Int(ttl as i32)))
 }
@@ -617,7 +645,7 @@ fn dgram_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let Some(id) = dc_id(ctx, this) else {
         return Ok(Some(Value::Object(None)));
     };
-    let addr = match dgram_with(id, |s| s.sock.local_addr().ok()).flatten() {
+    let addr = match dgram_socket(id).and_then(|s| s.local_addr().ok()) {
         Some(a) => a,
         None => return Ok(Some(Value::Object(None))),
     };
@@ -753,10 +781,53 @@ mod tests {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let id = dgram_register(sock);
         assert!(id > 0);
-        let port = dgram_with(id, |s| s.sock.local_addr().unwrap().port());
+        let port = dgram_socket(id).map(|s| s.local_addr().unwrap().port());
         assert!(port.is_some() && port.unwrap() > 0);
         dgram_remove(id);
-        assert!(dgram_with(id, |_| ()).is_none());
+        assert!(dgram_socket(id).is_none());
+    }
+
+    /// A parked receive must not lock other channels out of the registry.
+    ///
+    /// `dgram_socket` is the only way to reach a socket, so every I/O path
+    /// inherits this: the socket is lifted out and the registry lock released
+    /// before the syscall. The shape this guards against is the closure helper
+    /// it replaced, which ran `recv_from` with the read lock still held — one
+    /// idle blocking receive then blocked `close()` (a writer) and, behind that
+    /// queued writer, every other reader too.
+    #[test]
+    fn wp37_parked_receive_does_not_block_the_registry() {
+        let parked = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Bounded so a regression fails the assertion below rather than
+        // hanging the test run.
+        parked
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let parked_id = dgram_register(parked);
+
+        let receiver = std::thread::spawn(move || {
+            let sock = dgram_socket(parked_id).expect("registered");
+            let mut buf = [0u8; 16];
+            // Nothing is ever sent here, so this parks until the read timeout.
+            let _ = sock.recv_from(&mut buf);
+        });
+        // Give the receiver time to actually enter the syscall.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Both of these take the registry WRITE lock. With the socket held
+        // under the read lock they would queue behind the parked receive.
+        let started = std::time::Instant::now();
+        let other_id = dgram_register(UdpSocket::bind("127.0.0.1:0").unwrap());
+        dgram_remove(other_id);
+        dgram_remove(parked_id);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "registry writes queued behind a parked recv_from ({elapsed:?}) — \
+             the socket is being held under the registry lock again"
+        );
+        receiver.join().unwrap();
     }
 
     #[test]
@@ -776,13 +847,13 @@ mod tests {
 
         let payload = b"WP3.7 datagram round-trip";
 
-        let sent = dgram_with(c_id, |s| s.sock.send_to(payload, server_addr))
+        let sent = dgram_socket(c_id).map(|s| s.send_to(payload, server_addr))
             .unwrap()
             .unwrap();
         assert_eq!(sent, payload.len());
 
         let mut buf = [0u8; 64];
-        let (n, peer) = dgram_with(s_id, |s| s.sock.recv_from(&mut buf))
+        let (n, peer) = dgram_socket(s_id).map(|s| s.recv_from(&mut buf))
             .unwrap()
             .unwrap();
         assert_eq!(n, payload.len());
@@ -797,10 +868,10 @@ mod tests {
     fn wp37_set_get_broadcast_via_registry() {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let id = dgram_register(sock);
-        dgram_with(id, |s| s.sock.set_broadcast(true))
+        dgram_socket(id).map(|s| s.set_broadcast(true))
             .unwrap()
             .unwrap();
-        let on = dgram_with(id, |s| s.sock.broadcast()).unwrap().unwrap();
+        let on = dgram_socket(id).map(|s| s.broadcast()).unwrap().unwrap();
         assert!(on);
         dgram_remove(id);
     }
@@ -814,10 +885,10 @@ mod tests {
         let id = dgram_register(sock);
         let group = Ipv4Addr::new(224, 0, 0, 1);
         let iface = Ipv4Addr::UNSPECIFIED;
-        let joined = dgram_with(id, |s| s.sock.join_multicast_v4(&group, &iface));
+        let joined = dgram_socket(id).map(|s| s.join_multicast_v4(&group, &iface));
         if let Some(Ok(())) = joined {
             // Only assert leave if the join actually succeeded.
-            let left = dgram_with(id, |s| s.sock.leave_multicast_v4(&group, &iface)).unwrap();
+            let left = dgram_socket(id).map(|s| s.leave_multicast_v4(&group, &iface)).unwrap();
             assert!(left.is_ok(), "leave_multicast_v4 failed: {left:?}");
         }
         dgram_remove(id);
