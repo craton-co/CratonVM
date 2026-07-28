@@ -27,7 +27,7 @@ four residual Spring Boot classes passed in both JIT and no-JIT modes.
 
 ## Final validation
 
-Executable: `cratonvm-sb-devjit-residuals-r9-20260728-019fa8de.exe`, built
+Executable: `cratonvm-sb-devjit-residuals-r10-20260728-019fa8de.exe`, built
 from the topic after merging current `origin/dev`.
 Fixture: `C:\craton\CratonVM-spring-boot-rerun-20260717\apps\spring-boot`.
 Each class was run in its own process with a 1,200-second timeout.
@@ -40,5 +40,5 @@ Each class was run in its own process with a 1,200-second timeout.
 The two skips are reported by `SpringApplicationTests`; they are expected and
 present in both modes. Final result ledgers:
 
-- `C:\craton\sbdevjit-r9-full-jit-20260728-019fa8de\results\residuals-r9-jit\all-jit\results.tsv`
-- `C:\craton\sbdevjit-r9-full-nojit-20260728-019fa8de\results\residuals-r9-nojit\all-nojit\results.tsv`
+- `C:\craton\sbdevjit-r10-full-jit-20260728-019fa8de\results\residuals-r10-jit\all-jit\results.tsv`
+- `C:\craton\sbdevjit-r10-full-nojit-20260728-019fa8de\results\residuals-r10-nojit\all-nojit\results.tsv`
