@@ -88,7 +88,7 @@ lifted):
 ## Blocked — real, still-open, NOT this session's to fix (architectural)
 
 - ~~**Keycloak class-resolution loader-blindness**~~ / ~~**KC26-PIC.1 / KC26-RX.1 / KC26.LR**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). (The original entries claimed `ClassManager::find_class_bytes_delegated` needed a fourth loader path across "149 call sites"; that file was never touched. The defect was ordering: a fabricated stub is registered globally under `Application`, which poisons the binary name so the owning custom loader can never define the real class.)
-- **SuppressWarnings annotation bug** — any source containing `@SuppressWarnings("...")` fails in-process javac compilation (unrelated to any JIT ban, reproduces with JIT fully disabled). `docs/known-issues/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
+- ~~**SuppressWarnings annotation bug**~~ — **UPDATE 2026-07-27 — CLOSED.** Any source containing `@SuppressWarnings("...")` failed in-process javac compilation (unrelated to any JIT ban, reproduced with JIT fully disabled). Root cause was `LinkedHashSet.remove(Object)` deleting the element but returning `false` — javac's `Annotate.attributeAnnotation` reports `duplicate element 'value' in annotation @X` exactly when `members.remove(method)` answers false, so *every* annotation with a `value` element was uncompilable in-process. Fixed in `native-collections`/`native-builtins`; write-up retired out of `known-issues`. The doc's own hypothesis (duplicated `value` element in CratonVM's annotation metadata) was measured and refuted. Its follow-up question — whether `SPRING-TESTCOMPILER.3`'s symptom (a) was this bug — was tested and refuted too; that ban stays (see below).
 
 ## Blocked — genuinely missing fixture, confirmed absent (double-checked)
 
@@ -99,6 +99,7 @@ lifted):
 ## Tested, hypothesis refuted (no action, but investigated properly)
 
 - **TYPES-ERASURE.1 consolidation hypothesis** — tested whether banning `Types.erasure` alone subsumes the other 7 javac-family bans (`SPRING-TESTCOMPILER.1-4`, `HIB-STOREDPROC-JIT.1`). Refuted — all 8 are independent miscompiles. `docs/known-issues/javac-family-consolidation-hypothesis-refuted-20260726.md`. **These 8 bans remain active and correctly so** — not a gap, a confirmed-necessary state.
+- **`SPRING-TESTCOMPILER.3` symptom (a) == the SuppressWarnings bug?** (2026-07-27) — tested by un-banning `ClassFinder.complete` in an env-gated build with the SuppressWarnings fix in place and every other ban active. Refuted: `AutowiredAnnotationBeanRegistrationAotContributionTests` 14/14 → 9/14 (all 5 `DeprecationTests`) and `BeanDefinitionMethodGeneratorTests` 34/34 → 32/34. The ban stays, and now has a Spring-free standalone reproducer (`DeprecationSuppressionProbe.java`) plus a narrowed mechanism — see the `SPRING-TESTCOMPILER.3` comment in `vm/src/jit/skip_list.rs`.
 
 ## Found, not a ban, new VM bugs discovered this session
 
