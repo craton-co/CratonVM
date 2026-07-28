@@ -1935,6 +1935,72 @@ impl FileDescriptorTable {
         }
     }
 
+    /// Join a multicast group on a UDP socket (IPv6).
+    pub fn udp_join_multicast_v6(
+        &self,
+        fd: FdId,
+        multiaddr: &std::net::Ipv6Addr,
+        interface: u32,
+    ) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.join_multicast_v6(multiaddr, interface),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Leave a multicast group on a UDP socket (IPv6).
+    pub fn udp_leave_multicast_v6(
+        &self,
+        fd: FdId,
+        multiaddr: &std::net::Ipv6Addr,
+        interface: u32,
+    ) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.leave_multicast_v6(multiaddr, interface),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back SO_BROADCAST (the setter is `udp_set_broadcast`).
+    pub fn udp_broadcast(&self, fd: FdId) -> Result<bool, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.broadcast(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Set the IPv4 multicast TTL (`IP_MULTICAST_TTL`). Distinct from
+    /// `udp_set_ttl`, which is the unicast `IP_TTL`.
+    pub fn udp_set_multicast_ttl_v4(&self, fd: FdId, ttl: u32) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.set_multicast_ttl_v4(ttl),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Read back the IPv4 multicast TTL.
+    pub fn udp_multicast_ttl_v4(&self, fd: FdId) -> Result<u32, io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => s.multicast_ttl_v4(),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Pipe channels (in-memory)
     // -----------------------------------------------------------------------
