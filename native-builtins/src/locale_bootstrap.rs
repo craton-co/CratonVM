@@ -42,6 +42,17 @@ fn synthetic_locale_data(
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The language of a Locale this module synthesised (the cached `getDefault()`
+/// one), or `None` when `obj` is not ours. Companion to `lib.rs`'s
+/// `locale_data_get`: the two side tables are populated independently, so a
+/// caller that needs the language of an arbitrary Locale has to consult both.
+pub(crate) fn synthetic_language(obj: ObjectRef) -> Option<String> {
+    synthetic_locale_data()
+        .lock()
+        .get(&obj)
+        .map(|&(lang, _, _)| lang.to_string())
+}
+
 /// GC root scan for this module's cached synthetic Locale objects. The cached
 /// default Locale (returned by `Locale.getDefault()`) and every key of the
 /// synthetic-locale side-table are live `java/util/Locale` objects reachable
