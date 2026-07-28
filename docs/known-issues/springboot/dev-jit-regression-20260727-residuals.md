@@ -18,8 +18,15 @@ classes. Two causes were found and fixed:
 * **A retired-but-load-bearing JIT ban** — `654dfb918` deleted ~189
   `is_known_miscompile` entries as "inert"; the
   `ConcurrentReferenceHashMap` family among them was not. Restored narrowly as
-  `SPRING-RT-EQUALS.1` in `vm/src/jit/skip_list.rs` (see that comment for the
-  full isolation trail).
+  `SPRING-RT-EQUALS.1` in `vm/src/jit/skip_list.rs`.
+  **`SPRING-RT-EQUALS.1` has since been REMOVED (2026-07-28)**: the underlying
+  defect was root-caused — every inline-cache guard selected a cached compiled
+  callee by the 4-byte `ObjectHeader.class_id` alone, and a reference array
+  stores its COMPONENT class id in that word, so a call site warmed on a `Foo`
+  receiver dispatched a later `Foo[]` receiver into `Foo`'s own body. Fixed at
+  all five guard sites; the witness class `ConditionalOnPropertyTests` is
+  38/38 with the ban gone. See
+  `docs/internal/resolvabletype-array-receiver-mic-guard-fixed-20260728.md`.
 
 Sweep effect, 583 classes: **484 → 543 PASS, 77 → 28 FAIL, 11 → 0 CRASH.**
 Of the 16 classes still regressed at that point, 12 now pass (the narrowed ban

@@ -1257,6 +1257,19 @@ fn shadow_window_from_frame(
     if thread_ptr == 0 || thread_ptr & 0x7 != 0 {
         return None;
     }
+    // That word is only a thread pointer when `cm` really describes the frame
+    // at `rbp`. Callers are expected to have excluded the mis-attribution case
+    // (`chain_entry_rbp_is_foreign`), but a wrong `cm` turns this into an
+    // arbitrary aligned stack word and the two loads below would dereference
+    // it — which is exactly how the band verifier SIGSEGV'd on a `base` of
+    // `0x5555_0000_0004`. Every compiled frame on this thread caches THIS
+    // thread's `JvmThread`, so reject anything else whenever a thread is
+    // installed (it is null only in unit tests and on threads that never
+    // entered JIT code, where there is no frame to mis-attribute).
+    let current = crate::jit::helpers::current_jit_thread_ptr() as usize;
+    if current != 0 && thread_ptr != current {
+        return None;
+    }
     let ss = thread_ptr.checked_add(cm.shadow_off_in_thread as usize)?;
     if ss & 0x7 != 0 {
         return None;
@@ -1269,7 +1282,15 @@ fn shadow_window_from_frame(
     let base = unsafe {
         ((ss + cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET) as *const usize).read()
     };
-    if base == 0 || top < base || (top - base) % 8 != 0 {
+    // `base`/`top` address 8-byte slots in the thread's shadow buffer and the
+    // window can never exceed that buffer. An unaligned or oversized pair is a
+    // read of something that is not a `ShadowStack`, not a window to walk.
+    if base == 0
+        || base & 0x7 != 0
+        || top & 0x7 != 0
+        || top < base
+        || (top - base) / 8 > cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS
+    {
         return None;
     }
     Some((base, top))
@@ -1329,6 +1350,19 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
             if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
                 // MISSING_EXACT_RBP already covers rbp == 0; an out-of-range
                 // value means the band cannot be located at all.
+                unverified = true;
+                continue;
+            }
+            if chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp) {
+                // The innermost RBP belongs to a compiled callee reached
+                // through the inline MIC/PIC cascade or the hashed megamorphic
+                // stub, so this entry's `compiled_method` does not describe it
+                // — exactly the case `refresh_moving_young_coverage_for_current_thread`
+                // reports as FOREIGN_INNERMOST_RBP. Using `cm`'s frame layout
+                // here reads `[rbp - shadow_thread_slot_off]` out of an
+                // unrelated frame and hands `shadow_window_from_frame` a
+                // non-thread pointer. Nothing about this frame can be
+                // verified, so take the conservative verdict.
                 unverified = true;
                 continue;
             }
@@ -3503,6 +3537,42 @@ mod tests {
         f.cm.shadow_thread_slot_off = 8;
         f.cm.shadow_off_in_thread = 0;
         assert!(shadow_window_from_frame(f.rbp, &f.cm).is_none());
+    }
+
+    /// A frame whose `CompiledMethod` does not describe it (the
+    /// FOREIGN_INNERMOST_RBP case: an RBP published by a compiled callee
+    /// reached through the inline MIC/PIC cascade) hands
+    /// `shadow_window_from_frame` an arbitrary aligned stack word in place of
+    /// the cached `*mut JvmThread`, so `base`/`top` are read out of something
+    /// that is not a `ShadowStack`. The verifier SIGSEGV'd walking such a
+    /// window from a `base` of `0x5555_0000_0004`; an unaligned `base` cannot
+    /// address 8-byte shadow slots and must be rejected, not walked.
+    #[test]
+    fn shadow_window_rejects_an_unaligned_base() {
+        let mut f = fake_shadow_thread(&[0x1111, 0x2222], false);
+        let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, BASE_OFFSET = 16
+        f._thread[ss + 2] += 4;
+        assert!(
+            shadow_window_from_frame(f.rbp, &f.cm).is_none(),
+            "an unaligned base is not a shadow window",
+        );
+    }
+
+    /// Same failure mode, caught by size instead of alignment: the shadow
+    /// buffer never holds more than `DEFAULT_SHADOW_SLOTS` slots, so a wider
+    /// `[base, top)` proves the pair did not come from a `ShadowStack`.
+    /// Clamping the walk (which is all `published_shadow_values` used to do)
+    /// still reads up to 2 MiB from an address that was never mapped.
+    #[test]
+    fn shadow_window_rejects_a_window_wider_than_the_backing_buffer() {
+        let mut f = fake_shadow_thread(&[0x1111], false);
+        let ss = 24 / 8; // SHADOW_OFF_IN_THREAD / 8, TOP_OFFSET = 0
+        f._thread[ss] = f._thread[ss + 2]
+            + (cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS + 1) * 8;
+        assert!(
+            shadow_window_from_frame(f.rbp, &f.cm).is_none(),
+            "a window wider than the buffer is not a shadow window",
+        );
     }
 
     /// The verifier must impose no verdict (and no cost) while moving-young is
