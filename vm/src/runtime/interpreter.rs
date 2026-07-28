@@ -28339,7 +28339,6 @@ fn force_native_over_real_jdk_bytecode(
             class_name,
             "org/apache/maven/surefire/booter/ForkedBooter"
                 | "org/apache/tomcat/util/buf/CharChunk"
-                | "org/apache/tomcat/util/buf/AbstractChunk"
                 | "org/apache/catalina/connector/Response"
                 | "org/apache/tomcat/util/bcel/classfile/Constant"
         ))
@@ -28353,19 +28352,19 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Only `toString` is listed here, and only because it has a matching
+    // registration (`native_char_chunk_to_string`). This gate used to also
+    // claim `endsWith(String)`, `indexOf(char)` and
+    // `AbstractChunk.indexOf(String,III)`, none of which were ever
+    // registered — every consumer resolves the callback through
+    // `NativeMethodRegistry::find` and silently falls back to bytecode when
+    // it misses, so those three were pure dead config that read as "served
+    // by a native" to anyone auditing this list. If natives are added for
+    // them later, BOTH this gate and the `CharChunk` registrations in
+    // `native-builtins`' `register_essential_natives_with_shims` must be
+    // updated together.
     if class_name == "org/apache/tomcat/util/buf/CharChunk"
-        && matches!(
-            (method_name, method_descriptor),
-            ("toString", "()Ljava/lang/String;")
-                | ("endsWith", "(Ljava/lang/String;)Z")
-                | ("indexOf", "(C)I")
-        )
-    {
-        return true;
-    }
-    if class_name == "org/apache/tomcat/util/buf/AbstractChunk"
-        && method_name == "indexOf"
-        && method_descriptor == "(Ljava/lang/String;III)I"
+        && (method_name, method_descriptor) == ("toString", "()Ljava/lang/String;")
     {
         return true;
     }
