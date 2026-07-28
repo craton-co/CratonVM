@@ -5,8 +5,9 @@ coverage: the four `test_osr_loop_does_not_rerun_iterations_*` tests in
 `vm/tests/jit_local_exception_handler_tests.rs`, driving the committed fixture
 `vm/tests/resources/cratonvm/JitOsrLoopProgress.java`.
 
-Four defects were found behind the one reported symptom. Three are the reported
-bug; the fourth is a SIGSEGV the same fixture exposed.
+Five defects were found behind the one reported symptom. The first two are the
+reported bug; the other three are a SIGSEGV the same fixture exposed, each a
+distinct way for a JIT code buffer to be unmapped while it is still reachable.
 
 ## Symptom
 
@@ -133,6 +134,25 @@ Flipped to default-ON. Refusing publication costs one wasted compile — the met
 stays interpreted and is recompiled on a later invocation, by which point the
 callee has a live body. `CRATONVM_JIT_STRICT_CALLEE_ROOTS=0` restores the
 historical behaviour for bisection.
+
+## Defect 5 — a superseded artifact was unmapped while a thread was executing in it
+
+The last residual (~1/600 under load) had yet another trace: the `[jit-unmap]`
+line for a page, then a SIGSEGV **mid-body** in that same page — offset 0x553 of
+`maybeThrow`'s 1732-byte body, not its entry. Defects 3 and 4 both fault at a
+callee's *entry*; this one faults wherever the running thread happened to be.
+
+`defer_jit_owner` / `ACTIVE_JIT_EXECUTIONS` already exist for exactly this: a
+process-wide "is any thread inside JIT code" counter, with retirement queued
+until it reaches zero. Only the inline caches used it. Every `JitCache` mutation
+— `put`, `put_osr`, `invalidate_entries`, `clear_all` — dropped the artifact it
+replaced synchronously, so `ExecutableBuffer::drop` unmapped the code under a
+running mutator. A background tier-up publishing a C2 body for a method a thread
+is currently executing is not a corner case; it is the normal tiering event.
+
+All four sites now hand the replaced artifact to `defer_jit_owner`, which drops
+it immediately when no JIT execution is in flight (the common case, so retention
+is unchanged) and otherwise holds it until quiescence.
 
 ## Reproduction
 

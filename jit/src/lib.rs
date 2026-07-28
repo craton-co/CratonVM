@@ -5816,8 +5816,19 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.methods.load()).clone();
-        next.insert(h, (key, arc));
+        let superseded = next.insert(h, (key, arc));
         shard.methods.store(Arc::new(next));
+        // The artifact this publication replaces may still be EXECUTING: a
+        // mutator inside its body, or inside a callee it roots via
+        // `_direct_callee_roots`. Dropping it here runs
+        // `ExecutableBuffer::drop`, which unmaps the code under that thread —
+        // observed as a SIGSEGV with `pc == addr` MID-body (offset 0x553 of a
+        // 1732-byte `maybeThrow`) immediately after this site's `[jit-unmap]`
+        // line for the same page. Hand it to the same quiescence queue the
+        // inline caches use: `defer_jit_owner` drops immediately when no JIT
+        // execution is in flight (the common case, so no retention change) and
+        // otherwise holds the `Arc` until `ACTIVE_JIT_EXECUTIONS` reaches zero.
+        defer_jit_owner(superseded.map(|(_, cm)| cm));
         // T2.2 — bump on EVERY publication, not just replacements. A first-time
         // insertion is exactly the event the interpreter's negative
         // "no compiled body for this method" memo
@@ -5889,8 +5900,11 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.osr_methods.load()).clone();
-        next.insert(h, (key, arc));
+        let superseded = next.insert(h, (key, arc));
         shard.osr_methods.store(Arc::new(next));
+        // Same reasoning as `put` — an OSR body is, if anything, more likely to
+        // be mid-execution when it is replaced.
+        defer_jit_owner(superseded.map(|(_, cm)| cm));
         // T2.2 — unconditional, for the same reason as `put` above.
         JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
@@ -6056,20 +6070,39 @@ impl JitCache {
         for shard in self.shards.iter() {
             let current = shard.methods.load();
             if doomed(&current) {
+                // Retire through the quiescence queue — see `put`. An
+                // invalidation is exactly the case where a body is likely to be
+                // running (a redefine racing live code).
+                let evicted: Vec<Arc<CompiledMethod>> = current
+                    .values()
+                    .filter(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+                    .map(|(_, cm)| cm.clone())
+                    .collect();
                 let mut next = (**current).clone();
                 let old_len = next.len();
                 next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
                 removed += old_len - next.len();
                 shard.methods.store(Arc::new(next));
+                for cm in evicted {
+                    defer_jit_owner(Some(cm));
+                }
             }
 
             let current = shard.osr_methods.load();
             if doomed(&current) {
+                let evicted: Vec<Arc<CompiledMethod>> = current
+                    .values()
+                    .filter(|(_, cm)| remove_entries.contains(&(cm.entry_ptr() as usize)))
+                    .map(|(_, cm)| cm.clone())
+                    .collect();
                 let mut next = (**current).clone();
                 let old_len = next.len();
                 next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
                 removed += old_len - next.len();
                 shard.osr_methods.store(Arc::new(next));
+                for cm in evicted {
+                    defer_jit_owner(Some(cm));
+                }
             }
         }
         if removed != 0 {
@@ -6094,8 +6127,21 @@ impl JitCache {
                 }
             }
             count += shard.methods.load().len() + shard.osr_methods.load().len();
+            // Retire through the quiescence queue — see `put`. `clear_all` runs
+            // on JVMTI redefine, which does not stop the world here, so every
+            // body it drops may be live.
+            let evicted: Vec<Arc<CompiledMethod>> = [
+                shard.methods.load(),
+                shard.osr_methods.load(),
+            ]
+            .iter()
+            .flat_map(|map| map.values().map(|(_, cm)| cm.clone()).collect::<Vec<_>>())
+            .collect();
             shard.methods.store(Arc::new(FxHashMap::default()));
             shard.osr_methods.store(Arc::new(FxHashMap::default()));
+            for cm in evicted {
+                defer_jit_owner(Some(cm));
+            }
         }
         if count != 0 {
             JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
