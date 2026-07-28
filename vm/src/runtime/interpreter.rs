@@ -1124,6 +1124,32 @@ pub(crate) fn nret_find(addr: usize) -> Vec<(usize, usize, String)> {
     })
 }
 
+/// Finalizable roots every collection must seed, whichever path runs it.
+///
+/// Two disjoint sets, both of which the collector would otherwise miss:
+///
+///   * `ref_processor.finalizer_referent_addresses()` — registered
+///     finalizables not yet claimed. Only the `System.gc` path used to pass
+///     these; the ordinary allocation-driven collections below passed `&[]`.
+///   * `finalizer_thread.pending_addresses()` — objects already claimed and
+///     queued, waiting for `finalize()` to actually run. `mark_finalizer_enqueued`
+///     deliberately drops these from the first list, so nothing else roots
+///     them, yet the queue keeps only a raw address. `run_finalizers` also
+///     bails out early whenever a JIT borrow is live, which routinely leaves
+///     entries queued across several collections — a wide window in which a
+///     non-moving young sweep frees the object and leaves the queue pointing
+///     at reclaimed memory (SEGV in `run_finalizers`' `class_id_of`).
+fn finalizable_roots(shared: &SharedVm) -> Vec<usize> {
+    let mut addrs = {
+        let rp = shared.mem.ref_processor.lock();
+        rp.finalizer_referent_addresses()
+    };
+    addrs.extend(shared.mem.finalizer_thread.pending_addresses());
+    addrs.sort_unstable();
+    addrs.dedup();
+    addrs
+}
+
 pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
@@ -1186,11 +1212,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result =
-                shared
-                    .mem
-                    .heap
-                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let fin_roots = finalizable_roots(shared);
+            let result = shared
+                .mem
+                .heap
+                .collect_garbage_with_finalizers(
+                    &stw,
+                    &mut roots,
+                    &fin_roots,
+                    &shared.threads.monitors,
+                )
+                .0;
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
@@ -1388,11 +1420,17 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
                 weakref_null_referents_pre_gc(shared);
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-                let result =
-                    shared
-                        .mem
-                        .heap
-                        .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+                let fin_roots = finalizable_roots(shared);
+                let result = shared
+                    .mem
+                    .heap
+                    .collect_garbage_with_finalizers(
+                        &stw,
+                        &mut roots,
+                        &fin_roots,
+                        &shared.threads.monitors,
+                    )
+                    .0;
                 process_references_after_gc(shared, &result.pointer_map);
 
                 // Update shared VM state (statics, string pool, etc.)
@@ -1514,10 +1552,17 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
+        let fin_roots = finalizable_roots(shared);
         let result = shared
             .mem
             .heap
-            .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            .collect_garbage_with_finalizers(
+                &stw,
+                &mut roots,
+                &fin_roots,
+                &shared.threads.monitors,
+            )
+            .0;
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(&result.pointer_map);
@@ -1566,11 +1611,17 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                                     // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result =
-                shared
-                    .mem
-                    .heap
-                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let fin_roots = finalizable_roots(shared);
+            let result = shared
+                .mem
+                .heap
+                .collect_garbage_with_finalizers(
+                    &stw,
+                    &mut roots,
+                    &fin_roots,
+                    &shared.threads.monitors,
+                )
+                .0;
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: remap the ec_watch corruption-watch table across this
@@ -1719,10 +1770,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     mtroots_dump_initiator(shared, thread, 1);
 
     // Snapshot finalizable object addresses so the GC can resurrect dead ones
-    let fin_addrs: Vec<usize> = {
-        let rp = shared.mem.ref_processor.lock();
-        rp.finalizer_referent_addresses()
-    };
+    let fin_addrs: Vec<usize> = finalizable_roots(shared);
 
     let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
@@ -7925,12 +7973,19 @@ pub(crate) fn try_osr_with_backoff(
                 f.class_id,
             )
         };
-        let reusable = {
+        // Three-way classification, not two. `reusable` is the enter-now case;
+        // `published_but_unenterable` is a PUBLISHED OSR artifact that cannot be
+        // entered at THIS pc, which is a permanent property, not a
+        // still-compiling one (see the rejection arm below).
+        let (reusable, published_but_unenterable) = {
             let jc = shared.jit.jit_cache.read();
-            matches!(
-                jc.get_osr(&cn, &mn, &md, frame_class_id),
-                Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
-            )
+            match jc.get_osr(&cn, &mn, &md, frame_class_id) {
+                Some(c) if c.compiled_via_osr => {
+                    let ok = c.can_osr_enter(entry_pc);
+                    (ok, !ok)
+                }
+                _ => (false, false),
+            }
         };
         if !reusable {
             // Not compiled yet: ensure the worker is running, request an OSR
@@ -7938,7 +7993,32 @@ pub(crate) fn try_osr_with_backoff(
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            if crate::jit::tiered::is_osr_denied(&key) {
+            // An artifact this same path already published, which reports
+            // `can_osr_enter(entry_pc) == false`, will report that forever:
+            // `osr_pc_to_native[entry_pc]` is a pure function of the bytecode
+            // and the entry pc (the codegen writes `-1` for a pc strictly
+            // inside a LICM-hoisted loop body, whose pre-header an OSR entry
+            // would skip). Recompiling reproduces it byte for byte — the OSR
+            // path passes empty branch/unroll hint maps, so nothing profile-
+            // dependent can change the outcome; a class redefinition, the one
+            // thing that would, replaces the cached artifact and re-evaluates
+            // this check naturally.
+            //
+            // Treating it as "background compile pending" instead —
+            // `record_osr_background_pending()` resets `backward_count` without
+            // consuming the bounded per-pc rejection budget — made the loop
+            // re-request a compile every `osr_threshold` back-edges forever.
+            // Measured on the `CallRate.allocPutOld` probe: 200 full C2
+            // pipelines for 200 000 iterations (one per 1 000), 199 of them
+            // producing the identical un-enterable artifact, with the loop
+            // interpreted throughout. Route it to the existing bounded
+            // exponential-backoff schedule instead, which is already keyed
+            // per-pc, so other loop headers in the same method keep their OSR
+            // eligibility (unlike `mark_osr_denied`, which is method-wide).
+            //
+            // Strictly a waste-elimination change: it removes compiles, never
+            // adds compiled execution. The loop runs interpreted either way.
+            if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
                 thread.frames[*frame_idx].record_osr_rejection(entry_pc);
                 return OsrBackoffOutcome::Skip;
             }
@@ -27079,6 +27159,68 @@ pub(crate) fn is_ffm_memory_layout_native_override(
         )
 }
 
+/// FFM `java.lang.foreign.Arena` — the interface-native exemption that pairs
+/// with `force_ffm_memory_segment_interface_native` (vm/src/vm/vm_exec.rs).
+///
+/// `Arena.ofConfined()/ofAuto()/ofShared()/global()` are STATIC interface
+/// methods, so their registered natives always run (the interface skip only
+/// covers instance methods) and hand back a synthetic receiver stamped with
+/// the literal interface class name `java/lang/foreign/Arena`
+/// (native-builtins/src/phases_late/foreign_ffm.rs `p67_new_arena`, which also
+/// gives the arena the session that `scope()` hands out and `close()` closes).
+/// Every lifecycle method on that receiver is a NON-STATIC method whose
+/// declaring class is an interface — exactly the shape both dispatch guards
+/// skip — so `scope()`/`close()`/`allocate(…)` would resolve to the interface's
+/// own declaration (abstract in a real JDK image, a stub body under
+/// `--synthetic-jdk`) instead of the natives that own the arena's lifetime.
+/// `MemorySegment.scope` is already force-routed for precisely this reason;
+/// without this twin the two disagree and `arena.scope() != segment.scope()`.
+///
+/// Only triples that actually have a registration are listed: `scope`, `close`,
+/// the four `allocate` overloads and `allocateFrom`/`allocateUtf8String`
+/// (foreign_ffm.rs `register_p67_foreign_memory` + panama.rs
+/// `register_pe_arena`/`register_pe2_string_marshaling`). `allocateArray` has
+/// no native behind it on any class and is deliberately absent — forcing a name
+/// with no registration would only cost a fruitless registry probe.
+///
+/// A REAL `jdk.internal.foreign.ArenaImpl` receiver is unaffected: it declares
+/// `scope()`, `close()` and `allocate(long, long)` concretely, so dispatch
+/// resolves with `jdk/internal/foreign/ArenaImpl` as the declaring class and
+/// never matches this predicate. (The session natives these bodies call do have
+/// a real-receiver escape — `p67_session_delegate`'s
+/// `invoke_virtual_bytecode_only` — but this predicate never needs it, because
+/// a real `ArenaImpl` is not routed here in the first place.)
+pub(crate) fn is_ffm_arena_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/lang/foreign/Arena"
+        && matches!(
+            (method_name, descriptor),
+            ("scope", "()Ljava/lang/foreign/MemorySegment$Scope;")
+                | ("close", "()V")
+                | ("allocate", "(J)Ljava/lang/foreign/MemorySegment;")
+                | ("allocate", "(JJ)Ljava/lang/foreign/MemorySegment;")
+                | (
+                    "allocate",
+                    "(Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocate",
+                    "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocateFrom",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;"
+                )
+                | (
+                    "allocateUtf8String",
+                    "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;"
+                )
+        )
+}
+
 pub(crate) fn is_file_channel_impl_open_native_override(
     class_name: &str,
     method_name: &str,
@@ -29265,6 +29407,14 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_ffm_memory_layout_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // FFM Arena lifecycle. Reaching it from here is what wires the exemption
+    // into `try_stackless_invoke`'s step-6 interface guard (via
+    // `should_force_registered_native_over_bytecode`), so that path agrees with
+    // the explicit `force_ffm_arena_interface_native` term in
+    // `invoke_on_class_shared`. See `is_ffm_arena_native_override`.
+    if is_ffm_arena_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
@@ -33656,6 +33806,22 @@ fn compile_osr_artifact(
     // reuse kicks in.
     let osr_reused =
         matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
+    // DBG: name WHY a cached artifact was not reused. A cached
+    // `compiled_via_osr` artifact that cannot enter at `entry_pc` means the
+    // recompile below is guaranteed to produce the same un-enterable result
+    // (same bytecode, same entry pc), i.e. a pure-waste recompile loop —
+    // distinguishing that from "no artifact yet" or "artifact came from the
+    // invocation path" is the whole diagnosis.
+    if !osr_reused && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        let why = match &cached_osr {
+            None => "no-cached-artifact",
+            Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
+            Some(_) => "cached-cannot-enter-at-pc",
+        };
+        eprintln!(
+            "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+        );
+    }
     let compiled = if osr_reused {
         cached_osr
     } else {
@@ -44077,6 +44243,60 @@ mod tests {
             "java/lang/foreign/Linker",
             "find",
             descriptor
+        ));
+    }
+
+    #[test]
+    fn ffm_arena_force_native_covers_lifecycle() {
+        let arena = "java/lang/foreign/Arena";
+        for (name, descriptor) in [
+            ("scope", "()Ljava/lang/foreign/MemorySegment$Scope;"),
+            ("close", "()V"),
+            ("allocate", "(J)Ljava/lang/foreign/MemorySegment;"),
+            ("allocate", "(JJ)Ljava/lang/foreign/MemorySegment;"),
+            (
+                "allocate",
+                "(Ljava/lang/foreign/ValueLayout;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocate",
+                "(Ljava/lang/foreign/MemoryLayout;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocateFrom",
+                "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+            ),
+            (
+                "allocateUtf8String",
+                "(Ljava/lang/String;)Ljava/lang/foreign/MemorySegment;",
+            ),
+        ] {
+            assert!(
+                is_ffm_arena_native_override(arena, name, descriptor),
+                "Arena.{name}{descriptor} must be exempt from the interface instance-method skip"
+            );
+            assert!(
+                force_native_over_real_jdk_bytecode(arena, name, descriptor),
+                "step-6 dispatch must force the Arena.{name}{descriptor} native"
+            );
+        }
+        // No native is registered for these, so they must NOT be force-routed.
+        assert!(!is_ffm_arena_native_override(
+            arena,
+            "allocateArray",
+            "(Ljava/lang/foreign/MemoryLayout;J)Ljava/lang/foreign/MemorySegment;"
+        ));
+        // A real `ArenaImpl` declares scope/close/allocate concretely, so it
+        // resolves under its own name and must never match.
+        assert!(!is_ffm_arena_native_override(
+            "jdk/internal/foreign/ArenaImpl",
+            "close",
+            "()V"
+        ));
+        assert!(!is_ffm_arena_native_override(
+            "jdk/internal/foreign/ArenaImpl",
+            "allocate",
+            "(JJ)Ljava/lang/foreign/MemorySegment;"
         ));
     }
 

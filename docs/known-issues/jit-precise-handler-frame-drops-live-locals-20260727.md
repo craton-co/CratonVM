@@ -68,7 +68,13 @@ commit kept — makes the repro clean:
 | dev at/after `83e078aa5` | iteration 400-5,000 |
 | + exception-edge liveness fix (below) | iteration ~18,000 |
 | + gate closed (this change) | none (3 runs) |
-| gate closed, default heap, 1,500,000 ops | none |
+| gate closed, default heap, 4,500,000 ops (3 x 1.5M) | none |
+
+The default-heap row is sized to the rate the concurrent session measured on
+the broken build — ~1.3 errors per 1,000,000 operations at `-Xmx1g`, so a
+single clean 1.5M run would only be p ~ 0.13. 0 in 4,500,000 is p ~ 0.002.
+At `-Xmx64m` the same fix is checked over ~1,400,000 operations, where the
+broken build fails inside the first ~20,000.
 
 `CRATONVM_JIT_DENY` bisection pinned the victim method to
 `JSONParserBase$MSB.toString()` — `new String(this.b, 0, this.p + 1)`, reached

@@ -82,7 +82,7 @@ lifted):
 ## Kept — confirmed still needed, with real evidence
 
 - ~~**JAXB** (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27.** The QName-compare corruption no longer reproduces, including on a pre-fix binary under this session's own exact 2026-07-26 configuration, so it was closed by general JIT work landed between the two dates. What the 4000-iteration probe was still dying on was a separate general bug in a **JDK** class, now fixed.
-- ~~**ES fragile cluster** (`org/elasticsearch/`)~~ — **REMOVED 2026-07-27.** The `FloatFieldBlockLoaderTests` regression that kept it (38→41 failures) was the stale-compiled-entry defect in `try_jit_compile_callee`, not ES code: the class is now 31 failures with the ban on and 31 with it off, and a 19-class spread sample plus 3×3 runs of `TextFieldMapperTests` are identical either way. `docs/internal/es-fragile-cluster-confirmed-needed-20260726.md`, `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`.
+- ~~**ES fragile cluster** (`org/elasticsearch/`)~~ — **REMOVED 2026-07-27.** The `FloatFieldBlockLoaderTests` regression that kept it (38→41 failures) was the stale-compiled-entry defect in `try_jit_compile_callee`, not ES code: the class is now 31 failures with the ban on and 31 with it off, and a 19-class spread sample plus 3×3 runs of `TextFieldMapperTests` are identical either way. See the retired `es-fragile-cluster-confirmed-needed-20260726` and `nodeconnections-retired-jit-code-jump-20260727` write-ups.
 - **HIB-TEMPORAL.1** (`org/hibernate/`) — real Hibernate ORM 8.0 harness, lifting causes a full `StrategySelectionException` bootstrap cascade. `docs/known-issues/hib-temporal-1-still-needed-20260726.md`.
 
 ## Blocked — real, still-open, NOT this session's to fix (architectural)

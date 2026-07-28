@@ -69,7 +69,7 @@ started.
 - ~~JAXB (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27**, root-caused to
   `82b78bca5` (String compact-layout field intrinsic read 4 bytes high), not
   to JAXB. See `docs/internal/jaxb-jit-ban-removed-20260727.md`.
-- ~~ES fragile cluster (`org/elasticsearch/`)~~ — **BAN LIFTED 2026-07-27**, see the entry further down and `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`
+- ~~ES fragile cluster (`org/elasticsearch/`)~~ — **BAN LIFTED 2026-07-27**, see the entry further down
 - SPB.1 (`org/springframework/util/`) — inconclusive real-app-less repro, `docs/known-issues/spb1-springframework-util-investigation.md`
 - TOMCAT-JNDIREALM-RDN.1 / JIT.2 (`com/unboundid/`) — real Tomcat suite, SIGSEGV confirmed, see `docs/known-issues/jit-skip-list-open-bans-20260725.md`
 - `org/jboss/as/` (WildFly boot, part of the SPB.8b/8c family) — **BAN LIFTED
@@ -223,7 +223,7 @@ they were built for rather than the technology itself, so the earlier
   on 3 runs each way. `FloatFieldBlockLoaderTests`, the single class that kept
   the ban alive on 2026-07-26 (38 baseline -> 41 lifted), is now 31 failures
   with the ban on AND 31 with it off. The +3 was the stale-compiled-entry defect
-  closed by `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`
+  closed by the retired `nodeconnections-retired-jit-code-jump-20260727` write-up
   (the callee-compile probe handed out an entry address whose artifact it had
   already released), which was also SIGSEGV-ing
   `cluster.NodeConnectionsServiceTests` in the same window.
