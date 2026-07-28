@@ -118,6 +118,13 @@ pub struct AttachListener {
     /// `start_listening` is called with no race — every dispatch reads the
     /// list fresh through the shared lock.
     pub commands: Arc<parking_lot::RwLock<Vec<DiagnosticCommand>>>,
+    /// Set by [`AttachListener::stop_listening`] to tell the accept loop to
+    /// exit. Shared with the accept thread, which re-checks it every poll tick.
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    /// Join handle for the accept thread, so `stop_listening` (and therefore
+    /// `Drop`) can actually reap it instead of stranding it. `None` when this
+    /// listener never bound (non-Unix target, or `bind` failed).
+    accept_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AttachListener {
@@ -126,6 +133,8 @@ impl AttachListener {
             socket_path: socket_path.to_string(),
             is_listening: false,
             commands: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            accept_thread: None,
         }
     }
 
@@ -173,13 +182,50 @@ impl AttachListener {
             );
         }
 
+        // Poll rather than block in `accept()`, so `stop_listening` can
+        // retire this thread deterministically.
+        //
+        // The obvious alternative -- block in `accept()` and have
+        // `stop_listening` poke the socket with a throwaway connection -- is
+        // WRONG here, and silently so: `new_with_vm_state` binds
+        // `/tmp/.java_pid<pid>`, the same path for every VM in the process, and
+        // each bind unlinks the previous socket. A poke by path would then
+        // reach whichever listener bound LAST, so the older thread would never
+        // wake and the `join` below would hang forever. Polling needs no poke
+        // and cannot alias. One wakeup per `POLL` per live VM is negligible
+        // beside the leaked thread + fd this replaces.
+        const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+        if listener.set_nonblocking(true).is_err() {
+            // Cannot poll safely; leave the socket bound and unattended rather
+            // than spawn a thread `stop_listening` would not be able to reap.
+            tracing::warn!(
+                "AttachListener: set_nonblocking failed for {}; not serving attach requests",
+                self.socket_path
+            );
+            return;
+        }
         let commands = Arc::clone(&self.commands);
-        std::thread::Builder::new()
+        let shutdown = Arc::clone(&self.shutdown);
+        self.accept_thread = std::thread::Builder::new()
             .name("Attach-Listener".into())
             .spawn(move || {
-                for stream in listener.incoming() {
+                while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    let stream = match listener.accept() {
+                        Ok((conn, _addr)) => Ok(conn),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(POLL);
+                            continue;
+                        }
+                        Err(e) => Err(e),
+                    };
                     match stream {
                         Ok(conn) => {
+                            // The connection itself must be blocking: it is
+                            // handed to `handle_attach_connection`, which does
+                            // ordinary blocking reads/writes. `accept` on a
+                            // non-blocking listener yields a non-blocking
+                            // socket on Linux, so clear the flag explicitly.
+                            let _ = conn.set_nonblocking(false);
                             let commands = Arc::clone(&commands);
                             // One thread per connection: attach requests are
                             // rare (an operator running a diagnostic
@@ -205,16 +251,31 @@ impl AttachListener {
         self.is_listening = true;
     }
 
-    /// Best-effort: removes the socket file and clears the flag. Does not
-    /// signal or join the background accept thread (it has no way to be
-    /// woken from a blocking `accept()` short of a poke connection, and
-    /// nothing in this codebase calls `stop_listening` outside tests today
-    /// — the listener's real lifetime is the VM process's own). A stray
-    /// accept-loop thread from a `stop_listening` call is harmless: with
-    /// the socket file removed, no new client can reach it, and the VM
-    /// process exiting reaps it like any other thread.
+    /// Stop serving: signal the accept loop, unlink the socket, and join the
+    /// thread. Idempotent, and a no-op for a listener that never bound.
+    ///
+    /// This used to be "best-effort" and deliberately did NOT reap the accept
+    /// thread, on the reasoning that "the listener's real lifetime is the VM
+    /// process's own". That holds for a real VM process, which has one. It is
+    /// false for this crate's own test binary, where every `Vm::new` builds a
+    /// `JcmdProcessor` (see `JcmdProcessor::new_with_vm_state`) that binds
+    /// `/tmp/.java_pid<pid>` — the SAME path each time, since it is per-PID by
+    /// construction — and each bind unlinks the previous one's socket. The
+    /// earlier thread could then never be reached by any client, never
+    /// returned from `accept()`, and never exited: one `cargo test -p
+    /// cratonvm-vm --lib` run peaked at 286 threads, 71 of them named
+    /// `Attach-Listener`, each holding a socket fd.
+    ///
+    /// Bounded by construction: the accept loop checks `shutdown` at most one
+    /// poll interval away (see `start_listening`), so the join returns
+    /// promptly and cannot depend on a client ever connecting.
     pub fn stop_listening(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(handle) = self.accept_thread.take() {
+            let _ = handle.join();
+        }
         self.is_listening = false;
     }
 
@@ -500,6 +561,20 @@ impl DiagnosticCommand {
 // ---------------------------------------------------------------------------
 // jcmd implementation
 // ---------------------------------------------------------------------------
+
+impl Drop for AttachListener {
+    /// Reap the accept thread with the listener that owns it.
+    ///
+    /// Without this, a `JcmdProcessor` going out of scope — every `Vm` in the
+    /// test binary owns one — left its accept thread parked on a socket path
+    /// the next `Vm` had already unlinked. See
+    /// [`AttachListener::stop_listening`] for the measurement.
+    fn drop(&mut self) {
+        if self.is_listening {
+            self.stop_listening();
+        }
+    }
+}
 
 /// Processes jcmd-style diagnostic commands.
 pub struct JcmdProcessor {
