@@ -1602,6 +1602,36 @@ fn ois_stream_ref(addr: usize) -> Option<ObjectRef> {
         .copied()
 }
 
+/// Emit the default field block for the object on top of the `curObj` stack.
+///
+/// This is the byte-for-byte counterpart of the class descriptor that
+/// `writeObject` emitted for a custom-`writeObject` class: the same filter
+/// (non-static, non-transient declared fields) in the same order, which is
+/// exactly what the reader's `defaultReadObject` consumes. Shared by
+/// `defaultWriteObject()` and `writeFields()` so the two cannot drift apart
+/// and leave the stream desynchronised.
+fn write_default_field_block(
+    ctx: &mut dyn NativeContext,
+    addr: usize,
+    frame: &CurFrame,
+) -> MethodCallResult {
+    let fields = ctx.declared_fields(frame.class_id);
+    let serializable_fields: Vec<_> = fields
+        .iter()
+        .filter(|f| !f.is_static && (f.access_flags & ACC_TRANSIENT) == 0)
+        .collect();
+    for f in &serializable_fields {
+        let tc = field_type_code(&f.descriptor);
+        let v = ctx.get_field(frame.obj, f.slot_index);
+        if tc == 'L' || tc == '[' {
+            oos_write_value(ctx, addr, &v)?;
+        } else {
+            oos_write_primitive(addr, tc, &v);
+        }
+    }
+    Ok(None)
+}
+
 // ---------------------------------------------------------------------------
 // ObjectOutputStream  (6-field synthetic)
 //   0: stream_ref, 1: protocol_version, 2: depth,
@@ -1984,21 +2014,7 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
             // (incorrectly) call it outside the hook.
             None => return Ok(None),
         };
-        let fields = ctx.declared_fields(frame.class_id);
-        let serializable_fields: Vec<_> = fields
-            .iter()
-            .filter(|f| !f.is_static && (f.access_flags & ACC_TRANSIENT) == 0)
-            .collect();
-        for f in &serializable_fields {
-            let tc = field_type_code(&f.descriptor);
-            let v = ctx.get_field(frame.obj, f.slot_index);
-            if tc == 'L' || tc == '[' {
-                oos_write_value(ctx, addr, &v)?;
-            } else {
-                oos_write_primitive(addr, tc, &v);
-            }
-        }
-        Ok(None)
+        write_default_field_block(ctx, addr, &frame)
     });
     // flush() — copy internal buffer into underlying ByteArrayOutputStream if present
     r.register(cls, "flush", "()V", |ctx, args| {
@@ -2054,18 +2070,34 @@ fn register_object_output_stream(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // writeFields()V — flushes the `PutField` accumulator returned by
-    // `putFields()` into the stream.
+    // writeFields()V — emits the field block for the object currently being
+    // written, the `putFields()`-based alternative to `defaultWriteObject()`.
     //
-    // KEPT as a no-op, with the reason recorded rather than assumed: the
-    // accumulator is empty BY CONSTRUCTION. `putFields()` below hands back a
-    // 2-slot `ObjectOutputStream$PutField` whose only `put*` entry points are
-    // the abstract JDK declarations — no `PutField.put(String, …)` native is
-    // registered anywhere in the tree — so nothing is ever buffered for this
-    // method to emit. Writing a zero-length field block would be exactly as
-    // empty as writing nothing. The gap to close is `PutField.put*`, not this
-    // method; recorded as an open residual in the wave-2 report.
-    r.register(cls, "writeFields", "()V", |_ctx, _args| Ok(None));
+    // The wave-2 note kept this a no-op on the grounds that the `PutField`
+    // accumulator is empty by construction (true — no `PutField.put*` native is
+    // registered anywhere in the tree, so nothing is ever buffered). But the
+    // block is NOT optional: `writeObject` has already emitted a class
+    // descriptor naming these fields, and the reader's `defaultReadObject`
+    // consumes exactly that many bytes. Writing nothing desynchronises the
+    // stream for any class that has non-transient fields AND uses `putFields`.
+    // Emit the same block `defaultWriteObject()` does, from the live object.
+    //
+    // For the one real caller in-tree — `ConcurrentHashMap.writeObject`
+    // (native-collections), which uses the `serialPersistentFields` idiom —
+    // every declared field is transient, so the block is empty and the emitted
+    // bytes are identical to the previous no-op. Reading the values from the
+    // live object rather than the accumulator is the remaining approximation;
+    // closing it means implementing `PutField.put*`, still an open residual.
+    r.register(cls, "writeFields", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr = this.as_ptr() as usize;
+        match cur_top(addr) {
+            Some(frame) => write_default_field_block(ctx, addr, &frame),
+            // Outside a writeObject hook the JDK throws NotActiveException;
+            // stay lenient here, exactly as `defaultWriteObject` above does.
+            None => Ok(None),
+        }
+    });
 
     // putFields() -> ObjectOutputStream.PutField
     r.register(
@@ -4702,6 +4734,16 @@ fn register_object_input(r: &mut NativeMethodRegistry) {
     // expected real bytes already dispatched virtually to the OIS subclass
     // before reaching this default. Verified safe for JNDI bootstrap which
     // null-checks the return value (InitialContext.getURLOrDefaultInitCtx).
+    //
+    // Wave-3 reachability check, so this is not re-litigated: both entries are
+    // instance methods on an INTERFACE, and native lookup drops those unless
+    // the descriptor is the `()Liface;` / `(Liface;)Liface;` default-method
+    // shape (neither is) or the triple is force-listed (neither is). So they
+    // cannot intercept a user `ObjectInput` implementor at all — the only
+    // receiver that reaches them is one whose class collapses to the bare
+    // interface, i.e. a CratonVM synthetic with no backing stream. For that
+    // receiver `null` (end of stream) and `0` (no bytes readable without
+    // blocking) are the JDK's own legal answers, not placeholders.
     r.register(cls, "readObject", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });

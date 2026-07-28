@@ -192,6 +192,70 @@ fn clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResul
     Ok(None)
 }
 
+/// Shared verification decision behind `JceSecurity.canUseProvider` and
+/// `JceSecurity.getVerificationResult` — the two accessors MUST agree
+/// (`canUseProvider(p)` is literally `getVerificationResult(p) == null` in
+/// the real JDK), so they route through one function instead of being two
+/// independent constants that can drift apart.
+///
+/// Real JDK: `verifyProviderJar(p.getClass().getProtectionDomain()
+/// .getCodeSource())` — a **null CodeSource** (a JDK-bundled provider on the
+/// boot/platform loader) is verified outright; anything else must carry a JCE
+/// code-signing signature checked against the JDK's JCE signing roots.
+///
+/// CratonVM implements the first half faithfully and *cannot* implement the
+/// second: it ships no JCE code-signing trust anchors, and `JceSecurity
+/// .<clinit>` is no-op'd (registered below) so `verificationResults` /
+/// `PROVIDER_VERIFIED` / `queue` do not exist to consult. Rather than return
+/// a bare "verified" constant, we read the class's real CodeSource and, when
+/// it is an unsigned non-boot source (which HotSpot would reject), disclose
+/// the gap on the `tracing` log before accepting.
+///
+/// Note this gate is far less load-bearing here than on HotSpot: every
+/// `JceSecurity.getInstance` consumer (`Cipher`, `KeyGenerator`, `Mac`,
+/// `SecretKeyFactory`, `KeyAgreement`) is dispatched natively to
+/// `crate::crypto_impl`, so a provider passing this check still never gets
+/// its own crypto code invoked through the JCE path.
+///
+/// Returns `None` for "verified", `Some(reason)` for a verification failure.
+fn jce_verify_provider(ctx: &mut dyn NativeContext, prov: Option<ObjectRef>) -> Option<String> {
+    // Real JDK NPEs on `p.getClass()`; reporting a failure is closer to that
+    // than silently answering "verified" for a provider that is not there.
+    let p = match prov {
+        Some(p) => p,
+        None => return Some("provider is null".to_string()),
+    };
+    let cid = ctx.class_id_of_object(p);
+    let name = ctx
+        .class_name_of_id(cid)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    // No CodeSource == boot/platform provider; real `verifyProviderJar`
+    // returns null (verified) for exactly this case.
+    let code_base = ctx.class_code_base(cid)?;
+    if ctx.class_code_source_certs(cid).is_empty() && jce_first_unsigned_report(&name) {
+        tracing::warn!(
+            provider = %name,
+            code_base = %code_base,
+            "JceSecurity: provider code source carries no signer certificates; CratonVM has no \
+             JCE code-signing trust anchors, so it is accepted unverified (HotSpot would reject \
+             it). Crypto still dispatches natively, not through this provider."
+        );
+    }
+    None
+}
+
+/// True the first time `class_name` is reported as an unsigned provider
+/// source — keeps `jce_verify_provider`'s disclosure to one line per
+/// provider class instead of one per `getInstance`.
+fn jce_first_unsigned_report(class_name: &str) -> bool {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| RwLock::new(HashSet::new()))
+        .write()
+        .insert(class_name.to_string())
+}
+
 /// Real-JCA `java/security/Security.<clinit>` replacement.
 ///
 /// The real `<clinit>` fails in `initialize()` (it tries to read the
@@ -1307,6 +1371,16 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // points directly rather than resurrecting `ProviderList
     // .fromSecurityProperties()`/`threadLists` bring-up (the exact chain
     // the original no-op was written to avoid).
+    //
+    // KEEP: `null` is spec-correct here and this is NOT a signature-check
+    // bypass. `startJarVerification()` returns the *previous* thread-local
+    // provider list (`beginThreadProviderList(getJarList(...))`), whose only
+    // job is to stop verification from recursively loading providers out of
+    // the jar being verified; the actual signature check is
+    // `SignatureFileVerifier.processImpl`, which still runs in full on real
+    // bytecode. `null` is a legal prior-list value and is exactly what the
+    // paired `stopJarVerification(null)` → `endThreadProviderList(null)`
+    // expects, so the try/finally pair stays balanced.
     r.register(
         "sun/security/jca/Providers",
         "startJarVerification",
@@ -1344,44 +1418,73 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     //     `canUseProvider`, which our `JceSecurity.canUseProvider`
     //     intercept can short-circuit (see below).
     r.register("javax/crypto/JceSecurity", "<clinit>", "()V", clinit_noop);
-    // `JceSecurity.canUseProvider(Provider)` returns true so that
-    // post-clinit `KeyGenerator` / `Mac` lookups don't fault on the null
-    // `verifyingProviders` map.  Real-JDK behaviour for a signed-JCE
-    // provider is `true`; for BouncyCastle (loaded via reflection in
-    // BcProbe) we accept it unconditionally — provider verification is a
-    // signing-cert check, not a security-policy gate.
+    // `JceSecurity.canUseProvider(Provider)` — needed because the no-op'd
+    // clinit leaves `verifyingProviders` null and the real bytecode would
+    // NPE on it. Delegates to `jce_verify_provider` (which reads the
+    // provider's real CodeSource) rather than returning a bare `true`, and
+    // shares that decision with `getVerificationResult` below so the two can
+    // never disagree — real JDK defines this method AS
+    // `getVerificationResult(p) == null`.
     r.register(
         "javax/crypto/JceSecurity",
         "canUseProvider",
         "(Ljava/security/Provider;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            let prov = match args.first() {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
+            let ok = jce_verify_provider(ctx, prov).is_none();
+            Ok(Some(Value::Int(i32::from(ok))))
+        },
     );
     // `JceSecurity.isRestricted()` returns false (unlimited).  Matches the
     // default field value the no-op'd clinit leaves behind, but the static
     // accessor is explicitly registered so any reflective lookup sees a
     // resolved method instead of a null-method-table miss on the
     // synthetic class.
+    // KEEP: spec-correct, not a stub. `isRestricted == false` is what a
+    // stock JDK 9+ install reports (`crypto.policy=unlimited` ships by
+    // default), and it is factually true of this VM — `crate::crypto_impl`
+    // enforces no key-size ceiling at all, so there is nothing to restrict.
     r.register(
         "javax/crypto/JceSecurity",
         "isRestricted",
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
-    // `JceSecurity.getVerificationResult(Provider) -> Exception` returns
-    // `null` to mean "provider passed JCE jar-signing verification".  Real-
-    // JDK's clinit populates `verificationResults`/`verifyingProviders`/
-    // `PROVIDER_VERIFIED` so this method can index into them — under our
-    // no-op'd clinit those fields are null and the real bytecode NPEs at
-    // `new WeakIdentityWrapper(p, queue)` or
-    // `verificationResults.computeIfAbsent(...)`.  Bypass with `null`
-    // so the `JceSecurity.getInstance(...)` overloads (we no-op those
-    // too — see below) and any future caller see the "verified, no
-    // failure" path.
+    // `JceSecurity.getVerificationResult(Provider) -> Exception`: `null`
+    // means "verified", a non-null `Exception` is the failure the caller
+    // rethrows.  Real-JDK's clinit populates `verificationResults` /
+    // `verifyingProviders` / `PROVIDER_VERIFIED` so this method can index
+    // into them — under our no-op'd clinit those fields are null and the
+    // real bytecode NPEs at `new WeakIdentityWrapper(p, queue)` /
+    // `verificationResults.computeIfAbsent(...)`.  Same `jce_verify_provider`
+    // decision as `canUseProvider` above; on failure we hand back a real
+    // `SecurityException` so the caller sees the reason rather than a
+    // silent "verified".
     r.register(
         "javax/crypto/JceSecurity",
         "getVerificationResult",
         "(Ljava/security/Provider;)Ljava/lang/Exception;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let prov = match args.first() {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
+            match jce_verify_provider(ctx, prov) {
+                None => Ok(Some(Value::Object(None))),
+                Some(reason) => {
+                    let msg = ctx
+                        .create_string(&format!("JCE cannot authenticate the provider: {reason}"));
+                    ctx.new_object_initialized(
+                        "java/lang/SecurityException",
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(msg))],
+                    )
+                }
+            }
+        },
     );
 
     // `javax/crypto/JceSecurityManager.getCryptoPermission(String)` — the
@@ -1525,6 +1628,14 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             )?;
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Cipher",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             check_transformation_supported(ctx, &algo_str)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
@@ -1537,6 +1648,14 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Cipher",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             check_transformation_supported(ctx, &algo_str)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))

@@ -248,3 +248,70 @@ fn test_precise_handler_frame_keeps_a_handler_only_local() {
     // (live across the try).
     assert_eq!(precise_handler_mismatches("scopeMismatches"), 0);
 }
+
+fn osr_loop_progress_class_files_available() -> bool {
+    let dir = test_resources_dir();
+    std::path::Path::new(&format!("{dir}/cratonvm/JitOsrLoopProgress.class")).exists()
+}
+
+/// Every entry point returns a MISMATCH COUNT — a per-iteration visit tally, so
+/// an iteration the OSR'd body committed and the interpreter then re-ran is
+/// counted directly instead of silently corrupting an expected checksum.
+fn osr_loop_progress_mismatches(method: &str) -> i32 {
+    let mut vm = test_vm();
+    match vm.invoke("cratonvm/JitOsrLoopProgress", method, "()I", &[]) {
+        Ok(Some(Value::Int(v))) => v,
+        other => panic!("{method} returned unexpected value: {other:?}"),
+    }
+}
+
+#[test]
+fn test_osr_loop_does_not_rerun_iterations_when_a_callee_catches() {
+    if !osr_loop_progress_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // Two defects stacked here, both required for a 0:
+    //   * the OSR tier's eager direct-call wiring baked a machine-code CALL
+    //     into `step` even though it declares an exception table, so `step`'s
+    //     own `catch` never ran and its Boom escaped into the OSR'd caller
+    //     (the method-entry tier has had this BUG-H gate all along);
+    //   * `try_osr`'s pending-exception drain then "safe rejected" — resuming
+    //     the interpreter at the STALE pre-OSR pc, re-running every iteration
+    //     the OSR'd body had already committed (20 008 executed for 20 000).
+    assert_eq!(osr_loop_progress_mismatches("caughtMismatches"), 0);
+}
+
+#[test]
+fn test_osr_loop_does_not_rerun_iterations_when_an_exception_escapes() {
+    if !osr_loop_progress_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // The pure form: nothing below the caller can catch, so the OSR bail cannot
+    // pretend the loop should continue. Before the fix the safe reject resumed
+    // it anyway — 42 730 iterations executed where 12 346 were asked for.
+    assert_eq!(osr_loop_progress_mismatches("escapeMismatches"), 0);
+}
+
+#[test]
+fn test_osr_loop_does_not_rerun_iterations_on_an_implicit_npe() {
+    if !osr_loop_progress_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // `try_osr`'s pending-NPE drain had the same shape: search this frame's
+    // handlers (an OSR'd method provably has none — RBC.6b), then re-stash and
+    // resume the loop.
+    assert_eq!(osr_loop_progress_mismatches("npeMismatches"), 0);
+}
+
+#[test]
+fn test_osr_loop_does_not_rerun_iterations_on_an_implicit_aioobe() {
+    if !osr_loop_progress_class_files_available() {
+        eprintln!("Skipping: .class files not available (javac not on PATH?)");
+        return;
+    }
+    // Sibling of the NPE drain, same defect.
+    assert_eq!(osr_loop_progress_mismatches("aioobeMismatches"), 0);
+}

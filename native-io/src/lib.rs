@@ -4438,7 +4438,26 @@ fn native_scanner_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    ctx.set_field(this, SCAN_FIELD_CLOSED, Value::Int(1));
+    // STUB-REMOVAL (wave 3) — receiver guard, not a behaviour change for
+    // Scanner. This handler is also registered on `java/io/Closeable.close()V`
+    // and `java/lang/AutoCloseable.close()V` (see `register_scanner_natives`)
+    // so that a Scanner reached through its interface still closes. Those two
+    // registrations win over every rival `close()` in the tree, because
+    // `register_io_natives` runs after `register_builtins` in both modes.
+    //
+    // Unguarded, that meant ANY receiver arriving via the bare interface got
+    // `Int(1)` blind-written into field index 4 — a slot that is
+    // `SCAN_FIELD_CLOSED` only for a Scanner and is some unrelated field, of
+    // some unrelated type, on anything else. Interface natives only serve
+    // receivers whose resolved declaring class IS the interface, which bounds
+    // this to synthetic objects typed as bare Closeable/AutoCloseable rather
+    // than to user classes — but "only corrupts synthetic receivers" is not a
+    // guarantee worth keeping. Write the flag only when the receiver actually
+    // has the Scanner shape; for anything else, closing is a no-op here and
+    // the object's own close native (if any) does the real work.
+    if ctx.object_num_fields(this) > SCAN_FIELD_CLOSED {
+        ctx.set_field(this, SCAN_FIELD_CLOSED, Value::Int(1));
+    }
     Ok(None)
 }
 
@@ -7974,6 +7993,11 @@ static SR_STATE: OnceLock<Mutex<HashMap<i32, SrState>>> = OnceLock::new();
 struct SrState {
     units: Vec<u16>,
     pos: usize,
+    /// Position stashed by `mark(int)`. Real `StringReader.reset()` rewinds to
+    /// the LAST MARK (0 only when `mark` was never called), so this has to be
+    /// tracked here or `markSupported() == true` is a lie — see
+    /// `native_sr_mark`.
+    mark: usize,
 }
 
 fn sr_state() -> &'static Mutex<HashMap<i32, SrState>> {
@@ -8048,9 +8072,13 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         registry.register(sr, "close", "()V", native_sr_close);
         registry.register(sr, "skip", "(J)J", native_sr_skip);
         registry.register(sr, "reset", "()V", native_sr_reset);
+        // `mark(I)V` was missing entirely, which made the `markSupported()`
+        // below a lie and left `reset()` rewinding to 0 instead of the mark.
+        registry.register(sr, "mark", "(I)V", native_sr_mark);
         // KEEP: real `StringReader` genuinely supports mark/reset (it is
         // backed by an in-memory String), so `true` is the correct answer,
-        // not a placeholder — and `mark`/`reset` are implemented above.
+        // not a placeholder — and `mark`/`reset` are now both implemented
+        // against `SR_STATE` (see `native_sr_mark`).
         registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
             Ok(Some(Value::Int(1)))
         });
@@ -8286,7 +8314,14 @@ fn native_sr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => Vec::new(),
     };
     let key = ctx.identity_hash_code(this);
-    sr_state().lock().insert(key, SrState { units, pos: 0 });
+    sr_state().lock().insert(
+        key,
+        SrState {
+            units,
+            pos: 0,
+            mark: 0,
+        },
+    );
     Ok(None)
 }
 
@@ -8382,6 +8417,45 @@ fn native_sr_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Long(skip)))
 }
 
+/// `StringReader.mark(int)` — stash the current position so `reset()` can come
+/// back to it.
+///
+/// This had NO registration at all, while `markSupported()` next to it answered
+/// `true`. In real-JDK mode the unshadowed `mark(I)V` ran real JDK 25 bytecode,
+/// which pokes the `private final Reader r` delegate that our `<init>` native
+/// never creates; in `synthetic-jdk` mode there was no `mark` to run. Either way
+/// `reset()` below then rewound to 0 instead of the mark, so any consumer that
+/// does the standard `mark(n) / read-ahead / reset()` probe (BufferedReader,
+/// javax.xml's encoding sniffers, JSON/CSV lookahead parsers) silently re-read
+/// the stream from the beginning and duplicated everything before the mark.
+fn native_sr_mark(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    // Real `StringReader.mark` rejects a negative read-ahead limit before it
+    // checks whether the stream is open.
+    let read_ahead_limit = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if read_ahead_limit < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "Read-ahead limit < 0".to_string(),
+        }
+        .into());
+    }
+    let key = ctx.identity_hash_code(this);
+    match sr_state().lock().get_mut(&key) {
+        // The limit itself is deliberately ignored: the whole string is already
+        // buffered, so — exactly like the real `StringReader` — a mark never
+        // expires no matter how far the caller reads past it.
+        Some(state) => state.mark = state.pos,
+        None => return Err(ioe_stream_closed()),
+    }
+    Ok(None)
+}
+
 fn native_sr_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -8389,7 +8463,10 @@ fn native_sr_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let key = ctx.identity_hash_code(this);
     match sr_state().lock().get_mut(&key) {
-        Some(state) => state.pos = 0,
+        // Rewind to the last `mark()`, which is 0 when none was ever taken —
+        // the JDK's documented "reset to the beginning if the stream has never
+        // been marked" behaviour. This used to hardcode 0 unconditionally.
+        Some(state) => state.pos = state.mark,
         None => return Err(ioe_stream_closed()),
     }
     Ok(None)

@@ -68,6 +68,13 @@ use cratonvm_types::{ClassId, ObjectRef};
 /// outlives a lock acquisition: each scan/remap re-locks the target map
 /// freshly through its `RwLock`, so there is no aliasing with the
 /// owning cache's own `read()`/`write()` guards.
+///
+/// Lifetime is enforced by the registry lock itself, not by the "caches
+/// outlive the process" assumption above (which the unit tests break, and
+/// which any teardown path would break): [`scan_osc_cache_roots`] and
+/// [`remap_osc_cache_refs`] hold the registry guard for the whole walk, and
+/// [`OscCache::drop`] must take that same guard to deregister, so a
+/// registered map cannot be freed while a walk is dereferencing it.
 type OscMap = RwLock<FxHashMap<ClassId, ObjectRef>>;
 
 /// Lazily-initialised list of live cache backing maps. `Mutex` (not
@@ -99,14 +106,32 @@ unsafe impl Send for SendPtr {}
 /// Registered with the native-root registry via
 /// [`register_with_gc`]; must be a bare `fn` for that API.
 pub fn scan_osc_cache_roots(roots: &mut Vec<ObjectRef>) {
-    // Snapshot the pointer list under the registry lock, then release it
-    // before touching the per-cache locks to keep lock ordering simple
-    // (registry -> map, never the reverse).
-    let snapshot: Vec<SendPtr> = cache_registry().lock().clone();
-    for SendPtr(ptr) in snapshot {
-        // SAFETY: `ptr` points at a live `OscMap` owned by a `SharedVm`
-        // (see `OscMap` lifetime note above). We re-lock through its own
-        // `RwLock`, so no aliasing with the owner's guards.
+    // The registry lock is held for the WHOLE walk, not just long enough to
+    // clone the pointer list.
+    //
+    // It used to snapshot-then-release, "to keep lock ordering simple (registry
+    // -> map, never the reverse)" — but holding the registry across `map.read()`
+    // *is* registry -> map, the same order, so the early release bought nothing
+    // and opened a use-after-free: `OscCache::drop` deregisters under this very
+    // lock and then frees the map, so a cache dropped between the snapshot and
+    // the `&*ptr` below left a dangling pointer in the snapshot. Reading freed
+    // memory either faults outright or, if the freed bytes happen to look like a
+    // locked `RwLock`, parks `map.read()` forever.
+    //
+    // That is not theoretical: `runtime::serialization::oscache`'s own tests
+    // create and drop short-lived stack `OscCache`s while other threads run GC,
+    // and 1500 filtered runs of that module produced 5 SIGSEGVs and 2 permanent
+    // hangs. Holding the guard closes the window — `drop` cannot make progress
+    // while we walk, and no path takes the registry while holding a map lock
+    // (`register_with_gc` releases the registry before its caller touches
+    // `inner`), so the order stays total.
+    let guard = cache_registry().lock();
+    for &SendPtr(ptr) in guard.iter() {
+        // SAFETY: `ptr` names a map whose owning `OscCache` is still registered,
+        // and `OscCache::drop` must take the registry lock we are holding in
+        // order to deregister and be freed — so the map cannot go away while
+        // this reference lives. We re-lock through its own `RwLock`, so there is
+        // no aliasing with the owner's guards either.
         let map = unsafe { &*ptr };
         for (&class_id, desc) in map.read().iter() {
             // `ObjectRef` is non-null by construction; the guard is
@@ -137,8 +162,10 @@ pub fn scan_osc_cache_roots(roots: &mut Vec<ObjectRef>) {
 /// Registered with the native-root registry via [`register_with_gc`];
 /// must be a bare `fn` for that API.
 pub fn remap_osc_cache_refs(map: &HashMap<usize, usize>) {
-    let snapshot: Vec<SendPtr> = cache_registry().lock().clone();
-    for SendPtr(ptr) in snapshot {
+    // Registry guard held across the walk — see `scan_osc_cache_roots` for why
+    // the snapshot-then-release this replaces was a use-after-free.
+    let guard = cache_registry().lock();
+    for &SendPtr(ptr) in guard.iter() {
         // SAFETY: see `scan_osc_cache_roots`. We take the *write* lock
         // because we mutate the stored refs in place.
         let osc_map = unsafe { &*ptr };

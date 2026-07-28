@@ -452,12 +452,15 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             Ok(None)
         });
         r.register(cls, "sync", "()V", |_ctx, _args| {
-            // Preferences.sync() forces backing-store synchronization. Our impl uses an
-            // in-memory HashMap (no disk backing), so there's nothing to sync.
+            // KEEP. Preferences.sync() forces backing-store synchronization. Our impl
+            // uses an in-memory HashMap on field 0 (no disk backing), so there is
+            // nothing to sync; and the one state a real `sync` must honour — a node
+            // removed by `removeNode()`, which makes it throw BackingStoreException —
+            // cannot arise, as `removeNode` is not registered on either class.
             Ok(None)
         });
         r.register(cls, "flush", "()V", |_ctx, _args| {
-            // Same — no backing store to flush.
+            // KEEP — same: no backing store to flush, no removed-node state to report.
             Ok(None)
         });
         r.register(cls, "keys", "()[Ljava/lang/String;", |ctx, args| {
@@ -1078,27 +1081,24 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
 
-    // PropertyChangeListener / VetoableChangeListener are INTERFACES, and the
-    // dispatcher deliberately ignores a native registered on an interface
-    // instance method (`class_name_for_override` is built from the resolved
-    // method's DECLARING class, then dropped when that class is an interface —
-    // vm_exec.rs / interpreter.rs, "bridges for synthetic receivers with no
-    // real class hierarchy"). So these do NOT shadow a user listener body: they
-    // are only reached by a synthetic receiver that has no `propertyChange`/
-    // `vetoableChange` bytecode at all, and for a listener callback with no
-    // subscriber state to update, doing nothing IS the correct behaviour.
-    r.register(
-        "java/beans/PropertyChangeListener",
-        "propertyChange",
-        "(Ljava/beans/PropertyChangeEvent;)V",
-        native_noop_with_this,
-    );
-    r.register(
-        "java/beans/VetoableChangeListener",
-        "vetoableChange",
-        "(Ljava/beans/PropertyChangeEvent;)V",
-        native_noop_with_this,
-    );
+    // REMOVED 2026-07-28: no-op natives on
+    // `java/beans/PropertyChangeListener.propertyChange` and
+    // `java/beans/VetoableChangeListener.vetoableChange`.
+    //
+    // Both were unreachable-or-harmful, never useful. Real-JDK mode: these are
+    // interface INSTANCE methods, so `class_name_for_override` (the resolved
+    // method's declaring class) is an interface and the dispatcher drops the
+    // native — the descriptor is not the `(Liface;)Liface;` default-method
+    // shape and no `force_*` exemption covers `java.beans`. Synthetic mode:
+    // nothing in the tree ever stamps an object with either interface name
+    // (these two registrations were the only occurrences of the names), and
+    // an interface cannot be instantiated, so no receiver could reach them
+    // either — `pcs_dispatch`/`vcs_fire` invoke_virtual a user class or a
+    // lambda, which declares the method itself.
+    //
+    // And if a receiver DID reach them, silently swallowing a subscriber's
+    // callback is never the right answer — the whole point of the listener is
+    // its body. Deleted rather than kept so the no-op cannot shadow one.
 
     // VetoableChangeSupport = 2-field (source=0, listeners=1)
     let vcs = "java/beans/VetoableChangeSupport";
@@ -1259,8 +1259,11 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         introspector_get_bean_info,
     );
     r.register(intro, "flushCaches", "()V", |_ctx, _args| {
-        // Introspector caches BeanInfo per Class. Our implementation doesn't cache
-        // anything — each call walks the class freshly — so there's nothing to flush.
+        // KEEP. The real Introspector caches BeanInfo per Class, and callers use
+        // flushCaches to force a re-scan after a class changes. `introspector_get_bean_info`
+        // above holds no cache at all — verified: there is no BeanInfo cache anywhere
+        // in the tree, it re-walks the mirror on every call — so the post-condition
+        // "the next getBeanInfo re-scans" already holds unconditionally.
         Ok(None)
     });
     r.register(
@@ -1268,7 +1271,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         "flushFromCaches",
         "(Ljava/lang/Class;)V",
         |_ctx, _args| {
-            // Same — no cache to flush.
+            // KEEP — same, for one class.
             Ok(None)
         },
     );
@@ -1385,7 +1388,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
     // merge) dispatch to the abstract declaration and fail with
     // AbstractMethodError.
     //
-    // The four constants below are not placeholders: they are the bodies of
+    // KEEP — the four constants below are not placeholders: they are the bodies of
     // `java.beans.SimpleBeanInfo`, the JDK's own do-nothing BeanInfo, verbatim
     // — `getDefaultPropertyIndex()`/`getDefaultEventIndex()` return -1 ("no
     // default"), `getAdditionalBeanInfo()` and `getIcon(int)` return null. A
@@ -2862,7 +2865,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(ctx_iface, "close", "()V", |_ctx, _args| {
-        // Reached only by a receiver whose `close()` resolves on the interface
+        // KEEP. Reached only by a receiver whose `close()` resolves on the interface
         // itself (see the note above); `InitialContext` carries its own real
         // `close`. Doing nothing is right rather than convenient: the bindings
         // this interface fallback operates on live in an in-memory map on the

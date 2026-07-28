@@ -768,10 +768,16 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // size() / isEmpty() / remainingCapacity() reflect the actual slot
-    // state. A SynchronousQueue never reports non-zero size in the JDK —
-    // `put` blocks until handoff, so at any observable instant the
-    // internal slot appears empty. Keep the p58 stub's answer to match.
+    // KEEP: `SynchronousQueue.size()` is specified to always return zero —
+    // the queue has no internal capacity, `put` blocks until handoff, so
+    // there is no state a reader could report. This matches the p58
+    // registration in `phases_late::concurrent`.
+    //
+    // DIVERGENCE (deliberately left as-is, flagged for a follow-up): the
+    // javadoc says `isEmpty()` is likewise ALWAYS true, but the reader below
+    // answers false while a producer is parked in the slot, so the pair can
+    // report "not empty, size 0". This registration runs after p58's
+    // always-true `isEmpty`, so this is the version that is live.
     r.register(sq, "size", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
     r.register(sq, "isEmpty", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;

@@ -4493,10 +4493,37 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(sock))))
     });
-    r.register(sss, "bind", "(Ljava/net/SocketAddress;)V", |_ctx, _args| {
-        // The listener was already bound by createServerSocket; a later
-        // bind call is a no-op for our synthetic model.
-        Ok(None)
+    // bind(SocketAddress) — STUB-REMOVAL (wave 3). Was `Ok(None)`.
+    //
+    // Every `javax/net/ssl/SSLServerSocket` this module hands out is created
+    // ALREADY BOUND: all three `SSLServerSocketFactory.createServerSocket`
+    // overloads (~4341/4354/4363) open the rustls `TcpListener` up front, and
+    // there is no unbound-construction path. `ServerSocket.bind` on an already
+    // bound socket is specified to throw ("if the socket is already bound"),
+    // and on a closed socket to throw `SocketException: Socket is closed`.
+    //
+    // The old no-op let a caller rebind to a different address/port and get
+    // silence, while `getLocalPort()`/`accept()` kept serving the ORIGINAL
+    // listener — the address the caller asked for was never listened on. Any
+    // caller this now throws for is a caller that would also have thrown on a
+    // real JVM.
+    r.register(sss, "bind", "(Ljava/net/SocketAddress;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let closed = ssl_server_socket_state(ctx, this)
+            .map(|state| state.closed)
+            .unwrap_or_else(|| ctx.get_field(this, SSS_CLOSED).as_int().unwrap_or(1));
+        if closed != 0 {
+            return Err(crate::phases_early::throw_jca_exc(
+                ctx,
+                "java/net/SocketException",
+                "Socket is closed",
+            ));
+        }
+        Err(crate::phases_early::throw_jca_exc(
+            ctx,
+            "java/net/SocketException",
+            "Already bound",
+        ))
     });
     // STUB-REMOVAL (wave 2): both were `Ok(None)` no-ops — see
     // `sss_listener_identities` for why a silently-ignored
@@ -9918,6 +9945,10 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
     // (16384 + TLS record overhead: 5 header + 256 padding + 68 MAC/IV) for
     // `getPacketBufferSize`. Tomcat only needs them >= a TLS record so its
     // network/application `ByteBuffer`s are large enough.
+    // SHADOWING (wave 3): `tls.rs::register_ssl_session` registers the same two
+    // triples with the same two values and runs LATER (lib.rs ~23041 vs
+    // ~17506), so this copy loses. Inert duplicate — kept because the values
+    // agree; if you change one, change both.
     r.register(cls, "getApplicationBufferSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(16384)))
     });
@@ -9976,6 +10007,10 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
 
     // `isValid` flag is slot 2 only on the 7-field engine session; the 3-field
     // accept session has no flag — treat it as valid (it was just negotiated).
+    // SHADOWING (wave 3): `tls.rs::register_ssl_session` registers the same
+    // triple and runs later, so THAT one wins. Its version was slot-2-only and
+    // mis-reported the 3-field accept session; it has been made field-count
+    // aware to match this logic. Keep the two in step.
     r.register(cls, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if ctx.object_num_fields(this) >= 7 {
