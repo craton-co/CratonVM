@@ -154,15 +154,24 @@ not seen on the clean-dev control either, but those runs fail differently and
 much more slowly, so that is not a clean comparison. **Left unattributed** —
 if it recurs, it needs its own investigation, not a re-open of this doc.
 
-## Residual — NOT this bug
+## Residual — NOT this bug, and now also FIXED
 
 `org.apache.catalina.tribes.group.TestGroupChannelSenderConnections`
-intermittently SIGSEGVs in `testConnectionLinger` (JIT frames under
-`ParallelNioSender.keepalive` → `NioSender.read` — the TCP sender path, no UDP
-involved). This is **pre-existing on clean `origin/dev`** and unaffected by the
-changes here: an interleaved A/B of 12 runs each gave **2/12 crashes on the
-baseline binary and 2/12 on the fixed binary**. Filed separately as
-[`docs/known-issues/tomcat/tribes-senderconnections-niosender-keepalive-segv-20260727.md`](../../../known-issues/tomcat/tribes-senderconnections-niosender-keepalive-segv-20260727.md).
+intermittently SIGSEGVed in `testConnectionLinger`. It was **pre-existing on
+clean `origin/dev`** and unaffected by the changes here (an interleaved A/B of
+12 runs each gave 2/12 crashes on the baseline binary and 2/12 on the fixed
+one), so it was filed separately — and has since been root-caused and fixed on
+its own, as two further use-after-frees: the pending `finalize()` queue was not
+a GC root, and `HashMap.readObject` held its receiver and its
+`ObjectInputStream` in bare Rust locals across GC-capable replay calls. See
+[tribes-senderconnections-deserialize-segv-FIXED](tribes-senderconnections-deserialize-segv-FIXED.md).
+
+That file's original attribution — "JIT frames under
+`ParallelNioSender.keepalive` → `NioSender.read`" — was **wrong on both
+counts**: a crash report's Java frames are published at the last safepoint
+deposit rather than at the fault, and its `external/jit` frames are Windows
+exception dispatch, not compiled Java. The retired doc explains how to read
+these reports correctly.
 
 ## Follow-up (latent, same defect class as cause 2)
 

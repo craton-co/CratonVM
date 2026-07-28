@@ -416,6 +416,54 @@ pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: Obj
     }
 }
 
+/// GC-safe side table for `java.util.logging.Logger`'s parent link, keyed by
+/// `identity_hash_code` — same pattern, and the same reason, as
+/// `jul_logger_handlers_table`: real-JDK 25 keeps the parent inside
+/// `Logger$ConfigurationData` (reachable from slot 0 / `config`), while the
+/// flat synthetic loggers our `getLogger` natives mint hold their name there,
+/// so no raw slot index is safe for both shapes.
+fn jul_logger_parents_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn jul_logger_parent_get(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(logger);
+    let handle = *jul_logger_parents_table().lock().unwrap().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_logger_parent_set(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    parent: Option<ObjectRef>,
+) {
+    // Drop the previous parent root first: re-parenting must not leak the old
+    // logger as a permanent global root.
+    let key = ctx.identity_hash_code(logger);
+    if let Some(handle) = jul_logger_parents_table().lock().unwrap().remove(&key) {
+        ctx.remove_global_root(handle);
+    }
+    let Some(parent) = parent else {
+        return;
+    };
+    // Adding a global root may grow the root table and collect. The logger is
+    // keyed immediately afterward, so retain it across that allocation
+    // (mirrors `jul_logger_handlers_set`).
+    let logger_pin = ctx.pin_native_root(logger);
+    let handle = ctx.add_global_root(parent);
+    let logger = ctx.read_native_pin(logger_pin, logger);
+    let key = ctx.identity_hash_code(logger);
+    jul_logger_parents_table()
+        .lock()
+        .unwrap()
+        .insert(key, handle);
+    ctx.unpin_native_roots(logger_pin);
+}
+
 /// GC-safe side table for Logger filters. Real JDK loggers keep a Filter in
 /// `Logger$ConfigurationData`, while our compact loggers do not have that
 /// shape; sharing neither raw layout is safe.
@@ -1858,14 +1906,30 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // live. Spring's commons-logging and SLF4J adapters guard their warning
     // paths with these checks; returning false here silently erased records
     // instead of delivering them to the Java console stream.
-    fn slf4j_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(Some(Value::Int(0)))
+    //
+    // TRACE/DEBUG answer from `slf4j_threshold` (INFO by default) instead of a
+    // hardcoded `false`, so the property that admits TRACE/DEBUG records also
+    // opens the guards callers check before building them — otherwise the
+    // emitters below would never be reached and the filter would be inert.
+    fn slf4j_trace_on(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(if slf4j_threshold(ctx) <= SLF4J_TRACE {
+            1
+        } else {
+            0
+        })))
+    }
+    fn slf4j_debug_on(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+        Ok(Some(Value::Int(if slf4j_threshold(ctx) <= SLF4J_DEBUG {
+            1
+        } else {
+            0
+        })))
     }
     fn slf4j_enabled(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(1)))
     }
-    registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_false);
-    registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isTraceEnabled", "()Z", slf4j_trace_on);
+    registry.register("org/slf4j/Logger", "isDebugEnabled", "()Z", slf4j_debug_on);
     registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_enabled);
     registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_enabled);
     registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_enabled);
@@ -1879,13 +1943,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/Logger",
         "isTraceEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_trace_on,
     );
     registry.register(
         "org/slf4j/Logger",
         "isDebugEnabled",
         "(Lorg/slf4j/Marker;)Z",
-        slf4j_false,
+        slf4j_debug_on,
     );
     registry.register(
         "org/slf4j/Logger",
@@ -1942,9 +2006,13 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     // observable console output. The full Logback pipeline is not available
     // on every supported classpath, but Spring's OutputCaptureExtension must
     // see INFO/WARN/ERROR records exactly as it sees direct System.out writes.
-    fn slf4j_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
+    //
+    // TRACE/DEBUG go through the same `slf4j_log_msg` formatter as the levels
+    // above them, behind `slf4j_threshold`: at the default INFO threshold the
+    // record is dropped by the filter (matching `isTraceEnabled`/
+    // `isDebugEnabled` above), and lowering the threshold actually delivers it.
+    // This registration runs after `register_slf4j_natives`' own trace/debug
+    // block (last-registration-wins), so it is the one that decides.
     let lg = "org/slf4j/Logger";
     for sig in [
         "(Ljava/lang/String;)V",
@@ -1953,8 +2021,8 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
         "(Ljava/lang/String;Ljava/lang/Throwable;)V",
     ] {
-        registry.register(lg, "trace", sig, slf4j_noop);
-        registry.register(lg, "debug", sig, slf4j_noop);
+        registry.register(lg, "trace", sig, slf4j_trace_msg);
+        registry.register(lg, "debug", sig, slf4j_debug_msg);
         registry.register(lg, "info", sig, slf4j_log_msg);
         registry.register(lg, "warn", sig, slf4j_log_msg);
         registry.register(lg, "error", sig, slf4j_log_msg);
@@ -2121,27 +2189,27 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     });
 
     // Logging methods: trace, debug, info, warn, error
-    // trace(String) — instance method; SLF4J TRACE level is below the
-    // default threshold so trace() intentionally discards its arguments.
-    // NEW-6: documented with the _with_this form so the intent is clear.
-    registry.register(lg, "trace", "(Ljava/lang/String;)V", native_noop_with_this);
+    // trace(String) — same formatter as debug() below, gated on
+    // `slf4j_threshold` (TRACE sits below the default INFO threshold, so the
+    // filter drops the record instead of the native silently discarding it).
+    registry.register(lg, "trace", "(Ljava/lang/String;)V", slf4j_trace_msg);
     registry.register(
         lg,
         "trace",
         "(Ljava/lang/String;Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
     registry.register(
         lg,
         "trace",
         "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
     registry.register(
         lg,
         "trace",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
 
     // debug(String)
@@ -2701,18 +2769,15 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     register_log4j_stacklocator_bridge(registry);
 
     let log4j_lg = "org/apache/logging/log4j/Logger";
-    // Log4j2 trace — instance method, below default threshold. NEW-6.
-    registry.register(
-        log4j_lg,
-        "trace",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
+    // Log4j2 trace — same formatter as the debug/info/warn/error
+    // registrations below, behind `slf4j_threshold` (INFO by default, so a
+    // TRACE record is dropped by the filter rather than by the native).
+    registry.register(log4j_lg, "trace", "(Ljava/lang/String;)V", slf4j_trace_msg);
     registry.register(
         log4j_lg,
         "trace",
         "(Ljava/lang/String;[Ljava/lang/Object;)V",
-        native_noop_with_this,
+        slf4j_trace_msg,
     );
     registry.register(log4j_lg, "debug", "(Ljava/lang/String;)V", slf4j_log_msg);
     registry.register(
@@ -2753,8 +2818,14 @@ pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    registry.register(log4j_lg, "isTraceEnabled", "()Z", |_, _| {
-        Ok(Some(Value::Int(0)))
+    // Same threshold source as the `trace` registration above, so the guard
+    // callers check and the emitter they guard cannot disagree.
+    registry.register(log4j_lg, "isTraceEnabled", "()Z", |ctx, _| {
+        Ok(Some(Value::Int(if slf4j_threshold(ctx) <= SLF4J_TRACE {
+            1
+        } else {
+            0
+        })))
     });
     registry.register(log4j_lg, "isDebugEnabled", "()Z", |_, _| {
         Ok(Some(Value::Int(1)))
@@ -2891,6 +2962,68 @@ mod logback_construction_registration_tests {
             );
         }
     }
+}
+
+/// SLF4J level codes, as stored in the shim `Logger`'s `SLF4J_LEVEL` slot and
+/// as compared by the `is*Enabled` natives: 0=TRACE … 4=ERROR, 5=OFF.
+const SLF4J_TRACE: i32 = 0;
+const SLF4J_DEBUG: i32 = 1;
+const SLF4J_INFO: i32 = 2;
+const SLF4J_WARN: i32 = 3;
+const SLF4J_ERROR: i32 = 4;
+const SLF4J_OFF: i32 = 5;
+
+/// Process-wide threshold below which the SLF4J/Log4j shims drop a record.
+///
+/// The shims advertise INFO by default — that is exactly what their
+/// `is*Enabled` natives answer — and slf4j-simple's own
+/// `org.slf4j.simpleLogger.defaultLogLevel` property moves it. Consulting the
+/// property here is what makes TRACE/DEBUG suppression a *filter* decision
+/// rather than a hardcoded discard in the `trace`/`debug` natives: with
+/// `-Dorg.slf4j.simpleLogger.defaultLogLevel=trace` a TRACE record now reaches
+/// the same formatter and console sink every other level uses.
+///
+/// The per-logger level slot is deliberately NOT consulted: an
+/// allocated-but-never-stamped slot decodes as `Value::Int(0)` (an all-zero
+/// `Value` cell is `Int(0)`, i.e. indistinguishable from an explicit TRACE),
+/// and a receiver that reached these interface natives from a real Logback
+/// logger carries an unrelated field there. The `is*Enabled` natives that own
+/// the per-logger slot keep reading it as before.
+fn slf4j_threshold(ctx: &mut dyn NativeContext) -> i32 {
+    match ctx.get_system_property("org.slf4j.simpleLogger.defaultLogLevel") {
+        Some(level) => match level.trim().to_ascii_lowercase().as_str() {
+            "trace" | "all" | "finest" => SLF4J_TRACE,
+            "debug" | "fine" => SLF4J_DEBUG,
+            "warn" | "warning" => SLF4J_WARN,
+            "error" | "severe" | "fatal" => SLF4J_ERROR,
+            "off" | "none" => SLF4J_OFF,
+            // "info" and anything unparseable: slf4j-simple's own default.
+            _ => SLF4J_INFO,
+        },
+        None => SLF4J_INFO,
+    }
+}
+
+/// `trace(...)` for the SLF4J and Log4j2 shim loggers: the same formatter the
+/// neighbouring `debug(...)` registrations use (`{}` parameter substitution
+/// included), one level lower, delivered only when the threshold filter admits
+/// TRACE.
+fn slf4j_trace_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if slf4j_threshold(ctx) > SLF4J_TRACE {
+        return Ok(None);
+    }
+    slf4j_log_msg(ctx, args)
+}
+
+/// `debug(...)` routed through the same threshold filter as `slf4j_trace_msg`.
+/// Below the default INFO threshold, so this stays quiet unless the property
+/// lowers it — but the record is now dropped by the filter, not by a native
+/// that silently discards its arguments.
+fn slf4j_debug_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if slf4j_threshold(ctx) > SLF4J_DEBUG {
+        return Ok(None);
+    }
+    slf4j_log_msg(ctx, args)
 }
 
 fn slf4j_log_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

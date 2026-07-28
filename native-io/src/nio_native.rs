@@ -1412,10 +1412,6 @@ fn t16_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 
 // ---- java.util.logging extras (null-tolerant) ----
 
-fn t16_log_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
-
 fn t16_lr_get_sequence_number(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
         // Real-JDK layout (identified by its by-name-resolvable private
@@ -1547,25 +1543,36 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
         r.set_category(cratonvm_native_api::NativeKind::Bridge);
     }
 
-    // java.util.logging extras — null-tolerant variants that supersede the
-    // phase-72 handlers, which NPE on `args.first() == Object(None)`.
-    r.register(
-        "java/util/logging/Logger",
-        "entering",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
-        t16_log_noop,
-    );
+    // java.util.logging extras.
+    //
+    // REMOVED 2026-07-27 (stub-removal sweep): this block also registered
+    // no-ops for `Logger.entering(String,String)V` and
+    // `LogManager.readConfiguration()V`. They arrived as "null-tolerant
+    // variants that supersede the phase-72 handlers, which NPE on
+    // `args.first() == Object(None)`" — i.e. a null-receiver crash was fixed
+    // by silencing the method outright.
+    //
+    // The cost was invisible and real: `register_io_natives` runs AFTER
+    // `register_essential_natives_with_shims` in the real-JDK arm of
+    // `vm/src/vm/vm_init.rs`, and re-registration updates the slot in place
+    // (last-registration-wins — see `native-api/src/registry.rs`). So this
+    // no-op silently overwrote `logmanager.rs`'s real `entering`
+    // implementation and `Logger.entering(...)` emitted NOTHING, measured
+    // against HotSpot which logs a FINER "ENTRY" record. `logmanager.rs`'s
+    // `jul_trace_marker` is itself null-receiver tolerant (it early-returns
+    // on a null `this`), so the original NPE cannot recur.
+    //
+    // `readConfiguration()V` now resolves to `logmanager.rs`'s handler,
+    // which is ALSO a no-op — but a deliberate, documented one:
+    // `java.util.logging.config.file` can name a `config` class to
+    // instantiate, so parsing untrusted logging config is a code-execution
+    // vector. Dropping the undocumented duplicate leaves the security
+    // rationale attached to the one surviving site.
     r.register(
         "java/util/logging/LogRecord",
         "getSequenceNumber",
         "()J",
         t16_lr_get_sequence_number,
-    );
-    r.register(
-        "java/util/logging/LogManager",
-        "readConfiguration",
-        "()V",
-        t16_log_noop,
     );
 
     // MulticastSocket overrides live in `net.rs`.

@@ -13,15 +13,41 @@
 //! The fix is two-part:
 //!   1. A late-phase native override (`register_uncaught_handler_natives`)
 //!      that stores the per-instance handler in a global side-table
-//!      keyed by Thread `ObjectRef`.  We can't write to a real-JDK
-//!      `Thread.uncaughtExceptionHandler` field directly because
-//!      synthetic and real-JDK Thread layouts diverge and the field
-//!      offset isn't stable.  A side-table sidesteps that.
+//!      keyed by Thread `ObjectRef`.
 //!   2. `vm_exec.rs::thread_start` calls `take_uncaught_handler` after
 //!      `Thread.run()` returns Err, and if a handler is registered it
 //!      invokes `handler.uncaughtException(thread, throwable)` via the
 //!      shared dispatch path.  Default-handler fallback is also
 //!      consulted via `default_uncaught_handler`.
+//!
+//! REAL-JDK MIRRORING (2026-07-27).  The side table alone is invisible to
+//! real `java.lang.Thread` bytecode: HotSpot's own
+//! `dispatchUncaughtException` reads the REAL
+//! `Thread.uncaughtExceptionHandler` instance field (and, through the
+//! `ThreadGroup` chain, the REAL `Thread.defaultUncaughtExceptionHandler`
+//! static), so in the default real-JDK mode a handler that only ever
+//! reached the side table was silently dropped — `setUncaughtExceptionHandler`
+//! and `setDefaultUncaughtExceptionHandler` both had no observable effect.
+//! Whether the native or the real bytecode wins dispatch for these four
+//! methods differs per call path (see
+//! `interpreter::force_native_over_real_jdk_bytecode` vs.
+//! `invoke_or_native`), so the two stores are now kept in sync in BOTH
+//! directions:
+//!   * every setter writes the side table AND the real field/static;
+//!   * every getter reads the side table first and falls back to the real
+//!     field/static.
+//! The real writes go through `set_field_by_name` /
+//! `set_static_field_by_name`, i.e. they are resolved by NAME against the
+//! loaded class — never a hardcoded slot index, which would be wrong for a
+//! real JDK layout.  Both helpers are documented no-ops when the field does
+//! not exist, so on a SYNTHETIC `java/lang/Thread` stub (flat `_f0.._fN`
+//! slots, no `uncaughtExceptionHandler` field — see
+//! `class_manager::synthetic_stub_fields`) the mirror silently does nothing
+//! and the side table remains the only storage, exactly as before.
+//!
+//! The side-table lookups intentionally keep priority over the real field:
+//! they are the only storage that survives a synthetic Thread layout, and
+//! when both are populated they hold the same object anyway.
 //!
 //! The side-table is bounded (`MAX_TRACKED_THREADS`) so a long-lived
 //! VM with thousands of dead Thread objects can't leak handlers
@@ -95,6 +121,62 @@ pub fn default_uncaught_handler(ctx: &dyn NativeContext) -> Option<ObjectRef> {
     Some(ctx.read_var_handle_root(key).unwrap_or(cached))
 }
 
+/// Name of the real `java.lang.Thread` instance field that HotSpot's own
+/// `Thread.uncaughtExceptionHandler(UncaughtExceptionHandler)` bytecode
+/// writes and that `getUncaughtExceptionHandler()` /
+/// `dispatchUncaughtException(Throwable)` read back.
+const REAL_HANDLER_FIELD: &str = "uncaughtExceptionHandler";
+
+/// Name of the real `java.lang.Thread` STATIC field behind
+/// `set/getDefaultUncaughtExceptionHandler`.  `ThreadGroup.uncaughtException`
+/// consults it at the end of the parent chain, so mirroring into it keeps the
+/// real dispatch chain working even when the native setter is the one that
+/// ran.
+const REAL_DEFAULT_HANDLER_FIELD: &str = "defaultUncaughtExceptionHandler";
+
+/// Mirror the per-thread handler into the REAL `Thread.uncaughtExceptionHandler`
+/// field, resolved by NAME on the receiver's own loaded class.
+///
+/// No-op when the field does not exist (synthetic `Thread` stub) — see
+/// `NativeHeapAccess::set_field_by_name`, which is specified to do nothing when
+/// the name does not resolve in the receiver's class hierarchy.  Writing a
+/// field never allocates and never safepoints, so the caller's `thread` /
+/// `handler` locals cannot go stale across it.
+fn mirror_real_handler(ctx: &dyn NativeContext, thread: ObjectRef, handler: Option<ObjectRef>) {
+    ctx.set_field_by_name(thread, REAL_HANDLER_FIELD, Value::Object(handler));
+}
+
+/// Read the REAL `Thread.uncaughtExceptionHandler` instance field, by name.
+/// `None` when the field is absent (synthetic layout) or null.
+pub fn real_thread_handler(ctx: &dyn NativeContext, thread: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(thread, REAL_HANDLER_FIELD) {
+        Value::Object(Some(h)) => Some(h),
+        _ => None,
+    }
+}
+
+/// Mirror the process-wide default into the REAL
+/// `Thread.defaultUncaughtExceptionHandler` static, resolved by name.
+/// No-op when `java/lang/Thread` or the static cannot be resolved.
+fn mirror_real_default_handler(ctx: &mut dyn NativeContext, handler: Option<ObjectRef>) {
+    ctx.set_static_field_by_name(
+        "java/lang/Thread",
+        REAL_DEFAULT_HANDLER_FIELD,
+        Value::Object(handler),
+    );
+}
+
+/// Read the REAL `Thread.defaultUncaughtExceptionHandler` static, by name.
+/// `None` when the class/field cannot be resolved (synthetic stub) or null.
+pub fn real_default_handler(ctx: &dyn NativeContext) -> Option<ObjectRef> {
+    let class_id = ctx.class_id_by_name("java/lang/Thread")?;
+    let index = ctx.static_field_index_by_name(class_id, REAL_DEFAULT_HANDLER_FIELD)?;
+    match ctx.get_static_field(class_id, index) {
+        Value::Object(Some(h)) => Some(h),
+        _ => None,
+    }
+}
+
 fn store_handler(ctx: &mut dyn NativeContext, thread: ObjectRef, handler: ObjectRef) {
     let tkey = ctx.identity_hash_code(thread);
     {
@@ -145,8 +227,18 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
                 _ => return Ok(None),
             };
             match args.get(1) {
-                Some(Value::Object(Some(h))) => store_handler(ctx, this, *h),
-                Some(Value::Object(None)) | None => clear_handler(&*ctx, this),
+                Some(Value::Object(Some(h))) => {
+                    // Mirror into the REAL field FIRST, while `this`/`h` are
+                    // still exactly the addresses `safe_native_call` pinned on
+                    // entry: `set_field_by_name` neither allocates nor
+                    // safepoints, so nothing can have moved yet.
+                    mirror_real_handler(&*ctx, this, Some(*h));
+                    store_handler(ctx, this, *h);
+                }
+                Some(Value::Object(None)) | None => {
+                    mirror_real_handler(&*ctx, this, None);
+                    clear_handler(&*ctx, this);
+                }
                 _ => {}
             }
             Ok(None)
@@ -166,13 +258,20 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(t))) => *t,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            if let Some(h) = get_uncaught_handler(&*ctx, this) {
+            // Side table first, then the REAL field: the handler may have been
+            // installed by the real `Thread` bytecode on a call path where the
+            // native lost dispatch, in which case only the field is populated.
+            if let Some(h) =
+                get_uncaught_handler(&*ctx, this).or_else(|| real_thread_handler(&*ctx, this))
+            {
                 return Ok(Some(Value::Object(Some(h))));
             }
-            Ok(Some(match default_uncaught_handler(&*ctx) {
-                Some(h) => Value::Object(Some(h)),
-                None => Value::Object(None),
-            }))
+            Ok(
+                match default_uncaught_handler(&*ctx).or_else(|| real_default_handler(&*ctx)) {
+                    Some(h) => Some(Value::Object(Some(h))),
+                    None => Some(Value::Object(None)),
+                },
+            )
         },
     );
 
@@ -183,15 +282,23 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
         "setDefaultUncaughtExceptionHandler",
         "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
         |ctx, args| {
-            let entry = match args.first() {
-                Some(Value::Object(Some(h))) => {
+            let handler = match args.first() {
+                Some(Value::Object(Some(h))) => Some(*h),
+                _ => None,
+            };
+            // Mirror into the REAL static first (no allocation, no safepoint),
+            // so `ThreadGroup.uncaughtException`'s parent-chain fallback — real
+            // bytecode that cannot see the side table — finds it too.
+            mirror_real_default_handler(ctx, handler);
+            let entry = match handler {
+                Some(h) => {
                     // Keep alive + registry-remapped across GC moves
                     // (VarHandle-root pattern); key computed on the
                     // just-registered address, no allocation in between.
-                    ctx.register_var_handle_root(*h);
-                    Some((ctx.identity_hash_code(*h), *h))
+                    ctx.register_var_handle_root(h);
+                    Some((ctx.identity_hash_code(h), h))
                 }
-                _ => None,
+                None => None,
             };
             *default_handler().lock() = entry;
             Ok(None)
@@ -204,10 +311,12 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
         "getDefaultUncaughtExceptionHandler",
         "()Ljava/lang/Thread$UncaughtExceptionHandler;",
         |ctx, _args| {
-            Ok(Some(match default_uncaught_handler(&*ctx) {
-                Some(h) => Value::Object(Some(h)),
-                None => Value::Object(None),
-            }))
+            Ok(
+                match default_uncaught_handler(&*ctx).or_else(|| real_default_handler(&*ctx)) {
+                    Some(h) => Some(Value::Object(Some(h))),
+                    None => Some(Value::Object(None)),
+                },
+            )
         },
     );
 

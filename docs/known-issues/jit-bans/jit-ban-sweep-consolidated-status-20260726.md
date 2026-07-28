@@ -25,8 +25,8 @@ retain full evidence/repro details; this file is the summary.
 | TOMCAT-DOHEAD-JUNIT-ITERATOR.1 | `TestClass.collectAnnotatedMethodValues` | real junit-4.13.2, blanket-ban-lifted-too |
 | JSONSMART-PARSER.1 | `net/minidev/json/parser/` | real json-smart-2.3.jar; re-confirmed 2026-07-27 against json-smart-2.6.0 (3M round-trip ops, 0 errors), ban retired |
 | SPB.9 | `org/slf4j/`,`ch/qos/logback/`,`org/apache/commons/logging/` | real jcl-over-slf4j+logback |
-| JASPER-JDT.2 | `org/eclipse/jdt/internal/compiler/parser/` | real Tomcat TestCompiler, 2x2 repeated runs |
-| JASPER-JDT.3 | `org/eclipse/jdt/internal/compiler/ast/` | real Tomcat TestFormAuthenticatorA, 2x2 repeated runs |
+| JASPER-JDT.2 | `org/eclipse/jdt/internal/compiler/parser/` | **this row is void** — the runs had the virtual direct-entry path off, so nothing was measured; ban RESTORED 2026-07-27, then removed for good 2026-07-28 once root-caused to `613b10f4c` (see below) |
+| JASPER-JDT.3 | `org/eclipse/jdt/internal/compiler/ast/` | **this row is void** — same reason; RESTORED 2026-07-27, removed for good 2026-07-28 |
 | SPB.9d | `com/sun/beans/`,`java/beans/` | pure-JDK BeanIntrospectorProbe |
 | SPB.9b (partial) | `org/springframework/beans/factory/support/` | real spring-beans-7.0.7.jar |
 | SPB.9c | `context/annotation/`,`context/support/`,`core/io/support/`,`beans/factory/` | real spring-context-7.0.7.jar |
@@ -82,13 +82,13 @@ lifted):
 ## Kept — confirmed still needed, with real evidence
 
 - ~~**JAXB** (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27.** The QName-compare corruption no longer reproduces, including on a pre-fix binary under this session's own exact 2026-07-26 configuration, so it was closed by general JIT work landed between the two dates. What the 4000-iteration probe was still dying on was a separate general bug in a **JDK** class, now fixed.
-- ~~**ES fragile cluster** (`org/elasticsearch/`)~~ — **REMOVED 2026-07-27.** The `FloatFieldBlockLoaderTests` regression that kept it (38→41 failures) was the stale-compiled-entry defect in `try_jit_compile_callee`, not ES code: the class is now 31 failures with the ban on and 31 with it off, and a 19-class spread sample plus 3×3 runs of `TextFieldMapperTests` are identical either way. `docs/internal/es-fragile-cluster-confirmed-needed-20260726.md`, `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`.
+- ~~**ES fragile cluster** (`org/elasticsearch/`)~~ — **REMOVED 2026-07-27.** The `FloatFieldBlockLoaderTests` regression that kept it (38→41 failures) was the stale-compiled-entry defect in `try_jit_compile_callee`, not ES code: the class is now 31 failures with the ban on and 31 with it off, and a 19-class spread sample plus 3×3 runs of `TextFieldMapperTests` are identical either way. See the retired `es-fragile-cluster-confirmed-needed-20260726` and `nodeconnections-retired-jit-code-jump-20260727` write-ups.
 - **HIB-TEMPORAL.1** (`org/hibernate/`) — real Hibernate ORM 8.0 harness, lifting causes a full `StrategySelectionException` bootstrap cascade. `docs/known-issues/hib-temporal-1-still-needed-20260726.md`.
 
 ## Blocked — real, still-open, NOT this session's to fix (architectural)
 
 - ~~**Keycloak class-resolution loader-blindness**~~ / ~~**KC26-PIC.1 / KC26-RX.1 / KC26.LR**~~ — **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`). (The original entries claimed `ClassManager::find_class_bytes_delegated` needed a fourth loader path across "149 call sites"; that file was never touched. The defect was ordering: a fabricated stub is registered globally under `Application`, which poisons the binary name so the owning custom loader can never define the real class.)
-- **SuppressWarnings annotation bug** — any source containing `@SuppressWarnings("...")` fails in-process javac compilation (unrelated to any JIT ban, reproduces with JIT fully disabled). `docs/known-issues/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
+- ~~**SuppressWarnings annotation bug**~~ — **UPDATE 2026-07-27 — CLOSED.** Any source containing `@SuppressWarnings("...")` failed in-process javac compilation (unrelated to any JIT ban, reproduced with JIT fully disabled). Root cause was `LinkedHashSet.remove(Object)` deleting the element but returning `false` — javac's `Annotate.attributeAnnotation` reports `duplicate element 'value' in annotation @X` exactly when `members.remove(method)` answers false, so *every* annotation with a `value` element was uncompilable in-process. Fixed in `native-collections`/`native-builtins`; write-up retired out of `known-issues`. The doc's own hypothesis (duplicated `value` element in CratonVM's annotation metadata) was measured and refuted. Its follow-up question — whether `SPRING-TESTCOMPILER.3`'s symptom (a) was this bug — was tested and refuted too; that ban stays (see below).
 
 ## Blocked — genuinely missing fixture, confirmed absent (double-checked)
 
@@ -99,6 +99,7 @@ lifted):
 ## Tested, hypothesis refuted (no action, but investigated properly)
 
 - **TYPES-ERASURE.1 consolidation hypothesis** — tested whether banning `Types.erasure` alone subsumes the other 7 javac-family bans (`SPRING-TESTCOMPILER.1-4`, `HIB-STOREDPROC-JIT.1`). Refuted — all 8 are independent miscompiles. `docs/known-issues/javac-family-consolidation-hypothesis-refuted-20260726.md`. **These 8 bans remain active and correctly so** — not a gap, a confirmed-necessary state.
+- **`SPRING-TESTCOMPILER.3` symptom (a) == the SuppressWarnings bug?** (2026-07-27) — tested by un-banning `ClassFinder.complete` in an env-gated build with the SuppressWarnings fix in place and every other ban active. Refuted: `AutowiredAnnotationBeanRegistrationAotContributionTests` 14/14 → 9/14 (all 5 `DeprecationTests`) and `BeanDefinitionMethodGeneratorTests` 34/34 → 32/34. The ban stays, and now has a Spring-free standalone reproducer (`DeprecationSuppressionProbe.java`) plus a narrowed mechanism — see the `SPRING-TESTCOMPILER.3` comment in `vm/src/jit/skip_list.rs`.
 
 ## Found, not a ban, new VM bugs discovered this session
 
