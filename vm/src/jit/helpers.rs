@@ -9925,6 +9925,17 @@ mod tests {
     }
 }
 
+/// The `JIT_THREAD` TLS slot as a plain address, with none of the
+/// `jit_get_current_thread` side effects (that one also invalidates the
+/// per-thread JIT-scan cache, which must not happen from a GC root walk).
+///
+/// Zero when this thread is not currently inside a JIT invocation. Callers use
+/// it to CHECK a thread pointer recovered from a raw frame slot, never to
+/// dereference one.
+pub fn current_jit_thread_ptr() -> usize {
+    JIT_THREAD.with(|t| t.get()) as usize
+}
+
 /// Return the current thread's `JvmThread` pointer for the JIT inline
 /// TLAB bump-pointer fast path.
 ///
