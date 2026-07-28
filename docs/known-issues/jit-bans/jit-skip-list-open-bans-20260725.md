@@ -434,7 +434,18 @@ fixture: `org.apache.jasper.compiler.TestCompiler` (JASPER-JDT.2) and
 ban, not in the original ~46 -- see commit for details). Fixes
 `TestCompiler` 8/12 -> 12/12.
 
-**Residual, NOT yet fixed:** `TestFormAuthenticatorA`/`TestCompiler`
+**UPDATE 2026-07-28 — JASPER-JDT.2 and JASPER-JDT.3 are CLOSED.** Both bans
+were removed on 2026-07-26, RESTORED on 2026-07-27 (all four re-verification
+runs had the compiled-callee virtual direct-entry path off, so they measured
+an inert dispatch), and removed for good on 2026-07-28 after the defect was
+bisected to `613b10f4c` ("fix(jit): LICM/speculative pre-header bypassed by a
+branch into the loop header") and confirmed causally on one current-`dev`
+binary. Re-verified with the bans deleted: `TestOptionalELResolverInJsp` 3/3,
+`TestFormAuthenticatorA/B/C` 2/2 each, `TestCompiler` 2/2, with 167 parser +
+29 ast methods actually compiling per run. Full evidence in the retired
+`jasper-jdt-2-3-fixed-licm-preheader-20260728` write-up.
+
+**Residual, filed 2026-07-26, not observed since:** `TestFormAuthenticatorA`/`TestCompiler`
 still hit a SECOND, independent JIT bug in
 `org/apache/catalina/webresources/`: `AbstractResourceSet.checkPath`
 throws `IllegalArgumentException: The requested path [/WEB-INF/...] is
@@ -449,6 +460,14 @@ level) -- likely a similar family to the KEYEDLOCK-COMPUTE.1 fix just
 landed (String read shortly after construction/mutation reading a stale
 value) but not yet isolated to one method. Flagging for a future session
 rather than continuing further given time already spent this session.
+
+2026-07-28: zero occurrences across the ~46 real-Tomcat runs done to close
+JASPER-JDT.2/.3 (`TestFormAuthenticatorA/B/C`, `TestCompiler`,
+`TestOptionalELResolverInJsp`, all with the JDT packages JIT-compiled). Not
+targeted, so this is an absence and not a fix — but the `613b10f4c`
+pre-header bypass is a plausible cause (an elided bounds check or a stale
+hoist slot on a bypassed loop entry is exactly how a correct string reads
+back wrong), and current `dev` does not show it.
 
 **Result: HIB-BIGINTEGER-AIOOBE.2 landed 2026-07-26 11:20 UTC** (widened
 HIB-BIGINTEGER-AIOOBE.1's scope from MutableBigInteger-only to also cover

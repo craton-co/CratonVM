@@ -31,8 +31,27 @@ each on real Tomcat fixtures. With the flag on, real Tomcat
 `jakarta.el.TestOptionalELResolverInJsp` fails 3/3 (JSP compile dies with
 `ClassCastException: ...ast.QualifiedTypeReference cannot be cast to
 ...ast.FieldDeclaration` → HTTP 500) and passes 3/3 with `parser/` denied. Both
-bans are RESTORED; `parser/` is directly re-confirmed, `ast/` on the shadowing
-argument.
+bans were RESTORED on 2026-07-27; `parser/` directly re-confirmed, `ast/` on the
+shadowing argument.
+
+**UPDATE 2026-07-28 — both bans REMOVED, this time root-caused.** The failure
+was bisected across the 150 commits from the restore point to `dev` (two runs
+per step, both packages allowed, direct-entry path ON) to `613b10f4c`,
+"fix(jit): LICM/speculative pre-header bypassed by a branch into the loop
+header", and confirmed causally on a single current-`dev` binary with an
+env-gated revert of that guard: pre-fix behaviour 2/2 FAIL with the identical
+`ClassCastException`, shipping behaviour 2/2 PASS. Speculative pre-headers
+(LICM hoists and bounds-check-elision guards alike) are emitted at the
+loop-header PC and skipped by a forward branch into the header, so the loop ran
+with an uninitialised hoist slot or with bounds checks elided by a guard that
+never executed — which is exactly the AIOOBE / wrong-AST-node face both bans
+were opened for. Re-verified with the bans deleted (167 parser + 29 ast methods
+actually compiling): `TestOptionalELResolverInJsp` 3/3,
+`TestFormAuthenticatorA/B/C` 2/2 each, `TestCompiler` 2/2. See the retired
+`jasper-jdt-2-3-fixed-licm-preheader-20260728` write-up.
+
+The *rule* above still stands unchanged — it is what caught this in the first
+place.
 
 **Action for the rest of this inventory:** every removal in the 2026-07-25/26
 sweep justified by "no longer reproduces" needs re-checking with
@@ -151,12 +170,16 @@ checkouts onto the host or finding an equivalent real app.
   SPRINGBOOT-WITHOUT-JACKSON.2 — check before assuming a real-app test is
   needed).
 - **JASPER-JDT.3 residual** (`org/apache/catalina/webresources/AbstractResourceSet.checkPath`)
-  — this is not a ban to lift; it is an OPEN, already-flagged bug (a
-  distinct JIT-only `IllegalArgumentException` for a path that visibly
-  does start with `/`) found by a prior session while testing JASPER-JDT.3,
-  explicitly deferred as its own follow-up item (see
-  `docs/known-issues/jit-skip-list-open-bans-20260725.md`,
-  "JASPER-JDT.2 / JASPER-JDT.3" section).
+  — this is not a ban to lift; it is an already-flagged bug (a distinct
+  JIT-only `IllegalArgumentException` for a path that visibly does start
+  with `/`) found by a prior session while testing JASPER-JDT.3, explicitly
+  deferred as its own follow-up item (see
+  `docs/known-issues/jit-bans/jit-skip-list-open-bans-20260725.md`,
+  "JASPER-JDT.2 / JASPER-JDT.3" section). **2026-07-28: not observed in any
+  of the ~46 real-Tomcat runs done to close JASPER-JDT.2/.3** (26 suite runs
+  plus the bisect runs, all with the JDT packages compiling). That is an
+  absence rather than a fix — nothing targeted it and it was intermittent
+  when filed — but current `dev` does not show it.
 - **SPRING-TESTCOMPILER.1-4, HIB-STOREDPROC-JIT.1** (the other 6
   javac-family bans alongside TYPES-ERASURE.1) — the consolidation
   hypothesis (fixing/banning `Types.erasure` alone might subsume these)
