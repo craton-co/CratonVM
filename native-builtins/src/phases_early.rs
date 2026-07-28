@@ -13027,6 +13027,15 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
+            // Mirrors the same check in `jca::cipher::register_cipher_dispatch`
+            // — whichever registration wins, an unregistered provider name has
+            // to be rejected rather than silently ignored.
+            crate::jca::provider_chain::check_named_provider_arg(
+                ctx,
+                args,
+                1,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             let algo = obj_arg(args, 0)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
@@ -15551,6 +15560,13 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Signature;",
         |ctx, args| {
+            // Mirrors the same check in `jca::signature::sig_get_instance`.
+            crate::jca::provider_chain::check_named_provider_arg(
+                ctx,
+                args,
+                1,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
             let algo = obj_arg(args, 0)?;
             let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 4);
             ctx.set_field(obj, 0, Value::Object(Some(algo)));

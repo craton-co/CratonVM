@@ -1514,6 +1514,15 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
+            // Real `Cipher.getInstance(String, String)` resolves the provider
+            // name first (and capitalises both of its messages, unlike the
+            // shared `GetInstance` path) — see `check_named_provider_arg`.
+            crate::jca::provider_chain::check_named_provider_arg(
+                ctx,
+                args,
+                1,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
             check_transformation_supported(ctx, &algo_str)?;
