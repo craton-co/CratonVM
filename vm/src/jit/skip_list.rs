@@ -313,33 +313,60 @@ pub enum InitComplexity {
 /// Every other opcode is benign. The scan stops at the first
 /// disqualifier and returns `Complex`. If it walks the entire stream
 /// without finding one, it returns `Trivial`.
-/// Bisect knob (default OFF — no behaviour change): treat a constructor whose
-/// ONLY disqualifier is `putfield` as `Trivial`, keeping the ban for
-/// `putstatic` / `monitorenter` / `monitorexit` / `invokedynamic`.
+/// **DEFAULT ON since 2026-07-28.** A constructor whose ONLY disqualifier is
+/// `putfield` classifies as `Trivial` and is JIT-eligible; the ban is retained
+/// for `putstatic` / `monitorenter` / `monitorexit` / `invokedynamic`.
 ///
-/// Why this knob exists. `putfield` is what essentially every *real*
-/// constructor does — it is the whole point of one — so the blanket gate makes
+/// **Kill switch: `CRATONVM_JIT_PUTFIELD_INIT=0`** (also `off` / `false` /
+/// `no`) restores the historical blanket ban with no rebuild. If a regression
+/// run turns up a miscompile, a wrong result, or a crash, set that and re-run
+/// before doing anything else — it is the fastest possible attribution test for
+/// this change, and it cleanly separates "constructor compilation broke it"
+/// from everything else in the same build.
+///
+/// Why the ban was lifted. `putfield` is what essentially every *real*
+/// constructor does — it is the whole point of one — so the blanket gate made
 /// "allocate an object whose constructor assigns a field" run its constructor
-/// in the interpreter forever. Measured from C2-compiled code on the
-/// `CallRate` probe: ~2200 ns/alloc for a one-field constructor against
-/// ~130-160 ns for a field-store-free one, i.e. the gate, not allocation
-/// itself, is the dominant cost of `new` on every hot path in the VM
-/// (`new String(...)`, `new HashMap.Node(...)`, ...).
+/// in the interpreter forever, and unlike the RBC.6 gate such a constructor was
+/// never even *enqueued* for compilation (no `tiered-enqueue` line at all).
+/// That is a VM-wide ceiling on `new`: `new String(...)`,
+/// `new HashMap.Node(...)`, essentially the whole JDK. Measured on the
+/// `CallRate.allocBody` probe from C2-compiled code: **1846 ns/alloc banned vs
+/// 226 ns/alloc allowed — 8.2x** — with the empty-constructor controls
+/// (`allocArg` / `allocBare` / `allocNoCtor`) flat, so the change does only
+/// what it claims.
 ///
-/// The ban predates the open-source import (`a6dc911ed`) and is one of the
-/// four *structural* bans; unlike the ~46 named correctness bans it carries no
-/// incident write-up — only the "field stores trigger the JIT's
-/// load-forwarding interaction" note above. Per the ban-sweep methodology in
-/// `docs/known-issues/jit-bans/jit-skip-list-open-bans-20260725.md`, the first
-/// move on an unverified ban is to make it testable at runtime rather than to
-/// delete it. Set `CRATONVM_JIT_ALLOW_PUTFIELD_INIT=1` to lift it for a
-/// measurement run.
+/// Evidence gathered before flipping: the `CtorCheck` probe — which READS BACK
+/// every field, so an elided or miscompiled constructor cannot hide behind a
+/// good-looking timing — produces byte-identical checksums across HotSpot,
+/// CratonVM `--nojit`, ban-on and ban-off at 200k and 2M iterations, covering
+/// plain stores, a superclass ctor storing before a subclass ctor, a store fed
+/// by an instance-method call on the half-built object, and a conditional
+/// store. 26 tests across six JIT test binaries pass with it lifted, and a
+/// six-class Tomcat sweep showed no attributable regression (every non-PASS in
+/// that sweep reproduces identically with the ban ON).
+///
+/// What that evidence does NOT cover, stated plainly: this ban predates the
+/// open-source import (`a6dc911ed`) and is one of the four *structural* bans;
+/// unlike the ~46 named correctness bans it carries no incident write-up, only
+/// the "field stores trigger the JIT's load-forwarding interaction" note above.
+/// None of the above proves that rationale stale — it shows only that the tests
+/// run so far do not catch it. Flipped by explicit maintainer decision with a
+/// full regression run to follow; that run is the real verdict, which is why
+/// the kill switch exists.
 fn allow_putfield_init() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_ALLOW_PUTFIELD_INIT").is_some()
-    })
+    *ON.get_or_init(
+        || match cratonvm_types::flags::runtime_var("CRATONVM_JIT_PUTFIELD_INIT") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            ),
+            // Default: a constructor that only stores fields is compilable.
+            Err(_) => true,
+        },
+    )
 }
 
 pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
@@ -349,9 +376,11 @@ pub fn classify_init_complexity(bytecode: &[u8]) -> InitComplexity {
     while pc < bytecode.len() {
         let op = bytecode[pc];
         match op {
-            // `putfield` alone is separable from the other four: see
-            // `allow_putfield_init`. When the knob is off this arm is
-            // unreachable and the classification is byte-identical to before.
+            // `putfield` alone is separable from the other four: it is benign
+            // by default since 2026-07-28 — see `allow_putfield_init`, which
+            // also documents the `CRATONVM_JIT_PUTFIELD_INIT=0` kill switch.
+            // With that set this arm is unreachable and the classification is
+            // byte-identical to the historical behaviour.
             0xb5 if allow_putfield => {}
             0xb3 | 0xb5 | 0xc2 | 0xc3 | 0xba => return InitComplexity::Complex,
             _ => {}
