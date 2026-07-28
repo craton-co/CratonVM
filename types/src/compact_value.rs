@@ -307,6 +307,13 @@ pub fn object_degradation_count() -> u64 {
 ///
 /// Intended for test harnesses and fuzzers that want to measure degradations
 /// over a bounded window. Not used on any hot path.
+///
+/// **Prefer a delta** (`count_after - count_before`) over reset-then-assert.
+/// The counter is process-wide, so a reset is not "my window starts here" — it
+/// destroys whatever window any concurrent observer had already opened. This
+/// crate's own tests measured absolute counts after a reset and were flaky for
+/// exactly that reason; they now take
+/// [`degrade_counter_test_lock`] *and* assert deltas, and no longer call this.
 #[inline]
 pub fn reset_object_degradation_count() -> u64 {
     OBJECT_DEGRADATION_COUNT.swap(0, Ordering::Relaxed)
@@ -329,6 +336,25 @@ pub(crate) fn note_object_degradation() {
     if prev == 0 {
         emit_first_degradation_diag();
     }
+}
+
+/// Test-only mutex serialising every test that exercises a **degrading**
+/// decode path.
+///
+/// [`OBJECT_DEGRADATION_COUNT`] is one process-wide counter and `cargo test`
+/// runs the whole crate's tests in one process, in parallel — so a test that
+/// merely *triggers* a degradation perturbs any concurrently-running test that
+/// *counts* them. Both kinds must hold this lock, and that includes the
+/// degrading tests over in `crate::value` (`decode_value`'s `VTAG_OBJECT`
+/// cold path feeds this same counter through `note_object_degradation`), which
+/// is why the mutex lives here at module scope rather than inside
+/// `compact_value::tests` where it started: a lock only half the degraders can
+/// name is not a lock. Missing it is a flaky `assert_eq!(count, N)` under
+/// load, not a deterministic failure.
+#[cfg(test)]
+pub(crate) fn degrade_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Cold one-shot diagnostic for the first observed long↔object collision.
@@ -2386,6 +2412,7 @@ mod tests {
 
     #[test]
     fn to_value_null_ptr_subobject_decodes_as_long() {
+        let _guard = super::degrade_counter_test_lock();
         // BC SM2 fix (2026-05-28): `CompactValue::long` stores long bits
         // verbatim, so a slot with SUB_OBJECT bits and a null payload
         // could equally be a primitive long whose pattern landed here.
@@ -2552,6 +2579,7 @@ mod tests {
 
     #[test]
     fn to_value_unaligned_ptr_subobject_decodes_as_long() {
+        let _guard = super::degrade_counter_test_lock();
         // BC SM2 fix (2026-05-28): a NaN-tagged slot with SUB_OBJECT bits
         // but an unaligned payload cannot be a real object reference
         // (`CompactValue::object` panics on unaligned pointers), so it
@@ -2799,15 +2827,13 @@ mod tests {
 
     // ── HIGH: NaN-box long↔object type-confusion — checked decoders ──────
 
-    // The degradation counter is a process-wide static; serialize the tests
-    // that read/reset it so parallel `cargo test` runs don't interleave.
-    static DEGRADE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The lock that serialises every degrading test lives at module scope
+    // (`super::degrade_counter_test_lock`) so `crate::value`'s degrading tests
+    // can take the same one — see its doc comment.
 
     #[test]
     fn decode_by_descriptor_l_rejects_unseen_subobject_payload() {
-        let _guard = DEGRADE_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = super::degrade_counter_test_lock();
         let raw = make_tagged(SUB_OBJECT, 0x0000_6CCC_DDDD_E000);
         let cv = CompactValue::from_bits(raw);
         assert!(matches!(cv.decode_by_descriptor(b'L'), Value::Object(None)));
@@ -2820,31 +2846,31 @@ mod tests {
     /// and counts the degradation.
     #[test]
     fn to_value_checked_degrades_fabricated_pointer_to_long() {
-        let _guard = DEGRADE_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = super::degrade_counter_test_lock();
         // Aligned (multiple of 8), non-null payload inside a SUB_OBJECT slot.
         let aligned = 0x0000_6BAD_CAFE_D000u64; // % 8 == 0, non-zero
         let raw = make_tagged(SUB_OBJECT, aligned);
         let cv = CompactValue::from_bits(raw);
 
         // Context-free path rejects the never-seen payload instead of
-        // fabricating an object reference.
-        reset_object_degradation_count();
+        // fabricating an object reference. Assert the DELTA rather than
+        // resetting: the counter is process-wide, and zeroing it would
+        // silently break whatever other test is mid-count.
+        let base = object_degradation_count();
         match cv.to_value() {
             Value::Long(x) => assert_eq!(x as u64, raw),
             other => panic!("unchecked to_value should degrade to Long, got {other:?}"),
         }
-        assert_eq!(object_degradation_count(), 1);
+        assert_eq!(object_degradation_count() - base, 1);
 
         // Checked path with a heap that says "not a live object" degrades to
         // the bit-exact long and records the reclassification.
-        reset_object_degradation_count();
+        let base = object_degradation_count();
         match cv.to_value_checked(|_addr| false) {
             Value::Long(x) => assert_eq!(x as u64, raw),
             other => panic!("checked to_value should degrade to Long, got {other:?}"),
         }
-        assert_eq!(object_degradation_count(), 1);
+        assert_eq!(object_degradation_count() - base, 1);
     }
 
     /// When the heap predicate confirms the address is live, the checked
@@ -2852,17 +2878,15 @@ mod tests {
     /// count a degradation.
     #[test]
     fn to_value_checked_keeps_live_object() {
-        let _guard = DEGRADE_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = super::degrade_counter_test_lock();
         let aligned = 0x1234_5678_ABC0u64;
         let cv = CompactValue::object(aligned);
-        reset_object_degradation_count();
+        let base = object_degradation_count();
         match cv.to_value_checked(|addr| addr == aligned) {
             Value::Object(Some(o)) => assert_eq!(o.as_ptr() as u64, aligned),
             other => panic!("expected live Object, got {other:?}"),
         }
-        assert_eq!(object_degradation_count(), 0);
+        assert_eq!(object_degradation_count() - base, 0);
     }
 
     /// `to_value_checked` is identical to `to_value` for every non-object
@@ -2891,18 +2915,16 @@ mod tests {
     /// counts a degradation when a SUB_OBJECT slot fails heap validation.
     #[test]
     fn is_object_checked_validates_against_heap() {
-        let _guard = DEGRADE_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = super::degrade_counter_test_lock();
         let aligned = 0x4000u64;
         let real = CompactValue::object(aligned);
         assert!(real.is_object()); // unchecked pattern test
         assert!(real.is_object_checked(|addr| addr == aligned));
 
-        reset_object_degradation_count();
+        let base = object_degradation_count();
         // Same bit pattern, but the heap denies it → false + degradation.
         assert!(!real.is_object_checked(|_| false));
-        assert_eq!(object_degradation_count(), 1);
+        assert_eq!(object_degradation_count() - base, 1);
 
         // Non-object slots short-circuit without consulting the heap.
         assert!(!CompactValue::int(1).is_object_checked(|_| panic!("called")));
@@ -2914,16 +2936,14 @@ mod tests {
     /// countable rather than invisible.
     #[test]
     fn to_value_unchecked_degrade_increments_counter() {
-        let _guard = DEGRADE_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        reset_object_degradation_count();
+        let _guard = super::degrade_counter_test_lock();
+        let base = object_degradation_count();
         // Null payload SUB_OBJECT → Long, counted.
         let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0)).to_value();
         // Unaligned payload SUB_OBJECT → Long, counted.
         let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0x1001)).to_value();
         let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0x0000_6AAA_BBBB_C000)).to_value();
-        assert_eq!(object_degradation_count(), 3);
+        assert_eq!(object_degradation_count() - base, 3);
     }
 
     // ── HIGH: null-page plausibility guard for the unchecked SUB_OBJECT decode ──
@@ -2955,9 +2975,7 @@ mod tests {
     /// `Value::Object(Some(ObjectRef::from_raw(0x8)))` — a fabricated pointer.
     #[test]
     fn to_value_unchecked_null_page_subobject_degrades_to_long() {
-        let _guard = DEGRADE_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = super::degrade_counter_test_lock();
         for &aligned_low in &[0x8u64, 0x10, 0x100, NULL_GUARD_PAGE - 8] {
             // Aligned + non-null but inside the null-guard page → cannot be a
             // real heap reference.
@@ -2968,7 +2986,7 @@ mod tests {
             // The slot is bit-pattern-classified as an object (pure test)...
             assert!(cv.is_object());
             // ...but the hardened decoder refuses to fabricate a pointer.
-            reset_object_degradation_count();
+            let base = object_degradation_count();
             match cv.to_value() {
                 Value::Long(x) => assert_eq!(
                     x as u64, raw,
@@ -2980,7 +2998,7 @@ mod tests {
                 ),
             }
             assert_eq!(
-                object_degradation_count(),
+                object_degradation_count() - base,
                 1,
                 "null-page degrade must be counted ({raw:#018x})",
             );
@@ -2994,9 +3012,7 @@ mod tests {
     /// into an object reference.
     #[test]
     fn crafted_long_with_null_page_object_bits_is_not_an_object() {
-        let _guard = DEGRADE_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = super::degrade_counter_test_lock();
         // Construct the exact colliding i64: NANBOX | (SUB_OBJECT<<47) | 0x8.
         let crafted = (NANBOX_BITS | (SUB_OBJECT << SUBTAG_SHIFT) | 0x8) as i64;
         let cv = CompactValue::long(crafted);

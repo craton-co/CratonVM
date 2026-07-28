@@ -1496,6 +1496,7 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_unseen_plausible_object_payload() {
+        let _guard = crate::compact_value::degrade_counter_test_lock();
         let unseen = 0x0000_6AAA_BBBB_C000u64;
         assert!(plausible_heap_pointer(unseen));
         assert!(matches!(
@@ -1539,6 +1540,7 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_null_object() {
+        let _guard = crate::compact_value::degrade_counter_test_lock();
         // T14 graceful degradation: a VTAG_OBJECT tag paired with a null
         // pointer is treated as Value::Object(None) rather than panicking,
         // so corrupted or zero-initialized slots don't crash the VM.
@@ -1547,6 +1549,7 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_unaligned_object() {
+        let _guard = crate::compact_value::degrade_counter_test_lock();
         // T14 graceful degradation: a VTAG_OBJECT tag paired with an
         // unaligned (non-8-byte-aligned) pointer is treated as
         // Value::Object(None) rather than panicking (KC16 SIGSEGV audit).
@@ -1558,6 +1561,7 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_null_page_object() {
+        let _guard = crate::compact_value::degrade_counter_test_lock();
         assert!(matches!(decode_value(8, VTAG_OBJECT), Value::Object(None)));
         assert!(matches!(
             decode_value(0xff8, VTAG_OBJECT),
@@ -1567,6 +1571,7 @@ mod tests {
 
     #[test]
     fn decode_value_rejects_out_of_range_object() {
+        let _guard = crate::compact_value::degrade_counter_test_lock();
         assert!(matches!(
             decode_value(1u64 << 47, VTAG_OBJECT),
             Value::Object(None)
@@ -1581,8 +1586,12 @@ mod tests {
     /// release-mode degrade path.
     #[test]
     fn decode_value_object_degrade_increments_counter() {
-        use crate::compact_value::{object_degradation_count, reset_object_degradation_count};
-        reset_object_degradation_count();
+        let _guard = crate::compact_value::degrade_counter_test_lock();
+        use crate::compact_value::object_degradation_count;
+        // DELTA, not a reset: the counter is process-wide and zeroing it would
+        // break whatever other degrading test is mid-count. The guard above
+        // keeps that "other test" from running concurrently at all.
+        let base = object_degradation_count();
         // Null pointer with VTAG_OBJECT → degrade.
         assert!(matches!(decode_value(0, VTAG_OBJECT), Value::Object(None)));
         // Unaligned non-null pointer with VTAG_OBJECT → degrade.
@@ -1598,9 +1607,9 @@ mod tests {
             Value::Object(None)
         ));
         assert!(
-            object_degradation_count() >= 4,
+            object_degradation_count() - base >= 4,
             "expected at least 4 degradations recorded, got {}",
-            object_degradation_count()
+            object_degradation_count() - base
         );
     }
 
@@ -1806,6 +1815,7 @@ mod tests {
     /// wild pointer that the caller would dereference.
     #[test]
     fn rawslot_decode_reference_degrades_implausible_bits() {
+        let _guard = crate::compact_value::degrade_counter_test_lock();
         for bad in [1u64, 4, 0xFFF, (1u64 << 47) | 8] {
             let slot = RawSlot::from_bits(bad);
             assert_eq!(
@@ -1823,6 +1833,7 @@ mod tests {
     /// slots, so pin it.
     #[test]
     fn rawslot_decode_reference_needs_no_provenance_record() {
+        let _guard = crate::compact_value::degrade_counter_test_lock();
         // Deliberately an address this process has never constructed an
         // ObjectRef for. Plausible (aligned, above the guard page, < 2^47) but
         // unknown to the provenance bitmap.

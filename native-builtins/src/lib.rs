@@ -7014,10 +7014,14 @@ pub fn register_essential_natives_with_shims(
     let prev_category = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
 
-    // JDK-module registrations stay unconditional. They used to be mixed
-    // into the WildFly datasource/naming/security registrars, which made
-    // those application packs impossible to omit safely.
+    // JDK-module registrations stay unconditional except for the synthetic
+    // InitialContext implementation.  A real JDK must execute its own JNDI
+    // provider-selection bytecode so application `jndi.properties` resources
+    // and user-supplied InitialContextFactory implementations are honored.
+    // The compact in-memory naming implementation has a synthetic field layout
+    // and is therefore valid only when the synthetic JDK feature is enabled.
     crate::wildfly_datasources_tx::register_jdk_datasource_natives(registry);
+    #[cfg(feature = "synthetic-jdk")]
     crate::wildfly_naming::register_jdk_naming_natives(registry);
     crate::wildfly_security::register_jdk_security_natives(registry);
 

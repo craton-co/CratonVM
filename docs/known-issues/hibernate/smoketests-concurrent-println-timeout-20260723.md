@@ -103,28 +103,53 @@ c1_threshold=500  hot_but_stuck_in_interpreter=1531
 ```
 
 **1531 of 1642 hot methods never compile**, and the entire process spends
-**1 ms** compiling. Every one of the top 30 stuck methods carries
+**1 ms** compiling. Every one of the top 30 stuck methods carried
 `tier_fail_count=3` — the `MAX_TIER_FAIL_RETRIES` permanent ban
-(`jit/src/tiered.rs:39`). They are trivial accessors called tens of thousands of
+(`jit/src/tiered.rs`). They are trivial accessors called tens of thousands of
 times: `SessionLocal.isClosed()Z` (55 348), `JdbcConnection.checkClosed()V`
 (44 468), `SessionImpl.isClosed()Z`, `AbstractQueuedSynchronizer.getState()I`.
 Same shape as the `action.queue` doc's root cause 2 and tomcat doc 30.
 
-The mechanism is the one `background_compile_task`'s own comment describes
-(`vm/src/runtime/interpreter.rs`): the tier manager keeps enqueueing methods the
-skip list rejects, the background task declines each one *before* its
-`CRATONVM_DBG=jitc` trace point, and three declines ban the method for the
-process. With `CRATONVM_DBG=jitc`, **78 of 92 enqueued methods never produce a
-`bg-compile` line at all** — they are enqueued at `invoc_count=500`, again at
-564, again at 628, then banned.
+**That reading was misleading, and the admission accounting has since been
+fixed** (commit `7f894b4da`). `tier_fail_count` was charged both for a compile
+that ran and failed *and* for a method the VM declined on policy, so a
+permanently-ineligible method was enqueued and declined three times before the
+counter saturated — and the resulting `tier_fail_count=3` was indistinguishable
+from genuinely broken codegen. The two are now separate, and the same line reads:
 
-For a large share of this workload that is skip-list-by-design rather than a
-compiler bug: `org/hibernate/` is banned wholesale (HIB-TEMPORAL.1) and the
-`AbstractQueuedSynchronizer` `getState`/`setState`/`compareAndSetState` family is
-banned unconditionally (`vm/src/jit/skip_list.rs:2558`) — and those are precisely
-the methods at the top of the stuck list. So the two facts compose: the hot code
-is mostly ineligible, and the part that *is* eligible does not pay off (row 3 of
-the lever table). Both have to change before this class can pass.
+```
+hot_but_stuck_in_interpreter=1519 (of which ineligible-by-policy=1513, compile-failures=6)
+```
+
+So **99.6% of the "never compiles" population is banned by design**, not by a
+compiler bug: `org/hibernate/` wholesale (HIB-TEMPORAL.1), `org/h2/`
+(HIB-LONGTAIL.1, `vm/src/jit/skip_list.rs`), and the
+`AbstractQueuedSynchronizer` `getState`/`setState`/`compareAndSetState` family.
+Those bans stand on their own correctness grounds; they are the reason this
+workload is interpreted, and they are what would have to change.
+
+The genuinely broken minority is **six methods**, now listed under their own
+`COMPILE FAILED (not policy — these are bugs)` heading in the same dump
+(they never appeared in the top 30, which is ranked by invocation count):
+
+| method | tier_fail_count |
+|---|---|
+| `java/time/Instant.create(JI)` | 3 |
+| `org/antlr/v4/runtime/atn/ATNSimulator.getCachedContext` | 3 |
+| `org/antlr/v4/runtime/atn/ATNDeserializer.stateFactory(II)` | 3 |
+| `java/util/IdentityHashMap.clone()` | 3 |
+| `java/util/concurrent/LinkedBlockingQueue.take()` | 2 |
+| `java/util/concurrent/LinkedBlockingQueue.offer(Object)` | 2 |
+
+These are the actionable JIT bugs this workload exposes. Fixing all six would
+not close this class — they are a rounding error against the 5.2x requirement —
+but they are real and they are now visible.
+
+The enqueue-churn mechanism, via `CRATONVM_DBG=jitc`: the tier manager kept
+re-enqueueing methods the skip list rejects, and `background_compile_task`
+declined each *before* its trace point, so **78 of 92 enqueued methods never
+produced a `bg-compile` line** — enqueued at `invoc_count=500`, again at 564,
+again at 628, then banned. Post-fix a decline is recorded on the first attempt.
 
 Checked and rejected as the cause: a global `any_class_redefined()` latch
 disabling all background compilation. `bg-compile` lines continue to the end of
@@ -153,8 +178,16 @@ aggregate `new long[16]` throughput was flat from 1 to 4 threads while
 bump, the zeroing, *and* the header init — so hold time scales with allocation
 size. Fixed in commit `7888b80b6` (arrays now share the object path's hardened
 refill machinery; `is_humongous` no longer locks). Interpreter array allocation
-gained **+36% aggregate at 4 threads**; bt18 canary 2332 -> 2126 ms with an
-unchanged checksum; Hibernate 20-class family 117/117.
+gained **+36% aggregate at 4 threads**; bt18 canary showed no collapse and an
+unchanged checksum (68332206); Hibernate 20-class family 117/117.
+
+Measurement warning for bt18 specifically: its absolute time on this shared box
+swings roughly **2100–4200 ms** with peer build load. A later interleaved A/B
+(4 rounds, control built from the same tree with only the changed files
+reverted) put two binaries at 3989 ms vs 3965 ms while single samples taken
+hours apart had read 2264 ms and 3790 ms — i.e. an apparent "63% regression"
+that was entirely host state. Never compare bt18 numbers across sessions; only
+interleaved A/B on one host state means anything.
 
 Effect on this test: **~3%** (382.9 s -> 372.6 s). Recorded here so nobody
 re-derives it: allocation scaling was real and worth fixing, but it is not what
