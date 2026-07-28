@@ -135,11 +135,80 @@ UDS listener can be polled by raw OS handle (it cannot be `try_clone`d into a
   `probe-java/UdsSelectorProbe.java` in the fix worktree) cover the
   bind → accept → read/write → close round trip and the Tomcat-shaped
   "blocking acceptor + Selector poller" topology; both match HotSpot output.
+* `org.apache.tomcat.util.net.TestXxxEndpoint` → `OK (3 tests)` again after
+  merging current `origin/dev` into the branch.
 * `cargo test -p cratonvm-native-io` — the four new `uds::tests` pass,
   including a real socket round trip. (The one failure in that crate,
   `nio_selector::tests::t19_7_a_select_with_timeout_respects_deadline`, fails
   identically on unmodified `origin/dev` on this host and is unrelated.)
-* Full 646-class Tomcat suite rerun; see the run-comparison note below.
+* **No throughput cost on the shared read/write path.** `TcpHandle::Stream`
+  becoming an `Arc` and `resolve_stream` releasing the lock touch every NIO
+  channel read and write, so they were A/B'd against a control binary built
+  from the same `origin/dev` merge base, interleaving control/fix per round to
+  cancel host-load drift, on the most socket-lifecycle-intensive class in the
+  suite (`TestHttpServletDoHeadInvalidWrite0ValidWrite0` — 288 tests, one
+  Tomcat start/stop each):
+
+  | leg | mean | min | max |
+  |-----|-----:|----:|----:|
+  | control (`origin/dev`) | 259.3 s | 230.5 s | 298.0 s |
+  | fix | 240.4 s | 216.2 s | 262.3 s |
+
+  The fix was faster in 3/3 rounds — expected, since the registry lock is now
+  held for the map lookup only rather than across the whole syscall.
+
+  **Do not read a single run of this class as signal.** An early
+  non-interleaved pair measured 246 s (control) vs 427 s (fix), which was pure
+  noise. The whole `TestHttpServletDoHead*` family sits right at the suite
+  runner's default 300 s timeout — the 646-class `fullsuite-local-20260728`
+  reference has 49 of them PASSing at 287–296 s and 15 HANGing at 300 s — so
+  any run of that family against a 300 s timeout flips PASS↔HANG on host load
+  alone. Compare suite runs for this family at `-TimeoutSec 600` or higher.
+
+### Full 646-class suite rerun
+
+`run-tomcat-suite.ps1 -Category all -Parallel 6 -TimeoutSec 600`, fix binary,
+run `uds-fix-leg-20260727`:
+
+| | fix (600 s timeout) | reference `fullsuite-local-20260728` (300 s) |
+|---|---:|---:|
+| PASS | 564 | 547 |
+| FAIL | 44 | 40 |
+| HANG | 37 | 58 |
+| NOSUMMARY | 1 | 1 |
+
+`org.apache.tomcat.util.net.TestXxxEndpoint`: **FAIL → PASS**. 22 classes went
+non-PASS → PASS (almost all `TestHttpServletDoHead*`, which the longer timeout
+lets finish).
+
+Five classes went PASS → non-PASS. Each was then re-run **interleaved** against
+a control binary built from the same `origin/dev` merge base, and all five are
+pre-existing flakes, not regressions:
+
+| class | control | fix |
+|---|---|---|
+| `servlets.TestDefaultServletOptions` | FAIL (2/144) | PASS (144) |
+| `servlets.TestWebdavServletOptionsFile` | FAIL (1/104) | FAIL (1/104) |
+| `servlets.TestWebdavServletOptionsUnknown` | PASS (104) | PASS (104) |
+| `el.TestELInJsp` | PASS, 280 s | PASS, 430 s (the suite HANG was the 600 s timeout under 6-way load) |
+| `tribes.group.TestGroupChannelSenderConnections` | see below | see below |
+
+`TestGroupChannelSenderConnections` needed 40 interleaved rounds per binary to
+settle, because a single 8-round sample read 8/8 control vs 5/8 fix and looked
+like a regression:
+
+| | PASS | non-PASS (mostly `EXCEPTION_ACCESS_VIOLATION`) |
+|---|---:|---:|
+| control, JIT on | 25/40 | 15/40 |
+| fix, JIT on | 23/40 | 17/40 |
+| control, JIT off | 10/10 | 0 |
+| fix, JIT off | 10/10 | 0 |
+
+So it crashes at essentially the same rate on both binaries, only ever with the
+JIT on, and its PASS in the 2026-07-28 reference was luck. The crash is a
+JIT-frame SIGSEGV on a `Tribes-Task-Receiver` thread inside
+`NioReplicationTask.drainChannel` — the pre-existing JIT stale-reference
+family, unrelated to this fix and still open.
 
 `CRATONVM_DBG_SC_READ=1` also enables a `[UDS] …` trace of
 bind/accept/connect, kept as a permanent opt-in hook alongside the existing
