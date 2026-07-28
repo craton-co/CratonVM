@@ -312,19 +312,48 @@ pub fn approximate_object_size(
 // Native handlers — sun.instrument.InstrumentationImpl
 // ---------------------------------------------------------------------------
 
-/// Read `(receiver this) (Object transformer) (Z canRetransform)` style args.
-/// The receiver is at args[0]; the transformer at args[1]; the boolean at args[2].
-fn native_add_transformer0(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let transformer = match args.get(1) {
-        Some(Value::Object(Some(obj))) => *obj,
-        _ => return Ok(None), // null transformer → silently ignore (HotSpot NPEs; we tolerate)
-    };
-    let can_retransform = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+const MOCKITO_INLINE_TRANSFORMER: &str =
+    "org/mockito/internal/creation/bytebuddy/InlineBytecodeGenerator";
+
+/// Mockito's inline maker is process-wide, but Spring's temporary modified
+/// class paths can load a second copy of its implementation.  Its transformer
+/// state cannot be composed with a second copy: both attempt to weave the same
+/// JDK class, but their independently generated dispatch identifiers cannot
+/// share a transformed definition.  Keep the first process-wide maker for the
+/// VM lifetime and ignore later copies.  All other transformer types retain
+/// their specified registration order and multiplicity.
+fn add_instrumentation_transformer(
+    ctx: &mut dyn NativeContext,
+    transformer: ObjectRef,
+    can_retransform: bool,
+) {
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(transformer))
+        .unwrap_or_default();
+    if class_name == MOCKITO_INLINE_TRANSFORMER {
+        for existing in snapshot_transformer_chain() {
+            let existing_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(existing.transformer_ref))
+                .unwrap_or_default();
+            if existing_name == MOCKITO_INLINE_TRANSFORMER {
+                return;
+            }
+        }
+    }
     add_transformer_entry(TransformerEntry {
         transformer_ref: transformer,
         can_retransform,
         native_method_prefix: None,
     });
+}
+
+fn native_add_transformer0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let transformer = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None), // null transformer → silently ignore (HotSpot NPEs; we tolerate)
+    };
+    let can_retransform = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+    add_instrumentation_transformer(ctx, transformer, can_retransform);
     Ok(None)
 }
 
@@ -502,6 +531,23 @@ fn native_retransform_classes0(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         // classes this fails and we fall back to an empty buffer; the
         // transformer is still given a chance to swap in fresh bytes.
         let original = original_class_bytes(ctx, class_id);
+        // `retransformClasses` starts from the original class file.  Keep the
+        // live method metadata in that same state while Java transformers run:
+        // Byte Buddy combines the supplied bytes with reflection over
+        // `classBeingRedefined`, and otherwise observes the previous woven
+        // method attributes against the original byte stream.  This matters
+        // when a later temporary test loader installs a second transformer.
+        //
+        // The first in-place swap preserves the original-byte cache, so the
+        // final transformed swap below still has the required JVMTI base for a
+        // future retransformation.  Both swaps preserve class identity and do
+        // not run initializers.
+        if !original.is_empty() {
+            if let Err(msg) = ctx.retransform_class(class_id, &original) {
+                tracing::warn!("retransformClasses0: could not restore original bytes: {msg}");
+                continue;
+            }
+        }
         let final_bytes = run_transformer_chain(
             ctx,
             class_id,
@@ -1434,17 +1480,13 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         impl_class,
         "addTransformer",
         "(Ljava/lang/instrument/ClassFileTransformer;Z)V",
-        (|_ctx: &mut dyn NativeContext, args: &[Value]| {
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
             let transformer = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
             let can_retransform = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
-            add_transformer_entry(TransformerEntry {
-                transformer_ref: transformer,
-                can_retransform,
-                native_method_prefix: None,
-            });
+            add_instrumentation_transformer(ctx, transformer, can_retransform);
             Ok(None)
         }) as NativeCallback,
     );
@@ -1452,16 +1494,12 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         impl_class,
         "addTransformer",
         "(Ljava/lang/instrument/ClassFileTransformer;)V",
-        (|_ctx: &mut dyn NativeContext, args: &[Value]| {
+        (|ctx: &mut dyn NativeContext, args: &[Value]| {
             let transformer = match args.get(1) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            add_transformer_entry(TransformerEntry {
-                transformer_ref: transformer,
-                can_retransform: false,
-                native_method_prefix: None,
-            });
+            add_instrumentation_transformer(ctx, transformer, false);
             Ok(None)
         }) as NativeCallback,
     );
