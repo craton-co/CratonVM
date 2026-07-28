@@ -37657,6 +37657,131 @@ fn try_jit_compile_callee_slow(
     // intrinsics (see `resolve_string_field_layout`).
     let string_layout_resolver = || resolve_string_field_layout(shared);
 
+    // Direct JIT-to-JIT calls, LOOKUP-ONLY (tomcat doc 04, 2026-07-27).
+    //
+    // This argument used to be `None` ("no recursive callee compilation"),
+    // which is what the tiered BACKGROUND worker compiles every hot method
+    // with. `None` does not merely decline to compile a callee eagerly — it
+    // means `jit/src/lib.rs` plans NO `direct_calls` at all, so every
+    // `invokestatic`/`invokespecial` in a background-compiled body falls
+    // through to the generic `jit_invoke_dispatch` helper round trip, on
+    // every call, forever. Measured on `apps/tomcat-suite-runner/probes/
+    // CallCostProbe.java` (marginal cost of one extra invoke inside a
+    // compiled loop, same binary, same run):
+    //
+    //     invokestatic, background-compiled body  ~196 ns
+    //     invokestatic, mutator-compiled body     ~5-9 ns   (CRATONVM_BG_COMPILE=0)
+    //     invokestatic, HotSpot                   ~0.5 ns
+    //
+    // i.e. ~30x on the single most common call form in ordinary Java, on the
+    // path that compiles almost everything. Deploy-heavy Tomcat classes are
+    // exactly this shape (reflection, class loading, Digester), which is the
+    // residual "interpreter throughput x method count" wall doc 04 describes.
+    //
+    // The stated reason for `None` was recursion: `try_jit_upgrade_with_gate`'s
+    // `callee_compiler` will COMPILE an unseen callee inline, and doing that
+    // from the compile worker would nest compiles. This resolver keeps that
+    // property by never compiling anything — it answers only from
+    // `jit_cache`, so a callee that is already compiled (the overwhelmingly
+    // common case once a workload is warm; the tiered manager compiles leaves
+    // before their callers because leaves reach the invocation threshold
+    // first) gets a raw `CALL`, and anything else stays on dispatch exactly
+    // as before.
+    //
+    // Every refusal gate of the mutator-side `callee_compiler` is mirrored
+    // here, in the same order; each `None` is correctness-safe because it
+    // just leaves the site on the checked dispatch helper:
+    //   * FJP subclass blocklist (RFJP.1)
+    //   * Rust native shadow (S111r15)
+    //   * BUG-H: callee declaring its own exception table — a raw CALL would
+    //     let an implicit AIOOBE/NPE escape the callee's own `catch`
+    //   * `synchronized` callee (no monitor pairing across a raw CALL)
+    //   * JVMS 5.5: a `static` callee whose declaring class is not yet
+    //     initialized (the direct CALL bypasses every init check)
+    //   * an artifact carrying an unconditional invokedynamic trap
+    let direct_callee_lookup =
+        |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
+            macro_rules! dc_no {
+                ($why:expr) => {{
+                    if crate::runtime::env_cache::dbg_jitc() {
+                        eprintln!(
+                            "[cratonvm-jitc] bg-direct-call DECLINED {callee_class}.{callee_method}{callee_desc}: {}",
+                            $why
+                        );
+                    }
+                    return None;
+                }};
+            }
+            if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
+                dc_no!("fjp-blocklist");
+            }
+            if shared
+                .natives
+                .native_methods
+                .find(callee_class, callee_method, callee_desc)
+                .is_some()
+            {
+                dc_no!("native-shadow");
+            }
+            let callee_class_id = {
+                let cm = shared.classes.class_manager.read();
+                let Some(callee_cid) =
+                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
+                else {
+                    dc_no!("callee-class-not-found");
+                };
+                let store = cm.class_store();
+                let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
+                    callee_cid,
+                    callee_method,
+                    callee_desc,
+                    store,
+                ) else {
+                    dc_no!("callee-method-not-found");
+                };
+                if method.is_synchronized() {
+                    dc_no!("synchronized");
+                }
+                if method
+                    .code()
+                    .map_or(true, |c| !c.exception_table.is_empty())
+                {
+                    dc_no!("callee-exception-table");
+                }
+                if method.is_static()
+                    && !store
+                        .get(declaring_id)
+                        .map(crate::vm::is_class_initialized_fast)
+                        .unwrap_or(false)
+                {
+                    dc_no!("declaring-class-not-initialized");
+                }
+                callee_cid
+            };
+            let callee_class_arc: Arc<str> = Arc::from(callee_class);
+            let callee_method_arc: Arc<str> = Arc::from(callee_method);
+            let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
+            let jit_cache = shared.jit.jit_cache.read();
+            let Some(compiled) = jit_cache.get(
+                &callee_class_arc,
+                &callee_method_arc,
+                &callee_desc_arc,
+                callee_class_id,
+            ) else {
+                dc_no!("callee-not-yet-compiled");
+            };
+            if compiled.has_indy_trap {
+                dc_no!("indy-trap");
+            }
+            if crate::runtime::env_cache::dbg_jitc() {
+                eprintln!(
+                    "[cratonvm-jitc] bg-direct-call BOUND {callee_class}.{callee_method}{callee_desc}"
+                );
+            }
+            // Cast: object/code pointer to integer address
+            Some((compiled.entry_ptr() as usize, compiled.needs_context()))
+        };
+
     let compile_start = std::time::Instant::now();
     crate::jit::set_self_call_identity_stable(self_call_identity_stable(
         shared,
@@ -37669,7 +37794,9 @@ fn try_jit_compile_callee_slow(
         Some(&static_field_resolver),
         Some(&invoke_resolver),
         Some(&invokespecial_owner_resolver),
-        None, // no recursive callee compilation
+        // Lookup-only: binds an ALREADY-compiled callee to a raw CALL, never
+        // compiles one (see `direct_callee_lookup` above).
+        Some(&direct_callee_lookup),
         Some(&new_resolver),
         Some(&ldc_resolver),
         Some(&ldc2w_resolver),
