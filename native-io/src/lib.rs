@@ -15553,7 +15553,13 @@ fn dc_fds() -> &'static Mutex<HashMap<i32, FdId>> {
     FDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
+/// The UDP fd backing a `DatagramChannel`. This identity-hash table, plus the
+/// `fd_table` entry it points at, is the **single** source of truth for a
+/// channel's socket: `datagram.rs` resolves through here too, so a channel
+/// opened by `native_dc_open` is usable by every other DatagramChannel native.
+/// `datagram.rs` used to keep a parallel registry that nothing populated, so
+/// its `send` always failed with "no socket id" — see its module doc.
+pub(crate) fn dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
     dc_fds()
         .lock()
         .get(&ctx.identity_hash_code(channel))
@@ -16978,8 +16984,16 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
     r.register(dc, "read", "(Ljava/nio/ByteBuffer;)I", native_dc_read);
 
     // send(ByteBuffer, SocketAddress) → int
-    // The public send native is registered by datagram.rs; keep that guarded
-    // callback as the final registration.
+    // Was deferred to datagram.rs, which resolved the channel through its own
+    // registry that open()/bind() never populated — every send threw
+    // "send: no socket id". It now lives here with the rest of the
+    // fd_table-backed family; datagram.rs resolves through `dc_fd` too.
+    r.register(
+        dc,
+        "send",
+        "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
+        native_dc_send,
+    );
 
     // receive(ByteBuffer) → SocketAddress
     r.register(
@@ -17119,13 +17133,17 @@ fn native_dc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // ephemeral UDP socket. The real JDK JNDI DNS client relies on it for TXT
     // lookups; treating the null address as a required object turned that
     // ordinary call into `NullPointerException: arg 1 is null`.
+    // Decode through the same helper `connect` uses. The previous ad-hoc
+    // `read_string(addr_obj)` never matched a real `InetSocketAddress` — it is
+    // not a String and its slot 0 is not a host String either — so EVERY
+    // explicit bind silently fell through to the `0.0.0.0:0` wildcard default.
+    // `bind(new InetSocketAddress("127.0.0.1", 0))` therefore bound the
+    // wildcard, and `getLocalAddress()` reported `0.0.0.0` where HotSpot
+    // reports `127.0.0.1`. Keep the wildcard only for the genuinely-null
+    // argument, which is the JDK contract the comment above describes.
     let addr_str = match args.get(1) {
-        Some(Value::Object(Some(addr_obj))) => ctx
-            .read_string(*addr_obj)
-            .or_else(|| match ctx.get_field(*addr_obj, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s),
-                _ => None,
-            })
+        Some(Value::Object(Some(addr_obj))) => dc_socket_addr(ctx, *addr_obj)
+            .or_else(|| ctx.read_string(*addr_obj))
             .unwrap_or_else(|| "0.0.0.0:0".to_string()),
         _ => "0.0.0.0:0".to_string(),
     };
@@ -17238,10 +17256,23 @@ fn native_dc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
         message: "DatagramChannel.read: channel has no UDP socket".into(),
     })?;
-    let view = bb_storage_view(ctx, buffer)?;
-    let remaining = (view.lim - view.pos).max(0) as usize;
+    let pos = bb_storage_view(ctx, buffer)?.pos;
+    let remaining = (bb_storage_view(ctx, buffer)?.lim - pos).max(0) as usize;
     let mut bytes = vec![0u8; remaining];
-    let (received, _) = match ctx.fd_table().udp_recv(fd, &mut bytes) {
+    // A blocking-mode channel parks in recv until a datagram arrives, touching
+    // no Java heap. Bracket it so a concurrent stop-the-world pause does not
+    // wait forever on a mutator that never reaches a safepoint, and re-sync
+    // `buffer` afterwards — a pause inside the region may have moved it. The
+    // `BbView` is re-derived after the region for the same reason.
+    let mut held = vec![Value::Object(Some(buffer))];
+    ctx.begin_blocking_region();
+    let recv = ctx.fd_table().udp_recv(fd, &mut bytes);
+    ctx.end_blocking_region_refs(&mut held);
+    let buffer = match held[0] {
+        Value::Object(Some(b)) => b,
+        _ => buffer,
+    };
+    let (received, _) = match recv {
         Ok(received) => received,
         // Non-blocking channels report zero bytes when no datagram is ready;
         // surfacing EAGAIN as IOException makes JNDI treat a normal poll as a
@@ -17256,11 +17287,69 @@ fn native_dc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             .into());
         }
     };
+    let view = bb_storage_view(ctx, buffer)?;
     for (index, byte) in bytes.into_iter().take(received).enumerate() {
         bb_write_byte(ctx, view, view.pos as usize + index, byte)?;
     }
     buf_set_position(ctx, buffer, view.pos + received as i32);
     Ok(Some(Value::Int(received as i32)))
+}
+
+/// `DatagramChannel.send(ByteBuffer, SocketAddress) -> int`.
+///
+/// Previously registered by `datagram.rs` against its own registry, which
+/// `open()`/`bind()` never populated — every send threw
+/// `IOException: send: no socket id`. It belongs with the rest of the
+/// fd_table-backed family here.
+fn native_dc_send(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let buffer = obj_arg92(args, 1)?;
+    let target = obj_arg92(args, 2)?;
+    let fd = dc_fd(ctx, this).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.send: channel has no UDP socket".into(),
+    })?;
+    let dest = dc_socket_addr(ctx, target).ok_or_else(|| RuntimeError::IOException {
+        message: "DatagramChannel.send: target SocketAddress unparsable".into(),
+    })?;
+    // SSRF gate, matching the TCP path and the previous `datagram.rs` send:
+    // refuse datagrams to blocked ranges (link-local cloud metadata) before
+    // the real sendto(2).
+    if let Ok(parsed) = dest.parse::<std::net::SocketAddr>() {
+        crate::datagram::check_outbound_target(parsed)?;
+    }
+
+    let view = bb_storage_view(ctx, buffer)?;
+    let (pos, lim) = (view.pos, view.lim);
+    if pos >= lim {
+        return Ok(Some(Value::Int(0)));
+    }
+    let mut bytes = vec![0u8; (lim - pos) as usize];
+    bb_read_bytes(ctx, view, pos as usize, &mut bytes)?;
+
+    // send can park on a full local socket buffer — same GC-blocking protocol
+    // as the receive path above.
+    let mut held = vec![Value::Object(Some(buffer))];
+    ctx.begin_blocking_region();
+    let sent = ctx.fd_table().udp_send(fd, &bytes, &dest);
+    ctx.end_blocking_region_refs(&mut held);
+    let buffer = match held[0] {
+        Value::Object(Some(b)) => b,
+        _ => buffer,
+    };
+    let sent = match sent {
+        Ok(n) => n,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Ok(Some(Value::Int(0)));
+        }
+        Err(error) => {
+            return Err(RuntimeError::IOException {
+                message: format!("DatagramChannel.send to {dest}: {error}"),
+            }
+            .into());
+        }
+    };
+    buf_set_position(ctx, buffer, pos + sent as i32);
+    Ok(Some(Value::Int(sent as i32)))
 }
 
 /// Build a real-JDK-layout InetSocketAddress for a received IPv4 datagram.
@@ -18318,8 +18407,18 @@ mod io_tests {
         r
     }
 
+    /// `DatagramChannel.send` must exist and must be the fd_table-backed
+    /// `native_dc_send`, i.e. the same family that `open`/`bind` populate.
+    ///
+    /// This test used to assert the opposite — that `send` stayed routed to
+    /// `datagram.rs`'s callback, to stop this phase-92 registration from
+    /// overriding the SSRF gate. But `datagram.rs` resolved the channel through
+    /// a private registry that `open`/`bind` never populated, so the "guarded"
+    /// send threw `no socket id` on every real call and the channel could not
+    /// round-trip at all. The gate itself is what mattered; it now lives in
+    /// `native_dc_send` (see `datagram_channel_send_keeps_outbound_policy_gate`).
     #[test]
-    fn datagram_channel_send_keeps_guarded_registration() {
+    fn datagram_channel_send_uses_the_fd_table_family() {
         let r = io_registry();
         let actual = r
             .find(
@@ -18328,15 +18427,14 @@ mod io_tests {
                 "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
             )
             .expect("DatagramChannel.send registered");
-        let guarded = datagram::guarded_send_callback_for_test();
         assert_eq!(
-            actual as usize, guarded as usize,
-            "DatagramChannel.send must remain routed through guarded UDP send"
+            actual as usize, native_dc_send as usize,
+            "DatagramChannel.send must resolve through the same fd_table family as open/bind"
         );
     }
 
     #[test]
-    fn phase92_datagram_channel_does_not_register_public_send() {
+    fn phase92_datagram_channel_registers_public_send() {
         let mut r = NativeMethodRegistry::new();
         register_datagram_channel(&mut r);
         assert!(
@@ -18345,8 +18443,19 @@ mod io_tests {
                 "send",
                 "(Ljava/nio/ByteBuffer;Ljava/net/SocketAddress;)I",
             )
-            .is_none(),
-            "phase92 DatagramChannel must not override datagram.rs guarded send"
+            .is_some(),
+            "the fd_table DatagramChannel family owns send"
+        );
+    }
+
+    /// The SSRF gate that the previous routing existed to protect: a send to a
+    /// link-local cloud-metadata address must still be refused.
+    #[test]
+    fn datagram_channel_send_keeps_outbound_policy_gate() {
+        let metadata: std::net::SocketAddr = "169.254.169.254:80".parse().unwrap();
+        assert!(
+            datagram::check_outbound_target(metadata).is_err(),
+            "native_dc_send calls this gate; it must keep rejecting cloud metadata"
         );
     }
 
