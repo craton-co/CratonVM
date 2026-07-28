@@ -978,18 +978,70 @@ impl IrBuilder {
         // Consume the verifier's canonical decode/CFG contract instead of
         // maintaining a second opcode-length scanner in the compiler.
         let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;
+
+        // STUB-S8 fix: the bytecode of a `catch`/`finally` handler is reachable
+        // ONLY through an exception edge, and a JIT frame never takes one — an
+        // exception makes the compiled body return the `i64::MIN` sentinel and
+        // the runtime re-runs (or precisely resumes) the method in the
+        // interpreter, which is the only thing that consults the exception
+        // table (see `route_implicit_exception_through_callee` /
+        // `callee_has_exception_table` in vm/src/jit/helpers.rs). So handler
+        // bodies are dead code in the compiled body and must be SKIPPED, not
+        // walked.
+        //
+        // Walking them was the whole reason the optimizing tier refused every
+        // method with an exception table: the linear pc walk fell into the
+        // handler carrying whatever `ctrl`/`locals`/`stack` the *textually*
+        // preceding code left behind, and a handler's leading `astore` of the
+        // (never-modelled) exception object popped an empty stack, so the
+        // builder emitted orphan nodes referencing `NO_NODE` that the
+        // scheduler/lowerer still visited — panicking in `ir_lower::slot_of`
+        // on a `u32::MAX` slot index.
+        //
+        // Skipping is safe for the code AFTER a handler too: any instruction
+        // that follows unreachable code and is itself reachable can only be
+        // entered by a branch (fall-through from unreachable code is not a real
+        // predecessor), so it is necessarily a merge target and its state is
+        // restored by `activate_merge` rather than inherited. The `ctrl ==
+        // NO_NODE` bail inside the loop enforces exactly that invariant.
+        let reachable = normally_reachable_pcs(&verified, code_len);
+
+        // Only reachable targets get a merge node. A `merge_targets` entry that
+        // lies inside a skipped handler (or that only handler code branches to)
+        // would otherwise leave an `Op::Merge` with zero control inputs in the
+        // graph — never activated, because the walk never arrives there — and
+        // an input-less control node is exactly the kind of orphan the
+        // scheduler/lowerer is not prepared for.
         for &target in verified.merge_targets() {
             let target = target as usize;
-            self.ensure_merge(target);
+            if reachable.contains(&target) {
+                self.ensure_merge(target);
+            }
         }
         self.loop_headers = verified
             .loop_headers()
             .iter()
             .map(|target| *target as usize)
+            .filter(|target| reachable.contains(target))
             .collect();
 
         let mut pc = 0;
         while pc < code_len {
+            if !reachable.contains(&pc) {
+                // Handler-only (or otherwise unreachable) bytecode: emit no IR
+                // for it at all. `next_pc` comes from the verifier's canonical
+                // decode, so this steps over multi-byte operands correctly
+                // (a hand-rolled `pc += 1` would resync onto operand bytes).
+                pc = match verified.instruction_at(pc) {
+                    Some(decoded) => decoded.next_pc as usize,
+                    // Not an instruction boundary — the verifier guarantees the
+                    // walk only ever lands on one, so this is unreachable; bail
+                    // to single-pass rather than guess a length.
+                    None => return None,
+                };
+                continue;
+            }
+
             // If this PC is a merge target, activate the merge
             if self.merges.contains_key(&pc) {
                 // Add current state as predecessor (fall-through). On a loop
@@ -1005,6 +1057,16 @@ impl IrBuilder {
                 } else {
                     self.activate_merge(pc);
                 }
+            }
+
+            // Safety net for the skip above: reachable code must always have a
+            // live control token — either inherited from the fall-through or
+            // restored by the merge activation. If it does not, the reachable
+            // set and the merge bookkeeping disagree, and continuing would
+            // build the very orphan nodes the skip exists to prevent. Bail to
+            // the single-pass backend instead of emitting them.
+            if self.ctrl == NO_NODE {
+                return None;
             }
 
             // Step 1 of real-frame-deopt: record the abstract interpreter
@@ -2314,6 +2376,41 @@ impl IrBuilder {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+/// The set of bytecode pcs reachable from method entry following only
+/// **normal** control flow — branches, switches and fall-through, never an
+/// exception edge.
+///
+/// Everything outside this set is code the compiled body can never execute:
+/// in practice the bodies of `catch` / `finally` handlers, which are entered
+/// only by the interpreter after the JIT frame has already returned its
+/// `i64::MIN` sentinel. [`IrBuilder::build`] skips those pcs entirely rather
+/// than abstract-interpreting them with stale state (see the STUB-S8 comment
+/// there for what that used to produce).
+///
+/// Edges come from [`cratonvm_reader::VerifiedCode::successors`], the same
+/// canonical CFG contract the verifier and `merge_targets` are derived from,
+/// so this cannot disagree with the merge bookkeeping about where an
+/// instruction ends or which targets it has.
+fn normally_reachable_pcs(
+    verified: &cratonvm_reader::VerifiedCode,
+    code_len: usize,
+) -> HashSet<usize> {
+    let mut reachable = HashSet::with_capacity(verified.instructions().len());
+    if code_len == 0 {
+        return reachable;
+    }
+    let mut work = vec![0usize];
+    reachable.insert(0usize);
+    while let Some(pc) = work.pop() {
+        for succ in verified.successors(pc) {
+            if succ < code_len && reachable.insert(succ) {
+                work.push(succ);
+            }
+        }
+    }
+    reachable
+}
+
 /// Parse a `tableswitch` (0xaa) / `lookupswitch` (0xab) at opcode offset
 /// `op_pc`. Returns `(instruction_len, default_target, cases)` where each case
 /// is `(match_value, target_pc)`; all targets are absolute bytecode offsets
@@ -3334,6 +3431,128 @@ mod tests {
              header; a PC desync from mis-stepping invokedynamic would \
              decode the goto's offset bytes from the wrong position and \
              either miss this header or fabricate a wrong one"
+        );
+    }
+
+    /// The canonical `try`/`catch` layout javac emits:
+    ///
+    /// ```text
+    ///  0: iload_0
+    ///  1: iconst_1
+    ///  2: iadd
+    ///  3: istore_1      ← end of the protected range
+    ///  4: goto +7 → 11
+    ///  7: astore_2      ← HANDLER entry (exception object on an empty stack)
+    ///  8: iconst_0
+    ///  9: istore_1
+    /// 10: nop
+    /// 11: iload_1       ← join, reachable from both arms
+    /// 12: ireturn
+    /// ```
+    ///
+    /// pcs 7..=10 are reachable only through an exception edge. The builder
+    /// must emit NO nodes and NO safepoint snapshots for them: walking them
+    /// is what produced the `NO_NODE`-referencing orphans that panicked
+    /// `ir_lower::slot_of` (the handler's leading `astore` pops an empty
+    /// abstract stack, and `pop()` yields `NO_NODE` silently).
+    #[test]
+    fn test_handler_body_is_not_walked() {
+        let code: Vec<u8> = vec![
+            0x1a, // 0: iload_0
+            0x04, // 1: iconst_1
+            0x60, // 2: iadd
+            0x3c, // 3: istore_1
+            0xa7, 0x00, 0x07, // 4: goto +7 -> 11
+            0x4d, // 7: astore_2   (handler)
+            0x03, // 8: iconst_0
+            0x3c, // 9: istore_1
+            0x00, // 10: nop
+            0x1b, // 11: iload_1
+            0xac, // 12: ireturn
+        ];
+        let graph = build_ir(&code, code.len(), 1, 3);
+
+        let handler_pcs = 7..=10;
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if let Some(pc) = node.bytecode_pc {
+                assert!(
+                    !handler_pcs.contains(&pc),
+                    "node {id} ({:?}) was built for handler-only pc {pc}; \
+                     handler bodies are unreachable in a compiled frame and \
+                     must be skipped, not abstract-interpreted",
+                    node.op
+                );
+            }
+        }
+        for snap in &graph.safepoints {
+            assert!(
+                !handler_pcs.contains(&snap.bci),
+                "safepoint snapshot recorded for handler-only bci {}; the \
+                 compiled body can never resume there",
+                snap.bci
+            );
+        }
+        // The reachable code either side of the skipped region must still be
+        // built — the skip must not swallow the join or the tail.
+        assert!(
+            graph.nodes.iter().any(|n| n.bytecode_pc == Some(2)),
+            "the try body (pc 2, iadd) must still be compiled"
+        );
+        assert!(
+            graph.safepoints.iter().any(|s| s.bci == 11),
+            "the join after the handler (pc 11) must still be reached; a skip \
+             that failed to resync would drop it"
+        );
+    }
+
+    /// An opcode the builder cannot lower (`athrow`, 0xbf — the rethrow every
+    /// `finally` ends with) must no longer disqualify the WHOLE method when it
+    /// appears only inside a handler body. Before the skip, the linear walk
+    /// fell into the handler and hit `_ => return None`.
+    ///
+    /// (The `lib.rs` gate additionally consults `scan.has_athrow`, so this
+    /// particular shape is still refused one level up; the test pins the
+    /// builder's own behaviour, which is what the skip changes.)
+    #[test]
+    fn test_unsupported_opcode_in_handler_does_not_bail_the_method() {
+        let code: Vec<u8> = vec![
+            0x1a, // 0: iload_0
+            0x04, // 1: iconst_1
+            0x60, // 2: iadd
+            0x3c, // 3: istore_1
+            0xa7, 0x00, 0x05, // 4: goto +5 -> 9
+            0x4d, // 7: astore_2  (handler)
+            0xbf, // 8: athrow    — unsupported by the builder
+            0x1b, // 9: iload_1
+            0xac, // 10: ireturn
+        ];
+        let builder = IrBuilder::new(1, 3);
+        assert!(
+            builder.build(&code, code.len()).is_some(),
+            "an unsupported opcode reachable only through an exception edge \
+             must not bail the method to single-pass"
+        );
+    }
+
+    /// Reachability follows normal edges only, and in particular does NOT
+    /// treat a handler entry as a root.
+    #[test]
+    fn test_normally_reachable_excludes_handler_only_code() {
+        let code: Vec<u8> = vec![
+            0x1a, // 0: iload_0
+            0xa7, 0x00, 0x04, // 1: goto +4 -> 5
+            0x00, // 4: nop        (handler-only)
+            0xac, // 5: ireturn
+        ];
+        let verified = cratonvm_reader::verified_code(&code).unwrap();
+        let reachable = normally_reachable_pcs(&verified, code.len());
+        assert!(reachable.contains(&0));
+        assert!(reachable.contains(&1));
+        assert!(reachable.contains(&5), "the goto target is reachable");
+        assert!(
+            !reachable.contains(&4),
+            "pc 4 is only reachable by falling through a goto — i.e. not at \
+             all — so it must be excluded"
         );
     }
 }

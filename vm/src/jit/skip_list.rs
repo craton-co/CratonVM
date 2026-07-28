@@ -654,6 +654,58 @@ fn should_skip_jit_internal(
     // alone, ruling out `fillIn` despite it being the frame actually named in
     // SPRING-TESTCOMPILER.2's stack trace) is equally sufficient. Keep
     // `complete` interpreted until the x64 lowering bug is found.
+    //
+    // RE-VERIFIED 2026-07-27, and symptom (a)'s cause corrected. The
+    // "duplicate element 'value' in annotation @SuppressWarnings" defect
+    // found in 2026-07-26's javac sweep turned out to be a VM-wide
+    // `LinkedHashSet.remove` bug (it deleted the element but answered
+    // `false`, which is exactly when javac's `Annotate.attributeAnnotation`
+    // reports that error) and was fixed the same day -- so the open question
+    // that write-up left behind, "was SPRING-TESTCOMPILER.3's symptom (a)
+    // actually THAT bug rather than a JIT miscompile?", was tested directly.
+    // It was not. With the LinkedHashSet fix in place and this ban lifted (an
+    // env-gated build, all other bans left active):
+    //
+    //   AutowiredAnnotationBeanRegistrationAotContributionTests  14/14 -> 9/14
+    //       (exactly the 5 `DeprecationTests`, symptom (a) verbatim:
+    //        "warnings found and -Werror specified" against generated source
+    //        that does carry `@SuppressWarnings("deprecation")`)
+    //   BeanDefinitionMethodGeneratorTests                       34/34 -> 32/34
+    //
+    // Both are 100% with this ban active, matching HotSpot JDK 25. So the ban
+    // stays.
+    //
+    // What that round DID buy is a Spring-free standalone reproducer where
+    // there was none: `DeprecationSuppressionProbe.java` (committed at
+    // docs/known-issues/repros/jitban-remaining-20260726/) reproduces symptom
+    // (a) at iteration ~21 in ~2 minutes. The shape is load-bearing -- the
+    // deprecated type must live in a SEPARATE, already-compiled `.class` file
+    // on the classpath. A single-file probe never reproduces it, because
+    // javac emits no deprecation warning at all when
+    // `s.outermostClass() == other.outermostClass()`.
+    //
+    // Narrowed with `AnnotationEffectProbe2`/`AnnotationEffectProbe3` (extra
+    // oracles run in the same process the moment suppression flips):
+    // annotation ATTRIBUTION stays intact -- `@FunctionalInterface` on a
+    // two-abstract-method interface, `@Override` on a non-overriding method
+    // and `@SafeVarargs` on a non-varargs method all still report their
+    // errors -- and the loss is not deprecation-specific, since
+    // `@SuppressWarnings("rawtypes")` fails the same way. So this is
+    // annotation-derived `Lint` being consulted too early, not attribution
+    // stopping. Sharpest unexplained lead: the one oracle that still
+    // suppresses correctly differs only in NOT passing `-Werror`, and that
+    // is not an ordering artifact (3/3 runs, and re-running the whole
+    // oracle set in reverse order inside the same process reproduces it
+    // exactly). Remaining suspect for whoever picks this up: this method's
+    // own compiled tail, which brackets its work in
+    // `Annotate.blockAnnotations()`/`unblockAnnotationsNoFlush()` inside a
+    // catch-all `finally` and then ends with
+    // `if (!reader.filling) annotate.flush();` -- delaying that flush past
+    // the point where javac replays deferred lint gives exactly this
+    // signature. Also worth knowing before theorising: this method IS
+    // JIT-compiled despite carrying a non-empty exception table (measured
+    // with `CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are
+    // never admitted" rule of thumb does not apply here.
     if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
         return Some(SkipReason::ClassFinderComplete);
     }

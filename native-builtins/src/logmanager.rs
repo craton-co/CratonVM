@@ -34,9 +34,12 @@
 //!    Rejects names containing `../`, `\\`, `:`, or any ASCII control char
 //!    so malicious `loadConfiguration` calls can't traverse the filesystem
 //!    via logger-name injection.
-//! 4. `readConfiguration()` / `readConfiguration(InputStream)` — no-op that
-//!    returns null. We never parse untrusted logging configuration; all
-//!    levels are inherited from the process-wide tracing subscriber.
+//! 4. `readConfiguration()` / `readConfiguration(InputStream)` — both parse
+//!    the configuration and apply it (`apply_jul_config_entries`): install
+//!    `handlers=` on the root logger and record `<logger>.level` entries.
+//!    The no-arg overload follows the JDK's resolution order
+//!    (`java.util.logging.config.class`, then `.config.file`, then
+//!    `$java.home/conf/logging.properties`).
 //! 5. `reset()` — clears the logger registry (leaves the singleton in
 //!    place; JDK spec allows the manager instance to be kept while the
 //!    logger-name set is flushed).
@@ -958,14 +961,80 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Int(1)))
 }
 
+/// `LogManager.readConfiguration()` — the no-arg, startup-configuration
+/// overload. Follows the documented JDK resolution order:
+///
+///   1. `java.util.logging.config.class` — instantiate it; that class's
+///      constructor is responsible for calling `readConfiguration(InputStream)`
+///      itself (that is the documented contract). If it cannot be constructed,
+///      fall through, exactly as the JDK does.
+///   2. `java.util.logging.config.file` — read and apply that file.
+///   3. `$java.home/conf/logging.properties` — the JDK's own default.
+///
+/// This used to be a hard no-op justified as "we never parse untrusted logging
+/// configuration". That reasoning does not survive contact with the actual
+/// threat model: every path here is named by the application itself (a `-D`
+/// system property, or the JDK's own install file), which is no more
+/// attacker-controlled than the classpath we already load code from. The cost
+/// of the no-op was that `LogManager.getLogManager().readConfiguration()` —
+/// the documented way to (re)load logging configuration, and what a plain
+/// `java.util.logging` program relies on — silently did nothing: no handlers,
+/// no levels.
+///
+/// Note this is only reachable when a caller explicitly asks for it, or via a
+/// manager that does not override it (Tomcat's JULI and JBoss LogManager both
+/// override `readConfiguration` in their own bytecode and never reach here).
 fn native_read_configuration_no_arg(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // Security: we deliberately do NOT parse untrusted logging config —
-    // any path that would load a properties file is suppressed. The
-    // process-wide tracing subscriber already governs effective levels.
-    Ok(None)
+    // NOTE on manager subclasses: a `LogManager` subclass that overrides
+    // `readConfiguration` (Tomcat's `ClassLoaderLogManager`, JBoss's) runs its
+    // OWN bytecode — verified: JULI's `ClassLoaderLogManager.readConfiguration`
+    // frame appears in stack traces from a Tomcat run, and Tomcat's handler
+    // chain and FINE output are byte-for-byte identical with and without this
+    // implementation. So this native does not shadow such an override and must
+    // NOT try to detect one: a subclass that deliberately calls
+    // `super.readConfiguration()` to pick up the standard configuration is a
+    // legitimate pattern, and short-circuiting it would silently break it.
+
+    // 1. config.class — the JDK instantiates it and expects its ctor to call
+    //    readConfiguration(InputStream); we honour the same contract.
+    if let Some(cls) = ctx
+        .get_system_property("java.util.logging.config.class")
+        .filter(|c| !c.trim().is_empty())
+    {
+        let internal = cls.trim().replace('.', "/");
+        if let Ok(Some(_)) = ctx.new_object_initialized(&internal, "()V", &[]) {
+            return Ok(None);
+        }
+        // Unconstructible: the JDK logs and falls back to the file path.
+        tracing::warn!(
+            config_class = %cls.trim(),
+            "LogManager.readConfiguration: java.util.logging.config.class could not be \
+             instantiated; falling back to java.util.logging.config.file"
+        );
+    }
+
+    // 2. config.file, else 3. the JDK's own $java.home/conf/logging.properties.
+    let path = ctx
+        .get_system_property("java.util.logging.config.file")
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| p.trim().to_string())
+        .or_else(|| {
+            ctx.get_system_property("java.home")
+                .filter(|h| !h.trim().is_empty())
+                .map(|h| format!("{}/conf/logging.properties", h.trim_end_matches(['/', '\\'])))
+        });
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        // A missing/unreadable file is not fatal in the JDK either.
+        return Ok(None);
+    };
+    let entries = crate::properties_sidetable::parse_properties_pub(&bytes);
+    apply_jul_config_entries(ctx, &entries)
 }
 
 fn native_read_configuration_with_stream(
@@ -995,12 +1064,13 @@ pub(crate) fn parsed_log_properties() -> &'static Mutex<HashMap<String, String>>
 /// and forward per-handler `<HandlerClass>.level`/`.formatter` keys to the
 /// handler instances just created.
 ///
-/// This intentionally stays reachable ONLY from the `InputStream` overload
-/// (never the no-arg, filesystem-backed one — see
-/// `native_read_configuration_no_arg`), so the only content ever parsed
-/// here is a stream the caller's own Java code already produced (a
-/// packaged classpath `Resource`), not arbitrary filesystem/environment
-/// input.
+/// Reached from BOTH `readConfiguration` overloads: the `InputStream` one
+/// (a stream the caller's own Java code produced) and, since the no-arg
+/// overload was implemented, the startup file named by
+/// `java.util.logging.config.file` / `$java.home/conf/logging.properties`.
+/// Both are application-designated inputs — see
+/// `native_read_configuration_no_arg` for why the earlier
+/// "never touch a filesystem config" stance was dropped.
 fn apply_jul_config_entries(
     ctx: &mut dyn NativeContext,
     entries: &[(String, String)],
@@ -3200,7 +3270,12 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let throwable_obj = throwable_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
     let src_cls_obj = src_cls_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
     let src_mth_obj = src_mth_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
-    if let Some(t) = throwable_obj {
+    // Compose the console line NOW (while the Throwable's fields are readable)
+    // but do not emit it yet — the real handler chain gets first refusal, and
+    // we only fall back to the console sink if nothing accepted the record.
+    // Otherwise a config-installed `ConsoleHandler` and this sink both print
+    // it and every line appears twice (HotSpot prints it once).
+    let console_line = if let Some(t) = throwable_obj {
         // Detail-line, mirroring Tomcat's expectation that a throwable
         // is co-located with the message. We pull the throwable's
         // class name and detail message via standard fields; if the
@@ -3216,19 +3291,15 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             _ => String::new(),
         };
         if detail.is_empty() {
-            crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message} ({cls})"));
+            format!("{tag} [{logger_name}] {message} ({cls})")
         } else {
-            crate::emit_framework_log(
-                ctx,
-                &format!("{tag} [{logger_name}] {message} ({cls}: {detail})"),
-            );
+            format!("{tag} [{logger_name}] {message} ({cls}: {detail})")
         }
     } else {
-        crate::emit_framework_log(ctx, &format!("{tag} [{logger_name}] {message}"));
-    }
-    // `emit_framework_log` dispatches `println` into (overridable) Java
-    // bytecode and allocates the argument String, so every reference below has
-    // to come off its pin again.
+        format!("{tag} [{logger_name}] {message}")
+    };
+    // Reading the Throwable's fields above can allocate (`read_string`), so
+    // every reference below has to come off its pin again.
     let this = this_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
     let level_obj = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
     let message_obj = message_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
@@ -3248,14 +3319,19 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             None,
             throwable_obj,
         )
-        .map(|_| None)
     } else {
-        Ok(None)
+        Ok(false)
     };
+    // `console_line` is a plain Rust String, so emitting it here (after the
+    // publish) needs no further pin refresh.
+    let delivered = matches!(result, Ok(true));
+    if !delivered {
+        crate::emit_framework_log(ctx, &console_line);
+    }
     if let Some(base) = base_pin {
         ctx.unpin_native_roots(base);
     }
-    result
+    result.map(|_| None)
 }
 
 /// Shared body of `java/util/logging/Logger.entering` / `exiting` /
@@ -4194,20 +4270,42 @@ pub(crate) fn record_jul_logger_level(ctx: &dyn NativeContext, logger: ObjectRef
     }
 }
 
-fn native_jul_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    log_simple(ctx, args, "INFO");
-    publish_jul_convenience(ctx, args, "INFO")?;
+/// Publish to the real handler chain FIRST, and fall back to the native
+/// console sink only when no handler accepted the record.
+///
+/// Order matters. `log_simple` used to run unconditionally *before* the
+/// publish, so once a config file installed a real `ConsoleHandler` on the root
+/// logger every line was printed TWICE — once by our sink and once by the
+/// handler — where HotSpot prints it once. Measured on a plain-`LogManager`
+/// program calling `readConfiguration()`: 2 lines per call before, 1 after,
+/// matching HotSpot. It also removes a pre-existing duplicate under Tomcat
+/// (stock-conf stdout drops 55 -> 6 lines; HotSpot's is 6).
+///
+/// `publish_to_jul_handlers_full` has always reported whether a handler took
+/// the record (its doc even says the point is "so callers can keep the
+/// console-sink fallback for loggers that have no handler chain at all"); the
+/// result was simply discarded. This wires it up.
+fn jul_convenience_with_console_fallback(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    jul_level: &str,
+    console_tag: &str,
+) -> MethodCallResult {
+    let delivered = publish_jul_convenience(ctx, args, jul_level)?;
+    if !delivered {
+        log_simple(ctx, args, console_tag);
+    }
     Ok(None)
+}
+
+fn native_jul_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jul_convenience_with_console_fallback(ctx, args, "INFO", "INFO")
 }
 fn native_jul_logger_warning(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    log_simple(ctx, args, "WARN");
-    publish_jul_convenience(ctx, args, "WARNING")?;
-    Ok(None)
+    jul_convenience_with_console_fallback(ctx, args, "WARNING", "WARN")
 }
 fn native_jul_logger_severe(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    log_simple(ctx, args, "ERROR");
-    publish_jul_convenience(ctx, args, "SEVERE")?;
-    Ok(None)
+    jul_convenience_with_console_fallback(ctx, args, "SEVERE", "ERROR")
 }
 fn native_jul_logger_fine(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     jul_logger_fine_family(ctx, args, "FINE")
@@ -4234,26 +4332,27 @@ fn jul_logger_fine_family(
     args: &[Value],
     level_name: &str,
 ) -> MethodCallResult {
-    // `log_simple` applies the ancestor-aware `isLoggable` gate itself, so a
-    // logger with no configured fine level stays console-quiet exactly as
-    // before.
-    log_simple(ctx, args, level_name);
-    publish_jul_convenience(ctx, args, level_name)?;
-    Ok(None)
+    // Handlers first; `log_simple` (which applies the ancestor-aware
+    // `isLoggable` gate itself, so a logger with no configured fine level
+    // stays console-quiet) only when nothing accepted the record — see
+    // `jul_convenience_with_console_fallback` for why the order matters.
+    jul_convenience_with_console_fallback(ctx, args, level_name, level_name)
 }
 
+/// Returns `true` when a real handler accepted the record, so the caller can
+/// skip the native console echo and avoid printing the line twice.
 fn publish_jul_convenience(
     ctx: &mut dyn NativeContext,
     args: &[Value],
     level_name: &str,
-) -> MethodCallResult {
+) -> Result<bool, MethodCallFailed> {
     let (Some(Value::Object(Some(logger))), Some(Value::Object(Some(message)))) =
         (args.first(), args.get(1))
     else {
-        return Ok(None);
+        return Ok(false);
     };
     let Some(level) = resolve_standard_level(ctx, level_name) else {
-        return Ok(None);
+        return Ok(false);
     };
     // Gate on the real (ancestor-aware) effective level, matching the real
     // JDK's `Logger.info/warning/severe/fine(...)` convenience methods,
@@ -4266,9 +4365,9 @@ fn publish_jul_convenience(
         Some(Value::Int(1))
     );
     if !loggable {
-        return Ok(None);
+        return Ok(false);
     }
-    publish_to_jul_handlers(ctx, *logger, level, *message)
+    publish_to_jul_handlers_full(ctx, *logger, level, *message, None, None, None, None)
 }
 
 fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {

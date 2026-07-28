@@ -7447,6 +7447,17 @@ fn precise_handler_frames_enabled() -> bool {
     })
 }
 
+/// Opt-out for the STUB-S8 fix: when set, a method declaring an exception table
+/// is refused by the optimizing tier exactly as it was before that fix, so the
+/// same binary can be measured with and without the change.
+fn exc_table_c2_disabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_NO_EXC_TABLE_C2").is_some()
+    })
+}
+
 /// Whether every potentially throwing bytecode covered by this method's
 /// exception table already exits through an x64 runtime call site that can
 /// publish a precise reason-9 exceptional frame.
@@ -7869,16 +7880,37 @@ fn try_compile_inner(
     // keeps the historical IR-first behaviour.
     if optimize
         && ir::ir_compatible(&scan)
-        // STUB-S8: the IR builder has no exception-table-aware codegen — a
-        // handler entry isn't a registered merge target, so the builder walks
-        // over handler bytecode with stale `self.ctrl`/`self.locals`/`self.stack`
-        // state left over from wherever the linear PC walk last was. An
-        // implicit-throw-only method (try/catch with no `athrow` of its own)
-        // slips past the `scan.has_athrow` bail above and produces orphaned
-        // nodes referencing `NO_NODE` (a popped-empty-stack or
-        // never-assigned-local sentinel) that the scheduler/lowerer still
-        // visit, panicking in `ir_lower::slot_of` on a `u32::MAX` index.
-        && cached.exception_table.is_empty()
+        // STUB-S8 (was: `cached.exception_table.is_empty()`) — the optimizing
+        // tier used to refuse EVERY method with a `try`/`catch`, which is an
+        // enormous population of ordinary Java and cost ~7x on each of them
+        // (measured: a clone of Tomcat's `CharsetCache.getCharset` at 8252
+        // ns/op, 1094 with only the try/catch deleted). The stated reason was
+        // that the IR builder walked handler bytecode with stale
+        // `ctrl`/`locals`/`stack` and emitted orphan nodes referencing
+        // `NO_NODE` that panicked `ir_lower::slot_of`. `IrBuilder::build` now
+        // skips handler bodies outright (they are unreachable in a compiled
+        // frame — see the STUB-S8 comment there), so the orphans cannot arise
+        // and the table itself is no longer disqualifying.
+        //
+        // What still is: `precise_exception_frames`. When RBC.6 fires (a
+        // handler reads a non-parameter local) the single-pass backend keeps
+        // its promise by publishing a reason-9 frame at every throwing site, so
+        // the interpreter RESUMES mid-method with that local intact. The IR
+        // lowerer has no equivalent — its post-call check jumps to the shared
+        // sentinel bail — so such a method must stay on the single-pass
+        // backend or its handler would observe null/0. Methods below that line
+        // (handler reads only parameters, or no handler local at all) exit
+        // exceptionally through the identical `i64::MIN` sentinel + epilogue
+        // protocol in both tiers, so moving them to C2 changes code quality
+        // only. Lifting the precise-frame case too is the natural follow-up.
+        //
+        // `CRATONVM_JIT_NO_EXC_TABLE_C2=1` restores the old blanket exclusion.
+        // It exists so one binary can be A/B'd against its own pre-change
+        // behaviour — the only rigorous control, since comparing against a
+        // separately built branch confounds this change with everything else
+        // that landed — and as an escape hatch if a workload ever regresses.
+        && !(exc_table_c2_disabled() && !cached.exception_table.is_empty())
+        && !precise_exception_frames
         && ((!method_uses_category2(code, code_len, &cached.method_descriptor)
                 // inc 30: the pure int/long/ref IR path stays FP-free, so a
                 // float-using (cat-1) method is no longer admitted here — it
