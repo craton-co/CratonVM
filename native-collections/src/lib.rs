@@ -1424,7 +1424,37 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // worker→daemon stream desync. (Disabled, not deleted; impl kept for
     // reference. native-builtins' copy is synthetic-jdk-gated, already inert.)
     let _ = register_concurrent_skip_list_map_natives;
-    register_stamped_lock_natives(registry);
+    // StampedLock: DISABLED 2026-07-28 — this crate's copy silently destroyed
+    // mutual exclusion, and it WON, because `register_collections_natives`
+    // runs after `register_builtins` (last-registration-wins) and so
+    // overwrote `native-builtins`' real `parking_lot`-backed implementation.
+    //
+    // Two independent defects, both measured against HotSpot 25:
+    //
+    //  1. `native_sl_write_lock` spins at most `SL_SPIN_LIMIT` (1000) yields
+    //     and then GIVES UP, returning stamp 0 — while the caller believes it
+    //     holds the lock. `writeLock()` must block until granted; returning 0
+    //     is `tryWriteLock`'s failure contract, not `writeLock`'s.
+    //  2. It keeps its state in `set_field(this, SL_FIELD_STATE, Value::Int)`
+    //     BY INDEX. In real-JDK mode index 0 of a real `StampedLock` is
+    //     `state`, a *long*, so the write is coerced and the read-back
+    //     `match { Value::Int(v) => v, _ => 0 }` always falls to 0 — the lock
+    //     reads as permanently unlocked, the spin loop never waits, and every
+    //     thread enters.
+    //
+    // Measured with 4 threads incrementing under `writeLock()` with a yield
+    // inside the critical section (max threads observed inside; HotSpot = 1):
+    //     default real-JDK mode : 335 threads inside, 345 lost updates
+    //     --synthetic-jdk       :   2 threads inside,   1 lost update
+    //
+    // `native-builtins`' implementation is layout-independent (state lives in
+    // a side table keyed by a GC-stable identity key, and it mirrors `state`
+    // BY NAME), genuinely parks on a `Condvar` instead of spinning, and
+    // provides a strictly larger surface (`tryUnlockRead`/`tryUnlockWrite`,
+    // `tryConvertTo*Lock`, `getReadLockCount`, plus `unlock(J)V` added
+    // alongside this change). Leaving the call site here, disabled, so the
+    // next reader sees why it must not be re-enabled.
+    let _ = register_stamped_lock_natives;
     // Phaser is overridden with a synthetic 3-int layout (parties=0, arrived=1,
     // phase=2) that conflicts with the real JDK field layout (state(0, J),
     // parent(1, L), root(2, L), evenQ(3, L), oddQ(4, L)). In real-JDK mode the

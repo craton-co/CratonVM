@@ -7074,31 +7074,6 @@ pub fn register_essential_natives_with_shims(
     // incubator Vector API shims remain synthetic-only overrides.
     crate::vector_api::register_vector_support_natives(registry);
     crate::lang_system::register_runtime_natives(registry);
-    registry.register(
-        "java/util/concurrent/Executors",
-        "defaultThreadFactory",
-        "()Ljava/util/concurrent/ThreadFactory;",
-        |ctx, _args| {
-            let factory = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1);
-            ctx.set_field(factory, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(factory))))
-        },
-    );
-    registry.register(
-        "java/util/concurrent/ThreadFactory",
-        "newThread",
-        "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
-        |ctx, args| {
-            let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            let thread = alloc_concurrent_synthetic(ctx, "java/lang/Thread", 5);
-            let name = ctx.create_string("pool-thread");
-            ctx.set_field(thread, 0, Value::Object(Some(name)));
-            ctx.set_field(thread, 1, Value::Int(5));
-            ctx.set_field(thread, 3, runnable);
-            ctx.set_field(thread, 4, Value::Int(0));
-            Ok(Some(Value::Object(Some(thread))))
-        },
-    );
 
     // Synthetic-stream `spliterator()` natives — synthetic stream objects
     // (stamped with the bare `java/util/stream/*Stream` interface) are produced

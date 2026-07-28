@@ -2,7 +2,43 @@
 
 **Status: OPEN — found 2026-07-23**
 
-## Symptom
+## Closure — verified 2026-07-28
+
+The reported UCP-29 first-borrow failure was already resolved by the JDBC
+closure merged as `2f8249c36` on 2026-07-24. The original report remained in
+`docs/known-issues` after that delivery, so it was stale rather than an
+active residual.
+
+On a fresh release build from the initial `dev` snapshot (`b695d468f`), using Eclipse
+Temurin 25.0.3.9 and the real `apps/spring-boot` fixture, the full six-test
+`OracleUcpDataSourcePoolMetadataTests` class passed on every fresh VM process:
+
+| Mode | Fresh class processes | Tests | Failures / aborts / failed containers |
+|---|---:|---:|---:|
+| JIT | 3 | 18 | 0 / 0 / 0 |
+| `--nojit` | 3 | 18 | 0 / 0 / 0 |
+
+The JIT runs completed in 7.8 s, 6.9 s, and 6.6 s; the interpreter runs
+completed in 6.8 s, 6.6 s, and 5.7 s. This directly covers the historically
+timing-sensitive first on-demand borrow in `getPoolSizeOneConnection` in both
+execution modes.
+
+After merging current `origin/dev` into the delivery branch, a second fresh
+fat-LTO release build also passed the full class with JIT (6/6, 5.8 s) and
+`--nojit` (6/6, 6.5 s), so the retirement is validated on the final integrated
+runtime as well.
+
+The broader 52-class `spring-boot-jdbc` run could not be repeated on this
+host because the supplied fixture has an incomplete, untracked Gradle tree:
+its cached JDBC classpath references a missing
+`spring-boot-autoconfigure-4.1.0-SNAPSHOT.jar`, and Gradle cannot regenerate
+it because `build-plugin/spring-boot-antlib` is absent. Those resulting
+missing-class failures are fixture invalidation, not VM residuals. The
+previous valid full-module closure remains 51 PASS plus one expected EMPTY
+class in both modes; the current direct evidence above is the valid regression
+gate for this retired issue.
+
+## Original symptom
 
 `module/spring-boot-jdbc`'s `OracleUcpDataSourcePoolMetadataTests` passes
 5/6 tests; `getPoolSizeOneConnection()` fails on the very first JDBC
