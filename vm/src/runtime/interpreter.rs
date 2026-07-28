@@ -21338,6 +21338,12 @@ fn helpful_npe_invoke_message(
     num_params: usize,
 ) -> String {
     use crate::runtime::exceptions::helpful_npe;
+    // `-XX:-ShowCodeDetailsInExceptionMessages`: HotSpot's `getMessage()` is
+    // null. The throw site needs a `String`, so hand back the empty marker that
+    // `throw_runtime_error` maps to `None` (see its NPE arm).
+    if crate::runtime::env_cache::helpful_npe_suppressed() {
+        return String::new();
+    }
     let action = helpful_npe::action_invoke(owner_internal, method_name, method_descriptor);
     let frame = &thread.frames[frame_idx];
     // `last_instr_pc` is set by the dispatch loop to the bci of the opcode
@@ -21408,6 +21414,11 @@ fn helpful_npe_opcode_message_parts(
     depth_below_top: usize,
 ) -> String {
     use crate::runtime::exceptions::helpful_npe;
+    // See `helpful_npe_invoke_message`: an explicit opt-out yields the empty
+    // marker, which `throw_runtime_error` turns into a null `getMessage()`.
+    if crate::runtime::env_cache::helpful_npe_suppressed() {
+        return String::new();
+    }
     let resolver = CpPoolResolver {
         shared,
         class_id,

@@ -7026,13 +7026,11 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
     )
 }
 
-/// Direct compact-Latin1 lowercase helper. The registered Java helper is
-/// correct for interpreter execution, but its generic native-dispatch round
-/// trip dominates repeated charset lookups. This preserves the same cached
-/// immutable result and pending-return root contracts without that overhead.
-/// Direct receiver-typed `String.toLowerCase(Locale)` entry. The ASCII
-/// compact helper below owns the implementation; Locale is currently unused
-/// by the VM's existing ASCII fast path.
+/// Direct receiver-typed `String.toLowerCase(Locale)` entry — the thin
+/// direct-call form the JIT emits instead of a generic native-dispatch round
+/// trip, which dominates repeated case folding.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_string_locale_to_lower_direct(
     vm_ptr: i64,
     source: i64,
@@ -7041,11 +7039,22 @@ pub unsafe extern "C" fn jit_string_locale_to_lower_direct(
     jit_string_latin1_to_lower_direct(vm_ptr, source, 0, locale)
 }
 
+/// Compact-Latin1 sibling: `StringLatin1.toLowerCase(String, byte[], Locale)`,
+/// so `value` is the receiver's backing array (unused — the implementation
+/// reads the String) and `locale` the third argument.
+///
+/// Both entries delegate to `lang_string::jit_string_to_lower_case`, the same
+/// implementation the interpreted native uses. They used to carry a private copy
+/// of the ASCII/Unicode fold that ignored `locale` entirely, so a
+/// `toLowerCase(TURKISH)` call silently changed its answer when its caller
+/// tiered up — the interpreter said `tıtle`, the compiled code `title`.
+///
+/// SAFETY: called only from JIT-compiled code with a live `vm_ptr`.
 pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     vm_ptr: i64,
     source: i64,
     _value: i64,
-    _locale: i64,
+    locale: i64,
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
@@ -7056,6 +7065,13 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     let Some(source) = vm.mem.heap.is_object_address(source as usize) else {
         return 0;
     };
+    // A null / non-heap Locale means "default locale", exactly as the
+    // interpreted native treats a missing argument.
+    let locale_obj = if locale == 0 {
+        None
+    } else {
+        vm.mem.heap.is_object_address(locale as usize)
+    };
     let Some((thread, _guard)) = jit_thread_mut() else {
         return 0;
     };
@@ -7063,28 +7079,10 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
         shared: vm,
         thread: &mut *thread,
     };
-    let result = if let Some(cached) = ctx.get_ascii_case_string_cached(source, false) {
-        cached
-    } else {
-        let mut lower = ctx.read_string(source).unwrap_or_default();
-        let changed = if lower.is_ascii() {
-            let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
-            lower.make_ascii_lowercase();
-            changed
-        } else {
-            let folded = lower.to_lowercase();
-            if folded == lower {
-                false
-            } else {
-                lower = folded;
-                true
-            }
-        };
-        if changed {
-            ctx.create_ascii_case_string_cached(source, &lower, false)
-        } else {
-            source
-        }
+    let Some(result) = cratonvm_native_builtins::lang_string::jit_string_to_lower_case(
+        &mut ctx, source, locale_obj,
+    ) else {
+        return 0;
     };
     thread.native_pending_return = Some(result);
     result.as_ptr() as i64
