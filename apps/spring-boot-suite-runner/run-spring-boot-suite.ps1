@@ -283,7 +283,13 @@ function Split-ManifestLine([string]$Line) {
 
 function New-PathingJar {
   param([string]$Module, [string[]]$Entries)
-  $pathingDir = Join-Path $script:WorkRoot 'pathing-jars'
+  # -AllModes launches JIT and no-JIT child runners concurrently.  They have
+  # the same module classpath signature but must not race over one
+  # classpath.jar (one child can observe the other deleting/recreating it).
+  # Mode-local wrappers retain caching within a lane while making the two
+  # child processes independent.
+  $modePath = ConvertTo-SafeName $(if ($script:EffectiveModeName) { $script:EffectiveModeName } else { 'default' })
+  $pathingDir = Join-Path (Join-Path $script:WorkRoot 'pathing-jars') $modePath
   New-Item -ItemType Directory -Force -Path $pathingDir | Out-Null
   $signature = 'pathing-jar-manifest-url-v1' + "`n" + (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
   $hash = (Get-Sha256Hex $signature).Substring(0, 16)
@@ -740,6 +746,14 @@ function New-ProcessRecord {
   $psi.CreateNoWindow = $true
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
+  # Spring Boot's JUL formatter deliberately treats LOG_FORMAT as an
+  # application-facing override.  Letting a developer's ambient value leak
+  # into every direct JUnit launch changes assertions that exercise its
+  # documented default format (for example JavaLoggingSystemTests), and makes
+  # the CratonVM/HotSpot comparison host-dependent.  The runner owns a
+  # hermetic test-process environment, so remove only this formatter override;
+  # individual tests can still set the Java system property explicitly.
+  [void]$psi.Environment.Remove('LOG_FORMAT')
   Set-ProcessArguments -StartInfo $psi -Arguments $args
   $proc = [System.Diagnostics.Process]::new()
   $proc.StartInfo = $psi
@@ -825,10 +839,9 @@ function Invoke-Mode {
     # this.socketLock is null" — see docs/known-issues (reference_server_socket_gap
     # in memory) for the full history; this is a known, already-fixed-behind-
     # a-flag issue, not something to re-report as a new bug.
-    $env:CRATONVM_REAL_NET_SOCKETS = '1'
-    $env:CRATONVM_REAL_AQS = '1'
-    $env:CRATONVM_DISABLE_DEFAULT_WATCHDOG = '1'
-    $env:CRATONVM_ROOTSNAP_CACHE = '1'
+    $env:CRATONVM_REAL = 'net-sockets,aqs'
+    $env:CRATONVM_THREADS = '-default-watchdog'
+    $env:CRATONVM_JIT = 'rootsnap-cache'
   }
 
   $run = $RunName

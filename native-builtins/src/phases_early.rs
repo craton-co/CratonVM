@@ -6,6 +6,7 @@
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
+use crate::util_concurrent_ext::{atomic_array_cas, atomic_array_rmw};
 
 /// POSIX permits a blocking socket read to be interrupted before it consumes
 /// bytes. Retry that transient condition instead of exposing it as a Java EOF
@@ -8450,9 +8451,12 @@ fn fjp_state_clear() {
 
 #[cfg(test)]
 mod fjp_gc_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn gc_hooks_scan_result_and_remap_key_and_result() {
@@ -13023,6 +13027,15 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
         |ctx, args| {
+            // Mirrors the same check in `jca::cipher::register_cipher_dispatch`
+            // — whichever registration wins, an unregistered provider name has
+            // to be rejected rather than silently ignored.
+            crate::jca::provider_chain::check_named_provider_arg(
+                ctx,
+                args,
+                1,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             let algo = obj_arg(args, 0)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
@@ -15547,6 +15560,13 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Signature;",
         |ctx, args| {
+            // Mirrors the same check in `jca::signature::sig_get_instance`.
+            crate::jca::provider_chain::check_named_provider_arg(
+                ctx,
+                args,
+                1,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
             let algo = obj_arg(args, 0)?;
             let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 4);
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
@@ -18083,10 +18103,9 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     r.register(aia, "getAndSet", "(II)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let idx = args[1].as_int().unwrap_or(0) as usize;
-        let new_val = args[2];
+        let new_val = Value::Int(args[2].as_int().unwrap_or(0));
         if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let old = ctx.get_array_element(arr, idx);
-            ctx.set_array_element(arr, idx, new_val);
+            let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| new_val);
             Ok(Some(old))
         } else {
             Ok(Some(Value::Int(0)))
@@ -18098,13 +18117,8 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let expected = args[2].as_int().unwrap_or(0);
         let update = args[3].as_int().unwrap_or(0);
         if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let current = ctx.get_array_element(arr, idx).as_int().unwrap_or(0);
-            if current == expected {
-                ctx.set_array_element(arr, idx, Value::Int(update));
-                Ok(Some(Value::Int(1)))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
+            let ok = atomic_array_cas(ctx, arr, idx, Value::Int(expected), Value::Int(update));
+            Ok(Some(Value::Int(i32::from(ok))))
         } else {
             Ok(Some(Value::Int(0)))
         }
@@ -18114,9 +18128,10 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let idx = args[1].as_int().unwrap_or(0) as usize;
         let delta = args[2].as_int().unwrap_or(0);
         if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let old = ctx.get_array_element(arr, idx).as_int().unwrap_or(0);
-            ctx.set_array_element(arr, idx, Value::Int(old.wrapping_add(delta)));
-            Ok(Some(Value::Int(old)))
+            let (old, _) = atomic_array_rmw(ctx, arr, idx, |cur| {
+                Value::Int(cur.as_int().unwrap_or(0).wrapping_add(delta))
+            });
+            Ok(Some(old))
         } else {
             Ok(Some(Value::Int(0)))
         }
@@ -18125,10 +18140,10 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let idx = args[1].as_int().unwrap_or(0) as usize;
         if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let old = ctx.get_array_element(arr, idx).as_int().unwrap_or(0);
-            let new_val = old.wrapping_add(1);
-            ctx.set_array_element(arr, idx, Value::Int(new_val));
-            Ok(Some(Value::Int(new_val)))
+            let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+                Value::Int(cur.as_int().unwrap_or(0).wrapping_add(1))
+            });
+            Ok(Some(new_val))
         } else {
             Ok(Some(Value::Int(0)))
         }
@@ -18188,9 +18203,10 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let idx = args[1].as_int().unwrap_or(0) as usize;
         let delta = args[2].as_long().unwrap_or(0);
         if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let old = ctx.get_array_element(arr, idx).as_long().unwrap_or(0);
-            ctx.set_array_element(arr, idx, Value::Long(old.wrapping_add(delta)));
-            Ok(Some(Value::Long(old)))
+            let (old, _) = atomic_array_rmw(ctx, arr, idx, |cur| {
+                Value::Long(cur.as_long().unwrap_or(0).wrapping_add(delta))
+            });
+            Ok(Some(old))
         } else {
             Ok(Some(Value::Long(0)))
         }
@@ -18199,10 +18215,10 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let idx = args[1].as_int().unwrap_or(0) as usize;
         if let Value::Object(Some(arr)) = ctx.get_field(this, 0) {
-            let old = ctx.get_array_element(arr, idx).as_long().unwrap_or(0);
-            let new_val = old.wrapping_add(1);
-            ctx.set_array_element(arr, idx, Value::Long(new_val));
-            Ok(Some(Value::Long(new_val)))
+            let (_, new_val) = atomic_array_rmw(ctx, arr, idx, |cur| {
+                Value::Long(cur.as_long().unwrap_or(0).wrapping_add(1))
+            });
+            Ok(Some(new_val))
         } else {
             Ok(Some(Value::Long(0)))
         }
@@ -18272,13 +18288,8 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
         let this = obj_arg(args, 0)?;
         let idx = args[1].as_int().unwrap_or(0) as usize;
         if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-            let current = ctx.get_array_element(arr, idx);
-            if current == args[2] {
-                ctx.set_array_element(arr, idx, args[3]);
-                Ok(Some(Value::Int(1)))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
+            let ok = atomic_array_cas(ctx, arr, idx, args[2], args[3]);
+            Ok(Some(Value::Int(i32::from(ok))))
         } else {
             Ok(Some(Value::Int(0)))
         }
@@ -18309,8 +18320,8 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
             let this = obj_arg(args, 0)?;
             let idx = args[1].as_int().unwrap_or(0) as usize;
             if let Value::Object(Some(arr)) = ctx.get_field_by_name(this, "array") {
-                let old = ctx.get_array_element(arr, idx);
-                ctx.set_array_element(arr, idx, args[2]);
+                let new_val = args[2];
+                let (old, _) = atomic_array_rmw(ctx, arr, idx, |_| new_val);
                 Ok(Some(old))
             } else {
                 Ok(Some(Value::Object(None)))
@@ -21475,10 +21486,13 @@ fn native_scanner_find_within_horizon_string_int(
 // ===========================================================================
 #[cfg(test)]
 mod t2_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::{mock_ctx, MockNativeContext};
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     use cratonvm_types::{ArrayElementType, ClassId, ObjectRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
 

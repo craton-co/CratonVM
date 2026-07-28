@@ -42,11 +42,13 @@
 
 use std::sync::Arc;
 
+use cratonvm_native_api::{
+    NativeClassAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess,
+};
 use cratonvm_reader::class_access_flags::MethodAccessFlags;
 use cratonvm_reader::constant_pool::ConstantPoolEntry;
 use cratonvm_reader::instruction::Instruction;
 use tracing::trace;
-use cratonvm_native_api::{NativeClassAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess};
 
 use crate::classloading::resolution::{
     CachedBytecodeMethod, CachedInvokeTarget as GenericCachedInvokeTarget, MethodHandleKind,
@@ -1379,7 +1381,9 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         // the instant this pause is requested, to disambiguate
                         // whether a thread later seen parked was already
                         // excluded at request time or genuinely raced in.
-                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
+                        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STW_EXPECTED_IDS")
+                            .is_some()
+                        {
                             let expected_ids: Vec<u64> = shared
                                 .threads
                                 .thread_registry
@@ -1734,9 +1738,11 @@ pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
     // read the knob once. `Some(0)` = explicitly disabled.
     use std::sync::OnceLock;
     static LIMIT: OnceLock<u32> = OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_GC_OVERHEAD_LIMIT") {
-        Ok(v) => v.trim().parse::<u32>().unwrap_or(GC_OVERHEAD_LIMIT_CYCLES),
-        Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+    let limit = *LIMIT.get_or_init(|| {
+        match cratonvm_types::flags::runtime_var("CRATONVM_GC_OVERHEAD_LIMIT") {
+            Ok(v) => v.trim().parse::<u32>().unwrap_or(GC_OVERHEAD_LIMIT_CYCLES),
+            Err(_) => GC_OVERHEAD_LIMIT_CYCLES,
+        }
     });
     if limit == 0 {
         return false; // explicitly disabled
@@ -2368,9 +2374,9 @@ fn process_references_after_gc(
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
         let next_slot = gc_reference_next_slot(shared, ref_obj);
         shared.mem.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
-        // RQ_FIELD_SIZE. Slot 1 is `size` in the synthetic two-slot shape but
-        // `queueLength` — a `long` — on a real JDK ReferenceQueue, whose own
-        // `enqueue0`/`poll0` bytecode reads it back. Preserve the stored width.
+                                                                 // RQ_FIELD_SIZE. Slot 1 is `size` in the synthetic two-slot shape but
+                                                                 // `queueLength` — a `long` — on a real JDK ReferenceQueue, whose own
+                                                                 // `enqueue0`/`poll0` bytecode reads it back. Preserve the stored width.
         let new_size = match shared.mem.heap.get_field(q_obj, 1) {
             Value::Long(v) => Value::Long(v + 1),
             Value::Int(v) => Value::Int(v + 1),
@@ -2683,7 +2689,9 @@ fn dbg_invoke_stats_record(index: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INVOKESTATS").is_some()) {
+    if !*ON
+        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INVOKESTATS").is_some())
+    {
         return;
     }
     static COUNTS: [AtomicU64; 4] = [
@@ -2711,7 +2719,8 @@ fn dbg_refill_fail_state(shared: &SharedVm, requested: usize) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some())
+    {
         return;
     }
     static N: AtomicU64 = AtomicU64::new(0);
@@ -2734,7 +2743,8 @@ fn dbg_refill_fail(stage: usize, requested: usize) {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some()) {
+    if !*ON.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_TLABMISS").is_some())
+    {
         return;
     }
     static COUNTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -4102,7 +4112,9 @@ pub(crate) fn apply_pointer_map_to_thread(
     // thread, so this is the only place that can reach these handles.
     crate::native::jni::update_local_refs_after_gc(pointer_map);
     // BUG-03 trace (gated): record that the safepoint-peer remap ran for main.
-    if thread.thread_id.0 == 0 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
+    if thread.thread_id.0 == 0
+        && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some()
+    {
         let jto = thread
             .java_thread_obj
             .map(|o| o.as_ptr() as usize)
@@ -4301,7 +4313,12 @@ pub(crate) fn apply_pointer_map_to_thread(
     fn gc_verify_stale_enabled() -> bool {
         use std::sync::OnceLock;
         static E: OnceLock<bool> = OnceLock::new();
-        *E.get_or_init(|| cratonvm_types::flags::runtime_var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1"))
+        *E.get_or_init(|| {
+            cratonvm_types::flags::runtime_var("CRATONVM_GC_VERIFY_STALE")
+                .ok()
+                .as_deref()
+                == Some("1")
+        })
     }
     if gc_verify_stale_enabled() {
         use cratonvm_types::ObjectHeader;
@@ -5250,7 +5267,9 @@ pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
 /// uncached-invocation path). Default-OFF → behaviour is byte-for-byte unchanged.
 fn c2_first_call_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_FIRST_CALL").is_some())
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_C2_FIRST_CALL").is_some()
+    })
 }
 
 /// Execute a method on the given class.
@@ -5926,8 +5945,7 @@ pub fn execute(
             // transitively extend `java/util/concurrent/ForkJoinTask` miscompile
             // under deep recursion and must run in the interpreter pending a
             // proper regalloc fix.
-            let fjp_skip =
-                is_fjp_subclass_blocklisted(shared, &class_name_str, Some(class_id));
+            let fjp_skip = is_fjp_subclass_blocklisted(shared, &class_name_str, Some(class_id));
             // S111r15 - refuse to JIT a method directly backed by a Rust native at
             // this FIRST-CALL compile path too. Without this, `Character.toLowerCase(C)C`
             // bypassed the native override and corrupted Spring property-name parsing.
@@ -9368,11 +9386,7 @@ fn execute_frame_from_index(
                     // JDK/Spring frames.
                     let return_value = Some(value);
                     let _ = frame;
-                    fire_jvmti_method_exit_normal(
-                        thread,
-                        &thread.frames[frame_idx],
-                        &return_value,
-                    );
+                    fire_jvmti_method_exit_normal(thread, &thread.frames[frame_idx], &return_value);
                     if frame_idx > initial_frame_idx {
                         // Stackless return: pop child frame, push value to parent.
                         pop_and_recycle_frame(shared, thread);
@@ -11751,18 +11765,18 @@ fn find_exception_handler_pc_unknown(
         let catch_class_name_owned = catch_class_name.to_string();
         let catch_class_id =
             match cm_guard.find_class_by_name_for_class(catch_class_name, frame.class_id) {
-            Some(id) => id,
-            None => {
-                let owned = catch_class_name.to_string();
-                drop(cm_guard);
-                let loaded = shared.load_class_concurrent(&owned);
-                cm_guard = shared.classes.class_manager.read();
-                match loaded {
-                    Ok(id) => id,
-                    Err(_) => continue,
+                Some(id) => id,
+                None => {
+                    let owned = catch_class_name.to_string();
+                    drop(cm_guard);
+                    let loaded = shared.load_class_concurrent(&owned);
+                    cm_guard = shared.classes.class_manager.read();
+                    match loaded {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    }
                 }
-            }
-        };
+            };
         if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
             || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
         {
@@ -11830,22 +11844,22 @@ fn find_exception_handler_impl(
         // no allocation.
         let catch_class_id =
             match cm_guard.find_class_by_name_for_class(catch_class_name, frame.class_id) {
-            Some(id) => id,
-            None => {
-                // Lazy load: must drop the read lock since
-                // `load_class_concurrent` acquires the write lock.
-                // Copy the name into an owned String only on this
-                // (rare) slow path.
-                let owned = catch_class_name.to_string();
-                drop(cm_guard);
-                let loaded = shared.load_class_concurrent(&owned);
-                cm_guard = shared.classes.class_manager.read();
-                match loaded {
-                    Ok(id) => id,
-                    Err(_) => continue, // Can't load catch type — skip handler
+                Some(id) => id,
+                None => {
+                    // Lazy load: must drop the read lock since
+                    // `load_class_concurrent` acquires the write lock.
+                    // Copy the name into an owned String only on this
+                    // (rare) slow path.
+                    let owned = catch_class_name.to_string();
+                    drop(cm_guard);
+                    let loaded = shared.load_class_concurrent(&owned);
+                    cm_guard = shared.classes.class_manager.read();
+                    match loaded {
+                        Ok(id) => id,
+                        Err(_) => continue, // Can't load catch type — skip handler
+                    }
                 }
-            }
-        };
+            };
 
         if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
             || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
@@ -12302,7 +12316,8 @@ fn route_jit_exception_through_method(
 fn ir_deopt_resume_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_IR_DEOPT_RESUME").is_some())
+    *FLAG
+        .get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_IR_DEOPT_RESUME").is_some())
 }
 
 /// Map ONE reconstructed `FrameValue` (already resolved in-stub against the
@@ -16882,8 +16897,7 @@ fn execute_instruction(
                 );
             }
 
-            if crate::runtime::env_cache::dbg_loader_trace()
-                && class_name.contains("RootReference")
+            if crate::runtime::env_cache::dbg_loader_trace() && class_name.contains("RootReference")
             {
                 let cm = shared.classes.class_manager.read();
                 let ref_loader = cm.get_loader_id(referencing_class_id);
@@ -22042,7 +22056,8 @@ fn execute_invoke_kind(
                             // remapped mirror — pinpoints whether the staleness is in
                             // the operand-stack copy, the per-thread field, or the
                             // registry (the moving-GC concurrent-spawn reclamation).
-                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some() {
+                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BUG03").is_some()
+                            {
                                 let field = thread
                                     .java_thread_obj
                                     .map(|o| o.as_ptr() as usize)
@@ -22196,7 +22211,9 @@ fn execute_invoke_kind(
                             // stack and the per-frame locals/operand slots that
                             // reference this stale address so we can see HOW
                             // the bad pointer arrived in the receiver slot.
-                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STALE_RECV").is_some() {
+                            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STALE_RECV")
+                                .is_some()
+                            {
                                 // Cast: object/code pointer to integer address
                                 let stale_addr = obj_ref.as_ptr() as usize;
                                 // Extend CRATONVM_DBG_STALE_RECV with the A2
@@ -22214,7 +22231,9 @@ fn execute_invoke_kind(
                                 // reference surviving a legitimate
                                 // relocation -- see
                                 // initialize_real_thread_pool_executor).
-                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A2").is_some() {
+                                if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_A2")
+                                    .is_some()
+                                {
                                     let hist = cratonvm_gc::a2dbg::history_at(stale_addr, 16);
                                     if hist.is_empty() {
                                         eprintln!(
@@ -23134,7 +23153,10 @@ fn execute_invoke_kind(
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_INVSPECIAL").is_some() && is_special {
         let cm = shared.classes.class_manager.read();
         let cur_loader = cm.get_loader_id(current_class_id);
-        if matches!(cur_loader, Some(cratonvm_types::ClassLoaderId::UserDefined(_))) {
+        if matches!(
+            cur_loader,
+            Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+        ) {
             let invoke_class_resolved = cm.get_loaded_class_id(&invoke_class);
             drop(cm);
             eprintln!(
@@ -27545,6 +27567,67 @@ pub(crate) fn is_file_channel_impl_open_native_override(
         )
 }
 
+pub(crate) fn is_input_stream_transfer_to_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    matches!(
+        class_name,
+        "java/io/InputStream" | "java/io/FileInputStream"
+    ) && method_name == "transferTo"
+        && descriptor == "(Ljava/io/OutputStream;)J"
+}
+
+pub(crate) fn is_zip_output_primitive_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    (class_name == "java/util/zip/ZipOutputStream"
+        && matches!(
+            (method_name, descriptor),
+            ("writeShort", "(I)V")
+                | ("writeInt", "(J)V")
+                | ("writeLong", "(J)V")
+                | ("putNextEntry", "(Ljava/util/zip/ZipEntry;)V")
+                | ("write", "([BII)V")
+                | ("write", "([B)V")
+                | ("write", "(I)V")
+                | ("finish", "()V")
+                | ("close", "()V")
+        ))
+        || (class_name == "java/util/zip/ZipEntry"
+            && method_name == "setTime"
+            && descriptor == "(J)V")
+        // The real InflaterInputStream.close bytecode is contractually simple,
+        // but it runs once for every ZIP64 entry in the loader fixture. The
+        // registered native performs the same closed/inflater/underlying-stream
+        // transitions through real named fields; force it so virtual dispatch
+        // does not fall back to the interpreter for each tiny entry.
+        || (class_name == "java/util/zip/InflaterInputStream"
+            && matches!(
+                (method_name, descriptor),
+                ("close", "()V")
+                    | ("<init>", "(Ljava/io/InputStream;Ljava/util/zip/Inflater;I)V")
+                    | ("read", "()I")
+                    | ("read", "([BII)I")
+            ))
+        || (class_name == "org/springframework/boot/loader/jar/ZipInflaterInputStream"
+            && matches!(
+                (method_name, descriptor),
+                ("read", "([BII)I")
+                    | ("<init>", "(Ljava/io/InputStream;Ljava/util/zip/Inflater;I)V")
+            ))
+        || (class_name == "org/springframework/boot/loader/zip/FileDataBlock"
+            && matches!(
+                (method_name, descriptor),
+                ("open", "()V")
+                    | ("close", "()V")
+                    | ("read", "(Ljava/nio/ByteBuffer;J)I")
+            ))
+}
+
 pub(crate) fn is_native_thread_set_native_override(
     class_name: &str,
     method_name: &str,
@@ -28077,13 +28160,13 @@ fn force_native_over_real_jdk_bytecode(
         && matches!(
             method_name,
             "<init>"
-                | "getEntry"
                 | "getInputStream"
                 | "entries"
                 | "stream"
                 | "getComment"
                 | "close"
                 | "getName"
+                | "isMultiRelease"
                 | "size"
         )
     {
@@ -28956,6 +29039,25 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Spring Boot's nested archive protocol reaches the registered jar-FS
+    // bridge through these concrete real-JDK entry points. Letting the real
+    // bodies win discards the `jar:nested:` container identity before the
+    // native virtual filesystem can decode it.
+    if (class_name == "java/nio/file/Path"
+        && method_name == "of"
+        && method_descriptor == "(Ljava/net/URI;)Ljava/nio/file/Path;")
+        || (class_name == "java/nio/file/FileSystems" && method_name == "newFileSystem")
+        || (class_name == "java/nio/file/spi/FileSystemProvider" && method_name == "newFileSystem")
+        || (class_name == "org/springframework/boot/loader/launch/Archive"
+            && method_name == "create"
+            && matches!(
+                method_descriptor,
+                "(Ljava/io/File;)Lorg/springframework/boot/loader/launch/Archive;"
+                    | "(Ljava/lang/Class;)Lorg/springframework/boot/loader/launch/Archive;"
+            ))
+    {
+        return true;
+    }
 
     // `getDescriptor` has the same null-descriptor problem, but real HotSpot
     // guarantees `isNamed() == (getDescriptor() != null)` — a named module's
@@ -29051,6 +29153,59 @@ fn force_native_over_real_jdk_bytecode(
                 | "size"
                 | "close"
                 | "getName"
+        )
+    {
+        return true;
+    }
+    // Manifest attributes are keyed by Attributes.Name, whose equality and
+    // hash are case-insensitive. The bridge stores those names in the native
+    // HashMap path, so its registered Name methods must win over real JDK
+    // bytecode (which expects uninitialized private cache fields).
+    if class_name == "java/util/jar/Attributes$Name"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<init>", "(Ljava/lang/String;)V")
+                | ("toString", "()Ljava/lang/String;")
+                | ("equals", "(Ljava/lang/Object;)Z")
+                | ("hashCode", "()I")
+        )
+    {
+        return true;
+    }
+    if class_name == "java/util/jar/Attributes"
+        && method_name == "containsKey"
+        && method_descriptor == "(Ljava/lang/Object;)Z"
+    {
+        return true;
+    }
+    if class_name == "org/springframework/boot/loader/jar/ManifestInfo"
+        && method_name == "isMultiRelease"
+        && method_descriptor == "()Z"
+    {
+        return true;
+    }
+    if class_name == "org/springframework/boot/loader/jar/NestedJarFile"
+        && method_name == "getJarEntry"
+        && method_descriptor == "(Ljava/lang/String;)Ljava/util/jar/JarEntry;"
+    {
+        return true;
+    }
+    if class_name == "org/springframework/boot/loader/jar/NestedJarFile$NestedJarEntry"
+        && method_name == "getRealName"
+        && method_descriptor == "()Ljava/lang/String;"
+    {
+        return true;
+    }
+    if class_name == "org/springframework/boot/loader/net/protocol/jar/UrlJarFile"
+        && method_name == "getEntry"
+        && method_descriptor == "(Ljava/lang/String;)Ljava/util/zip/ZipEntry;"
+    {
+        return true;
+    }
+    if class_name == "org/springframework/boot/loader/zip/ZipContent$SignatureFiles"
+        && matches!(
+            (method_name, method_descriptor),
+            ("<clinit>", "()V") | ("bufferEndsWithSignatureSuffix", "()Z")
         )
     {
         return true;
@@ -29266,11 +29421,14 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
-    if class_name == "java/lang/Runtime$Version"
-        && matches!(
-            (method_name, method_descriptor),
-            ("feature", "()I") | ("build", "()Ljava/util/Optional;")
-        )
+    if (class_name == "java/lang/Runtime"
+        && method_name == "version"
+        && method_descriptor == "()Ljava/lang/Runtime$Version;")
+        || (class_name == "java/lang/Runtime$Version"
+            && matches!(
+                (method_name, method_descriptor),
+                ("feature", "()I") | ("build", "()Ljava/util/Optional;")
+            ))
     {
         return true;
     }
@@ -29742,6 +29900,40 @@ fn force_native_over_real_jdk_bytecode(
         return true;
     }
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_input_stream_transfer_to_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_zip_output_primitive_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Keep the cached virtual-call path aligned with vm_exec's
+    // FileSystemProvider.newFileChannel override. The real base method is a
+    // deliberate UnsupportedOperationException stub; the registered native
+    // constructs CratonVM's fd-backed FileChannel for the default provider.
+    if matches!(
+        class_name,
+        "java/nio/file/spi/FileSystemProvider"
+            | "sun/nio/fs/WindowsFileSystemProvider"
+            | "sun/nio/fs/UnixFileSystemProvider"
+    )
+        && method_name == "newFileChannel"
+        && method_descriptor
+            == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;"
+    {
+        return true;
+    }
+    // Native-backed ZIP metadata uses the real JDK field layout but may carry
+    // a null optional comment. Keep the bridge for the nullable setter so a
+    // Spring Boot nested-entry copy does not enter ZipEntry's CEN validation
+    // path with compact/native state.
+    if matches!(
+        class_name,
+        "java/util/zip/ZipEntry" | "java/util/jar/JarEntry"
+    ) && method_name == "setComment"
+        && method_descriptor == "(Ljava/lang/String;)V"
+    {
         return true;
     }
     if is_native_thread_set_native_override(class_name, method_name, method_descriptor) {
@@ -30572,6 +30764,39 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    // FileChannel.open() invokes FileSystemProvider.newFileChannel through a
+    // default-provider receiver (WindowsFileSystemProvider on this host),
+    // while the fd-backed native is registered on the JDK base class. Route
+    // the forced call to that base registration explicitly so a cached
+    // runtime receiver name cannot bypass it and run the JDK's deliberate
+    // UnsupportedOperationException stub.
+    if method_name == "newFileChannel"
+        && method_descriptor
+            == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;"
+        && matches!(
+            class_name,
+            "java/nio/file/spi/FileSystemProvider"
+                | "sun/nio/fs/WindowsFileSystemProvider"
+                | "sun/nio/fs/UnixFileSystemProvider"
+        )
+    {
+        let cb = shared.natives.native_methods.find(
+            "java/nio/file/spi/FileSystemProvider",
+            method_name,
+            method_descriptor,
+        )?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     // The resource-name argument is specified to be non-null for every
     // ClassLoader resource accessor.  A virtual call whose constant-pool
     // owner is ClassLoader can resolve to an inherited cached method on a
@@ -31378,6 +31603,12 @@ pub(crate) fn real_protected_stub_class(class_name: &str) -> bool {
                 // factory must run its real bytecode so the result has the
                 // real field layout and ISO-8601 `toString()` semantics.
                 | "java/time/Instant"
+                // Spring Boot's loader decodes central-directory DOS times via
+                // ZonedDateTime.of(...). The synthetic bridge stores its
+                // fields in a compact layout that is incompatible with the
+                // loaded JDK class, turning historical ZIP timestamps into
+                // the current clock value when converted to an Instant.
+                | "java/time/ZonedDateTime"
                 // NOT "java/util/StringJoiner" (2026-07-10): yielding this
                 // class's SyntheticStub natives to real bytecode here exposes
                 // a deterministic heap-reference-integrity defect (the
@@ -31457,6 +31688,34 @@ fn try_stackless_invoke(
     // the caller's operand stack — otherwise the next `pop_int` blows up
     // with `expected int on stack, got ref(...)`.
     let ret_type = crate::jit::return_type(descriptor);
+
+    // A nested-archive subclass calls `super(file)` with invokespecial. Mockito
+    // can redefine JarFile, so the ordinary redefine guard would otherwise run
+    // the real JDK constructor. Its ZipFile state is not present on CratonVM's
+    // compact native JarFile representation; retain the bridge for precisely
+    // the registered File constructor shapes. Ordinary mock calls remain
+    // redefine-aware.
+    if is_special
+        && class_name == "java/util/jar/JarFile"
+        && method_name == "<init>"
+        && matches!(
+            descriptor,
+            "(Ljava/io/File;)V"
+                | "(Ljava/io/File;Z)V"
+                | "(Ljava/io/File;ZI)V"
+                | "(Ljava/io/File;ZILjava/lang/Runtime$Version;)V"
+        )
+    {
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find("java/util/jar/JarFile", method_name, descriptor)
+        {
+            safe_native_call(shared, thread, callback, args)?;
+            return Ok(CachedCallResult::Handled);
+        }
+    }
 
     // A subclass `super.close()` is an invokespecial whose constant-pool
     // owner is JarFile even though the concrete implementation is inherited
@@ -32560,7 +32819,9 @@ fn execute_invokestatic(
     // dispatcher (visible in the bt18 regression profile's getenv storm).
     fn invokestatic_loader_trace() -> bool {
         static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *G.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some())
+        *G.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
+        })
     }
     if invokestatic_loader_trace()
         && (method_class_name.contains("SpringFactoriesLoader")
@@ -34239,6 +34500,19 @@ fn compile_osr_artifact(
             if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
                 return None;
             }
+            // A previous compile for exactly this back-edge produced a body
+            // whose `osr_dead_mask` refuses entry there. That verdict is a pure
+            // function of a deterministic compile, so re-running the pipeline
+            // can only reach it again — 256 times over ten H2 `nioMemLZF:`
+            // operations before this memo existed. See `mark_osr_entry_rejected`.
+            if crate::jit::is_osr_entry_rejected(
+                &class_name,
+                &method_name,
+                &method_descriptor,
+                entry_pc,
+            ) {
+                return None;
+            }
             let code_len = code.len().saturating_sub(2); // padded_bytecode adds 2
             let scan = match crate::jit::x64::jit_scan(&code, code_len, &method_descriptor) {
                 Some(s) => s,
@@ -35156,6 +35430,26 @@ fn compile_osr_artifact(
         None => return None,
     };
 
+    // The compile succeeded but the body may still refuse to enter at the PC it
+    // was compiled for (non-zero `osr_dead_mask[entry_pc]`). Memo that so the
+    // next trip over this back-edge does not re-run the whole pipeline to the
+    // same conclusion; the artifact stays cached and other PCs are unaffected.
+    if !osr_reused && !compiled.can_osr_enter(entry_pc) {
+        crate::jit::mark_osr_entry_rejected(
+            &class_name,
+            &method_name,
+            &method_descriptor,
+            entry_pc,
+        );
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] OSR-reject {}.{}{} entry_pc={} (dead_mask non-zero; memoed)",
+                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+            );
+        }
+        return None;
+    }
+
     if crate::runtime::env_cache::dbg_jitc() {
         eprintln!(
             "[cratonvm-jitc] OSR-{} {}.{}{} entry_pc={} entry={:p} len={}",
@@ -35254,7 +35548,9 @@ fn try_osr(
         // back to _qd0 + 1. Anything higher leaked.
         {
             let now = cratonvm_gc::gc_quiescence::depth();
-            if now > _qd0 + 1 && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
+            if now > _qd0 + 1
+                && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some()
+            {
                 eprintln!(
                     "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
                     _qd0,
@@ -35799,9 +36095,9 @@ fn jit_invoke_targets_native_shadow(
         };
         let method_name = method_name.to_string();
         let descriptor = descriptor.to_string();
-        let declaring_class =
-            if let Some(target_id) = cm.find_class_by_name_for_class(&target_class, caller_class_id)
-            {
+        let declaring_class = if let Some(target_id) =
+            cm.find_class_by_name_for_class(&target_class, caller_class_id)
+        {
             let store = cm.class_store();
             crate::classloading::find_method_recursive(target_id, &method_name, &descriptor, store)
                 .and_then(|(_, declaring_id)| {
@@ -35809,9 +36105,9 @@ fn jit_invoke_targets_native_shadow(
                         .get(declaring_id)
                         .map(|declaring| declaring.name.to_string())
                 })
-            } else {
-                None
-            };
+        } else {
+            None
+        };
         (
             target_class,
             method_name,
@@ -36445,11 +36741,7 @@ fn try_jit_upgrade_with_gate(
         |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
             // RFJP.1 — never JIT a callee on a class transitively extending
             // `java/util/concurrent/ForkJoinTask`; matches `try_jit_compile_callee`.
-            if is_fjp_subclass_blocklisted(
-                shared,
-                callee_class,
-                Some(cached.declaring_class_id),
-            ) {
+            if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
                 return None;
             }
             // S111r15 — refuse to compile a callee that has a Rust native
@@ -37761,10 +38053,7 @@ fn try_jit_compile_callee_slow(
             _ => return None,
         };
         let target_class = class.constant_pool.get_class_name(class_idx)?;
-        Some(
-            cm.find_class_by_name_for_class(target_class, cid)?
-                .as_u32(),
-        )
+        Some(cm.find_class_by_name_for_class(target_class, cid)?.as_u32())
     };
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
         let cm = shared.classes.class_manager.read();
@@ -38612,8 +38901,7 @@ fn resolve_inline_site(
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
     let cm = shared.classes.class_manager.read();
-    let callee_class_id =
-        cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
+    let callee_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
     let store = cm.class_store();
     let (method, declaring_id) = crate::classloading::find_method_recursive(
         callee_class_id,
@@ -41147,10 +41435,16 @@ fn execute_invokevirtual_cached(
                         format!("Bytecode declaring_class_id={dcid:?} declaring_loader={dloader:?} declaring_name={}", cached.class_name)
                     }
                     CachedInvokeTarget::Native { .. } => "Native".to_string(),
-                    CachedInvokeTarget::VirtualBytecode { cached, receiver_class_id, .. } => {
+                    CachedInvokeTarget::VirtualBytecode {
+                        cached,
+                        receiver_class_id,
+                        ..
+                    } => {
                         format!("VirtualBytecode receiver_class_id={receiver_class_id:?} declaring_name={}", cached.class_name)
                     }
-                    CachedInvokeTarget::VirtualNative { receiver_class_id, .. } => {
+                    CachedInvokeTarget::VirtualNative {
+                        receiver_class_id, ..
+                    } => {
                         format!("VirtualNative receiver_class_id={receiver_class_id:?}")
                     }
                     CachedInvokeTarget::Jit { cached, .. } => {
@@ -43154,8 +43448,7 @@ fn populate_virtual_invoke_cache(
 /// time [`resolve_method_metadata`] resolves such an entry, so the guard costs
 /// one relaxed atomic load per invoke instead of a full method-ref resolution
 /// in every process that has never loaded Spring.
-static ADAPT_ISIN_SEEN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ADAPT_ISIN_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The class whose `isIn` call sites [`ADAPT_ISIN_SEEN`] arms for.
 const SPRING_MERGED_ANNOTATION_ADAPT: &str =
@@ -43336,8 +43629,7 @@ fn invokespecial_owner_class_name(
         class.constant_pool.get(cp_index),
         Some(ConstantPoolEntry::InterfaceMethodReference { .. })
     );
-    let Some(cp_class_id) =
-        cm.find_class_by_name_for_class(method_class_name, current_class_id)
+    let Some(cp_class_id) = cm.find_class_by_name_for_class(method_class_name, current_class_id)
     else {
         return Arc::clone(method_class_name);
     };

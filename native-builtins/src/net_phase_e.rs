@@ -386,17 +386,25 @@ fn probe_restrictions() -> &'static Mutex<HashMap<NativeObjKey, ProbeRestriction
 /// True when `this` is a probe socket (created during probe mode and never
 /// connected) — the setters below then record rather than reconnect.
 fn is_probe_socket(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    probe_restrictions().lock().contains_key(&native_obj_key(ctx, this))
+    probe_restrictions()
+        .lock()
+        .contains_key(&native_obj_key(ctx, this))
 }
 
 fn record_probe_ciphers(ctx: &dyn NativeContext, this: ObjectRef, ciphers: Vec<String>) {
-    if let Some(e) = probe_restrictions().lock().get_mut(&native_obj_key(ctx, this)) {
+    if let Some(e) = probe_restrictions()
+        .lock()
+        .get_mut(&native_obj_key(ctx, this))
+    {
         e.0 = ciphers;
     }
 }
 
 fn record_probe_protocols(ctx: &dyn NativeContext, this: ObjectRef, protocols: Vec<String>) {
-    if let Some(e) = probe_restrictions().lock().get_mut(&native_obj_key(ctx, this)) {
+    if let Some(e) = probe_restrictions()
+        .lock()
+        .get_mut(&native_obj_key(ctx, this))
+    {
         e.1 = protocols;
     }
 }
@@ -406,7 +414,9 @@ pub(crate) fn take_probe_restrictions(
     ctx: &dyn NativeContext,
     this: ObjectRef,
 ) -> Option<ProbeRestrictions> {
-    probe_restrictions().lock().remove(&native_obj_key(ctx, this))
+    probe_restrictions()
+        .lock()
+        .remove(&native_obj_key(ctx, this))
 }
 
 /// Transfer an accepted plain Socket's TCP stream to a TLS layer.
@@ -1752,7 +1762,10 @@ fn hostname_string() -> String {
 #[cfg(test)]
 mod hostname_string_tests {
     #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
     #[test]
     fn hostname_string_agrees_with_the_crate_wide_resolver() {
         // Two registrations of `InetAddress.getLocalHost()` exist (this phase-E
@@ -1765,7 +1778,11 @@ mod hostname_string_tests {
     fn hostname_string_is_non_empty_and_stable() {
         let first = super::hostname_string();
         assert!(!first.is_empty(), "hostname must never be empty");
-        assert_eq!(first, super::hostname_string(), "must be stable across calls");
+        assert_eq!(
+            first,
+            super::hostname_string(),
+            "must be stable across calls"
+        );
     }
 }
 
@@ -5218,9 +5235,16 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
     } else {
         return Err(format!("unsupported URL: {url}"));
     };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    // An authority ends at the first path, query, or fragment delimiter. A
+    // query-only target (for example `http://host:8080?trace=false`) must not
+    // feed `8080?trace=false` to the port parser; HTTP's origin-form still
+    // requires a leading slash. Fragments are client-side only and therefore
+    // must not be sent on the wire.
+    let (authority, path) = match rest.find(|c| matches!(c, '/' | '?' | '#')) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+        Some(i) if rest.as_bytes()[i] == b'?' => (&rest[..i], format!("/{}", &rest[i..])),
+        Some(i) => (&rest[..i], "/".to_string()),
+        None => (rest, "/".to_string()),
     };
     // RFC 3986: authority = [ userinfo "@" ] host [ ":" port ]. Split at the
     // LAST '@' (userinfo may itself contain an encoded/raw '@').
@@ -5236,7 +5260,7 @@ fn http_parse_url(url: &str) -> Result<(bool, String, u16, String, Option<String
         }
         None => (hostport.to_string(), if scheme { 443 } else { 80 }),
     };
-    Ok((scheme, host, port, path.to_string(), userinfo))
+    Ok((scheme, host, port, path, userinfo))
 }
 
 fn http_perform_request(
@@ -5900,7 +5924,11 @@ fn huc_url_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 /// under `HUC_RESP_HEADERS`) for `key` (case-insensitive) and return its
 /// value. Shared by `getHeaderField`/`getLastModified`/`getHeaderFieldDate`
 /// so all three agree on the same real HTTP(S) response headers.
-fn huc_find_header_value(ctx: &mut dyn NativeContext, this: ObjectRef, key: &str) -> Option<String> {
+fn huc_find_header_value(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: &str,
+) -> Option<String> {
     if let Value::Object(Some(arr)) = ctx.get_field(this, HUC_RESP_HEADERS) {
         let len = ctx.array_length(arr);
         for i in 0..len {
@@ -5934,8 +5962,18 @@ fn parse_rfc1123_date_millis(s: &str) -> Option<i64> {
     let mut parts = rest.split_whitespace();
     let day: i64 = parts.next()?.parse().ok()?;
     let month = match parts.next()? {
-        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
-        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
         _ => return None,
     };
     let year: i64 = parts.next()?.parse().ok()?;
@@ -6326,7 +6364,20 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             eprintln!("[OSTR-DBG] URL.openStream: {}", url_str);
         }
 
-        // Resolve the URL to raw bytes. Handles file:, jar:file:!/, and
+        // `JarUrl` exposes Spring Boot nested archives as
+        // `jar:nested:/outer.jar/!inner.jar!/entry`. Preserve that external
+        // spelling for URL identity, but route byte access through the proven
+        // `jar:file:` nested-archive reader below: after the protocol prefix,
+        // both forms carry the identical outer-path / inner-entry grammar.
+        // Spring Boot spells only the outer boundary as `/!inner`; the generic
+        // reader spells that same boundary `!/inner`, while preserving further
+        // `!/` archive/resource separators unchanged.
+        if let Some(rest) = url_str.strip_prefix("jar:nested:") {
+            url_str = format!("jar:file:{}", rest.replacen("/!", "!/", 1));
+        }
+
+        // Resolve the URL to raw bytes. Handles file:, jar:file:!/, normalized
+        // jar:nested:!/, and
         // classpath: schemes locally; http(s): goes through the HTTP client.
         let bytes: Vec<u8> = if let Some(rest) = url_str.strip_prefix("jar:file:") {
             // jar:file:/path/to.jar!/entry  (single-level)
@@ -6837,7 +6888,11 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     "sun/net/www/protocol/file/FileURLConnection",
                     "<init>",
                     "(Ljava/net/URL;Ljava/io/File;)V",
-                    &[Value::Object(Some(conn)), Value::Object(Some(this)), Value::Object(Some(file))],
+                    &[
+                        Value::Object(Some(conn)),
+                        Value::Object(Some(this)),
+                        Value::Object(Some(file)),
+                    ],
                 )?;
                 return Ok(Some(Value::Object(Some(conn))));
             }
@@ -7126,6 +7181,10 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 
     // URLConnection.setUseCaches / setDefaultUseCaches / connect — Spring's
     // `ResourceUtils.useCachesIfNecessary` calls setUseCaches(false) on
+    // file: URLs. Avoid the real-JDK setter's uninitialised-connected check,
+    // but retain the requested per-connection value: Spring Boot's nested
+    // JarUrlConnection uses it to select its cached-empty-stream and
+    // close-on-close paths.
     // file: URLs; without these no-op natives the call would fall through
     // to the real-JDK setter, which probes the (uninitialised) connected
     // field and throws IllegalStateException. Make them no-ops on both
@@ -7177,7 +7236,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     r.register(JRT_URL_CONNECTION, "getLastModified", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let url = huc_url_string(ctx, this);
-        Ok(Some(Value::Long(synthetic_resource_url_last_modified(&url))))
+        Ok(Some(Value::Long(synthetic_resource_url_last_modified(
+            &url,
+        ))))
     });
     r.register(
         JRT_URL_CONNECTION,
@@ -7196,7 +7257,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "java/net/URLConnection",
         "setUseCaches",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let use_caches = args.get(1).and_then(Value::as_int).unwrap_or(1);
+            ctx.set_field_by_name(this, "useCaches", Value::Int(use_caches));
+            Ok(None)
+        },
     );
     r.register(
         "java/net/URLConnection",
@@ -7732,9 +7798,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 "(Ljava/lang/String;)Ljava/lang/String;",
                 &[Value::Object(Some(name_obj))],
             ) {
-                Ok(Some(Value::Object(Some(s)))) => {
-                    ctx.read_string(s).and_then(|v| parse_rfc1123_date_millis(&v))
-                }
+                Ok(Some(Value::Object(Some(s)))) => ctx
+                    .read_string(s)
+                    .and_then(|v| parse_rfc1123_date_millis(&v)),
                 _ => None,
             };
             Ok(Some(Value::Long(parsed.unwrap_or(fallback))))
@@ -7992,18 +8058,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             }
             let is_liquibase = match ctx.invoke_virtual(resource, "getURL", "()Ljava/net/URL;", &[])
             {
-                Ok(Some(Value::Object(Some(url)))) => match ctx.invoke_virtual(
-                    url,
-                    "toExternalForm",
-                    "()Ljava/lang/String;",
-                    &[],
-                ) {
-                    Ok(Some(Value::Object(Some(s)))) => ctx
-                        .read_string(s)
-                        .map(|s| s.contains("liquibase-core"))
-                        .unwrap_or(false),
-                    _ => false,
-                },
+                Ok(Some(Value::Object(Some(url)))) => {
+                    match ctx.invoke_virtual(url, "toExternalForm", "()Ljava/lang/String;", &[]) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx
+                            .read_string(s)
+                            .map(|s| s.contains("liquibase-core"))
+                            .unwrap_or(false),
+                        _ => false,
+                    }
+                }
                 _ => false,
             };
             if is_liquibase {
@@ -10273,7 +10336,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
-                eprintln!("[dbg-tls-auth] re6 SSLContext.init key={}", ctx.identity_hash_code(this));
+                eprintln!(
+                    "[dbg-tls-auth] re6 SSLContext.init key={}",
+                    ctx.identity_hash_code(this)
+                );
             }
             ctx.set_field(this, 1, Value::Int(1));
             // Stash the actual KeyManager objects too (may include a test
@@ -10332,7 +10398,10 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if crate::nbflags().dbg_tls_auth_ok {
-                eprintln!("[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}", ctx.identity_hash_code(this));
+                eprintln!(
+                    "[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}",
+                    ctx.identity_hash_code(this)
+                );
             }
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
             ctx.set_field(f, 0, Value::Object(Some(this)));
@@ -12267,13 +12336,9 @@ fn re10_auth_result_kind(ctx: &dyn NativeContext, result: ObjectRef) -> Option<A
     // and the bound keeps a pathological/self-referential chain from spinning.
     for _ in 0..16 {
         match ctx.class_name_of_id(cid)?.as_str() {
-            "com/sun/net/httpserver/Authenticator$Success" => {
-                return Some(AuthResultKind::Success)
-            }
+            "com/sun/net/httpserver/Authenticator$Success" => return Some(AuthResultKind::Success),
             "com/sun/net/httpserver/Authenticator$Retry" => return Some(AuthResultKind::Retry),
-            "com/sun/net/httpserver/Authenticator$Failure" => {
-                return Some(AuthResultKind::Failure)
-            }
+            "com/sun/net/httpserver/Authenticator$Failure" => return Some(AuthResultKind::Failure),
             _ => {}
         }
         cid = ctx.superclass_of(cid)?;
@@ -13319,11 +13384,14 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
     use cratonvm_native_api::NativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn re1_http_parse_url_plain() {
@@ -13357,6 +13425,24 @@ mod tests {
         assert_eq!(port, 8080);
         assert_eq!(path, "/resource");
         assert_eq!(userinfo.as_deref(), Some("alice:secret"));
+    }
+
+    #[test]
+    fn re1_http_parse_url_query_only_and_fragment_do_not_extend_authority() {
+        let (https, host, port, path, userinfo) =
+            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false")
+                .unwrap();
+        assert!(!https);
+        assert_eq!(host, "localhost");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/?trace=false&message=false");
+        assert_eq!(userinfo.as_deref(), Some("alice:secret"));
+
+        let (_, host, port, path, _) =
+            http_parse_url("https://example.com:8443#client-only").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8443);
+        assert_eq!(path, "/");
     }
 
     #[test]

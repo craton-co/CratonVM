@@ -771,12 +771,40 @@ pub(crate) fn native_url_hash_code(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let s = url_external_form(ctx, this);
-    let mut h: i32 = 0;
-    for b in s.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(b as i32);
+    let string_hash = |value: &str| {
+        value.bytes().fold(0i32, |hash, byte| {
+            hash.wrapping_mul(31).wrapping_add(byte as i32)
+        })
+    };
+    let protocol = url_str_field(ctx, this, "protocol", URL_FIELD_PROTOCOL).unwrap_or_default();
+    // URLStreamHandler's file-handler contract is component based, not the
+    // hash of `toExternalForm()`: protocol + host + port + file + ref.  The
+    // generic external-form hash happened to preserve equality but broke a
+    // jar URL handler which delegates its inner `file:` URL to URL.hashCode.
+    // Keep the existing canonical external-form behavior for other protocols
+    // while matching the JDK's file-URL rule exactly (including port -1).
+    if protocol.eq_ignore_ascii_case("file") {
+        let host = url_str_field(ctx, this, "host", URL_FIELD_HOST).unwrap_or_default();
+        let port = match ctx.get_field_by_name(this, "port") {
+            Value::Int(port) => port,
+            _ => match ctx.get_field(this, URL_FIELD_PORT) {
+                Value::Int(port) => port,
+                _ => -1,
+            },
+        };
+        let file = url_str_field(ctx, this, "file", URL_FIELD_PATH).unwrap_or_default();
+        let reference = match ctx.get_field_by_name(this, "ref") {
+            Value::Object(Some(reference)) => ctx.read_string(reference).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let hash = string_hash(&protocol)
+            .wrapping_add(string_hash(&host.to_ascii_lowercase()))
+            .wrapping_add(port)
+            .wrapping_add(string_hash(&file))
+            .wrapping_add(string_hash(&reference));
+        return Ok(Some(Value::Int(hash)));
     }
-    Ok(Some(Value::Int(h)))
+    Ok(Some(Value::Int(string_hash(&url_external_form(ctx, this)))))
 }
 
 /// Populate a `java.net.URI` object's named fields from its full text.
@@ -1607,10 +1635,13 @@ fn native_inet_is_reachable(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 #[cfg(test)]
 mod new2_net_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     /// Helper: allocate a minimal `InetAddress` synthetic carrying a
     /// hostname / address pair. Mirrors what the real natives produce.
