@@ -585,9 +585,26 @@ pub(crate) fn handler_has_unsafe_local_read(
 
 /// Build the control flow graph from bytecode.
 fn build_cfg(code: &[u8], code_len: usize) -> Vec<BasicBlock> {
+    build_cfg_with_leaders(code, code_len, &[])
+}
+
+/// [`build_cfg`] plus caller-supplied extra leaders. Exception handler entry
+/// pcs are leaders even though no branch targets them — the runtime's
+/// exception router enters them directly — and a handler that is not a block
+/// start has no `live_in` for [`live_locals_per_pc_with_handlers`] to read.
+fn build_cfg_with_leaders(
+    code: &[u8],
+    code_len: usize,
+    extra_leaders: &[usize],
+) -> Vec<BasicBlock> {
     // First pass: find all block-starting PCs
     let mut block_starts = vec![false; code_len + 1];
     block_starts[0] = true;
+    for &leader in extra_leaders {
+        if leader < code_len {
+            block_starts[leader] = true;
+        }
+    }
 
     let mut pc = 0;
     while pc < code_len {
@@ -1446,6 +1463,31 @@ pub fn live_locals_per_pc(code: &[u8], code_len: usize, num_params: usize) -> Ve
     live_locals_per_pc_with_coverage(code, code_len, num_params).0
 }
 
+/// [`live_locals_per_pc_with_coverage`] with EXCEPTION EDGES modelled.
+///
+/// `handlers` is `(start_pc, end_pc, handler_pc)` per exception-table entry.
+/// Every instruction inside `[start_pc, end_pc)` can transfer control to
+/// `handler_pc`, so each block overlapping that range gains the handler's
+/// block as a successor and the handler's `live_in` flows back into the
+/// protected code.
+///
+/// Without this, a local that ONLY the handler reads is computed dead at every
+/// pc in the protected range — and that is precisely where the precise
+/// exceptional-frame snapshot is taken, so the reconstructed handler frame
+/// dropped the value it was about to read. With a reference local that also
+/// unroots a live object: the collector reclaims it, the address is recycled,
+/// and an unrelated object shows up in its place (observed as json-smart
+/// re-parses returning a key `String`, and as
+/// `ClassCastException: java.lang.Object cannot be cast to JSONArray`).
+pub fn live_locals_per_pc_with_handlers(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    handlers: &[(usize, usize, usize)],
+) -> (Vec<u64>, Vec<bool>) {
+    live_locals_per_pc_inner(code, code_len, num_params, handlers)
+}
+
 /// [`live_locals_per_pc`] plus the parallel *coverage* bitmap: `covered[pc]` is
 /// `true` exactly when `pc` is an instruction start inside some basic block, so
 /// `live_at[pc]` is a computed answer rather than the `0` default.
@@ -1460,7 +1502,37 @@ fn live_locals_per_pc_with_coverage(
     code_len: usize,
     num_params: usize,
 ) -> (Vec<u64>, Vec<bool>) {
-    let mut blocks = build_cfg(code, code_len);
+    live_locals_per_pc_inner(code, code_len, num_params, &[])
+}
+
+fn live_locals_per_pc_inner(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    handlers: &[(usize, usize, usize)],
+) -> (Vec<u64>, Vec<bool>) {
+    let leaders: Vec<usize> = handlers.iter().map(|&(_, _, h)| h).collect();
+    let mut blocks = build_cfg_with_leaders(code, code_len, &leaders);
+    if !handlers.is_empty() {
+        // Exception edges: protected block -> handler block. Collect first, so
+        // the successor lists can be mutated without holding a borrow.
+        let mut edges: Vec<(usize, usize)> = Vec::new();
+        for &(start, end, handler) in handlers {
+            let Some(handler_idx) = blocks.iter().position(|b| b.start_pc == handler) else {
+                continue;
+            };
+            for (i, block) in blocks.iter().enumerate() {
+                if block.start_pc < end && block.end_pc > start {
+                    edges.push((i, handler_idx));
+                }
+            }
+        }
+        for (from, to) in edges {
+            if !blocks[from].successors.contains(&to) {
+                blocks[from].successors.push(to);
+            }
+        }
+    }
     for block in &mut blocks {
         compute_gen_kill(code, block);
     }
@@ -2397,6 +2469,46 @@ mod tests {
     }
 
     // ── live_locals_per_pc (OSR-exit dead-local detection) ──────────────────
+
+    #[test]
+    /// A local that ONLY the catch handler reads is live throughout the
+    /// protected range — the handler is a successor of every instruction in
+    /// it. Without exception edges the liveness scan says "dead", and the
+    /// consumer that acts on that (the x64 deopt/exceptional-frame snapshot)
+    /// then drops the value — and, for a reference, drops the GC's only view
+    /// of that object through this frame.
+    #[test]
+    fn live_locals_per_pc_sees_a_local_only_the_handler_reads() {
+        // 0: iconst_0            9: istore_2
+        // 1: istore_1           10: return
+        // 2: invokestatic #2    11: return
+        // 5: goto 11
+        // 8: iload_1   <- handler entry, reads local 1
+        // exception table: [2, 5) -> handler 8
+        let code = [
+            0x03, 0x3c, 0xb8, 0x00, 0x02, 0xa7, 0x00, 0x06, 0x1b, 0x3d, 0xb1, 0xb1,
+        ];
+        let len = code.len();
+        let blind = live_locals_per_pc(&code, len, 1);
+        assert_eq!(
+            blind[2] & (1 << 1),
+            0,
+            "precondition: with no exception edges the handler's read is invisible"
+        );
+
+        let (aware, covered) = live_locals_per_pc_with_handlers(&code, len, 1, &[(2, 5, 8)]);
+        assert_ne!(
+            aware[2] & (1 << 1),
+            0,
+            "local 1 must be live at the protected pc — the handler reads it"
+        );
+        assert!(covered[8], "the handler pc must become a covered block start");
+        assert_eq!(
+            aware[1] & (1 << 1),
+            0,
+            "the exception edge must not make the local live BEFORE its store"
+        );
+    }
 
     #[test]
     fn live_locals_per_pc_marks_loop_counter_dead_after_loop_exit() {

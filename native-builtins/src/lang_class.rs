@@ -11923,8 +11923,24 @@ pub(crate) fn annotation_element_to_java_typed(
                 }
                 _ => "java/lang/Object".to_string(),
             };
-            let comp_cid = ctx
-                .class_id_by_name(&comp_name_owned)
+            // Resolve the COMPONENT through the declaring class's loader first,
+            // exactly as the scalar `Enum` and `Class` arms above already do.
+            // `class_id_by_name` is the loader-blind global lookup, so under
+            // classloader isolation the array's component came from the app
+            // loader while the attribute's declared return type came from the
+            // fork -- and Spring's `AnnotationTypeMapping.adapt` rejected the
+            // value with the self-contradictory "should be compatible with
+            // RequestMethod[] but a RequestMethod[] value was returned"
+            // (`test.context.aot.TestContextAotGeneratorIntegrationTests`,
+            // `test.context.aot.AotIntegrationTests`). `probes/ForkArrProbe.java`.
+            let comp_cid = container_loader
+                .and_then(|loader| {
+                    match resolve_annotation_class_via_loader(ctx, loader, &comp_name_owned) {
+                        Ok(mirror) => ctx.class_id_from_mirror(mirror),
+                        Err(_) => None,
+                    }
+                })
+                .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
                     let _ = ctx.load_class(&comp_name_owned);
                     ctx.class_id_by_name(&comp_name_owned)

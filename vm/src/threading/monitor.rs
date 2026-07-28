@@ -84,7 +84,7 @@
 //! a missing index entry is repaired from it.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cratonvm_types::{self as types, ObjectHeader};
@@ -107,6 +107,49 @@ use crate::error::{MethodCallFailed, RuntimeError, VmError};
 use crate::runtime::lock_order::{LockLevel, OrderedPlMutex};
 use crate::threading::jvm_thread::ThreadId;
 use crate::types::ObjectRef;
+
+// ---------------------------------------------------------------------------
+// CAS-lock hot-path cache
+// ---------------------------------------------------------------------------
+//
+// `Unsafe.compareAndSet*` is implemented with a per-object `Mutex` because a
+// `Value` slot is not itself atomic.  The registry owns each mutex in an Arc;
+// the old hot path acquired the registry shard and cloned that Arc for every
+// CAS, even when one AQS state object was being retried by the same Java
+// thread.  Keep a small, direct-mapped, *non-owning* cache of those mutex
+// pointers instead.  The registry remains the owner and linearization point.
+//
+// A collection may re-key or discard an idle registry entry, so entries are
+// valid only for one `cas_lock_epoch`.  `remap_after_gc` and `prune_dead` run
+// under the collector's stop-the-world token and bump that epoch before a
+// mutator can resume.  Consequently a raw pointer is never dereferenced after
+// its owning Arc can have been dropped.  This avoids a per-operation Arc
+// retain/release without retaining Java objects or locks across a collection.
+const CAS_LOCK_CACHE_SLOTS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct CasLockCacheEntry {
+    table_id: u64,
+    epoch: u64,
+    object_key: usize,
+    lock: *const Mutex<()>,
+}
+
+impl CasLockCacheEntry {
+    const EMPTY: Self = Self {
+        table_id: 0,
+        epoch: 0,
+        object_key: 0,
+        lock: std::ptr::null(),
+    };
+}
+
+thread_local! {
+    static CAS_LOCK_CACHE: std::cell::RefCell<[CasLockCacheEntry; CAS_LOCK_CACHE_SLOTS]> =
+        const { std::cell::RefCell::new([CasLockCacheEntry::EMPTY; CAS_LOCK_CACHE_SLOTS]) };
+}
+
+static NEXT_CAS_LOCK_CACHE_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // KC16-watchdog: global stack-dump-request flag for parked Object.wait()ers
@@ -1056,6 +1099,14 @@ pub struct MonitorTable {
     /// ordering constraints and is never held while acquiring another tracked
     /// lock.
     cas_locks: Box<[OrderedPlMutex<FxHashMap<usize, Arc<Mutex<()>>>>]>,
+    /// Stable identity for this table's thread-local CAS cache entries.  This
+    /// deliberately is not an address: a later VM may reuse an old table's
+    /// allocation address after its Java threads have exited.
+    cas_lock_cache_table_id: u64,
+    /// Incremented while all mutators are stopped immediately before a CAS
+    /// registry re-key/prune.  A matching cache epoch therefore proves the
+    /// cached raw mutex pointer is still owned by the registry.
+    cas_lock_epoch: AtomicU64,
 }
 
 impl MonitorTable {
@@ -1067,6 +1118,8 @@ impl MonitorTable {
                 .map(|_| OrderedPlMutex::new(FxHashMap::default(), LockLevel::Monitors))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            cas_lock_cache_table_id: NEXT_CAS_LOCK_CACHE_TABLE_ID.fetch_add(1, Ordering::Relaxed),
+            cas_lock_epoch: AtomicU64::new(1),
             cas_locks: (0..MONITOR_SHARDS)
                 .map(|_| OrderedPlMutex::new(FxHashMap::default(), LockLevel::Monitors))
                 .collect::<Vec<_>>()
@@ -1742,12 +1795,39 @@ impl MonitorTable {
         F: FnOnce() -> R,
     {
         let key = obj_ref.as_ptr() as usize;
+        let epoch = self.cas_lock_epoch.load(Ordering::Acquire);
+        let slot = (key >> 3) & (CAS_LOCK_CACHE_SLOTS - 1);
+        let cached = CAS_LOCK_CACHE.with(|cache| {
+            let entry = cache.borrow()[slot];
+            (entry.table_id == self.cas_lock_cache_table_id
+                && entry.epoch == epoch
+                && entry.object_key == key
+                && !entry.lock.is_null())
+            .then_some(entry.lock)
+        });
+        if let Some(lock) = cached {
+            // SAFETY: the registry owns this mutex for the whole matching
+            // epoch. Every path that can drop/re-key an entry bumps
+            // `cas_lock_epoch` while mutators are stopped before they may
+            // observe the changed registry.
+            let _guard = unsafe { &*lock }.lock();
+            return f();
+        }
         let lock = {
             let mut cas = self.cas_locks[shard_of(key)].lock();
             cas.entry(key)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
+        let lock_ptr = Arc::as_ptr(&lock);
+        CAS_LOCK_CACHE.with(|cache| {
+            cache.borrow_mut()[slot] = CasLockCacheEntry {
+                table_id: self.cas_lock_cache_table_id,
+                epoch,
+                object_key: key,
+                lock: lock_ptr,
+            };
+        });
         let _guard = lock.lock();
         f()
     }
@@ -1919,6 +1999,10 @@ impl MonitorTable {
         if pointer_map.is_empty() {
             return;
         }
+        // Mutators are stopped for this whole operation. Invalidate cached raw
+        // CAS-lock pointers before an idle entry can be dropped or a moved one
+        // re-keyed below.
+        self.cas_lock_epoch.fetch_add(1, Ordering::Release);
         // SHARDING + LOCK ORDER: every shard of both registries is L6, and the
         // hierarchy forbids equal-level nesting, so we may never hold two shard
         // guards at once. Re-keying can also move an entry to a DIFFERENT shard
@@ -2036,6 +2120,10 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
         if dead.is_empty() {
             return;
         }
+        // `dead` is processed under the collector's stop-the-world token, so
+        // no mutator can retain a cache hit while its registry owner is
+        // removed. The next mutator observation must use a fresh lookup.
+        self.cas_lock_epoch.fetch_add(1, Ordering::Release);
         {
             // Group by shard so each shard is locked once; never two at a time.
             for d in dead {
@@ -2619,6 +2707,26 @@ mod tests {
         // CAS lock should execute the closure and return its result
         let result = table.with_cas_lock(obj, || 42);
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn monitor_cas_lock_cache_is_invalidated_on_remap() {
+        let table = MonitorTable::new();
+        let old_heap = Heap::new();
+        let old_obj = old_heap.alloc_object(ClassId::new(0), 0);
+        let new_heap = Heap::new();
+        let new_obj = new_heap.alloc_object(ClassId::new(0), 0);
+
+        // Populate this OS thread's raw-pointer cache, then simulate the
+        // stop-the-world re-key that a moving collection performs.
+        table.with_cas_lock(old_obj, || {});
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(old_obj.as_ptr() as usize, new_obj.as_ptr() as usize);
+        table.remap_after_gc(&pointer_map);
+
+        let mut ran = false;
+        table.with_cas_lock(new_obj, || ran = true);
+        assert!(ran, "CAS lock must be re-looked-up after a remap");
     }
 
     #[test]

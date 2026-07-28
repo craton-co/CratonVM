@@ -204,11 +204,13 @@ like a regression:
 | control, JIT off | 10/10 | 0 |
 | fix, JIT off | 10/10 | 0 |
 
-So it crashes at essentially the same rate on both binaries, only ever with the
-JIT on, and its PASS in the 2026-07-28 reference was luck. The crash is a
-JIT-frame SIGSEGV on a `Tribes-Task-Receiver` thread inside
-`NioReplicationTask.drainChannel` — the pre-existing JIT stale-reference
-family, unrelated to this fix and still open.
+So it crashes at essentially the same rate on both binaries, and its PASS in
+the 2026-07-28 reference was luck. This is the already-filed
+[tribes-senderconnections-niosender-keepalive-segv-20260727](../../../known-issues/tomcat/tribes-senderconnections-niosender-keepalive-segv-20260727.md)
+— a use-after-free with two causes, one of which is still open. (That doc also
+warns not to read the `external/jit` frames in the dump as compiled Java: they
+are the Windows exception-dispatch path and appear at byte-identical addresses
+in every crash.)
 
 `CRATONVM_DBG_SC_READ=1` also enables a `[UDS] …` trace of
 bind/accept/connect, kept as a permanent opt-in hook alongside the existing

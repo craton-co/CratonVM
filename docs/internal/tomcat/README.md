@@ -30,7 +30,7 @@ accounting: of the 9 confirmed CratonVM-only regressions, **7 are fixed and
 verified**; the remaining 2 (`TestManagerWebapp.testBug57700`,
 `TestSsl.testPost`) are confirmed to be the same already-tracked,
 deliberately-deferred interpreter/dispatch throughput ceiling as
-[04-embedded-server-throughput-wall-OPEN.md](../fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-OPEN.md),
+[04-embedded-server-throughput-wall-OPEN.md](../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md),
 not new or independently-fixable bugs.
 
 Note: none of this fixture work is git-tracked — it all lives on the Azure

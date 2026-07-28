@@ -7,7 +7,7 @@ the GC-overhead limit mis-scoring every productive young sweep as "freed 0".
 
 A **residual** remains: with the OOM gone the class no longer fails on a
 heap error, but it still cannot finish inside a suite timeout — see
-[30](30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md), which
+[30](../../../known-issues/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md), which
 root-causes that part and stays OPEN.
 
 ## Symptom (as originally filed)

@@ -2874,6 +2874,28 @@ pub fn set_precise_exception_frame_request(on: bool) {
 }
 
 thread_local! {
+    /// One-shot `[start_pc, end_pc)` list of the next method's exception-table
+    /// protected ranges, published by the bytecode front-end.
+    ///
+    /// The backend is otherwise entirely exception-table-blind, and that is
+    /// fine for every lowering that RETURNS to this frame: the shared exception
+    /// stub re-enters the interpreter at the throwing bci and the method's own
+    /// handler table takes over from there. It is NOT fine for the sibling
+    /// tail-call, which tears this frame down and `JMP`s into the callee, so an
+    /// exception the callee raises unwinds straight past a handler that was
+    /// supposed to catch it. See `pc_is_protected`.
+    static PROTECTED_RANGES_REQUEST: std::cell::Cell<Option<Vec<(u32, u32)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Publish the next method compile's exception-table protected ranges.
+/// One-shot, like [`set_precise_exception_frame_request`], so a bailed compile
+/// cannot leak its ranges into the next unrelated method on this worker thread.
+pub fn set_protected_ranges_request(ranges: Vec<(u32, u32)>) {
+    PROTECTED_RANGES_REQUEST.with(|c| c.set(if ranges.is_empty() { None } else { Some(ranges) }));
+}
+
+thread_local! {
     /// OSR-tier sibling of [`KERNEL_REG_HOMES_REQUEST`] — set (only) by the
     /// interpreter's `compile_osr_artifact` (perf/halfgap-20260717).
     static KERNEL_REG_HOMES_OSR_REQUEST: std::cell::Cell<bool> =
@@ -7930,6 +7952,10 @@ struct Compiler {
     /// This method uses frame-preserving exception exits for handlers that
     /// read non-parameter locals (RBC.6 precise-handler continuation).
     precise_exception_frames: bool,
+    /// `[start_pc, end_pc)` ranges covered by this method's exception table.
+    /// Empty when the method has no handlers. Consulted only by
+    /// [`Compiler::pc_is_protected`]; see `PROTECTED_RANGES_REQUEST`.
+    protected_ranges: Vec<(u32, u32)>,
     /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
     /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
     /// Forces `has_dispatch` for the SAME thread-availability reason as
@@ -8321,6 +8347,12 @@ struct Compiler {
     /// the OSR-compiled code already committed
     /// (`docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
     local_liveness: Vec<u64>,
+    /// Parallel coverage bitmap for [`Self::local_liveness`]: `false` at a pc
+    /// no basic block covers, where the liveness answer is the `0` default
+    /// ("nothing live") rather than a computed result. Treating that as "every
+    /// local is dead" would discard the whole frame, so the snapshot builder
+    /// falls back to "everything live" there.
+    local_liveness_covered: Vec<bool>,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -8998,6 +9030,7 @@ impl Compiler {
         cache_jit_thread_for_inline_new: bool,
         reserve_stack_floor: bool,
         precise_exception_frames: bool,
+        protected_ranges: Vec<(u32, u32)>,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
         // Each local takes 8 bytes: [rbp - 8], [rbp - 16], ...
@@ -9305,6 +9338,7 @@ impl Compiler {
             emitted_athrow: false,
             emitted_monitor_call: false,
             precise_exception_frames,
+            protected_ranges,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             forward_patches: Vec::new(),
@@ -9378,6 +9412,7 @@ impl Compiler {
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
             local_liveness: Vec::new(),
+            local_liveness_covered: Vec::new(),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
@@ -9788,7 +9823,10 @@ impl Compiler {
             // can overwrite it. `Undefined` maps to an inert zero and is sound
             // precisely because liveness proves no path reads the old value
             // before its next definition.
-            if i < 64 {
+            // Only act on a COMPUTED liveness answer. An uncovered pc (no
+            // basic block reaches it) reads as 0 = "nothing live", and acting
+            // on that would drop every local in the frame.
+            if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
                 let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
                 if live_here & (1u64 << i) == 0 {
                     locals.push(FrameValue::Undefined);
@@ -18335,20 +18373,58 @@ impl Compiler {
     /// dispatching a `J`/`D`-returning callee sound (a `Pack.bigEndianToLong`
     /// SHA-512 word == `0x8000_0000_0000_0000` would otherwise be misread as a
     /// deopt and the caller would silently bail mid-method).
+    /// Is `pc` inside any of this method's exception-table protected ranges?
+    ///
+    /// Only the sibling tail-call needs this. Every other lowering keeps this
+    /// frame alive across the call and routes a pending exception through the
+    /// shared stub, which re-enters the interpreter at the throwing bci where
+    /// the method's own handler table applies. A tail-call has already run
+    /// `emit_epilogue_without_ret` by the time the callee executes, so there is
+    /// no frame left to catch into and the exception escapes to this method's
+    /// caller instead — the wrong handler, silently.
+    fn pc_is_protected(&self, pc: usize) -> bool {
+        let pc = pc as u32;
+        self.protected_ranges
+            .iter()
+            .any(|(start, end)| pc >= *start && pc < *end)
+    }
+
     fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
+        // The simulated operand stack at this point is the state *after* the
+        // instruction which made the fallible call: every invoke lowering has
+        // already removed its receiver and arguments before emitting the ABI
+        // call above.  A frame-deopt snapshot must therefore resume at that
+        // instruction's successor, not at `dbg_last_pc` itself.  Resuming at
+        // the invoke would make the interpreter try to consume the already
+        // removed operands (TransactionUtil.wrapInTransaction's
+        // `Consumer.accept` was the concrete failure: the reconstructed frame
+        // resumed pc=25 with an empty stack, and the virtual dispatch cache
+        // underflowed after advancing to pc=30).
+        //
+        // Every caller invokes this helper after lowering a bytecode operation.
+        // `dbg_last_op` provides the exact encoded width for the only variable
+        // length invoke forms; all other supported fallible helpers here use
+        // the ordinary three-byte CP form or a one-byte operation.  Keeping the
+        // original PC for non-invoke operations avoids changing their exception
+        // routing semantics.
+        let deopt_resume_bci = match self.dbg_last_op {
+            0xb9 | 0xba => self.dbg_last_pc.saturating_add(5),
+            0xb6 | 0xb7 | 0xb8 => self.dbg_last_pc.saturating_add(3),
+            _ => self.dbg_last_pc,
+        };
         // The bytecode compiler has just emitted the dispatch, so its local
         // homes still describe the point at which an exception from that call
         // is caught. A params-only handler reconstruction is insufficient for
         // this method; retain a typed snapshot and branch to its frame-deopt
         // exit instead of the shared sentinel-only exit below.
         if self.precise_exception_frames
-            && !self.deopt_box_ptr_by_bci.contains_key(&self.dbg_last_pc)
+            && !self.deopt_box_ptr_by_bci.contains_key(&deopt_resume_bci)
         {
             let box_ptr = self.build_and_record_deopt_point(
-                self.dbg_last_pc,
+                deopt_resume_bci,
                 crate::deopt::DeoptReason::ReceiverTypeChanged,
             );
-            self.deopt_box_ptr_by_bci.insert(self.dbg_last_pc, box_ptr);
+            self.deopt_box_ptr_by_bci.insert(deopt_resume_bci, box_ptr);
         }
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
@@ -18376,7 +18452,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
@@ -18390,7 +18466,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
@@ -24970,8 +25046,13 @@ impl Compiler {
                                     (b'V', 0xB1) => true,
                                     _ => false,
                                 };
-                            let is_sibling_tail =
-                                tail_op_matches && callee_needs_ctx == self.needs_heap;
+                            // A tail-call inside a try region would tear this
+                            // frame down before the callee runs, so anything it
+                            // throws escapes the handler that covers this pc
+                            // (see `pc_is_protected`). Demote to a normal CALL.
+                            let is_sibling_tail = tail_op_matches
+                                && callee_needs_ctx == self.needs_heap
+                                && !self.pc_is_protected(pc);
 
                             // Round-8 wave-3: sibling-tail demotion.
                             // Tail-calling with stack args is non-trivial
@@ -25174,8 +25255,14 @@ impl Compiler {
                         // Self-recursive call (no invoke_info, no direct_call)
                         let n = self.num_params;
 
-                        // Check for tail call: invokestatic self at PC, xreturn at PC+3
-                        let is_tail_call = pc + 3 < code_len && matches!(code[pc + 3], 0xac..=0xb0); // ireturn..areturn
+                        // Check for tail call: invokestatic self at PC, xreturn at PC+3.
+                        // Never inside a try region — the tail form tears this
+                        // frame down, so a throw from the self-recursive callee
+                        // would bypass the handler covering this pc
+                        // (see `pc_is_protected`).
+                        let is_tail_call = pc + 3 < code_len
+                            && matches!(code[pc + 3], 0xac..=0xb0) // ireturn..areturn
+                            && !self.pc_is_protected(pc);
 
                         // jit-invokedynamic-groovy-regression fix: a method
                         // containing a live invokedynamic site (compiled as an
@@ -28805,6 +28892,10 @@ pub fn compile_with_param_slots(
     // A handler-local request is one-shot too, so a compile bailout cannot
     // accidentally arm the next unrelated method on this worker thread.
     let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
+    // Same one-shot discipline as the flag above.
+    let protected_ranges = PROTECTED_RANGES_REQUEST
+        .with(|c| c.take())
+        .unwrap_or_default();
     // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
     // but the published artifact KEEPS its OSR entries — the trampoline's
     // register-seeded entry contract is exactly what the assignments
@@ -29288,6 +29379,7 @@ pub fn compile_with_param_slots(
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
         precise_exception_frames,
+        protected_ranges,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
     // Safepoint publication plan (arch-2026-07-26 R1). Built here rather than
@@ -29613,7 +29705,17 @@ pub fn compile_with_param_slots(
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
         // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
-        compiler.local_liveness = super::regalloc::live_locals_per_pc(code, code_len, num_params);
+        // The exception table MUST be modelled: these snapshots are taken at
+        // pcs inside protected ranges, and a local only the handler reads is
+        // otherwise computed dead exactly there.
+        let (liveness, covered) = super::regalloc::live_locals_per_pc_with_handlers(
+            code,
+            code_len,
+            num_params,
+            &exception_ranges,
+        );
+        compiler.local_liveness = liveness;
+        compiler.local_liveness_covered = covered;
     }
 
     // Emit prologue
@@ -30291,6 +30393,7 @@ mod tests {
             false,
             false,
             false,
+            Vec::new(),
         );
 
         assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));

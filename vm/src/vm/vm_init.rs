@@ -5048,7 +5048,7 @@ impl Vm {
         self.main_thread.set_vm_state(state);
         self.main_thread.tlab.retire();
         {
-            let ctx = crate::vm::vm_exec::NativeContextImpl {
+            let mut ctx = crate::vm::vm_exec::NativeContextImpl {
                 shared: &self.shared,
                 thread: &mut self.main_thread,
             };

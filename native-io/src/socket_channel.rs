@@ -2889,6 +2889,74 @@ fn ssc_bind_unix(
     Ok(Some(Value::Object(Some(this))))
 }
 
+/// Read the already-resolved numeric IP out of an `InetSocketAddress`
+/// (`getAddress().getHostAddress()`), or `None` when the address is
+/// unresolved / wildcard.
+fn sa_resolved_ip(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Option<String> {
+    let ia = match ctx.invoke_virtual(sa, "getAddress", "()Ljava/net/InetAddress;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let text = match ctx.invoke_virtual(ia, "getHostAddress", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s)?,
+        _ => return None,
+    };
+    // Only trust it if it really is a literal — a shim that echoes the
+    // hostname back would otherwise defeat the point.
+    if text.parse::<std::net::IpAddr>().is_ok() {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Resolve a listen target to exactly ONE socket address.
+///
+/// `TcpListener::bind(&str)` walks *every* address the target resolves to and
+/// binds the first that succeeds. For a name like `localhost`, which resolves
+/// to both `::1` and `127.0.0.1`, that quietly converts "this port is already
+/// taken" into "bound to the other family's loopback instead" — where the JDK
+/// binds the single `InetAddress` held by the `InetSocketAddress` and raises
+/// `BindException` on the second attempt.
+///
+/// That difference is load-bearing. Tomcat Tribes' `ReceiverBase` auto-bind
+/// loop discovers its listen port purely by catching that `BindException` and
+/// retrying 4000 → 4001 → …, so the silent fallback let *every* channel in a
+/// process claim port 4000: all of them then announced the same
+/// `tcp://host:4000` member identity over multicast, each channel recognised
+/// its peers as itself, and membership never converged (TestTcpFailureDetector
+/// saw 0 members, TestNonBlockingCoordinator 4 of 9).
+///
+/// A literal address is used as-is. A name is resolved and IPv4 is preferred,
+/// matching `InetAddress.getByName`'s default ordering (`preferIPv6Addresses`
+/// is false by default, and the Tomcat suite additionally runs with
+/// `-Djava.net.preferIPv4Stack=true`).
+pub(crate) fn single_bind_addr(host: &str, port: u16) -> Result<SocketAddr, std::io::Error> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    // A scoped v6 literal ("fe80::1%3") only parses through the socket-addr
+    // resolver, so leave it to the lookup below.
+    if !bare.contains('%') {
+        if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+            return Ok(SocketAddr::new(ip, port));
+        }
+    }
+    let resolved: Vec<SocketAddr> = (bare, port).to_socket_addrs()?.collect();
+    resolved
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| resolved.first())
+        .copied()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("no address resolved for {host}"),
+            )
+        })
+}
+
 fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -2907,13 +2975,18 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     }
 
     let (host, port) = decode_socket_address(ctx, sa)?;
+    // Prefer the numeric address the JDK already resolved into this
+    // InetSocketAddress over its hostname text: `getHostString()` hands back
+    // "localhost" for `new InetSocketAddress("localhost", p)`, and a *name* is
+    // exactly what makes the bind below ambiguous (see `single_bind_addr`).
+    let host = sa_resolved_ip(ctx, sa).unwrap_or(host);
     // host==""/"0.0.0.0"/"::" maps to wildcard.
-    let bind_text = if host.is_empty() {
-        format!("0.0.0.0:{port}")
+    let bind_addr = if host.is_empty() {
+        SocketAddr::from(([0, 0, 0, 0], port))
     } else {
-        format!("{host}:{port}")
+        single_bind_addr(&host, port).map_err(|e| map_err(&format!("{host}:{port}"), e))?
     };
-    let listener = TcpListener::bind(&bind_text).map_err(|e| map_err(&bind_text, e))?;
+    let listener = TcpListener::bind(bind_addr).map_err(|e| map_err(&bind_addr.to_string(), e))?;
     let local_port = listener
         .local_addr()
         .map(|a| a.port() as i32)

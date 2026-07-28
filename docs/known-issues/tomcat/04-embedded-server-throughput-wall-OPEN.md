@@ -1,5 +1,65 @@
 # Group 04 — Embedded-server deployment throughput wall  (OPEN, dominant)
 
+> ## 2026-07-27 — this group now OWNS the residual throughput evidence from the 1500 s rerun
+>
+> `../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md` (now closed) collected a
+> batch of Tomcat classes that looked like new bugs but were really this
+> group's wall, plus a few that turned out to be genuine, separate defects.
+> After root-causing every item in that doc, the following — and ONLY the
+> following — remain as group-04 evidence. They are *measurements of this
+> wall*, not open bugs of their own, and should not be re-triaged as new:
+>
+> | class | CratonVM | HotSpot | note |
+> |---|---|---|---|
+> | `catalina.startup.TestHostConfigAutomaticDeploymentAddition` | HANG @1500 s | 52 s | one webapp-directory deploy alone = 107.9 s |
+> | `catalina.startup.TestHostConfigAutomaticDeploymentModification` | HANG @1500 s | 59 s | one descriptor deploy = 109.7 s |
+> | `catalina.startup.TestHostConfigAutomaticDeploymentDeleteC` | HANG @1500 s | 33 s | sibling `DeleteB` passed at 1365 s — degree, not kind |
+> | `coyote.http2.TestHttp2Section_8_2` | HANG @1500 s | — | 1000+ parameterized cases, each starting/stopping a connector |
+> | `catalina.mapper.TestMapperPerformance.testPerformance` | 4.1 s (best host) / 7.0 s (worst host) per 10⁶ `mapper.map()`, **idle box** | 0.10 s / 0.37 s | ABSOLUTE 5 s budget. 19–41× HotSpot: the easiest hostname now fits inside the budget, the hardest one (`iowejoiejfoiew`, also HotSpot's slowest) does not. Ordinary interpreter gap against a fixed wall-clock limit |
+> | `el.parser.TestELParserPerformance.testParserInstanceReuse` | ReInit ≈ `new` ±1 % | ReInit 2× faster | relative assertion, flips run to run |
+> | `websocket.server.TestAsyncMessagesPerformance.testAsyncTiming` | inter-chunk gaps 1–9 ms; under load the 50 ms server pause is also observed as only 2–13 ms | <0.5 ms / >40 ms | every `message.capacity()` check PASSES — the framing is correct. Both directions of timing error point the same way: the client cannot drain in real time, so frames queue server-side and are then read back-to-back (gap too *small*) while chunks of one message arrive far apart (gap too *large*). Client-side throughput, not a websocket defect |
+>
+> Two of those deserve a footnote because they read as "CratonVM's optimiser is
+> backwards" when they are not:
+>
+> * `juli.TestOneLineFormatterPerformance.testDateFormat` asserts
+>   `DateFormatCache` beats `String.format`. It fails on CratonVM for a reason
+>   specific to this VM's *shape*, not merely its speed: `java.util
+>   .Formatter.format` — which is what `String.format` delegates to — is
+>   registered as a **Rust `NativeKind::Intrinsic`**
+>   (`native-builtins/src/lib.rs`, `register_formatter_natives`), so it runs
+>   near HotSpot speed while everything it is being raced against is ordinary
+>   interpreted bytecode. Steady-state per-call cost from
+>   `apps/tomcat-suite-runner/probes/DateFmtProbe.java`, measured on an
+>   **idle** box:
+>
+>   | operation | HotSpot | CratonVM | ratio |
+>   |---|---|---|---|
+>   | `String.format` (intrinsic) | 3.61 µs | 10.08 µs | **2.8×** |
+>   | `StringBuilder.append(long).toString()` | 0.058 µs | 4.44 µs | 77× |
+>   | `Calendar.get` | 0.102 µs | 7.42 µs | 73× |
+>   | `SimpleDateFormat.format` (the cache's miss path) | 0.547 µs | 160.5 µs | **293×** |
+>
+>   The intrinsic asymmetry alone is sufficient to flip the assertion: even if
+>   `SimpleDateFormat.format` ran at the *ordinary* ~77× bytecode gap it would
+>   cost ~42 µs and still lose to a 10 µs `String.format`. So this test cannot
+>   pass until the general interpreter gap closes, and it is **not** evidence
+>   of a defect in the slower path.
+>
+>   Worth a separate look some day, though: `SimpleDateFormat.format` is
+>   ~4× worse than the general bytecode gap (293× vs ~75×), which the probe
+>   isolates in a few seconds with no Tomcat fixture. That is a throughput
+>   lead for this group, not a correctness bug.
+> * `TestELParserPerformance` runs its `ReInit` loop first and its `new
+>   ELParser()` loop second, so the first loop absorbs JIT warm-up. That is
+>   why it fails on a loaded host and passes on a quiet one.
+>
+> Everything else that doc listed is now closed as a real, separate,
+> *fixed* defect — `File.setLastModified` on directories, the path-keyed
+> jar/war byte cache, the discarded truncated HTTP response body, and the
+> `file:`-URL leading-slash + percent-decode ordering bug — see the closed
+> doc for details.
+
 > ## 2026-07-21 CROSS-CONFIRMATION — same mechanism independently rediscovered from Spring Boot JUnit5 test severe-slowdown reports, not just Tomcat deploy
 >
 > A completely separate investigation (Spring Boot suite "severe slowdown,
@@ -154,7 +214,7 @@
 > serving at all — it **reset every request** before reading it.
 >
 > Root cause (FIXED, dev — `fix/tomcat-suite-bugs-09-10`,
-> `native-io/src/socket_channel.rs`): `NioEndpoint.setSocketOptions` calls
+> `../../../native-io/src/socket_channel.rs`): `NioEndpoint.setSocketOptions` calls
 > `SocketChannel.setOption(SocketOption, Object)` on every accepted connection.
 > The `sc_set_option` native was registered only with the `NetworkChannel`
 > return-type descriptor, but `SocketChannel.setOption` **covariantly** returns
@@ -188,7 +248,7 @@
 >    (`begin_blocking_region` around `perform` did not help). Likely fix: **drop
 >    the native `HttpURLConnection` bridge so the real `sun.net.www` bytecode runs
 >    over the now-working socket layer** (the raw-`Socket` path already works
->    in-process). See [bug 10](10-pagecontext-npe-contains-null-FAIL.md).
+>    in-process). See [bug 10](../../internal/fixed-suite-bugs/tomcat/10-pagecontext-npe-contains-null-FAIL.md).
 > 3. **Interpreter throughput** (the original wall below) — still real for the
 >    cold deploy (jar/TLD/annotation scanning, classloading).
 >

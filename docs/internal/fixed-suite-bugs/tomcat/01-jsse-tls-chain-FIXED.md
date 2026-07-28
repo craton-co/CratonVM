@@ -57,7 +57,7 @@ same as HotSpot).
 
 **Caveat:** `TestSsl` is not confirmed all-green — it is throughput-bound
 (group 04): each JSSE method's webapp deploy is slow, so the full class does not
-finish within practical timeouts. See [04](04-embedded-server-throughput-wall-OPEN.md).
+finish within practical timeouts. See [04](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md).
 
 ## Reproduction
 
