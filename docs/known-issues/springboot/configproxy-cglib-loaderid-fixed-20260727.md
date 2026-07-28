@@ -294,3 +294,29 @@ Rebuilt and re-run after merging `origin/dev` into the branch:
   clean run; two of three runs additionally tripped the pre-existing
   `process_vm_publish_and_resolve` flake described under R4. With
   `--skip runtime::lock_order` the suite is **2379 passed, 0 failed, 3/3**.
+
+### Second re-verification (`origin/dev` @ `16fe5ef60`)
+
+`dev` moved again before the merge landed, so everything was rebuilt and
+re-run once more: Spring Boot battery **10/10, 95/95, 0 divergences**;
+`LookupForkDiag` **11/11 app, 11/11 fork**; `cargo test --release`
+types **417/0**, classloading **638/0**, vm `--lib` **2428 passed, 2 failed**.
+
+Both vm failures are inherited from `dev`, in files this branch does not
+touch (`git diff HEAD origin/dev -- vm/src/jit/skip_list.rs` is empty):
+
+- `native::jni::tests::process_vm_publish_and_resolve` — the
+  enforcement-timing flake described under R4.
+- `jit::skip_list::tests::generated_proxy_class_is_jit_eligible_after_proxy_jitcall_1_removal`
+  — deterministic, and the same shape as the diskbbq test that failed during
+  the first re-verification: a JIT-ban removal landed on `dev` while its test
+  still asserts the old policy (here `$ProxyN` classes are expected to be
+  JIT-eligible but still return `Some(JdkDynamicProxyTrampoline)`).
+
+**Unrelated drive-by, needed to run any of the above:** a `dev` commit added
+`Class::record_object_methods` without updating six **test-only**
+`Class { .. }` literals, so `cargo test -p cratonvm-classloading` and
+`cargo test -p cratonvm-vm` did not compile at all (E0063). Added the field at
+all six (`classloading/src/verifier.rs` x2, `vm/src/vm/vm_util.rs` x2,
+`vm/src/vm/vm_exec.rs`, `vm/src/runtime/stackwalker.rs`), matching what the
+non-test constructors already do.
