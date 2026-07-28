@@ -5513,41 +5513,39 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
-    // UncaughtExceptionHandler
+    // UncaughtExceptionHandler.
+    //
+    // `uncaughtException` is declared on an INTERFACE, and the dispatcher
+    // deliberately declines a registered native for an interface INSTANCE
+    // method: both `vm_exec::invoke_on_class_shared` and the twin in
+    // `interpreter::try_stackless_invoke` (step 6) null out `override_cb`
+    // when `declaring_is_interface && !is_static`, unless the class appears
+    // in `force_native_over_real_jdk_bytecode` — which
+    // `java/lang/Thread$UncaughtExceptionHandler` does not. So a user
+    // handler (lambda or named class) resolves to its OWN declaring class
+    // and its body runs; this registration never shadows it. What it does
+    // cover is a receiver that has no bytecode at all (a synthetic handler
+    // object), for which "swallow the exception" is the same outcome as
+    // HotSpot's default when no handler is installed. KEEP.
     r.register(
         "java/lang/Thread$UncaughtExceptionHandler",
         "uncaughtException",
         "(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
         native_noop_with_this,
     );
-    let th = "java/lang/Thread";
-    r.register(
-        th,
-        "setUncaughtExceptionHandler",
-        "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
-        native_noop_with_this,
-    );
-    // Thread.setDefaultUncaughtExceptionHandler is a STATIC method —
-    // no receiver. We intentionally use plain `native_noop` to reflect
-    // that. NEW-6: distinguished from the instance setter above.
-    r.register(
-        th,
-        "setDefaultUncaughtExceptionHandler",
-        "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
-        native_noop,
-    );
-    r.register(
-        th,
-        "getUncaughtExceptionHandler",
-        "()Ljava/lang/Thread$UncaughtExceptionHandler;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        th,
-        "getDefaultUncaughtExceptionHandler",
-        "()Ljava/lang/Thread$UncaughtExceptionHandler;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // Thread.set/getUncaughtExceptionHandler and the static
+    // set/getDefaultUncaughtExceptionHandler used to be registered here as
+    // no-ops / null-returners, which DROPPED every handler the application
+    // installed. Delegate to the real side-table implementation instead of
+    // restating it: `uncaught_handlers::register_uncaught_handler_natives`
+    // stores the handler in a GC-remapped, identity-hash-keyed table that
+    // `vm_exec::thread_start` consults through `take_uncaught_handler` /
+    // `default_uncaught_handler` when `Thread.run()` escapes. Registering
+    // the same callbacks here (rather than a local copy) guarantees this
+    // registration point cannot disagree with the other call sites of that
+    // registrar, and `register` is last-write-wins, so calling it twice is
+    // harmless.
+    crate::uncaught_handlers::register_uncaught_handler_natives(r);
     r.set_category(__prev_cat);
 }
 

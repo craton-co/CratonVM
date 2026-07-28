@@ -2206,24 +2206,26 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
 
     if let Err(error) = &result {
         if let MethodCallFailed::ExceptionThrown(exception) = error {
-            let pin_base = thread.native_pin_roots.len();
-            thread.native_pin_roots.push(*exception);
+            // W1-C (real-JDK, 2026-07-27): same handler resolution as the
+            // platform-thread death path in `thread_start` — side table -> real
+            // `Thread.uncaughtExceptionHandler` field -> side-table default,
+            // then `dispatchUncaughtException` only when nothing was found.
+            // Mirroring the real field alone would NOT have fixed this path:
+            // real `getUncaughtExceptionHandler()` gates on `isTerminated()`,
+            // which resolves through the `holder.threadStatus` this VM never
+            // advances. The helper owns the pin/re-read/truncate discipline
+            // (including the `try_lambda_dispatch` routing a lambda handler
+            // needs), so this site no longer pins the Throwable itself.
             if let Some(thread_obj) = shared.threads.thread_registry.java_thread_obj(tid) {
                 let receiver_class = shared.mem.heap.class_id_of(thread_obj);
-                let exception = thread.native_pin_roots[pin_base];
-                let _ = invoke_on_class_shared(
+                let _ = dispatch_uncaught_exception_shared(
                     &shared,
                     &mut thread,
+                    thread_obj,
+                    *exception,
                     receiver_class,
-                    "dispatchUncaughtException",
-                    "(Ljava/lang/Throwable;)V",
-                    &[
-                        Value::Object(Some(thread_obj)),
-                        Value::Object(Some(exception)),
-                    ],
                 );
             }
-            thread.native_pin_roots.truncate(pin_base);
         } else {
             eprintln!("Virtual thread {} terminated with error: {:?}", tid, error);
         }
@@ -2299,6 +2301,185 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
 pub struct NativeContextImpl<'a> {
     pub shared: &'a SharedVm,
     pub thread: &'a mut JvmThread,
+}
+
+/// W1-C (real-JDK, 2026-07-27): run the `UncaughtExceptionHandler` for a
+/// thread whose `run()` escaped with `exc`, falling back to the Java
+/// `Thread.dispatchUncaughtException(Throwable)` when no handler is found.
+///
+/// Shared by BOTH thread-death paths — the platform-thread one in
+/// `thread_start` and the virtual-thread one in the continuation runtime —
+/// which previously each open-coded the `dispatchUncaughtException` invoke and
+/// so would have drifted apart under this fix.
+///
+/// # Why this does not just call `dispatchUncaughtException`
+///
+/// `Thread.setUncaughtExceptionHandler` can land in either of two stores
+/// depending on which side wins dispatch on the path the user's call took: the
+/// Rust side table in `native_builtins::uncaught_handlers` (native won) or the
+/// real `Thread.uncaughtExceptionHandler` field (real bytecode won). The real
+/// `dispatchUncaughtException` bytecode can only ever see the second — so a
+/// handler that reached only the side table was silently dropped, which is why
+/// `setUncaughtExceptionHandler` had no observable effect in the default
+/// real-JDK mode. The setters now mirror into BOTH stores; reading both here
+/// closes the loop for handlers installed before that mirroring could run.
+///
+/// It also matters that this bypasses real `getUncaughtExceptionHandler()`,
+/// whose JDK 25 bytecode opens with an `isTerminated()` guard that resolves
+/// through `holder.threadStatus` — a field this VM never advances past 0 (see
+/// `native-builtins/src/lib.rs`'s note on `getState`). Mirroring the field
+/// alone would therefore not have been enough on either path.
+///
+/// # Handler precedence
+///
+/// Per-thread handler (side table, then real field) beats everything, matching
+/// the Thread spec, so invoking it directly is what HotSpot would do. The
+/// DEFAULT tier is read from the side table ONLY: when the default lives solely
+/// in the real static, the fallback runs the genuine `ThreadGroup` ->
+/// `Thread.getDefaultUncaughtExceptionHandler` chain instead, which preserves a
+/// `ThreadGroup` subclass that overrides `uncaughtException`. (When the side
+/// table does hold a default we call it directly and a group override loses —
+/// the same approximation the `getUncaughtExceptionHandler` native has always
+/// made.)
+///
+/// # GC
+///
+/// `exc` and `thread_obj` arrive as bare Rust locals with no interpreter frame
+/// covering them: `run()`'s frame has already popped and the handler's frame
+/// does not exist yet. Every call below is re-entrant (lazy class init /
+/// allocation on the way into the handler body), so all three refs are pinned
+/// in `native_pin_roots` for the duration and RE-READ from their pinned slots
+/// immediately before each call — a copy taken earlier can be stale. One
+/// `truncate` restores the caller's pin depth on every exit path.
+fn dispatch_uncaught_exception_shared(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    thread_obj: ObjectRef,
+    exc: ObjectRef,
+    fallback_class: ClassId,
+) -> MethodCallResult {
+    const EXC: usize = 0;
+    const THREAD_OBJ: usize = 1;
+    const HANDLER: usize = 2;
+    let pin_base = thread.native_pin_roots.len();
+    thread.native_pin_roots.push(exc);
+    thread.native_pin_roots.push(thread_obj);
+
+    let handler_thread = thread.native_pin_roots[pin_base + THREAD_OBJ];
+    let dbg = cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNCAUGHT").is_some();
+    let ueh = {
+        let nctx = NativeContextImpl {
+            shared,
+            thread: &mut *thread,
+        };
+        // The tiers are separate bindings rather than one `.or_else` chain only
+        // so the gated trace below can report WHICH tier answered; the
+        // short-circuit order is identical.
+        let side =
+            cratonvm_native_builtins::uncaught_handlers::take_uncaught_handler(&nctx, handler_thread);
+        let field = if side.is_none() {
+            cratonvm_native_builtins::uncaught_handlers::real_thread_handler(&nctx, handler_thread)
+        } else {
+            None
+        };
+        let dflt = if side.is_none() && field.is_none() {
+            cratonvm_native_builtins::uncaught_handlers::default_uncaught_handler(&nctx)
+        } else {
+            None
+        };
+        if dbg {
+            eprintln!(
+                "[dbg-uncaught] resolve: thread_obj={:p} ihash={} side_table={} real_field={} side_default={}",
+                handler_thread.as_ptr(),
+                nctx.identity_hash_code(handler_thread),
+                side.is_some(),
+                field.is_some(),
+                dflt.is_some(),
+            );
+        }
+        side.or(field).or(dflt)
+    };
+    if dbg && ueh.is_none() {
+        eprintln!(
+            "[dbg-uncaught] no handler found; falling back to Thread.dispatchUncaughtException"
+        );
+    }
+
+    let result = if let Some(handler) = ueh {
+        thread.native_pin_roots.push(handler);
+        let handler_ref = thread.native_pin_roots[pin_base + HANDLER];
+        let handler_cid = shared.mem.heap.class_id_of(handler_ref);
+        // A lambda handler (`(t, e) -> ...`, the common shape) has a synthetic
+        // class_id that is not in the class store: resolving `uncaughtException`
+        // by name would land on the abstract interface method. Route it through
+        // `try_lambda_dispatch`, exactly as the proxy-invoke path does. Bind the
+        // table lookup to its own statement so the `lambda_proxies` read guard
+        // is definitely released before the re-entrant dispatch runs.
+        let handler_is_lambda = shared
+            .classes.lambda_proxies
+            .read()
+            .contains_key(&handler_cid);
+        let lambda_result = if handler_is_lambda {
+            let sam_args = [
+                Value::Object(Some(thread.native_pin_roots[pin_base + THREAD_OBJ])),
+                Value::Object(Some(thread.native_pin_roots[pin_base + EXC])),
+            ];
+            match crate::runtime::interpreter::try_lambda_dispatch(
+                shared,
+                thread,
+                handler_ref,
+                handler_cid,
+                "uncaughtException",
+                "(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
+                &sam_args,
+            ) {
+                Ok(Some(v)) => Some(Ok(v)),
+                // Not a SAM match after all — fall through to name resolution.
+                Ok(None) => None,
+                Err(le) => Some(Err(le)),
+            }
+        } else {
+            None
+        };
+        match lambda_result {
+            Some(r) => r,
+            None => {
+                // Copy the pinned slots into locals first: the call takes
+                // `&mut thread`, so the argument list cannot also borrow it.
+                let handler_ref = thread.native_pin_roots[pin_base + HANDLER];
+                let thread_now = thread.native_pin_roots[pin_base + THREAD_OBJ];
+                let exc_now = thread.native_pin_roots[pin_base + EXC];
+                invoke_on_class_shared(
+                    shared,
+                    thread,
+                    handler_cid,
+                    "uncaughtException",
+                    "(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
+                    &[
+                        Value::Object(Some(handler_ref)),
+                        Value::Object(Some(thread_now)),
+                        Value::Object(Some(exc_now)),
+                    ],
+                )
+            }
+        }
+    } else {
+        let thread_now = thread.native_pin_roots[pin_base + THREAD_OBJ];
+        let exc_now = thread.native_pin_roots[pin_base + EXC];
+        invoke_on_class_shared(
+            shared,
+            thread,
+            fallback_class,
+            "dispatchUncaughtException",
+            "(Ljava/lang/Throwable;)V",
+            &[
+                Value::Object(Some(thread_now)),
+                Value::Object(Some(exc_now)),
+            ],
+        )
+    };
+    thread.native_pin_roots.truncate(pin_base);
+    result
 }
 
 #[inline]
@@ -9112,6 +9293,20 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                     if result.is_ok() { "ok" } else { "ERR" }
                 );
             }
+            // Reachability probe for the uncaught-handler path. An `Ok` here
+            // when the Runnable definitely threw means the exception was
+            // swallowed BELOW this frame and no amount of work in the `Err` arm
+            // can matter — see the force-native `java/lang/Thread.run()V` shim
+            // in native-builtins, which discards `invoke_virtual`'s Result with
+            // `let _ =`.
+            if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
+                eprintln!(
+                    "[dbg-uncaught] tid={} run() returned {} (Err is required for the \
+                     UncaughtExceptionHandler path to run at all)",
+                    tid.0,
+                    if result.is_ok() { "Ok" } else { "Err" },
+                );
+            }
             if let Err(e) = result {
                 // W1-C: dispatch the per-Thread (or default)
                 // UncaughtExceptionHandler before dropping the exception.
@@ -9188,21 +9383,28 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                             exc_ref.as_ptr(),
                         );
                     }
-                    let dispatch_result = invoke_on_class_shared(
+                    // W1-C (real-JDK, 2026-07-27): the handler lookup + invoke
+                    // + `dispatchUncaughtException` fallback all live in
+                    // `dispatch_uncaught_exception_shared`, which the
+                    // virtual-thread death path calls too — see its doc comment
+                    // for why consulting the side table here is load-bearing.
+                    //
+                    // Re-read the pinned Throwable rather than reusing the
+                    // `exc_ref` copy taken above: the gated
+                    // `CRATONVM_DBG_UNCAUGHT` block between them runs a
+                    // re-entrant `toString` invoke that can move it. The helper
+                    // pins both refs again for its own re-entrant calls.
+                    let exc_now = jvm_thread.native_pin_roots[pin_base];
+                    let thread_now = shared_arc
+                        .threads.thread_registry
+                        .java_thread_obj(tid)
+                        .unwrap_or(thread_obj_for_spawn);
+                    let dispatch_result = dispatch_uncaught_exception_shared(
                         &shared_arc,
                         &mut jvm_thread,
+                        thread_now,
+                        exc_now,
                         recv_cid,
-                        "dispatchUncaughtException",
-                        "(Ljava/lang/Throwable;)V",
-                        &[
-                            Value::Object(Some(
-                                shared_arc
-                                    .threads.thread_registry
-                                    .java_thread_obj(tid)
-                                    .unwrap_or(thread_obj_for_spawn),
-                            )),
-                            Value::Object(Some(exc_ref)),
-                        ],
                     );
                     jvm_thread.native_pin_roots.truncate(pin_base);
                     if let Err(de) = dispatch_result {
@@ -20174,6 +20376,25 @@ fn invoke_on_class_shared_inner(
                 method_name,
                 descriptor,
             );
+        // FFM `Arena`: same exemption, same reason, as
+        // `force_ffm_memory_segment_interface_native` above — the arena handed
+        // out by the (static, therefore always-native) `ofConfined`/`ofAuto`/
+        // `ofShared`/`global` factories is stamped with the literal interface
+        // name, so its `scope`/`close`/`allocate*` are interface INSTANCE
+        // methods and the rule below would drop their registered natives, which
+        // are the only thing that models the arena's session lifetime. Kept in
+        // `interpreter.rs` next to the other `is_ffm_*_native_override` helpers
+        // and consulted from BOTH dispatch sites: this one, and
+        // `try_stackless_invoke` step 6 (which reaches it through
+        // `force_native_over_real_jdk_bytecode`). A real
+        // `jdk.internal.foreign.ArenaImpl` receiver never matches — it declares
+        // all three concretely, so `class_name_for_override` is `ArenaImpl`.
+        let force_ffm_arena_interface_native =
+            crate::runtime::interpreter::is_ffm_arena_native_override(
+                &class_name_for_override,
+                method_name,
+                descriptor,
+            );
         let force_interface_default_native =
             crate::runtime::interpreter::should_force_registered_native_over_bytecode(
                 shared,
@@ -20188,6 +20409,7 @@ fn invoke_on_class_shared_inner(
             && !force_ffm_symbol_lookup_interface_native
             && !force_ffm_group_layout_interface_native
             && !force_ffm_memory_layout_interface_native
+            && !force_ffm_arena_interface_native
             && !force_interface_default_native
         {
             None
