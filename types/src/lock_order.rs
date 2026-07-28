@@ -234,6 +234,27 @@ pub mod tracking {
         }
     }
 
+    /// Turn enforcement on for the rest of this process, unconditionally.
+    ///
+    /// Exists for **test binaries only**. `cargo test --release` builds the
+    /// suite with `debug_assertions` off, so [`enforced`] defaults to `false`
+    /// and every `#[should_panic(expected = "lock order violation")]` test in
+    /// `vm/src/runtime/lock_order.rs` stopped panicking and failed — 18
+    /// failures that looked like real regressions in every `--release` test
+    /// run and had to be re-triaged as noise each time. Calling this at the
+    /// top of those tests makes a release run exercise the same code path a
+    /// debug run does.
+    ///
+    /// It can only ever *enable* checking (never disable it), and the check
+    /// itself is a pure assertion over a per-thread bit-set, so flipping it on
+    /// mid-process cannot introduce a false positive: a lock acquired before
+    /// the flip simply was not recorded, which can only cause a violation to
+    /// be *missed*, not invented.
+    #[doc(hidden)]
+    pub fn force_enable_for_testing() {
+        ENFORCE.store(2, Ordering::Relaxed);
+    }
+
     fn compute_enforced() -> bool {
         // Always enforce in debug builds; the env opt-in is for release.
         if cfg!(debug_assertions) {
