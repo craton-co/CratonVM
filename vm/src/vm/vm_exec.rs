@@ -4337,6 +4337,15 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|cs| cs.functional_interface.to_string())
     }
 
+    fn lambda_functional_interface_id(&self, class_id: ClassId) -> Option<ClassId> {
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .and_then(|cs| cs.functional_interface_id)
+    }
+
     fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
         self.shared
             .classes

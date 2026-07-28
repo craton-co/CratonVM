@@ -9988,9 +9988,8 @@ pub(crate) fn native_class_get_constructor(
 
 // --- Class.getInterfaces / Class.getModifiers ---
 
-/// Resolve a lambda proxy's functional-interface NAME to a `ClassId`,
-/// scoped to the lambda's own host (defining/enclosing) class's loader
-/// rather than the flat global store.
+/// Resolve a lambda proxy's functional interface to a `ClassId`, preserving
+/// the bootstrap's exact resolved identity before any host-scoped fallback.
 ///
 /// Residual 4 follow-up (2026-07-20, docs/known-issues/springboot/
 /// core-spring-boot-test-config-data-and-classpath-scan-cluster.md): both
@@ -10012,6 +10011,14 @@ fn lambda_functional_interface_id_loader_aware(
     class_id: ClassId,
     iface_name: &str,
 ) -> Option<ClassId> {
+    // The invokedynamic bootstrap resolves the SAM through the defining
+    // class's loader and retains that ClassId on the call site.  Use that
+    // authoritative identity first: host names are not unique under forked
+    // loaders, so resolving the host by name can lose the exact loader and
+    // make both the scoped and global fallbacks ambiguous.
+    if let Some(iface_id) = ctx.lambda_functional_interface_id(class_id) {
+        return Some(iface_id);
+    }
     let host_id = ctx
         .lambda_proxy_host(class_id)
         .and_then(|host_name| ctx.class_id_by_name(&host_name));
@@ -11178,9 +11185,16 @@ fn resolve_annotation_class_via_loader(
     loader: ObjectRef,
     class_name: &str,
 ) -> Result<ObjectRef, Option<ObjectRef>> {
+    // Loading through a user-defined loader can allocate and re-enter Java.
+    // Keep the loader and the freshly-created class-name String visible to a
+    // moving collector until the virtual call has consumed them.
+    let loader_pin = ctx.pin_native_root(loader);
     let dotted = class_name.replace('/', ".");
     let name_obj = ctx.create_string(&dotted);
-    match ctx.invoke_virtual(
+    let name_pin = ctx.pin_native_root(name_obj);
+    let loader = ctx.read_native_pin(loader_pin, loader);
+    let name_obj = ctx.read_native_pin(name_pin, name_obj);
+    let result = match ctx.invoke_virtual(
         loader,
         "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
@@ -11192,7 +11206,10 @@ fn resolve_annotation_class_via_loader(
         Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc)) => Err(Some(exc)),
         // Internal VM error вЂ” don't synthesize; let the caller fall back.
         Err(_) => Err(None),
-    }
+    };
+    ctx.unpin_native_roots(name_pin);
+    ctx.unpin_native_roots(loader_pin);
+    result
 }
 
 /// Create an annotation proxy object from annotation data.
@@ -11597,7 +11614,12 @@ pub(crate) fn annotation_element_to_java_typed(
                     Err(_) => None,
                 }
             });
-            let enum_cid_opt = via_loader.or_else(|| {
+            // An application-loaded annotation can lack an ObjectRef for its
+            // defining loader while its ClassId still carries the correct
+            // namespace. Prefer that scoped lookup to the global table.
+            let via_container_scope = container_class_id
+                .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+            let enum_cid_opt = via_loader.or(via_container_scope).or_else(|| {
                 ctx.class_id_by_name(class_name).or_else(|| {
                     let _ = ctx.load_class(class_name);
                     ctx.class_id_by_name(class_name)
@@ -11949,6 +11971,10 @@ pub(crate) fn annotation_element_to_java_typed(
                         Ok(mirror) => ctx.class_id_from_mirror(mirror),
                         Err(_) => None,
                     }
+                })
+                .or_else(|| {
+                    container_class_id
+                        .and_then(|holder| ctx.class_id_by_name_near(&comp_name_owned, holder))
                 })
                 .or_else(|| ctx.class_id_by_name(&comp_name_owned))
                 .or_else(|| {
@@ -13628,8 +13654,13 @@ pub(crate) fn native_class_get_generic_interfaces(
                         eprintln!("[LAMBDA-GENERIC] typesig_to_real_type -> {val:?}");
                     }
                     if let Value::Object(Some(pt)) = val {
+                        // Building the result array can move the newly-created
+                        // ParameterizedTypeImpl before it is published.
+                        let pt_pin = ctx.pin_native_root(pt);
                         let arr = ctx.new_ref_array(ClassId::new(0), 1);
+                        let pt = ctx.read_native_pin(pt_pin, pt);
                         ctx.set_array_element(arr, 0, Value::Object(Some(pt)));
+                        ctx.unpin_native_roots(pt_pin);
                         return Ok(Some(Value::Object(Some(arr))));
                     }
                 }
