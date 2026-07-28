@@ -6420,6 +6420,33 @@ mod tests {
     // Vm construction
     // -----------------------------------------------------------------------
 
+    /// Dropping a `Vm` must actually destroy its `SharedVm`.
+    ///
+    /// It did not: `JcmdProcessor::new_with_vm_state` cloned the `Arc` into
+    /// nine diagnostic-command closures that live inside
+    /// `SharedVm::debug.jcmd_processor`, so the VM owned nine strong
+    /// references to itself. `Arc::strong_count` went 1 -> 10 across that one
+    /// call and stayed at 9 after the `Vm` was dropped, leaking the heap,
+    /// class manager, thread registry and JIT caches of every VM ever built --
+    /// visible in this crate's own test binary as ~80 `Attach-Listener`
+    /// threads outliving the tests that created them.
+    #[test]
+    fn dropping_a_vm_destroys_its_shared_state() {
+        let vm = Vm::new(VmConfig::default());
+        let weak = std::sync::Arc::downgrade(&vm.shared);
+        assert_eq!(
+            std::sync::Arc::strong_count(&vm.shared),
+            1,
+            "the Vm must be the only strong owner of its SharedVm"
+        );
+        drop(vm);
+        assert!(
+            weak.upgrade().is_none(),
+            "SharedVm outlived its Vm: {} strong refs remain",
+            weak.strong_count()
+        );
+    }
+
     #[test]
     fn vm_new_creates_main_thread() {
         let vm = Vm::new(VmConfig::default());
