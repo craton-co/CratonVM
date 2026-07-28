@@ -26,9 +26,13 @@ against HotSpot where the `ByteBuffer` version is 1,130x. That one is **not**
 fixed here; it is a change to the VM's hottest dispatch path and it is now
 scoped precisely enough to be a bounded project rather than a mystery.
 
-The ban itself **stays**. So do JASPER-JDT.2 and .3 — though the direct
-re-confirmation the previous revision claimed for `parser/` does not reproduce
-in 40 runs, which is recorded below rather than acted on.
+The `org/h2/` ban itself **stays**. The two Eclipse JDT bans this page's flip
+forced back on are **gone again** — a concurrent session bisected the actual
+defect (`613b10f4c`, an LICM/speculative pre-header a forward branch into the
+loop header skips) and removed them causally rather than on staleness. The
+40-run null result this revision measured independently is corroboration for
+that, and is kept below with the reason it looked like a contradiction at the
+time.
 
 None of the closed residuals was an H2 bug.
 
@@ -385,7 +389,7 @@ earlier revision recorded as *closed* — it regressed again once the dispatch f
 let compiled H2 code actually run compiled, which is a good reason to distrust
 any per-class verdict taken before that fix.
 
-## The flip's own fallout: two Eclipse JDT bans had to be RESTORED
+## The flip's own fallout: two Eclipse JDT bans had to be RESTORED (since fixed)
 
 Turning the dispatch flag on regressed one Tomcat class:
 `jakarta.el.TestOptionalELResolverInJsp` went PASS -> FAIL, reproducibly (3/3
@@ -413,60 +417,39 @@ reproduced the defect whatever its state. Same shadowing shape this module
 already annotates for other removed bans, just hidden behind a flag instead of
 behind another rule.
 
-Both are restored. Both **stay** restored — but the direct re-confirmation the
-previous revision claimed for `parser/` does not reproduce, and that is recorded
-here rather than quietly dropped.
+Both were restored on 2026-07-27. `parser/` is directly re-confirmed by the
+bisection above; `ast/` was restored on the shadowing argument alone.
 
-### Re-measured 2026-07-27, and it does not reproduce
+**UPDATE 2026-07-28 — both bans are now REMOVED again, and this time the defect
+is root-caused rather than assumed stale.** Bisected across the 150 commits from
+the restore point to `dev` (two runs per step, both packages allowed, direct-entry
+path ON) to `613b10f4c`, "fix(jit): LICM/speculative pre-header bypassed by a
+branch into the loop header", and confirmed causally on a single current-`dev`
+binary carrying an env-gated revert of that guard — pre-fix behaviour 2/2 FAIL
+with the identical `ClassCastException`, shipping behaviour 2/2 PASS. So the
+`CRATONVM_JIT_DENY=org/eclipse/jdt/internal/compiler/parser/` bisection recorded
+above was pointing at the *victim* package, not at a JDT-specific defect: the
+bypassed pre-header is a general x64 backend bug that ECJ's `Parser`/AST code
+happens to hit hard. Re-verified with the bans deleted:
+`TestOptionalELResolverInJsp` 3/3, `TestFormAuthenticatorA/B/C` 2/2 each,
+`TestCompiler` 2/2, 167 parser + 29 ast methods compiling per run. Full evidence
+in the retired `jasper-jdt-2-3-fixed-licm-preheader-20260728` write-up. None of
+this changes the H2 verdicts on this page.
 
-`jakarta.el.TestOptionalELResolverInJsp`, the failure this restore rests on,
-with `org/eclipse/jdt/internal/compiler/parser/` JIT-eligible and the virtual
-direct-entry path ON (its shipped default):
 
-| binary | runs | PASS | FAIL |
-|---|---|---|---|
-| this revision | 20 | 20 | 0 |
-| pre-fix `dev` (`017bc3734`) | 20 | 20 | 0 |
-
-40 runs, no `ClassCastException`, no `JasperException`. The control matters more
-than the counts, and it is clean: `CRATONVM_DBG_JIT_COMPILED` counts **0**
-compiled `org/eclipse/jdt/internal/compiler/parser/` methods with the ban
-active and **166** with it lifted, so these runs really did execute compiled
-parser code. This is not the shadowed-verification mistake this section
-documents — that is exactly what was checked for.
-
-`ast/` (JASPER-JDT.3) was the half the previous revision restored without any
-measurement at all, so its own repro has now been run under the flag too:
-`TestFormAuthenticatorA` with `org/eclipse/jdt/internal/compiler/ast/`
-JIT-eligible is **3/3 PASS** (and 3/3 with the ban active). Three runs, not
-twenty — an attempt to extend it to the 20-run bar ran on a host that had
-climbed to load 46 on 16 cores and hit the harness timeout, which is evidence
-about the host, not about a `ClassCastException`. So `ast/` is no longer
-restored on argument alone, but three clean runs is well short of what removing
-it would need.
-
-Both binaries being clean rules out "this revision fixed it". The most likely
-remaining explanation is the merge itself: the previous revision measured on its
-own branch, and `017bc3734` is where that branch met several concurrent
-sessions' work. A fix landing in one of those would close this without anyone
-attributing it — the "two fixes that each work may not have been tried
-together" hazard, in its benign direction.
-
-**The bans stay anyway, and this is deliberate.** A null result over 20 runs
-does not overturn a positive one: the previous revision did not merely observe a
-failure, it *bisected* it — denying `parser/` restored PASS while denying
-`ast/`, `lookup/` and `util/` did not. That is evidence of causation, and a
-nondeterministic defect that stops reproducing is the single most common way a
-JIT ban gets removed and then has to be restored. This module already carries
-two such round trips.
-
-**What the next session needs to decide it** (and what this one deliberately did
-not do unilaterally): re-run the previous revision's own bisection, not just the
-class. If denying `parser/` no longer changes anything *because nothing fails*,
-then the ban has no repro at all and can be removed on that basis. If the
-failure reappears at any run count, it stays and this table becomes the record
-of how flaky it is. Either way the 20-run bar applies, with the direct-entry
-path on.
+This revision reached the same place independently, from the other end, and its
+numbers are worth keeping as corroboration. `TestOptionalELResolverInJsp` with
+`parser/` JIT-eligible and the direct-entry path on is **20/20 PASS on this
+tree and 20/20 PASS on the pre-fix `dev` it branched from** (`017bc3734`) — with
+the control checked, because a lift that does not lift proves nothing:
+`CRATONVM_DBG_JIT_COMPILED` counts 0 compiled `parser/` methods with the ban
+active and 166 with it lifted. `TestFormAuthenticatorA` with `ast/` lifted is
+3/3. At the time that looked like an unexplained disagreement with the
+restore, and it was written up as "keep the bans, a null result does not
+overturn a positive one — go re-run the bisection". The bisection above is that
+re-run, and it settles it: **`613b10f4c` is an ancestor of `017bc3734`**, so
+both of those binaries already carried the LICM pre-header fix. Two clean arms
+was not a flaky defect going quiet; it was the defect being gone from both.
 
 **The rule this leaves behind:** any ban whose mechanism is compiled-to-compiled
 virtual dispatch must be re-verified with
@@ -477,18 +460,6 @@ nothing. That flag was default-OFF for the entire period in which the
 believing either.
 
 (This section appeared twice, verbatim, in the previous revision. Deduplicated.)
-
-### The unit test the restore left failing
-
-`vm/src/jit/skip_list.rs` still carried
-`jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal`,
-asserting `check(...) == None` for both packages. The restore put the ban entries
-back and did not touch the test, so it asserted the opposite of the shipped
-behaviour and was failing on `dev`. Replaced with
-`jdt_parser_and_ast_packages_are_banned_after_jasper_jdt_2_3_restore` plus
-`jasper_jdt_bans_are_liftable_for_bisection`, which pins that each half stays
-individually liftable via `CRATONVM_JIT_ALLOW_PACKAGES` so a future removal
-attempt can still bisect.
 
 ## Also fixed — `ClassCastException` named an array receiver by its component
 
@@ -573,8 +544,9 @@ re-runs.
 
 ## Related
 
-- `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment and the restored
-  `JASPER-JDT.2`/`.3` entries.
+- `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment and the
+  `JASPER-JDT.2`/`.3` removal comment (restored 2026-07-27, removed again
+  2026-07-28 once root-caused).
 - `vm/src/jit/helpers.rs` — `direct_virtual_compiled_callee_entry_enabled`.
 - `native-builtins/src/util_concurrent_ext.rs` — `atomic_array_cas` /
   `atomic_array_rmw`, and the comment recording why the array atomics were not

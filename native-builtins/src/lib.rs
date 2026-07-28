@@ -29446,7 +29446,18 @@ pub(crate) fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8
     let mut out = Vec::with_capacity(input.len().div_ceil(3) * 4);
     let mut i = 0;
     let mut line_len = 0;
+    // Real `Base64.Encoder.encode0` writes the MIME line separator only when
+    // more input remains (`if (dp < len && sp < end)`), so a payload that ends
+    // exactly on a 76-char boundary gets NO trailing CRLF (57 bytes → 76
+    // chars, not 78). Emitting it eagerly after the quad that fills the line —
+    // as this loop used to — appended a phantom CRLF at end-of-output. Emit it
+    // lazily instead, just before whatever actually follows.
     while i + 2 < input.len() {
+        if variant == B64_VARIANT_MIME && line_len == 76 {
+            out.push(b'\r');
+            out.push(b'\n');
+            line_len = 0;
+        }
         let b0 = input[i] as u32;
         let b1 = input[i + 1] as u32;
         let b2 = input[i + 2] as u32;
@@ -29457,13 +29468,12 @@ pub(crate) fn b64_encode(input: &[u8], variant: i32, no_padding: bool) -> Vec<u8
         out.push(table[(triple & 0x3F) as usize]);
         i += 3;
         line_len += 4;
-        if variant == B64_VARIANT_MIME && line_len >= 76 {
-            out.push(b'\r');
-            out.push(b'\n');
-            line_len = 0;
-        }
     }
     let remaining = input.len() - i;
+    if remaining > 0 && variant == B64_VARIANT_MIME && line_len == 76 {
+        out.push(b'\r');
+        out.push(b'\n');
+    }
     if remaining == 1 {
         let b0 = input[i] as u32;
         out.push(table[((b0 >> 2) & 0x3F) as usize]);
@@ -29546,73 +29556,113 @@ pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
 
 /// Matches real `java.util.Base64.Decoder`'s exact wording for an
 /// out-of-alphabet byte (`"Illegal base64 character " +
-/// Integer.toString(b & 0xff, 16)`) — Spring Boot's
+/// Integer.toString(src[sp - 1], 16)`) — Spring Boot's
 /// `Base64ProtocolResolverTests`/`JksSslStoreBundleTests` assert on this
 /// text, not just the exception type.
+///
+/// `src` is a `byte[]`, so the value handed to `Integer.toString(int, 16)` is
+/// the SIGNED byte: `0xff` renders as `"-1"` and `0xc3` as `"-3d"`, not as
+/// `"ff"`/`"c3"`. Verified against HotSpot 25.
 fn b64_illegal_char_msg(b: u8) -> String {
-    format!("Illegal base64 character {b:x}")
+    let signed = b as i8 as i32;
+    if signed < 0 {
+        format!("Illegal base64 character -{:x}", signed.unsigned_abs())
+    } else {
+        format!("Illegal base64 character {signed:x}")
+    }
 }
 
+/// Line-for-line port of real `java.util.Base64.Decoder` (JDK 25
+/// `java.base/java/util/Base64.java`): the two length guards of
+/// `decodedOutLength`, then `decode0`'s shift-register loop.
+///
+/// The previous hand-rolled quad-at-a-time loop diverged from the JDK on
+/// every malformed input — different exception text for each of the four
+/// error shapes, no "trailing bytes after the padding" check at all, and it
+/// treated MIME as merely "strip whitespace" when RFC 2045 decoding must
+/// ignore EVERY non-alphabet byte. Callers assert on that text (Spring Boot's
+/// `Base64ProtocolResolverTests` / `JksSslStoreBundleTests` both check for
+/// `"Illegal base64"`), so the wording is part of the contract, not cosmetic.
+/// Each case below is pinned by `Base64Probe` diffed against HotSpot 25.
 fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
-    // RFC 4648's basic and URL decoders reject every non-alphabet byte,
-    // including whitespace.  Only MIME decoding ignores whitespace.
-    let filtered: Vec<u8> = if variant == B64_VARIANT_MIME {
-        input
-        .iter()
-        .copied()
-        .filter(|&c| c != b'\r' && c != b'\n' && c != b' ' && c != b'\t')
-            .collect()
-    } else {
-        input.to_vec()
-    };
+    let is_mime = variant == B64_VARIANT_MIME;
+    let sl = input.len();
 
-    let mut out = Vec::with_capacity(filtered.len() * 3 / 4);
-    let mut i = 0;
-    while i < filtered.len() {
-        let remaining = filtered.len() - i;
-        if remaining < 2 {
-            return Err("Incomplete base64 input".to_string());
-        }
-        let c0 = b64_decode_char(filtered[i], variant)
-            .ok_or_else(|| b64_illegal_char_msg(filtered[i]))?;
-        let c1 = b64_decode_char(filtered[i + 1], variant)
-            .ok_or_else(|| b64_illegal_char_msg(filtered[i + 1]))?;
+    // `decodedOutLength` runs first on real JDK (`decode` sizes `dst` with it
+    // before calling `decode0`), so its guard wins over anything the decode
+    // loop would report. A 1-byte input is fatal for BASIC/URL but not for
+    // MIME — MIME falls through to `decode0`, which then reports the dangling
+    // unit itself ("Last unit does not have enough valid bits").
+    if sl == 1 && !is_mime {
+        return Err("Input byte[] should at least have 2 bytes for base64 bytes".to_string());
+    }
 
-        if remaining == 2 {
-            out.push(((c0 << 2) | (c1 >> 4)) as u8);
-            break;
-        }
-        let third = filtered[i + 2];
-        if third == b'=' {
-            if remaining != 4 || filtered[i + 3] != b'=' {
-                return Err("Invalid base64 padding".to_string());
+    let mut out: Vec<u8> = Vec::with_capacity(sl / 4 * 3 + 3);
+    let mut sp = 0usize;
+    let mut bits: u32 = 0;
+    let mut shiftto: i32 = 18; // bit position of the first byte of a 4-char atom
+
+    while sp < sl {
+        let raw = input[sp];
+        sp += 1;
+        let Some(b) = b64_decode_char(raw, variant) else {
+            if raw == b'=' {
+                // `=`    shiftto==18 — padding with nothing in front of it
+                // `x=`   shiftto==12 — dangling single char, handled after the loop
+                // `xx=`  shiftto==6 && sp==sl — missing the second `=`
+                // `xx=y` shiftto==6 — last char is not `=`
+                let wrong_tail = shiftto == 6 && {
+                    if sp == sl {
+                        true
+                    } else {
+                        let next = input[sp];
+                        sp += 1;
+                        next != b'='
+                    }
+                };
+                if wrong_tail || shiftto == 18 {
+                    return Err("Input byte array has wrong 4-byte ending unit".to_string());
+                }
+                break;
             }
-            out.push(((c0 << 2) | (c1 >> 4)) as u8);
-            break;
-        }
-        let c2 = b64_decode_char(third, variant)
-            .ok_or_else(|| b64_illegal_char_msg(third))?;
-
-        if remaining == 3 {
-            out.push(((c0 << 2) | (c1 >> 4)) as u8);
-            out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
-            break;
-        }
-        let fourth = filtered[i + 3];
-        if fourth == b'=' {
-            if remaining != 4 {
-                return Err("Invalid base64 padding".to_string());
+            if is_mime {
+                // RFC 2045: ignore every non-alphabet byte, not just whitespace.
+                continue;
             }
-            out.push(((c0 << 2) | (c1 >> 4)) as u8);
-            out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
-            break;
+            return Err(b64_illegal_char_msg(raw));
+        };
+        bits |= b << (shiftto as u32);
+        shiftto -= 6;
+        if shiftto < 0 {
+            out.push((bits >> 16) as u8);
+            out.push((bits >> 8) as u8);
+            out.push(bits as u8);
+            shiftto = 18;
+            bits = 0;
         }
-        let c3 = b64_decode_char(fourth, variant)
-            .ok_or_else(|| b64_illegal_char_msg(fourth))?;
-        out.push(((c0 << 2) | (c1 >> 4)) as u8);
-        out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
-        out.push((((c2 & 0x3) << 6) | c3) as u8);
-        i += 4;
+    }
+    // Reached the end of the input, or broke out on padding.
+    if shiftto == 6 {
+        out.push((bits >> 16) as u8);
+    } else if shiftto == 0 {
+        out.push((bits >> 16) as u8);
+        out.push((bits >> 8) as u8);
+    } else if shiftto == 12 {
+        return Err("Last unit does not have enough valid bits".to_string());
+    }
+    // Anything past the padding is invalid — except MIME filler, which is
+    // skipped. Note real JDK's `if (isMIME && base64[src[sp++]] < 0)` only
+    // evaluates (and so only advances) `sp` when `isMIME` is true, which is
+    // why the reported index differs by one between the two modes.
+    while sp < sl {
+        if is_mime {
+            let trailing = input[sp];
+            sp += 1;
+            if b64_decode_char(trailing, variant).is_none() {
+                continue;
+            }
+        }
+        return Err(format!("Input byte array has incorrect ending byte at {sp}"));
     }
     Ok(out)
 }
@@ -29861,7 +29911,16 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
-    match b64_decode(src_str.as_bytes(), variant) {
+    // Real `Decoder.decode(String)` is `decode(src.getBytes(ISO_8859_1))`: one
+    // byte per UTF-16 unit, with anything above U+00FF replaced by `'?'`.
+    // Handing it UTF-8 instead splits every non-ASCII char into a multi-byte
+    // sequence, so the reported illegal character was the first continuation
+    // byte rather than the real one (`"AB€D"` → `e2`, not `3f`).
+    let src_bytes: Vec<u8> = src_str
+        .encode_utf16()
+        .map(|u| if u <= 0xFF { u as u8 } else { b'?' })
+        .collect();
+    match b64_decode(&src_bytes, variant) {
         Ok(decoded) => {
             let result = b64_write_byte_array(ctx, &decoded);
             Ok(Some(Value::Object(Some(result))))
@@ -29874,7 +29933,150 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 mod base64_tests {
     #[allow(unused_imports)]
     use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
-    use super::{b64_encode, B64_VARIANT_BASIC, B64_VARIANT_URL};
+    use super::{
+        b64_decode, b64_encode, B64_VARIANT_BASIC, B64_VARIANT_MIME, B64_VARIANT_URL,
+    };
+
+    /// Every expectation below is a literal line of `Base64Probe`'s output on
+    /// HotSpot 25 — see
+    /// `docs/internal/fixed-suite-bugs/repros/base64-decoder-parity/Base64Probe.java`.
+    fn err(input: &str, variant: i32) -> String {
+        b64_decode(input.as_bytes(), variant).expect_err("must reject")
+    }
+
+    #[test]
+    fn decode_error_messages_match_real_jdk_wording() {
+        // The message Spring Boot's Base64ProtocolResolverTests asserts on.
+        assert_eq!(
+            err("not valid base64", B64_VARIANT_BASIC),
+            "Illegal base64 character 20"
+        );
+        assert_eq!(
+            err("not base 64", B64_VARIANT_BASIC),
+            "Illegal base64 character 20"
+        );
+        // One distinct message per malformed shape, not one catch-all.
+        assert_eq!(
+            err("A", B64_VARIANT_BASIC),
+            "Input byte[] should at least have 2 bytes for base64 bytes"
+        );
+        assert_eq!(
+            err("ABCDE", B64_VARIANT_BASIC),
+            "Last unit does not have enough valid bits"
+        );
+        assert_eq!(
+            err("A=AA", B64_VARIANT_BASIC),
+            "Last unit does not have enough valid bits"
+        );
+        for bad_tail in ["AB=", "AB=C", "=AAA", "ABCD=", "ABCD=="] {
+            assert_eq!(
+                err(bad_tail, B64_VARIANT_BASIC),
+                "Input byte array has wrong 4-byte ending unit",
+                "input {bad_tail:?}"
+            );
+        }
+        // Trailing data after the padding — the old decoder accepted this.
+        assert_eq!(
+            err("AB==CD", B64_VARIANT_BASIC),
+            "Input byte array has incorrect ending byte at 4"
+        );
+        // MIME advances past the offending byte before reporting; BASIC does
+        // not (Java's `&&` short-circuits the `sp++`).
+        assert_eq!(
+            err("AB==CD", B64_VARIANT_MIME),
+            "Input byte array has incorrect ending byte at 5"
+        );
+    }
+
+    #[test]
+    fn illegal_char_message_uses_the_signed_byte_in_hex() {
+        // `Integer.toString(src[sp - 1], 16)` on a `byte[]` — 0xff is -1.
+        assert_eq!(
+            b64_decode(&[b'A', b'B', 0xff, b'D'], B64_VARIANT_BASIC).expect_err("must reject"),
+            "Illegal base64 character -1"
+        );
+        assert_eq!(
+            b64_decode(&[b'A', b'B', 0x80, b'D'], B64_VARIANT_BASIC).expect_err("must reject"),
+            "Illegal base64 character -80"
+        );
+        assert_eq!(
+            b64_decode(&[b'A', b'B', 0xc3, b'D'], B64_VARIANT_BASIC).expect_err("must reject"),
+            "Illegal base64 character -3d"
+        );
+        assert_eq!(
+            b64_decode(&[b'A', b'B', 0x00, b'D'], B64_VARIANT_BASIC).expect_err("must reject"),
+            "Illegal base64 character 0"
+        );
+    }
+
+    #[test]
+    fn mime_decoder_ignores_every_non_alphabet_byte_not_just_whitespace() {
+        // RFC 2045 decoding skips illegal characters outright.
+        assert_eq!(
+            b64_decode(b"AB@@CD", B64_VARIANT_MIME).expect("MIME skips junk"),
+            vec![0x00, 0x10, 0x83]
+        );
+        assert_eq!(
+            b64_decode(&[b'A', b'B', 0xff, b'C', b'D'], B64_VARIANT_MIME).expect("MIME skips junk"),
+            vec![0x00, 0x10, 0x83]
+        );
+        // `-` and `_` are not in the MIME alphabet, so both are dropped.
+        assert_eq!(b64_decode(b"-_", B64_VARIANT_MIME).expect("skipped"), Vec::<u8>::new());
+        // …but they ARE the URL alphabet's 62/63.
+        assert_eq!(b64_decode(b"-_", B64_VARIANT_URL).expect("url"), vec![0xfb]);
+        // A lone char is fatal for BASIC but reaches decode0 for MIME.
+        assert_eq!(
+            err("A", B64_VARIANT_MIME),
+            "Last unit does not have enough valid bits"
+        );
+        assert_eq!(b64_decode(b"", B64_VARIANT_MIME).expect("empty"), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn decode_accepts_the_well_formed_shapes() {
+        assert_eq!(b64_decode(b"", B64_VARIANT_BASIC).expect("ok"), Vec::<u8>::new());
+        assert_eq!(b64_decode(b"AB", B64_VARIANT_BASIC).expect("ok"), vec![0x00]);
+        assert_eq!(b64_decode(b"AB==", B64_VARIANT_BASIC).expect("ok"), vec![0x00]);
+        assert_eq!(b64_decode(b"ABC", B64_VARIANT_BASIC).expect("ok"), vec![0x00, 0x10]);
+        assert_eq!(b64_decode(b"ABC=", B64_VARIANT_BASIC).expect("ok"), vec![0x00, 0x10]);
+        assert_eq!(
+            b64_decode(b"ABCD", B64_VARIANT_BASIC).expect("ok"),
+            vec![0x00, 0x10, 0x83]
+        );
+        assert_eq!(
+            b64_decode(b"a+b/", B64_VARIANT_BASIC).expect("ok"),
+            vec![0x6b, 0xe6, 0xff]
+        );
+    }
+
+    #[test]
+    fn mime_encoder_omits_the_trailing_line_separator() {
+        // Real `encode0` writes the separator only when more input follows, so
+        // a payload ending exactly on the 76-char boundary gets none.
+        let payload: Vec<u8> = (0..57u16).map(|i| i as u8).collect();
+        let encoded = b64_encode(&payload, B64_VARIANT_MIME, false);
+        assert_eq!(encoded.len(), 76, "57 bytes is exactly one full MIME line");
+        assert!(!encoded.ends_with(b"\r\n"));
+        // 58 bytes spills onto a second line, so the separator does appear.
+        let payload: Vec<u8> = (0..58u16).map(|i| i as u8).collect();
+        let encoded = b64_encode(&payload, B64_VARIANT_MIME, false);
+        assert_eq!(encoded.len(), 82);
+        assert_eq!(&encoded[76..78], b"\r\n");
+        // Two full lines, still no trailing separator.
+        let payload: Vec<u8> = (0..114u16).map(|i| i as u8).collect();
+        let encoded = b64_encode(&payload, B64_VARIANT_MIME, false);
+        assert_eq!(encoded.len(), 154);
+        assert!(!encoded.ends_with(b"\r\n"));
+    }
+
+    #[test]
+    fn mime_round_trip_survives_the_line_separators() {
+        let payload: Vec<u8> = (0..300u16).map(|i| (i * 7) as u8).collect();
+        let encoded = b64_encode(&payload, B64_VARIANT_MIME, false);
+        assert_eq!(b64_decode(&encoded, B64_VARIANT_MIME).expect("round trip"), payload);
+        let encoded = b64_encode(&payload, B64_VARIANT_BASIC, false);
+        assert_eq!(b64_decode(&encoded, B64_VARIANT_BASIC).expect("round trip"), payload);
+    }
 
     #[test]
     fn url_encoder_without_padding_omits_all_trailing_equals() {

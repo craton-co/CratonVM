@@ -10,6 +10,7 @@ Before attempting to resolve any of the open bans below, you must account for th
 
 1. **The Virtual Dispatch Trap (Discovered 2026-07-27):**
    You **MUST** test with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=1` (or verify it is enabled in your build). If this flag is off, compiled-to-compiled virtual dispatch is skipped entirely, meaning tests will silently pass because JIT-compiled callers are falling back to the interpreter. (This trap falsely cleared several bans previously).
+   The worked example is `JASPER-JDT.2`/`.3` (Eclipse JDT parser + AST): falsely cleared 2026-07-26, restored 2026-07-27 by this trap, and finally **CLOSED 2026-07-28** — with the flag on, the failure was bisected to `613b10f4c` ("fix(jit): LICM/speculative pre-header bypassed by a branch into the loop header") and confirmed on one binary by env-gated reverting that guard (pre-fix 2/2 FAIL, shipping 2/2 PASS). Both bans are now removed from `skip_list.rs`. The lesson to copy is the second half: a removal that can name the fixing commit is worth much more than one that only says "no longer reproduces" — the void 2026-07-26 removal looked just as careful.
 2. **The `cargo test` Trap:**
    Running `cargo test` does **not** rebuild the `cratonvm` executable. Always run `cargo build --release` and check the binary's `mtime` before trusting a "still crashes/now passes" result against a real reproduction.
 3. **No-Rebuild Bisection (First Move):**
@@ -36,12 +37,10 @@ These bans have been recently re-verified against real applications or reproduce
 *   **`HIB-TEMPORAL.1` (`org/hibernate/`)**
   *   **Status:** Verified active. Tested against a real Hibernate ORM 8.0 test harness.
   *   **Note:** Bug is *more* severe than originally documented: lifting it causes a full `StrategySelectionException` Hibernate bootstrap failure, not just a narrow DDL-descriptor NPE.
-*   **`JASPER-JDT.2` (`org/eclipse/jdt/internal/compiler/parser/`) & `JASPER-JDT.3` (`.../ast/`)**
-  *   **Status:** Verified active.
-  *   **Note:** Temporarily removed but **RESTORED 2026-07-27** when it was discovered that without `direct_virtual_compiled_callee_entry_enabled()`, the defect was hidden. With the flag on, real Tomcat `jakarta.el.TestOptionalELResolverInJsp` fails (HTTP 500 / `ClassCastException`).
 *   **`JASPER-JDT.3` Residual Bug (`org/apache/catalina/webresources/AbstractResourceSet.checkPath`)**
-  *   **Status:** Open bug (not just a ban to lift).
+  *   **Status:** Open bug (not just a ban to lift), but not seen recently.
   *   **Note:** Throws an independent JIT-only `IllegalArgumentException: The requested path ... must begin with /` for paths that *do* start with `/` (i.e. `path.charAt(0) != '/'` evaluates true incorrectly). Requires real Tomcat call context to reproduce; standalone probes do not trigger it.
+  *   **2026-07-28:** zero occurrences across the ~46 real-Tomcat runs done to close JASPER-JDT.2/.3 (`TestFormAuthenticatorA/B/C`, `TestCompiler`, `TestOptionalELResolverInJsp`, all with the JDT packages JIT-compiled). Nothing targeted it, so this is an absence rather than a fix — but the `613b10f4c` pre-header bypass is a plausible cause (an elided bounds check or a stale hoist slot on a bypassed loop entry is exactly how a correct string reads back wrong), and current `dev` does not show it.
 *   **`ANTLR-COLDPATH.1` (ATN config-context)**
   *   **Status:** Verified active. Narrow 7-method guard covering shaded and unshaded runtimes.
   *   **Note:** Kept specifically for correctness safety-net. (The broader package-level throughput bans around it have been resolved/removed, but these 7 specific methods must remain interpreted).
