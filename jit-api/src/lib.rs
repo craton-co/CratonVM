@@ -806,6 +806,23 @@ pub struct JitRuntimeHelpers {
     /// Appended at the END of the struct so all prior golden offsets stay
     /// stable.
     pub set_throw_bci: usize,
+    /// Service a compiled callee's `i64::MIN` deopt/exception sentinel at an
+    /// INLINE (generated) call site.
+    ///
+    /// The MIC/PIC cascade calls a cached compiled entry directly, so no
+    /// dispatch helper is on the stack to notice that the callee trapped. The
+    /// callee's reconstructed frame would then sit in the thread's single stash
+    /// slot until some unrelated sink consumed it, de-speculating the wrong
+    /// method and failing to resume. Called ONLY on the rare
+    /// `RAX == i64::MIN` branch after an inline call.
+    ///
+    /// Appended at the END of the struct so all prior golden offsets stay
+    /// stable.
+    ///
+    /// Signature: `extern "C" fn(vm_ptr: i64, info_ptr: i64, args_ptr: i64,
+    /// num_args: i64) -> i64` — returns the resumed call result, or `i64::MIN`
+    /// unchanged when the sentinel must keep propagating.
+    pub service_callee_deopt: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -965,6 +982,9 @@ helper_fields! {
     (jit_card_old_base,               FieldKind::Offset),
     (jit_card_old_end,                FieldKind::Offset),
     (set_throw_bci,                  FieldKind::RequiredPtr),
+    // Optional: a hand-built test helpers table leaves it 0, and the codegen
+    // then emits no sentinel check — the pre-existing behaviour.
+    (service_callee_deopt,           FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -990,7 +1010,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 57,
+    JitRuntimeHelpers::NUM_FIELDS == 58,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );

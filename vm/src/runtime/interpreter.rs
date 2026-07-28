@@ -7406,6 +7406,13 @@ pub fn execute(
                                 if let Some(rframe_for_despec) =
                                     cratonvm_jit::deopt::take_last_deopt()
                                 {
+                                    dbg_deopt_sink(
+                                        "execute-first-call-tierup",
+                                        &rframe_for_despec,
+                                        &format!(
+                                            "{class_name_str}.{method_name}{method_descriptor}"
+                                        ),
+                                    );
                                     let deopt_reason = compiled
                                         .deopt_points
                                         .iter()
@@ -7428,14 +7435,19 @@ pub fn execute(
                                     // before the guard. Build the same cached
                                     // metadata the hot callsites use and resume
                                     // the captured frame directly.
-                                    if compiled.can_deopt_resume
-                                        && deopt_frame_matches_method(
-                                            &rframe_for_despec,
-                                            &class_name_str,
-                                            method_name,
-                                            method_descriptor,
-                                        )
-                                    {
+                                    // Which of the three independent gates
+                                    // refused is the whole diagnosis, and they
+                                    // need completely different fixes — record
+                                    // it for the message below.
+                                    let resume_gate_ok = compiled.can_deopt_resume;
+                                    let key_matches = deopt_frame_matches_method(
+                                        &rframe_for_despec,
+                                        &class_name_str,
+                                        method_name,
+                                        method_descriptor,
+                                    );
+                                    let mut materialize_failed = false;
+                                    if resume_gate_ok && key_matches {
                                         let cached = Arc::new(CachedBytecodeMethod {
                                             declaring_class_id: class_id,
                                             class_name: Arc::from(class_name_str.as_str()),
@@ -7463,13 +7475,15 @@ pub fn execute(
                                             quickened: std::sync::OnceLock::new(),
                                         });
                                         let pin_base = thread.native_pin_roots.len();
-                                        if let Some(frame) = build_deopt_frame_inner(
+                                        let built = build_deopt_frame_inner(
                                             shared,
                                             thread,
                                             &cached,
                                             &rframe_for_despec,
                                             false,
-                                        ) {
+                                        );
+                                        materialize_failed = built.is_none();
+                                        if let Some(frame) = built {
                                             // Keep materialization pins live
                                             // through the frame-push handoff and
                                             // the resumed execution. The frame
@@ -7489,15 +7503,31 @@ pub fn execute(
                                     // past bci 0. Refuse a whole-method replay:
                                     // it is observably wrong for methods with
                                     // stores, I/O, monitor actions, or callbacks.
+                                    let why = if !resume_gate_ok {
+                                        "can_deopt_resume=false (no deopt points, \
+                                         or an elided monitor)"
+                                    } else if !key_matches {
+                                        "the stashed frame belongs to a different method"
+                                    } else if materialize_failed {
+                                        "the frame could not be materialised from its map"
+                                    } else {
+                                        "unknown"
+                                    };
                                     return Err(MethodCallFailed::InternalError(
                                         VmError::Internal {
                                             message: format!(
                                                 "precise deoptimization unavailable for \
-                                                 {}.{}{} at bci {}; refusing side-effecting replay",
+                                                 {}.{}{} at bci {} ({}, stashed key {:?}, \
+                                                 inline callers {}, reason {:?}); \
+                                                 refusing side-effecting replay",
                                                 class_name_str,
                                                 method_name,
                                                 method_descriptor,
-                                                rframe_for_despec.bci
+                                                rframe_for_despec.bci,
+                                                why,
+                                                rframe_for_despec.method_key,
+                                                rframe_for_despec.caller_frames.len(),
+                                                deopt_reason,
                                             ),
                                         },
                                     ));
@@ -13203,6 +13233,28 @@ fn vm_jit_free_code_enabled() -> bool {
 /// bails) carries THAT callee's key and must never be resumed as if it were
 /// this method's. An empty key (legacy/test producer, or the superseded-guard
 /// `bci == u32::MAX` sentinel frame) never matches.
+
+/// CRATONVM_DBG_DEOPT — record which `take_last_deopt()` sink consumed a
+/// stashed frame, and what method that sink was running.
+///
+/// The stash is a single thread-local slot with four consumers. A frame taken
+/// by the wrong one de-speculates an innocent method and cannot resume, so the
+/// consuming site is the first thing any deopt investigation needs and was the
+/// one thing not recorded.
+pub(crate) fn dbg_deopt_sink(
+    site: &str,
+    rframe: &cratonvm_jit::deopt::ReconstructedFrame,
+    running: &str,
+) {
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_none() {
+        return;
+    }
+    eprintln!(
+        "[cratonvm-deopt] sink={site} running={running} stash={} bci={}",
+        rframe.method_key, rframe.bci,
+    );
+}
+
 pub(crate) fn deopt_frame_matches_method(
     rframe: &cratonvm_jit::deopt::ReconstructedFrame,
     class_name: &str,
@@ -35790,6 +35842,7 @@ fn try_osr(
     //     (the unconditional-at-header trigger). The validated Step-8 default.
     if result_i64 == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            dbg_deopt_sink("osr-exit", &rframe, "");
             // Identity gate (jit-invokedynamic-groovy-regression): the stash
             // could belong to a NESTED compiled callee of the OSR'd code whose
             // sentinel bubbled up here; transferring THAT frame into this live
@@ -39925,6 +39978,7 @@ fn execute_jit_call(
     // a deopt (an undetected i64::MIN would be pushed as a real return == 0).
     if result == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            dbg_deopt_sink("jit-callsite-a", &rframe, "");
             if ir_deopt_resume_enabled() {
                 if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
                     return Ok(r);
@@ -40347,6 +40401,7 @@ fn execute_jit_call_decoded(
     // (a deopt always returns it) so the common path skips the thread-local.
     if result == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
+            dbg_deopt_sink("jit-callsite-b", &rframe, "");
             if ir_deopt_resume_enabled() {
                 if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
                     return Ok(Some(r));

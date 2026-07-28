@@ -5387,6 +5387,7 @@ pub fn unowned_ic_entry_refusals() -> u64 {
     UNOWNED_IC_ENTRY_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+
 /// Whether `entry` may be published into an inline-cache slot that generated
 /// code calls without further validation.
 ///
@@ -5402,6 +5403,14 @@ pub fn unowned_ic_entry_refusals() -> u64 {
 /// next tier-up `put` from dropping the last clone and `munmap`ping it under a
 /// slot still holding the raw pointer. Refuse those; the site falls back to the
 /// dispatch helper, which re-resolves authoritatively.
+///
+/// A callee that can DEOPT is publishable: the emitted sequence checks the
+/// `i64::MIN` sentinel after the inline `CALL` and routes it through
+/// `jit_service_callee_deopt`, which performs the same precise resume every
+/// helper-mediated dispatch arm does. Before that check existed, the sentinel
+/// escaped to the caller as if it were the caller's own deopt and the callee's
+/// stashed frame was mis-attributed by an unrelated sink — see
+/// `handle_compiled_callee_deopt_sentinel` in `vm/src/jit/helpers.rs`.
 fn jit_entry_publishable(entry: u64, owner: &Option<Arc<CompiledMethod>>) -> bool {
     if entry == 0 || owner.is_some() {
         return true;
