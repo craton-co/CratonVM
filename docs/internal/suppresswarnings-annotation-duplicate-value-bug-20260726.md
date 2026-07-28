@@ -121,32 +121,65 @@ Three things follow.
    fails the same way, so this is annotation-derived `Lint` generally, not one
    category's warning path.
 3. The one oracle that still suppresses correctly differs from the failing
-   ones only in **not passing `-Werror`** — and it is not an ordering
-   artifact. The pattern held 3/3 runs, and running the whole oracle set a
-   second time in reverse order within the same process reproduces it exactly
-   (`AnnotationEffectProbe3` does both orders for this reason). Under
-   `-Werror` the annotation's suppression is ignored and the warnings print;
-   without it, the same annotation on the same source shape suppresses
-   cleanly and nothing is printed. That is the sharpest lead this round
-   produced and it is unexplained.
+   ones only in **not passing `-Werror`**, reproducibly (3/3 runs, and
+   order-independent — `AnnotationEffectProbe3` runs the set both ways). With
+   the root cause below in hand this is a consequence, not a cause: whether a
+   given compilation trips depends on how many `CompletionFailure`s pass
+   through `ClassFinder.complete` before the counter is stuck, and the
+   `-Werror` runs drive more of them.
 
-The remaining suspect is `ClassFinder.complete`'s own compiled tail: it
-brackets its work in `Annotate.blockAnnotations()` /
-`unblockAnnotationsNoFlush()` inside a catch-all `finally`, then ends with
-`if (!reader.filling) annotate.flush();`. Delaying that flush past the point
-where javac replays deferred lint would produce this signature — suppression
-missed, every other annotation check unaffected, no diagnostic of its own.
-Not proven; handed off in the `SPRING-TESTCOMPILER.3` comment in
-`vm/src/jit/skip_list.rs`.
+**ROOT-CAUSED 2026-07-28.** Symptom (a) is a JIT-compiled `finally` that
+never runs. `[PUTFIELD-WATCH]` on `Annotate.blockCount`
+(`CRATONVM_DBG_FIELD_WATCH=Annotate.blockCount`) shows healthy compilations
+pairing `blockAnnotations()` with `unblockAnnotationsNoFlush()` and returning
+to 0, while the first failing compilation runs five `blockAnnotations()` with
+no matching unblock and ends at 4. `ClassFinder.complete` wraps its body in
+`try { annotate.blockAnnotations(); … } finally {
+annotate.unblockAnnotationsNoFlush(); dependencies.pop(); }`, so a skipped
+`finally` leaves annotations blocked and `Annotate.flush()` a no-op for the
+rest of that compilation. javac throws `CompletionFailure` through `complete`
+constantly while resolving cross-compilation-unit references — which is
+exactly why the reproducer needs the deprecated type in a separate `.class`
+file.
 
-Also measured while doing this, and worth knowing: `ClassFinder.complete` **is**
-JIT-compiled today despite carrying a non-empty exception table (confirmed with
+Reduced to a 3-second, javac-free witness: `try { n++; thrower(); } finally
+{ n--; }` in a loop where `thrower` throws every 7th call leaks one count per
+throw under JIT and zero under `--nojit` / HotSpot. Only a catch-all
+(`catch_type == 0`) leaks; typed `catch`, `catch (Throwable)` and
+catch-and-rethrow are unaffected, because a catch-all has nothing but the pc
+range to match on. Witnesses committed alongside the others:
+`FinallyBalanceProbe`, `FinallyShapeProbe`, `FinallyThrowSiteProbe`,
+`CallPathProbe`.
+
+Three independent escape routes; **two fixed 2026-07-28**:
+
+1. **Foreign throw pc.** `JitSignals::athrow_bci` still held the bci the
+   *callee's* compiled `athrow` lowering stashed, and the interpreter
+   range-checked that foreign pc against the *caller's* exception table.
+   Fixed by stamping the invoke's own bci in the post-invoke exception-check
+   stub (`JitRuntimeHelpers::set_throw_bci`).
+2. **Whole-method re-execution.** When a compiled caller invoked a compiled
+   callee that threw, the runtime re-ran the callee from its entry,
+   duplicating every side effect the compiled attempt had already performed.
+   Fixed by resuming the callee at its handler
+   (`interpreter::run_jit_callee_handler`).
+3. **Lambda / method-reference dispatch — still open.** A compiled method
+   reached via `try_lambda_dispatch` escapes without any drain consulting its
+   exception table. `CallPathProbe` isolates it: with both fixes in place
+   `STATIC-direct`, `IFACE-class-inline` and `IFACE-class-delegating` are
+   clean while `LAMBDA-methodref` and `LAMBDA-body` still leak.
+   `ClassFinder`'s completer is `this::complete`, a method reference, so
+   javac takes exactly that route — which is why `SPRING-TESTCOMPILER.3`
+   stays banned for now.
+
+Also measured, contradicting a common assumption: `ClassFinder.complete` **is**
+JIT-compiled despite carrying a non-empty exception table (confirmed with
 `CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are never
 admitted" rule of thumb does not hold for it. Of the eight javac-family bans,
 only `Types.erasure`, `ClassReader.readAttrs`, `ClassReader.readInnerClasses`
-and `ClassFinder.complete` were observed compiling at all in these workloads.
+and `ClassFinder.complete` were observed compiling at all in these workloads;
 `ClassReader.readInnerClasses` un-banned kills the VM outright on the
-consolidation probe, so that one is emphatically still load-bearing too.
+consolidation probe.
 
 ## Recommendation #3, answered: yes, the impact was as broad as feared
 

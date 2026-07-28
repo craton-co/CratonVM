@@ -8068,7 +8068,11 @@ struct Compiler {
     /// letting the JIT keep running with a bogus `0` return value (which
     /// previously masked the true exception with a downstream NPE; see the
     /// Jetty `Main.main` "getClasspath on null" miscompile).
-    exception_check_stubs: Vec<usize>,
+    /// `(patch_offset, throw_site_bci)` -- the bci is the bytecode pc of
+    /// the fallible operation whose cold path branches here, so the stub
+    /// can stamp it onto the pending-exception signal (see
+    /// `JitRuntimeHelpers::set_throw_bci`).
+    exception_check_stubs: Vec<(usize, usize)>,
     /// Speculative BCE: deopt guards to emit at loop headers.
     /// Each guard checks that array.length >= loop_bound before entering the loop.
     speculative_bce_guards: Vec<SpeculativeBCEGuard>,
@@ -8630,6 +8634,14 @@ struct Compiler {
     /// for that guard, baked as arg0 (imm64) by the frame-deopt stub. Populated
     /// by `emit_deopt_snapshot_at_guard`.
     deopt_box_ptr_by_bci: rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
+    /// Reason-9 (`DeoptReason::PendingException`) snapshots, keyed by the
+    /// THROWING instruction's own bci. Separate from `deopt_box_ptr_by_bci`
+    /// because the two disagree about what the key means: an ordinary deopt
+    /// point resumes at its bci, an exceptional one is *thrown* at its bci and
+    /// is only ever used to pick a handler. Sharing one map let a reason-2/6
+    /// box be handed to a reason-9 stub (and vice versa).
+    exc_frame_box_ptr_by_bci:
+        rustc_hash::FxHashMap<usize, *const crate::deopt::DeoptimizationPoint>,
     /// deopt-osr Step 7: bcis (loop-boundary PCs vetted by OSR-entry) that carry
     /// an OSR-exit map in `deopt_points`/`deopt_boxes` (tagged
     /// `DeoptReason::OsrExit`). Transferred to `CompiledMethod::osr_exit_points`
@@ -9469,6 +9481,7 @@ impl Compiler {
             method_key: String::new(),
             deopt_regs_base,
             deopt_box_ptr_by_bci: FxHashMap::default(),
+            exc_frame_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_points: Vec::new(),
             osr_exit_box_ptr_by_bci: FxHashMap::default(),
             osr_exit_test_trigger_bci: None,
@@ -18407,24 +18420,28 @@ impl Compiler {
         // the ordinary three-byte CP form or a one-byte operation.  Keeping the
         // original PC for non-invoke operations avoids changing their exception
         // routing semantics.
-        let deopt_resume_bci = match self.dbg_last_op {
-            0xb9 | 0xba => self.dbg_last_pc.saturating_add(5),
-            0xb6 | 0xb7 | 0xb8 => self.dbg_last_pc.saturating_add(3),
-            _ => self.dbg_last_pc,
-        };
-        // The bytecode compiler has just emitted the dispatch, so its local
-        // homes still describe the point at which an exception from that call
-        // is caught. A params-only handler reconstruction is insufficient for
-        // this method; retain a typed snapshot and branch to its frame-deopt
-        // exit instead of the shared sentinel-only exit below.
-        if self.precise_exception_frames
-            && !self.deopt_box_ptr_by_bci.contains_key(&deopt_resume_bci)
-        {
+        // ...which is why an ordinary RESUME snapshot keys on the successor.
+        // A reason-9 frame is not a resume point: it is consumed by
+        // `route_jit_signal_exception`, which uses the frame's bci as the THROW
+        // pc for the handler's `[start_pc, end_pc)` range test. javac routinely
+        // ends a protected range exactly at the successor of its last invoke
+        // (`JSONValue.toJSONString`: range [8,14), invoke at pc 11), so keying
+        // this snapshot on the successor put the throw OUTSIDE the very handler
+        // that had to run and the exception escaped its own catch block. Key it
+        // on the throwing instruction itself.
+        //
+        // The frame is also only useful where this method's exception table can
+        // catch at all: outside every protected range the throw propagates to
+        // the caller, so the shared sentinel-only exit is both correct and
+        // cheaper, and the stash stays quiet on straight-line invokes.
+        let throw_bci = self.dbg_last_pc;
+        let precise_exc_stub = self.precise_exception_frames && self.pc_is_protected(throw_bci);
+        if precise_exc_stub && !self.exc_frame_box_ptr_by_bci.contains_key(&throw_bci) {
             let box_ptr = self.build_and_record_deopt_point(
-                deopt_resume_bci,
-                crate::deopt::DeoptReason::ReceiverTypeChanged,
+                throw_bci,
+                crate::deopt::DeoptReason::PendingException,
             );
-            self.deopt_box_ptr_by_bci.insert(deopt_resume_bci, box_ptr);
+            self.exc_frame_box_ptr_by_bci.insert(throw_bci, box_ptr);
         }
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
@@ -18451,10 +18468,11 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x85]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
+            if precise_exc_stub {
+                self.deopt_stubs.push((patch_offset, throw_bci, 9));
             } else {
-                self.exception_check_stubs.push(patch_offset);
+                self.exception_check_stubs
+                    .push((patch_offset, self.dbg_last_pc));
             }
             // .keep: patch the JNE above to land here (self-relative ⇒ copy-safe).
             let keep_off = self.buf.pos();
@@ -18465,10 +18483,11 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x84]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
+            if precise_exc_stub {
+                self.deopt_stubs.push((patch_offset, throw_bci, 9));
             } else {
-                self.exception_check_stubs.push(patch_offset);
+                self.exception_check_stubs
+                    .push((patch_offset, self.dbg_last_pc));
             }
         }
     }
@@ -18495,7 +18514,8 @@ impl Compiler {
         self.buf.emit(&[0x0F, 0x84]);
         let patch_offset = self.buf.pos();
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-        self.exception_check_stubs.push(patch_offset);
+        self.exception_check_stubs
+            .push((patch_offset, self.dbg_last_pc));
         // Force `has_dispatch` (see the field doc): the fallible `jit_newarray`
         // helper needs the per-thread `JIT_THREAD` TLS set — both to run the
         // allocation-failure GC and to construct the OOME — which only the
@@ -18512,19 +18532,50 @@ impl Compiler {
             return;
         }
 
-        let stub_offset = self.buf.pos();
-
-        // MOV RAX, i64::MIN  — deopt sentinel so the interpreter's post-JIT
-        // path treats this as a deopt return and drains the pending
-        // exception. 48 B8 <imm64>
-        self.buf.emit(&[0x48, 0xB8]);
-        self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
-
-        // Standard method epilogue: restore callee-saved regs and return.
-        self.emit_epilogue();
-
-        // Patch every recorded JE branch to point to the shared stub.
-        for &patch_off in &self.exception_check_stubs {
+        // One stub per DISTINCT throw-site bci, not one shared stub.
+        //
+        // The bci matters because `JitSignals::athrow_bci` is consumed by
+        // `execute_jit_call` as *this* method's throw site and range-checked
+        // against `[start_pc, end_pc)` of every entry in this method's own
+        // exception table. Until this stub stamps it, that field still held
+        // whatever the CALLEE's compiled `athrow` lowering left there -- a pc
+        // in a different method, which lands inside this method's protected
+        // region only by coincidence.
+        //
+        // A typed handler survives that coincidence often enough to look
+        // healthy (it is also matched on exception class), but a catch-all
+        // (`catch_type == 0`, i.e. a javac `finally`) has nothing else to
+        // match on: a foreign bci outside the region silently drops it and the
+        // `finally` never runs. `FinallyBalanceProbe.java` is the witness --
+        // `try { n++; thrower(); } finally { n--; }` leaked one count per
+        // throw under JIT and zero under `--nojit` / HotSpot.
+        //
+        // Grouping by bci keeps the cost at one small pad per distinct
+        // fallible bytecode rather than per branch site (unrolled loop copies
+        // share their original bci).
+        let sites = self.exception_check_stubs.clone();
+        let mut stub_by_bci: FxHashMap<usize, usize> = FxHashMap::default();
+        for (patch_off, bci) in sites {
+            let stub_offset = match stub_by_bci.get(&bci) {
+                Some(&off) => off,
+                None => {
+                    let off = self.buf.pos();
+                    stub_by_bci.insert(bci, off);
+                    // Stamp this method's own throw-site bci over whatever the
+                    // callee left behind. The argument registers are dead here
+                    // -- the method is about to return.
+                    self.emit_mov_imm32_sx(ARG_REGS[0], bci as i32); // Cast: bci fits i32
+                    self.emit_call_absolute(self.helpers.set_throw_bci);
+                    // MOV RAX, i64::MIN - deopt sentinel so the interpreter's
+                    // post-JIT path treats this as a deopt return and drains
+                    // the pending exception. 48 B8 <imm64>
+                    self.buf.emit(&[0x48, 0xB8]);
+                    self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
+                    // Standard method epilogue: restore callee-saved regs and return.
+                    self.emit_epilogue();
+                    off
+                }
+            };
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf.try_patch_i32(patch_off, rel32).ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
@@ -18675,10 +18726,12 @@ impl Compiler {
                     // NOT gated behind `deopt_real_enabled()` — see the doc above.
                     8 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
                     // Reason 9 is a pending Java exception in a method whose
-                    // handler reads non-parameter locals. Its snapshot is taken
-                    // immediately after the throwing invoke, and is consumed by
-                    // the interpreter's exception route rather than normal resume.
-                    9 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
+                    // handler reads non-parameter locals. Its snapshot is keyed
+                    // on the THROWING invoke's own bci (not a resume point — see
+                    // `emit_post_invoke_exception_check`) and lives in its own
+                    // map, because it is consumed by the interpreter's exception
+                    // route rather than by any resume sink.
+                    9 => self.exc_frame_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
             } else {
@@ -21838,10 +21891,10 @@ impl Compiler {
                                     .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
-                                let orig_excn_stubs: Vec<usize> = self
+                                let orig_excn_stubs: Vec<(usize, usize)> = self
                                     .exception_check_stubs
                                     .iter()
-                                    .filter(|&&po| po >= body_start && po < body_end)
+                                    .filter(|&&(po, _)| po >= body_start && po < body_end)
                                     .copied()
                                     .collect();
                                 // JEP 358: each entry is (action, patch_offset);
@@ -22053,8 +22106,11 @@ impl Compiler {
                                             .iter()
                                             .map(|&(po, bci)| (po + shift_us, bci)),
                                     );
-                                    self.exception_check_stubs
-                                        .extend(orig_excn_stubs.iter().map(|&po| po + shift_us));
+                                    self.exception_check_stubs.extend(
+                                        orig_excn_stubs
+                                            .iter()
+                                            .map(|&(po, bci)| (po + shift_us, bci)),
+                                    );
                                     self.null_check_store_stubs.extend(
                                         orig_nullstore_stubs
                                             .iter()
@@ -29190,9 +29246,26 @@ pub fn compile_with_param_slots(
     let fp_strength_reduction_pcs =
         find_fp_strength_reductions(code, code_len, &loops, &ldc2w_info);
 
-    // Register allocation: graph-coloring allocator for locals
-    let alloc_result =
-        super::regalloc::allocate_registers(code, code_len, max_locals, num_params, &loops);
+    // Register allocation: graph-coloring allocator for locals.
+    //
+    // A method compiled with precise exceptional frames has its handler frame
+    // rebuilt from REGISTER homes, so the interference graph must know that
+    // protected code can branch to the handler — otherwise a local only the
+    // catch block reads is dead throughout the try and shares its register with
+    // something else. Every other compile passes no handlers and is unchanged.
+    let ra_handlers: &[(usize, usize, usize)] = if precise_exception_frames {
+        &exception_ranges
+    } else {
+        &[]
+    };
+    let alloc_result = super::regalloc::allocate_registers_with_handlers(
+        code,
+        code_len,
+        max_locals,
+        num_params,
+        &loops,
+        ra_handlers,
+    );
 
     // Pure-kernel GPR local homes (see `kernel_reg_locals_enabled` for the
     // full safety argument). Consume the per-compile request (set only by the
@@ -29423,6 +29496,7 @@ pub fn compile_with_param_slots(
             num_params,
             &compiler.local_assignments,
             param_oop_mask,
+            ra_handlers,
         );
         compiler.safepoint_publish = Some(safepoint_publish);
     }
@@ -29969,28 +30043,88 @@ pub fn compile_with_param_slots(
         .enumerate()
         .filter(|(_, a)| a.is_some())
         .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    // The mask must name the dead locals that are actually *hazardous*, not
+    // every dead local. `osr_enter` declines any entry whose mask is non-zero
+    // (a deliberate 2026-07-04 conservatism: the trampoline's skip-the-load
+    // avoided clobbering the live owner, but the resulting coalesced state
+    // transition was not proven safe -- see
+    // docs/internal/fixed-suite-bugs/jit-osr-linux-regression-triad.md). The
+    // hazard that argument rests on is *sharing*: a dead local whose register
+    // is also some live local's home. A dead local that owns its register
+    // outright has no coalesced state to reconstruct -- nothing reads it before
+    // the loop redefines it -- so flagging it only costs OSR entries.
+    //
+    // The blanket form cost a lot of them. `org/h2/compress/CompressLZF.
+    // compress(Ljava/nio/ByteBuffer;I[BI)I` -- the single hottest method in
+    // H2's `TestFileSystem` `nioMemLZF:` case -- was refused at its main loop
+    // header (`entry_pc=220`, mask `0x201`: `this` and one temporary, neither
+    // sharing a register with anything live) and so never ran compiled at all
+    // (2026-07-27).
+    //
+    // Set CRATONVM_JIT_OSR_DEAD_MASK_BLANKET=1 to restore the old
+    // flag-every-dead-local behaviour.
+    let blanket_dead_mask =
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_OSR_DEAD_MASK_BLANKET").is_some();
+    let resident = reg_resident | xmm_resident;
+    // `local <-> home register` lookup, GPR and XMM kept apart: they are
+    // different register files and can never alias each other.
+    let gpr_home = |i: usize| osr_local_assignments.get(i).copied().flatten();
+    let xmm_home = |i: usize| osr_xmm_assignments.get(i).copied().flatten();
     let mut osr_dead_mask = vec![0u64; code_len + 1];
     for &(pc, live_in) in &compiler.osr_block_live_in {
-        if pc < osr_dead_mask.len() {
-            osr_dead_mask[pc] = (reg_resident | xmm_resident) & !live_in;
+        if pc >= osr_dead_mask.len() {
+            continue;
         }
+        let dead = resident & !live_in;
+        if blanket_dead_mask || dead == 0 {
+            osr_dead_mask[pc] = dead;
+            continue;
+        }
+        let live_resident = resident & live_in;
+        let mut hazardous = 0u64;
+        for i in 0..64 {
+            if (dead >> i) & 1 == 0 {
+                continue;
+            }
+            let (dg, dx) = (gpr_home(i), xmm_home(i));
+            for j in 0..64 {
+                if (live_resident >> j) & 1 == 0 {
+                    continue;
+                }
+                let shares = (dg.is_some() && dg == gpr_home(j))
+                    || (dx.is_some() && dx == xmm_home(j));
+                if shares {
+                    hazardous |= 1u64 << i;
+                    break;
+                }
+            }
+        }
+        osr_dead_mask[pc] = hazardous;
     }
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_OSR_META").is_some() {
-        let masked: Vec<(usize, u64)> = compiler
-            .osr_block_live_in
-            .iter()
-            .filter_map(|&(pc, live_in)| {
-                let m = (reg_resident | xmm_resident) & !live_in;
-                if m != 0 {
-                    Some((pc, m))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !masked.is_empty() {
+        // Report the mask that is actually published, alongside the blanket
+        // "every dead register-resident local" set it is refined from, so the
+        // two can be compared directly. Printing a separately recomputed
+        // blanket value made this diagnostic silently disagree with the real
+        // metadata once the refinement landed.
+        let mut blanket: Vec<(usize, u64)> = Vec::new();
+        let mut published: Vec<(usize, u64)> = Vec::new();
+        for &(pc, live_in) in &compiler.osr_block_live_in {
+            let b = (reg_resident | xmm_resident) & !live_in;
+            if b != 0 {
+                blanket.push((pc, b));
+            }
+            let p = osr_dead_mask.get(pc).copied().unwrap_or(0);
+            if p != 0 {
+                published.push((pc, p));
+            }
+        }
+        if !blanket.is_empty() || !published.is_empty() {
             eprintln!(
-                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} masked_entries={masked:x?}"
+                "[osr-meta] gpr_resident={reg_resident:#x} xmm_resident={xmm_resident:#x} \
+                 blanket_entries={blanket:x?} published_entries={published:x?} \
+                 unblocked={}",
+                blanket.len() - published.len()
             );
         }
     }
@@ -30594,6 +30728,7 @@ mod tests {
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
+            set_throw_bci: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
             jit_frem: sentinel,
@@ -42530,7 +42665,7 @@ mod flag_and_header_contracts {
         // Both locals register-homed, as the allocator would do for a hot kernel.
         let assignments = vec![Some(R12), Some(R13)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals, 0,
             "an int-only kernel has no reference locals"
@@ -42555,7 +42690,7 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![None, Some(R12)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &assignments, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals & 0b10,
             0b10,
@@ -42571,7 +42706,7 @@ mod flag_and_header_contracts {
         // already frame-resident, so nothing needs publishing.
         let spilled = vec![None, None];
         let plan_spilled =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &spilled, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &spilled, 0, &[]);
         assert!(plan_spilled.no_reference_in_registers());
         assert!(!reference_local_in_register(Some(&plan_spilled), &spilled));
     }
@@ -42587,7 +42722,7 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![Some(R12)];
         let without =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0, &[]);
         assert!(
             without.no_reference_in_registers(),
             "the bytecode scan alone cannot see an unloaded reference parameter"
@@ -42599,6 +42734,7 @@ mod flag_and_header_contracts {
             1,
             &assignments,
             0b1, // param_oop_mask: local 0 is a reference parameter
+            &[],
         );
         assert!(
             !with.no_reference_in_registers(),
@@ -42632,7 +42768,7 @@ mod flag_and_header_contracts {
         let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
         let no_homes = vec![None, None];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &no_homes, 0);
+            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &no_homes, 0, &[]);
         assert_eq!(
             reference_local_in_register(Some(&plan), &no_homes),
             reference_local_in_register(None, &no_homes),
@@ -42665,6 +42801,7 @@ mod flag_and_header_contracts {
             0,
             &alloc.assignments,
             0,
+            &[],
         );
         assert!(plan.no_reference_in_registers());
     }

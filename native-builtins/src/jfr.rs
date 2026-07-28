@@ -11,7 +11,7 @@
 //! and monotonic-clock contract required by the Java streaming implementation;
 //! event payload collection remains owned by CratonVM's `jfr` crate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -110,6 +110,34 @@ fn known_jfr_type_for_class_mirror(ctx: &mut dyn NativeContext, args: &[Value]) 
     }
 }
 
+/// Threads the caller has excluded from recording via `JVM.exclude(Thread)`.
+///
+/// Keyed by identity hash, never by `ObjectRef`: the key is stable across a
+/// moving GC and the table holds no heap reference that would have to be
+/// scanned or remapped.
+fn excluded_threads() -> &'static Mutex<HashSet<i32>> {
+    static EXCLUDED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    EXCLUDED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn jfr_thread_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Option<i32> {
+    match args.first() {
+        Some(Value::Object(Some(thread))) => Some(ctx.identity_hash_code(*thread)),
+        _ => None,
+    }
+}
+
+/// `EventConfiguration` objects handed to `JVM.setConfiguration(Class, cfg)`,
+/// keyed by the canonical event-class name.
+///
+/// The value is a GLOBAL ROOT handle, not a raw `ObjectRef`: the configuration
+/// outlives the native call and must stay both reachable and correctly
+/// forwarded across a moving GC (`add_global_root` / `resolve_global_root`).
+fn event_configurations() -> &'static Mutex<HashMap<String, usize>> {
+    static CONFIGS: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn dump_path() -> &'static Mutex<Option<String>> {
     static DUMP_PATH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
     DUMP_PATH.get_or_init(|| Mutex::new(None))
@@ -154,6 +182,17 @@ fn saved_dump_path(ctx: &mut dyn NativeContext) -> Value {
 pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     const JVM: &str = "jdk/jfr/internal/JVM";
 
+    // Every entry below is `void` and has NO paired reader anywhere on this
+    // native surface, so a no-op cannot make any observable answer disagree
+    // with it — that is the test each one had to pass to stay here.
+    // `registerNatives()V` is a genuine no-op on HotSpot too (the JNI
+    // registration it performs has no Java-visible effect); the `set*` tuning
+    // knobs address a chunk writer this bridge does not own; `log`/`logEvent`/
+    // `subscribeLogLevel` are JFR's own internal trace channel, not the
+    // application's logging; `flush`/`markChunkFinal`/`emitOldObjectSamples`/
+    // `emitDataLoss` operate on chunks that do not exist. The two that would
+    // otherwise belong here — `exclude`/`include` — were pulled OUT because
+    // `isExcluded` reads them back; see their registrations further down.
     for (name, descriptor) in [
         ("registerNatives", "()V"),
         ("markChunkFinal", "()V"),
@@ -184,8 +223,6 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
             "(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
         ),
         ("emitOldObjectSamples", "(JZZ)V"),
-        ("exclude", "(Ljava/lang/Thread;)V"),
-        ("include", "(Ljava/lang/Thread;)V"),
         ("emitDataLoss", "(J)V"),
         ("unregisterStackFilter", "(J)V"),
         ("setMiscellaneous", "(JJ)V"),
@@ -236,11 +273,23 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ))))
     });
 
+    // Constant `false` answers that are STATEMENTS OF FACT about this VM, not
+    // placeholders — each names the CratonVM property that makes it true:
+    //   * `emitEvent`/`setThreshold`  — the Java-side per-event recorder is not
+    //     wired to a chunk writer here (payload collection is owned by the Rust
+    //     `jfr` crate), so no event is emitted through this boundary and the
+    //     honest answer to "did you emit it?" is no;
+    //   * `getAllowedToDoEventRetransforms`/`isInstrumented` — `retransform
+    //     Classes` above is a no-op, so no event class is ever instrumented;
+    //     answering `true` to either would contradict that no-op;
+    //   * `shouldRotateDisk` — there is no on-disk chunk repository to rotate;
+    //   * `isContainerized` — CratonVM reports host, not cgroup, limits.
+    // `isExcluded(Thread)` is deliberately NOT in this list: it is a guard whose
+    // answer must follow `exclude`/`include` (see below).
     for (name, descriptor) in [
         ("emitEvent", "(JJJ)Z"),
         ("setThreshold", "(JJ)Z"),
         ("getAllowedToDoEventRetransforms", "()Z"),
-        ("isExcluded", "(Ljava/lang/Thread;)Z"),
         ("isExcluded", "(Ljava/lang/Class;)Z"),
         ("isInstrumented", "(Ljava/lang/Class;)Z"),
         ("shouldRotateDisk", "()Z"),
@@ -248,23 +297,32 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(JVM, name, descriptor, |_ctx, _args| Ok(Some(Value::Int(0))));
     }
+    // Constant `true` = "the request was accepted". `addStringConstant`,
+    // `setCutoff` and `setThrottle` tune a recorder whose settings this bridge
+    // does not consume, and no JDK caller can observe the stored value through
+    // any other entry point (there is no `getCutoff`/`getThrottle`), so nothing
+    // is made to disagree by accepting them. `isProduct` is simply true: this
+    // is not a fastdebug build.
     for (name, descriptor) in [
         ("addStringConstant", "(JLjava/lang/String;)Z"),
         ("setCutoff", "(JJ)Z"),
         ("setThrottle", "(JJJ)Z"),
-        (
-            "setConfiguration",
-            "(Ljava/lang/Class;Ljdk/jfr/internal/event/EventConfiguration;)Z",
-        ),
         ("isProduct", "()Z"),
     ] {
         registry.register(JVM, name, descriptor, |_ctx, _args| Ok(Some(Value::Int(1))));
     }
 
+    // Zero here means "no such id / nothing recorded", which is what a Java
+    // caller gets on a JVM with no chunk repository: no stack trace has been
+    // interned (`getStackTraceId`, `registerStackFilter`), no event has been
+    // committed (`commit`), no event class has been unloaded
+    // (`getUnloadedEventClassCount`). `hostTotalMemory`/`hostTotalSwapMemory`
+    // are the one honest gap in this group: CratonVM has no portable host-RAM
+    // probe, and 0 is the JDK's own "unknown" sentinel for them.
+    // `getThreadId` is deliberately NOT in this list — see below.
     for (name, descriptor) in [
         ("getUnloadedEventClassCount", "()J"),
         ("getStackTraceId", "(IJ)J"),
-        ("getThreadId", "(Ljava/lang/Thread;)J"),
         ("commit", "(J)J"),
         ("hostTotalMemory", "()J"),
         ("hostTotalSwapMemory", "()J"),
@@ -277,6 +335,63 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Long(0)))
         });
     }
+
+    // `exclude`/`include` are the JFR thread filter and `isExcluded` is the
+    // guard that reads it. As a no-op/no-op/constant-false trio the guard
+    // contradicted the mutators outright: a caller could exclude a thread and
+    // then be told by the JVM that the same thread was still being recorded.
+    // Track the exclusions and answer the guard from the same table.
+    registry.register(JVM, "exclude", "(Ljava/lang/Thread;)V", |ctx, args| {
+        if let Some(key) = jfr_thread_key(ctx, args) {
+            excluded_threads()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(key);
+        }
+        Ok(None)
+    });
+    registry.register(JVM, "include", "(Ljava/lang/Thread;)V", |ctx, args| {
+        if let Some(key) = jfr_thread_key(ctx, args) {
+            excluded_threads()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&key);
+        }
+        Ok(None)
+    });
+    registry.register(JVM, "isExcluded", "(Ljava/lang/Thread;)Z", |ctx, args| {
+        let excluded = match jfr_thread_key(ctx, args) {
+            Some(key) => excluded_threads()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .contains(&key),
+            None => false,
+        };
+        Ok(Some(Value::Int(i32::from(excluded))))
+    });
+
+    // Every thread reported the same id (0), so any JFR consumer that groups
+    // or joins records by thread collapsed the whole process onto one thread.
+    // Report the receiver's own id, exactly as `java/lang/Thread.getId` does
+    // (`tid` field, falling back to the executing VM thread).
+    registry.register(
+        JVM,
+        "getThreadId",
+        "(Ljava/lang/Thread;)J",
+        |ctx, args| {
+            let receiver_tid = match args.first() {
+                Some(Value::Object(Some(thread))) => match ctx.get_field_by_name(*thread, "tid") {
+                    Value::Long(tid) if tid > 0 => Some(tid),
+                    Value::Int(tid) if tid > 0 => Some(tid as i64),
+                    _ => None,
+                },
+                _ => None,
+            };
+            Ok(Some(Value::Long(
+                receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
+            )))
+        },
+    );
 
     // OpenJDK's Type table uses these IDs as map-key identity.  Returning the
     // same placeholder for every type silently collapses the table and makes
@@ -302,6 +417,12 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/List;",
         |ctx, _args| ctx.new_object_initialized("java/util/ArrayList", "()V", &[]),
     );
+    // A null `EventWriter` is the JDK's own "this thread has no chunk buffer"
+    // answer, and it is unreachable rather than merely unimplemented here: the
+    // only caller is the `commit` code that `retransformClasses` bytecode
+    // weaving installs into an event class, and `retransformClasses` /
+    // `isInstrumented` above say no class is ever instrumented. Fabricating a
+    // writer over a buffer that does not exist would be strictly worse.
     registry.register(
         JVM,
         "getEventWriter",
@@ -314,11 +435,65 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         "()Ljdk/jfr/internal/event/EventWriter;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // `setConfiguration` used to report success from the blanket "return 1"
+    // group while storing nothing, and `getConfiguration` answered a constant
+    // null — so OpenJDK's `EventConfiguration` round-trip
+    // (`JVM.setConfiguration(cls, cfg)` then `JVM.getConfiguration(cls)`, which
+    // is how `EventWriterFactory`/`EventHandlerCreator` find an event class's
+    // settings) always came back empty despite the setter claiming it worked.
+    // Keep the configuration in a side table keyed by the canonical event class
+    // name, holding a GLOBAL ROOT so the object survives and is forwarded
+    // across a moving GC.
+    registry.register(
+        JVM,
+        "setConfiguration",
+        "(Ljava/lang/Class;Ljdk/jfr/internal/event/EventConfiguration;)Z",
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(mirror))) => class_name_for_mirror(ctx, *mirror),
+                _ => None,
+            };
+            let Some(name) = name else {
+                return Ok(Some(Value::Int(0)));
+            };
+            let handle = match args.get(1) {
+                Some(Value::Object(Some(config))) => Some(ctx.add_global_root(*config)),
+                _ => None,
+            };
+            let previous = {
+                let mut table = event_configurations()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                match handle {
+                    Some(handle) => table.insert(name, handle),
+                    None => table.remove(&name),
+                }
+            };
+            if let Some(previous) = previous {
+                ctx.remove_global_root(previous);
+            }
+            Ok(Some(Value::Int(1)))
+        },
+    );
     registry.register(
         JVM,
         "getConfiguration",
         "(Ljava/lang/Class;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(mirror))) => class_name_for_mirror(ctx, *mirror),
+                _ => None,
+            };
+            let handle = name.and_then(|name| {
+                event_configurations()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .get(&name)
+                    .copied()
+            });
+            let config = handle.and_then(|handle| ctx.resolve_global_root(handle));
+            Ok(Some(Value::Object(config)))
+        },
     );
     registry.register(JVM, "setDumpPath", "(Ljava/lang/String;)V", |ctx, args| {
         let value = match args.first() {
@@ -431,6 +606,25 @@ mod tests {
         assert!(registry
             .find("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
             .is_some());
+        // The thread filter and the event-configuration round trip are
+        // stateful: the guard/reader must exist alongside its mutator, or the
+        // pair silently disagrees again (wave-2 stub removal).
+        for (name, descriptor) in [
+            ("exclude", "(Ljava/lang/Thread;)V"),
+            ("include", "(Ljava/lang/Thread;)V"),
+            ("isExcluded", "(Ljava/lang/Thread;)Z"),
+            (
+                "setConfiguration",
+                "(Ljava/lang/Class;Ljdk/jfr/internal/event/EventConfiguration;)Z",
+            ),
+            ("getConfiguration", "(Ljava/lang/Class;)Ljava/lang/Object;"),
+            ("getThreadId", "(Ljava/lang/Thread;)J"),
+        ] {
+            assert!(
+                registry.find("jdk/jfr/internal/JVM", name, descriptor).is_some(),
+                "jdk/jfr/internal/JVM.{name}{descriptor} must stay registered"
+            );
+        }
     }
 
     #[test]

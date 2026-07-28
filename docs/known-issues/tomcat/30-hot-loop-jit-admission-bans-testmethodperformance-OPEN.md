@@ -3,8 +3,9 @@
 **Status:** 🔴 **OPEN.** Residual of
 [24](../../internal/fixed-suite-bugs/tomcat/24-stringcache-oom-under-load-FIXED.md) (whose `OutOfMemoryError` is FIXED).
 This is a *throughput* residual, in the family of
-[04](04-embedded-server-throughput-wall-OPEN.md) and
-[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md) — but unlike those it
+[31](31-synchronized-code-never-jit-compiled.md) (and of the retired
+[04](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-CLOSED.md) /
+[29](../../internal/fixed-suite-bugs/tomcat/29-throughput-wall-recurrence-and-unconfirmed-CLOSED.md)) — but unlike those it
 is root-caused here to three **specific, named** admission gates, all of which
 were added deliberately to close real silent-corruption bugs.
 
@@ -24,13 +25,23 @@ MessageBytes conversion took :6573830400ns          (HotSpot, same loop)
 ```
 
 **3100-3800 s vs 6.6 s for the same 100M iterations — ~470-580x**, stable
-across loops rather than a warm-up artefact. Six such loops put phase 1 alone
-at ~5-6 hours, so the class cannot finish inside any suite timeout. Before the bug-24 fix this was masked: the run died with a spurious
-OOM at ~150-600 s and never reached a timeout.
+across loops rather than a warm-up artefact. Phase 2 (`Method.bytesToString`,
+no allocation) is worse still: 1793-2277 s per 100M loop against HotSpot's
+0.40 s, ~4800x.
 
-That same run is also the end-to-end confirmation for bug 24 — it cleared
-200 000 000+ iterations with no `OutOfMemoryError`, against a pre-fix baseline
-that died before 10 000 000.
+Run to completion, the class **PASSES** — in **30 149 s (8.4 hours)** against
+HotSpot's 41.2 s:
+
+```
+Time: 30,149.543
+
+OK (1 test)
+```
+
+So nothing here is a functional defect any more; it is purely a throughput
+gap, and that gap is ~730x on the class as a whole. Before the bug-24 fix this
+was all masked: the run died with a spurious OOM at ~150-600 s and never
+reached a timeout. That same run is the end-to-end confirmation for bug 24.
 
 ## Root cause — three independent admission bans on the same hot path
 

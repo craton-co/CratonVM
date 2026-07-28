@@ -255,14 +255,30 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
     });
-    r.register(am, "containsKey", "(Ljava/lang/Object;)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
+    // W2: both used to answer a constant `false`. `AbstractMap` is a CLASS, so
+    // these natives intercept every Map subclass that inherits (rather than
+    // overrides) `containsKey`/`containsValue` — which is the normal case,
+    // since providing them is the whole point of extending `AbstractMap`. Such
+    // a map reported that it contained nothing at all, while its sibling
+    // `size()`/`isEmpty()`/`toString()` natives right here read the real entry
+    // count and disagreed.
+    //
+    // Serve them from the same bucket walk the concrete maps use. These are the
+    // very helpers the `WeakHashMap` registration ~650 lines below already
+    // shares, and they understand the 3-slot (buckets, size, capacity) layout
+    // `native_al_init_default_for_map` above installs — the same layout the
+    // neighbouring `isEmpty` reads its size from.
+    r.register(
+        am,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        cratonvm_native_collections::native_map_contains_key_pub,
+    );
     r.register(
         am,
         "containsValue",
         "(Ljava/lang/Object;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        cratonvm_native_collections::native_map_contains_value_pub,
     );
     r.register(am, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -945,6 +961,9 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Empty enumeration
     let ee = "java/util/Collections$EmptyEnumeration";
+    // KEEP: the class IS the empty enumeration — `hasMoreElements` is false by
+    // definition, exactly as in the real `Collections.EmptyEnumeration`. (Its
+    // `nextElement` right below correctly throws NoSuchElementException.)
     r.register(ee, "hasMoreElements", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -1191,17 +1210,32 @@ pub(crate) fn register_p64_sequenced_collections(r: &mut NativeMethodRegistry) {
         "()Ljava/util/SequencedSet;",
         native_p64_sm_seq_entry_set,
     );
+    // W2: both used to DROP the mapping and return null. That is the worst of
+    // the three possible behaviours: the real `SequencedMap` declares them as
+    // default methods that THROW `UnsupportedOperationException`, and
+    // `LinkedHashMap` overrides them to actually insert — so a caller either
+    // learns the map is read-only or gets its entry stored. Silently accepting
+    // the call and storing nothing meant a later `get(k)` returned null with no
+    // hint of where the value went.
+    //
+    // Store the mapping through the shared bucket-walking `put`, which is what
+    // the only sequenced map in this tree (`LinkedHashMap`) does. `putLast` is
+    // then exactly right — a fresh key goes to the end of insertion order.
+    // Residual for `putFirst`: the entry is stored but NOT moved to the front,
+    // so iteration order can differ from the real JDK. That is a strictly
+    // smaller error than losing the entry, and it is visible (the value is
+    // there) rather than silent.
     r.register(
         sm,
         "putFirst",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        cratonvm_native_collections::native_map_put_pub,
     );
     r.register(
         sm,
         "putLast",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        cratonvm_native_collections::native_map_put_pub,
     );
 
     // LinkedHashMap-specific SequencedMap methods
@@ -1695,6 +1729,49 @@ pub(crate) fn register_p65_checked_collections(r: &mut NativeMethodRegistry) {
 // Misc: java.util.EnumMap, java.util.EnumSet, java.lang.Iterable additions
 // =============================================================================
 
+/// `Ordering` → the -1/0/1 an `int compareTo` must return (W2).
+fn ordering_to_int(o: std::cmp::Ordering) -> i32 {
+    match o {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Unbox a BOXED PRIMITIVE to an `f64` for the `java.lang.Comparable.compareTo`
+/// fallback (W2).
+///
+/// Gated on the wrapper CLASS NAME, deliberately: the sibling
+/// `natural_compare` in native-collections documents how a raw slot-0 probe
+/// mis-fires on any POJO whose first declared field happens to be a primitive
+/// (two unsaved JPA entities both read `id == 0` and compared "equal", which
+/// silently dropped an element from a natural-order TreeSet). Only the eight
+/// wrapper classes may be unboxed here.
+fn comparable_boxed_number(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<f64> {
+    let name = ctx.class_name_of_id(ctx.class_id_of_object(obj))?;
+    match name.as_str() {
+        "java/lang/Integer"
+        | "java/lang/Long"
+        | "java/lang/Short"
+        | "java/lang/Byte"
+        | "java/lang/Character"
+        | "java/lang/Boolean"
+        | "java/lang/Float"
+        | "java/lang/Double" => {}
+        _ => return None,
+    }
+    if ctx.object_num_fields(obj) == 0 {
+        return None;
+    }
+    match ctx.get_field(obj, 0) {
+        Value::Int(v) => Some(v as f64),
+        Value::Long(v) => Some(v as f64),
+        Value::Float(v) => Some(v as f64),
+        Value::Double(v) => Some(v),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1733,6 +1810,16 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
     );
 
     // java.io.Serializable — marker interface (no methods, but sometimes referenced)
+    //
+    // KEEP. `java.io.Serializable` genuinely declares no members, so this key
+    // is only ever reached by a static-field lookup that walked all the way up
+    // to the interface — i.e. by a class with no explicit
+    // `static final long serialVersionUID` — and 0 is the correct "not
+    // declared" answer there. The serialization machinery does not go through
+    // this native at all: `serialization.rs`'s `ObjectStreamClass` builder
+    // resolves the field with `static_field_index_by_name` on the CONCRETE
+    // class and falls back to `compute_default_svuid`, so no stream ever
+    // carries this 0.
     r.register(
         "java/io/Serializable",
         "serialVersionUID",
@@ -1741,11 +1828,57 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
     );
 
     // java.lang.Comparable — compareTo for String already exists; add for wrappers
+    //
+    // W2: this used to answer a constant 0, i.e. "every object compares equal".
+    // `compareTo` is ABSTRACT, so the interface-native guard does not apply to
+    // it (an abstract method takes the `check_override` branch and is cached by
+    // RECEIVER class), which means any receiver whose class declares no
+    // `compareTo` landed here — and a comparison that always says "equal"
+    // silently collapses a sort into a no-op and makes a TreeMap/TreeSet
+    // dedup-drop everything after the first element. That is precisely the B2
+    // failure `natural_compare` in native-collections was fixed for.
+    //
+    // Decide the cases we can decide (String content, then the boxed
+    // primitives this registration was added for), and raise ClassCastException
+    // for the rest rather than inventing an ordering. The JDK's own
+    // natural-order paths throw ClassCastException when they cannot order two
+    // values, so callers already handle it.
     r.register(
         "java/lang/Comparable",
         "compareTo",
         "(Ljava/lang/Object;)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                // `x.compareTo(null)` throws NPE on every JDK Comparable.
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Comparable.compareTo: null argument".to_string()),
+                    }
+                    .into())
+                }
+            };
+            if this == other {
+                return Ok(Some(Value::Int(0)));
+            }
+            if let (Some(a), Some(b)) = (ctx.read_string(this), ctx.read_string(other)) {
+                return Ok(Some(Value::Int(ordering_to_int(a.cmp(&b)))));
+            }
+            if let (Some(a), Some(b)) = (
+                comparable_boxed_number(ctx, this),
+                comparable_boxed_number(ctx, other),
+            ) {
+                return Ok(Some(Value::Int(ordering_to_int(a.total_cmp(&b)))));
+            }
+            Err(RuntimeError::ClassCastException {
+                message:
+                    "Comparable.compareTo: receiver declares no compareTo and is neither a String \
+                     nor a boxed primitive"
+                        .to_string(),
+            }
+            .into())
+        },
     );
 
     // java.lang.AutoCloseable

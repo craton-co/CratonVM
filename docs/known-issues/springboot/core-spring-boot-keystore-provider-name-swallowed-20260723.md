@@ -93,7 +93,18 @@ providers regardless of the requested name.
 
 `JksSslStoreBundleTests` has one other, unrelated failure in the same run
 (`invalidBase64EncodedLocationThrowsException`) — see
-`core-spring-boot-base64-decoder-message-mismatch-20260723.md` for that one.
+`../../internal/fixed-suite-bugs/springboot/core-spring-boot-base64-decoder-message-mismatch-20260723-FIXED.md`
+for that one (fixed and retired 2026-07-28).
+
+**Note added 2026-07-28 (while closing the base64 doc above):** the hypothesis
+in this doc looks overtaken. `getinstance_instance_provider`
+(`native-builtins/src/jca/provider_chain.rs`) now resolves the provider name
+before the algorithm and raises `NoSuchProviderException` — item 3 of
+`../../internal/fixed-suite-bugs/springboot/core39-clusterD-lifecycle-ssl-validation-FIXED.md`.
+`JksSslStoreBundleTests` runs **14/14 green** on unmodified `origin/dev`
+(`ccf774db3`), JIT and `--nojit`, including both methods listed below. This doc
+was not independently re-root-caused in that session, so it is left OPEN for a
+triage pass to confirm and retire rather than closed here.
 
 ## Affected classes
 

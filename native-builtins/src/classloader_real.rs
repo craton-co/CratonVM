@@ -563,7 +563,13 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // ClassLoader.registerAsParallelCapable() — always return true
+    // ClassLoader.registerAsParallelCapable() — always return true.
+    // KEEP (constant, justified): the boolean means "this loader class is now
+    // registered as parallel-capable". CratonVM does not serialize loading on a
+    // per-class-name lock in the first place, so every loader behaves as
+    // parallel-capable and `true` is the accurate answer, not an optimistic
+    // one. (Real JDK returns false only for the bookkeeping case where a
+    // superclass was not itself registered — a distinction we do not model.)
     r.register(cl, "registerAsParallelCapable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });

@@ -112,7 +112,34 @@ Post-fix trace:
 [GC_OVERHEAD] before=537058760 after=288400 promoted=0 freed=536770360 cap=1610612736 unproductive=false streak=0
 ```
 
-`cargo test -p cratonvm-gc --lib`: 872 passed, 0 failed.
+`cargo test -p cratonvm-gc --lib`: 872 passed, 0 failed. Repeated on three
+separately-built binaries (pre-`dev`-merge, post-merge, final integration):
+9-10M iterations each, 10-11 forced GCs each, every one scored productive,
+`streak` never left 0, zero OOMs.
+
+### End-to-end: the class now PASSES
+
+The unmodified `org.apache.tomcat.util.http.TestMethodPerformance` was run to
+completion on the fixed binary. All 1 200 000 000 iterations executed with no
+`OutOfMemoryError`:
+
+```
+Time: 30,149.543
+
+OK (1 test)
+```
+
+8.4 hours against HotSpot's 41.2 s, so the class still cannot fit a suite
+timeout — but the defect this doc is about is gone, and what remains is purely
+throughput, tracked in
+[30](../../../known-issues/tomcat/30-hot-loop-jit-admission-bans-testmethodperformance-OPEN.md).
+Pre-fix, the same class died with `OutOfMemoryError` before 10 000 000
+iterations (154-598 s).
+
+**Suite regression check:** six known-PASS Tomcat classes
+(`TestOrderInterceptor`, `TestSwallowAbortedUploads`, `TestResponsePerformance`,
+`TestDefaultServlet`, `TestStandardWrapper`, `TestTomcat`) all still PASS on
+the fixed binary with zero OOMs.
 
 ## Blast radius
 

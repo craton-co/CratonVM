@@ -1663,6 +1663,13 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // No-op the listener entirely; metadata reader caching is purely an
     // optimization and skipping cleanup is harmless. Also no-op `destroy()`
     // so the bean's lifecycle teardown path doesn't NPE the same way.
+    //
+    // KEEP (deliberate no-ops), re-audited 2026-07-27. Both method bodies do
+    // nothing but `metadataReaderFactory.clearCache()`; the field is null
+    // under CratonVM's partial bootstrap, and skipping a cache eviction has
+    // no observable effect on anything but memory. The right end state is to
+    // DELETE these two once `setMetadataReaderFactory` is actually reached
+    // during context refresh — not to reimplement them here.
     const SMRF_BEAN: &str = "org/springframework/boot/autoconfigure/\
          SharedMetadataReaderFactoryContextInitializer\
          $SharedMetadataReaderFactoryBean";

@@ -128,6 +128,9 @@ struct ReaderState {
     /// XML declaration encoding, as reported by
     /// XMLStreamReader.getCharacterEncodingScheme().
     character_encoding_scheme: Option<String>,
+    /// `standalone` pseudo-attribute of the XML declaration.
+    /// `None` = the declaration omitted it (so `standaloneSet()` is false).
+    standalone: Option<bool>,
 }
 
 impl ReaderState {
@@ -306,6 +309,7 @@ fn split_qname(qname: &[u8]) -> (String, String) {
 struct PreparedXml {
     bytes: Vec<u8>,
     character_encoding_scheme: Option<String>,
+    standalone: Option<bool>,
 }
 
 fn prepare_xml_bytes(bytes: &[u8]) -> PreparedXml {
@@ -334,9 +338,11 @@ fn prepare_xml_bytes(bytes: &[u8]) -> PreparedXml {
     };
 
     let declared = xml_decl_encoding(&text);
+    let standalone = xml_decl_standalone(&text);
     PreparedXml {
         bytes: text.into_bytes(),
         character_encoding_scheme: declared,
+        standalone,
     }
 }
 
@@ -354,11 +360,28 @@ fn decode_utf16_bytes(bytes: &[u8], big_endian: bool) -> String {
 }
 
 fn xml_decl_encoding(text: &str) -> Option<String> {
+    xml_decl_attr(text, "encoding")
+}
+
+/// `standalone` pseudo-attribute of the XML declaration, per XML 1.0 §2.9.
+/// `None` means the declaration was absent or omitted the attribute, which is
+/// what `XMLStreamReader.standaloneSet()` reports as `false`.
+fn xml_decl_standalone(text: &str) -> Option<bool> {
+    match xml_decl_attr(text, "standalone")?.as_str() {
+        "yes" => Some(true),
+        "no" => Some(false),
+        // Any other literal is not well-formed; treat it as "not declared"
+        // rather than guessing, matching a non-validating parser's leniency.
+        _ => None,
+    }
+}
+
+/// Pull one quoted pseudo-attribute out of the `<?xml … ?>` declaration.
+fn xml_decl_attr(text: &str, key: &str) -> Option<String> {
     let s = text.strip_prefix('\u{FEFF}').unwrap_or(text).trim_start();
     let rest = s.strip_prefix("<?xml")?;
     let end = rest.find("?>").unwrap_or(rest.len());
     let decl = &rest[..end];
-    let key = "encoding";
     let key_pos = decl.find(key)?;
     let mut tail = &decl[key_pos + key.len()..];
     tail = tail.trim_start();
@@ -561,6 +584,7 @@ fn make_reader_state(bytes: &[u8]) -> ReaderState {
         events,
         cursor: 0,
         character_encoding_scheme: prepared.character_encoding_scheme,
+        standalone: prepared.standalone,
     }
 }
 
@@ -1986,17 +2010,23 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_get_pi_data,
     );
+    // isStandalone / standaloneSet — read from the XML declaration instead of
+    // reporting a flat `false`. A document declaring `standalone="yes"` tells
+    // consumers no external markup declarations need to be honoured; answering
+    // `false` (and `standaloneSet()==false`) made every such document look
+    // like it had no declaration at all, so DTD-aware consumers took the
+    // external-subset path for a document that had explicitly opted out.
     registry.register(
         "javax/xml/stream/XMLStreamReader",
         "isStandalone",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_is_standalone,
     );
     registry.register(
         "javax/xml/stream/XMLStreamReader",
         "standaloneSet",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_standalone_set,
     );
     registry.register(
         "javax/xml/stream/XMLStreamReader",
@@ -2314,6 +2344,24 @@ fn native_get_character_encoding_scheme(
     Ok(Some(Value::Object(
         scheme.map(|encoding| ctx.create_string(&encoding)),
     )))
+}
+
+/// `XMLStreamReader.isStandalone()` — the value of the declaration's
+/// `standalone` pseudo-attribute; false when it was not declared.
+fn native_is_standalone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let standalone = with_state(ctx, this, |s| s.standalone).flatten();
+    Ok(Some(Value::Int(i32::from(standalone == Some(true)))))
+}
+
+/// `XMLStreamReader.standaloneSet()` — whether the declaration carried a
+/// `standalone` pseudo-attribute at all.
+fn native_standalone_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let declared = with_state(ctx, this, |s| s.standalone.is_some()).unwrap_or(false);
+    Ok(Some(Value::Int(i32::from(declared))))
 }
 
 /// `com.sun.xml.internal.stream.events.EndElementEvent.getNamespaces()` — return
