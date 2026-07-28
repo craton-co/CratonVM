@@ -3285,7 +3285,7 @@ fn ssc_accept_unix(
     let path = cf_get_str(ctx, this, F_UDS_PATH).unwrap_or_default();
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    init_channel_locks(ctx, child);
+    let child = init_channel_locks(ctx, child);
     cf_set(ctx, child, F_OPEN, Value::Int(1));
     cf_set(
         ctx,
