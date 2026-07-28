@@ -131,10 +131,10 @@ UDS listener can be polled by raw OS handle (it cannot be `try_clone`d into a
 
 * `org.apache.tomcat.util.net.TestXxxEndpoint` → `OK (3 tests)`, 4/4 runs
   (3× JIT on, 1× `--nojit`). Was `FAILURES!!! Tests run: 3, Failures: 1`.
-* Standalone probes (`probe-java/UdsProbe.java`,
-  `probe-java/UdsSelectorProbe.java` in the fix worktree) cover the
-  bind → accept → read/write → close round trip and the Tomcat-shaped
-  "blocking acceptor + Selector poller" topology; both match HotSpot output.
+* Standalone probes in [`tools/uds-probe`](../../../../tools/uds-probe) cover
+  the bind → accept → read/write → close round trip (`UdsProbe.java`) and the
+  Tomcat-shaped "blocking acceptor + Selector poller" topology
+  (`UdsSelectorProbe.java`); both match HotSpot output line for line.
 * `org.apache.tomcat.util.net.TestXxxEndpoint` → `OK (3 tests)` again after
   merging current `origin/dev` into the branch.
 * `cargo test -p cratonvm-native-io` — the four new `uds::tests` pass,
