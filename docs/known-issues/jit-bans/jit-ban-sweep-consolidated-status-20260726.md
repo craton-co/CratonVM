@@ -25,8 +25,8 @@ retain full evidence/repro details; this file is the summary.
 | TOMCAT-DOHEAD-JUNIT-ITERATOR.1 | `TestClass.collectAnnotatedMethodValues` | real junit-4.13.2, blanket-ban-lifted-too |
 | JSONSMART-PARSER.1 | `net/minidev/json/parser/` | real json-smart-2.3.jar; re-confirmed 2026-07-27 against json-smart-2.6.0 (3M round-trip ops, 0 errors), ban retired |
 | SPB.9 | `org/slf4j/`,`ch/qos/logback/`,`org/apache/commons/logging/` | real jcl-over-slf4j+logback |
-| JASPER-JDT.2 | `org/eclipse/jdt/internal/compiler/parser/` | real Tomcat TestCompiler, 2x2 repeated runs |
-| JASPER-JDT.3 | `org/eclipse/jdt/internal/compiler/ast/` | real Tomcat TestFormAuthenticatorA, 2x2 repeated runs |
+| JASPER-JDT.2 | `org/eclipse/jdt/internal/compiler/parser/` | **this row is void** — the runs had the virtual direct-entry path off, so nothing was measured; ban RESTORED 2026-07-27, then removed for good 2026-07-28 once root-caused to `613b10f4c` (see below) |
+| JASPER-JDT.3 | `org/eclipse/jdt/internal/compiler/ast/` | **this row is void** — same reason; RESTORED 2026-07-27, removed for good 2026-07-28 |
 | SPB.9d | `com/sun/beans/`,`java/beans/` | pure-JDK BeanIntrospectorProbe |
 | SPB.9b (partial) | `org/springframework/beans/factory/support/` | real spring-beans-7.0.7.jar |
 | SPB.9c | `context/annotation/`,`context/support/`,`core/io/support/`,`beans/factory/` | real spring-context-7.0.7.jar |
