@@ -142,16 +142,22 @@ ROUNDTRIP MISMATCH at iter=47981
 ```
 
 This is NOT the ban's bug returning, and not the HashMap-capacity bug fixed
-here (`MiniJsonProbe`, its deterministic repro, stays clean). It arrived with
-`4f280090f`, which flipped the JIT's compiled-callee direct entry to
-default-ON: with `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0` the same
-merged binary runs 1,500,000 operations twice with 0 errors. Written up, with
-the full evidence table and the suspected mechanism, in
-`docs/known-issues/jit-virtual-direct-entry-json-corruption-20260727.md`.
+here (`MiniJsonProbe`, its deterministic repro, stays clean).
 
-Disposition is unchanged: the corruption is in the JIT's virtual-dispatch
-inline cache, which every interface-heavy workload uses — re-banning
-`net/minidev/json/parser/` would hide one victim of it, not fix it.
+**Root-caused and fixed** (same session, after the first attempt blamed the
+wrong commit): running the probe under `-Xmx64m` turns "1 error per 1,500,000
+operations" into "first error by iteration 5,000", and a `git bisect` over the
+merged range with that repro names `83e078aa5` — which relaxed the RBC.6
+admission gate so methods whose exception handler reads a non-parameter local
+are compiled on the promise of a precise exceptional frame. The frames drop
+live values (an unrelated object appears where a live one was), so the gate is
+closed again by default. Full evidence, including the liveness bug fixed
+underneath it, is in
+`docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+
+Disposition is unchanged: the corruption was in shared JIT frame
+reconstruction, not in `net/minidev/json/parser/` — re-banning the package
+would have hidden one victim of it, not fixed it.
 
 ## Known, unrelated coverage gap seen in the same runs
 

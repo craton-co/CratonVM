@@ -220,3 +220,54 @@ params-only rule was added for), plus a `HandlerLocals` conformance probe
 sequential and nested try blocks / behind a `synchronized` block / reassigned
 after the call, with the throwing call reached through each invoke opcode
 including one in tail position) — byte-identical on CratonVM and HotSpot.
+
+## Update 2026-07-27 (2) — the third factor: try/catch excludes a method from C2
+
+The residual flagged above ("NOT admission … a third factor, not yet
+identified") is now identified: **a method with an exception table never enters
+the optimizing IR pipeline at all**, so it is permanently limited to
+single-pass-backend code quality — worth ~7x here.
+
+`jit/src/lib.rs:7831` gates the whole IR/C2 path on
+`cached.exception_table.is_empty()`. The rationale is in the STUB-S8 comment
+directly above it: the IR builder has no exception-table-aware codegen — a
+handler entry is not a registered merge target, so the builder would walk
+handler bytecode with stale `ctrl`/`locals`/`stack` from wherever the linear PC
+walk last was, producing orphaned nodes referencing `NO_NODE` that the
+scheduler/lowerer still visit (panicking in `ir_lower::slot_of` on a `u32::MAX`
+index).
+
+Measured with `LazyIsolate`, which changes exactly one thing per variant —
+300k iterations, single thread, same binary, same run:
+
+| variant | CratonVM | HotSpot |
+|---|---|---|
+| d4 clone of `getCharset`, handler reads a non-param local, `try` | 8252 ns/op | 74 |
+| d5 **identical, `try`/`catch` removed** | **1094 ns/op** | 85 |
+| d8 same but handler reads ONLY parameters, `try` | 7091 ns/op | 17 |
+| d9 **identical, `try`/`catch` removed** | **1149 ns/op** | 61 |
+| d7 plain `ConcurrentHashMap` control | 1339 ns/op | 72 |
+
+d8/d9 are the important pair: that handler reads only parameters, so
+`local_handler_reads_unsafe_local` is false and `precise_exception_frames` is
+never engaged — and it is still ~6x slower than its no-`try` twin. So this is
+**not** the RBC.6 escape hatch being expensive; it is the flat
+`exception_table.is_empty()` requirement on C2. The catch block is never
+entered in any variant; the cost is entirely static.
+
+That closes out the "why is `LazyCsCache` still slow" question for this doc:
+`CharsetCache.getCharset` has a `try`/`catch (UnsupportedCharsetException)`,
+so even now that it compiles it can only ever be C1-quality.
+
+### What a fix requires
+
+Exception-table support in the IR builder: register each handler entry as a
+merge target with a correctly-typed `ctrl`/`locals`/`stack` state, so the
+handler's bytecode is built as a real CFG block rather than walked over. That
+is a self-contained but non-trivial IR project, and it would lift a ceiling
+that applies to **every** `try`/`catch` method in every workload — not just
+this test. It is almost certainly worth more than anything else named in this
+document.
+
+Reproduce the measurement with the `LazyIsolate` probe shape above; the d5/d9
+"delete the try/catch, change nothing else" control is what makes it airtight.

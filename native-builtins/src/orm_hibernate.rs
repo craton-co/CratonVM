@@ -1279,7 +1279,29 @@ pub(crate) fn register_hibernate_testing_util_intrinsics(registry: &mut NativeMe
     );
 }
 
+fn native_hibernate_sqm_jpa_criteria_parameter_wrapper_hash_code(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let hash = match args.first() {
+        Some(Value::Object(Some(this))) => {
+            match ctx.get_field_by_name(*this, "criteriaParameterId") {
+                Value::Int(value) => value,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+    Ok(Some(Value::Int(hash)))
+}
+
 pub(crate) fn register_hibernate_models_intrinsics(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "org/hibernate/query/sqm/tree/expression/SqmJpaCriteriaParameterWrapper",
+        "hashCode",
+        "()I",
+        native_hibernate_sqm_jpa_criteria_parameter_wrapper_hash_code,
+    );
     registry.register(
         HIBERNATE_ASSOCIATION_KEY,
         "hashCode",

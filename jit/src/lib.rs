@@ -7399,6 +7399,42 @@ fn local_handler_reads_unsafe_local(
     false
 }
 
+/// Whether the precise-handler-frame relaxation of the RBC.6 gate is enabled.
+///
+/// **Default OFF (2026-07-27).** The relaxation (added by `83e078aa5`) compiles
+/// methods whose exception handler reads a local beyond the incoming
+/// parameters, on the promise that every throwing site in the protected range
+/// publishes a precise exceptional frame. Measured against that promise, the
+/// handoff still loses live values:
+///
+/// | build (json-smart round-trip probe, `-Xmx64m`, 200k ops/run) | first error |
+/// |---|---|
+/// | dev before `83e078aa5` | none |
+/// | dev at/after `83e078aa5` | iteration 400-5,000 |
+/// | same, with this gate closed | none |
+///
+/// The failures are lost-object failures, not exception-handling failures: a
+/// re-parse returns one of the document's own keys, or a
+/// `ClassCastException: java.lang.Object cannot be cast to JSONArray` — an
+/// unrelated object standing where a live one used to be, i.e. a value dropped
+/// from a reconstructed frame (and with it, from the GC's view of that frame).
+/// One input to that has been fixed separately (the liveness scan behind the
+/// snapshot had no exception edges — see
+/// `regalloc::live_locals_per_pc_with_handlers`), but the shape survives it, so
+/// the admission stays closed until the handoff itself is proven.
+///
+/// Set `CRATONVM_JIT_PRECISE_HANDLER_FRAMES=1` to re-open it while working on
+/// it. Repro: `docs/known-issues/repros/jsonsmart/JsonSmartProbeWarmed.java`
+/// under `-Xmx64m`; writeup:
+/// `docs/known-issues/jit-precise-handler-frame-drops-live-locals-20260727.md`.
+fn precise_handler_frames_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_JIT_PRECISE_HANDLER_FRAMES").is_some()
+    })
+}
+
 /// Whether every potentially throwing bytecode covered by this method's
 /// exception table already exits through an x64 runtime call site that can
 /// publish a precise reason-9 exceptional frame.
@@ -7767,11 +7803,13 @@ fn try_compile_inner(
         if unsafe_local {
             #[cfg(target_arch = "x86_64")]
             {
-                if !precise_exception_frame_sites_supported(
-                    code,
-                    code_len,
-                    &cached.exception_table,
-                ) {
+                if !precise_handler_frames_enabled()
+                    || !precise_exception_frame_sites_supported(
+                        code,
+                        code_len,
+                        &cached.exception_table,
+                    )
+                {
                     // A handler that reads a later local remains interpreted
                     // unless every throwing site in its protected ranges can
                     // publish that local through the precise exceptional-frame

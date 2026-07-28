@@ -8347,6 +8347,12 @@ struct Compiler {
     /// the OSR-compiled code already committed
     /// (`docs/known-issues/tomcat-08-07/testoutputbuffer-writespeed-content-length-mismatch.md`).
     local_liveness: Vec<u64>,
+    /// Parallel coverage bitmap for [`Self::local_liveness`]: `false` at a pc
+    /// no basic block covers, where the liveness answer is the `0` default
+    /// ("nothing live") rather than a computed result. Treating that as "every
+    /// local is dead" would discard the whole frame, so the snapshot builder
+    /// falls back to "everything live" there.
+    local_liveness_covered: Vec<bool>,
     /// deopt-osr FU2 — whether the method touches any `long`/`float`/`double`
     /// (`code_uses_long_float_double`). The method-level gate for the operand-stack
     /// snapshot: the abstract stack has no per-entry width source, so when this is
@@ -9406,6 +9412,7 @@ impl Compiler {
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
             local_liveness: Vec::new(),
+            local_liveness_covered: Vec::new(),
             uses_long_float_double: false,
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
@@ -9816,7 +9823,10 @@ impl Compiler {
             // can overwrite it. `Undefined` maps to an inert zero and is sound
             // precisely because liveness proves no path reads the old value
             // before its next definition.
-            if i < 64 {
+            // Only act on a COMPUTED liveness answer. An uncovered pc (no
+            // basic block reaches it) reads as 0 = "nothing live", and acting
+            // on that would drop every local in the frame.
+            if i < 64 && self.local_liveness_covered.get(bci).copied().unwrap_or(false) {
                 let live_here = self.local_liveness.get(bci).copied().unwrap_or(u64::MAX);
                 if live_here & (1u64 << i) == 0 {
                     locals.push(FrameValue::Undefined);
@@ -18380,19 +18390,41 @@ impl Compiler {
     }
 
     fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
+        // The simulated operand stack at this point is the state *after* the
+        // instruction which made the fallible call: every invoke lowering has
+        // already removed its receiver and arguments before emitting the ABI
+        // call above.  A frame-deopt snapshot must therefore resume at that
+        // instruction's successor, not at `dbg_last_pc` itself.  Resuming at
+        // the invoke would make the interpreter try to consume the already
+        // removed operands (TransactionUtil.wrapInTransaction's
+        // `Consumer.accept` was the concrete failure: the reconstructed frame
+        // resumed pc=25 with an empty stack, and the virtual dispatch cache
+        // underflowed after advancing to pc=30).
+        //
+        // Every caller invokes this helper after lowering a bytecode operation.
+        // `dbg_last_op` provides the exact encoded width for the only variable
+        // length invoke forms; all other supported fallible helpers here use
+        // the ordinary three-byte CP form or a one-byte operation.  Keeping the
+        // original PC for non-invoke operations avoids changing their exception
+        // routing semantics.
+        let deopt_resume_bci = match self.dbg_last_op {
+            0xb9 | 0xba => self.dbg_last_pc.saturating_add(5),
+            0xb6 | 0xb7 | 0xb8 => self.dbg_last_pc.saturating_add(3),
+            _ => self.dbg_last_pc,
+        };
         // The bytecode compiler has just emitted the dispatch, so its local
         // homes still describe the point at which an exception from that call
         // is caught. A params-only handler reconstruction is insufficient for
         // this method; retain a typed snapshot and branch to its frame-deopt
         // exit instead of the shared sentinel-only exit below.
         if self.precise_exception_frames
-            && !self.deopt_box_ptr_by_bci.contains_key(&self.dbg_last_pc)
+            && !self.deopt_box_ptr_by_bci.contains_key(&deopt_resume_bci)
         {
             let box_ptr = self.build_and_record_deopt_point(
-                self.dbg_last_pc,
+                deopt_resume_bci,
                 crate::deopt::DeoptReason::ReceiverTypeChanged,
             );
-            self.deopt_box_ptr_by_bci.insert(self.dbg_last_pc, box_ptr);
+            self.deopt_box_ptr_by_bci.insert(deopt_resume_bci, box_ptr);
         }
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
@@ -18420,7 +18452,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
@@ -18434,7 +18466,7 @@ impl Compiler {
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
             if self.precise_exception_frames {
-                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+                self.deopt_stubs.push((patch_offset, deopt_resume_bci, 9));
             } else {
                 self.exception_check_stubs.push(patch_offset);
             }
@@ -29673,7 +29705,17 @@ pub fn compile_with_param_slots(
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
         // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
-        compiler.local_liveness = super::regalloc::live_locals_per_pc(code, code_len, num_params);
+        // The exception table MUST be modelled: these snapshots are taken at
+        // pcs inside protected ranges, and a local only the handler reads is
+        // otherwise computed dead exactly there.
+        let (liveness, covered) = super::regalloc::live_locals_per_pc_with_handlers(
+            code,
+            code_len,
+            num_params,
+            &exception_ranges,
+        );
+        compiler.local_liveness = liveness;
+        compiler.local_liveness_covered = covered;
     }
 
     // Emit prologue
@@ -30351,6 +30393,7 @@ mod tests {
             false,
             false,
             false,
+            Vec::new(),
         );
 
         assert!(matches!(compiler.push_stack(), Some(StackSlot::Frame(_))));

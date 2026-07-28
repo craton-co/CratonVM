@@ -1810,16 +1810,62 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
     // already false in VMManagementImpl).
     r.register(cls, "setVerboseClass", "(Z)V", |_ctx, _args| Ok(None));
 
-    // <init>(Lsun/management/VMManagement;)V — no-op constructor; the
-    // VMManagement reference is stored by Java bytecode in a field that
-    // we don't read.
+    // <init>(Lsun/management/VMManagement;)V — mirror the real
+    // `ClassLoadingImpl(VMManagement vm) { this.jvm = vm; }`. Dropping the
+    // argument left `jvm` null on every instance, so each inherited bytecode
+    // accessor that routes through it (`getLoadedClassCount`, `isVerbose`,
+    // `setVerboseClass`) NPE'd on `this.jvm` the moment a JMX client touched
+    // the bean — the same shape as the `MemoryImpl.isVerbose` null-`jvm` bug
+    // documented in `register_jmx_natives`.
     r.register(
         cls,
         "<init>",
         "(Lsun/management/VMManagement;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let jvm = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "jvm", jvm);
+            Ok(None)
+        },
     );
     r.set_category(__prev_cat);
+}
+
+/// Establish the state `MemoryManagerImpl`'s Java constructor establishes:
+/// the manager's `name` (which `getName()` reads straight back) and the
+/// `isValid` flag `ManagementFactoryHelper` filters the platform bean lists
+/// on. Shared by the `MemoryManagerImpl` / `GarbageCollectorImpl`
+/// constructors and by the `alloc_*` factory paths, so a bean carries the
+/// same state whichever way it was built.
+fn init_memory_manager_fields(ctx: &mut dyn NativeContext, this: ObjectRef, name: Value) {
+    ctx.set_field_by_name(this, "name", name);
+    ctx.set_field_by_name(this, "isValid", Value::Int(1));
+}
+
+/// Read a `long` constructor/method argument. Callers reaching a native
+/// through a JIT'd or reflective path can present a `long` as `Value::Int`,
+/// so accept both rather than silently defaulting a real argument to 0.
+fn long_arg(args: &[Value], idx: usize) -> i64 {
+    match args.get(idx) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+/// The JMM's "metric unavailable" `MemoryUsage` (-1, -1, -1, -1).
+///
+/// CratonVM's collector exposes no per-pool (Eden / Old Gen) byte accounting
+/// — only the aggregate `heap_allocated_bytes`, which `MemoryImpl
+/// .getMemoryUsage0` already surfaces — so every `MemoryPoolImpl` usage query
+/// answers with the spec-defined sentinel rather than a fabricated number.
+fn undefined_memory_usage(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
+    ctx.set_field(mu, 0, Value::Long(-1));
+    ctx.set_field(mu, 1, Value::Long(-1));
+    ctx.set_field(mu, 2, Value::Long(-1));
+    ctx.set_field(mu, 3, Value::Long(-1));
+    mu
 }
 
 /// `sun.management.GarbageCollectorImpl` — per-collector counters.
@@ -1848,26 +1894,40 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Long(ctx.gc_collection_count() as i64)))
     });
 
-    // <init>(Ljava/lang/String;Lsun/management/VMManagement;)V — no-op;
-    // the name + VMManagement refs are stored by Java bytecode in fields
-    // we don't introspect.
+    // <init>(Ljava/lang/String;Lsun/management/VMManagement;)V — the `name`
+    // argument is exactly what `getName()` below reads back, so discarding it
+    // made every bean built through the real constructor answer `getName() ==
+    // null` while only the ones built by `alloc_garbage_collector_impl`
+    // reported a name. Store both arguments, mirroring the Java constructor.
     r.register(
         cls,
         "<init>",
         "(Ljava/lang/String;Lsun/management/VMManagement;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            init_memory_manager_fields(
+                ctx,
+                this,
+                args.get(1).copied().unwrap_or(Value::Object(None)),
+            );
+            let jvm = args.get(2).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "jvm", jvm);
+            Ok(None)
+        },
     );
 
     // JDK 25 also has the public `<init>(Ljava/lang/String;)V` form (used
-    // by ManagementFactoryHelper internals). No-op so synthetic
-    // construction in `alloc_garbage_collector_impl` doesn't need to chain
-    // through the real bytecode.
-    r.register(
-        cls,
-        "<init>",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
+    // by ManagementFactoryHelper internals) — same `name` handling, no
+    // VMManagement to record.
+    r.register(cls, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_memory_manager_fields(
+            ctx,
+            this,
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+        );
+        Ok(None)
+    });
 
     // Wave 1 / Task A: getName()Ljava/lang/String; — read the synthetic
     // `name` slot we populate in `alloc_garbage_collector_impl`. The
@@ -1897,12 +1957,18 @@ pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/MemoryManagerImpl";
 
-    r.register(
-        cls,
-        "<init>",
-        "(Ljava/lang/String;)V",
-        native_noop_with_this,
-    );
+    // <init>(Ljava/lang/String;)V — the argument IS the manager name that
+    // `getName()` below reads; the previous no-op threw it away, so a manager
+    // constructed by real bytecode had a null name.
+    r.register(cls, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_memory_manager_fields(
+            ctx,
+            this,
+            args.get(1).copied().unwrap_or(Value::Object(None)),
+        );
+        Ok(None)
+    });
 
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1938,12 +2004,46 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "sun/management/MemoryPoolImpl";
 
-    r.register(
-        cls,
-        "<init>",
-        "(Ljava/lang/String;ZJJ)V",
-        native_noop_with_this,
-    );
+    // <init>(Ljava/lang/String;ZJJ)V — the real
+    // `MemoryPoolImpl(String name, boolean isHeap, long usageThreshold,
+    // long gcThreshold)`. All four arguments are read back by accessors:
+    // `name` by `getName()`, `isHeap` by `getType()` (both registered just
+    // below), and the two thresholds by the pure-Java `getUsageThreshold()` /
+    // `getCollectionUsageThreshold()`. The previous no-op discarded every one
+    // of them, so a pool constructed through this ctor reported a null name
+    // and a NON_HEAP type regardless of what it was created as. The two
+    // `*Supported` flags are derived exactly the way the JDK derives them: a
+    // negative threshold means the pool does not support that threshold.
+    r.register(cls, "<init>", "(Ljava/lang/String;ZJJ)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name = args.get(1).copied().unwrap_or(Value::Object(None));
+        let is_heap = match args.get(2) {
+            Some(Value::Int(v)) => *v,
+            _ => 0,
+        };
+        let usage_threshold = long_arg(args, 3);
+        let collection_threshold = long_arg(args, 4);
+        ctx.set_field_by_name(this, "name", name);
+        ctx.set_field_by_name(this, "isHeap", Value::Int(is_heap));
+        ctx.set_field_by_name(this, "isValid", Value::Int(1));
+        ctx.set_field_by_name(this, "usageThreshold", Value::Long(usage_threshold));
+        ctx.set_field_by_name(
+            this,
+            "collectionThreshold",
+            Value::Long(collection_threshold),
+        );
+        ctx.set_field_by_name(
+            this,
+            "usageThresholdSupported",
+            Value::Int(i32::from(usage_threshold >= 0)),
+        );
+        ctx.set_field_by_name(
+            this,
+            "collectionThresholdSupported",
+            Value::Int(i32::from(collection_threshold >= 0)),
+        );
+        Ok(None)
+    });
 
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1981,22 +2081,13 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // getUsage / getPeakUsage / getCollectionUsage — return UNDEFINED_USAGE
-    // (-1, -1, -1, -1) per the JMM spec for "metric unavailable". HONEST,
-    // not fabricated: CratonVM's collector does not expose per-pool
-    // (Eden / Old Gen) byte accounting — only an aggregate
-    // `heap_allocated_bytes`, which is surfaced via MemoryMXBean /
-    // MemoryImpl.getMemoryUsage0(heap) above. The -1 sentinel is the
-    // spec-defined "unavailable" value, not a made-up number.
+    // getUsage / getCollectionUsage — the JMM "metric unavailable" sentinel;
+    // see `undefined_memory_usage` for why that is the honest answer here.
     let undefined_usage: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, _args| {
-        let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
-        ctx.set_field(mu, 0, Value::Long(-1));
-        ctx.set_field(mu, 1, Value::Long(-1));
-        ctx.set_field(mu, 2, Value::Long(-1));
-        ctx.set_field(mu, 3, Value::Long(-1));
+        let mu = undefined_memory_usage(ctx);
         Ok(Some(Value::Object(Some(mu))))
     };
-    for name in ["getUsage0", "getPeakUsage0", "getCollectionUsage0"] {
+    for name in ["getUsage0", "getCollectionUsage0"] {
         r.register(
             cls,
             name,
@@ -2005,12 +2096,45 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
         );
     }
 
-    // resetPeakUsage0()V — clears the recorded peak. Our peak metric is the
-    // UNDEFINED_USAGE sentinel (-1), so there is nothing to reset; a no-op
-    // matches the spec-defined "unavailable" behaviour and lets callers
-    // (e.g. MemoryPoolMXBean.resetPeakUsage()) complete instead of hitting
-    // an UnsatisfiedLinkError.
-    r.register(cls, "resetPeakUsage0", "()V", native_noop_with_this);
+    // getPeakUsage0 — answer with the peak this pool has actually recorded
+    // (`peakUsage`), falling back to the current usage when nothing has been
+    // recorded yet. That fallback is what makes the JMM invariant
+    // "peak >= current, and peak == current immediately after a reset" hold
+    // rather than being asserted by two independent constants.
+    r.register(
+        cls,
+        "getPeakUsage0",
+        "()Ljava/lang/management/MemoryUsage;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(peak)) = ctx.get_field_by_name(this, "peakUsage") {
+                return Ok(Some(Value::Object(Some(peak))));
+            }
+            let mu = undefined_memory_usage(ctx);
+            Ok(Some(Value::Object(Some(mu))))
+        },
+    );
+
+    // resetPeakUsage0()V — the JMM contract is "reset the recorded peak to
+    // the pool's CURRENT usage", so record the current usage on the instance
+    // instead of ignoring the call; `getPeakUsage0` above reads it back.
+    //
+    // RESIDUAL: with no per-pool byte accounting the current usage is the
+    // UNDEFINED sentinel, so today a reset is not externally observable — the
+    // pre- and post-reset answers are equal. The state machine is the real
+    // one, so this becomes correct for free once per-pool accounting lands;
+    // what is missing is the metric, not the reset.
+    r.register(cls, "resetPeakUsage0", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Building the snapshot allocates, which can relocate the receiver —
+        // keep it rooted and re-read it before the field write.
+        let pin = ctx.pin_native_root(this);
+        let now = undefined_memory_usage(ctx);
+        let this = ctx.read_native_pin(pin, this);
+        ctx.set_field_by_name(this, "peakUsage", Value::Object(Some(now)));
+        ctx.unpin_native_roots(pin);
+        Ok(None)
+    });
 
     // getMemoryManagers0()[Ljava/lang/management/MemoryManagerMXBean; --
     // backs the pure-Java getMemoryManagerNames(), which Tomcat's
@@ -2052,8 +2176,7 @@ pub fn alloc_memory_pool_impl(ctx: &mut dyn NativeContext, name: &str, is_heap: 
 pub fn alloc_garbage_collector_impl(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "sun/management/GarbageCollectorImpl", 4);
     let n = ctx.create_string(name);
-    ctx.set_field_by_name(obj, "name", Value::Object(Some(n)));
-    ctx.set_field_by_name(obj, "isValid", Value::Int(1));
+    init_memory_manager_fields(ctx, obj, Value::Object(Some(n)));
     obj
 }
 
@@ -2285,6 +2408,10 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/ManagementFactory";
+    // KEEP: spec-correct. `ManagementFactory` is a final all-static factory
+    // whose only constructor is `private ManagementFactory() {}` — an empty
+    // body that exists solely to suppress the default one. The class has no
+    // instance state, so an empty native is exactly the real behaviour.
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
     // KAFKA-MBEAN: do NOT register a native for
@@ -2417,6 +2544,16 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
 
 fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/RuntimeMXBean", 10);
+    init_runtime_mxbean_fields(ctx, obj);
+    obj
+}
+
+/// Populate the 10 synthetic `RuntimeMXBean` slots the getters below read by
+/// index. Shared by the factory path (`alloc_runtime_mxbean`) and by the
+/// `<init>` native, so a bean carries the same state however it was built —
+/// without this, a directly-constructed bean answers `getName() == null` and
+/// hands back an untyped default slot for the `long` getters.
+fn init_runtime_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     let pid = std::process::id();
     let name = ctx.create_string(&format!("cratonvm@{}", pid));
     ctx.set_field(obj, 0, Value::Object(Some(name)));
@@ -2440,14 +2577,22 @@ fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(args_list, 0, Value::Object(Some(empty_arr)));
     ctx.set_field(args_list, 1, Value::Int(0));
     ctx.set_field(obj, 9, Value::Object(Some(args_list)));
-    obj
 }
 
 fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/RuntimeMXBean";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // `RuntimeMXBean` is an interface, so this can only ever run for a
+    // CratonVM synthetic receiver — but a synthetic receiver arrives with
+    // every slot at its untyped default, which is precisely the state the
+    // index-based getters below cannot read. Establish the same state the
+    // factory does.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_runtime_mxbean_fields(ctx, this);
+        Ok(None)
+    });
 
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2587,6 +2732,11 @@ fn register_platform_logging_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/PlatformLoggingMXBean";
+    // KEEP: all-defaults is provably the correct fresh state. This bean is
+    // the file's one genuinely stateless MXBean — `alloc_logging_mxbean`
+    // allocates it with ZERO fields, and every method below answers from the
+    // live `LogManager` rather than from per-instance state, so there is
+    // nothing a constructor could establish.
     r.register(cls, "<init>", "()V", native_noop_with_this);
     r.register(
         cls,
@@ -2698,7 +2848,35 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/MemoryMXBean";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // `MemoryMXBean` is an interface; the platform bean is allocated as a
+    // concrete `sun/management/MemoryImpl` by `alloc_memory_mxbean`, so this
+    // only runs for a synthetic receiver stamped with the interface name. Such
+    // a receiver reaches the two usage getters below with all five slots at
+    // their untyped default, and each getter then falls back to a hard-coded
+    // 16MB/256MB/64MB guess. Seed the slots from the same live accessors
+    // `MemoryImpl.getMemoryUsage0` uses so the fallbacks stay unreached.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let heap_used = ctx.heap_allocated_bytes() as i64;
+        // Same derivation as `MemoryImpl.getMemoryUsage0`: non-heap usage is
+        // estimated from the real loaded-class count, and its max is the
+        // honest "undefined" sentinel because CratonVM does not cap metaspace.
+        // `getNonHeapMemoryUsage` below reuses slot 4 as `committed` too, so
+        // that surfaces as an "unavailable" committed rather than a fabricated
+        // byte count — deliberate: this bean has no metaspace accounting.
+        const AVG_CLASS_METADATA_BYTES: i64 = 4096;
+        let non_heap_used = (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
+        ctx.set_field(this, 0, Value::Long(heap_used));
+        ctx.set_field(this, 1, Value::Long(ctx.max_heap_bytes()));
+        ctx.set_field(
+            this,
+            2,
+            Value::Long(heap_used.max(ctx.initial_heap_bytes())),
+        );
+        ctx.set_field(this, 3, Value::Long(non_heap_used));
+        ctx.set_field(this, 4, Value::Long(-1));
+        Ok(None)
+    });
 
     r.register(
         cls,
@@ -2769,7 +2947,20 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/MemoryUsage";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // The real `MemoryUsage` is a concrete final class with no no-arg
+    // constructor, so this descriptor only exists for CratonVM synthetic
+    // receivers (the 4-arg form below is the one real bytecode calls, and it
+    // already round-trips). A synthetic receiver's four slots hold untyped
+    // defaults, which the `()J` getters would hand straight back; give it the
+    // same UNDEFINED shape `MemoryPoolImpl` uses for "no measurement taken".
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Long(-1));
+        ctx.set_field(this, 1, Value::Long(-1));
+        ctx.set_field(this, 2, Value::Long(-1));
+        ctx.set_field(this, 3, Value::Long(-1));
+        Ok(None)
+    });
     r.register(cls, "<init>", "(JJJJ)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // args: this, init, used, committed, max (longs take 2 slots each in JVM
@@ -3166,6 +3357,14 @@ fn registered_thread_name(ctx: &dyn NativeContext, thread_id: i64) -> Option<Str
 
 fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ThreadMXBean", 6);
+    init_thread_mxbean_fields(ctx, obj);
+    obj
+}
+
+/// Populate the 6 synthetic `ThreadMXBean` slots the count getters read by
+/// index — shared by the factory path and the `<init>` native so both produce
+/// the same bean.
+fn init_thread_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     let thread_count = ctx.active_thread_count();
     ctx.set_field(obj, 0, Value::Int(thread_count)); // threadCount (real)
     ctx.set_field(obj, 1, Value::Int(thread_count)); // peakThreadCount (real)
@@ -3173,14 +3372,19 @@ fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, 3, Value::Int(0)); // daemonThreadCount
     ctx.set_field(obj, 4, Value::Long(-1)); // currentThreadCpuTime (not supported)
     ctx.set_field(obj, 5, Value::Long(-1)); // currentThreadUserTime
-    obj
 }
 
 fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/ThreadMXBean";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface — synthetic receivers only. Without this the count getters
+    // below read untyped default slots instead of the live thread counts.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_thread_mxbean_fields(ctx, this);
+        Ok(None)
+    });
 
     r.register(cls, "getThreadCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3398,8 +3602,19 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
 // 6. ClassLoadingMXBean — 3-field synthetic
 // ---------------------------------------------------------------------------
 
+/// Slot holding the `verbose` flag `setVerbose`/`isVerbose` round-trip
+/// through. Slots 0..2 are the three class-count metrics.
+const CLM_VERBOSE: usize = 3;
+
 fn alloc_class_loading_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 3);
+    let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 4);
+    init_class_loading_mxbean_fields(ctx, obj);
+    obj
+}
+
+/// Populate the synthetic `ClassLoadingMXBean` slots — shared by the factory
+/// path and the `<init>` native.
+fn init_class_loading_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     let loaded = ctx.loaded_class_count() as i32;
     ctx.set_field(obj, 0, Value::Int(loaded)); // loadedClassCount (real)
     ctx.set_field(
@@ -3407,19 +3622,23 @@ fn alloc_class_loading_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
         1,
         Value::Long(loaded as i64 + ctx.unloaded_class_count() as i64),
     );
-    ctx.set_field(
-        obj,
-        2,
-        Value::Long(ctx.unloaded_class_count() as i64),
-    );
-    obj
+    ctx.set_field(obj, 2, Value::Long(ctx.unloaded_class_count() as i64));
+    // Verbose class loading starts off, exactly as it does on a HotSpot that
+    // was not given `-verbose:class`.
+    ctx.set_field(obj, CLM_VERBOSE, Value::Int(0));
 }
 
 fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/ClassLoadingMXBean";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface — synthetic receivers only. Establishes the verbose flag the
+    // setter/getter pair below round-trip through.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_class_loading_mxbean_fields(ctx, this);
+        Ok(None)
+    });
 
     r.register(cls, "getLoadedClassCount", "()I", |ctx, _args| {
         Ok(Some(Value::Int(ctx.loaded_class_count() as i32)))
@@ -3432,10 +3651,31 @@ fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
     r.register(cls, "getUnloadedClassCount", "()J", |ctx, _args| {
         Ok(Some(Value::Long(ctx.unloaded_class_count() as i64)))
     });
-    r.register(cls, "isVerbose", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // isVerbose/setVerbose must round-trip: the JMM contract is that
+    // `setVerbose(b)` is observable through `isVerbose()`. Previously the
+    // setter discarded the flag and the getter answered a hard-coded `false`,
+    // so `setVerbose(!isVerbose())` left the bean unchanged — a live,
+    // measured defect. CratonVM has no `-verbose:class` tracing to actually
+    // switch on, so the flag is state-only; that is a smaller lie than
+    // dropping the caller's write entirely, and it is what a HotSpot with
+    // class-load logging disabled reports too.
+    r.register(cls, "isVerbose", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let verbose = match ctx.get_field(this, CLM_VERBOSE) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(verbose)))
     });
-    r.register(cls, "setVerbose", "(Z)V", native_noop_with_this);
+    r.register(cls, "setVerbose", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let verbose = match args.get(1) {
+            Some(Value::Int(v)) => i32::from(*v != 0),
+            _ => 0,
+        };
+        ctx.set_field(this, CLM_VERBOSE, Value::Int(verbose));
+        Ok(None)
+    });
     r.set_category(__prev_cat);
 }
 
@@ -3445,6 +3685,13 @@ fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
 
 fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/OperatingSystemMXBean", 5);
+    init_os_mxbean_fields(ctx, obj);
+    obj
+}
+
+/// Populate the 5 synthetic `OperatingSystemMXBean` slots — shared by the
+/// factory path and the `<init>` native.
+fn init_os_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     // REAL: OS name / arch / version come from the live process. name+arch
     // use std::env consts; version prefers the `os.version` system property
     // (populated by the VM at startup, same source RuntimeMXBean.getClassPath
@@ -3465,14 +3712,19 @@ fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let cpus = ctx.available_processor_count();
     ctx.set_field(obj, 3, Value::Int(cpus));
     ctx.set_field(obj, 4, Value::Double(-1.0));
-    obj
 }
 
 fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/OperatingSystemMXBean";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface — synthetic receivers only. All four index-based getters
+    // below would otherwise read null / untyped default slots.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_os_mxbean_fields(ctx, this);
+        Ok(None)
+    });
 
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3502,6 +3754,13 @@ fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
 
 fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/CompilationMXBean", 3);
+    init_compilation_mxbean_fields(ctx, obj);
+    obj
+}
+
+/// Populate the 3 synthetic `CompilationMXBean` slots — shared by the factory
+/// path and the `<init>` native.
+fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     // name = CratonVM's real JIT identity (not a fabricated foreign name).
     // totalCompilationTime stays 0 and isCompilationTimeMonitoringSupported
     // stays false because the VM does NOT track cumulative JIT wall time —
@@ -3513,14 +3772,19 @@ fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     ctx.set_field(obj, 1, Value::Long(0)); // totalCompilationTime (unsupported)
     ctx.set_field(obj, 2, Value::Int(0)); // isCompilationTimeMonitoringSupported = false
-    obj
 }
 
 fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/CompilationMXBean";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface — synthetic receivers only. `getName()` reads slot 0, which
+    // is null on an unconstructed bean.
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_compilation_mxbean_fields(ctx, this);
+        Ok(None)
+    });
 
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3599,6 +3863,13 @@ fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
 
 fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/GarbageCollectorMXBean", 4);
+    init_gc_mxbean_fields(ctx, obj);
+    obj
+}
+
+/// Populate the 4 synthetic `GarbageCollectorMXBean` slots — shared by the
+/// factory path and the `<init>` native.
+fn init_gc_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     let name = ctx.create_string("CratonVM GC");
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     let gc_count = ctx.gc_collection_count() as i64;
@@ -3613,14 +3884,20 @@ fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.set_array_element(pool_names, 1, Value::Object(Some(survivor)));
     ctx.set_array_element(pool_names, 2, Value::Object(Some(old_gen)));
     ctx.set_field(obj, 3, Value::Object(Some(pool_names)));
-    obj
 }
 
 fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/GarbageCollectorMXBean";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    // Interface — synthetic receivers only. `getName()` / `getMemoryPoolNames()`
+    // read slots 0 and 3, both null on an unconstructed bean (a null
+    // `String[]` return from `getMemoryPoolNames()` NPEs its callers).
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        init_gc_mxbean_fields(ctx, this);
+        Ok(None)
+    });
 
     r.register(cls, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -5642,7 +5919,7 @@ mod jmx_tests {
         // MemoryMXBean = 6 fields
         // MemoryUsage = 4 fields
         // ThreadMXBean = 6 fields
-        // ClassLoadingMXBean = 3 fields
+        // ClassLoadingMXBean = 4 fields (3 counters + the verbose flag)
         // OperatingSystemMXBean = 5 fields
         // CompilationMXBean = 3 fields
         // GarbageCollectorMXBean = 4 fields

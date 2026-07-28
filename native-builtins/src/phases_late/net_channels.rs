@@ -2297,6 +2297,12 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
         "(Ljava/net/http/WebSocket;ILjava/lang/String;)Ljava/util/concurrent/CompletionStage;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    // KEEP: `Listener.onError`'s JDK default body is genuinely empty
+    // (`default void onError(WebSocket ws, Throwable error) {}`) — the
+    // no-op IS the spec. It cannot swallow a user override either: `handle`
+    // resolves to the implementing class, so native lookup (keyed on the
+    // resolved method's declaring class) never reaches this interface entry
+    // for a class that declares its own `onError`.
     r.register(
         wsl,
         "onError",
@@ -3729,6 +3735,62 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
 // com.sun.net.httpserver — HttpServer, HttpContext, HttpExchange, HttpHandler, Headers
 // =============================================================================
 
+// `HttpContext` is a 2-slot synthetic (path=0, handler=1) whose layout is
+// mirrored in `class_manager.rs::synthetic_stub_fields` and allocated from two
+// separate modules, so the authenticator cannot simply take a third slot. Bind
+// it in a side table keyed by (vm, identity hash), holding a global GC root so
+// a moving collector cannot leave the entry pointing at a vacated address.
+type HttpContextKey = (usize, i32);
+
+fn http_context_authenticators(
+) -> &'static std::sync::Mutex<std::collections::HashMap<HttpContextKey, usize>> {
+    static R: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<HttpContextKey, usize>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn http_context_key(ctx: &dyn NativeContext, hctx: ObjectRef) -> HttpContextKey {
+    (ctx.vm_identity(), ctx.identity_hash_code(hctx))
+}
+
+/// Bind `auth` to `hctx` and return the authenticator it replaced — the real
+/// `HttpContext.setAuthenticator` hands the previous one back.
+///
+/// The displaced global root is deliberately left in place: the reference is
+/// about to be returned to Java, and dropping the root first would hand the
+/// caller an object with no root holding it.
+fn http_context_set_authenticator(
+    ctx: &mut dyn NativeContext,
+    hctx: ObjectRef,
+    auth: Option<ObjectRef>,
+) -> Option<ObjectRef> {
+    let key = http_context_key(ctx, hctx);
+    let handle = auth
+        .map(|auth| ctx.add_global_root(auth))
+        .filter(|h| *h != 0);
+    let previous = {
+        let mut table = http_context_authenticators()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match handle {
+            Some(h) => table.insert(key, h),
+            None => table.remove(&key),
+        }
+    };
+    previous.and_then(|h| ctx.resolve_global_root(h))
+}
+
+fn http_context_authenticator(ctx: &dyn NativeContext, hctx: ObjectRef) -> Option<ObjectRef> {
+    let key = http_context_key(ctx, hctx);
+    let handle = http_context_authenticators()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .copied();
+    handle.and_then(|h| ctx.resolve_global_root(h))
+}
+
 pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3855,11 +3917,48 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         "()Lcom/sun/net/httpserver/HttpHandler;",
         |ctx, args| Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1))),
     );
+    // `setAuthenticator` is a real mutator: dropping the argument silently
+    // disables authentication on the context, which is a security failure
+    // rather than a missing convenience. The JDK signature RETURNS the
+    // authenticator it replaced — javac emits that descriptor at every real
+    // call site, so the void spelling below could never have matched one; it
+    // is kept (now storing too) for in-tree callers that use it.
+    r.register(
+        hctx,
+        "setAuthenticator",
+        "(Lcom/sun/net/httpserver/Authenticator;)Lcom/sun/net/httpserver/Authenticator;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let auth = match args.get(1).copied() {
+                Some(Value::Object(o)) => o,
+                _ => None,
+            };
+            let previous = http_context_set_authenticator(ctx, this, auth);
+            Ok(Some(Value::Object(previous)))
+        },
+    );
     r.register(
         hctx,
         "setAuthenticator",
         "(Lcom/sun/net/httpserver/Authenticator;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let auth = match args.get(1).copied() {
+                Some(Value::Object(o)) => o,
+                _ => None,
+            };
+            let _ = http_context_set_authenticator(ctx, this, auth);
+            Ok(None)
+        },
+    );
+    r.register(
+        hctx,
+        "getAuthenticator",
+        "()Lcom/sun/net/httpserver/Authenticator;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Object(http_context_authenticator(ctx, this))))
+        },
     );
     r.register(
         hctx,
@@ -3906,12 +4005,36 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
 
-    // HttpHandler interface (default no-op so abstract dispatch resolves).
+    // `HttpHandler` is an interface, so under a real JDK the declaring class
+    // of a resolved `handle` is the user's implementation and this entry is
+    // never reached for it; it fires only for a synthetic receiver that has
+    // no implementation anywhere (and in `--synthetic-jdk` mode there is no
+    // interface bytecode to fall through to either). The old no-op left the
+    // request dispatcher in `net_phase_e` reading the exchange's untouched
+    // status slot, so an unhandled request answered `200 OK` with an empty
+    // body — the one reply that is certainly wrong. Report the server-side
+    // failure instead, through the exchange's own natives so this works
+    // against a real `HttpExchange` as well as the synthetic one.
     r.register(
         "com/sun/net/httpserver/HttpHandler",
         "handle",
         "(Lcom/sun/net/httpserver/HttpExchange;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let Some(Value::Object(Some(exchange))) = args.get(1).copied() else {
+                return Ok(None);
+            };
+            // `-1` is the com.sun.net.httpserver convention for "no response
+            // body". Errors are swallowed: failing to report the failure must
+            // not turn into a second, different failure on the caller.
+            let _ = ctx.invoke_virtual(
+                exchange,
+                "sendResponseHeaders",
+                "(IJ)V",
+                &[Value::Int(500), Value::Long(-1)],
+            );
+            let _ = ctx.invoke_virtual(exchange, "close", "()V", &[]);
+            Ok(None)
+        },
     );
 
     // Headers = HashMap pattern (3-field)
