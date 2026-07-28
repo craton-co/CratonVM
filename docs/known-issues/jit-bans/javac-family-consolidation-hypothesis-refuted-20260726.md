@@ -79,7 +79,10 @@ compiled body for `readClass` itself producing `sym == null` — banning
 change how `readClass`'s own body gets JIT'd. Each of these 8 bans
 guards a genuinely distinct x64 lowering defect in its own named method;
 the "javac-family" grouping in the comments describes a shared *trigger
-scenario* (repeated in-process compilation), not a shared *root cause*.
+scenario* (repeated in-process compilation), not a shared 
+
+
+*root cause*.
 
 ## Recommendation
 
