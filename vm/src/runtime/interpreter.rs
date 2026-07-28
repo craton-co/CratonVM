@@ -8086,6 +8086,20 @@ pub(crate) enum OsrBackoffOutcome {
     /// The new current frame index is communicated back via the
     /// `frame_idx` out-parameter (which the helper mutates).
     ContinueDispatch,
+    /// The OSR'd code exited with a Java exception in flight that this frame
+    /// cannot catch (an OSR'd method provably declares no exception table —
+    /// see RBC.6b in `compile_osr_artifact`). The caller must hand the
+    /// throwable to the dispatch loop's `pending_java_exception` channel so it
+    /// unwinds from THIS frame, instead of resuming the loop.
+    ///
+    /// The old behaviour here was `Skip` + a re-stashed exception, i.e.
+    /// "keep interpreting this frame from where it was". That is correct only
+    /// when the bail precedes any committed loop iteration; the exception can
+    /// surface at any invoke, arbitrarily far into the loop, and every
+    /// iteration the OSR'd body had already committed was then executed a
+    /// second time by the interpreter. See the retired
+    /// `jit-osr-bail-on-callee-exception-reruns-loop-iterations` write-up.
+    ThrowJava(ObjectRef),
 }
 
 /// Run the standard back-edge OSR orchestration: backoff check → try_osr →
@@ -8105,6 +8119,10 @@ pub(crate) enum OsrBackoffOutcome {
 ///                             initial_frame_idx, entry_pc) {
 ///     OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
 ///     OsrBackoffOutcome::ContinueDispatch => continue,
+///     OsrBackoffOutcome::ThrowJava(exc) => {
+///         pending_java_exception = Some((exc, entry_pc));
+///         continue;
+///     }
 ///     OsrBackoffOutcome::Skip => {}
 /// }
 /// safepoint_check(shared, thread);
@@ -8218,7 +8236,27 @@ pub(crate) fn try_osr_with_backoff(
         // artifact via its `osr_reused` fast path (no inline compile).
     }
     let osr_class_id = thread.frames[*frame_idx].class_id;
-    match try_osr(shared, thread, *frame_idx, osr_class_id, entry_pc) {
+    // Out-channel for an exception the OSR'd body exited with (see
+    // `OsrBackoffOutcome::ThrowJava`). `try_osr`'s return type has no error
+    // arm, and widening it would touch every `return None` in a ~500-line
+    // function; a single out-parameter written on exactly one path is the
+    // minimal honest channel.
+    let mut osr_throw: Option<ObjectRef> = None;
+    let osr_result = try_osr(
+        shared,
+        thread,
+        *frame_idx,
+        osr_class_id,
+        entry_pc,
+        &mut osr_throw,
+    );
+    // Checked BEFORE the rejection bookkeeping below: the OSR'd body RAN (and
+    // committed loop iterations), so this is not a rejected attempt and must
+    // not consume the per-pc rejection budget.
+    if let Some(exc) = osr_throw {
+        return OsrBackoffOutcome::ThrowJava(exc);
+    }
+    match osr_result {
         Some(osr_val) => {
             if *frame_idx > initial_frame_idx {
                 pop_and_recycle_frame(shared, thread);
@@ -8645,6 +8683,10 @@ fn execute_frame_from_index(
                                         ) {
                                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                             OsrBackoffOutcome::ContinueDispatch => continue,
+                                            OsrBackoffOutcome::ThrowJava(exc) => {
+                                                pending_java_exception = Some((exc, entry_pc));
+                                                continue;
+                                            }
                                             OsrBackoffOutcome::Skip => {}
                                         }
                                         safepoint_check(shared, thread);
@@ -8969,6 +9011,10 @@ fn execute_frame_from_index(
                         ) {
                             OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                             OsrBackoffOutcome::ContinueDispatch => continue,
+                            OsrBackoffOutcome::ThrowJava(exc) => {
+                                pending_java_exception = Some((exc, entry_pc));
+                                continue;
+                            }
                             OsrBackoffOutcome::Skip => {}
                         }
                         safepoint_check(shared, thread);
@@ -9011,6 +9057,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9056,6 +9106,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9100,6 +9154,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9144,6 +9202,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9188,6 +9250,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9232,6 +9298,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9463,6 +9533,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9506,6 +9580,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9549,6 +9627,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9592,6 +9674,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9635,6 +9721,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -9678,6 +9768,10 @@ fn execute_frame_from_index(
                             ) {
                                 OsrBackoffOutcome::ReturnOuter(v) => return Ok(v),
                                 OsrBackoffOutcome::ContinueDispatch => continue,
+                                OsrBackoffOutcome::ThrowJava(exc) => {
+                                    pending_java_exception = Some((exc, entry_pc));
+                                    continue;
+                                }
                                 OsrBackoffOutcome::Skip => {}
                             }
                             safepoint_check(shared, thread);
@@ -34346,6 +34440,37 @@ fn dbg_osr_recompile_reason(
     );
 }
 
+/// BUG-H parity for the OSR tier — does `callee` declare a non-empty exception
+/// table? A direct machine-code `CALL` into such a callee bypasses the
+/// interpreter↔JIT boundary, so an exception the callee should catch locally
+/// never reaches its own handler. Mirrors the gate inside `execute`'s
+/// `callee_compiler` closure; resolution is loader-aware via `caller_class_id`,
+/// exactly like the invoke-site resolution that produced the name.
+///
+/// Unresolvable metadata reports `true` (keep the dispatch helper) — the
+/// conservative direction, since the helper path is always correct.
+fn osr_callee_declares_handlers(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    callee_class: &str,
+    callee_method: &str,
+    callee_desc: &str,
+) -> bool {
+    let cm = shared.classes.class_manager.read();
+    let Some(callee_cid) = cm.find_class_by_name_for_class(callee_class, caller_class_id) else {
+        return true;
+    };
+    let store = cm.class_store();
+    let Some((method, _decl)) =
+        crate::classloading::find_method_recursive(callee_cid, callee_method, callee_desc, store)
+    else {
+        return true;
+    };
+    method
+        .code()
+        .map_or(true, |c| !c.exception_table.is_empty())
+}
+
 fn compile_osr_artifact(
     shared: &SharedVm,
     class_id: ClassId,
@@ -34765,6 +34890,28 @@ fn compile_osr_artifact(
             let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
             let mut owned_jit_invoke_infos2: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
             let mut direct_calls2: Vec<(usize, crate::jit::JitDirectCall)> = Vec::new();
+            // FIX (jit-osr-loop-direct-call-retired-code-segv): the entry
+            // addresses of COMPILED callees baked into this body as raw
+            // machine-code CALLs. `JitCache::prepare_for_publication` turns
+            // these into `_direct_callee_roots` — strong `Arc`s that keep each
+            // callee's `ExecutableBuffer` mapped for as long as this artifact
+            // can run. The method-entry tier has always populated
+            // `_direct_callee_entries` (jit/src/lib.rs); this OSR tier never
+            // did, so its baked CALLs were rooted by NOTHING: the first
+            // background tier-up `put` for such a callee dropped the artifact
+            // this body calls, `ExecutableBuffer::drop` unmapped it, and the
+            // next OSR entry jumped into freed memory (SIGSEGV with
+            // `pc == addr` at the callee's page-aligned entry — ~1-2 % of runs
+            // idle, ~20 % under load, on the `JitOsrLoopProgress` fixture).
+            //
+            // Only real compiled-artifact entries belong here: the intrinsic /
+            // helper direct calls emitted above (`Math.sqrt`,
+            // `Integer.valueOf`, `Integer.intValue`, the `HashMap` fast paths)
+            // are Rust function addresses with no owning artifact, and
+            // `resolve_jit_entry_owner` would fail on them — inflating the
+            // unrooted-callee counter and, under
+            // `CRATONVM_JIT_STRICT_CALLEE_ROOTS`, refusing publication.
+            let mut osr_direct_callee_entries: Vec<usize> = Vec::new();
             let mut mic_slots2: Vec<(usize, *const crate::jit::JitMICSlot)> = Vec::new();
             let mut owned_mic_slots2: Vec<Box<crate::jit::JitMICSlot>> = Vec::new();
             let mut pic_slots2: Vec<(usize, *const crate::jit::JitPICSlot)> = Vec::new();
@@ -35056,6 +35203,26 @@ fn compile_osr_artifact(
                         &callee_method,
                         &callee_desc,
                     )
+                    // BUG-H (jit-osr-bail-on-callee-exception): the OSR tier
+                    // was missing the gate the method-entry `callee_compiler`
+                    // has — never bake a direct machine-code CALL into a
+                    // callee that declares a non-empty exception table. The
+                    // direct CALL bypasses `jit_invoke_dispatch`, so
+                    // `route_implicit_exc_through_callee` never runs and the
+                    // callee's OWN `catch` is skipped: the exception escapes
+                    // into the OSR'd caller, where it hits the OSR bail path.
+                    // Measured on `JitOsrLoopProgress`: a callee whose handler
+                    // catches its own `Boom` had that Boom surface at the OSR
+                    // return five times per 20 000-iteration run. Dropping the
+                    // site to the dispatch helper restores the callee's
+                    // exception table exactly as the method-entry tier does.
+                    && !osr_callee_declares_handlers(
+                        shared,
+                        class_id,
+                        &callee_class,
+                        &callee_method,
+                        &callee_desc,
+                    )
                     // jit-invokedynamic-groovy-regression fix: never bake a
                     // direct machine-code CALL to an indy-trap-bearing
                     // artifact — see the matching gate in `callee_compiler`.
@@ -35075,6 +35242,11 @@ fn compile_osr_artifact(
                                 guard_class_id: 0,
                             },
                         ));
+                        // Keep this callee's body mapped for the lifetime of
+                        // the artifact we are about to emit — see the
+                        // declaration of `osr_direct_callee_entries`.
+                        // `baked_callee_pins` only covers the emit window.
+                        osr_direct_callee_entries.push(entry);
                         continue;
                     }
                 }
@@ -35423,6 +35595,13 @@ fn compile_osr_artifact(
                 return None;
             };
             cm.compiled_via_osr = true;
+            // Hand the baked callee entries to `put_osr` ->
+            // `prepare_for_publication`, which upgrades each to a strong `Arc`
+            // in `_direct_callee_roots`. Without this the OSR body's direct
+            // CALLs are unrooted; see the declaration above.
+            osr_direct_callee_entries.sort_unstable();
+            osr_direct_callee_entries.dedup();
+            cm._direct_callee_entries = osr_direct_callee_entries;
             cm._jit_strings = owned_jit_strings2;
             cm._jit_invoke_infos = owned_jit_invoke_infos2;
             cm._jit_mic_slots.extend(owned_mic_slots2);
@@ -35496,12 +35675,43 @@ fn compile_osr_artifact(
     Some(compiled)
 }
 
+/// jit-osr-bail-on-callee-exception fix — hand an exception the OSR'd body
+/// exited with to the dispatch loop's unwinder instead of resuming the loop.
+///
+/// Returns `true` when the caller must `return None` immediately (the
+/// throwable is now owned by `throw_out` and `OsrBackoffOutcome::ThrowJava`
+/// will deliver it to `pending_java_exception`, which searches this frame's
+/// handlers and then unwinds).
+///
+/// Returns `false` — leaving `throw_out` untouched — only when the OSR'd frame
+/// DOES declare an exception table, in which case the caller keeps its
+/// historical re-stash behaviour. `compile_osr_artifact` refuses to OSR such a
+/// method (RBC.6b), so this is a guard against a future gate relaxation
+/// silently changing exception routing, not a live path.
+fn propagate_osr_exception(
+    thread: &JvmThread,
+    frame_idx: usize,
+    exc: ObjectRef,
+    throw_out: &mut Option<ObjectRef>,
+) -> bool {
+    if !thread.frames[frame_idx].exception_table().is_empty() {
+        return false;
+    }
+    *throw_out = Some(exc);
+    true
+}
+
 fn try_osr(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
     class_id: ClassId,
     entry_pc: usize,
+    // Out-channel: set to the in-flight throwable when the OSR'd body exited
+    // exceptionally and this frame cannot catch it. Written on exactly the
+    // paths that used to re-stash + safe-reject; see `OsrBackoffOutcome::
+    // ThrowJava` for why the safe reject was wrong there.
+    throw_out: &mut Option<ObjectRef>,
 ) -> Option<Option<Value>> {
     if crate::classloading::any_class_redefined() {
         return None;
@@ -35636,13 +35846,36 @@ fn try_osr(
                 &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, cname
             );
         }
-        crate::jit::helpers::stash_jit_pending_exception(exc);
         // OSR is same-frame replacement: the interpreter keeps executing THIS
         // frame, so a frame naming the OSR'd method itself can never be used and
         // is dropped. A frame naming a CALLEE the OSR'd code invoked is a
-        // different matter — the exception is only re-stashed here and the
-        // callee's own drain routes it later, so that frame must survive.
+        // different matter — the callee's own drain routes it later, so that
+        // frame must survive.
         drop_own_exceptional_frame(&class_name_arc, &method_name_arc, &descriptor_arc);
+        // FIX (jit-osr-bail-on-callee-exception-reruns-loop-iterations,
+        // silent wrong answers on default settings): the re-stash + `return
+        // None` below is "OSR rejected, keep interpreting THIS frame from
+        // where it was". That is correct only when the bail precedes any
+        // committed loop iteration — true for the unconditional-at-header
+        // OSR-exit trigger it was written for, false here: the exception
+        // surfaces at an arbitrary invoke, possibly thousands of iterations
+        // into the loop, and the interpreter frame's induction variable and
+        // accumulators were never advanced by the OSR'd code. Every iteration
+        // between OSR entry and the throw was therefore executed a SECOND
+        // time (measured: 20 000 requested, 20 008 executed on the doc's
+        // repro; 12 346 requested, 42 730 executed when the exception escapes
+        // the OSR'd method entirely).
+        //
+        // Propagate instead. This frame cannot catch: `compile_osr_artifact`
+        // refuses to OSR a method with a non-empty exception table (RBC.6b)
+        // and refuses one that `athrow`s (RBC.6), so an exception reaching
+        // here always escapes the OSR'd method. `propagate_osr_exception`
+        // re-checks that rather than assuming it, and falls back to the
+        // historical re-stash if a future gate relaxation makes it false.
+        if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
+            return None;
+        }
+        crate::jit::helpers::stash_jit_pending_exception(exc);
         return None;
     }
     if crate::jit::helpers::take_jit_pending_npe() {
@@ -35678,8 +35911,15 @@ fn try_osr(
                     fire_jvmti_exception_catch(frame, handler_pc);
                     return None;
                 }
-                // No in-frame handler — fall back to re-stash so the
-                // NPE is not lost across the OSR→interpreter handoff.
+                // No in-frame handler. Propagate out of the OSR'd frame
+                // rather than re-stashing and resuming the loop — see the
+                // pending-exception drain above for why resuming re-runs
+                // already-committed iterations.
+                if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
+                    return None;
+                }
+                // Historical fallback (unreachable while RBC.6b holds): keep
+                // the NPE alive across the OSR→interpreter handoff.
                 crate::jit::helpers::stash_jit_pending_exception(exc);
             }
             _ => {
@@ -35707,10 +35947,13 @@ fn try_osr(
             "java/lang/ArrayIndexOutOfBoundsException",
             Some(&msg),
         ) {
-            Ok(exc) => {
-                if let Some((handler_pc, exc_ref)) =
-                    find_exception_handler_any_pc(shared, &thread.frames[frame_idx], entry_pc, exc)
-                {
+            Ok(exc_obj) => {
+                if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
+                    shared,
+                    &thread.frames[frame_idx],
+                    entry_pc,
+                    exc_obj,
+                ) {
                     let frame = &mut thread.frames[frame_idx];
                     frame.stack.clear();
                     let _ = frame.stack.push(Value::Object(Some(exc_ref)));
@@ -35718,7 +35961,13 @@ fn try_osr(
                     fire_jvmti_exception_catch(frame, handler_pc);
                     return None;
                 }
-                // No in-frame handler — re-stash so the AIOOBE is not lost.
+                // No in-frame handler. Propagate out of the OSR'd frame
+                // rather than re-stashing and resuming the loop (see the
+                // pending-exception drain above).
+                if propagate_osr_exception(thread, frame_idx, exc_obj, throw_out) {
+                    return None;
+                }
+                // Historical fallback (unreachable while RBC.6b holds).
                 crate::jit::helpers::stash_jit_pending_aioobe(index, length);
             }
             Err(_) => {
@@ -35755,7 +36004,13 @@ fn try_osr(
                     fire_jvmti_exception_catch(frame, handler_pc);
                     return None;
                 }
-                // No in-frame handler — re-stash so it is not lost.
+                // No in-frame handler. Propagate out of the OSR'd frame
+                // rather than re-stashing and resuming the loop (see the
+                // pending-exception drain above).
+                if propagate_osr_exception(thread, frame_idx, exc, throw_out) {
+                    return None;
+                }
+                // Historical fallback (unreachable while RBC.6b holds).
                 crate::jit::helpers::stash_jit_pending_arithmetic();
             }
             _ => {

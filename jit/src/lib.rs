@@ -673,6 +673,19 @@ fn jit_code_cache_at_capacity() -> bool {
     true
 }
 
+/// Whether to trace code-buffer unmaps (`CRATONVM_DBG_JIT_UNMAP`). Read once and
+/// cached: `Drop` runs on compile threads and during teardown, where a
+/// per-call environment read would be both hot and needlessly fallible.
+fn dbg_jit_unmap_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_UNMAP")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
         if self.ptr.is_null() {
@@ -682,6 +695,23 @@ impl Drop for ExecutableBuffer {
             regions.deregister(self.ptr);
         }
         COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
+        // DIAG: `CRATONVM_DBG_JIT_UNMAP=1` names every code buffer as it is
+        // unmapped. Paired with `CRATONVM_DBG=jitc` (which prints each
+        // artifact's `entry=0x..`) and the crash handler's `pc=` line, it
+        // answers "did this SIGSEGV jump into a body that had just been
+        // retired?" in a single run — the question each round of the
+        // retired-JIT-code family previously needed a bespoke LD_PRELOAD shim
+        // for. It is what identified the unrooted OSR direct-call targets
+        // (`osr_direct_callee_entries` in the interpreter's
+        // `compile_osr_artifact`).
+        if dbg_jit_unmap_enabled() {
+            eprintln!(
+                "[jit-unmap] ptr=0x{:x} cap={} tid={:?}",
+                self.ptr as usize,
+                self.capacity,
+                std::thread::current().id()
+            );
+        }
         platform::free_executable(self.ptr, self.capacity);
     }
 }
@@ -5532,13 +5562,28 @@ pub static UNROOTED_DIRECT_CALLEES: std::sync::atomic::AtomicUsize =
 
 /// `CRATONVM_JIT_STRICT_CALLEE_ROOTS=1` refuses to publish a compiled body whose
 /// baked direct-call targets cannot all be kept alive.
+/// Whether an unrootable baked direct-call target blocks publication.
+///
+/// DEFAULT-ON since 2026-07-28. It arrived default-OFF with the diagnostic that
+/// found the retired-JIT-code family (e4b848394), which only *counted* the
+/// event — so the common case was to publish anyway, exactly the use-after-free
+/// `prepare_for_publication`'s doc comment says must not happen. Observed on
+/// the `JitOsrLoopProgress` fixture: `step`'s C2 compile baked a CALL to
+/// `maybeThrow`'s live entry, a concurrent `maybeThrow` recompile replaced it
+/// and unmapped the old body BEFORE `step` reached publication, and the
+/// published `step` then jumped into the freed page (SIGSEGV, `pc == addr`).
+///
+/// Refusing publication costs one wasted compile: the method stays interpreted
+/// and is recompiled on a later invocation, by which point the callee has a
+/// live body. `CRATONVM_JIT_STRICT_CALLEE_ROOTS=0` restores the historical
+/// publish-anyway behaviour for bisection.
 fn strict_callee_roots_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         cratonvm_types::flags::runtime_var("CRATONVM_JIT_STRICT_CALLEE_ROOTS")
             .map(|v| v != "0")
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
