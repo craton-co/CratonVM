@@ -1683,6 +1683,38 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Obje
     ia
 }
 
+/// `InetAddress.getByAddress(byte[])` — construct a concrete, layout-correct
+/// address mirror from exactly four or sixteen raw octets.
+///
+/// Keep this as the sole implementation and registration of the one-argument
+/// factory. In particular, IPv6 must pass through [`alloc_inet_address`],
+/// which applies HotSpot's uncompressed eight-group text representation.
+fn native_inet_get_by_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = obj_arg(args, 0)?;
+    let len = ctx.array_length(arr);
+    let ip_str = if len == 4 {
+        let b = java_byte_array_to_vec(ctx, arr, 0, 4)?;
+        Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()
+    } else if len == 16 {
+        let b = java_byte_array_to_vec(ctx, arr, 0, 16)?;
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&b);
+        Ipv6Addr::from(octets).to_string()
+    } else {
+        return Err(iae(format!("addr is of illegal length: {len}")));
+    };
+    // `getByAddress` has no separately supplied hostname. Use the same
+    // HotSpot-normalized numeric text for both logical fields; otherwise a
+    // caller that reads the host-side value (such as Jetty's connector setup)
+    // can still observe Rust's RFC-5952-compressed IPv6 form.
+    let ip_text = hotspot_ip_string(&ip_str);
+    let obj = alloc_inet_address(ctx, &ip_text, &ip_text);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
 fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32) -> ObjectRef {
     // Wave 3-B² (RE.4): the real JDK `InetSocketAddress.getPort()` is
     //     getfield  holder
@@ -5119,23 +5151,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         ia,
         "getByAddress",
         "([B)Ljava/net/InetAddress;",
-        |ctx, args| {
-            let arr = obj_arg(args, 0)?;
-            let len = ctx.array_length(arr);
-            let ip_str = if len == 4 {
-                let b = java_byte_array_to_vec(ctx, arr, 0, 4)?;
-                Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()
-            } else if len == 16 {
-                let b = java_byte_array_to_vec(ctx, arr, 0, 16)?;
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&b);
-                Ipv6Addr::from(octets).to_string()
-            } else {
-                return Err(iae(format!("addr is of illegal length: {len}")));
-            };
-            let obj = alloc_inet_address(ctx, &ip_str, &ip_str);
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        native_inet_get_by_address,
     );
 
     // `equals`, `hashCode`, `toString` — registered for `InetAddress` and
@@ -12558,6 +12574,7 @@ struct Re8WinAdapterAddress {
 }
 #[cfg(windows)]
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Re8WinSocketAddress {
     address: *const u8,
     length: i32,
@@ -15298,6 +15315,37 @@ mod tests {
         // Plain IPv4 and non-IP hosts: untouched.
         assert_eq!(hotspot_ip_string("127.0.0.1"), "127.0.0.1");
         assert_eq!(hotspot_ip_string("example.com"), "example.com");
+    }
+
+    #[test]
+    fn re3_get_by_address_uses_hotspot_ipv6_text_and_concrete_layout() {
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(ArrayElementType::Byte, 16);
+        for (i, byte) in [
+            0xfeu8, 0x80, 0, 0, 0, 0, 0, 0, 0x67, 0xb0, 0x09, 0x9e, 0x5a, 0x9b, 0x28,
+            0x7e,
+        ]
+        .iter()
+        .enumerate()
+        {
+            ctx.set_array_element(bytes, i, Value::Int((*byte as i8) as i32));
+        }
+
+        let result = native_inet_get_by_address(&mut ctx, &[Value::Object(Some(bytes))])
+            .expect("a sixteen-byte address must be accepted");
+        let address = match result {
+            Some(Value::Object(Some(address))) => address,
+            other => panic!("expected InetAddress, got {other:?}"),
+        };
+
+        assert_eq!(
+            inet_addr_resolve(&ctx, address),
+            Some((
+                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+            )),
+            "getByAddress must preserve HotSpot's uncompressed IPv6 text"
+        );
     }
 
     #[test]

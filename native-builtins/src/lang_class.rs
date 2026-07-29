@@ -1420,10 +1420,11 @@ pub(crate) fn native_class_get_resource_as_stream(
                         let cls = ctx
                             .class_name_of_id(ctx.class_id_of_object(stream))
                             .unwrap_or_default();
-                        let avail = match ctx.invoke_virtual(stream, "available", "()I", &[]) {
-                            Ok(Some(Value::Int(n))) => n.to_string(),
-                            other => format!("{other:?}"),
-                        };
+                        let avail =
+                            match ctx.invoke_virtual(stream, "available", "()I", &[]) {
+                                Ok(Some(Value::Int(n))) => n.to_string(),
+                                other => format!("{other:?}"),
+                            };
                         eprintln!("[CLASS-RES]   delegated -> stream {cls} available={avail}");
                     }
                     Ok(_) => eprintln!("[CLASS-RES]   delegated -> NULL"),
@@ -2163,13 +2164,13 @@ pub(crate) fn native_class_for_name(
                 );
                 if s111_dbg_enabled()
                     && (dotted_name.contains("ConditionalOnMissingBean")
-                        || dotted_name
-                            .contains("DataSourceAutoConfiguration$PooledDataSourceConfiguration"))
+                        || dotted_name.contains("DataSourceAutoConfiguration$PooledDataSourceConfiguration"))
                 {
                     if let Value::Object(Some(mirror_ref)) = mirror {
                         let cid = ctx.class_id_from_mirror(mirror_ref);
-                        let defining_loader =
-                            cid.and_then(|id| crate::classloader::defining_loader_for(id.as_u32()));
+                        let defining_loader = cid.and_then(|id| {
+                            crate::classloader::defining_loader_for(id.as_u32())
+                        });
                         eprintln!(
                             "[S111-DBG] loadClass({}) mirror={:?} cid={:?} defining_loader={:?}",
                             dotted_name, mirror_ref, cid, defining_loader
@@ -6575,23 +6576,6 @@ pub(crate) fn native_method_get_return_type(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-
-    // Real-JDK Method mirrors can carry a stale/private-field layout view.
-    // The declared member descriptor is authoritative and includes the exact
-    // return type, including annotation members such as Label.value():String.
-    // Resolving it with the declaring class's loader also preserves identity
-    // for application-defined return types.
-    let descriptor = method_descriptor_for_invoke(ctx, this);
-    let (_, return_descriptor) = parse_descriptor_param_and_return(&descriptor);
-    if !return_descriptor.is_empty() {
-        if let Value::Object(Some(clazz)) = method_clazz_value(ctx, this) {
-            if let Some(class_id) = mirror_class_id(ctx, clazz) {
-                return Ok(Some(Value::Object(Some(
-                    descriptor_to_class_mirror_via_loader(ctx, &return_descriptor, class_id),
-                ))));
-            }
-        }
-    }
     Ok(Some(method_return_type_value(ctx, this)))
 }
 
@@ -8088,7 +8072,7 @@ pub(crate) fn native_class_get_declared_methods(
             // `MethodGraph.Compiler`, used by Mockito's inline mock maker)
             // answers differently on CratonVM for
             // `AbstractStringBuilder.substring(int)` on a mocked
-            // `StringBuilder` (see
+            // `StringBuilder` (see 
             // CRATONVM-SPRING-GENUINE-BUGLIST's MockitoBeanByTypeLookup
             // entry). Landing this alone does NOT flip that specific
             // `isOverridden` answer -- confirmed by direct A/B: calling
@@ -10524,25 +10508,19 @@ pub fn proxy_last_interfaces() -> Option<ObjectRef> {
 /// declaring class.  Real-JDK class-definition hooks can omit a direct object
 /// record for generated Ehcache JAXB model classes; their sibling `ConfigType`
 /// in the same namespace retains the authoritative loader identity.
-fn annotation_container_loader(
-    ctx: &mut dyn NativeContext,
-    holder_class_id: ClassId,
-) -> Option<ObjectRef> {
+fn annotation_container_loader(ctx: &mut dyn NativeContext, holder_class_id: ClassId) -> Option<ObjectRef> {
     let holder_name = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
     crate::classloader::defining_loader_for(holder_class_id.as_u32()).or_else(|| {
-        holder_name
-            .starts_with("org/ehcache/xml/model/")
-            .then(|| {
-                ctx.class_id_by_name_near("org/ehcache/xml/model/ConfigType", holder_class_id)
-                    .and_then(|sibling| crate::classloader::defining_loader_for(sibling.as_u32()))
-                    .or_else(|| {
-                        let id = ctx.loader_id_of_class(holder_class_id);
-                        (id >= 3)
-                            .then(|| crate::classloader::loader_object_for_namespace_id(id as u32))
-                            .flatten()
-                    })
-            })
-            .flatten()
+        holder_name.starts_with("org/ehcache/xml/model/").then(|| {
+            ctx.class_id_by_name_near("org/ehcache/xml/model/ConfigType", holder_class_id)
+                .and_then(|sibling| crate::classloader::defining_loader_for(sibling.as_u32()))
+                .or_else(|| {
+                    let id = ctx.loader_id_of_class(holder_class_id);
+                    (id >= 3)
+                        .then(|| crate::classloader::loader_object_for_namespace_id(id as u32))
+                        .flatten()
+                })
+        }).flatten()
     })
 }
 
@@ -11442,20 +11420,21 @@ fn create_annotation_proxy(
         String,
         cratonvm_native_api::AnnotationElementValue,
         Option<String>,
+        Option<ClassId>,
     )> = ann
         .elements
         .iter()
-        .map(|(n, v)| (n.clone(), v.clone(), None))
+        .map(|(n, v)| (n.clone(), v.clone(), None, None))
         .collect();
 
     // Fill in AnnotationDefault values for missing elements
     if let Some(ann_cid) = ann_class_id_opt {
         let methods = ctx.declared_methods(ann_cid);
         let explicit_names: std::collections::HashSet<String> =
-            all_elements.iter().map(|(n, _, _)| n.clone()).collect();
+            all_elements.iter().map(|(n, _, _, _)| n.clone()).collect();
         // For explicit elements, also backfill the return-type descriptor
         // so empty arrays carry the right component hint.
-        for (name, _, desc_slot) in all_elements.iter_mut() {
+        for (name, _, desc_slot, _) in all_elements.iter_mut() {
             if let Some(m) = methods.iter().find(|m| &m.name == name) {
                 if let Some(ret) = m.descriptor.strip_prefix("()") {
                     *desc_slot = Some(ret.to_string());
@@ -11475,8 +11454,42 @@ fn create_annotation_proxy(
                 ctx.method_annotation_default(ann_cid, &m.name, &m.descriptor)
             {
                 let ret_desc = m.descriptor.strip_prefix("()").map(|s| s.to_string());
-                all_elements.push((m.name.clone(), default_val, ret_desc));
+                // AnnotationDefault values are resolved in the annotation
+                // interface's loader, not the loader of the class carrying
+                // this annotation usage. This must agree with
+                // Method.getDefaultValue(), which Spring compares against
+                // the raw annotation value by Class identity.
+                all_elements.push((m.name.clone(), default_val, ret_desc, Some(ann_cid)));
             }
+        }
+    }
+
+    // `@Reflective` declares `value` and `processors` as a reciprocal
+    // Spring `@AliasFor` pair. Keep the proxy representation canonical when
+    // either member is supplied explicitly: Spring's annotation mapping
+    // validates the two members before it applies its own alias adaptation.
+    // Materializing the omitted member from the Java default here can yield a
+    // loader-distinct `Class` mirror after a forked test has populated Spring
+    // metadata caches, even though it denotes the same logical processor.
+    if ann.type_descriptor == "Lorg/springframework/aot/hint/annotation/Reflective;" {
+        let has_explicit_value = ann.elements.iter().any(|(name, _)| name == "value");
+        let has_explicit_processors = ann.elements.iter().any(|(name, _)| name == "processors");
+        let value_index = all_elements.iter().position(|(name, _, _, _)| name == "value");
+        let processors_index = all_elements
+            .iter()
+            .position(|(name, _, _, _)| name == "processors");
+        match (value_index, processors_index) {
+            (Some(value), Some(processors))
+                if has_explicit_value && !has_explicit_processors =>
+            {
+                all_elements[processors].1 = all_elements[value].1.clone();
+            }
+            (Some(value), Some(processors))
+                if has_explicit_processors && !has_explicit_value =>
+            {
+                all_elements[value].1 = all_elements[processors].1.clone();
+            }
+            _ => {}
         }
     }
 
@@ -11508,16 +11521,23 @@ fn create_annotation_proxy(
     // mid-loop, leaving a stale Rust-local copy; pin both across the whole
     // loop and re-fetch before every use, matching the documented
     // `pin_native_root`/`read_native_pin` contract.
-    for (i, (name, val, ret_desc)) in all_elements.iter().enumerate() {
+    for (i, (name, val, ret_desc, default_owner)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
         names_arr = ctx.read_native_pin(names_pin, names_arr);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
+        let (value_container_class_id, value_container_loader) = match default_owner {
+            Some(owner) => (
+                Some(*owner),
+                crate::classloader::defining_loader_for(owner.as_u32()),
+            ),
+            None => (container_class_id, container_loader),
+        };
         let java_val = annotation_element_to_java_typed(
             ctx,
             val,
             ret_desc.as_deref(),
-            container_class_id,
-            container_loader,
+            value_container_class_id,
+            value_container_loader,
             ann_class_id_opt,
         );
         if crate::nbflags().iae_trace2 {
@@ -11748,28 +11768,24 @@ pub(crate) fn annotation_element_to_java_typed(
             // An application-loaded annotation can lack an ObjectRef for its
             // defining loader while its ClassId still carries the correct
             // namespace. Prefer that scoped lookup to the global table.
-            let via_container_scope =
-                container_class_id.and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
-            let enum_cid_opt = annotation_scope
-                .or(via_loader)
-                .or(via_container_scope)
-                .or_else(|| {
-                    // Resolve an annotation enum reference through the declaring
-                    // member's initiating loader. A bare global lookup can miss an
-                    // application dependency that is visible to that member (for
-                    // example Mockito's `Mock$Strictness`) and can also lose the
-                    // correct identity under an isolated loader.
-                    container_class_id.and_then(|holder| {
-                        ctx.class_id_by_name_via_referencing_class(holder, class_name)
-                            .ok()
-                    })
+            let via_container_scope = container_class_id
+                .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+            let enum_cid_opt = annotation_scope.or(via_loader).or(via_container_scope).or_else(|| {
+                // Resolve an annotation enum reference through the declaring
+                // member's initiating loader. A bare global lookup can miss an
+                // application dependency that is visible to that member (for
+                // example Mockito's `Mock$Strictness`) and can also lose the
+                // correct identity under an isolated loader.
+                container_class_id.and_then(|holder| {
+                    ctx.class_id_by_name_via_referencing_class(holder, class_name)
+                        .ok()
                 })
-                .or_else(|| {
-                    ctx.class_id_by_name(class_name).or_else(|| {
-                        let _ = ctx.load_class(class_name);
-                        ctx.class_id_by_name(class_name)
-                    })
-                });
+            }).or_else(|| {
+                ctx.class_id_by_name(class_name).or_else(|| {
+                    let _ = ctx.load_class(class_name);
+                    ctx.class_id_by_name(class_name)
+                })
+            });
             if let Some(enum_cid) = enum_cid_opt {
                 // GC-safety (2026-07-16): this is the "enum builder" residual
                 // gap flagged (but never swept) in
@@ -16882,9 +16898,7 @@ pub(crate) fn native_class_get_declared_classes(
                     .or_else(|| {
                         let ns_id = ctx.loader_id_of_class(class_id);
                         (ns_id >= 3)
-                            .then(|| {
-                                crate::classloader::loader_object_for_namespace_id(ns_id as u32)
-                            })
+                            .then(|| crate::classloader::loader_object_for_namespace_id(ns_id as u32))
                             .flatten()
                     });
                 let driven = loader_obj.and_then(|loader_obj| {
@@ -16902,17 +16916,15 @@ pub(crate) fn native_class_get_declared_classes(
                 });
                 match driven {
                     Some(id) => Some(id),
-                    None => ctx
-                        .class_id_by_name_near(inner_class, class_id)
-                        .or_else(|| {
-                            ctx.load_class(inner_class)
-                                .ok()
-                                .flatten()
-                                .and_then(|value| match value {
-                                    Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
-                                    _ => None,
-                                })
-                        }),
+                    None => ctx.class_id_by_name_near(inner_class, class_id).or_else(|| {
+                        ctx.load_class(inner_class)
+                            .ok()
+                            .flatten()
+                            .and_then(|value| match value {
+                                Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
+                                _ => None,
+                            })
+                    }),
                 }
             }
         };
@@ -18528,14 +18540,11 @@ pub(crate) fn native_class_set_signers(
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::mock_ctx;
     use cratonvm_native_api::NativeContext;
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{
-        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
-        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
-    };
 
     #[test]
     fn string_constructor_reflection_order_matches_hotspot_for_spel_conversion() {
