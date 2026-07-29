@@ -3403,12 +3403,16 @@ fn tlab_alloc_array(
 
 /// Try to allocate an array, running GC and retrying on failure.
 ///
-/// `try_alloc_array_full` is deliberately used rather than the young-only
-/// `try_alloc_array`: it has the same young-first policy, but once a
-/// non-moving JIT-safe sweep has left the young generation fragmented it can
-/// spill the request into old space.  This matches `alloc_object_shared`'s
-/// object path.  Retrying young-only here used to report OOM for a tiny array
-/// while most of the heap was available as old-generation headroom.
+/// The pre-GC probe is deliberately young-only.  Spilling into old space before
+/// the boundary collection defers reclamation and can make the no-JIT native
+/// allocation-pressure path collect later while a native still owns transient
+/// array state.  That corrupted live parser buffers under sustained Hibernate
+/// allocation.  After the boundary collection, JIT mode uses
+/// `try_alloc_array_full` because a non-moving JIT-safe sweep can leave young
+/// space fragmented despite ample old-generation headroom.  Interpreter-only
+/// mode keeps arrays in the moving young generation; diverting those arrays
+/// into old space violated its boundary-pressure ordering and mutated shared
+/// Hibernate query buffers.
 fn gc_alloc_array(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3422,7 +3426,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array_full(class_id, element_type, length)
+        .try_alloc_array(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3439,27 +3443,41 @@ fn gc_alloc_array(
             },
         )));
     }
-    if let Some(arr) = shared
-        .mem
-        .heap
-        .try_alloc_array_full(class_id, element_type, length)
-    {
+    let post_gc = if crate::runtime::env_cache::disable_jit() {
+        shared
+            .mem
+            .heap
+            .try_alloc_array(class_id, element_type, length)
+    } else {
+        shared
+            .mem
+            .heap
+            .try_alloc_array_full(class_id, element_type, length)
+    };
+    if let Some(arr) = post_gc {
         return Ok(arr);
     }
     // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
     // spans — only a completed mark cycle's cleanup can. Run one
     // synchronously and retry once before surfacing OOM.
     g1_force_full_cycle(shared, thread);
-    shared
-        .mem
-        .heap
-        .try_alloc_array_full(class_id, element_type, length)
-        .ok_or_else(|| {
-            maybe_dump_heap_on_oom(shared, thread);
-            MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
-                message: format!("Java heap space (alloc_array length {})", length),
-            }))
-        })
+    let last_attempt = if crate::runtime::env_cache::disable_jit() {
+        shared
+            .mem
+            .heap
+            .try_alloc_array(class_id, element_type, length)
+    } else {
+        shared
+            .mem
+            .heap
+            .try_alloc_array_full(class_id, element_type, length)
+    };
+    last_attempt.ok_or_else(|| {
+        maybe_dump_heap_on_oom(shared, thread);
+        MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
+            message: format!("Java heap space (alloc_array length {})", length),
+        }))
+    })
 }
 
 /// Update the thread's root snapshot with current frame ObjectRefs.
