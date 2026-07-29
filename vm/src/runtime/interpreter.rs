@@ -7255,13 +7255,43 @@ pub fn execute(
                                 // rather than leave it for a later invocation to
                                 // mis-claim. A callee's frame is left alone: its
                                 // exception is still in flight.
+                                if lambda_dispatch_active() {
+                                    let cached = Arc::new(CachedBytecodeMethod {
+                                        declaring_class_id: class_id,
+                                        class_name: Arc::from(class_name_str.as_str()),
+                                        method_name: Arc::from(method_name),
+                                        method_descriptor: Arc::from(method_descriptor),
+                                        source_file: source_file.as_deref().map(Arc::from),
+                                        code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+                                        exception_table: Arc::from(code_attr.exception_table.as_slice()),
+                                        max_stack: code_attr.max_stack,
+                                        max_locals: code_attr.max_locals,
+                                        num_params: count_method_params(method_descriptor) as u16,
+                                        is_synchronized,
+                                        is_static,
+                                        force_native_cache: std::sync::OnceLock::new(),
+                                        native_callback_cache: std::sync::OnceLock::new(),
+                                        invoc_key: std::sync::OnceLock::new(),
+                                        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                                        quickened: std::sync::OnceLock::new(),
+                                    });
+                                    let throw_pc = jit_local_athrow_pc(
+                                        &cached,
+                                        crate::jit::helpers::peek_jit_athrow_bci(),
+                                    );
+                                    crate::jit::helpers::clear_jit_athrow_bci();
+                                    if let Some(result) = run_jit_callee_handler(
+                                        shared, thread, &cached, throw_pc, exc, args,
+                                    ) {
+                                        return result;
+                                    }
+                                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                                }
                                 drop_own_exceptional_frame(
                                     &class_name_str,
                                     method_name,
                                     method_descriptor,
                                 );
-                                // Stash the exception in a variable visible to the interpreter
-                                // loop that runs below (after frame push).
                                 jit_early_exception = Some(exc);
                             } else {
                                 let result = match jit_result {
@@ -24987,6 +25017,14 @@ fn try_invoke_cached_lambda_impl(
 /// `invoke_or_native` fallback would mis-route to the abstract
 /// `java/lang/reflect/InvocationHandler.invoke` (which has no Code
 /// attribute).
+thread_local! {
+    static LAMBDA_DISPATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn lambda_dispatch_active() -> bool {
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.get() != 0)
+}
+
 pub(crate) fn try_lambda_dispatch(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -25030,6 +25068,15 @@ pub(crate) fn try_lambda_dispatch(
         )));
     }
     let _lambda_depth_guard = LambdaDepthGuard;
+
+    struct LambdaDispatchGuard;
+    impl Drop for LambdaDispatchGuard {
+        fn drop(&mut self) {
+            LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _lambda_dispatch_guard = LambdaDispatchGuard;
 
     // Look up the lambda proxy metadata for this ClassId.
     let call_site = {

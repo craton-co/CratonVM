@@ -5,7 +5,7 @@ a full 4548-class suite run surfaced 302 CRASH-status classes attributable to th
 absence, spread far beyond the sampled `bytecode.enhancement` package (ByteBuddy's proxy/lazy-init
 machinery is invoked implicitly by ordinary entity mapping throughout the suite). The ban has been
 re-instated verbatim. See
-`docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-reinstated-20260729-FIXED.md` for the full
+`hib-bytebuddy-reinstated-20260729-FIXED.md` for the full
 verification (298/302 previously-crashing classes now pass with the ban back). Everything below
 this line is the ORIGINAL (now-incorrect) removal rationale, kept for history — do not act on it.
 
