@@ -215,12 +215,6 @@ pub(crate) fn register_net_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(
         ia,
-        "getByAddress",
-        "([B)Ljava/net/InetAddress;",
-        native_inet_get_by_address,
-    );
-    registry.register(
-        ia,
         "getLoopbackAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
@@ -1446,41 +1440,6 @@ fn native_inet_get_all_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(Some(Value::Object(Some(arr))))
 }
 
-/// InetAddress.getByAddress(byte[]) — create from raw bytes.
-///
-/// Accepts a 4-byte array (IPv4) or a 16-byte array (IPv6). The IPv6 path
-/// previously returned a hardcoded `::1` regardless of the input bytes; this
-/// version uses the actual bytes via [`std::net::Ipv6Addr::from`] so that
-/// `getByAddress({0xfe, 0x80, ...})` returns an `InetAddress` whose
-/// `getHostAddress()` reflects the real input.
-fn native_inet_get_by_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let bytes_arr = match args.first() {
-        Some(Value::Object(Some(a))) => *a,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let len = ctx.array_length(bytes_arr);
-    let addr_str = if len == 4 {
-        let b = read_byte_array(ctx, bytes_arr, 4);
-        std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()
-    } else if len == 16 {
-        let b = read_byte_array(ctx, bytes_arr, 16);
-        let mut octets = [0u8; 16];
-        octets.copy_from_slice(&b);
-        std::net::Ipv6Addr::from(octets).to_string()
-    } else {
-        return Err(RuntimeError::IllegalArgumentException {
-            message: format!("addr is of illegal length: {len}"),
-        }
-        .into());
-    };
-    let ia = alloc_concurrent_synthetic(ctx, "java/net/InetAddress", 2);
-    let host = ctx.create_string(&addr_str);
-    let addr = ctx.create_string(&addr_str);
-    ctx.set_field(ia, 0, Value::Object(Some(host)));
-    ctx.set_field(ia, 1, Value::Object(Some(addr)));
-    Ok(Some(Value::Object(Some(ia))))
-}
-
 /// Parse the address string stored on field 1 into an `IpAddr`. Returns
 /// `None` if the field is absent or not parseable.
 fn inet_addr_string(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<std::net::IpAddr> {
@@ -1715,65 +1674,6 @@ mod new2_net_tests {
         assert!(
             ip_s.parse::<std::net::Ipv4Addr>().is_ok(),
             "ip must parse as IPv4 (got {ip_s})"
-        );
-    }
-
-    // ---------------- C2: getByAddress IPv6 ----------------
-
-    #[test]
-    fn inet_get_by_address_ipv4_round_trip() {
-        let mut ctx = MockNativeContext::new();
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
-        // 192.168.1.42 — last octet sign-extends if cast naively.
-        ctx.set_array_element(arr, 0, Value::Int((192u8 as i8) as i32));
-        ctx.set_array_element(arr, 1, Value::Int((168u8 as i8) as i32));
-        ctx.set_array_element(arr, 2, Value::Int(1));
-        ctx.set_array_element(arr, 3, Value::Int(42));
-        let result = native_inet_get_by_address(&mut ctx, &[Value::Object(Some(arr))]).unwrap();
-        let ia = match result {
-            Some(Value::Object(Some(o))) => o,
-            _ => panic!("expected InetAddress"),
-        };
-        let ip = match ctx.get_field(ia, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        assert_eq!(ip, "192.168.1.42");
-    }
-
-    #[test]
-    fn inet_get_by_address_ipv6_uses_real_bytes() {
-        let mut ctx = MockNativeContext::new();
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 16);
-        // fe80::1 — link-local
-        let bytes = [0xfeu8, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        for (i, b) in bytes.iter().enumerate() {
-            ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
-        }
-        let result = native_inet_get_by_address(&mut ctx, &[Value::Object(Some(arr))]).unwrap();
-        let ia = match result {
-            Some(Value::Object(Some(o))) => o,
-            _ => panic!("expected InetAddress"),
-        };
-        let ip = match ctx.get_field(ia, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        // Std-lib formats this as the canonical compressed form.
-        assert_eq!(
-            ip, "fe80::1",
-            "IPv6 getByAddress must use the real bytes, not hardcoded ::1"
-        );
-    }
-
-    #[test]
-    fn inet_get_by_address_invalid_length_throws() {
-        let mut ctx = MockNativeContext::new();
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 7);
-        let result = native_inet_get_by_address(&mut ctx, &[Value::Object(Some(arr))]);
-        assert!(
-            result.is_err(),
-            "byte[] of length != 4 and != 16 must throw IllegalArgumentException"
         );
     }
 

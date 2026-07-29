@@ -341,7 +341,15 @@ mod tests {
     #[test]
     fn hashed_vtable_stub_rejects_array_receivers() {
         let mut buf = ExecutableBuffer::new(4096).expect("buffer");
-        emit_hashed_vtable_stub(&mut buf, 0x7fff_0000_0000_2000, 24, &[32, 40], 0);
+        emit_hashed_vtable_stub(
+            &mut buf,
+            0x7fff_0000_0000_2000,
+            24,
+            &[32, 40],
+            0,
+            0,
+            0,
+        );
         let bytes = buf.as_slice();
         let guard = [
             0x80u8,
