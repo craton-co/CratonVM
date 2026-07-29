@@ -1560,12 +1560,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         let result = shared
             .mem
             .heap
-            .collect_garbage_with_finalizers(
-                &stw,
-                &mut roots,
-                &fin_roots,
-                &shared.threads.monitors,
-            )
+            .collect_garbage_with_finalizers(&stw, &mut roots, &fin_roots, &shared.threads.monitors)
             .0;
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
@@ -12427,7 +12422,9 @@ fn route_jit_exception_through_method(
 
     let mut synchronized_args = cached.is_synchronized.then(|| incoming_args.to_vec());
     let synchronized_monitor = match synchronized_args.as_mut() {
-        Some(args) => Some(JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args)?),
+        Some(args) => Some(JitSynchronizedMonitorGuard::acquire(
+            shared, thread, cached, args,
+        )?),
         None => None,
     };
     let incoming_args = synchronized_args.as_deref().unwrap_or(incoming_args);
@@ -16268,11 +16265,11 @@ fn execute_instruction(
                     }
                 }
             } // end `if any_field_diag()` — consolidated getfield diagnostics
-            // Read side of the [PUTFIELD-WATCH] ledger further down: with both
-            // halves on one filter a "the constructor stored it but the reader
-            // sees null" question is answerable from a single log, without
-            // guessing which of the two sides is wrong. Same class filter
-            // (`CRATONVM_DBG_FIELD_WATCH=<substr>[,<substr>…]`).
+              // Read side of the [PUTFIELD-WATCH] ledger further down: with both
+              // halves on one filter a "the constructor stored it but the reader
+              // sees null" question is answerable from a single log, without
+              // guessing which of the two sides is wrong. Same class filter
+              // (`CRATONVM_DBG_FIELD_WATCH=<substr>[,<substr>…]`).
             if crate::runtime::env_cache::dbg_field_watch() {
                 let decl_name = shared
                     .classes
@@ -16315,11 +16312,11 @@ fn execute_instruction(
                     }
                 }
             }
-              // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
-              // records only is_reference/is_volatile, so we re-read the first
-              // byte of the descriptor from the constant pool to choose the
-              // direct CompactValue push path for J/D.  Two field loads — no
-              // hashmap work on the fast path.
+            // K2 (T10.9.E) — category-2 primitive tag hint.  `ResolvedField`
+            // records only is_reference/is_volatile, so we re-read the first
+            // byte of the descriptor from the constant pool to choose the
+            // direct CompactValue push path for J/D.  Two field loads — no
+            // hashmap work on the fast path.
             let desc_byte = Some(field.desc_byte);
             // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Fast path: no
             // watchpoint registered ⇒ one HashMap read returning None.
@@ -17078,8 +17075,9 @@ fn execute_instruction(
             // once a receiver's concrete class is known (see the
             // `execute_invokevirtual_vtable_fast` "miss path" comment in the
             // raw fast-dispatch loop, which already relies on this fact).
-            match execute_invokevirtual_cached(shared, thread, frame_idx, *index, saved_pc, false, true)?
-            {
+            match execute_invokevirtual_cached(
+                shared, thread, frame_idx, *index, saved_pc, false, true,
+            )? {
                 CachedCallResult::FramePushed => {
                     return Ok(InstructionResult::FramePushed);
                 }
@@ -19774,7 +19772,11 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
 fn array_component_class_name(name: &str) -> Option<&str> {
     let element = name.strip_prefix('[')?.trim_start_matches('[');
     let inner = element.strip_prefix('L')?.strip_suffix(';')?;
-    if inner.is_empty() { None } else { Some(inner) }
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
 }
 
 #[inline]
@@ -20132,10 +20134,8 @@ pub(crate) fn resolve_class_loader_aware(
     // for initiating-resolution map probes merely because another loader was
     // registered elsewhere in the process.
     let has_registered_defining_loader =
-        cratonvm_native_builtins::classloader::defining_loader_for(
-            referencing_class_id.as_u32(),
-        )
-        .is_some();
+        cratonvm_native_builtins::classloader::defining_loader_for(referencing_class_id.as_u32())
+            .is_some();
     let has_loader_namespace = direct_user_loader || has_registered_defining_loader;
     let isolated_url_definition = if has_registered_defining_loader {
         is_isolated_url_loader_definition(shared, thread, referencing_class_id)
@@ -20220,52 +20220,55 @@ pub(crate) fn resolve_class_loader_aware(
     // misses an annotation that its name-keyed lookup just found.
     let loader_faithful = should_use_loader_initiated_resolution(shared, referencing_class_id)
         || isolated_url_definition;
-    let user_loader =
-        if loader_faithful && has_loader_namespace && !name.starts_with('[') && !is_global_resolution_namespace(name) {
-            let direct_loader_id = shared
-                .classes
-                .class_manager
-                .read()
-                .get_loader_id(referencing_class_id);
-            match direct_loader_id {
-                Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => Some(l),
-                // `should_use_loader_initiated_resolution` just confirmed (via the
-                // `defining_loader_for` side table) that `referencing_class_id` WAS
-                // defined by a recognized user loader (Groovy or
-                // CompileWithForkedClassLoader) -- but `class_manager`'s own
-                // `loader_id` field for that same ClassId can disagree (return
-                // `Application`/`None`), silently discarding the gate's answer and
-                // falling all the way through to the loader-BLIND global fallback
-                // below. Observed for the `AotTestContextInitializers`/
-                // `AotTestContextInitializersFactory`/
-                // `DefaultCacheAwareContextLoaderDelegate`/
-                // `AotMergedContextConfiguration` family under
-                // `@CompileWithForkedClassLoader` (2026-07-22 AOT bean-override
-                // double-context-refresh session, see
-                // CRATONVM-SPRING-GENUINE-BUGLIST) -- a `new`
-                // instruction referencing one of these classes resolved via the
-                // global path instead of the fork's own already-loaded copy,
-                // busting a `Class`-identity-keyed cache
-                // (`AotMergedContextConfiguration.hashCode()`) and causing a
-                // second, uncustomized `ApplicationContext` to be created. Trust
-                // the side table `should_use_loader_initiated_resolution` already
-                // consulted directly instead of silently downgrading to "not a
-                // user loader" on a disagreement.
-                _ => cratonvm_native_builtins::classloader::defining_loader_for(
-                    referencing_class_id.as_u32(),
+    let user_loader = if loader_faithful
+        && has_loader_namespace
+        && !name.starts_with('[')
+        && !is_global_resolution_namespace(name)
+    {
+        let direct_loader_id = shared
+            .classes
+            .class_manager
+            .read()
+            .get_loader_id(referencing_class_id);
+        match direct_loader_id {
+            Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => Some(l),
+            // `should_use_loader_initiated_resolution` just confirmed (via the
+            // `defining_loader_for` side table) that `referencing_class_id` WAS
+            // defined by a recognized user loader (Groovy or
+            // CompileWithForkedClassLoader) -- but `class_manager`'s own
+            // `loader_id` field for that same ClassId can disagree (return
+            // `Application`/`None`), silently discarding the gate's answer and
+            // falling all the way through to the loader-BLIND global fallback
+            // below. Observed for the `AotTestContextInitializers`/
+            // `AotTestContextInitializersFactory`/
+            // `DefaultCacheAwareContextLoaderDelegate`/
+            // `AotMergedContextConfiguration` family under
+            // `@CompileWithForkedClassLoader` (2026-07-22 AOT bean-override
+            // double-context-refresh session, see
+            // CRATONVM-SPRING-GENUINE-BUGLIST) -- a `new`
+            // instruction referencing one of these classes resolved via the
+            // global path instead of the fork's own already-loaded copy,
+            // busting a `Class`-identity-keyed cache
+            // (`AotMergedContextConfiguration.hashCode()`) and causing a
+            // second, uncustomized `ApplicationContext` to be created. Trust
+            // the side table `should_use_loader_initiated_resolution` already
+            // consulted directly instead of silently downgrading to "not a
+            // user loader" on a disagreement.
+            _ => cratonvm_native_builtins::classloader::defining_loader_for(
+                referencing_class_id.as_u32(),
+            )
+            .map(|loader_obj| {
+                let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                cratonvm_types::ClassLoaderId::UserDefined(
+                    cratonvm_native_builtins::classloader::loader_namespace_id(
+                        &mut ctx, loader_obj,
+                    ),
                 )
-                .map(|loader_obj| {
-                    let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                    cratonvm_types::ClassLoaderId::UserDefined(
-                        cratonvm_native_builtins::classloader::loader_namespace_id(
-                            &mut ctx, loader_obj,
-                        ),
-                    )
-                }),
-            }
-        } else {
-            None
-        };
+            }),
+        }
+    } else {
+        None
+    };
     if dbg_trace {
         eprintln!("[LOADER-TRACE] name={name} user_loader={user_loader:?}");
     }
@@ -20747,8 +20750,8 @@ fn resolve_field_ref_loader_aware(
     // it may predate the loader's private definition and point at the
     // application copy. A getstatic against that stale owner shares static
     // annotation metadata caches across otherwise isolated frameworks.
-    let isolated_url_definition = loader_sensitive
-        && is_isolated_url_loader_definition(shared, thread, current_class_id);
+    let isolated_url_definition =
+        loader_sensitive && is_isolated_url_loader_definition(shared, thread, current_class_id);
     let loader_local_id = if loader_sensitive {
         if isolated_url_definition {
             lookup_loader_defined_exact(shared, current_class_id, &field_class_name)
@@ -28044,9 +28047,7 @@ pub(crate) fn is_aqls_state_native_override(
     class_name == "java/util/concurrent/locks/AbstractQueuedLongSynchronizer"
         && matches!(
             (method_name, descriptor),
-            ("getState", "()J")
-                | ("setState", "(J)V")
-                | ("compareAndSetState", "(JJ)Z")
+            ("getState", "()J") | ("setState", "(J)V") | ("compareAndSetState", "(JJ)Z")
         )
 }
 
@@ -38723,9 +38724,11 @@ fn try_jit_compile_callee_slow(
     //   * JVMS 5.5: a `static` callee whose declaring class is not yet
     //     initialized (the direct CALL bypasses every init check)
     //   * an artifact carrying an unconditional invokedynamic trap
-    let direct_callee_lookup =
-        |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<(usize, bool)> {
-            macro_rules! dc_no {
+    let direct_callee_lookup = |callee_class: &str,
+                                callee_method: &str,
+                                callee_desc: &str|
+     -> Option<(usize, bool)> {
+        macro_rules! dc_no {
                 ($why:expr) => {{
                     if crate::runtime::env_cache::dbg_jitc() {
                         eprintln!(
@@ -38736,75 +38739,75 @@ fn try_jit_compile_callee_slow(
                     return None;
                 }};
             }
-            if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
-                dc_no!("fjp-blocklist");
-            }
-            if shared
-                .natives
-                .native_methods
-                .find(callee_class, callee_method, callee_desc)
-                .is_some()
-            {
-                dc_no!("native-shadow");
-            }
-            let callee_class_id = {
-                let cm = shared.classes.class_manager.read();
-                let Some(callee_cid) =
-                    cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
-                else {
-                    dc_no!("callee-class-not-found");
-                };
-                let store = cm.class_store();
-                let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
-                    callee_cid,
-                    callee_method,
-                    callee_desc,
-                    store,
-                ) else {
-                    dc_no!("callee-method-not-found");
-                };
-                if method.is_synchronized() {
-                    dc_no!("synchronized");
-                }
-                if method
-                    .code()
-                    .map_or(true, |c| !c.exception_table.is_empty())
-                {
-                    dc_no!("callee-exception-table");
-                }
-                if method.is_static()
-                    && !store
-                        .get(declaring_id)
-                        .map(crate::vm::is_class_initialized_fast)
-                        .unwrap_or(false)
-                {
-                    dc_no!("declaring-class-not-initialized");
-                }
-                callee_cid
+        if is_fjp_subclass_blocklisted(shared, callee_class, Some(cached.declaring_class_id)) {
+            dc_no!("fjp-blocklist");
+        }
+        if shared
+            .natives
+            .native_methods
+            .find(callee_class, callee_method, callee_desc)
+            .is_some()
+        {
+            dc_no!("native-shadow");
+        }
+        let callee_class_id = {
+            let cm = shared.classes.class_manager.read();
+            let Some(callee_cid) =
+                cm.find_class_by_name_for_class(callee_class, cached.declaring_class_id)
+            else {
+                dc_no!("callee-class-not-found");
             };
-            let callee_class_arc: Arc<str> = Arc::from(callee_class);
-            let callee_method_arc: Arc<str> = Arc::from(callee_method);
-            let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
-            let jit_cache = shared.jit.jit_cache.read();
-            let Some(compiled) = jit_cache.get(
-                &callee_class_arc,
-                &callee_method_arc,
-                &callee_desc_arc,
-                callee_class_id,
+            let store = cm.class_store();
+            let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
+                callee_cid,
+                callee_method,
+                callee_desc,
+                store,
             ) else {
-                dc_no!("callee-not-yet-compiled");
+                dc_no!("callee-method-not-found");
             };
-            if compiled.has_indy_trap {
-                dc_no!("indy-trap");
+            if method.is_synchronized() {
+                dc_no!("synchronized");
             }
-            if crate::runtime::env_cache::dbg_jitc() {
-                eprintln!(
-                    "[cratonvm-jitc] bg-direct-call BOUND {callee_class}.{callee_method}{callee_desc}"
-                );
+            if method
+                .code()
+                .map_or(true, |c| !c.exception_table.is_empty())
+            {
+                dc_no!("callee-exception-table");
             }
-            // Cast: object/code pointer to integer address
-            Some((compiled.entry_ptr() as usize, compiled.needs_context()))
+            if method.is_static()
+                && !store
+                    .get(declaring_id)
+                    .map(crate::vm::is_class_initialized_fast)
+                    .unwrap_or(false)
+            {
+                dc_no!("declaring-class-not-initialized");
+            }
+            callee_cid
         };
+        let callee_class_arc: Arc<str> = Arc::from(callee_class);
+        let callee_method_arc: Arc<str> = Arc::from(callee_method);
+        let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
+        let jit_cache = shared.jit.jit_cache.read();
+        let Some(compiled) = jit_cache.get(
+            &callee_class_arc,
+            &callee_method_arc,
+            &callee_desc_arc,
+            callee_class_id,
+        ) else {
+            dc_no!("callee-not-yet-compiled");
+        };
+        if compiled.has_indy_trap {
+            dc_no!("indy-trap");
+        }
+        if crate::runtime::env_cache::dbg_jitc() {
+            eprintln!(
+                "[cratonvm-jitc] bg-direct-call BOUND {callee_class}.{callee_method}{callee_desc}"
+            );
+        }
+        // Cast: object/code pointer to integer address
+        Some((compiled.entry_ptr() as usize, compiled.needs_context()))
+    };
 
     let compile_start = std::time::Instant::now();
     crate::jit::set_self_call_identity_stable(self_call_identity_stable(
@@ -39941,14 +39944,16 @@ impl JitSynchronizedMonitorGuard {
         } else {
             match args.first() {
                 Some(Value::Object(Some(obj))) => *obj,
-                _ => return Err(MethodCallFailed::InternalError(VmError::Internal {
-                    message: "JIT entered synchronized instance method without this".to_string(),
-                })),
+                _ => {
+                    return Err(MethodCallFailed::InternalError(VmError::Internal {
+                        message: "JIT entered synchronized instance method without this"
+                            .to_string(),
+                    }))
+                }
             }
         };
-        let fixed = crate::vm::vm_exec::monitor_enter_synchronized_method(
-            shared, thread, monitor, args,
-        );
+        let fixed =
+            crate::vm::vm_exec::monitor_enter_synchronized_method(shared, thread, monitor, args);
         let pin_index = thread.native_pin_roots.len();
         thread.native_pin_roots.push(fixed);
         Ok(Self {
@@ -39992,7 +39997,10 @@ impl Drop for JitSynchronizedMonitorGuard {
                     "implicit monitorexit after JIT synchronized method failed");
             }
             if !shared.threads.monitors.holds(monitor, thread.thread_id) {
-                shared.threads.thread_registry.remove_jmx_locked_monitor(thread.thread_id, monitor);
+                shared
+                    .threads
+                    .thread_registry
+                    .remove_jmx_locked_monitor(thread.thread_id, monitor);
             }
             thread.native_pin_roots.truncate(self.pin_index);
         }
@@ -40108,10 +40116,13 @@ fn execute_jit_call(
         };
     }
 
-    let mut synchronized_args = cached.is_synchronized
+    let mut synchronized_args = cached
+        .is_synchronized
         .then(|| jit_saved_args_to_values(cached, &saved_args, np));
     let _synchronized_monitor = if let Some(args) = synchronized_args.as_mut() {
-        Some(JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args)?)
+        Some(JitSynchronizedMonitorGuard::acquire(
+            shared, thread, cached, args,
+        )?)
     } else {
         None
     };
@@ -40229,8 +40240,10 @@ fn execute_jit_call(
             // `i64::MIN`-collision fix) so it cannot leak to the next JIT
             // call. The dispatch helper that stashed this exception also set
             // the deopt flag before returning `i64::MIN`.
-            let exc_locals = synchronized_args.as_deref()
-                .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
+            let exc_locals = synchronized_args.as_deref().map_or_else(
+                || jit_saved_args_to_values(cached, &saved_args, np),
+                |args| args.to_vec(),
+            );
             let throw_pc = jit_local_athrow_pc(cached, sig.athrow_bci);
             return route_jit_signal_exception(
                 shared,
@@ -40300,8 +40313,10 @@ fn execute_jit_call(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                let exc_locals = synchronized_args.as_deref()
-                    .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
+                let exc_locals = synchronized_args.as_deref().map_or_else(
+                    || jit_saved_args_to_values(cached, &saved_args, np),
+                    |args| args.to_vec(),
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -40339,8 +40354,10 @@ fn execute_jit_call(
             Some(&msg),
         ) {
             Ok(exc) => {
-                let exc_locals = synchronized_args.as_deref()
-                    .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
+                let exc_locals = synchronized_args.as_deref().map_or_else(
+                    || jit_saved_args_to_values(cached, &saved_args, np),
+                    |args| args.to_vec(),
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -40373,8 +40390,10 @@ fn execute_jit_call(
             },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
-                let exc_locals = synchronized_args.as_deref()
-                    .map_or_else(|| jit_saved_args_to_values(cached, &saved_args, np), |args| args.to_vec());
+                let exc_locals = synchronized_args.as_deref().map_or_else(
+                    || jit_saved_args_to_values(cached, &saved_args, np),
+                    |args| args.to_vec(),
+                );
                 return route_jit_signal_exception(
                     shared,
                     thread,
@@ -40645,7 +40664,9 @@ fn execute_jit_call_decoded(
     }
     let mut synchronized_args = cached.is_synchronized.then(|| args_slice.to_vec());
     let _synchronized_monitor = if let Some(args) = synchronized_args.as_mut() {
-        Some(JitSynchronizedMonitorGuard::acquire(shared, thread, cached, args)?)
+        Some(JitSynchronizedMonitorGuard::acquire(
+            shared, thread, cached, args,
+        )?)
     } else {
         None
     };
@@ -41978,6 +41999,165 @@ fn native_override_for_cached_reflect_invoke(
 /// Fast invokevirtual/invokeinterface/invokespecial using monomorphic inline cache
 /// (stackless dispatch). Returns FramePushed for bytecode cache hits,
 /// Handled for native, CacheMiss for fall-through.
+/// Execute the canonical instance-field accessor body without allocating an
+/// interpreter frame.
+///
+/// A substantial fraction of real workloads are made of generated getters
+/// (`aload_0; getfield; <x>return`).  They are semantically simple, but even
+/// with an already-warm virtual-call cache the normal interpreter path still
+/// builds a frame, executes three bytecodes, and tears the frame down.  That
+/// dominates `--nojit` graph-planning workloads, where the accessors are hot
+/// enough that compiling them would normally hide the cost.
+///
+/// This deliberately accepts only the exact five-byte verifier-safe shape,
+/// uses an *already resolved* field entry (a cold symbolic reference falls
+/// through to ordinary bytecode), and stays out of every JVMTI/redefinition
+/// mode that needs to observe the callee frame or field access.  It therefore
+/// has the same field value and exception behaviour as the bytecode body while
+/// retaining the normal path for all observable instrumentation cases.
+fn try_execute_cached_trivial_instance_getter(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+) -> Result<Option<CachedCallResult>, MethodCallFailed> {
+    if cached.is_static
+        || cached.is_synchronized
+        || cached.num_params != 0
+        || args.len() != 1
+        || crate::classloading::any_class_redefined()
+        || crate::runtime::jvmti::any_method_entry_listener_active()
+        || crate::runtime::jvmti::any_method_exit_listener_active()
+        || crate::runtime::jvmti::any_field_watchpoint_active()
+    {
+        return Ok(None);
+    }
+
+    // Cached bytecode carries two speculative-read padding bytes.
+    let code_len = cached.code.len().saturating_sub(2);
+    let code = &cached.code[..code_len];
+    if code.len() != 5 || code[0] != 0x2a || code[1] != 0xb4 {
+        return Ok(None);
+    }
+    let return_opcode = code[4];
+    if !matches!(return_opcode, 0xac | 0xad | 0xae | 0xaf | 0xb0) {
+        return Ok(None);
+    }
+    let field_cp_index = u16::from_be_bytes([code[2], code[3]]);
+
+    // Do not resolve here: resolving a first-use symbolic reference may load
+    // classes and collect, while the decoded argument is intentionally a
+    // short-lived Rust local.  The ordinary first invocation resolves it and
+    // all later invocations can use this pure cache hit.
+    let field = match shared
+        .classes
+        .resolution_cache
+        .read()
+        .get_field(cached.declaring_class_id, field_cp_index)
+    {
+        Some(field) if !field.is_static && !field.is_volatile => field.clone(),
+        _ => return Ok(None),
+    };
+
+    // Validate that the field descriptor is precisely this method's return
+    // descriptor, not just the broad return opcode category.
+    let descriptor_matches = {
+        let cm = shared.classes.class_manager.read();
+        let Some(class) = cm.get_class(cached.declaring_class_id) else {
+            return Ok(None);
+        };
+        let Some(ConstantPoolEntry::FieldReference {
+            name_and_type_index,
+            ..
+        }) = class.constant_pool.get(field_cp_index)
+        else {
+            return Ok(None);
+        };
+        let Some((_, field_descriptor)) =
+            class.constant_pool.get_name_and_type(*name_and_type_index)
+        else {
+            return Ok(None);
+        };
+        cached
+            .method_descriptor
+            .strip_prefix("()")
+            .is_some_and(|return_descriptor| return_descriptor == field_descriptor)
+    };
+    if !descriptor_matches {
+        return Ok(None);
+    }
+
+    let return_matches_field = matches!(
+        (field.desc_byte, return_opcode),
+        (b'J', 0xad)
+            | (b'F', 0xae)
+            | (b'D', 0xaf)
+            | (b'L' | b'[', 0xb0)
+            | (b'Z' | b'B' | b'C' | b'S' | b'I', 0xac)
+    );
+    if !return_matches_field {
+        return Ok(None);
+    }
+
+    let Value::Object(Some(receiver)) = args[0] else {
+        // The normal invokevirtual null check remains responsible for the
+        // precisely constructed NPE and its stack trace.
+        return Ok(None);
+    };
+    let receiver = shared.mem.heap.load_and_forward(receiver);
+    let mut value = shared.mem.heap.get_field(receiver, field.field_index);
+    match field.desc_byte {
+        b'J' => {
+            let bits = match value {
+                Value::Long(x) => x,
+                Value::Double(x) => x.to_bits() as i64,
+                Value::Int(x) => x as i64,
+                Value::Object(None) | Value::Uninitialized => 0,
+                Value::Object(Some(raw)) => raw.as_ptr() as usize as i64,
+                Value::Float(x) => x.to_bits() as i64,
+                Value::ReturnAddress(pc) => pc as i64,
+            };
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_long_checked(CompactValue::long(bits))?;
+        }
+        b'D' => {
+            let number = match value {
+                Value::Double(x) => x,
+                Value::Long(x) => f64::from_bits(x as u64),
+                Value::Int(x) => x as f64,
+                Value::Object(None) | Value::Uninitialized => 0.0,
+                Value::Object(Some(raw)) => f64::from_bits(raw.as_ptr() as usize as u64),
+                Value::Float(x) => x as f64,
+                Value::ReturnAddress(pc) => pc as f64,
+            };
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_double_checked(CompactValue::double(number))?;
+        }
+        _ => {
+            if field.is_reference {
+                if matches!(value, Value::Int(0) | Value::Long(0)) {
+                    value = Value::Object(None);
+                }
+            } else {
+                value = match value {
+                    Value::Object(None) => Value::Int(0),
+                    Value::Object(Some(raw)) => Value::Int(raw.as_ptr() as usize as i32),
+                    other => other,
+                };
+                value = narrow_int_to_field_type(value, field.desc_byte);
+            }
+            if let Value::Object(Some(object)) = value {
+                value = Value::Object(Some(shared.mem.heap.load_and_forward(object)));
+            }
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+        }
+    }
+    Ok(Some(CachedCallResult::Handled))
+}
+
 fn execute_invokevirtual_cached(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -42590,6 +42770,12 @@ fn execute_invokevirtual_cached(
                         shared, thread, frame_idx, &cached, args_slice,
                     ) {
                         return res;
+                    }
+
+                    if let Some(result) = try_execute_cached_trivial_instance_getter(
+                        shared, thread, frame_idx, &cached, args_slice,
+                    )? {
+                        return Ok(result);
                     }
 
                     // (bug-03 layer B, default-ON; off-switch CRATONVM_JIT_VIRTUAL_TIERUP=0)

@@ -29442,18 +29442,21 @@ pub fn compile_with_param_slots(
     let kernel_reg_homes_osr_requested =
         KERNEL_REG_HOMES_OSR_REQUEST.with(|c| c.take()) && kernel_reg_osr_enabled();
 
-    // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
-    // This is a heuristic only — see the `buf.overflowed()` bailout below for
-    // the safety net. The multipliers are kept generous (and saturating to
-    // avoid usize wrap on huge inputs) so the common case never overflows.
+    // Estimate buffer size. A bytecode invoke is not the old ~40-byte helper
+    // call: the current lowering can emit a context bridge, exception/deopt
+    // edge, and MIC/PIC dispatch machinery. Hibernate's concurrent query path
+    // demonstrated that the former 96-byte invoke allowance repeatedly
+    // exhausted otherwise modest 10 KiB buffers, leaving hot methods in the
+    // interpreter. Keep enough headroom for those sites; the code-cache cap
+    // remains the global bound on retained executable memory.
     let inline_extra: usize = inline_sites
         .values()
         .map(|s| s.callee_code_len.saturating_mul(64))
         .sum();
     let estimated_size = code_len
-        .saturating_mul(64)
-        .saturating_add(4096)
-        .saturating_add(invoke_info.len().saturating_mul(96))
+        .saturating_mul(96)
+        .saturating_add(8192)
+        .saturating_add(invoke_info.len().saturating_mul(512))
         .saturating_add(inline_extra);
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
