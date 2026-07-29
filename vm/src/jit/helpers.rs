@@ -2603,7 +2603,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     // site proven non-escaping by the JIT's scalar-replacement optimizer
     // (`self.scalar_replaced` in `jit/src/x64.rs`'s 0xbb codegen) elides the
     // call to this helper entirely and is NOT covered by this fix -- flagged
-    // as a residual in docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md.
+    // as a residual in CRATONVM-SPRING-GENUINE-BUGLIST.
     if let Some((thread, _guard)) = jit_thread_mut() {
         if let Err(err) = crate::vm::ensure_class_initialized_shared(vm, thread, class_id) {
             use crate::error::MethodCallFailed;
@@ -4064,7 +4064,7 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // a reference by the caller, that `Int(0)` becomes a null pointer --
     // `LineWrapper$FlushType.ordinal()` NPE, JIT-only (the interpreter
     // path always initializes the class on its own earlier `getstatic`,
-    // masking this gap; see docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md,
+    // masking this gap; see CRATONVM-SPRING-GENUINE-BUGLIST,
     // "JavaPoet LineWrapper$FlushType NPE" JIT-only residual).
     //
     // Mirror the interpreter: ensure init before reading. On failure

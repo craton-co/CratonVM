@@ -16743,8 +16743,8 @@ fn execute_instruction(
         // hit non-JDK bytecode already enjoyed. Measured impact: a standalone
         // SAX/DTD parse-loop repro (no Spring/Tomcat involved) went from
         // ~155ms/parse to ~0.6ms/parse on CratonVM after this fix (HotSpot:
-        // ~0.46ms/parse) — see docs/known-issues/CRATONVM-SPRING-GENUINE-
-        // BUGLIST.md, RequestMappingMessageConversionIntegrationTests entry.
+        // ~0.46ms/parse) — see CRATONVM-SPRING-GENUINE-
+        // BUGLIST, RequestMappingMessageConversionIntegrationTests entry.
         Instruction::Invokevirtual(index) | Instruction::Invokespecial(index) => {
             let is_special_invoke = matches!(instruction, Instruction::Invokespecial(_));
             match execute_invokevirtual_cached(
@@ -19611,7 +19611,7 @@ fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectR
 /// fork's own loader already has its own copy of -- surfacing as
 /// `IllegalStateException`/`ClassCastException`-shaped `==`/`instanceof`
 /// failures wherever the two identities meet (see
-/// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md`'s
+/// `CRATONVM-SPRING-GENUINE-BUGLIST`'s
 /// `searchEnclosingClass` writeup). The class is `final` with no
 /// subtypes, so an exact-id match is sufficient -- no `is_subclass_of`
 /// walk needed, unlike Groovy's.
@@ -19964,7 +19964,7 @@ pub(crate) fn resolve_class_loader_aware(
                 // `AotMergedContextConfiguration` family under
                 // `@CompileWithForkedClassLoader` (2026-07-22 AOT bean-override
                 // double-context-refresh session, see
-                // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md) -- a `new`
+                // CRATONVM-SPRING-GENUINE-BUGLIST) -- a `new`
                 // instruction referencing one of these classes resolved via the
                 // global path instead of the fork's own already-loaded copy,
                 // busting a `Class`-identity-keyed cache
@@ -30698,7 +30698,7 @@ pub(crate) fn should_force_registered_native_over_bytecode(
 /// dispatch -- re-ran the full scan on every single call with no
 /// memoization at all. Profiling `BeanRegistrationsAotContributionTests`
 /// (~54 min vs HotSpot's 13s for the same test, see
-/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's AOT cluster
+/// CRATONVM-SPRING-GENUINE-BUGLIST's AOT cluster
 /// section) found exactly this: `intercept_force_registered_native` ->
 /// `should_force_registered_native_over_bytecode` ->
 /// `force_native_over_real_jdk_bytecode` live at the top of repeated gdb

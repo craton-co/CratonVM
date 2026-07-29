@@ -5628,7 +5628,7 @@ pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 // Stale-ObjectRef hazard (2026-07-17, see
-// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md section 5.8 follow-up
+// CRATONVM-SPRING-GENUINE-BUGLIST section 5.8 follow-up
 // #2): `tg_enumerate_threads` walks `ThreadRegistry::alive_thread_objects()`
 // (every live Thread mirror) and, for each one, `tg_matches_thread` walks its
 // full ThreadGroup ancestry chain via repeated `tg_get_field(.., "parent",
@@ -5781,7 +5781,7 @@ pub(crate) fn tg_enumerate_threads(
     // for however long it takes to process every earlier one, which is
     // exactly the window that let this bug reproduce even after the first
     // round of pinning below was added (see
-    // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md 5.8 follow-up
+    // CRATONVM-SPRING-GENUINE-BUGLIST 5.8 follow-up
     // #2). Pin the *entire* snapshot in one tight pass immediately after
     // capturing it instead, so every element is under a live pin before any
     // further GC-unsafe native call has a chance to run.

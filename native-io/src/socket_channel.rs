@@ -1235,7 +1235,7 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // connection (via this exact native) within ~40ms-2s of the
             // handshake completing, before the client's first post-handshake
             // frame write — root cause of that class's TIMEOUT still open, see
-            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md. Kept as a
+            // CRATONVM-SPRING-GENUINE-BUGLIST. Kept as a
             // permanent opt-in hook (zero cost when unset) for whoever
             // continues that investigation, matching CRATONVM_DBG_NET /
             // CRATONVM_DBG_STALE_RECV etc.

@@ -2968,7 +2968,7 @@ pub(crate) fn loader_id_for(ctx: &mut dyn NativeContext, loader: Value) -> u32 {
 /// proxy generated against such a class, mis-routing the proxy into the
 /// Application namespace and CNFE-failing the `Class.forName(name, true,
 /// loader)` CGLIB issues right after — see
-/// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md`'s Groovy cluster
+/// `CRATONVM-SPRING-GENUINE-BUGLIST`'s Groovy cluster
 /// entry (`GroovyAspectTests`/`GroovyAspectIntegrationTests` residuals).
 pub(crate) fn define_class_via_full(
     ctx: &mut dyn NativeContext,

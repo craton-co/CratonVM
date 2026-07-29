@@ -7991,8 +7991,8 @@ pub(crate) fn native_class_get_declared_methods(
             // `MethodGraph.Compiler`, used by Mockito's inline mock maker)
             // answers differently on CratonVM for
             // `AbstractStringBuilder.substring(int)` on a mocked
-            // `StringBuilder` (see docs/known-issues/
-            // CRATONVM-SPRING-GENUINE-BUGLIST.md's MockitoBeanByTypeLookup
+            // `StringBuilder` (see 
+            // CRATONVM-SPRING-GENUINE-BUGLIST's MockitoBeanByTypeLookup
             // entry). Landing this alone does NOT flip that specific
             // `isOverridden` answer -- confirmed by direct A/B: calling
             // Mockito's own `compiler.compile(...)` externally with this fix

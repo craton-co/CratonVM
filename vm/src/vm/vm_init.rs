@@ -4325,7 +4325,7 @@ impl SharedVm {
     /// calls `std::process::abort`.
     ///
     /// JIT-frame caveat (2026-07-16 investigation of the
-    /// `docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md` "T19.H1
+    /// `CRATONVM-SPRING-GENUINE-BUGLIST` "T19.H1
     /// watchdog SIGSEGVs on JIT frames" note): `thread.frames` is the
     /// interpreter's own logical frame stack. A method dispatched straight
     /// to already-JIT-compiled machine code (`execute_invokestatic_cached`

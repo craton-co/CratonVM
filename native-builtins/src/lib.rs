@@ -3477,7 +3477,7 @@ fn spring_extension_get_application_context(
     // Store miss on a different Class-identity Namespace) with its own
     // un-customized ApplicationContext -- this is the AOT bean-override
     // double-context-refresh bug (see
-    // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's AOT cluster
+    // CRATONVM-SPRING-GENUINE-BUGLIST's AOT cluster
     // sections). Anchor resolution on the CURRENT test class's own loader
     // instead via the shared helper above; falls through to the existing,
     // unchanged global behavior when there's no fork-loaded copy.
@@ -32765,7 +32765,7 @@ fn async_worker_pool(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
 /// Netty `Future`/`Promise` instead of a JDK `FutureTask`) reaches this same
 /// native via `invokespecial AbstractExecutorService.submit(...)` from within
 /// their own overriding `submit()` -- see
-/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md 5.2. Those classes have
+/// CRATONVM-SPRING-GENUINE-BUGLIST 5.2. Those classes have
 /// no `workers` field (that's TPE-specific), so the narrower check misreports
 /// them as synthetic and CratonVM's single-threaded-immediate-execution model
 /// silently replaces the real `newTaskFor()` override, handing back a plain

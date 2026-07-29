@@ -3390,7 +3390,7 @@ impl<'a> NativeContextImpl<'a> {
     /// thread construction path itself, so that would loop.
     ///
     /// CONCURRENCY (fixes a confirmed TOCTOU race — see
-    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// CRATONVM-SPRING-GENUINE-BUGLIST, "5.8
     /// follow-up #4"): the body below allocates two `ThreadGroup` objects
     /// and runs their `<init>` (bytecode, can trigger a moving GC), so it
     /// cannot simply hold `main_thread_group`'s write lock across the
