@@ -47,7 +47,7 @@ pub(crate) fn io_flags() -> &'static cratonvm_types::IoFlags {
     &cratonvm_types::flags().io
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -15650,6 +15650,32 @@ fn dc_fds() -> &'static Mutex<HashMap<i32, FdId>> {
     FDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Connection state belongs beside the fd table mapping rather than in the
+// real JDK implementation object's private fields.  Identity hashes survive
+// moving GC, and an fd is connected exactly while this set contains it.
+fn dc_connected_channels() -> &'static Mutex<HashSet<i32>> {
+    static CONNECTED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    CONNECTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn dc_mark_connected(ctx: &dyn NativeContext, channel: ObjectRef) {
+    dc_connected_channels()
+        .lock()
+        .insert(ctx.identity_hash_code(channel));
+}
+
+fn dc_clear_connected(ctx: &dyn NativeContext, channel: ObjectRef) {
+    dc_connected_channels()
+        .lock()
+        .remove(&ctx.identity_hash_code(channel));
+}
+
+fn dc_is_connected(ctx: &dyn NativeContext, channel: ObjectRef) -> bool {
+    dc_connected_channels()
+        .lock()
+        .contains(&ctx.identity_hash_code(channel))
+}
+
 /// The UDP fd backing a `DatagramChannel`. This identity-hash table, plus the
 /// `fd_table` entry it points at, is the **single** source of truth for a
 /// channel's socket: `datagram.rs` resolves through here too, so a channel
@@ -15679,6 +15705,7 @@ pub(crate) fn datagram_channel_udp_clone(
 
 fn set_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef, fd: FdId) {
     dc_fds().lock().insert(ctx.identity_hash_code(channel), fd);
+    dc_clear_connected(ctx, channel);
 }
 
 fn remove_dc_fd(ctx: &dyn NativeContext, channel: ObjectRef) -> Option<FdId> {
@@ -17077,6 +17104,13 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
         native_dc_connect,
     );
+    r.register(
+        dc,
+        "disconnect",
+        "()Ljava/nio/channels/DatagramChannel;",
+        native_dc_disconnect,
+    );
+    r.register(dc, "isConnected", "()Z", native_dc_is_connected);
     r.register(dc, "write", "(Ljava/nio/ByteBuffer;)I", native_dc_write);
     r.register(dc, "read", "(Ljava/nio/ByteBuffer;)I", native_dc_read);
 
@@ -17361,7 +17395,27 @@ fn native_dc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         .map_err(|e| RuntimeError::IOException {
             message: format!("DatagramChannel.connect({peer}): {e}"),
         })?;
+    dc_mark_connected(ctx, this);
     Ok(Some(Value::Object(Some(this))))
+}
+
+fn native_dc_disconnect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    if !dc_is_connected(ctx, this) {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    if let Some(fd) = dc_fd(ctx, this) {
+        ctx.fd_table().udp_disconnect(fd).map_err(|e| RuntimeError::IOException {
+            message: format!("DatagramChannel.disconnect: {e}"),
+        })?;
+    }
+    dc_clear_connected(ctx, this);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn native_dc_is_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    Ok(Some(Value::Int(i32::from(dc_is_connected(ctx, this)))))
 }
 
 fn native_dc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17570,6 +17624,7 @@ fn native_dc_receive(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn native_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg92(args, 0)?;
+    dc_clear_connected(ctx, this);
     if let Some(fd_id) = remove_dc_fd(ctx, this) {
         let _ = ctx.fd_table().close(fd_id);
     }

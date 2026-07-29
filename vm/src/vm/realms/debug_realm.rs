@@ -55,6 +55,16 @@ pub struct DebugRealm {
     /// in `vm-cli/src/main.rs`'s `run()`.
     pub jfr_dump_on_exit: parking_lot::Mutex<Option<(u64, String)>>,
 
+    /// The active recording created by the real-JDK jdk.jfr.Event bridge.
+    /// Kept separate from -XX:StartFlightRecording, which may coexist.
+    pub jfr_java_recording: parking_lot::Mutex<Option<u64>>,
+
+    /// Whether that Java-owned recording is currently accepting events.
+    pub jfr_java_recording_running: std::sync::atomic::AtomicBool,
+
+    /// Last output path supplied by the Java JFR recorder.
+    pub jfr_java_output: parking_lot::Mutex<Option<String>>,
+
     /// obsaudit D15 (2026-07-26) — the real attach-API jcmd processor,
     /// constructed in `Vm::new` (not here — it needs an `Arc<SharedVm>` for
     /// `VmDiagnosticState`, which does not exist yet during `SharedVm::new`)

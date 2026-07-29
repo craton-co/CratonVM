@@ -27582,9 +27582,17 @@ impl Compiler {
                                 || self
                                     .method_label
                                     .starts_with("java/util/regex/Pattern$GroupHead.match");
+                            // Cached direct entries cannot publish the caller's
+                            // precise exception frame. A protected call in a method
+                            // whose handler reads locals must take the dispatch path,
+                            // where `emit_post_invoke_exception_check` records that
+                            // complete caller state before entering its handler.
+                            let protected_precise_handler_call = self.precise_exception_frames
+                                && self.pc_is_protected(pc);
                             let inline_virtual_ic_allowed =
                                 crate::direct_jit_callee_calls_enabled()
-                                    && !regex_backtracking_frame;
+                                    && !regex_backtracking_frame
+                                    && !protected_precise_handler_call;
                             let pic_inline =
                                 inline_virtual_ic_allowed && pic_ptr.is_some() && args_fit;
                             let mic_inline = inline_virtual_ic_allowed
@@ -28218,7 +28226,7 @@ impl Compiler {
                             // megamorphic misses through this exact library.
                             // It reloads arg0, performs two lock-free probes,
                             // and falls through here only on a real miss.
-                            if let Some(pic) = pic_ptr {
+                            if let Some(pic) = pic_ptr.filter(|_| inline_virtual_ic_allowed) {
                                 let arg_offsets: Vec<i32> = (0..n)
                                     .map(|i| args_base_offset + ((n - 1 - i) as i32) * 8)
                                     .collect();

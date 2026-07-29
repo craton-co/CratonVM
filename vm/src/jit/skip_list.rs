@@ -109,27 +109,19 @@ pub enum SkipReason {
     /// JIT-only array-index corruption residual. Keep the implementation
     /// interpreted until the lowering defect is identified.
     BigIntegerArithmetic,
-    /// Javac's `JavacTool.getTask` loses the compiler file-manager context
-    /// after tiered compilation. Keep this cold compiler setup method
-    /// interpreted until its JIT lowering is understood.
+    /// JavacTool.getTask loses the compiler file-manager context after tiered
+    /// compilation. Keep this cold compiler setup method interpreted until
+    /// its JIT lowering is understood.
     JavacToolContext,
-    /// Javac's `ClassReader.readClass` corrupts a `Symbol` reference once
-    /// tier-compiled under repeated in-process compilation. Keep this
-    /// classfile-parsing method interpreted until its JIT lowering is
-    /// understood.
+    /// ClassReader.readClass corrupts a Symbol reference once tier-compiled
+    /// under repeated in-process compilation. Keep this classfile-parsing
+    /// method interpreted until its JIT lowering is understood.
     ClassReaderReadClass,
-    /// Javac's `ClassFinder.complete` has a second, distinct JIT residual in
-    /// the same repeated-in-process-compilation scenario as
-    /// `ClassReaderReadClass` above — a deprecation-warning `-Werror` false
-    /// positive and outright duplicated-token generated source, not an NPE.
-    /// Keep this symbol-completion method interpreted until its JIT lowering
-    /// is understood.
-    ClassFinderComplete,
     /// Javac's `ClassFinder.fillIn` -- the method `ClassFinder.complete`
     /// itself calls to do the actual symbol completion -- is a FIFTH
     /// distinct JIT residual in the same repeated-in-process-compilation
-    /// scenario as `ClassReaderReadClass`/`ClassFinderComplete` above.
-    /// `ClassFinderComplete`'s own doc comment noted `fillIn` was
+    /// scenario as `ClassReaderReadClass`/`ClassFinder.complete` above.
+    /// `ClassFinder.complete`'s own doc comment noted `fillIn` was
     /// bisect-RULED-OUT for the two symptoms known at the time (a
     /// deprecation-warning `-Werror` false positive and duplicated-token
     /// generated source) -- but `fillIn` gets its own independent JIT
@@ -146,7 +138,7 @@ pub enum SkipReason {
     /// standalone repro (`ToolProvider.getSystemJavaCompiler().getTask(...)
     /// .call()` looped in one process, each iteration compiling a trivial
     /// user class against a small JSpecify-`@Nullable`-annotated
-    /// `@FunctionalInterface` also in scope) -- with `ClassFinderComplete`
+    /// `@FunctionalInterface` also in scope) -- with `ClassFinder.complete`
     /// already interpreted per the fix above. Keep this symbol-completion
     /// method interpreted until its own JIT lowering is understood too.
     ClassFinderFillIn,
@@ -156,7 +148,7 @@ pub enum SkipReason {
     /// `enterMember` calls and `ClassType.setEnclosingType` field writes) --
     /// is a SIXTH distinct JIT residual in the same repeated-in-process-
     /// javac-compilation family as `ClassReaderReadClass`/
-    /// `ClassFinderComplete`/`ClassFinderFillIn` above. Symptom: real
+    /// `ClassFinder.complete`/`ClassFinderFillIn` above. Symptom: real
     /// javac's own `class file truncated at offset N` diagnostic (thrown
     /// from `ClassReader.nextChar`/`nextByte`/`nextInt` once the shared
     /// `bp` buffer-position cursor has been driven past the end of the
@@ -189,7 +181,7 @@ pub enum SkipReason {
     /// length `nextInt()` and either dispatching to a specific
     /// `AttributeReader` or skipping `bp += attrLen`) -- is a SEVENTH
     /// distinct JIT residual in the same repeated-in-process-javac-
-    /// compilation family as `ClassReaderReadClass`/`ClassFinderComplete`/
+    /// compilation family as `ClassReaderReadClass`/`ClassFinder.complete`/
     /// `ClassFinderFillIn`/`ClassReaderReadInnerClasses` above, same
     /// "moderately complex counted loop over the shared `bp` cursor" shape.
     /// Symptom: real javac's `bad class file... bad signature: "ourceFile"`
@@ -220,12 +212,12 @@ pub enum SkipReason {
     /// (the $-placeholder format-string parser, reached from
     /// `org/springframework/javapoet/CodeBlock$Builder`) is a FOURTH distinct
     /// JIT residual in the same repeated-in-process-javac-compilation
-    /// scenario as `ClassReaderReadClass`/`ClassFinderComplete` above, but
+    /// scenario as `ClassReaderReadClass`/`ClassFinder.complete` above, but
     /// this one is not in javac itself — it is in Spring's own code
     /// generation support library. Two symptoms trace to this one method:
     /// outright duplicated tokens in the generated source (e.g. `import
     /// import ...`, `class class`) identical in shape to
-    /// `ClassFinderComplete`'s corruption, and a bogus
+    /// `ClassFinder.complete`'s corruption, and a bogus
     /// `ClassCastException: String cannot be cast to TypeName` thrown from
     /// `argToType` — despite `argToType`'s own $T dispatch being guarded by
     /// an `instanceof` immediately before the `checkcast` that throws,
@@ -738,29 +730,10 @@ fn should_skip_jit_internal(
     //      before the throw. Fixed by resuming the callee AT its handler
     //      instead (`interpreter::run_jit_callee_handler`).
     //
-    // The THIRD is still open and is why this ban stays: a compiled method
-    // reached through LAMBDA / method-reference dispatch
-    // (`try_lambda_dispatch` -> `invoke_shared` / `invoke_on_class_shared*`,
-    // not the invoke-cache `CachedInvokeTarget::Jit` path) escapes without
-    // any drain consulting its exception table -- no
-    // `route_jit_signal_exception` and no `route_implicit_exc_through_callee`
-    // fires for it. `CallPathProbe` isolates this precisely: with both fixes
-    // in place `STATIC-direct`, `IFACE-class-inline` and
-    // `IFACE-class-delegating` are clean while `LAMBDA-methodref` and
-    // `LAMBDA-body` still leak. `ClassFinder`'s completer is
-    // `Completer thisCompleter = this::complete;` -- a method reference --
-    // so javac takes exactly that route, and the ban is still load-bearing:
-    // AutowiredAnnotationBeanRegistrationAotContributionTests is 9/14 with it
-    // lifted and 14/14 with it active.
-    //
-    // Also measured, contradicting a common assumption: this method IS
-    // JIT-compiled despite carrying a non-empty exception table
-    // (`CRATONVM_DBG_DUMP_JIT=LIST`), so the "handler-bearing methods are
-    // never admitted" rule of thumb does not apply here.
-    if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
-        return Some(SkipReason::ClassFinderComplete);
-    }
-
+    // Lambda and method-reference dispatch now takes the same precise
+    // handler-resume drain as ordinary JIT entries. CallPathProbe validates
+    // all five routes, including both lambda forms, so complete is eligible
+    // for JIT again.
     if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "fillIn" {
         return Some(SkipReason::ClassFinderFillIn);
     }
@@ -1469,12 +1442,12 @@ fn should_skip_jit_internal(
         // reaches past that point with CRATONVM_DISABLE_JIT=1. Keep controller
         // bytecode interpreted until the special-call backend is corrected.
         // Liftable with CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/as/controller/.
-        // WILDFLY-CONTROLLER-JIT.1's org/jboss/as/controller/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("org/jboss/as/controller/")
-        //     && !package_allowed("org/jboss/as/controller/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
+        // WILDFLY-CONTROLLER-JIT.1's org/jboss/as/controller/ guard is active.
+        if class_name.starts_with("org/jboss/as/controller/")
+            && !package_allowed("org/jboss/as/controller/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
 
         // JSONSMART-PARSER.1 -- REMOVED 2026-07-26. Originally (2026-07-09)
         // the default JIT crashed inside emitted code after compiling parser
@@ -1827,13 +1800,6 @@ fn should_skip_jit_internal(
         // was out of scope for this round. Do NOT lift until that producer
         // is found and fixed, or until the EC `AllTests` run completes
         // cleanly under the allow-packages override.
-        // RBC.1's org/bouncycastle/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("org/bouncycastle/")
-        //     && !is_bouncycastle_crypto_hotpath_carveout(class_name, method_name)
-        //     && !package_allowed("org/bouncycastle/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
 
         // SUNEC-INTPOLY -- REMOVED 2026-07-26, BUT SEE THE WARNING BELOW.
         // Re-verified with a standalone probe (EcIntPolyProbe.java, pure
@@ -2058,12 +2024,6 @@ fn should_skip_jit_internal(
         // a second iteration if the next downstream gap surfaces there.
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/cloud/`.
         // SPB.5's org/springframework/cloud/ guard (Spring CLOUD, not plain
-        // Spring/Spring Boot) -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("org/springframework/cloud/")
-        //     && !package_allowed("org/springframework/cloud/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
 
         // ANTLR.1 -- REMOVED 2026-07-26. Reason 1 (correctness -- the
         // PredictionContext equality/hash miscompile) was already
@@ -2139,10 +2099,6 @@ fn should_skip_jit_internal(
         // `MethodMetadata` and `RequestTemplate` objects, each storing
         // `template` / `headers` / `body` slots immediately after `new`.
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=feign/`.
-        // SPB.7's feign/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("feign/") && !package_allowed("feign/", allow_packages) {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
 
         // SPB.8 (Session 113 r2) — provisional blanket ban for the JBoss
         // Modules class-graph and resource loading code paths.
@@ -2173,12 +2129,12 @@ fn should_skip_jit_internal(
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/modules/`. The
         // companion `org/jboss/as/` ban below covers the WildFly server
         // boot path that consumes the module graph.
-        // SPB.8's org/jboss/modules/ guard -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("org/jboss/modules/")
-        //     && !package_allowed("org/jboss/modules/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
+        // SPB.8's org/jboss/modules/ guard is active.
+        if class_name.starts_with("org/jboss/modules/")
+            && !package_allowed("org/jboss/modules/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
 
         // SPB.8b — `org/jboss/as/` blanket ban REMOVED 2026-07-27.
         //
@@ -2237,22 +2193,22 @@ fn should_skip_jit_internal(
         // were dispatched ~200x in the trace immediately before the crash).
         // Both `org/jboss/msc/` and `org/jboss/logging/` are extended below
         // with the same SPB.8 archetype reasoning.
-        // SPB.8c's org/wildfly/, org/jboss/msc/, org/jboss/logging/ guards -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("org/wildfly/")
-        //     && !package_allowed("org/wildfly/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
-        // if class_name.starts_with("org/jboss/msc/")
-        //     && !package_allowed("org/jboss/msc/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
-        // if class_name.starts_with("org/jboss/logging/")
-        //     && !package_allowed("org/jboss/logging/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
+        // SPB.8c's org/wildfly/, org/jboss/msc/, org/jboss/logging/ guards are active.
+        if class_name.starts_with("org/wildfly/")
+            && !package_allowed("org/wildfly/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/jboss/msc/")
+            && !package_allowed("org/jboss/msc/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+        if class_name.starts_with("org/jboss/logging/")
+            && !package_allowed("org/jboss/logging/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
 
         // SPB.9 -- `org/slf4j/` and `ch/qos/logback/` REMOVED 2026-07-26.
         // Originally (Session 114) banned as a blanket trio (with
@@ -2319,12 +2275,6 @@ fn should_skip_jit_internal(
         // miscompile is root-caused.
         // CGL.1's net/sf/cglib/ guard (the standalone, unshaded CGLIB
         // artifact -- Spring's OWN internal copy is org/springframework/cglib/
-        // and is unaffected either way) -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("net/sf/cglib/")
-        //     && !package_allowed("net/sf/cglib/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
 
         // SPB-FLYWAY-HSQLDB.1 -- REMOVED 2026-07-26. Re-verified with a
         // standalone probe (FlywayHsqldbProbe.java, real hsqldb-2.7.4.jar --
@@ -2476,12 +2426,6 @@ fn should_skip_jit_internal(
         // miscompile is root-caused.
         // PIC.1's org/junit/platform/console/shadow/picocli/ guard (JUnit
         // Platform's own console-standalone launcher tool, not any of the 5
-        // target apps' own test execution path) -- COMMENTED OUT 2026-07-28, UNVERIFIED. Per explicit user decision, only tomcat/hibernate/spring/spring-boot/h2 need to work right now; every ban for an unrelated ecosystem was commented out without re-verification to reduce the JIT-disabled surface for the apps that matter. If a real crash resurfaces on this package for one of the 5 target apps specifically, re-add the ban.
-        // if class_name.starts_with("org/junit/platform/console/shadow/picocli/")
-        //     && !package_allowed("org/junit/platform/console/shadow/picocli/", allow_packages)
-        // {
-        //     return Some(SkipReason::RustJvmTestFixture);
-        // }
     }
 
     None

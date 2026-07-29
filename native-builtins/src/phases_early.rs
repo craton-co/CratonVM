@@ -9116,6 +9116,49 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(task))))
         },
     );
+    // `awaitQuiescence` must observe the FutureTask roots created by the
+    // real-worker `execute(Runnable)` bridge. The old constant true could say
+    // the pool was idle while a worker was blocked inside user code.
+    r.register(
+        "java/util/concurrent/ForkJoinPool",
+        "awaitQuiescence",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        |ctx, args| {
+            let timeout = match args.get(1) {
+                Some(Value::Long(value)) => (*value).max(0) as u64,
+                Some(Value::Int(value)) => (*value).max(0) as u64,
+                _ => 0,
+            };
+            let nanos = match args.get(2).copied() {
+                Some(Value::Object(Some(unit))) => match ctx.invoke_virtual(
+                    unit,
+                    "toNanos",
+                    "(J)J",
+                    &[Value::Long(timeout.min(i64::MAX as u64) as i64)],
+                ) {
+                    Ok(Some(Value::Long(value))) if value > 0 => value as u64,
+                    Ok(Some(Value::Int(value))) if value > 0 => value as u64,
+                    _ => timeout.saturating_mul(1_000_000),
+                },
+                _ => timeout.saturating_mul(1_000_000),
+            };
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_nanos(nanos))
+                .unwrap_or_else(std::time::Instant::now);
+            loop {
+                if crate::util_concurrent_ext::async_tasks_quiescent(ctx) {
+                    return Ok(Some(Value::Int(1)));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(Some(Value::Int(0)));
+                }
+                ctx.begin_blocking_region();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                ctx.end_blocking_region();
+            }
+        },
+    );
+
     // ForkJoinTask.fork / join / invoke / get / isDone / isCompletedNormally /
     // isCancelled / cancel / complete — all routed through the side-table.
     //
