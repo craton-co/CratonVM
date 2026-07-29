@@ -3978,6 +3978,78 @@ impl GenerationalHeap {
         let mut young_from = self.young_from.lock();
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
+
+        // ---- Cheney invariant: to-space must be able to hold ALL of from-space.
+        //
+        // The end-of-cycle expansion further down grows only `young_to`, which
+        // at that point is the arena that was just reset. After the NEXT swap
+        // that grown arena becomes FROM-space while its sibling is still at the
+        // old capacity, so the two semispaces end up a full doubling apart. A
+        // cycle in which more than to-space's worth of data survives then ran
+        // out of destination mid-copy, and `forward_object` had nowhere to put
+        // the object:
+        //
+        //   FATAL: OutOfMemoryError: GC could not relocate a live object -
+        //   young to-space is full (tried 65568 bytes, to-space has
+        //   16724264/16777216 used).
+        //
+        // ...followed by `std::process::abort()`. That killed the VM
+        // un-catchably where HotSpot throws a perfectly ordinary
+        // `OutOfMemoryError`. Reproduced with a 25-line probe under `-Xmx64m`,
+        // with `[youngstate] arena-grow 16777216 -> 33554432` one cycle earlier
+        // naming the asymmetry exactly.
+        //
+        // Equalise here instead of at the growth site: `young_to` was reset at
+        // the end of the previous cycle so it is empty and growing it is legal
+        // (`Arena::grow` asserts precisely that, because `Vec::resize` may
+        // reallocate), and the target is a capacity the sibling arena already
+        // holds - so it is within `max_young_semi_size` by construction and
+        // needs no re-clamping. With this in place `young_to.capacity() >=
+        // young_from.capacity() >= young_from.used()`, and since every
+        // destination byte this cycle can spend comes from a from-space object
+        // (promotion to old gen only ever REMOVES demand), the copy phase can
+        // no longer run out of to-space.
+        if young_to.used() == 0 && young_to.capacity() < young_from.capacity() {
+            let target = young_from.capacity();
+            tracing::debug!(
+                to_capacity = young_to.capacity(),
+                from_capacity = target,
+                "GC: equalising young semispaces before the copy phase"
+            );
+            young_to.grow(target);
+        }
+
+        // Backstop for the same failure. If to-space still cannot cover
+        // from-space (only reachable if the equalisation above was skipped
+        // because to-space was somehow non-empty), SKIP this young collection
+        // rather than start a copy that cannot finish. Over-retaining for one
+        // cycle is recoverable - the allocation slow path spills to old gen,
+        // and if there is genuinely no memory left it raises a *catchable*
+        // `OutOfMemoryError` through `alloc_object_shared`'s normal ladder.
+        // Aborting mid-copy is not recoverable by anyone. Same shape, and the
+        // same "nothing destructive has happened yet" reasoning, as the
+        // object-start-walk skip further down.
+        let to_headroom = young_to.capacity().saturating_sub(young_to.used());
+        if to_headroom < young_from.used() {
+            tracing::warn!(
+                to_headroom,
+                from_used = young_from.used(),
+                "GC: young to-space cannot cover from-space - skipping this young \
+                 collection (over-retain; the allocator raises a catchable OOM if \
+                 memory is genuinely exhausted)"
+            );
+            return (
+                GcResult {
+                    stats: crate::gc::GcStats {
+                        objects_copied: 0,
+                        bytes_copied: 0,
+                        bytes_freed: 0,
+                    },
+                    pointer_map: HashMap::new(),
+                },
+                Vec::new(),
+            );
+        }
         // CRATONVM_DBG_STALE_OBJREF: only locked/touched below when the flag
         // is set (see the `quarantine` field's doc comment); an uncontended
         // lock of an unused, zero-capacity arena otherwise.
@@ -9178,22 +9250,29 @@ impl GenerationalHeap {
                     match young_to.alloc(total_size, 8) {
                         Some(ptr) => ptr,
                         None => {
-                            // UAF fix: both old gen and to-space are full.
-                            // Previously this returned `old_ptr`, leaving the
-                            // object in from-space. But the caller resets
-                            // young_from immediately after this collection,
-                            // wiping that memory — every still-live reference
-                            // to `old_ptr` would then dangle (use-after-free).
-                            // A copying collector cannot safely "skip" an
-                            // object: there is no valid address to hand back.
-                            // This is an unrecoverable OOM; abort hard, the
-                            // same way `alloc_young_initialized` handles young-gen
-                            // exhaustion.
+                            // UNREACHABLE by construction since the semispace
+                            // equalisation + headroom check in
+                            // `collect_garbage_inner` (see the "Cheney
+                            // invariant" block): to-space is guaranteed to be
+                            // able to hold ALL of from-space before the copy
+                            // phase starts, and promotion to old gen only ever
+                            // removes demand from it. Kept as the backstop for
+                            // a future regression of that guarantee.
+                            //
+                            // We cannot degrade gracefully HERE: returning
+                            // `old_ptr` leaves the object in from-space, which
+                            // the caller resets immediately after this
+                            // collection — every still-live reference would
+                            // dangle (use-after-free). A copying collector has
+                            // no valid address to hand back for an unrelocated
+                            // object, which is exactly why the guarantee is
+                            // made up-front instead.
                             eprintln!(
-                                "FATAL: OutOfMemoryError: GC could not relocate a live object — \
-                                 both old gen and young to-space are full during promotion \
-                                 (tried {} bytes, to-space {}/{} used). Cannot leave the object \
-                                 unmoved without dangling references after from-space reset.",
+                                "FATAL: GC could not relocate a live object — both old gen and \
+                                 young to-space are full during promotion (tried {} bytes, \
+                                 to-space {}/{} used). This is an invariant violation: the \
+                                 to-space >= from-space guarantee in collect_garbage_inner \
+                                 should have made this unreachable.",
                                 total_size,
                                 young_to.used(),
                                 young_to.capacity(),
@@ -9208,19 +9287,19 @@ impl GenerationalHeap {
             match young_to.alloc(total_size, 8) {
                 Some(ptr) => ptr,
                 None => {
-                    // UAF fix: young to-space is full. Previously this
-                    // returned `old_ptr`, leaving the object in from-space —
-                    // but the caller resets young_from right after this
-                    // collection, so every live reference to `old_ptr` would
-                    // dangle (use-after-free). A copying collector has no
-                    // valid address to return for an un-relocated object.
-                    // This is an unrecoverable OOM; abort hard, consistent
-                    // with `alloc_young_initialized`'s handling of young-gen exhaustion.
+                    // UNREACHABLE by construction — see the identical case in
+                    // the promotion branch above and the "Cheney invariant"
+                    // block in `collect_garbage_inner`. Returning `old_ptr`
+                    // here would leave the object in from-space, which the
+                    // caller resets right after this collection, dangling every
+                    // live reference to it; that is why the to-space >=
+                    // from-space guarantee is established BEFORE the copy phase
+                    // rather than patched up here.
                     eprintln!(
-                        "FATAL: OutOfMemoryError: GC could not relocate a live object — \
-                         young to-space is full (tried {} bytes, to-space has {}/{} used). \
-                         Cannot leave the object unmoved without dangling references after \
-                         from-space reset.",
+                        "FATAL: GC could not relocate a live object — young to-space is full \
+                         (tried {} bytes, to-space has {}/{} used). This is an invariant \
+                         violation: the to-space >= from-space guarantee in \
+                         collect_garbage_inner should have made this unreachable.",
                         total_size,
                         young_to.used(),
                         young_to.capacity(),

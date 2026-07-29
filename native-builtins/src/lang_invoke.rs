@@ -945,6 +945,28 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         varhandle_access_mode_type_uncached,
     );
 
+    // VarHandle.toMethodHandle(AccessMode) -> MethodHandle.
+    //
+    // Real JDK bytecode resolves this through `VarForm.memberName_table`, and
+    // CratonVM's post-clinit fixup installs a VarForm stub whose four tables
+    // are all null (`vm/src/vm/vm_util.rs`) -- so the real path produced a
+    // MemberName with an EMPTY method name and the call died as
+    // `NoSuchMethodError: java/lang/invoke/VarHandleReferences$FieldInstanceReadWrite.`
+    // (note the missing method name). jboss-threads' `JDKSpecific$ThreadAccess`
+    // (the JDK-24+ multi-release copy) does exactly this to null out
+    // `Thread.threadLocals`, so EVERY worker-thread teardown reported
+    // "terminated with error".
+    //
+    // Our VarHandles are side-table backed, so build the equivalent synthetic
+    // getter/setter MethodHandle directly from that meta -- the same object
+    // `Lookup.findGetter`/`findSetter` hand out, which this VM can dispatch.
+    r.register(
+        vh,
+        "toMethodHandle",
+        "(Ljava/lang/invoke/VarHandle$AccessMode;)Ljava/lang/invoke/MethodHandle;",
+        varhandle_to_method_handle,
+    );
+
     // VarHandle.get(Object...) → Object
     // For instance fields: args = [receiver]; for static: args = []
     r.register(
@@ -8382,6 +8404,16 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/reflect/Field;)Ljava/lang/invoke/MethodHandle;",
         lookup_unreflect_setter,
     );
+    // `unreflectVarHandle(Field)` is `findVarHandle`'s reflection-shaped twin.
+    // Without it the real JDK body ran and produced a VarHandle with no
+    // side-table meta, which every `varhandle_get`/`_set` native then failed
+    // to recognise.
+    r.register(
+        lk,
+        "unreflectVarHandle",
+        "(Ljava/lang/reflect/Field;)Ljava/lang/invoke/VarHandle;",
+        lookup_unreflect_var_handle,
+    );
     // Real signature is `unreflectConstructor(Constructor)` — the previous
     // `(Class, MethodType)` descriptor never matched the real call, so it fell
     // through to real-JDK bytecode that built a real DirectMethodHandle$Constructor
@@ -8806,6 +8838,152 @@ fn lookup_unreflect_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     };
     let mh = alloc_method_handle(ctx, &class_name, &field_name, &desc, MH_KIND_SETTER);
     Ok(Some(Value::Object(Some(mh))))
+}
+
+/// `MethodHandles.Lookup.unreflectVarHandle(Field)`.
+fn lookup_unreflect_var_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    const ACC_STATIC: i32 = 0x0008;
+    let field_obj = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return Err(no_such_field_error("", "")),
+    };
+    let class_mirror = match ctx.get_field_by_name(field_obj, "clazz") {
+        Value::Object(Some(m)) => Some(m),
+        _ => None,
+    };
+    let class_name = match class_mirror {
+        Some(m) => mirror_class_name(ctx, m).unwrap_or_default(),
+        None => String::new(),
+    };
+    let field_name = match ctx.get_field_by_name(field_obj, "name") {
+        Value::Object(Some(n)) => ctx.read_string(n).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let modifiers = match ctx.get_field_by_name(field_obj, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let field_desc = read_field_descriptor_string(ctx, field_obj);
+    if class_name.is_empty() || field_name.is_empty() {
+        return Err(no_such_field_error(&class_name, &field_name));
+    }
+    if (modifiers & ACC_STATIC) != 0 {
+        let vh = alloc_static_var_handle(ctx, &class_name, &field_name, &field_desc);
+        return Ok(Some(Value::Object(Some(vh))));
+    }
+    let field_index = ctx.resolve_field_index(&class_name, &field_name).unwrap_or(0);
+    let class_id = match class_mirror.and_then(|m| mirror_class_id(ctx, m)) {
+        Some(id) => id,
+        None => match ctx.class_id_by_name(&class_name) {
+            Some(id) => id,
+            None => match ctx.ensure_class_initialized(&class_name) {
+                Ok(id) => id,
+                Err(_) => return Err(no_such_field_error(&class_name, &field_name)),
+            },
+        },
+    };
+    let vh = alloc_instance_var_handle(
+        ctx,
+        &class_name,
+        &field_name,
+        &field_desc,
+        field_index,
+        class_id,
+    );
+    Ok(Some(Value::Object(Some(vh))))
+}
+
+/// `VarHandle.toMethodHandle(AccessMode)` -- see the registration comment.
+///
+/// Only the plain read/write access modes are expressible as one of our
+/// synthetic getter/setter MethodHandles. Anything else (the CAS and
+/// get-and-update families) raises `UnsupportedOperationException` rather than
+/// handing back a handle that would silently do the wrong thing.
+fn varhandle_to_method_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let vh = match args.first() {
+        Some(Value::Object(Some(v))) => *v,
+        _ => {
+            return Err(MethodCallFailed::from(RuntimeError::NullPointerException {
+                message: Some("VarHandle.toMethodHandle on a null VarHandle".to_string()),
+            }))
+        }
+    };
+    let mode_name = match args.get(1) {
+        Some(Value::Object(Some(mode))) => access_mode_name(ctx, *mode),
+        _ => String::new(),
+    };
+    let Some(meta) = vh_meta_get(ctx, vh) else {
+        return Err(MethodCallFailed::from(
+            RuntimeError::UnsupportedOperationException {
+                message: "VarHandle.toMethodHandle: VarHandle has no CratonVM meta".to_string(),
+            },
+        ));
+    };
+    let is_static = match meta.kind {
+        VH_KIND_INSTANCE => false,
+        VH_KIND_STATIC => true,
+        other => {
+            return Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: format!(
+                        "VarHandle.toMethodHandle: unsupported VarHandle kind {other} \
+                         (array / byte-view handles have no field-accessor form)"
+                    ),
+                },
+            ))
+        }
+    };
+    let class = meta.class_name.clone();
+    let field = meta.field_name.clone();
+    let fdesc = meta.field_desc.clone();
+    // `GET_AND_*` is the read-modify-write family, NOT a read.
+    let is_get = mode_name.starts_with("GET") && !mode_name.starts_with("GET_AND");
+    let is_set = mode_name.starts_with("SET");
+    let (kind, desc) = if is_get {
+        (
+            MH_KIND_GETTER,
+            if is_static {
+                format!("(){fdesc}")
+            } else {
+                format!("(L{class};){fdesc}")
+            },
+        )
+    } else if is_set {
+        (
+            MH_KIND_SETTER,
+            if is_static {
+                format!("({fdesc})V")
+            } else {
+                format!("(L{class};{fdesc})V")
+            },
+        )
+    } else {
+        return Err(MethodCallFailed::from(
+            RuntimeError::UnsupportedOperationException {
+                message: format!(
+                    "VarHandle.toMethodHandle: access mode {mode_name} has no \
+                     field-accessor MethodHandle form in CratonVM"
+                ),
+            },
+        ));
+    };
+    let mh = alloc_method_handle(ctx, &class, &field, &desc, kind);
+    Ok(Some(Value::Object(Some(mh))))
+}
+
+/// Read a `VarHandle$AccessMode` constant's enum name (`"GET"`, `"SET"`, ...).
+fn access_mode_name(ctx: &mut dyn NativeContext, mode: ObjectRef) -> String {
+    if let Value::Object(Some(n)) = ctx.get_field_by_name(mode, "name") {
+        if let Some(s) = ctx.read_string(n) {
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    match ctx.invoke_virtual(mode, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(n)))) => ctx.read_string(n).unwrap_or_default(),
+        _ => String::new(),
+    }
 }
 
 fn lookup_unreflect_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

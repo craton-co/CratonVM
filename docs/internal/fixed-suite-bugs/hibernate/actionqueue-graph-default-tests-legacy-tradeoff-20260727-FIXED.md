@@ -228,3 +228,18 @@ So the default currently pays three times: 19 gated classes, −28 % on
 insert-heavy flushes, and a permanent divergence from upstream. It still cannot
 be removed today — §2 — but the ledger against it is larger than the original
 doc implied.
+
+## Closure (2026-07-29)
+
+**FIXED.** CratonVM no longer injects the `legacy` queue setting, restoring
+Hibernate's upstream GRAPH default. The JIT code-buffer estimator now leaves
+enough room for real graph-planner call shapes, and the interpreter serves the
+verifier-exact `aload_0; getfield; return` accessor shape without a frame when
+dispatch, linkage, redefinition, volatility, and JVMTI observation permit it.
+
+Validated with the real JDK 25 Hibernate fixture and the uniquely built
+`cratonvm-actionqueue-graph-20260729-019faddd.exe`: all 27 scoped classes and
+202 tests passed in both JIT and `--nojit` modes (`found=started=ok`, zero
+failed, zero aborted, `@@BATCHEND failed_classes=0`). In the full no-JIT sweep,
+the original blockers passed too: `IdentityJoinedSubclassBatchingTest` 6/6 in
+99,515 ms and `JoinedSubclassBatchingTest` 6/6 in 123,100 ms.
