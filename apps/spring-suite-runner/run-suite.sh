@@ -54,7 +54,9 @@ find_vm() {
 }
 
 # Tunables (env or flags).
-BATCH="${BATCH:-12}"            # classes per cratonvm.exe invocation
+# A fresh VM per class is the correctness default: Spring tests create global
+# instrumentation and compiler/class-loader state that is unsafe to batch.
+BATCH="${BATCH:-1}"             # classes per cratonvm.exe invocation
 BATCH_TO="${BATCH_TO:-600}"     # per-batch timeout (s) — hang detector
 ONE_TO="${ONE_TO:-180}"         # per-class re-run timeout (s) for crash recovery
 EXTRA_VM_ARGS="${EXTRA_VM_ARGS:-}"   # extra cratonvm CLI args (verbatim)
@@ -164,7 +166,10 @@ run_mode() {
 
   # slice the list
   local sliced; sliced="$(mktemp)"
-  awk -v s="$start" -v c="$count" 'NR>=(s>0?s:1){print} (c>0 && ++n>=c){exit}' "$listfile" > "$sliced"
+  awk -v s="$start" -v c="$count" '
+    BEGIN { first=(s>0?s:1) }
+    NR>=first { print; n++; if (c>0 && n>=c) exit }
+  ' "$listfile" > "$sliced"
   local total; total="$(wc -l < "$sliced")"
   {
     echo "mode=$label  binary=$VM"
@@ -209,7 +214,8 @@ run_mode() {
       flush_batch
       cur_mod="$mod"
       local cpf="$mod/build/cratonvm-testcp.txt"
-      local mcp="$KRUN_W:$(tr -d '\r' < "$cpf")"
+      # Match Gradle's test runtime instead of preferring the packaged JAR.
+      local mcp="$KRUN_W:$mod/build/classes/java/main:$mod/build/classes/kotlin/main:$mod/build/resources/main:$(tr -d '\r' < "$cpf")"
       af="$outdir/.af_$(basename "$mod").txt"; { echo "-cp"; echo "$mcp"; } > "$af"
       afm="$(cygpath -m "$af")"
     fi
