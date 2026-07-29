@@ -54,7 +54,7 @@ Two NEW findings surfaced while re-testing, both independent of these
 bans (confirmed to reproduce identically whether the bans are active or
 lifted):
 
-- `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`
+- `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`
   — `S03_ConfigProxy` scenario regressed 8/8 → 4/8 since 2026-06-11;
   confirmed NOT JIT-related (reproduces with `CRATONVM_DISABLE_JIT=1`
   too). **FIXED same day**: `define_class_full`'s

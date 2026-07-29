@@ -482,8 +482,9 @@ pub(crate) fn resolve_standard_level(ctx: &mut dyn NativeContext, name: &str) ->
 /// Allocate a `Logger` object, populate its name field, and register
 /// it in the process-wide registry.
 ///
-/// Every non-root logger gets a real parent link (the logger for its
-/// dotted-name prefix, recursively demand-created) so `getParent()` /
+/// Every non-root logger gets a real parent link -- the NEAREST ALREADY
+/// EXISTING dotted-name ancestor, or the root logger when there is none -- so
+/// `getParent()` /
 /// `getEffectiveLevel()`-style ancestor walks terminate correctly instead
 /// of chasing a permanently-null parent. The root logger ("") has no
 /// parent but is seeded with the JDK-default `Level.INFO` so those same
@@ -522,11 +523,15 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
         ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(default_level));
     } else {
         ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
-        let parent_name = match name.rfind('.') {
-            Some(idx) => &name[..idx],
-            None => "",
-        };
-        let parent = get_or_create_logger(ctx, parent_name);
+        // Real JUL does NOT materialise the intermediate namespace nodes:
+        // `LogManager.addLogger` records the name in a `LogNode` tree but only
+        // ever links the new `Logger` to the nearest ancestor that ALREADY has
+        // a Logger object, falling back to the root. Demand-creating the
+        // immediate dotted prefix instead made
+        // `Logger.getLogger("com.example.Foo").getParent()` answer with a
+        // `com.example` logger HotSpot never creates (it answers with the root).
+        let parent_name = nearest_existing_ancestor_name(name);
+        let parent = get_or_create_logger(ctx, &parent_name);
         let parent_pin = ctx.pin_native_root(parent);
         obj = ctx.read_native_pin(obj_pin, obj);
         let parent = ctx.read_native_pin(parent_pin, parent);
@@ -536,6 +541,24 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     obj = ctx.read_native_pin(obj_pin, obj);
     ctx.unpin_native_roots(obj_pin);
     obj
+}
+
+/// The name of the nearest ancestor of `name` that already has a `Logger`
+/// object in the registry, or `""` (the root) when there is none.
+///
+/// This is JUL's `LogManager.LogNode.getParentLogger` rule. Walking the whole
+/// dotted prefix chain matters: `getLogger("a.b.c.d")` with only `a` present
+/// must parent to `a`, not to a freshly fabricated `a.b.c`.
+fn nearest_existing_ancestor_name(name: &str) -> String {
+    let reg = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cur = name;
+    while let Some(idx) = cur.rfind('.') {
+        cur = &cur[..idx];
+        if reg.get(cur).copied().unwrap_or(0) != 0 {
+            return cur.to_string();
+        }
+    }
+    String::new()
 }
 
 /// Resolve `java.util.logging.Logger.NO_RESOURCE_BUNDLE` — the shared
@@ -668,6 +691,10 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> O
         }
     }
     let obj = allocate_logger(ctx, name);
+    // Descendants that were parented to a HIGHER ancestor (or to the root)
+    // before this node existed must now point at it -- JUL does the same in
+    // `LogNode.walkAndSetParent` when `addLogger` inserts an intermediate node.
+    let mut reparent: Vec<u64> = Vec::new();
     {
         let mut reg = logger_registry().lock().unwrap_or_else(|e| e.into_inner());
         // Check again under the lock (TOCTOU); if another thread beat
@@ -679,6 +706,33 @@ pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> O
             }
         }
         reg.insert(name.to_string(), obj.as_ptr() as u64);
+        let prefix = format!("{name}.");
+        for (other, &addr) in reg.iter() {
+            if addr == 0 || !other.starts_with(&prefix) {
+                continue;
+            }
+            // Recompute `other`'s nearest existing ancestor against the
+            // registry as it now stands; only the ones this insert actually
+            // took over get re-linked.
+            let mut cur: &str = other.as_str();
+            let mut nearest: &str = "";
+            while let Some(i) = cur.rfind('.') {
+                cur = &cur[..i];
+                if reg.get(cur).copied().unwrap_or(0) != 0 {
+                    nearest = cur;
+                    break;
+                }
+            }
+            if nearest == name {
+                reparent.push(addr);
+            }
+        }
+    }
+    // `set_field` neither allocates nor safepoints, so `obj` and every address
+    // read out of the registry above stay valid across this loop.
+    for addr in reparent {
+        let child = unsafe { object_from_u64(addr) };
+        ctx.set_field(child, LOGGER_FIELD_PARENT, Value::Object(Some(obj)));
     }
     obj
 }
@@ -6548,20 +6602,23 @@ mod tests {
             )
             .unwrap();
         }
-        // `get_or_create_logger` materialises a real Logger for every
-        // dotted-name ancestor up to the root so `getEffectiveLevel()`-style
-        // walks and JUL's parent-handler propagation terminate correctly
-        // (5bfc73479). Registering "a.b.c" and "d.e.f" therefore also creates
-        // "a", "a.b", "d", "d.e" and the shared root "" — 7 entries, not 2.
-        // What matters here is that both requested loggers are present and
-        // that every entry is an ancestor of one of them.
+        // JUL does NOT materialise the intermediate namespace nodes:
+        // `LogManager.addLogger` links a new Logger to the nearest ancestor
+        // that ALREADY has a Logger object, falling back to the root, and
+        // re-parents existing descendants when an intermediate appears
+        // later. Registering "a.b.c" and "d.e.f" therefore creates exactly
+        // three entries -- the two requested loggers plus the shared root
+        // -- and `getLogger("a.b.c").getParent()` is the ROOT, which is
+        // what HotSpot answers. (This used to demand-create "a", "a.b",
+        // "d" and "d.e" as well, so the registry held 7 entries and
+        // `getParent()` returned a logger HotSpot never creates.)
         {
             let reg = logger_registry()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let mut names: Vec<&str> = reg.keys().map(|k| k.as_str()).collect();
             names.sort_unstable();
-            assert_eq!(names, ["", "a", "a.b", "a.b.c", "d", "d.e", "d.e.f"]);
+            assert_eq!(names, ["", "a.b.c", "d.e.f"]);
         }
         native_reset(&mut ctx, &[Value::Object(Some(mgr))]).unwrap();
         assert!(

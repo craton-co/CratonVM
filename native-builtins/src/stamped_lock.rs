@@ -72,14 +72,36 @@ use parking_lot::{Condvar, Mutex};
 pub const STAMPED_ORIGIN: i64 = 256;
 const JDK_WBIT: i64 = 128;
 
+/// How much one write release advances the version.
+///
+/// The low 8 bits of every stamp are reserved for the mode flags below —
+/// exactly as the JDK reserves its low `ABITS` — so a stamp carries BOTH
+/// "which version of the lock did I observe" and "which mode do I hold".
+/// Without a mode bit, `tryConvertToOptimisticRead` cannot tell a read stamp
+/// from an optimistic one and would either leak a read hold or fail to
+/// release one.
+const VERSION_STEP: i64 = 256;
+/// Set on a WRITE stamp (`writeLock` / `tryWriteLock` / a successful
+/// `tryConvertToWriteLock`). Deliberately the LOW bit: `unlock(J)V` and
+/// several call sites already use "odd stamp ⇒ write stamp".
+const STAMP_WRITE: i64 = 1;
+/// Set on a READ stamp (`readLock` / `tryReadLock` / a successful
+/// `tryConvertToReadLock`).
+const STAMP_READ: i64 = 2;
+/// Selects the version part of a stamp (everything above the mode flags).
+const VERSION_MASK: i64 = !0xFF;
+
 // ---------------------------------------------------------------------------
 // StampedLock backend
 // ---------------------------------------------------------------------------
 
 /// Logical state of one StampedLock instance.
 struct StampedState {
-    /// Version counter. Low bit = write flag (odd ⇒ writer active).
-    stamp: i64,
+    /// Version counter, always a multiple of [`VERSION_STEP`]. Advanced by
+    /// every write release so stamps issued before it stop validating.
+    version: i64,
+    /// A writer currently holds the lock.
+    write_held: bool,
     /// Number of currently held read locks.
     readers: i32,
 }
@@ -87,14 +109,27 @@ struct StampedState {
 impl StampedState {
     fn new() -> Self {
         Self {
-            stamp: STAMPED_ORIGIN,
+            version: STAMPED_ORIGIN,
+            write_held: false,
             readers: 0,
         }
     }
 
     #[inline]
-    fn write_held(&self) -> bool {
-        self.stamp & 1 != 0
+    fn write_stamp(&self) -> i64 {
+        self.version | STAMP_WRITE
+    }
+
+    #[inline]
+    fn read_stamp(&self) -> i64 {
+        self.version | STAMP_READ
+    }
+
+    /// Drop the write hold and publish a new version.
+    #[inline]
+    fn release_write(&mut self) {
+        self.write_held = false;
+        self.version = self.version.wrapping_add(VERSION_STEP);
     }
 }
 
@@ -134,6 +169,11 @@ fn stamped_slot(addr: usize) -> std::sync::Arc<StampedLockSlot> {
         .clone()
 }
 
+/// Clamp a nanosecond timeout to something `Duration::from_nanos` accepts.
+fn timeout_duration(nanos: i64) -> std::time::Duration {
+    std::time::Duration::from_nanos(nanos.max(0) as u64)
+}
+
 /// `<init>()` — establish the slot for this lock's GC-stable identity key.
 pub fn stamped_init(addr: usize) {
     // Always (re-)install a fresh slot so a recycled identity key can't
@@ -146,78 +186,127 @@ pub fn stamped_init(addr: usize) {
 }
 
 /// `writeLock()` — block until exclusive write access is granted, return
-/// the (odd) stamp.
+/// the (odd) write stamp.
 pub fn stamped_write_lock(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
-    while state.write_held() || state.readers > 0 {
+    while state.write_held || state.readers > 0 {
         slot.cv.wait(&mut state);
     }
-    state.stamp |= 1; // set write bit
-    state.stamp
+    state.write_held = true;
+    state.write_stamp()
 }
 
-/// `tryWriteLock()` — non-blocking. Returns 0 on failure, the new odd
-/// stamp on success.
+/// `tryWriteLock()` — non-blocking. Returns 0 on failure, the write stamp
+/// on success.
 pub fn stamped_try_write_lock(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
-    if state.write_held() || state.readers > 0 {
+    if state.write_held || state.readers > 0 {
         return 0;
     }
-    state.stamp |= 1;
-    state.stamp
+    state.write_held = true;
+    state.write_stamp()
+}
+
+/// `tryWriteLock(time, unit)` — wait at most `nanos`. Returns 0 on timeout.
+pub fn stamped_try_write_lock_timed(addr: usize, nanos: i64) -> i64 {
+    let slot = stamped_slot(addr);
+    let mut state = slot.state.lock();
+    if nanos <= 0 {
+        if state.write_held || state.readers > 0 {
+            return 0;
+        }
+        state.write_held = true;
+        return state.write_stamp();
+    }
+    let deadline = std::time::Instant::now() + timeout_duration(nanos);
+    while state.write_held || state.readers > 0 {
+        if slot.cv.wait_until(&mut state, deadline).timed_out() {
+            return 0;
+        }
+    }
+    state.write_held = true;
+    state.write_stamp()
 }
 
 /// `readLock()` — block until no writer is active, then increment the
-/// reader count. Returns the current (even) stamp — the JDK uses bits
-/// 0..7 to encode reader count, but our higher-level state lives in
-/// `readers` so we just hand back the even part of the stamp.
+/// reader count and return a READ stamp (carries [`STAMP_READ`] so
+/// `tryConvertToOptimisticRead` can tell it from an optimistic stamp).
 pub fn stamped_read_lock(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
-    while state.write_held() {
+    while state.write_held {
         slot.cv.wait(&mut state);
     }
     state.readers += 1;
-    state.stamp
+    state.read_stamp()
 }
 
-/// `tryReadLock()` — non-blocking. Returns 0 on failure, current stamp on success.
+/// `tryReadLock()` — non-blocking. Returns 0 on failure, a read stamp on success.
 pub fn stamped_try_read_lock(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
-    if state.write_held() {
+    if state.write_held {
         return 0;
     }
     state.readers += 1;
-    state.stamp
+    state.read_stamp()
+}
+
+/// `tryReadLock(time, unit)` — wait at most `nanos`. Returns 0 on timeout.
+pub fn stamped_try_read_lock_timed(addr: usize, nanos: i64) -> i64 {
+    let slot = stamped_slot(addr);
+    let mut state = slot.state.lock();
+    if nanos <= 0 {
+        if state.write_held {
+            return 0;
+        }
+        state.readers += 1;
+        return state.read_stamp();
+    }
+    let deadline = std::time::Instant::now() + timeout_duration(nanos);
+    while state.write_held {
+        if slot.cv.wait_until(&mut state, deadline).timed_out() {
+            return 0;
+        }
+    }
+    state.readers += 1;
+    state.read_stamp()
 }
 
 /// `tryOptimisticRead()` — never blocks. Returns 0 if a writer is active,
-/// the current stamp otherwise. Caller must subsequently `validate(stamp)`
+/// the current version otherwise. Caller must subsequently `validate(stamp)`
 /// to confirm no writer ran in the meantime.
 pub fn stamped_try_optimistic_read(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let state = slot.state.lock();
-    if state.write_held() {
+    if state.write_held {
         0
     } else {
-        state.stamp
+        state.version
     }
 }
 
-/// `validate(stamp)` — true iff `stamp` is a valid optimistic-read stamp
-/// AND no writer has run since `stamp` was issued.
+/// `validate(stamp)` — true iff `stamp` still describes the lock.
+///
+/// Mirrors the JDK: a WRITE stamp validates while its holder still holds the
+/// lock (the JDK compares `SBITS`, which includes `WBIT`); a read or
+/// optimistic stamp validates while the version is unchanged and no writer
+/// has taken over.
 pub fn stamped_validate(addr: usize, stamp: i64) -> bool {
     if stamp == 0 {
         return false; // 0 is the "invalid" sentinel
     }
     let slot = stamped_slot(addr);
     let state = slot.state.lock();
-    // Valid if no writer is currently holding AND the visible stamp matches
-    // the one the caller observed (modulo the write bit).
-    !state.write_held() && (state.stamp & !1i64) == (stamp & !1i64)
+    if (stamp & VERSION_MASK) != state.version {
+        return false;
+    }
+    if stamp & STAMP_WRITE != 0 {
+        return state.write_held;
+    }
+    !state.write_held
 }
 
 /// `unlockWrite(stamp)` — release the write lock, advance the version.
@@ -225,29 +314,31 @@ pub fn stamped_unlock_write(addr: usize) {
     let slot = stamped_slot(addr);
     {
         let mut state = slot.state.lock();
-        // Advance: ensure odd, then +1 → next even value (and "stamp
-        // changed" w.r.t. any optimistic read taken before this write).
-        state.stamp = (state.stamp | 1).wrapping_add(1);
+        if !state.write_held {
+            return;
+        }
+        state.release_write();
     }
     // Wake any reader/writer queued behind us.
     slot.cv.notify_all();
 }
 
-/// `unlockRead(stamp)` — decrement reader count; if it hits 0 wake any
-/// queued writer.
+/// Release a write hold without a stamp; false when none was held.
 pub fn stamped_try_unstamped_unlock_write(addr: usize) -> bool {
     let slot = stamped_slot(addr);
     {
         let mut state = slot.state.lock();
-        if !state.write_held() {
+        if !state.write_held {
             return false;
         }
-        state.stamp = (state.stamp | 1).wrapping_add(1);
+        state.release_write();
     }
     slot.cv.notify_all();
     true
 }
 
+/// `unlockRead(stamp)` — decrement reader count; if it hits 0 wake any
+/// queued writer.
 pub fn stamped_unlock_read(addr: usize) {
     let slot = stamped_slot(addr);
     let drained_to_zero;
@@ -263,8 +354,7 @@ pub fn stamped_unlock_read(addr: usize) {
     }
 }
 
-/// `tryConvertToWriteLock(stamp)` — if we hold the only read lock and
-/// `stamp` is still valid, atomically promote to write lock.
+/// Release a read hold without a stamp; false when none was held.
 pub fn stamped_try_unstamped_unlock_read(addr: usize) -> bool {
     let slot = stamped_slot(addr);
     let drained_to_zero;
@@ -282,59 +372,154 @@ pub fn stamped_try_unstamped_unlock_read(addr: usize) -> bool {
     true
 }
 
+/// The value mirrored into the real `StampedLock.state` field so JDK bytecode
+/// that merely *reads* it (`toString`, `isLocked`) sees something coherent.
 pub fn stamped_visible_state(addr: usize) -> i64 {
     let slot = stamped_slot(addr);
     let state = slot.state.lock();
-    let base = state.stamp & !1i64;
-    if state.write_held() {
+    let base = state.version;
+    if state.write_held {
         base | JDK_WBIT
     } else {
         base.saturating_add(i64::from(state.readers.clamp(0, 126)))
     }
 }
 
+/// `tryConvertToWriteLock(stamp)`.
+///
+/// Per the JDK: succeeds when the stamp already holds the write lock (returns
+/// it unchanged), when it is the ONLY read hold (upgrade), or when it is a
+/// still-valid optimistic stamp and the lock is free.
 pub fn stamped_try_convert_to_write(addr: usize, stamp: i64) -> i64 {
+    if stamp == 0 {
+        return 0;
+    }
     let slot = stamped_slot(addr);
     let mut state = slot.state.lock();
-    if state.write_held() {
-        // Already a writer — caller can't convert across that.
+    if (stamp & VERSION_MASK) != state.version {
         return 0;
     }
-    if state.readers != 1 {
-        // Either no readers (so caller can't have been the sole reader)
-        // or more than one (so they can't be the sole reader either).
-        return 0;
+    if stamp & STAMP_WRITE != 0 {
+        return if state.write_held {
+            state.write_stamp()
+        } else {
+            0
+        };
     }
-    if (state.stamp & !1i64) != (stamp & !1i64) {
-        return 0;
-    }
-    state.readers = 0;
-    state.stamp |= 1;
-    state.stamp
-}
-
-/// `tryConvertToReadLock(stamp)` — downgrade a write lock to a read lock.
-pub fn stamped_try_convert_to_read(addr: usize) -> i64 {
-    let slot = stamped_slot(addr);
-    let new_stamp;
-    {
-        let mut state = slot.state.lock();
-        if !state.write_held() {
+    if stamp & STAMP_READ != 0 {
+        if state.write_held || state.readers != 1 {
             return 0;
         }
-        // Advance the version (write released) and immediately take a read.
-        state.stamp = (state.stamp | 1).wrapping_add(1);
-        state.readers = 1;
-        new_stamp = state.stamp;
+        state.readers = 0;
+        state.write_held = true;
+        return state.write_stamp();
     }
-    slot.cv.notify_all();
+    // Optimistic stamp: only convertible while the lock is completely free.
+    if state.write_held || state.readers != 0 {
+        return 0;
+    }
+    state.write_held = true;
+    state.write_stamp()
+}
+
+/// `tryConvertToReadLock(stamp)` — downgrade a write lock (or upgrade an
+/// optimistic observation) to a read lock.
+pub fn stamped_try_convert_to_read(addr: usize, stamp: i64) -> i64 {
+    if stamp == 0 {
+        return 0;
+    }
+    let slot = stamped_slot(addr);
+    let new_stamp;
+    let notify;
+    {
+        let mut state = slot.state.lock();
+        if (stamp & VERSION_MASK) != state.version {
+            return 0;
+        }
+        if stamp & STAMP_WRITE != 0 {
+            if !state.write_held {
+                return 0;
+            }
+            // Advance the version (write released) and immediately take a read.
+            state.release_write();
+            state.readers += 1;
+            new_stamp = state.read_stamp();
+            notify = true;
+        } else if stamp & STAMP_READ != 0 {
+            // Already a read hold — nothing to do.
+            return stamp;
+        } else {
+            if state.write_held {
+                return 0;
+            }
+            state.readers += 1;
+            new_stamp = state.read_stamp();
+            notify = false;
+        }
+    }
+    if notify {
+        slot.cv.notify_all();
+    }
     new_stamp
+}
+
+/// `tryConvertToOptimisticRead(stamp)` — release whatever hold `stamp`
+/// represents and hand back an observation stamp; 0 if `stamp` is stale.
+///
+/// **This is a release path, not an inspection.** Agroal's
+/// `StampedCopyOnWriteArrayList` (io.agroal:agroal-pool) never calls
+/// `unlockWrite` at all — every mutator is
+/// `long stamp = lock.writeLock(); try { … } finally { optimisticStamp =
+/// lock.tryConvertToOptimisticRead(stamp); }`. While this method was missing
+/// from the native surface the call fell through to real JDK bytecode, which
+/// reads the real `state` field this side-table backend does not drive: it
+/// returned 0 and released nothing, so the write hold leaked and the next
+/// `readLock()` blocked forever. That deadlocked the Keycloak 26.6.1 boot in
+/// `JPAConfig.startAll` (Agroal's connection pool), with the JPA startup
+/// thread and the pool's validation thread both parked in
+/// `StampedCopyOnWriteArrayList.getUnderlyingArray`.
+pub fn stamped_try_convert_to_optimistic(addr: usize, stamp: i64) -> i64 {
+    if stamp == 0 {
+        return 0;
+    }
+    let slot = stamped_slot(addr);
+    let version;
+    let notify;
+    {
+        let mut state = slot.state.lock();
+        if (stamp & VERSION_MASK) != state.version {
+            return 0;
+        }
+        if stamp & STAMP_WRITE != 0 {
+            if !state.write_held {
+                return 0;
+            }
+            state.release_write();
+            version = state.version;
+            notify = true;
+        } else if stamp & STAMP_READ != 0 {
+            if state.readers <= 0 {
+                return 0;
+            }
+            state.readers -= 1;
+            version = state.version;
+            notify = state.readers == 0;
+        } else {
+            // Already an optimistic observation: still valid iff no writer
+            // has taken the lock since it was issued.
+            return if state.write_held { 0 } else { state.version };
+        }
+    }
+    if notify {
+        slot.cv.notify_all();
+    }
+    version
 }
 
 /// `isWriteLocked()` — non-blocking inspection.
 pub fn stamped_is_write_locked(addr: usize) -> bool {
     let slot = stamped_slot(addr);
-    let result = slot.state.lock().write_held();
+    let result = slot.state.lock().write_held;
     result
 }
 
@@ -343,6 +528,13 @@ pub fn stamped_is_read_locked(addr: usize) -> bool {
     let slot = stamped_slot(addr);
     let result = slot.state.lock().readers > 0;
     result
+}
+
+/// `isLocked()` — held in either mode.
+pub fn stamped_is_locked(addr: usize) -> bool {
+    let slot = stamped_slot(addr);
+    let state = slot.state.lock();
+    state.write_held || state.readers > 0
 }
 
 /// `getReadLockCount()` — current number of held read locks.
@@ -756,6 +948,103 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(stamped_get_read_lock_count(a), 0);
+    }
+
+    /// The Agroal `StampedCopyOnWriteArrayList` shape: `writeLock()` is
+    /// released ONLY by `tryConvertToOptimisticRead(stamp)`. Before this was
+    /// implemented natively the write hold leaked and the next `readLock()`
+    /// blocked forever (Keycloak 26.6.1 boot deadlock in JPAConfig.startAll).
+    #[test]
+    fn stamped_convert_to_optimistic_releases_the_write_lock() {
+        let a = fresh_addr();
+        stamped_init(a);
+        let w = stamped_write_lock(a);
+        assert!(stamped_is_write_locked(a));
+        let obs = stamped_try_convert_to_optimistic(a, w);
+        assert!(obs != 0, "converting a held write stamp must succeed");
+        assert!(!stamped_is_write_locked(a), "write lock must be released");
+        assert!(stamped_validate(a, obs));
+        // The whole point: a reader must now get through without blocking.
+        let r = stamped_read_lock(a);
+        assert!(r & 1 == 0);
+        stamped_unlock_read(a);
+    }
+
+    #[test]
+    fn stamped_convert_to_optimistic_releases_a_read_hold() {
+        let a = fresh_addr();
+        stamped_init(a);
+        let r = stamped_read_lock(a);
+        assert_eq!(stamped_get_read_lock_count(a), 1);
+        let obs = stamped_try_convert_to_optimistic(a, r);
+        assert!(obs != 0);
+        assert_eq!(stamped_get_read_lock_count(a), 0);
+        // A writer can now take the lock without blocking.
+        assert!(stamped_try_write_lock(a) != 0);
+        stamped_unlock_write(a);
+    }
+
+    #[test]
+    fn stamped_convert_to_optimistic_on_stale_stamp_is_zero() {
+        let a = fresh_addr();
+        stamped_init(a);
+        let s = stamped_try_optimistic_read(a);
+        stamped_write_lock(a);
+        stamped_unlock_write(a);
+        assert_eq!(stamped_try_convert_to_optimistic(a, s), 0);
+        assert_eq!(stamped_try_convert_to_optimistic(a, 0), 0);
+    }
+
+    #[test]
+    fn stamped_read_and_optimistic_stamps_are_distinguishable() {
+        let a = fresh_addr();
+        stamped_init(a);
+        let opt = stamped_try_optimistic_read(a);
+        let rd = stamped_read_lock(a);
+        assert_ne!(opt, rd, "an optimistic stamp must not look like a read stamp");
+        // Converting the OPTIMISTIC stamp must not steal the reader's hold.
+        assert!(stamped_try_convert_to_optimistic(a, opt) != 0);
+        assert_eq!(stamped_get_read_lock_count(a), 1);
+        stamped_unlock_read(a);
+    }
+
+    #[test]
+    fn stamped_timed_try_write_lock_times_out_under_a_reader() {
+        let a = fresh_addr();
+        stamped_init(a);
+        stamped_read_lock(a);
+        let t0 = std::time::Instant::now();
+        assert_eq!(stamped_try_write_lock_timed(a, 20_000_000), 0);
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(15));
+        stamped_unlock_read(a);
+        assert!(stamped_try_write_lock_timed(a, 20_000_000) != 0);
+        stamped_unlock_write(a);
+    }
+
+    #[test]
+    fn stamped_convert_to_read_downgrades_a_write_hold() {
+        let a = fresh_addr();
+        stamped_init(a);
+        let w = stamped_write_lock(a);
+        let r = stamped_try_convert_to_read(a, w);
+        assert!(r != 0);
+        assert!(!stamped_is_write_locked(a));
+        assert_eq!(stamped_get_read_lock_count(a), 1);
+        stamped_unlock_read(a);
+    }
+
+    #[test]
+    fn stamped_is_locked_covers_both_modes() {
+        let a = fresh_addr();
+        stamped_init(a);
+        assert!(!stamped_is_locked(a));
+        stamped_read_lock(a);
+        assert!(stamped_is_locked(a));
+        stamped_unlock_read(a);
+        stamped_write_lock(a);
+        assert!(stamped_is_locked(a));
+        stamped_unlock_write(a);
+        assert!(!stamped_is_locked(a));
     }
 
     // --- ReentrantReadWriteLock ---

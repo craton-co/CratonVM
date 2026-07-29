@@ -91,6 +91,29 @@ pub fn create_java_string_uninterned(shared: &SharedVm, text: &str) -> ObjectRef
     alloc_java_string_object(shared, text)
 }
 
+/// Fallible twin of [`create_java_string_uninterned`]: `None` instead of
+/// aborting the process when the heap cannot hold the `String`.
+///
+/// Callers that hold a `JvmThread` must go through
+/// `interpreter::create_string_or_oom`, which GCs and retries around this and
+/// finally raises a catchable `OutOfMemoryError` -- the same contract `new`
+/// has. Before that existed, a `"a" + b` on a full heap called
+/// [`create_java_string_uninterned`] and `std::process::abort()`ed the VM
+/// ("FATAL: heap exhausted allocating java/lang/String"), where HotSpot throws
+/// `OutOfMemoryError: Java heap space`.
+pub fn try_create_java_string_uninterned(shared: &SharedVm, text: &str) -> Option<ObjectRef> {
+    if shared
+        .classes
+        .compact_strings
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && text.is_ascii()
+    {
+        return try_alloc_java_string_object_from_ascii(shared, text.as_bytes());
+    }
+    let units: Vec<u16> = text.encode_utf16().collect();
+    try_alloc_java_string_object_from_units(shared, &units)
+}
+
 /// Thread-aware, GC-safe dynamic String allocation for native helpers. The
 /// ASCII path uses the ordinary object TLAB and a hit-only byte-array TLAB
 /// allocation, retaining a fresh String object and backing array every call.
