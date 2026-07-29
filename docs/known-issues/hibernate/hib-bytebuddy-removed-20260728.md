@@ -37,7 +37,7 @@ never returns" miscompile family as `HIB-PROXY`.
 
 This ban was never re-verified after 2026-06-13, well before this week's
 general JIT correctness fixes (loader_id encode/decode asymmetry fix —
-see `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`
+see `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`
 — and the atomic-array RMW fix in `ffb8dfa22`, among others). Age alone
 made it worth re-checking; ByteBuddy is core to Hibernate's
 bytecode-enhancement feature, one of the 5 apps this host currently

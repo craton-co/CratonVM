@@ -54,7 +54,7 @@ impl ClassLoaderId {
     /// sites and drifted apart, which silently mistagged every CGLIB-enhanced
     /// `@Configuration` subclass as `UserDefined(2)` instead of `Application`
     /// and broke package-private override detection (see
-    /// `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`).
+    /// `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`).
     pub const fn to_native_id(self) -> u32 {
         match self {
             ClassLoaderId::Bootstrap => Self::NATIVE_BOOTSTRAP,

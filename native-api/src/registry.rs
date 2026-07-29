@@ -1181,7 +1181,7 @@ pub trait NativeClassAccess {
     /// `UserDefined(2)` puts the new class in a different runtime package from
     /// its own superclass and silently breaks package-private override
     /// detection — see
-    /// `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`.
+    /// `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`.
     fn define_class_full(
         &mut self,
         name: &str,
