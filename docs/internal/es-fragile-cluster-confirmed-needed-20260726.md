@@ -110,3 +110,78 @@ yet fully characterized" — still holds in the sense that only ~27 of 2555
 classes were sampled. What changed is that the one measured regression is gone
 and none of the sampled classes now differ, so the blanket ban no longer has
 evidence behind it.
+
+## 2026-07-29 — 197-class re-sweep: two more general JIT bugs, and one open residual
+
+The removal above sampled ~27 of the 2555 compiled test classes and said so.
+This is that sweep widened by an order of magnitude: **197 classes**, every 13th
+of the sorted class list, spread across `action`, `cluster`, `common`,
+`discovery`, `health`, `index`, `indices`, `inference`, `lucene`, `rest`,
+`search`, `snapshots`, `transport` and more, run with
+`CRATONVM_JIT_DENY=org/elasticsearch/` (which reproduces the old ban exactly)
+against the shipped configuration, so the two arms differ only in whether ES
+bytecode may be compiled.
+
+It confirms the removal and finds two further defects the narrower sample never
+reached. Both, like the ones before them, are general JIT bugs rather than
+anything Elasticsearch-specific:
+
+- **`ef8788ae5`** — `regalloc`'s entry liveness seed assumed one JVM local slot
+  per parameter, so a reference parameter sitting *past* a `long`/`double`
+  parameter was not live-in, the colouring gave it the same register as a live
+  earlier parameter, and the prologue clobbered it. Surfaced as
+  `RecoverySourceHandlerTests` 1 -> 5 failures; bisected to
+  `MultiChunkTransfer.lambda$handleItems$4(long, Tuple, Void)`, whose `Tuple`
+  argument arrived null.
+- **`afa68cfd7`** — the deopt snapshot at an `invokedynamic` uncommon trap typed
+  only `J` and `I` call-site arguments, so a `float`/`double` argument became
+  `FrameValue::Unsupported` and the resume refused the frame with an internal
+  error that silently killed the thread. Surfaced as
+  `FlattenedFieldRootBlockLoaderTests` stopping at 269 of 360 tests and being
+  *reported as a suite timeout* after only 289 s of a 1200 s budget — because
+  randomizedtesting's watchdog reads "worker no longer alive and never set
+  `completed`" as exactly that. Bisected to
+  `DefaultWrappersHandler.lambda$transform$8(double, Function, Supplier)`.
+
+Both were narrowed the same way and it is worth recording the method: widen or
+narrow *what may be compiled* with `CRATONVM_JIT_ALLOW_PACKAGES` /
+`CRATONVM_JIT_DENY` (package -> subpackage -> class -> method), then read the
+emitted code with `CRATONVM_DBG_JIT_CODE=<substring>`, which prints each
+artifact's `param_jvm_slots` alongside its machine code. That dump is what made
+the register-allocation bug self-evident: `mov r12, rcx ; mov r12, r8`, two
+incoming arguments parked in the same register.
+
+One trap worth flagging: do NOT narrow these by adding
+`-Dtests.method=<name>`. That configuration fails for an unrelated harness
+reason (a `ClassNotFoundException` from the filter path) in *both* arms, and
+looks exactly like a reproduction.
+
+### Result
+
+**196 of 197 classes match their interpreted baseline exactly**, including the
+seven-class vector/DiskBBQ hang cluster that
+`fixed-suite-bugs/elasticsearch-suite/elasticsearch-vector-diskbbq-hangs.md`
+had retired *by* this containment: six are identical either way and the seventh
+(`IVFKnnFloatSlicedVectorQueryTests`) times out in both arms at a 60-minute
+budget, so it is a pre-existing hang the ban never addressed.
+
+Two differences are in the removal's favour — `CCSTelemetrySnapshotTests`
+completes instead of timing out, and `SnapshotsInProgressSerializationTests`
+drops from 3 failures to 2.
+
+### One residual, still open
+
+`StringRareTermsTests.testConcurrentSerialization` fails 3/6 with ES
+JIT-eligible and 0/6 with it interpreted, measured in interleaved pairs so both
+arms see identical machine load.
+
+It is **not** a third instance of the pattern above. Its rate falls
+monotonically with the amount of ES code left interpreted and no single package
+prefix owns it — denying `search/aggregations/bucket/` alone and denying its
+complement alone each still fail, while denying both does not. That is a
+shrinking race window, not a miscompiled method, and the sequential
+serialization tests over the same objects pass in every run. The blanket ban was
+suppressing it only by making everything slow enough.
+
+Filed with its full evidence, symptoms and first place to look at
+`docs/known-issues/elasticsearch/concurrent-serialization-diverges-under-jit-20260728.md`.
