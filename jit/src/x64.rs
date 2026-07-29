@@ -28216,27 +28216,36 @@ impl Compiler {
                             // ---- Shared compact hashed/vtable stub ----
                             // Both the baseline and optimizing tiers lower
                             // megamorphic misses through this exact library.
-                            // It reloads arg0, performs two lock-free probes,
-                            // and falls through here only on a real miss.
-                            if let Some(pic) = pic_ptr {
-                                let arg_offsets: Vec<i32> = (0..n)
-                                    .map(|i| args_base_offset + ((n - 1 - i) as i32) * 8)
-                                    .collect();
-                                done_patches32.extend(
-                                    crate::runtime_lowering::emit_hashed_vtable_stub(
-                                        &mut self.buf,
-                                        pic as usize,
-                                        self.heap_local_offset,
-                                        &arg_offsets,
-                                        if self.precise_maps {
-                                            self.helpers.frame_record
-                                        } else {
-                                            0
-                                        },
-                                        self.helpers.service_callee_deopt,
-                                        info as usize,
-                                    ),
-                                );
+                            // Its hit path is also a raw JIT-to-JIT `CALL`, so
+                            // it is part of the same direct-callee contract as
+                            // the MIC/PIC cascades above.  In particular, do
+                            // not leave this stub enabled when
+                            // `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0`: that used
+                            // to bypass the master safety switch and left an
+                            // unguarded callee RBP visible to a moving young
+                            // collection.  The normal helper immediately
+                            // below remains the safe miss/opt-out route.
+                            if inline_virtual_ic_allowed {
+                                if let Some(pic) = pic_ptr {
+                                    let arg_offsets: Vec<i32> = (0..n)
+                                        .map(|i| args_base_offset + ((n - 1 - i) as i32) * 8)
+                                        .collect();
+                                    done_patches32.extend(
+                                        crate::runtime_lowering::emit_hashed_vtable_stub(
+                                            &mut self.buf,
+                                            pic as usize,
+                                            self.heap_local_offset,
+                                            &arg_offsets,
+                                            if self.precise_maps {
+                                                self.helpers.frame_record
+                                            } else {
+                                                0
+                                            },
+                                            self.helpers.service_callee_deopt,
+                                            info as usize,
+                                        ),
+                                    );
+                                }
                             }
 
                             // ---- Slow path: helper ABI setup + call ----
