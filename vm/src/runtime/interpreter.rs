@@ -36894,11 +36894,16 @@ fn jit_invoke_targets_native_shadow(
     if jit_native_shadow_is_final_wrapper_unbox(&target_class, &method_name, &descriptor) {
         return false;
     }
-    let direct = shared
-        .natives
-        .native_methods
-        .find(&target_class, &method_name, &descriptor)
-        .is_some();
+    // A compiled direct call bypasses the interpreter's native-vs-bytecode
+    // decision. Treat forced real-JDK overrides exactly like registered
+    // native shadows, so a caller of Class's Signature bridge cannot enter
+    // the incompatible JDK bytecode body.
+    let direct = force_native_over_real_jdk_bytecode(&target_class, &method_name, &descriptor)
+        || shared
+            .natives
+            .native_methods
+            .find(&target_class, &method_name, &descriptor)
+            .is_some();
     let inherited = declaring_class.as_ref().is_some_and(|declaring_class| {
         shared
             .natives
@@ -36960,6 +36965,66 @@ fn jit_method_calls_native_shadowed(
         };
         if let Some(cp_idx) = jit_native_shadow_dynamic_invoke_index(&instruction) {
             if jit_invoke_targets_native_shadow(shared, caller_class_id, cp_idx) {
+                return true;
+            }
+        }
+        if next_pc <= pc || next_pc > scan_len {
+            return true;
+        }
+        pc = next_pc;
+    }
+    false
+}
+
+/// Detect forced `Class` generic-metadata bridges in a prospective compiled
+/// caller. They must continue through interpreter dispatch, which chooses the
+/// Signature-attribute native implementation over the real-JDK bytecode.
+fn jit_method_calls_forced_class_generic_metadata(
+    shared: &SharedVm,
+    caller_class_id: ClassId,
+    code: &[u8],
+    code_len: usize,
+) -> bool {
+    let scan_len = code_len.min(code.len());
+    let scan_code = &code[..scan_len];
+    let mut pc = 0;
+    while pc < scan_len {
+        let (instruction, next_pc) = match Instruction::decode(scan_code, pc) {
+            Ok(decoded) => decoded,
+            Err(_) => return true,
+        };
+        if let Some(cp_idx) = jit_native_shadow_dynamic_invoke_index(&instruction) {
+            let is_forced_generic_metadata = {
+                let cm = shared.classes.class_manager.read();
+                let Some(caller) = cm.get_class(caller_class_id) else {
+                    return true;
+                };
+                let cp = &caller.constant_pool;
+                let (class_index, nat_index) = match cp.get(cp_idx) {
+                    Some(ConstantPoolEntry::MethodReference {
+                        class_index,
+                        name_and_type_index,
+                    })
+                    | Some(ConstantPoolEntry::InterfaceMethodReference {
+                        class_index,
+                        name_and_type_index,
+                    }) => (*class_index, *name_and_type_index),
+                    _ => return true,
+                };
+                matches!(
+                    (cp.get_class_name(class_index), cp.get_name_and_type(nat_index)),
+                    (
+                        Some("java/lang/Class"),
+                        Some((
+                            "getTypeParameters",
+                            "()[Ljava/lang/reflect/TypeVariable;"
+                        ))
+                            | Some(("getGenericInterfaces", "()[Ljava/lang/reflect/Type;"))
+                            | Some(("getGenericSuperclass", "()Ljava/lang/reflect/Type;"))
+                    )
+                )
+            };
+            if is_forced_generic_metadata {
                 return true;
             }
         }
@@ -38596,6 +38661,15 @@ fn try_jit_compile_callee_slow(
     }
 
     let code_attr = method.code()?;
+    if jit_method_calls_forced_class_generic_metadata(
+        shared,
+        callee_class_id,
+        &code_attr.code,
+        code_attr.code.len(),
+    ) {
+        crate::jit::mark_jit_bail_listed(class_name, method_name, descriptor);
+        return None;
+    }
     // jit-invokestatic-clinit-gap fix (2026-07-17): third occurrence of the
     // same gap as the `callee_compiler` (compile-time direct_calls) and
     // `resolve_inline_site` (inlining) closures above -- this is the
@@ -43104,12 +43178,32 @@ fn execute_invokevirtual_cached(
                             &cached.method_descriptor,
                         )
                         .is_some();
+                    // `cached.class_name` is the call site's symbolic owner;
+                    // for an interface call it need not be the concrete
+                    // receiver that this monomorphic cache just validated.
+                    // Consult the receiver ClassId for the java.util virtual
+                    // tier-up exclusion so subtypes reached through List/Map
+                    // or Iterator are covered as well.
+                    let receiver_is_java_util = {
+                        let cm = shared.classes.class_manager.read();
+                        cm.get_class(receiver_class_id)
+                            .is_some_and(|class| class.name.starts_with("java/util/"))
+                    };
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
                         && !has_registered_native
                         && !crate::classloading::any_class_redefined()
                         && !crate::runtime::env_cache::disable_jit()
+                        // The generic-conversion regression reaches a hot
+                        // java.util graph while Spring creates annotation and
+                        // conversion metadata. Its instance-method tier-ups
+                        // are independently JIT-safe at direct/static sites,
+                        // but this cached virtual route can publish a stale
+                        // receiver-specific entry and then spin. Keep only
+                        // this virtual promotion out of java.util; static
+                        // compilation and ordinary direct dispatch remain on.
+                        && !receiver_is_java_util
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?

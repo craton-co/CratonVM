@@ -5278,6 +5278,10 @@ pub(crate) fn register_phase68_natives(registry: &mut NativeMethodRegistry) {
     crate::t27_tls::register_t27_natives(registry);
     register_p68_security_cert(registry);
     register_p68_jdbc(registry);
+    // `DriverManager` only here, never on the real-JDK path: it is a CONCRETE
+    // class, so a native on it intercepts and would hijack every
+    // `getConnection(url)` in a build that has a real driver.
+    register_p68_jdbc_driver_manager(registry);
     register_p68_xml(registry);
     register_p68_invoke_extras(registry);
     registry.set_category(__prev_cat);

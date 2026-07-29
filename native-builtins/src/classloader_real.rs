@@ -1476,6 +1476,37 @@ pub(crate) fn cl_real_load_class_base_from_args(
 /// 500s with `ClassNotFoundException: org.apache.jsp.*_jsp`. The dispatch is
 /// forced onto this native by `intercept_urlclassloader_subclass_find_class`
 /// (the subclass methodref escapes the static-class force-native gate).
+/// Loaders that `URLClassLoader.close()` has shut, by identity hash.
+///
+/// Keyed by identity hash rather than by `ObjectRef` because a moving GC
+/// relocates the loader and a raw-pointer key would go stale — the same reason
+/// `net_phase_e`'s client-shutdown table is keyed this way. Nothing here is a GC
+/// root: an entry for a collected loader is unreachable but harmless, and a
+/// loader is closed at most once per program.
+fn ucl_closed_loaders() -> &'static std::sync::Mutex<std::collections::HashSet<i32>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record that `URLClassLoader.close()` was called on this loader.
+pub fn ucl_mark_closed(ctx: &mut dyn NativeContext, loader: cratonvm_types::ObjectRef) {
+    let key = ctx.identity_hash_code(loader);
+    ucl_closed_loaders()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key);
+}
+
+/// Has this loader been closed?
+pub fn ucl_is_closed(ctx: &mut dyn NativeContext, loader: cratonvm_types::ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(loader);
+    ucl_closed_loaders()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+}
+
 pub fn ucl_real_find_class(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1501,6 +1532,23 @@ pub fn ucl_real_find_class(
         ));
     }
     let internal = class_name.replace('.', "/");
+    // A CLOSED loader must stop finding classes it has not already loaded —
+    // that is the whole observable half of `URLClassLoader.close()` (already
+    // defined classes stay defined; `close()` unloads nothing). Checked HERE
+    // because in real-JDK mode this native IS `findClass`: the real bytecode
+    // would consult `ucp`, which CratonVM leaves unpopulated, so closing `ucp`
+    // has no effect and every post-close load used to succeed.
+    if ucl_is_closed(ctx, this) {
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &class_name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
+    }
     if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
         return result;
     }

@@ -1444,6 +1444,71 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
 // discover and instantiate service providers.
 // =============================================================================
 
+/// `URLClassLoader.close()` for the REAL-JDK path.
+///
+/// The `close()` inside `register_s1_classloading` (and `classloader::ucl_close`)
+/// only runs under `register_synthetic_overrides`, and both are written for the
+/// SYNTHETIC carrier: they read the URL array out of a fixed slot and write a
+/// `closed` flag into another. Neither is safe on a real `java.net.URLClassLoader`,
+/// whose slots belong to `ucp`/`acc`/... — so the real-JDK build needs its own,
+/// layout-free version.
+///
+/// This one asks the loader for its URLs through `getURLs()` (real bytecode, real
+/// layout) and retracts exactly those roots. Classes already defined stay
+/// defined, which is what HotSpot does: `close()` shuts the `URLClassPath` and
+/// unloads nothing.
+pub fn register_url_classloader_close_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    r.register("java/net/URLClassLoader", "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let urls = ctx
+            .invoke_virtual(this, "getURLs", "()[Ljava/net/URL;", &[])
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Object(None));
+        let paths = s1_url_array_to_fs_paths(ctx, urls);
+        if !paths.is_empty() {
+            ctx.unregister_dynamic_classpath(&paths);
+        }
+        // Retracting the dynamic-classpath roots is only half of it in real-JDK
+        // mode: the loader's own `findClass` there is
+        // `classloader_real::ucl_real_find_class`, which searches on its own
+        // behalf because the real `ucp` CratonVM hands the loader is never
+        // populated. Mark the loader so that native refuses too.
+        crate::classloader_real::ucl_mark_closed(ctx, this);
+        Ok(None)
+    });
+    r.set_category(__prev_cat);
+}
+
+/// Every filesystem path a `URL[]` names, in order.
+///
+/// Shared by `URLClassLoader`'s constructors (which register the paths) and by
+/// `close()` (which retracts them), so the two cannot compute a different set
+/// from the same array and leave a root behind.
+fn s1_url_array_to_fs_paths(ctx: &mut dyn NativeContext, url_arr_val: Value) -> Vec<String> {
+    let Value::Object(Some(arr)) = url_arr_val else {
+        return Vec::new();
+    };
+    let len = ctx.array_length(arr);
+    let mut paths = Vec::new();
+    for i in 0..len {
+        let Value::Object(Some(url_obj)) = ctx.get_array_element(arr, i) else {
+            continue;
+        };
+        // URL field 5 = full string (URL_FIELD_FULL)
+        let Value::Object(Some(s)) = ctx.get_field(url_obj, 5) else {
+            continue;
+        };
+        let full_str = ctx.read_string(s).unwrap_or_default();
+        if let Some(path) = s1_url_to_fs_path(&full_str) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
 /// Extract a filesystem path from a Java URL string.
 ///
 /// Handles:
@@ -1588,28 +1653,7 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
     // Helper closure: extract filesystem paths from a URL[] array object
     // and register them with the VM classpath.
     fn register_url_array(ctx: &mut dyn NativeContext, url_arr_val: Value) {
-        let arr = match url_arr_val {
-            Value::Object(Some(a)) => a,
-            _ => return,
-        };
-        let len = ctx.array_length(arr);
-        let mut paths = Vec::new();
-        for i in 0..len {
-            let url_val = ctx.get_array_element(arr, i);
-            let url_obj = match url_val {
-                Value::Object(Some(o)) => o,
-                _ => continue,
-            };
-            // URL field 5 = full string (URL_FIELD_FULL)
-            let full_val = ctx.get_field(url_obj, 5);
-            let full_str = match full_val {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => continue,
-            };
-            if let Some(path) = s1_url_to_fs_path(&full_str) {
-                paths.push(path);
-            }
-        }
+        let paths = s1_url_array_to_fs_paths(ctx, url_arr_val);
         if !paths.is_empty() {
             ctx.register_dynamic_classpath(&paths);
         }
@@ -1776,34 +1820,32 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
         crate::classloader::cl_get_resource_as_stream_essential,
     );
 
-    // URLClassLoader.close() — nothing to release. Real `close()` shuts the
-    // JarFiles that URLClassPath keeps open, but this synthetic loader opens
-    // none: `<init>`/`addURL` hand the paths to `ctx.register_dynamic_classpath`
-    // and keep only the URL[] and parent refs. The remaining half of the
-    // contract (a closed loader must stop serving new classes/resources) needs a
-    // VM-side way to retract a dynamic-classpath entry, which does not exist —
-    // so post-close loads still succeed here.
+    // URLClassLoader.close() — IMPLEMENTED (was a no-op).
     //
-    // ESCALATED wave 4 (2026-07-28) — still not fixable from this crate. The
-    // only classpath mutator on the native ABI is
-    // `NativeContext::register_dynamic_classpath(&mut self, paths: &[String])`
-    // (`native-api/src/registry.rs`); it is append-only and returns nothing, so
-    // a native cannot name, let alone drop, the entries a given loader added.
-    // Closing the loop needs BOTH halves on `NativeContext`:
-    //   * `register_dynamic_classpath` to return a handle/entry-id per path (or
-    //     a sibling `register_dynamic_classpath_owned(owner: ObjectRef, …)`),
-    //     and
-    //   * `unregister_dynamic_classpath(&mut self, ids: &[..])` backed by
-    //     `classloading::class_path` so subsequent `findClass`/`getResource`
-    //     misses those roots.
-    // Faking the other observable half here (flip a `closed` flag and make
-    // `getResource`/`findClass` fail afterwards) was rejected: those handlers
-    // are `crate::classloader::cl_get_resource*_essential`, shared by EVERY
-    // loader, and CratonVM callers today keep using loaders they have closed —
-    // exactly because close has always been lenient. Turning that into hard
-    // failures without the classpath retraction that justifies it would trade
-    // one wrong behaviour for a louder one.
-    r.register(ucl, "close", "()V", native_noop_with_this);
+    // Real `close()` shuts the `URLClassPath` so a closed loader stops finding
+    // NEW classes and resources; classes it already defined stay defined
+    // (`close()` unloads nothing). This synthetic loader opens no JarFiles of
+    // its own — `<init>`/`addURL` hand the paths to
+    // `ctx.register_dynamic_classpath` — so the whole of the observable contract
+    // is retracting those roots, which is now possible:
+    // `NativeContext::unregister_dynamic_classpath` reaches
+    // `ClassPath::remove_path`, which use-counts each spec (a JAR handed to two
+    // live loaders survives the first close) and never touches a startup
+    // classpath root.
+    //
+    // Idempotent, per the javadoc: closing twice retracts once, because the
+    // second call finds the use count already gone. Errors are not reported —
+    // `close()` throws `IOException` only when a resource fails to close, and
+    // there is nothing here that can fail.
+    r.register(ucl, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let url_arr = ctx.get_field(this, 0);
+        let paths = s1_url_array_to_fs_paths(ctx, url_arr);
+        if !paths.is_empty() {
+            ctx.unregister_dynamic_classpath(&paths);
+        }
+        Ok(None)
+    });
 
     // =========================================================================
     // java.util.ServiceLoader — real META-INF/services discovery

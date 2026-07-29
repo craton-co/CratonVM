@@ -13120,6 +13120,33 @@ fn nio_owner_principal(ctx: &mut dyn NativeContext, path_value: Value) -> Method
         }
         .into()
     };
+    // Windows first: `p59_files_read_attributes` produces the DOS/Windows
+    // attribute shape there, which has no `owner()` at all, so the Unix
+    // delegation below could only ever throw — `Files.getOwner` was
+    // unconditionally `UnsupportedOperationException` on Windows while HotSpot
+    // answers. `win_file_owner_account` asks the OS for the real owner SID and
+    // resolves it to `DOMAIN\account`.
+    #[cfg(windows)]
+    {
+        let path_text = match path_value {
+            Value::Object(Some(p)) => p57_read_path(ctx, p),
+            _ => String::new(),
+        };
+        if !path_text.is_empty() {
+            if std::fs::symlink_metadata(&path_text).is_err() {
+                return Err(p57_no_such_file(ctx, &path_text));
+            }
+            let Some((account, sid_text, sid_type)) = win_file_owner_account(&path_text) else {
+                return Err(RuntimeError::IOException {
+                    message: format!("getOwner: cannot read the owner of {path_text}"),
+                }
+                .into());
+            };
+            return Ok(Some(Value::Object(Some(alloc_windows_user_principal(
+                ctx, &account, &sid_text, sid_type,
+            )))));
+        }
+    }
     let attrs = match p59_files_read_attributes(ctx, &[path_value])? {
         Some(Value::Object(Some(attrs))) => attrs,
         _ => return Err(unsupported()),
@@ -13148,6 +13175,201 @@ pub fn register_real_jdk_files_owner(r: &mut NativeMethodRegistry) {
             nio_owner_principal(ctx, path_value)
         },
     );
+}
+
+/// The owner of a file as Windows reports it: `(account, sid, sid_type)`.
+///
+/// `GetNamedSecurityInfoW(.., OWNER_SECURITY_INFORMATION, ..)` yields the owner
+/// SID; `LookupAccountSidW` turns it into `DOMAIN\account` (the rendering
+/// `sun.nio.fs.WindowsUserPrincipals` uses), and `ConvertSidToStringSidW` gives
+/// the `S-1-5-…` form the JDK keeps for `equals`/`hashCode`. A SID with no
+/// resolvable account (an orphaned ACL entry) still gets a principal, named by
+/// its SID string — which is exactly what the JDK does in that case.
+///
+/// `None` means the OS refused the query; the caller raises `IOException`, the
+/// outcome `Files.getOwner` specifies for a failed lookup.
+#[cfg(windows)]
+fn win_file_owner_account(path: &str) -> Option<(String, String, i32)> {
+    const SE_FILE_OBJECT: i32 = 1;
+    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
+    const ERROR_SUCCESS: u32 = 0;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+    const ERROR_NONE_MAPPED: u32 = 1332;
+
+    #[link(name = "Advapi32")]
+    extern "system" {
+        fn GetNamedSecurityInfoW(
+            object_name: *const u16,
+            object_type: i32,
+            security_info: u32,
+            owner: *mut *mut std::ffi::c_void,
+            group: *mut *mut std::ffi::c_void,
+            dacl: *mut *mut std::ffi::c_void,
+            sacl: *mut *mut std::ffi::c_void,
+            security_descriptor: *mut *mut std::ffi::c_void,
+        ) -> u32;
+        fn LookupAccountSidW(
+            system_name: *const u16,
+            sid: *mut std::ffi::c_void,
+            name: *mut u16,
+            name_len: *mut u32,
+            domain: *mut u16,
+            domain_len: *mut u32,
+            use_: *mut i32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut std::ffi::c_void, out: *mut *mut u16) -> i32;
+    }
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn GetLastError() -> u32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    fn from_wide(buf: &[u16]) -> String {
+        let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..end])
+    }
+
+    let wpath = wide(path);
+    let mut owner: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `wpath` is NUL-terminated and outlives the call; every out-pointer
+    // is a live local. On success the descriptor is a single LocalAlloc block
+    // that owns `owner`, freed exactly once below and never escaping.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wpath.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if rc != ERROR_SUCCESS || owner.is_null() {
+        if !descriptor.is_null() {
+            // SAFETY: allocated by the call above, freed once.
+            unsafe { LocalFree(descriptor) };
+        }
+        return None;
+    }
+
+    // SID string form (`S-1-5-21-…`), used as the principal's identity.
+    let mut sid_text = String::new();
+    let mut sid_wide: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `owner` points into the live descriptor; the returned buffer is a
+    // LocalAlloc block freed immediately after it is copied out.
+    if unsafe { ConvertSidToStringSidW(owner, &mut sid_wide) } != 0 && !sid_wide.is_null() {
+        let mut len = 0usize;
+        // SAFETY: the OS returns a NUL-terminated UTF-16 string.
+        while unsafe { *sid_wide.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` stops at the NUL, so the slice is in bounds.
+        sid_text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(sid_wide, len) });
+        // SAFETY: allocated by ConvertSidToStringSidW, freed once.
+        unsafe { LocalFree(sid_wide.cast()) };
+    }
+
+    // Account name. Two-call idiom: ask for the required sizes, then fill.
+    let mut name_len: u32 = 0;
+    let mut domain_len: u32 = 0;
+    let mut sid_type: i32 = 0;
+    // SAFETY: zero lengths with null buffers is the documented sizing call; it
+    // fails with ERROR_INSUFFICIENT_BUFFER and writes the two lengths.
+    unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            owner,
+            std::ptr::null_mut(),
+            &mut name_len,
+            std::ptr::null_mut(),
+            &mut domain_len,
+            &mut sid_type,
+        )
+    };
+    let sizing_error = unsafe { GetLastError() };
+    let account = if sizing_error == ERROR_INSUFFICIENT_BUFFER && name_len > 0 {
+        let mut name = vec![0u16; name_len as usize];
+        let mut domain = vec![0u16; domain_len.max(1) as usize];
+        // SAFETY: both buffers are sized by the call above and outlive this one.
+        let ok = unsafe {
+            LookupAccountSidW(
+                std::ptr::null(),
+                owner,
+                name.as_mut_ptr(),
+                &mut name_len,
+                domain.as_mut_ptr(),
+                &mut domain_len,
+                &mut sid_type,
+            )
+        };
+        if ok != 0 {
+            let account = from_wide(&name);
+            let domain = from_wide(&domain);
+            if domain.is_empty() {
+                account
+            } else {
+                format!("{domain}\\{account}")
+            }
+        } else {
+            String::new()
+        }
+    } else if sizing_error == ERROR_NONE_MAPPED {
+        // A SID with no account behind it. The JDK names the principal by its
+        // SID string rather than failing, so do the same.
+        String::new()
+    } else {
+        String::new()
+    };
+
+    // SAFETY: `descriptor` came from the successful call above and is freed once;
+    // `owner` points inside it and is not used after this.
+    unsafe { LocalFree(descriptor) };
+
+    if account.is_empty() && sid_text.is_empty() {
+        return None;
+    }
+    let account = if account.is_empty() {
+        sid_text.clone()
+    } else {
+        account
+    };
+    Some((account, sid_text, sid_type))
+}
+
+/// Materialise the `UserPrincipal` `Files.getOwner` hands back on Windows.
+///
+/// Uses the real JDK carrier `sun.nio.fs.WindowsUserPrincipals$User` and writes
+/// its three fields BY NAME, so the object satisfies `instanceof UserPrincipal`
+/// and any JDK code that reads those fields directly sees the right values. The
+/// accessors below are registered on the same class, so a build where that class
+/// is synthesized rather than loaded still answers.
+#[cfg(windows)]
+fn alloc_windows_user_principal(
+    ctx: &mut dyn NativeContext,
+    account: &str,
+    sid_text: &str,
+    sid_type: i32,
+) -> cratonvm_types::ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "sun/nio/fs/WindowsUserPrincipals$User", 3);
+    // GC-SAFETY: `create_string` allocates, so pin the carrier and re-read it
+    // through the pin after each allocation before writing into it.
+    let pin = ctx.pin_native_root(obj);
+    let sid_str = ctx.create_string(sid_text);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.set_field_by_name(obj, "sidString", Value::Object(Some(sid_str)));
+    let account_str = ctx.create_string(account);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.set_field_by_name(obj, "accountName", Value::Object(Some(account_str)));
+    ctx.set_field_by_name(obj, "sidType", Value::Int(sid_type));
+    ctx.unpin_native_roots(pin);
+    obj
 }
 
 /// Same identity key as `basic_file_attributes_file_key`, but computed straight
@@ -15805,6 +16027,69 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;Ljava/nio/file/attribute/UserPrincipal;)Ljava/nio/file/Path;",
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
+    // Accessors for the carrier `nio_owner_principal` returns on Windows.
+    // `getName()` is the whole of `UserPrincipal`; `toString`/`equals`/`hashCode`
+    // mirror `sun.nio.fs.WindowsUserPrincipals$User`, which compares on the SID
+    // string (two principals for the same SID are equal even when the account
+    // name renders differently) and prints `account (type)`.
+    {
+        let wup = "sun/nio/fs/WindowsUserPrincipals$User";
+        r.register(wup, "getName", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field_by_name(this, "accountName")))
+        });
+        r.register(wup, "toString", "()Ljava/lang/String;", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = match ctx.get_field_by_name(this, "accountName") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // `SidType` values from Win32 `SID_NAME_USE`, in declaration order.
+            let kind = match ctx.get_field_by_name(this, "sidType") {
+                Value::Int(1) => "USER",
+                Value::Int(2) => "GROUP",
+                Value::Int(3) => "DOMAIN",
+                Value::Int(4) => "ALIAS",
+                Value::Int(5) => "WELL_KNOWN_GROUP",
+                Value::Int(6) => "DELETED_ACCOUNT",
+                Value::Int(7) => "INVALID",
+                Value::Int(9) => "COMPUTER",
+                _ => "UNKNOWN",
+            };
+            let s = ctx.create_string(&format!("{name} ({kind})"));
+            Ok(Some(Value::Object(Some(s))))
+        });
+        r.register(wup, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(Value::Object(Some(other))) = args.get(1).copied() else {
+                return Ok(Some(Value::Int(0)));
+            };
+            if ctx.class_id_of_object(other) != ctx.class_id_of_object(this) {
+                return Ok(Some(Value::Int(0)));
+            }
+            let read = |ctx: &mut dyn NativeContext, o| match ctx.get_field_by_name(o, "sidString") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let a = read(ctx, this);
+            let b = read(ctx, other);
+            Ok(Some(Value::Int(i32::from(!a.is_empty() && a == b))))
+        });
+        r.register(wup, "hashCode", "()I", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sid = match ctx.get_field_by_name(this, "sidString") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // `String.hashCode()`, so the value matches what the real carrier
+            // (which hashes the same field) would produce.
+            let mut hash: i32 = 0;
+            for ch in sid.encode_utf16() {
+                hash = hash.wrapping_mul(31).wrapping_add(i32::from(ch));
+            }
+            Ok(Some(Value::Int(hash)))
+        });
+    }
     r.register(
         f,
         "createLink",

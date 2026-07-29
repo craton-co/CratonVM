@@ -5578,6 +5578,14 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .extend_application_classpath(paths);
     }
 
+    fn unregister_dynamic_classpath(&mut self, paths: &[String]) -> usize {
+        self.shared
+            .classes
+            .class_manager
+            .write()
+            .retract_application_classpath(paths)
+    }
+
     fn register_bootstrap_classpath(&mut self, paths: &[String]) {
         self.shared
             .classes

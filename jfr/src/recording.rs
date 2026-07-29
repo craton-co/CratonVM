@@ -366,6 +366,14 @@ impl FlightRecorder {
         self.refresh_running_ids();
     }
 
+    /// Ids of every currently-running recording.
+    ///
+    /// Exposed for `jdk.jfr.internal.JVM.endRecording()`, which takes no id and
+    /// must stop whatever this VM has running.
+    pub fn running_recording_ids(&self) -> Vec<u64> {
+        self.running_ids.clone()
+    }
+
     /// Recompute the cached running-recording IDs and update the global
     /// `JFR_ENABLED` flag accordingly. Called after every state transition.
     fn refresh_running_ids(&mut self) {
