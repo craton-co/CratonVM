@@ -1252,6 +1252,70 @@ pub fn lookup_jit_method_name(addr: usize) -> Option<String> {
         .map(|(_, _, name)| name.clone())
 }
 
+/// Outcome of a crash-time JIT name lookup.
+///
+/// [`lookup_jit_method_name`] collapses "the registry covers no such address"
+/// and "the registry mutex happened to be held" into the same `None`. Those are
+/// not the same fact, and a whole investigation
+/// (`jit-wild-jump-page-aligned-pc-20260728`) rested on reading a missing
+/// `jit pc :` line as the former.
+pub enum JitNameLookup {
+    /// The registry mutex was held. The absence of a name says nothing.
+    Locked,
+    /// The registry was read and no published body covers the address.
+    NotFound,
+    Found(String),
+}
+
+/// Like [`lookup_jit_method_name`], but distinguishes "no match" from "could
+/// not read the registry". `try_lock`, so it is safe from a crash handler.
+pub fn lookup_jit_method_name_detailed(addr: usize) -> JitNameLookup {
+    let Ok(v) = jit_name_ranges().try_lock() else {
+        return JitNameLookup::Locked;
+    };
+    match v
+        .iter()
+        .find(|(e, end, _)| addr >= *e && addr < *end)
+        .map(|(_, _, name)| name.clone())
+    {
+        Some(name) => JitNameLookup::Found(name),
+        None => JitNameLookup::NotFound,
+    }
+}
+
+/// Outcome of a crash-time live-code-region lookup. Same reasoning as
+/// [`JitNameLookup`]: a lock that could not be taken is not a negative.
+pub enum JitRegionLookup {
+    Locked,
+    NotFound,
+    /// `(base, capacity)` of the live executable buffer covering the address.
+    Found(usize, usize),
+}
+
+/// Which LIVE executable buffer covers `addr`?
+///
+/// Complements [`recent_code_free_covering`] (buffers already unmapped) and
+/// [`lookup_jit_method_name`] (bodies `JitCache::put` published). Every
+/// [`ExecutableBuffer`] registers here, including the ones no `put` ever names:
+/// OSR trampolines, and bodies a compiler thread is still emitting — which on
+/// Linux are mapped `rw-` and so fault on instruction fetch exactly like an
+/// unmapped page. `try_lock`, so it is safe from a crash handler.
+pub fn jit_code_region_covering(addr: usize) -> JitRegionLookup {
+    let Ok(regions) = jit_code_regions().try_lock() else {
+        return JitRegionLookup::Locked;
+    };
+    let idx = regions.regions.partition_point(|&(s, _)| s <= addr);
+    if idx == 0 {
+        return JitRegionLookup::NotFound;
+    }
+    let (start, end) = regions.regions[idx - 1];
+    if addr >= start && addr < end {
+        JitRegionLookup::Found(start, end - start)
+    } else {
+        JitRegionLookup::NotFound
+    }
+}
+
 /// Where each storage class lives in a compiled frame, as positive
 /// `[rbp - off]` byte offsets. Every range is `lo..hi` (exclusive `hi`), and an
 /// empty range is `0..0`.
@@ -12878,6 +12942,60 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// A crash handler must be able to tell "no compiled body covers this
+    /// address" from "I could not read the registry". Collapsing the two into
+    /// one `None` is what made the 2026-07-28 wild-jump report unreadable.
+    #[test]
+    fn jit_name_lookup_separates_absence_from_an_unreadable_registry() {
+        // Addresses far outside anything this process maps, so the assertion
+        // cannot be perturbed by a concurrently-running test's registrations.
+        let base = 0x5EED_0000_0000usize;
+        register_jit_method_name(base, 0x100, "Probe.absent()V".to_string());
+        assert!(matches!(
+            lookup_jit_method_name_detailed(base + 0x10),
+            JitNameLookup::Found(ref n) if n == "Probe.absent()V"
+        ));
+        assert!(matches!(
+            lookup_jit_method_name_detailed(base + 0x100),
+            JitNameLookup::NotFound
+        ));
+
+        let _held = jit_name_ranges().lock().expect("registry lock");
+        assert!(matches!(
+            lookup_jit_method_name_detailed(base + 0x10),
+            JitNameLookup::Locked
+        ));
+    }
+
+    /// Every executable buffer registers a live region, including the ones no
+    /// `JitCache::put` ever names. A crash handler uses that to separate "this
+    /// address is a buffer we still hold" from "this address is nothing".
+    #[test]
+    fn live_code_region_covers_a_buffer_the_name_registry_never_saw() {
+        let buf = ExecutableBuffer::new(4096).expect("alloc failed");
+        let base = buf.as_ptr() as usize;
+        assert!(matches!(
+            jit_code_region_covering(base),
+            JitRegionLookup::Found(b, cap) if b == base && cap == 4096
+        ));
+        assert!(matches!(
+            jit_code_region_covering(base + 4095),
+            JitRegionLookup::Found(..)
+        ));
+        // One past the end is outside THIS buffer. Phrased as "not this base"
+        // rather than "NotFound" because a concurrently-created buffer may
+        // legitimately be mapped immediately after it.
+        assert!(!matches!(
+            jit_code_region_covering(base + 4096),
+            JitRegionLookup::Found(b, _) if b == base
+        ));
+        drop(buf);
+        assert!(!matches!(
+            jit_code_region_covering(base),
+            JitRegionLookup::Found(b, _) if b == base
+        ));
+    }
+
     #[test]
     fn test_executable_buffer_finalize_and_make_writable() {
         let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
@@ -13609,6 +13727,57 @@ mod tests {
         assert!(
             lookup_jit_code_range(old_entry).is_none(),
             "dropping the final direct caller must reclaim the old body"
+        );
+    }
+
+    /// A body whose baked direct-call target cannot be pinned must NOT reach
+    /// the cache.
+    ///
+    /// `prepare_for_publication` upgrades every `_direct_callee_entries` address
+    /// into a strong `Arc` so the emitted `call` keeps its callee mapped. When
+    /// one no longer resolves — the callee was superseded between the compile
+    /// driver baking its address and this publication — the body carries a call
+    /// to an address nothing owns. Publishing it anyway (the historical
+    /// default-OFF `CRATONVM_JIT_STRICT_CALLEE_ROOTS` behaviour) is the
+    /// retired `jit-wild-jump-page-aligned-pc-20260728` crash: the callee is
+    /// retired on an ordinary tier-up while NO thread is inside compiled code —
+    /// a legal, quiescent retirement that `defer_jit_owner` cannot help with,
+    /// because a baked address holds no `Arc` — and the caller's next
+    /// invocation jumps into the unmapped page (`SIGSEGV`, `pc == addr`, at the
+    /// callee's page-aligned entry).
+    #[test]
+    fn a_body_with_an_unpinnable_baked_callee_is_not_published() {
+        let cache = JitCache::new();
+        // An entry no `put` ever registered an owner for, whose buffer is
+        // already gone: exactly what `resolve_jit_entry_owner` cannot pin.
+        let orphan_entry = {
+            let mut buf = ExecutableBuffer::new(64).expect("alloc orphan callee");
+            buf.emit(&[0xC3]);
+            let cm = CompiledMethod::new(buf);
+            let entry = cm.entry_ptr() as usize;
+            drop(cm);
+            entry
+        };
+        assert!(
+            resolve_jit_entry_owner(orphan_entry).is_none(),
+            "test setup: the orphan entry must not resolve to a live owner"
+        );
+
+        let mut caller_buf = ExecutableBuffer::new(64).expect("alloc caller");
+        caller_buf.emit(&[0xC3]);
+        let mut caller = CompiledMethod::new(caller_buf);
+        caller._direct_callee_entries.push(orphan_entry);
+
+        let class: Arc<str> = Arc::from("DanglingCaller");
+        let method: Arc<str> = Arc::from("call");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(4713);
+        cache.put(class.clone(), method.clone(), desc.clone(), cid, caller);
+
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_none(),
+            "a body whose baked `call` target is unowned must not be published; \
+             it stays interpreted and recompiles once the callee is live again"
         );
     }
 

@@ -5,13 +5,16 @@
 # non-zero exit with its captured stderr tail.
 BIN=$1; ROUNDS=${2:-10}; PAR=${3:-8}; shift 3
 EXTRA=("$@")
+# `HOGS` is read from the environment (`HOGS=20 ./stress_rtq.sh …`). It used to
+# be hardcoded to 6 BELOW this point, so every documented `HOGS=…` invocation
+# silently ran at 6 — and load is the knob these races turn on.
+HOGS=${HOGS:-6}
 CP=/data/tmp/rtq/probe:/data/data/spring-boot-tomcat-crossmodule-20260717/cratonvm-suite/classes:$(ls /data/data/spring-boot-tomcat-crossmodule-20260717/cratonvm-suite/lib/*.jar | tr '\n' ':')
 OUT=/data/tmp/rtq/stress
 rm -rf "$OUT"; mkdir -p "$OUT"; cd "$OUT" || exit 1
 
 # CPU load: enough to make the scheduler preempt VM threads mid-compile.
-HOGS=6
-for i in $(seq 1 $HOGS); do
+for i in $(seq 1 "$HOGS"); do
   ( while :; do :; done ) &
   echo $! >> "$OUT/hogs.pid"
 done
