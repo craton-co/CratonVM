@@ -29384,11 +29384,15 @@ pub fn compile_with_param_slots(
     } else {
         &[]
     };
+    // `param_jvm_slots` (not just `num_params`): a category-2 parameter spans
+    // two JVM slots, so the allocator must know which slots actually hold an
+    // incoming argument. See `regalloc::param_live_in_mask`.
     let alloc_result = super::regalloc::allocate_registers_with_handlers(
         code,
         code_len,
         max_locals,
         num_params,
+        param_jvm_slots,
         &loops,
         ra_handlers,
     );
@@ -29620,6 +29624,7 @@ pub fn compile_with_param_slots(
             code_len,
             max_locals,
             num_params,
+            param_jvm_slots,
             &compiler.local_assignments,
             param_oop_mask,
             ra_handlers,
@@ -29912,6 +29917,7 @@ pub fn compile_with_param_slots(
             code,
             code_len,
             num_params,
+            param_jvm_slots,
             &exception_ranges,
         );
         compiler.local_liveness = liveness;
@@ -42805,7 +42811,7 @@ mod flag_and_header_contracts {
         // Both locals register-homed, as the allocator would do for a hot kernel.
         let assignments = vec![Some(R12), Some(R13)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &[], &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals, 0,
             "an int-only kernel has no reference locals"
@@ -42830,7 +42836,7 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![None, Some(R12)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &assignments, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &[], &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals & 0b10,
             0b10,
@@ -42846,7 +42852,7 @@ mod flag_and_header_contracts {
         // already frame-resident, so nothing needs publishing.
         let spilled = vec![None, None];
         let plan_spilled =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &spilled, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &[], &spilled, 0, &[]);
         assert!(plan_spilled.no_reference_in_registers());
         assert!(!reference_local_in_register(Some(&plan_spilled), &spilled));
     }
@@ -42862,20 +42868,13 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![Some(R12)];
         let without =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &[], &assignments, 0, &[]);
         assert!(
             without.no_reference_in_registers(),
             "the bytecode scan alone cannot see an unloaded reference parameter"
         );
-        let with = crate::regalloc::plan_safepoint_publication(
-            &code,
-            code_len,
-            1,
-            1,
-            &assignments,
-            0b1, // param_oop_mask: local 0 is a reference parameter
-            &[],
-        );
+        let with = crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &[], &assignments, 0b1, // param_oop_mask: local 0 is a reference parameter
+            &[]);
         assert!(
             !with.no_reference_in_registers(),
             "param_oop_mask must make the never-loaded reference parameter visible; \
@@ -42908,7 +42907,7 @@ mod flag_and_header_contracts {
         let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
         let no_homes = vec![None, None];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &no_homes, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &[], &no_homes, 0, &[]);
         assert_eq!(
             reference_local_in_register(Some(&plan), &no_homes),
             reference_local_in_register(None, &no_homes),
@@ -42934,15 +42933,7 @@ mod flag_and_header_contracts {
              can_elide_self_call_register_spill's soundness argument breaks"
         );
         // Feeding the allocator's own output back through the plan must agree.
-        let plan = crate::regalloc::plan_safepoint_publication(
-            &code,
-            code.len(),
-            80,
-            0,
-            &alloc.assignments,
-            0,
-            &[],
-        );
+        let plan = crate::regalloc::plan_safepoint_publication(&code, code.len(), 80, 0, &[], &alloc.assignments, 0, &[]);
         assert!(plan.no_reference_in_registers());
     }
 
