@@ -76,3 +76,21 @@ CBC and DHE docs.
 class pass). Expected, given this is a permanent upstream rustls limitation
 rather than a bug to fix. Log:
 `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard6/logs/module_spring-boot-tomcat.org.springframework.boot.tomcat.SslConnectorCustomizerTests.out.log`.
+
+**Confirmed still failing 2026-07-28** (`RunName=craton-rerun-20260728`):
+same test, same identical mismatch, 7/8 other tests in the class still pass:
+
+```
+Expecting actual:
+  ["TLSv1.2"]
+to contain exactly in any order:
+  ["TLSv1.1", "TLSv1.2"]
+but could not find the following elements:
+  ["TLSv1.1"]
+```
+
+Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard2/logs/module_spring-boot-tomcat.org.springframework.boot.tomcat.SslConnectorCustomizerTests.out.log`.
+No change expected or needed — this remains the same permanent, deliberate
+upstream rustls limitation this doc already describes, not re-investigated
+further this session.
