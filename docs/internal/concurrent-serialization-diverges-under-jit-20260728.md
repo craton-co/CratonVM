@@ -1,0 +1,35 @@
+# Concurrent serialization divergence under JIT — resolved 2026-07-29
+
+## Root cause
+
+Several native collection paths retained `ObjectRef`s only in Rust vectors or
+locals while invoking Java code or allocating a destination collection. A
+moving collection could therefore relocate those objects, after which a later
+comparison, hash, iterator store, or wrapper publication used the stale
+address. The issue surfaced as intermittent concurrent wire-serialization
+inequality in Elasticsearch snapshots and had previously been hidden by a
+broad Elasticsearch JIT restriction.
+
+The repair roots and refreshes all affected references across re-entry in the
+interpreter/native invocation boundary and native collection operations:
+
+- native map and list hash/equality snapshots;
+- generic list comparison snapshots while both iterators run;
+- set hash/equality snapshots and set iterator array materialization;
+- unmodifiable-wrapper allocation; and
+- `Arrays.hashCode(Object[])` array traversal.
+
+## Validation
+
+All validation used b12, SHA-256
+`6bbf1cfd02447e3ad8eb0fe0631395b0527c5ab9793e9af9a87a6ca1bc58bead`,
+from the isolated Azure worktree and target directory.
+
+- `SnapshotsInProgressSerializationTests`: 3/3 JIT and 3/3 `--nojit`, each
+  `OK (10 tests)`.
+- `StringRareTermsTests`: 6/6 JIT and 6/6 `--nojit`, each `OK (7 tests)`.
+- `LongRareTermsTests`: 2/2 JIT and 2/2 `--nojit`, each `OK (7 tests)`.
+- `cargo test -p cratonvm-native-collections --lib`: 85/85 passed.
+
+The issue is retired from `docs/known-issues` because the exact reproducer and
+the linked residual classes are green in both execution modes.
