@@ -4904,19 +4904,43 @@ impl ClassManager {
             .filter(|class| class.loader_id == loader_id)
             .map(|class| class.id)
             .collect();
+        self.unload_user_classes_inner(ids)
+    }
+
+    /// Atomically detach exactly the requested user-defined classes from the
+    /// live metadata graph.
+    ///
+    /// A class-manager loader id is a resolution namespace, not necessarily a
+    /// unique Java `ClassLoader` object: JDK dynamic proxies can share a
+    /// synthetic namespace even when their defining loaders have different
+    /// lifetimes. GC therefore supplies the ClassIds whose defining-loader
+    /// entries were proven dead, and unloading any sibling merely because it
+    /// shares that namespace would invalidate a still-executing class.
+    pub fn unload_user_classes(&mut self, class_ids: &[ClassId]) -> Vec<UnloadedClass> {
+        let ids: FxHashSet<ClassId> = class_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.class_store
+                    .get(*id)
+                    .is_some_and(|class| matches!(class.loader_id, ClassLoaderId::UserDefined(_)))
+            })
+            .collect();
+        self.unload_user_classes_inner(ids)
+    }
+
+    fn unload_user_classes_inner(&mut self, ids: FxHashSet<ClassId>) -> Vec<UnloadedClass> {
         if ids.is_empty() {
-            self.user_loaders.remove(&loader_id);
             return Vec::new();
         }
 
         // Remove both defining and initiating-name aliases that point into the
-        // dead loader's class set.
+        // exact dead class set. Do not remove aliases for live siblings that
+        // happen to share the same resolution namespace.
         self.loaded_classes.retain(|_, id| !ids.contains(id));
         // Removal here is by ClassId set, not by key, so there is no
         // per-entry hook to decrement the name index through.
         self.rebuild_name_definitions();
-        self.user_loaders.remove(&loader_id);
-
         self.vtable_descriptors.retain(|id, _| !ids.contains(id));
         self.skip_bytecode_verification
             .retain(|id| !ids.contains(id));
@@ -4940,13 +4964,20 @@ impl ClassManager {
                 unloaded.push(UnloadedClass {
                     id,
                     name: class.name,
-                    loader_id,
+                    loader_id: class.loader_id,
                 });
                 // Symbolic and reflective resolution caches may hold the class
                 // as either key or resolved target.
                 fire_resolution_invalidate_hook(id.as_u32());
             }
         }
+        self.user_loaders = self
+            .class_store
+            .iter()
+            .filter_map(|class| {
+                matches!(class.loader_id, ClassLoaderId::UserDefined(_)).then_some(class.loader_id)
+            })
+            .collect();
         unloaded.sort_unstable_by_key(|class| class.id.as_u32());
         unloaded
     }
@@ -9191,6 +9222,19 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/nio/channels/DatagramChannel" => instance_fields(5),
         // MulticastSocket = 5 (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
         "java/net/MulticastSocket" => instance_fields(5),
+        // DatagramPacket = 5 (buf=0, length=1, address=2, port=3, offset=4) per
+        // `net_channels::register_p72_datagram`, and Preferences = 5 (backing
+        // map=0, name=1, parent=2, children=3, removed=4) per
+        // `beans_jndi::register_p72_preferences`.
+        //
+        // Both were ABSENT and fell to the `_ => vec![]` arm below, so a
+        // synthetic-mode `new` produced a ZERO-slot object and every raw-slot
+        // native for them was inert — the same failure mode wave 2 found with
+        // DOMSource/DOMResult. Note the silence: `set_field` on a short object
+        // drops the write rather than erroring, so the natives looked
+        // implemented while storing nothing.
+        "java/net/DatagramPacket" => instance_fields(5),
+        "java/util/prefs/Preferences" => instance_fields(5),
         // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
         // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
         // allocates enough slots for the synthetic-mode field layout used by
@@ -9223,9 +9267,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "com/sun/net/httpserver/HttpServer" | "com/sun/net/httpserver/HttpServerImpl" => {
             instance_fields(5)
         }
-        // HttpExchange = 8 (method, uri, reqHeaders, respHeaders, reqBody,
-        // statusCode, owner_socket, response_chunks)
-        "com/sun/net/httpserver/HttpExchange" => instance_fields(8),
+        // HttpExchange = 9 (method, uri, reqHeaders, respHeaders, reqBody,
+        // statusCode, owner_socket, response_chunks, principal)
+        //
+        // This read 8 while `net_phase_e.rs` has used `HEX_NUM_FIELDS = 9`
+        // with `HEX_PRINCIPAL = 8`, so the last slot did not exist and every
+        // write to it went nowhere — losing the authenticated principal on
+        // every synthetic-mode exchange. A too-short object does not fail
+        // loudly here; the store is simply dropped, which is why the
+        // off-by-one survived. If you add a slot in `net_phase_e.rs`, add it
+        // here in the same change.
+        "com/sun/net/httpserver/HttpExchange" => instance_fields(9),
         // HttpExchange$ResponseBody = 2 (owner exchange, dummy)
         "com/sun/net/httpserver/HttpExchange$ResponseBody" => instance_fields(2),
         // HttpContext = 2 (path, handler)
@@ -12923,10 +12975,6 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
             descriptor: cratonvm_types::intern_arc(descriptor),
             attributes: vec![],
         };
-        out.push(mk_static(
-            "defaultThreadFactory",
-            "()Ljava/util/concurrent/ThreadFactory;",
-        ));
         out.extend([
             mk_static(
                 "newCachedThreadPool",
@@ -12937,14 +12985,6 @@ fn synthetic_stub_ctor_methods(name: &str) -> Vec<ClassFileMethod> {
                 "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
             ),
         ]);
-    }
-    if name == "java/util/concurrent/ThreadFactory" {
-        out.push(ClassFileMethod {
-            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::NATIVE,
-            name: cratonvm_types::intern_arc("newThread"),
-            descriptor: cratonvm_types::intern_arc("(Ljava/lang/Runnable;)Ljava/lang/Thread;"),
-            attributes: vec![],
-        });
     }
     if name == "java/util/concurrent/ScheduledThreadPoolExecutor" {
         let mk = |method: &str, descriptor: &str| ClassFileMethod {
@@ -13285,6 +13325,26 @@ mod tests {
         );
         // Field layout is preserved: the stub still declares its N slots.
         assert_eq!(cm.get_class(anon_id).map(|c| c.num_total_fields), Some(4));
+    }
+
+    #[test]
+    fn exact_user_class_unload_preserves_live_siblings_in_the_same_namespace() {
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        let dead = cm.ensure_synthetic_class("test/proxy/Dead", 0);
+        let live = cm.ensure_synthetic_class("test/proxy/Live", 0);
+        let namespace = ClassLoaderId::UserDefined(77);
+        cm.class_store.get_mut(dead).unwrap().loader_id = namespace;
+        cm.class_store.get_mut(live).unwrap().loader_id = namespace;
+
+        let unloaded = cm.unload_user_classes(&[dead]);
+
+        assert_eq!(unloaded.len(), 1);
+        assert_eq!(unloaded[0].id, dead);
+        assert!(cm.get_class(dead).is_none(), "the proven-dead class is tombstoned");
+        assert!(
+            cm.get_class(live).is_some(),
+            "a live sibling in the same synthetic namespace must remain loaded"
+        );
     }
 
     #[test]

@@ -1333,24 +1333,17 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
     // no real Reader bytecode to defer to.
     #[cfg(feature = "synthetic-jdk")]
     {
-        // -------------------------------------------------------------------------
-        // java.io.InputStream.close() — spec-correct no-op: the base class body
-        // in java.base is literally empty (`public void close() throws
-        // IOException {}`); every stream that owns a handle overrides it, and an
-        // override resolves to the subclass, not here.
-        // -------------------------------------------------------------------------
-        r.register("java/io/InputStream", "close", "()V", native_noop_with_this);
-        // KEEP (deliberate constant), audited 2026-07-27. `InputStream.read()`
-        // is abstract in java.base — a native on it is only ever reached by a
-        // synthetic-mode subclass that supplies no `read()` of its own, i.e.
-        // a stream with no source. EOF is the only answer that does not
-        // fabricate data. It is NOT the answer for a stream that does have a
-        // source: every such class (ByteArrayInputStream, the
-        // getResourceAsStream product, FileInputStream) registers its own
-        // `read` and that override wins.
-        r.register("java/io/InputStream", "read", "()I", |_ctx, _args| {
-            Ok(Some(Value::Int(-1))) // EOF
-        });
+        // DELETED wave 4 (2026-07-28): `java/io/InputStream.close()V` (a no-op)
+        // and `java/io/InputStream.read()I` (a constant EOF) used to be
+        // registered here. Both were DEAD registrations, in both run modes:
+        // `native-io::register_io_natives` registers the same two triples
+        // UNGATED (`native-io/src/lib.rs`, the "java.io.InputStream (base class
+        // fallback)" block) bound to `native_bais_read` / `native_bais_close`,
+        // and it runs strictly AFTER this registrar in every VM init path
+        // (`vm/src/vm/vm_init.rs`: register_builtins → register_io_natives, and
+        // register_essential_natives_with_shims → register_io_natives).
+        // Last-registration-wins, so nothing ever reached the constants here.
+        // Do not re-add them: they can only shadow the working implementations.
 
         // -------------------------------------------------------------------------
         // java.io.InputStreamReader.<init>(InputStream)  — store stream at field 0
@@ -1789,8 +1782,27 @@ pub(crate) fn register_s1_classloading(r: &mut NativeMethodRegistry) {
     // and keep only the URL[] and parent refs. The remaining half of the
     // contract (a closed loader must stop serving new classes/resources) needs a
     // VM-side way to retract a dynamic-classpath entry, which does not exist —
-    // so post-close loads still succeed here. Left as-is deliberately rather
-    // than faked; see the stub-removal report.
+    // so post-close loads still succeed here.
+    //
+    // ESCALATED wave 4 (2026-07-28) — still not fixable from this crate. The
+    // only classpath mutator on the native ABI is
+    // `NativeContext::register_dynamic_classpath(&mut self, paths: &[String])`
+    // (`native-api/src/registry.rs`); it is append-only and returns nothing, so
+    // a native cannot name, let alone drop, the entries a given loader added.
+    // Closing the loop needs BOTH halves on `NativeContext`:
+    //   * `register_dynamic_classpath` to return a handle/entry-id per path (or
+    //     a sibling `register_dynamic_classpath_owned(owner: ObjectRef, …)`),
+    //     and
+    //   * `unregister_dynamic_classpath(&mut self, ids: &[..])` backed by
+    //     `classloading::class_path` so subsequent `findClass`/`getResource`
+    //     misses those roots.
+    // Faking the other observable half here (flip a `closed` flag and make
+    // `getResource`/`findClass` fail afterwards) was rejected: those handlers
+    // are `crate::classloader::cl_get_resource*_essential`, shared by EVERY
+    // loader, and CratonVM callers today keep using loaders they have closed —
+    // exactly because close has always been lenient. Turning that into hard
+    // failures without the classpath retraction that justifies it would trade
+    // one wrong behaviour for a louder one.
     r.register(ucl, "close", "()V", native_noop_with_this);
 
     // =========================================================================
@@ -5303,17 +5315,40 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         r.register(cls, "array", "()[I", |ctx, args| {
             Ok(Some(Value::Object(s2_bb_arr(ctx, obj_arg(args, 0)?))))
         });
-        // KEEP (deliberate constants) — audited 2026-07-27. Every receiver
-        // reaching these is a view buffer produced by `s2_view_buf_fn!` and
-        // backed by the int[] that `s2_bb_arr` (just above) hands out, so
-        // `isDirect() == false` is a fact about the layout, not a
-        // placeholder: a direct buffer would have no accessible backing
-        // array. `isReadOnly() == false` is exact for the same reason —
-        // `asReadOnlyBuffer` is unimplemented for these classes (see the note
-        // immediately below), so no read-only view of one can exist yet.
-        // Whoever implements it must replace this with a real flag read
-        // rather than leave the constant standing.
-        r.register(cls, "isDirect", "()Z", |_, _| Ok(Some(Value::Int(0))));
+        // `isDirect` — IMPLEMENTED wave 4 (2026-07-28). The wave-3 note here
+        // claimed "every receiver is a heap view backed by the int[]", which is
+        // false: `s2_view_buf_fn!` has a second branch — when the SOURCE
+        // ByteBuffer is direct (`s2_bb_direct_addr`), the view it hands out has
+        // NO backing array and carries a native `address` instead. Real JDK
+        // agrees that such a view is direct
+        // (`allocateDirect(n).asIntBuffer().isDirect() == true`), so the
+        // constant `false` was wrong for exactly that case — and wrong in the
+        // direction that makes callers take the "copy via array()" path on a
+        // buffer that has no array. Answer from the same storage probe every
+        // accessor in this file uses: `s2_bb_direct_addr` returns `Some` only
+        // when `s2_bb_arr` finds nothing AND a positive address slot exists.
+        r.register(cls, "isDirect", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Int(
+                if s2_bb_direct_addr(ctx, this).is_some() {
+                    1
+                } else {
+                    0
+                },
+            )))
+        });
+        // `isReadOnly` — KEEP, but the wave-3 justification was also wrong:
+        // `asReadOnlyBuffer` IS registered for all five view classes (see the
+        // `s2_typed_buffer_view_fns!` expansions below), it just aliases
+        // `duplicate` and therefore hands back a WRITABLE buffer. So no
+        // read-only view of an s2 buffer can exist, and `false` is exact for
+        // every receiver that can reach here — not because the method is
+        // missing, but because the only producer of a read-only view does not
+        // produce one. FOLLOW-UP for whoever makes `$ro` real: it needs a
+        // read-only flag on the view (the 6-slot synthetic is full — slots
+        // 0..5 are array/pos/limit/cap/byte-start-marker/segment — so this
+        // needs a wider allocation), `put`/`compact` must then throw
+        // `ReadOnlyBufferException`, and THIS registration must read the flag.
         r.register(cls, "isReadOnly", "()Z", |_, _| Ok(Some(Value::Int(0))));
     }
 

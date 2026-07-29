@@ -699,7 +699,7 @@ no repeating `InterceptingExecutableInvoker` warning — the recursion guard
 this doc fixed is confirmed still working. Root-caused (to the extent
 possible without a debugger attach) as a new, separate doc rather than
 reopening this one:
-[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md).
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md`](modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md).
 `ConnectionFactoryUnwrapperTests` (this cluster's `StackOverflowError`
 example class) also regressed, but back to its *original* pre-fix symptom —
 see the regression note added to

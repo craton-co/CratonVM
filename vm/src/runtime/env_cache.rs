@@ -315,22 +315,50 @@ pub fn set_show_code_details_in_exception_messages(on: bool) {
     SHOW_CODE_DETAILS.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The explicitly-configured value of the flag, or `None` when nothing set it
+/// (the `-1` sentinel and no `CRATONVM_HELPFUL_NPE_OPCODES`).
 #[inline]
-pub fn helpful_npe_opcodes() -> bool {
+fn show_code_details_explicit() -> Option<bool> {
     // Explicit env override wins (interim developer knob), parsed once.
     static ENV: OnceLock<Option<bool>> = OnceLock::new();
     let env = *ENV.get_or_init(|| match cratonvm_types::flags::runtime_var("CRATONVM_HELPFUL_NPE_OPCODES") {
         Ok(v) => Some(!v.is_empty() && v != "0"),
         Err(_) => None,
     });
-    if let Some(b) = env {
-        return b;
+    if env.is_some() {
+        return env;
     }
-    // Otherwise honor `-XX:±ShowCodeDetailsInExceptionMessages`. The CLI
-    // resolves an absent flag to the on default and calls `set()`, so `== 1`
-    // here yields the HotSpot-matching default for app runs; the `-1` sentinel
-    // (set() never called) stays off for embedders/tests that don't wire it.
-    SHOW_CODE_DETAILS.load(std::sync::atomic::Ordering::Relaxed) == 1
+    match SHOW_CODE_DETAILS.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the flag was explicitly turned **off** — `-XX:-ShowCodeDetails\
+/// InExceptionMessages` or `CRATONVM_HELPFUL_NPE_OPCODES=0`.
+///
+/// HotSpot's `getMessage()` is `null` for an implicit-dereference NPE under that
+/// flag, so this is *not* the same as "not on": the `-1` sentinel (an embedder
+/// or the in-process Rust test harness that never wires the flag) must keep the
+/// legacy diagnostic strings, and only an explicit opt-out suppresses the
+/// message outright.
+#[inline]
+pub fn helpful_npe_suppressed() -> bool {
+    show_code_details_explicit() == Some(false)
+}
+
+/// Whether a null-deref opcode should build its message through the JEP-358
+/// path at all.
+///
+/// True both when the flag is **on** (build the HotSpot message) and when it is
+/// explicitly **off** (build the HotSpot *suppression* — the builders return the
+/// empty marker, which becomes a null `getMessage()`). Only the unwired sentinel
+/// returns false, keeping the pre-JEP-358 diagnostics for embedders and the
+/// in-process test harness.
+#[inline]
+pub fn helpful_npe_opcodes() -> bool {
+    show_code_details_explicit().is_some()
 }
 
 /// proxy-real-classfile — real-super gate. When ON (the **default**, per the

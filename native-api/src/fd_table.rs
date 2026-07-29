@@ -1892,6 +1892,26 @@ impl FileDescriptorTable {
         }
     }
 
+    /// Set the IP type-of-service / DSCP byte on a UDP socket (IP_TOS).
+    ///
+    /// Added so `DatagramChannel.setTrafficClass` could stop being a silent
+    /// no-op. `FileEntry` and `get_entry` are private to this module and
+    /// `native-io` has no `socket2` dependency, so this could not be written
+    /// on the caller's side.
+    ///
+    /// The option is genuinely advisory — routers may ignore the bits — but
+    /// "the network might not honour it" is not the same as "we never asked",
+    /// and only the latter was true before.
+    pub fn udp_set_tos(&self, fd: FdId, tos: u32) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).set_tos(tos),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
     /// Set SO_RCVBUF on a UDP socket.
     pub fn udp_set_recv_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
         let entry = self

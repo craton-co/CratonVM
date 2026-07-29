@@ -512,14 +512,21 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         cl,
         "getUnnamedModule",
         "()Ljava/lang/Module;",
-        |ctx, _args| {
+        |ctx, args| {
             // Return the ONE canonical unnamed-module mirror rather than a fresh
             // allocation per call: the JDK compares Modules by identity, so
             // `Foo.class.getModule() == loader.getUnnamedModule()` (and Mockito's
             // `assureCanReadMockito` / ResourceBundle's caller-module checks) must
             // see the same object. It also carries a non-null `loader`, matching
             // HotSpot. See `lang_class::canonical_unnamed_module`.
-            let m = crate::lang_class::canonical_unnamed_module(ctx);
+            // Per-loader for user-defined loaders (HotSpot: every loader has
+            // its own unnamed module and `Module.getClassLoader()` answers
+            // that loader); built-in loaders keep the single canonical one.
+            let this = match args.first() {
+                Some(Value::Object(o)) => *o,
+                _ => None,
+            };
+            let m = crate::lang_class::unnamed_module_for_loader(ctx, this);
             Ok(Some(Value::Object(Some(m))))
         },
     );
@@ -570,6 +577,29 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
     // parallel-capable and `true` is the accurate answer, not an optimistic
     // one. (Real JDK returns false only for the bookkeeping case where a
     // superclass was not itself registered — a distinction we do not model.)
+    //
+    // Wave-3 shadowing note: this class+method+descriptor is registered THREE
+    // times — here, `classloader.rs::cl_register_as_parallel_capable`, and
+    // `deprecated_internal.rs`. All three return 1, so last-write-wins is
+    // currently harmless; if you ever change the answer, change all three or
+    // the edit will be silently shadowed.
+    //
+    // RESOLVED — the "known inconsistency" this comment used to describe is
+    // gone; re-verified wave 4 (2026-07-28). The claim was that
+    // `classloader.rs::cl_is_registered_as_parallel_capable` read a
+    // `CL_IS_PARALLEL_CAPABLE` field nothing ever SET, so the query answered
+    // false while this answers true. All four ClassLoader initialisers in
+    // `classloader.rs` (`alloc_classloader`, `cl_init`, `cl_init_parent`,
+    // `cl_init_name_parent`) now seed that slot to `Int(1)`, and the query
+    // native falls back to `1` for loaders whose layout is too short to carry
+    // the slot. Register and query therefore agree. If you ever make this
+    // return something other than 1, update `CL_IS_PARALLEL_CAPABLE`'s four
+    // writers and `cl_is_registered_as_parallel_capable`'s fallback too.
+    //
+    // Not implementable as a caller-class lookup from here in any case: the
+    // method is STATIC, so there is no receiver, and `NativeContext` exposes no
+    // caller-class / stack-walk accessor to stand in for the JDK's
+    // `Reflection.getCallerClass()` + static `ParallelLoaders` set.
     r.register(cl, "registerAsParallelCapable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });

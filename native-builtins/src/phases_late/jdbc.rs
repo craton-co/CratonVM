@@ -49,8 +49,31 @@ pub(crate) mod jdbc_registry {
     struct CachedResult {
         rows: Vec<Vec<String>>,
         column_names: Vec<String>,
-        /// SQLite column type names (TEXT, INTEGER, REAL, BLOB, NULL)
+        /// The DECLARED type of each result column, exactly as SQLite reports
+        /// it from `sqlite3_column_decltype` — free text such as `INTEGER`,
+        /// `VARCHAR(20)`, `DECIMAL(10,2)`, `unsigned big int`. Empty for a
+        /// column that has no declared type at all (an expression, an
+        /// aggregate, a literal: `SELECT a+b`, `SELECT count(*)`).
+        ///
+        /// Kept RAW rather than pre-normalised because the parenthesised
+        /// arguments are the only real source we have for `getPrecision` /
+        /// `getScale`, and the affinity rules in `type_affinity` are defined
+        /// over the raw text.
         column_types: Vec<String>,
+        /// The runtime SQLite storage class of each column in the FIRST row
+        /// (`INTEGER`/`REAL`/`TEXT`/`BLOB`/`NULL`), or empty when the result
+        /// set has no rows. This is the fallback for columns with no declared
+        /// type: SQLite itself has no static type for an expression, so the
+        /// value actually produced is the only type information that exists.
+        column_runtime_types: Vec<String>,
+        /// The connection that produced this result. `ResultSetMetaData`
+        /// only carries the stmt id, so this is how metadata queries
+        /// (`isNullable`) get back to the live schema.
+        conn_id: i64,
+        /// The SQL text that produced it — read by `column_nullable` to
+        /// decide whether an outer join / union could have introduced NULLs
+        /// into an otherwise NOT NULL column.
+        sql: String,
     }
 
     struct PreparedState {
@@ -58,6 +81,21 @@ pub(crate) mod jdbc_registry {
         sql: String,
         params: HashMap<usize, ParamValue>,
         batch: Vec<HashMap<usize, ParamValue>>,
+        /// `CallableStatement.registerOutParameter(int, …)` registrations,
+        /// keyed by the 1-based parameter index.
+        out_params: HashMap<usize, OutParam>,
+        /// The same, for the `registerOutParameter(String, …)` overloads.
+        out_params_by_name: HashMap<String, OutParam>,
+    }
+
+    /// One `CallableStatement.registerOutParameter` registration: the
+    /// `java.sql.Types` code the caller asked for plus the optional scale /
+    /// SQL type name carried by the three-argument overloads.
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct OutParam {
+        pub sql_type: i32,
+        pub scale: i32,
+        pub type_name: Option<String>,
     }
 
     #[derive(Clone)]
@@ -238,7 +276,7 @@ pub(crate) mod jdbc_registry {
     pub fn execute_query(conn_id: i64, sql: &str) -> Result<(i64, usize), String> {
         let mut reg = registry().lock();
 
-        let (rows, column_names, column_types) = {
+        let (rows, column_names, column_types, column_runtime_types) = {
             let conn = reg
                 .connections
                 .get(&conn_id)
@@ -251,10 +289,21 @@ pub(crate) mod jdbc_registry {
                 .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
                 .collect();
 
-            // Column types — rusqlite doesn't expose decl_type easily before execution.
-            // Default all to TEXT; actual type detection happens at row-read time.
-            let col_types: Vec<String> = (0..column_count).map(|_| "TEXT".to_string()).collect();
+            // Real declared types, straight out of `sqlite3_column_decltype`
+            // (rusqlite's `column_decltype` feature). `decl_type()` is `None`
+            // for a column that has no declared type — an expression, an
+            // aggregate or a literal — which we record as the empty string and
+            // resolve later against the first row's storage class. This
+            // hardcoded `vec!["TEXT"; n]` until 2026-07-28, which made
+            // `getColumnType()` report `Types.VARCHAR` for every column of
+            // every result set.
+            let col_types: Vec<String> = stmt
+                .columns()
+                .iter()
+                .map(|c| c.decl_type().unwrap_or("").to_string())
+                .collect();
 
+            let mut col_runtime_types: Vec<String> = vec![String::new(); column_count];
             let mut result_rows: Vec<Vec<String>> = Vec::new();
             let mut rows_iter = stmt.query([]).map_err(|e| sanitize_error(&e))?;
 
@@ -262,8 +311,14 @@ pub(crate) mod jdbc_registry {
                 if result_rows.len() >= MAX_RESULT_ROWS {
                     break; // Prevent unbounded memory growth
                 }
+                let first_row = result_rows.is_empty();
                 let mut vals = Vec::with_capacity(column_count);
                 for i in 0..column_count {
+                    if first_row {
+                        if let Ok(v) = row.get_ref(i) {
+                            col_runtime_types[i] = storage_class_name(v.data_type()).to_string();
+                        }
+                    }
                     let val: String = row
                         .get::<_, String>(i)
                         .or_else(|_| row.get::<_, i64>(i).map(|v| v.to_string()))
@@ -274,7 +329,7 @@ pub(crate) mod jdbc_registry {
                 result_rows.push(vals);
             }
 
-            (result_rows, col_names, col_types)
+            (result_rows, col_names, col_types, col_runtime_types)
         };
 
         let row_count = rows.len();
@@ -293,6 +348,9 @@ pub(crate) mod jdbc_registry {
                 rows,
                 column_names,
                 column_types,
+                column_runtime_types,
+                conn_id,
+                sql: sql.to_string(),
             },
         );
         Ok((stmt_id, row_count))
@@ -358,6 +416,8 @@ pub(crate) mod jdbc_registry {
                 sql: sql.to_string(),
                 params: HashMap::new(),
                 batch: Vec::new(),
+                out_params: HashMap::new(),
+                out_params_by_name: HashMap::new(),
             },
         );
         id
@@ -402,6 +462,100 @@ pub(crate) mod jdbc_registry {
         }
     }
 
+    // --- CallableStatement OUT-parameter registrations ---
+    //
+    // JDBC requires the driver to REMEMBER the type a caller registers for an
+    // OUT parameter — it is the only record that the parameter is an OUT at
+    // all. SQLite has no stored procedures, so nothing executes against the
+    // registration yet, but the state below is real, survives to
+    // `free_prepared`, and is readable through `out_parameter*`; and an
+    // unknown statement id / illegal index is now reported instead of being
+    // silently swallowed.
+
+    /// Record a `registerOutParameter(int parameterIndex, …)` registration.
+    pub fn register_out_parameter(
+        ps_id: i64,
+        index: usize,
+        sql_type: i32,
+        scale: i32,
+        type_name: Option<String>,
+    ) -> Result<(), String> {
+        if index == 0 {
+            return Err("registerOutParameter: parameter index is 1-based".to_string());
+        }
+        let mut reg = registry().lock();
+        let ps = reg
+            .prepared
+            .get_mut(&ps_id)
+            .ok_or_else(|| "Prepared statement not found".to_string())?;
+        ps.out_params.insert(
+            index,
+            OutParam {
+                sql_type,
+                scale,
+                type_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record a `registerOutParameter(String parameterName, int sqlType)`
+    /// registration.
+    pub fn register_out_parameter_named(
+        ps_id: i64,
+        name: &str,
+        sql_type: i32,
+    ) -> Result<(), String> {
+        register_out_parameter_named_ext(ps_id, name, sql_type, 0, None)
+    }
+
+    /// The same, for the two three-argument named overloads —
+    /// `(String, int, int)` carries a scale, `(String, int, String)` carries
+    /// a SQL type name. Both are part of `CallableStatement` and were
+    /// previously unregistered, so a caller using them got the class's
+    /// (abstract / absent) body rather than a recorded registration.
+    pub fn register_out_parameter_named_ext(
+        ps_id: i64,
+        name: &str,
+        sql_type: i32,
+        scale: i32,
+        type_name: Option<String>,
+    ) -> Result<(), String> {
+        if name.is_empty() {
+            return Err("registerOutParameter: parameter name is empty".to_string());
+        }
+        let mut reg = registry().lock();
+        let ps = reg
+            .prepared
+            .get_mut(&ps_id)
+            .ok_or_else(|| "Prepared statement not found".to_string())?;
+        ps.out_params_by_name.insert(
+            name.to_string(),
+            OutParam {
+                sql_type,
+                scale,
+                type_name,
+            },
+        );
+        Ok(())
+    }
+
+    /// The registration made for a 1-based parameter index, if any.
+    pub fn out_parameter(ps_id: i64, index: usize) -> Option<OutParam> {
+        let reg = registry().lock();
+        reg.prepared
+            .get(&ps_id)
+            .and_then(|ps| ps.out_params.get(&index).cloned())
+    }
+
+    /// The registration made for a named parameter, if any.
+    pub fn out_parameter_named(ps_id: i64, name: &str) -> Option<OutParam> {
+        let reg = registry().lock();
+        reg.prepared
+            .get(&ps_id)
+            .and_then(|ps| ps.out_params_by_name.get(name).cloned())
+    }
+
     /// Execute a prepared query. Returns (stmt_id, row_count).
     pub fn execute_prepared_query(ps_id: i64) -> Result<(i64, usize), String> {
         let mut reg = registry().lock();
@@ -413,7 +567,7 @@ pub(crate) mod jdbc_registry {
             (ps.conn_id, ps.sql.clone(), ps.params.clone())
         };
 
-        let (rows, column_names, column_types) = {
+        let (rows, column_names, column_types, column_runtime_types) = {
             let conn = reg
                 .connections
                 .get(&conn_id)
@@ -448,16 +602,29 @@ pub(crate) mod jdbc_registry {
             let col_names: Vec<String> = (0..column_count)
                 .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
                 .collect();
-            let col_types: Vec<String> = (0..column_count).map(|_i| "TEXT".to_string()).collect();
+            // Same real-decltype read as `execute_query` — see the comment
+            // there. Both paths hardcoded `vec!["TEXT"; n]` until 2026-07-28.
+            let col_types: Vec<String> = stmt
+                .columns()
+                .iter()
+                .map(|c| c.decl_type().unwrap_or("").to_string())
+                .collect();
 
+            let mut col_runtime_types: Vec<String> = vec![String::new(); column_count];
             let mut result_rows: Vec<Vec<String>> = Vec::new();
             let mut rows_iter = stmt.raw_query();
             while let Some(row) = rows_iter.next().map_err(|e| sanitize_error(&e))? {
                 if result_rows.len() >= MAX_RESULT_ROWS {
                     break;
                 }
+                let first_row = result_rows.is_empty();
                 let mut vals = Vec::with_capacity(column_count);
                 for i in 0..column_count {
+                    if first_row {
+                        if let Ok(v) = row.get_ref(i) {
+                            col_runtime_types[i] = storage_class_name(v.data_type()).to_string();
+                        }
+                    }
                     let val: String = row
                         .get::<_, String>(i)
                         .or_else(|_| row.get::<_, i64>(i).map(|v| v.to_string()))
@@ -468,7 +635,7 @@ pub(crate) mod jdbc_registry {
                 result_rows.push(vals);
             }
 
-            (result_rows, col_names, col_types)
+            (result_rows, col_names, col_types, col_runtime_types)
         };
 
         let row_count = rows.len();
@@ -484,6 +651,9 @@ pub(crate) mod jdbc_registry {
                 rows,
                 column_names,
                 column_types,
+                column_runtime_types,
+                conn_id,
+                sql,
             },
         );
         Ok((stmt_id, row_count))
@@ -642,26 +812,387 @@ pub(crate) mod jdbc_registry {
             .unwrap_or_else(|| "?".to_string())
     }
 
-    /// Get the declared column type name (e.g. "INTEGER", "TEXT", "REAL").
-    pub fn get_column_type_name(stmt_id: i64, col: usize) -> String {
-        let reg = registry().lock();
-        reg.results
-            .get(&stmt_id)
-            .and_then(|r| r.column_types.get(col))
-            .cloned()
-            .unwrap_or_else(|| "TEXT".to_string())
+    /// SQLite's five storage classes, spelled the way `typeof()` and every
+    /// SQLite JDBC driver spell them.
+    fn storage_class_name(t: rusqlite::types::Type) -> &'static str {
+        match t {
+            rusqlite::types::Type::Null => "NULL",
+            rusqlite::types::Type::Integer => "INTEGER",
+            rusqlite::types::Type::Real => "REAL",
+            rusqlite::types::Type::Text => "TEXT",
+            rusqlite::types::Type::Blob => "BLOB",
+        }
     }
 
-    /// Map SQLite type name to JDBC type code.
-    pub fn get_column_type_code(stmt_id: i64, col: usize) -> i32 {
-        let type_name = get_column_type_name(stmt_id, col);
-        match type_name.to_uppercase().as_str() {
-            "INTEGER" | "INT" | "BIGINT" => 4, // Types.INTEGER
-            "REAL" | "DOUBLE" | "FLOAT" => 8,  // Types.DOUBLE
-            "BLOB" => 2004,                    // Types.BLOB
-            "BOOLEAN" | "BOOL" => 16,          // Types.BOOLEAN
-            _ => 12,                           // Types.VARCHAR
+    /// The five type affinities SQLite can assign to a column.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Affinity {
+        Integer,
+        Text,
+        Blob,
+        Real,
+        Numeric,
+    }
+
+    /// SQLite's documented "Determination Of Column Affinity" algorithm
+    /// (datatype3.html §3.1), applied verbatim and IN ORDER to the raw
+    /// declared type. Every rule is a case-insensitive substring test:
+    ///
+    ///   1. contains "INT"                          → INTEGER
+    ///   2. else contains "CHAR", "CLOB" or "TEXT"  → TEXT
+    ///   3. else contains "BLOB", or is empty       → BLOB ("no affinity")
+    ///   4. else contains "REAL", "FLOA" or "DOUB"  → REAL
+    ///   5. else                                    → NUMERIC
+    ///
+    /// The order is load-bearing, not stylistic: SQLite's own worked examples
+    /// depend on it. `VARCHAR(255)` stops at rule 2; `unsigned big int` stops
+    /// at rule 1; `FLOATING POINT` stops at rule 1 as well (it contains "INT")
+    /// even though it looks like a rule-4 name; `STRING`, `DATETIME` and
+    /// `POINT` fall through to rule 5.
+    fn type_affinity(decl_type: &str) -> Affinity {
+        let d = decl_type.to_uppercase();
+        if d.contains("INT") {
+            Affinity::Integer
+        } else if d.contains("CHAR") || d.contains("CLOB") || d.contains("TEXT") {
+            Affinity::Text
+        } else if d.contains("BLOB") || d.trim().is_empty() {
+            Affinity::Blob
+        } else if d.contains("REAL") || d.contains("FLOA") || d.contains("DOUB") {
+            Affinity::Real
+        } else {
+            Affinity::Numeric
         }
+    }
+
+    /// A declared type's base name — everything before the argument list,
+    /// trimmed and uppercased. `VARCHAR(20)` → `VARCHAR`,
+    /// `DECIMAL(10, 2)` → `DECIMAL`, `unsigned big int` → `UNSIGNED BIG INT`.
+    fn decl_base_name(decl_type: &str) -> String {
+        decl_type
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_uppercase()
+    }
+
+    /// The `(precision)` / `(precision, scale)` arguments of a declared type:
+    /// `DECIMAL(10,2)` → `(Some(10), Some(2))`, `VARCHAR(20)` →
+    /// `(Some(20), None)`, `INTEGER` → `(None, None)`. `None` means the
+    /// schema states no such number — JDBC's "not applicable" — and is never
+    /// papered over with a default.
+    fn decl_args(decl_type: &str) -> (Option<i32>, Option<i32>) {
+        let open = match decl_type.find('(') {
+            Some(i) => i,
+            None => return (None, None),
+        };
+        let close = match decl_type[open..].find(')') {
+            Some(i) => open + i,
+            None => return (None, None),
+        };
+        let mut parts = decl_type[open + 1..close].split(',');
+        let precision = parts.next().and_then(|s| s.trim().parse::<i32>().ok());
+        let scale = parts.next().and_then(|s| s.trim().parse::<i32>().ok());
+        (precision, scale)
+    }
+
+    /// The type string that describes result column `col`: the DECLARED type
+    /// when the column has one, else the storage class the first row's value
+    /// actually had, else "" — which is SQLite's genuine "no type information
+    /// exists" answer for an expression over an empty result set.
+    ///
+    /// One lock acquisition, and no computation performed under it, so the
+    /// public accessors below can be composed freely without re-entering the
+    /// non-reentrant registry mutex.
+    fn effective_type(stmt_id: i64, col: usize) -> String {
+        let reg = registry().lock();
+        let r = match reg.results.get(&stmt_id) {
+            Some(r) => r,
+            None => return String::new(),
+        };
+        let declared = r.column_types.get(col).cloned().unwrap_or_default();
+        if !declared.trim().is_empty() {
+            return declared;
+        }
+        r.column_runtime_types.get(col).cloned().unwrap_or_default()
+    }
+
+    // `java.sql.Types` codes used below. Every value is fixed by the JDBC
+    // specification and matches the JDK's `java.sql.Types` fields exactly
+    // (the same constants `register_p68_jdbc` publishes on `java/sql/Types`).
+    const TYPES_NULL: i32 = 0;
+    const TYPES_CHAR: i32 = 1;
+    const TYPES_NUMERIC: i32 = 2;
+    const TYPES_DECIMAL: i32 = 3;
+    const TYPES_INTEGER: i32 = 4;
+    const TYPES_SMALLINT: i32 = 5;
+    const TYPES_DOUBLE: i32 = 8;
+    const TYPES_VARCHAR: i32 = 12;
+    const TYPES_BOOLEAN: i32 = 16;
+    const TYPES_TINYINT: i32 = -6;
+    const TYPES_BIGINT: i32 = -5;
+    const TYPES_BLOB: i32 = 2004;
+    const TYPES_CLOB: i32 = 2005;
+
+    /// `ResultSetMetaData.getColumnTypeName(col)` — the database-specific type
+    /// name for the column.
+    ///
+    /// Reports the declared type's base name when the column has a declared
+    /// type (`VARCHAR(20)` → `VARCHAR`); the storage class of the first row's
+    /// value when it does not (`SELECT a+b` over a non-empty result →
+    /// `INTEGER`); and `BLOB` when neither exists, because SQLite's "no
+    /// affinity" IS BLOB affinity (datatype3.html §3.1 rule 3).
+    ///
+    /// Until 2026-07-28 this returned `TEXT` for every column of every result
+    /// set: both execute paths filled `column_types` with `vec!["TEXT"; n]`
+    /// and never asked SQLite for a declared type at all.
+    pub fn get_column_type_name(stmt_id: i64, col: usize) -> String {
+        let eff = effective_type(stmt_id, col);
+        if eff.trim().is_empty() {
+            return "BLOB".to_string();
+        }
+        decl_base_name(&eff)
+    }
+
+    /// `ResultSetMetaData.getColumnType(col)` — the `java.sql.Types` code.
+    pub fn get_column_type_code(stmt_id: i64, col: usize) -> i32 {
+        type_code_for(&effective_type(stmt_id, col))
+    }
+
+    /// Map one declared (or observed) SQLite type string onto a
+    /// `java.sql.Types` code through the affinity rules. Split out from
+    /// `get_column_type_code` so it is pure — no database, no registry lock.
+    fn type_code_for(sqlite_type: &str) -> i32 {
+        let upper = sqlite_type.to_uppercase();
+        // A first-row storage class of NULL means the value IS SQL NULL and
+        // the column declared nothing; Types.NULL is that exact situation.
+        if upper.trim() == "NULL" {
+            return TYPES_NULL;
+        }
+        match type_affinity(sqlite_type) {
+            // SQLite stores every integer as a signed 64-bit value, but a
+            // declared width is real schema information the caller asked for,
+            // so it is honoured when the schema states one.
+            Affinity::Integer => {
+                if upper.contains("BIGINT") {
+                    TYPES_BIGINT
+                } else if upper.contains("SMALLINT") {
+                    TYPES_SMALLINT
+                } else if upper.contains("TINYINT") {
+                    TYPES_TINYINT
+                } else {
+                    TYPES_INTEGER
+                }
+            }
+            Affinity::Text => {
+                if upper.contains("CLOB") {
+                    TYPES_CLOB
+                } else if matches!(
+                    decl_base_name(sqlite_type).as_str(),
+                    "CHAR" | "NCHAR" | "CHARACTER" | "NATIONAL CHARACTER"
+                ) {
+                    TYPES_CHAR
+                } else {
+                    TYPES_VARCHAR
+                }
+            }
+            // "No affinity": a declared BLOB, or nothing declared at all.
+            Affinity::Blob => TYPES_BLOB,
+            // Every REAL-affinity value is stored as an 8-byte IEEE 754
+            // double, so DOUBLE is the accurate code for REAL / FLOAT /
+            // DOUBLE alike — none of them is a 4-byte float in SQLite.
+            Affinity::Real => TYPES_DOUBLE,
+            Affinity::Numeric => {
+                if upper.contains("BOOL") {
+                    TYPES_BOOLEAN
+                } else if upper.contains("DECIMAL") {
+                    TYPES_DECIMAL
+                } else {
+                    TYPES_NUMERIC
+                }
+            }
+        }
+    }
+
+    /// `ResultSetMetaData.getColumnClassName(col)` — the fully-qualified name
+    /// of the class `ResultSet.getObject` would hand back for this column.
+    /// Derived from the same code `getColumnType` reports, so the two can
+    /// never disagree with each other.
+    pub fn get_column_class_name(stmt_id: i64, col: usize) -> String {
+        let name = match get_column_type_code(stmt_id, col) {
+            TYPES_BIGINT => "java.lang.Long",
+            TYPES_INTEGER | TYPES_SMALLINT | TYPES_TINYINT => "java.lang.Integer",
+            TYPES_DOUBLE => "java.lang.Double",
+            TYPES_NUMERIC | TYPES_DECIMAL => "java.math.BigDecimal",
+            TYPES_BOOLEAN => "java.lang.Boolean",
+            TYPES_CHAR | TYPES_VARCHAR | TYPES_CLOB => "java.lang.String",
+            TYPES_BLOB => "[B",
+            // Types.NULL — the column produced SQL NULL and declared nothing,
+            // so no more specific class can be promised.
+            _ => "java.lang.Object",
+        };
+        name.to_string()
+    }
+
+    /// `ResultSetMetaData.getPrecision(col)` — the column's specified size:
+    /// maximum decimal digits for a numeric column, characters for a
+    /// character column, and 0 where the size "is not applicable" (JDBC).
+    ///
+    /// Real sources only, in order: the declared `(precision)` argument
+    /// (`DECIMAL(10,2)` → 10, `VARCHAR(20)` → 20); otherwise the width
+    /// SQLite's own storage imposes — 19 decimal digits for an INTEGER (i64)
+    /// and 15 significant digits for a REAL (IEEE 754 double). A TEXT or BLOB
+    /// column with no declared length genuinely has no bound, so it reports
+    /// the spec's not-applicable 0 rather than an invented ceiling.
+    pub fn get_column_precision(stmt_id: i64, col: usize) -> i32 {
+        let eff = effective_type(stmt_id, col);
+        if let (Some(p), _) = decl_args(&eff) {
+            if p >= 0 {
+                return p;
+            }
+        }
+        match type_affinity(&eff) {
+            Affinity::Integer => 19,
+            Affinity::Real => 15,
+            _ => 0,
+        }
+    }
+
+    /// `ResultSetMetaData.getScale(col)` — digits to the right of the decimal
+    /// point. Only a declared `(precision, scale)` argument list can answer
+    /// this: SQLite keeps no scale of its own, and a value's runtime storage
+    /// class does not carry one. 0 otherwise, the spec's "not applicable".
+    pub fn get_column_scale(stmt_id: i64, col: usize) -> i32 {
+        match decl_args(&effective_type(stmt_id, col)).1 {
+            Some(s) if s >= 0 => s,
+            _ => 0,
+        }
+    }
+
+    /// `ResultSetMetaData.isSigned(col)` — true when the column holds a signed
+    /// number. SQLite's INTEGER, REAL and NUMERIC affinities are all signed;
+    /// there is no unsigned storage class at all (`unsigned big int` has
+    /// INTEGER affinity and still holds negatives). TEXT and BLOB are not
+    /// numeric, and BOOLEAN is not signed, so those report false.
+    pub fn is_column_signed(stmt_id: i64, col: usize) -> bool {
+        matches!(
+            get_column_type_code(stmt_id, col),
+            TYPES_INTEGER
+                | TYPES_BIGINT
+                | TYPES_SMALLINT
+                | TYPES_TINYINT
+                | TYPES_DOUBLE
+                | TYPES_NUMERIC
+                | TYPES_DECIMAL
+        )
+    }
+
+    /// `ResultSetMetaData.getColumnDisplaySize(col)` — the maximum number of
+    /// characters needed to display a value from this column.
+    ///
+    /// Answered from real data, in order: the declared length when the schema
+    /// states one (`VARCHAR(20)` → 20); otherwise the widest value actually
+    /// present in this result set, which the row cache already holds as
+    /// rendered text; otherwise 0. Nothing is guessed from the type for the
+    /// empty-result case.
+    pub fn get_column_display_size(stmt_id: i64, col: usize) -> i32 {
+        let eff = effective_type(stmt_id, col);
+        if let (Some(p), _) = decl_args(&eff) {
+            if p > 0 {
+                return p;
+            }
+        }
+        let reg = registry().lock();
+        let result = match reg.results.get(&stmt_id) {
+            Some(r) => r,
+            None => return 0,
+        };
+        result
+            .rows
+            .iter()
+            .filter_map(|row| row.get(col))
+            .map(|v| v.chars().count())
+            .max()
+            .unwrap_or(0) as i32
+    }
+
+    /// `ResultSetMetaData.columnNoNulls` / `columnNullable`.
+    const COLUMN_NO_NULLS: i32 = 0;
+    const COLUMN_NULLABLE: i32 = 1;
+
+    /// Answer `ResultSetMetaData.isNullable(col)` from the live SQLite
+    /// schema instead of assuming "nullable".
+    ///
+    /// SQLite records the per-column NOT NULL constraint and exposes it
+    /// through the `pragma_table_info` table-valued function. We report
+    /// `columnNoNulls` only when both hold:
+    ///   * the producing statement has no JOIN and no UNION — an outer join
+    ///     or a union with a nullable arm can put NULLs into a column that
+    ///     is declared NOT NULL in its base table; and
+    ///   * every table in the schema that declares a column of this name
+    ///     declares it NOT NULL (we do not know which table a result column
+    ///     came from, so unanimity is the only sound test).
+    /// Anything else — computed columns, aliases, unknown ids, a pragma
+    /// that will not compile — keeps the permissive `columnNullable`, which
+    /// is what a caller has to assume anyway.
+    pub fn column_nullable(stmt_id: i64, col: usize) -> i32 {
+        let reg = registry().lock();
+        let result = match reg.results.get(&stmt_id) {
+            Some(r) => r,
+            None => return COLUMN_NULLABLE,
+        };
+        let name = match result.column_names.get(col) {
+            Some(n) => n.clone(),
+            None => return COLUMN_NULLABLE,
+        };
+        let upper = result.sql.to_uppercase();
+        if upper.contains("JOIN") || upper.contains("UNION") {
+            return COLUMN_NULLABLE;
+        }
+        let conn = match reg.connections.get(&result.conn_id) {
+            Some(c) => c,
+            None => return COLUMN_NULLABLE,
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT ti.\"notnull\" FROM sqlite_master AS m, \
+             pragma_table_info(m.name) AS ti \
+             WHERE m.type = 'table' AND ti.name = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return COLUMN_NULLABLE,
+        };
+        let mut rows = match stmt.query([name.as_str()]) {
+            Ok(r) => r,
+            Err(_) => return COLUMN_NULLABLE,
+        };
+        let mut seen = false;
+        while let Ok(Some(row)) = rows.next() {
+            seen = true;
+            if row.get::<_, i64>(0).unwrap_or(0) == 0 {
+                return COLUMN_NULLABLE;
+            }
+        }
+        if seen {
+            COLUMN_NO_NULLS
+        } else {
+            COLUMN_NULLABLE
+        }
+    }
+
+    /// `DatabaseMetaData.isReadOnly()` for a connection id.
+    ///
+    /// `open_connection` always opens read/write (`Connection::open`), so
+    /// SQLite's `query_only` pragma is the only way a connection of ours can
+    /// become read-only — and it is real per-connection state, not a guess.
+    pub fn is_read_only(conn_id: i64) -> bool {
+        let reg = registry().lock();
+        let conn = match reg.connections.get(&conn_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+            .map(|v| v != 0)
+            .unwrap_or(false)
     }
 
     pub fn get_row_count(stmt_id: i64) -> usize {
@@ -1000,6 +1531,21 @@ pub(crate) mod jdbc_registry {
     /// Driver version string.
     pub fn driver_version() -> &'static str {
         "1.0"
+    }
+
+    /// `getDriverMajorVersion` / `getDriverMinorVersion`, parsed out of
+    /// `driver_version()` so the three answers cannot drift apart.
+    pub fn driver_version_parts() -> (i32, i32) {
+        let mut parts = driver_version().split('.');
+        let major = parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let minor = parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        (major, minor)
     }
 }
 
@@ -2356,6 +2902,95 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(&type_name)))))
         },
     );
+    // The five accessors below were NOT REGISTERED AT ALL before 2026-07-28 —
+    // not stubbed, not fabricated, simply absent, so any caller reaching them
+    // on our synthetic `java/sql/ResultSetMetaData` (which has no bytecode
+    // behind it) failed outright. They are added here rather than left absent
+    // because the declared-type data that `execute_query` now records is
+    // enough to answer all five for real: the affinity gives the class name
+    // and the signedness, and the declared `(precision, scale)` argument list
+    // gives the size and scale. See the doc comments on the corresponding
+    // `jdbc_registry` functions for exactly which source each answer comes
+    // from and where it deliberately reports JDBC's "not applicable" 0.
+    r.register(
+        rsmd,
+        "getColumnClassName",
+        "(I)Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let stmt_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let col = match args.get(1) {
+                Some(Value::Int(c)) => (*c - 1) as usize,
+                _ => 0,
+            };
+            let name = jdbc_registry::get_column_class_name(stmt_id, col);
+            Ok(Some(Value::Object(Some(ctx.create_string(&name)))))
+        },
+    );
+    r.register(rsmd, "getPrecision", "(I)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(jdbc_registry::get_column_precision(
+            stmt_id, col,
+        ))))
+    });
+    r.register(rsmd, "getScale", "(I)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(jdbc_registry::get_column_scale(
+            stmt_id, col,
+        ))))
+    });
+    r.register(rsmd, "isSigned", "(I)Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(i32::from(
+            jdbc_registry::is_column_signed(stmt_id, col),
+        ))))
+    });
+    r.register(rsmd, "getColumnDisplaySize", "(I)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(jdbc_registry::get_column_display_size(
+            stmt_id, col,
+        ))))
+    });
     // JDBC spec for getTableName: "table name or "" if not applicable". The
     // row cache built by `execute_query` keeps column names only — SQLite's
     // originating-table metadata (sqlite3_column_table_name) is a build-time
@@ -2368,15 +3003,27 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(I)Ljava/lang/String;",
         |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string(""))))),
     );
-    // KEEP (deliberate constant): `1` is `ResultSetMetaData.columnNullable`.
-    // We do not record per-column NOT NULL constraints, and a SQLite column
-    // is nullable unless explicitly declared otherwise, so columnNullable is
-    // the correct default for the overwhelming majority of columns — and it
-    // is the permissive direction: a caller told "nullable" null-checks, a
-    // caller told "not nullable" would not.
-    r.register(rsmd, "isNullable", "(I)I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    }); // columnNullable
+    // Real answer, read back from the SQLite schema: the wave-3 note that
+    // "we do not record per-column NOT NULL constraints" was wrong — SQLite
+    // does record them and `pragma_table_info` exposes them. See
+    // `jdbc_registry::column_nullable` for the (deliberately conservative)
+    // rule; it still falls back to columnNullable whenever the answer is not
+    // provable.
+    r.register(rsmd, "isNullable", "(I)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(jdbc_registry::column_nullable(
+            stmt_id, col,
+        ))))
+    });
 
     // KEEP (deliberate constants): these are the `java.sql.Types` int
     // constants, fixed by the JDBC specification — every value below matches
@@ -2447,15 +3094,15 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    // KEEP (deliberate constants): the major/minor split of
-    // `jdbc_registry::driver_version()` ("1.0"), which `getDriverVersion`
-    // above reports as a string. These describe OUR driver, so a literal is
-    // the right answer — they must stay in step with `driver_version`.
+    // Derived from `jdbc_registry::driver_version()` rather than duplicated
+    // as literals, so `getDriverVersion` / `getDriverMajorVersion` /
+    // `getDriverMinorVersion` cannot drift apart when the driver version
+    // string changes.
     r.register(dbmd, "getDriverMajorVersion", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(jdbc_registry::driver_version_parts().0)))
     });
     r.register(dbmd, "getDriverMinorVersion", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+        Ok(Some(Value::Int(jdbc_registry::driver_version_parts().1)))
     });
     r.register(dbmd, "getURL", "()Ljava/lang/String;", |ctx, _args| {
         // Our DriverManager opens `jdbc:sqlite:<path>` URLs. Without
@@ -2467,19 +3114,30 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("");
         Ok(Some(Value::Object(Some(s))))
     });
-    // KEEP (deliberate constants). Each of these is a true statement about
-    // THIS driver, not a placeholder:
-    //   isReadOnly          — `open_connection` always opens read/write
-    //                         (`rusqlite::Connection::open`); we never open a
-    //                         database in read-only mode.
+    // Real per-connection state: field 0 of the DatabaseMetaData synthetic
+    // is the connection id, and `is_read_only` reads SQLite's `query_only`
+    // pragma off that connection. (We always open read/write, so the pragma
+    // is the only route to a read-only connection — but it IS a route, and
+    // the old unconditional `false` could not see it.)
+    r.register(dbmd, "isReadOnly", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(i32::from(jdbc_registry::is_read_only(
+            conn_id,
+        )))))
+    });
+    // KEEP (capability answers, constant in every real driver too). Each is
+    // a compile-time-true statement about THIS driver, and the reference
+    // SQLite JDBC driver hardcodes the same three:
     //   supportsTransactions— backed by real BEGIN/COMMIT/ROLLBACK in
     //                         `set_auto_commit` / `commit` / `rollback`.
     //   supportsSavepoints  — backed by `savepoint_create` /
     //                         `savepoint_rollback` / `savepoint_release`.
     //   supportsBatchUpdates— backed by `add_batch` / `execute_batch`.
-    r.register(dbmd, "isReadOnly", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
     r.register(dbmd, "supportsTransactions", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -2489,9 +3147,12 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     r.register(dbmd, "supportsBatchUpdates", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // KEEP: `0` is the JDBC spec's encoding for "no limit, or the limit is
+    // unknown" (java.sql.DatabaseMetaData#getMaxConnections). Neither SQLite
+    // nor this registry imposes a connection cap, so 0 is the *correct*
+    // answer, not a placeholder — the reference SQLite JDBC driver returns 0
+    // here as well.
     r.register(dbmd, "getMaxConnections", "()I", |_ctx, _args| {
-        // rusqlite doesn't impose a hard connection limit; 0 means
-        // "no limit or unknown" per the JDBC spec.
         Ok(Some(Value::Int(0)))
     });
 
@@ -2917,39 +3578,145 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
 
     // NEW-14.N1 — CallableStatement output parameter support.
     //
-    // `registerOutParameter(int, int)` / `registerOutParameter(int, int, int)`
-    // / `registerOutParameter(String, int)` record the caller's intent but
-    // our rusqlite backend doesn't expose true stored-procedure OUT
-    // parameters — rusqlite is a pure SQLite binding and SQLite's CALL
-    // mechanism is limited. The natives below mark the registration as
-    // a no-op (which is spec-legal: a CallableStatement that registers
-    // an OUT parameter but never reads it is valid per JDBC §4.2), and
-    // `wasNull()` / `getObject(int)` fall through to the inherited
-    // PreparedStatement implementation which returns the corresponding
-    // ResultSet column value.
+    // These were no-ops until 2026-07-28, justified by the claim that
+    // `wasNull()` / `getObject(int)` "fall through to the inherited
+    // PreparedStatement implementation". That claim was false: `getObject` /
+    // `wasNull` are registered on `java/sql/ResultSet` only, and the
+    // `alias_class` calls above copy Statement/PreparedStatement onto
+    // CallableStatement — not ResultSet. So the registration was simply
+    // dropped, with nothing downstream to compensate.
     //
-    // KEEP (deliberate no-ops) — re-confirmed 2026-07-27. The registration
-    // itself carries no state SQLite could honour; the values a caller
-    // subsequently reads come from the ResultSet path above, so recording the
-    // requested SQL type here would change nothing that is ever read back.
+    // SQLite has no stored procedures, so we still cannot *execute* an OUT
+    // parameter; what a driver can and must do is REMEMBER the registration
+    // (JDBC §4.3.2 — the registered type is the only record that a parameter
+    // is an OUT at all). `jdbc_registry::register_out_parameter*` stores it on
+    // the PreparedState, `out_parameter*` reads it back, and an unknown
+    // statement id or a 0 index is now reported rather than swallowed.
     let cstmt = "java/sql/CallableStatement";
-    r.register(cstmt, "registerOutParameter", "(II)V", |_ctx, _args| {
+    r.register(cstmt, "registerOutParameter", "(II)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        jdbc_registry::register_out_parameter(ps_id, idx, sql_type, 0, None)
+            .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         Ok(None)
     });
-    r.register(cstmt, "registerOutParameter", "(III)V", |_ctx, _args| {
+    r.register(cstmt, "registerOutParameter", "(III)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let ps_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+        let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let scale = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+        jdbc_registry::register_out_parameter(ps_id, idx, sql_type, scale, None)
+            .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
         Ok(None)
     });
+    // Descriptor fix: the three-argument type-name overload is
+    // `registerOutParameter(int, int, String)` — `(IILjava/lang/String;)V`.
+    // This was registered as `(ILjava/lang/String;)V`, which names no method
+    // on `java.sql.CallableStatement` at all, so the entry could never be
+    // reached by any call site in either run mode.
     r.register(
         cstmt,
         "registerOutParameter",
-        "(ILjava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        "(IILjava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let idx = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as usize;
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let type_name = match args.get(3) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
+            };
+            jdbc_registry::register_out_parameter(ps_id, idx, sql_type, 0, type_name)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
     );
     r.register(
         cstmt,
         "registerOutParameter",
         "(Ljava/lang/String;I)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            jdbc_registry::register_out_parameter_named(ps_id, &name, sql_type)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
+    );
+    // The two remaining named overloads. Without these, a caller using the
+    // scale or type-name form fell through to the class body (there is none
+    // in synthetic mode) and the registration was lost.
+    r.register(
+        cstmt,
+        "registerOutParameter",
+        "(Ljava/lang/String;II)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let scale = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            jdbc_registry::register_out_parameter_named_ext(ps_id, &name, sql_type, scale, None)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
+    );
+    r.register(
+        cstmt,
+        "registerOutParameter",
+        "(Ljava/lang/String;ILjava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let type_name = match args.get(3) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
+            };
+            jdbc_registry::register_out_parameter_named_ext(ps_id, &name, sql_type, 0, type_name)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
     );
     r.set_category(__prev_cat);
 }
@@ -3034,6 +3801,128 @@ pub(crate) mod new14_jdbc_tests {
         );
 
         jdbc_registry::free_results(stmt_id);
+        jdbc_registry::close_connection(conn);
+    }
+
+    /// Column type metadata is read from SQLite's DECLARED types.
+    ///
+    /// Regression test for the pre-2026-07-28 behaviour: both execute paths
+    /// filled `column_types` with `vec!["TEXT"; n]`, so `getColumnTypeName()`
+    /// answered "TEXT" and `getColumnType()` answered `Types.VARCHAR` (12) for
+    /// every column of every result set in the VM.
+    #[test]
+    fn column_metadata_comes_from_declared_types_not_a_blanket_text() {
+        let conn = jdbc_registry::open_connection(":memory:").unwrap();
+        jdbc_registry::execute_update(
+            conn,
+            "CREATE TABLE typed (i INTEGER, b BIGINT, t TEXT, v VARCHAR(20), \
+             r REAL, d DECIMAL(10,2), z BLOB, flag BOOLEAN)",
+        )
+        .expect("create table");
+        jdbc_registry::execute_update(
+            conn,
+            "INSERT INTO typed VALUES (1, 2, 'three', 'four', 5.5, 6.25, x'07', 1)",
+        )
+        .expect("insert row");
+
+        let (rs, n) = jdbc_registry::execute_query(conn, "SELECT * FROM typed").unwrap();
+        assert_eq!(n, 1);
+
+        // (column, expected getColumnTypeName, expected java.sql.Types code)
+        let expected: &[(usize, &str, i32)] = &[
+            (0, "INTEGER", 4),
+            (1, "BIGINT", -5),
+            (2, "TEXT", 12),
+            (3, "VARCHAR", 12),
+            (4, "REAL", 8),
+            (5, "DECIMAL", 3),
+            (6, "BLOB", 2004),
+            (7, "BOOLEAN", 16),
+        ];
+        for &(col, name, code) in expected {
+            assert_eq!(
+                jdbc_registry::get_column_type_name(rs, col),
+                name,
+                "getColumnTypeName of column {col}"
+            );
+            assert_eq!(
+                jdbc_registry::get_column_type_code(rs, col),
+                code,
+                "getColumnType of column {col}"
+            );
+        }
+
+        // The declared (precision, scale) argument list is the only real
+        // source for these two, and absence reports JDBC's "not applicable" 0.
+        assert_eq!(jdbc_registry::get_column_precision(rs, 5), 10);
+        assert_eq!(jdbc_registry::get_column_scale(rs, 5), 2);
+        assert_eq!(jdbc_registry::get_column_precision(rs, 3), 20);
+        assert_eq!(jdbc_registry::get_column_scale(rs, 3), 0);
+        assert_eq!(jdbc_registry::get_column_precision(rs, 2), 0);
+        assert_eq!(jdbc_registry::get_column_display_size(rs, 3), 20);
+
+        assert!(jdbc_registry::is_column_signed(rs, 0), "INTEGER is signed");
+        assert!(!jdbc_registry::is_column_signed(rs, 2), "TEXT is not");
+        assert_eq!(
+            jdbc_registry::get_column_class_name(rs, 0),
+            "java.lang.Integer"
+        );
+        assert_eq!(
+            jdbc_registry::get_column_class_name(rs, 1),
+            "java.lang.Long"
+        );
+        assert_eq!(
+            jdbc_registry::get_column_class_name(rs, 2),
+            "java.lang.String"
+        );
+        assert_eq!(jdbc_registry::get_column_class_name(rs, 6), "[B");
+
+        jdbc_registry::free_results(rs);
+        jdbc_registry::close_connection(conn);
+    }
+
+    /// A column produced by an expression has no declared type at all —
+    /// SQLite reports `NULL` from `sqlite3_column_decltype`. The type name
+    /// then has to describe the value actually produced, and must not fall
+    /// back to a blanket TEXT. With no rows to look at, the answer is
+    /// SQLite's "no affinity", which is BLOB affinity.
+    #[test]
+    fn expression_columns_report_the_runtime_storage_class() {
+        let conn = jdbc_registry::open_connection(":memory:").unwrap();
+        jdbc_registry::execute_update(conn, "CREATE TABLE nums (a INTEGER, b INTEGER)").unwrap();
+        jdbc_registry::execute_update(conn, "INSERT INTO nums VALUES (2, 3)").unwrap();
+
+        let (rs, _) =
+            jdbc_registry::execute_query(conn, "SELECT a + b, a * 1.5, 'lit', a FROM nums")
+                .unwrap();
+        assert_eq!(jdbc_registry::get_column_type_name(rs, 0), "INTEGER");
+        assert_eq!(jdbc_registry::get_column_type_code(rs, 0), 4);
+        assert_eq!(jdbc_registry::get_column_type_name(rs, 1), "REAL");
+        assert_eq!(jdbc_registry::get_column_type_code(rs, 1), 8);
+        assert_eq!(jdbc_registry::get_column_type_name(rs, 2), "TEXT");
+        // A plain column reference still reports its DECLARED type.
+        assert_eq!(jdbc_registry::get_column_type_name(rs, 3), "INTEGER");
+        jdbc_registry::free_results(rs);
+
+        // No rows → no runtime value either → SQLite's "no affinity".
+        let (empty, n) =
+            jdbc_registry::execute_query(conn, "SELECT a + b FROM nums WHERE a > 1000").unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(jdbc_registry::get_column_type_name(empty, 0), "BLOB");
+        assert_eq!(jdbc_registry::get_column_type_code(empty, 0), 2004);
+        jdbc_registry::free_results(empty);
+
+        // The PreparedStatement path carried the identical hardcode and has to
+        // give the identical answers.
+        let ps = jdbc_registry::prepare(conn, "SELECT a, a + b FROM nums WHERE a = ?");
+        jdbc_registry::bind_int(ps, 1, 2);
+        let (prs, rows) = jdbc_registry::execute_prepared_query(ps).unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(jdbc_registry::get_column_type_name(prs, 0), "INTEGER");
+        assert_eq!(jdbc_registry::get_column_type_name(prs, 1), "INTEGER");
+        jdbc_registry::free_results(prs);
+        jdbc_registry::free_prepared(ps);
+
         jdbc_registry::close_connection(conn);
     }
 
@@ -3251,5 +4140,48 @@ pub(crate) mod new14_jdbc_tests {
         );
         assert_eq!(jdbc_registry::driver_name(), "CratonVM JDBC");
         assert_eq!(jdbc_registry::driver_version(), "1.0");
+    }
+
+    // ---- NEW-14.N1 CallableStatement OUT-parameter registration ----
+
+    /// `registerOutParameter` must keep the registration (it used to be a
+    /// no-op that dropped it), reject an unknown statement, and disappear
+    /// with the statement.
+    #[test]
+    fn new14_register_out_parameter_round_trips() {
+        let conn = jdbc_registry::open_connection(":memory:").unwrap();
+        let ps = jdbc_registry::prepare(conn, "SELECT ?");
+
+        // (int, int) — java.sql.Types.INTEGER.
+        jdbc_registry::register_out_parameter(ps, 1, 4, 0, None).unwrap();
+        let p = jdbc_registry::out_parameter(ps, 1).expect("registration recorded");
+        assert_eq!(p.sql_type, 4);
+        assert_eq!(p.scale, 0);
+        assert_eq!(p.type_name, None);
+
+        // (int, int, int) — Types.DECIMAL with a scale.
+        jdbc_registry::register_out_parameter(ps, 2, 3, 4, None).unwrap();
+        assert_eq!(jdbc_registry::out_parameter(ps, 2).unwrap().scale, 4);
+
+        // (int, int, String) — Types.STRUCT with a SQL type name.
+        jdbc_registry::register_out_parameter(ps, 3, 2002, 0, Some("MY_TYPE".to_string())).unwrap();
+        let p3 = jdbc_registry::out_parameter(ps, 3).expect("registration recorded");
+        assert_eq!(p3.sql_type, 2002);
+        assert_eq!(p3.type_name.as_deref(), Some("MY_TYPE"));
+
+        // (String, int) — named parameter.
+        jdbc_registry::register_out_parameter_named(ps, "total", 4).unwrap();
+        let named = jdbc_registry::out_parameter_named(ps, "total").expect("named registration");
+        assert_eq!(named.sql_type, 4);
+
+        // Nothing was registered for index 9.
+        assert!(jdbc_registry::out_parameter(ps, 9).is_none());
+        // A 1-based index of 0 and an unknown statement are both errors.
+        assert!(jdbc_registry::register_out_parameter(ps, 0, 4, 0, None).is_err());
+        assert!(jdbc_registry::register_out_parameter(ps + 9999, 1, 4, 0, None).is_err());
+
+        jdbc_registry::free_prepared(ps);
+        assert!(jdbc_registry::out_parameter(ps, 1).is_none());
+        jdbc_registry::close_connection(conn);
     }
 }

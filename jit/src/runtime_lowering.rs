@@ -251,6 +251,20 @@ pub(crate) fn emit_hashed_vtable_stub(
     emit_load_frame(buf, RAX, arg_offsets[0]);
     buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
     miss_patches.push(emit_jcc(buf, 0x84)); // JZ slow
+    // Array-receiver guard. The hashed ways below compare only the 4-byte
+    // `ObjectHeader.class_id`, which a reference array fills with its COMPONENT
+    // class id — so a `Foo[]` receiver matches a way published for a `Foo`
+    // receiver and is called into `Foo`'s method body. `ObjectHeader.kind`
+    // (offset 4) separates them; anything not a plain object takes the
+    // resolving helper, which dispatches arrays on `java/lang/Object`.
+    //   CMP BYTE [RAX + OBJECT_KIND_OFFSET], ObjectKind::Object
+    buf.emit(&[
+        0x80,
+        0x78,
+        cratonvm_types::OBJECT_KIND_OFFSET as u8,
+        cratonvm_types::ObjectKind::Object as u8,
+    ]);
+    miss_patches.push(emit_jcc(buf, 0x85)); // JNE slow
     buf.emit(&[0x8B, 0x10]); // MOV EDX,[RAX]
 
     // ECX = ((class_id * golden-ratio hash) >> shift) * 2.
@@ -318,6 +332,35 @@ mod tests {
             assert_eq!(base & 1, 0);
             assert!(base + 1 < crate::JIT_MEGA_ENTRIES);
         }
+    }
+
+    /// The hashed ways compare only `ObjectHeader.class_id`, which a reference
+    /// array fills with its COMPONENT class id — so the stub must reject a
+    /// non-object receiver kind before it hashes that word, or a `Foo[]`
+    /// receiver is called into a way published for a `Foo` receiver.
+    #[test]
+    fn hashed_vtable_stub_rejects_array_receivers() {
+        let mut buf = ExecutableBuffer::new(4096).expect("buffer");
+        emit_hashed_vtable_stub(&mut buf, 0x7fff_0000_0000_2000, 24, &[32, 40], 0);
+        let bytes = buf.as_slice();
+        let guard = [
+            0x80u8,
+            0x78,
+            cratonvm_types::OBJECT_KIND_OFFSET as u8,
+            cratonvm_types::ObjectKind::Object as u8,
+        ];
+        let guard_at = bytes
+            .windows(guard.len())
+            .position(|w| w == guard)
+            .expect("the stub must emit CMP BYTE [RAX+kind], Object");
+        let hash_at = bytes
+            .windows(2)
+            .position(|w| w == [0x8B, 0x10])
+            .expect("the stub must load the class id into EDX");
+        assert!(
+            guard_at < hash_at,
+            "the kind guard must precede the class-id load (guard@{guard_at}, load@{hash_at})"
+        );
     }
 
     #[test]

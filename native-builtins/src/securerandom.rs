@@ -15,7 +15,12 @@
 //!
 //! This module supplies:
 //!
-//! * **SecureRandom** — backed directly by the OS CSPRNG.  Linux uses
+//! * **SecureRandom (SHA1PRNG)** — the one algorithm the JDK specifies as a
+//!   deterministic function of its seed. Once `setSeed` is called on an
+//!   instance obtained from `getInstance("SHA1PRNG")`, this module runs the
+//!   real `sun.security.provider.SecureRandom` state machine so the stream
+//!   replays exactly as it does on HotSpot. See the SHA1PRNG section below.
+//! * **SecureRandom (everything else)** — backed directly by the OS CSPRNG.  Linux uses
 //!   `/dev/urandom` (preferred over `getrandom(2)` because the latter
 //!   would block for ≈1s during early-boot fixtures, and
 //!   `/dev/urandom` is fed by the same entropy pool past initialization).
@@ -535,33 +540,376 @@ pub(crate) fn native_random_next_gaussian(
 // java.security.SecureRandom natives — OS-CSPRNG-backed
 // ---------------------------------------------------------------------------
 
+/// Shared body of `SecureRandom.<init>()V` and `SecureRandom.<init>([B)V`.
+///
+/// There is no per-instance RNG state to build — every draw pulls fresh
+/// entropy from the OS (see the module header) — but the ctor is NOT
+/// side-effect-free: the JDK's `getDefaultPRNG` records the selected
+/// algorithm on the instance, and `SecureRandom.getAlgorithm()` is plain
+/// bytecode reading that field (no native overrides it — grep `"getAlgorithm"`).
+///
+/// STUB-REMOVAL (wave 3): both ctors used to be pure no-ops, so `algorithm`
+/// stayed null and `getAlgorithm()` handed back null — a caller doing
+/// `sr.getAlgorithm().equals(…)` or logging it got an NPE instead of a name.
+/// Record the same name the `getInstanceStrong()` factory already stamps via
+/// `make_secure_random`, so every construction route agrees.
+fn secure_random_record_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return;
+    };
+    // `create_string` can move the heap; pin `this` across it.
+    let pin = ctx.pin_native_root(this);
+    let algo = ctx.create_string("OS-CSPRNG");
+    let this = ctx.read_native_pin(pin, this);
+    ctx.set_field_by_name(this, "algorithm", Value::Object(Some(algo)));
+    ctx.unpin_native_roots(pin);
+}
+
+// ---------------------------------------------------------------------------
+// SHA1PRNG — the one JCA algorithm whose output IS reproducible from a seed
+// ---------------------------------------------------------------------------
+//
+// STUB-REMOVAL (wave 4). Every other method in this module reads the OS CSPRNG
+// on every draw, and for `DRBG` / `NativePRNG` / `new SecureRandom()` that is
+// both spec-legal and strictly stronger: their `engineSetSeed` mixes the
+// caller's bytes with fresh entropy input, so two identically-seeded instances
+// diverge on HotSpot too.
+//
+// `SHA1PRNG` is the exception, and the divergence was measurable rather than
+// theoretical: `sun.security.provider.SecureRandom` keeps its whole state in a
+// 20-byte SHA-1 digest, and `engineSetSeed` before the first draw makes the
+// entire output stream a pure function of the seed. Two
+// `SecureRandom.getInstance("SHA1PRNG")` instances seeded alike produce
+// IDENTICAL bytes on HotSpot and produced DIFFERENT bytes here. Callers do
+// depend on that (deterministic test fixtures, replayable data generation), so
+// the faithful algorithm is implemented below rather than documented away.
+//
+// Scope, deliberately narrow — this engages ONLY when
+//   (a) `getAlgorithm()` is literally "SHA1PRNG" (so `new SecureRandom()`,
+//       `getInstanceStrong()` and every other algorithm are untouched), AND
+//   (b) the caller supplied a seed via `setSeed`.
+// An unseeded SHA1PRNG instance keeps drawing from the OS CSPRNG. That is not
+// a fidelity loss: real SHA1PRNG self-seeds from `SeedGenerator` on first use,
+// so its output is non-deterministic in exactly that case as well. The one
+// residual difference is "draw first, then setSeed", where real JDK folds the
+// pre-existing state into the digest and we start from `SHA1(seed)` — but the
+// real state there came from OS entropy, so neither VM is reproducible.
+//
+// Note this makes CratonVM reproduce SHA1PRNG's weak-seed behaviour as well
+// (`getInstance("SHA1PRNG")` + `setSeed(millis)` yields a predictable stream).
+// That is what the algorithm IS, and what the same program does on HotSpot;
+// diverging to "secretly stronger" hides the bug from the developer instead of
+// from the attacker.
+//
+// `engineGenerateSeed` is deliberately NOT routed here — real SHA1PRNG serves
+// it from `SeedGenerator` (the OS), not from the PRNG state, which is what
+// `native_secure_random_generate_seed` already does.
+
+const SHA1PRNG_DIGEST: usize = 20;
+
+/// Per-instance `sun.security.provider.SecureRandom` state: the 20-byte
+/// `state`, the unconsumed tail of the last digest block, and
+/// `java.util.Random`'s cached second Gaussian deviate (SecureRandom does not
+/// override `nextGaussian`, so the pairing is part of the reproducible stream).
+#[derive(Clone)]
+struct Sha1Prng {
+    state: [u8; SHA1PRNG_DIGEST],
+    remainder: [u8; SHA1PRNG_DIGEST],
+    rem_count: usize,
+    next_gaussian: Option<f64>,
+}
+
+/// Keyed exactly like `SEED_TABLE` — see its doc comment for why the GC-stable
+/// identity hash is the right key and why the state cannot live in a field.
+static SHA1PRNG_TABLE: RwLock<Option<FxHashMap<i32, Sha1Prng>>> = RwLock::new(None);
+
+/// Fast bail for the overwhelmingly common case (nothing ever asked for a
+/// seeded SHA1PRNG), so the draw paths do not take the table lock per call.
+static SHA1PRNG_ANY_SEEDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn with_prng_write<R>(f: impl FnOnce(&mut FxHashMap<i32, Sha1Prng>) -> R) -> R {
+    let mut g = SHA1PRNG_TABLE.write();
+    if g.is_none() {
+        *g = Some(FxHashMap::default());
+    }
+    f(g.as_mut().expect("table just initialized"))
+}
+
+fn secure_random_receiver(args: &[Value]) -> Option<ObjectRef> {
+    match args.first() {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    }
+}
+
+/// True when this instance was handed out by `getInstance("SHA1PRNG")`.
+/// `algorithm` is the real field every construction route stamps (see
+/// `secure_random_record_algorithm` / `make_secure_random`).
+fn secure_random_is_sha1prng(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    match ctx.get_field_by_name(this, "algorithm") {
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
+            .is_some_and(|n| n.eq_ignore_ascii_case("SHA1PRNG")),
+        _ => false,
+    }
+}
+
+/// `sun.security.provider.SecureRandom.updateState` — state = state + output + 1
+/// as a 160-bit little-endian addition, forced to change at least one bit.
+fn sha1prng_update_state(state: &mut [u8; SHA1PRNG_DIGEST], output: &[u8; SHA1PRNG_DIGEST]) {
+    let mut last: i32 = 1;
+    let mut changed = false;
+    for i in 0..SHA1PRNG_DIGEST {
+        let v = state[i] as i32 + output[i] as i32 + last;
+        let t = v as u8;
+        changed |= state[i] != t;
+        state[i] = t;
+        last = v >> 8;
+    }
+    if !changed {
+        state[0] = state[0].wrapping_add(1);
+    }
+}
+
+/// `engineSetSeed(byte[])`: `digest.update(state); state = digest.digest(seed)`
+/// — i.e. `SHA1(previous_state || seed)`, or `SHA1(seed)` on a fresh instance.
+fn sha1prng_set_seed_bytes(ctx: &mut dyn NativeContext, this: ObjectRef, seed: &[u8]) {
+    let key = obj_key(ctx, this);
+    let installed = with_prng_write(|t| {
+        let mut input: Vec<u8> = Vec::with_capacity(SHA1PRNG_DIGEST + seed.len());
+        if let Some(prev) = t.get(&key) {
+            input.extend_from_slice(&prev.state);
+        }
+        input.extend_from_slice(seed);
+        let digest = crate::real_sha1(&input);
+        if digest.len() != SHA1PRNG_DIGEST {
+            return false;
+        }
+        let mut state = [0u8; SHA1PRNG_DIGEST];
+        state.copy_from_slice(&digest);
+        t.insert(
+            key,
+            Sha1Prng {
+                state,
+                remainder: [0u8; SHA1PRNG_DIGEST],
+                rem_count: 0,
+                next_gaussian: None,
+            },
+        );
+        true
+    });
+    if installed {
+        SHA1PRNG_ANY_SEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `engineNextBytes` — returns false when this instance has no seeded state,
+/// which is every caller's signal to fall through to the OS CSPRNG.
+fn sha1prng_next_bytes(ctx: &mut dyn NativeContext, this: ObjectRef, out: &mut [u8]) -> bool {
+    if !SHA1PRNG_ANY_SEEDED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let key = obj_key(ctx, this);
+    with_prng_write(|t| {
+        let Some(prng) = t.get_mut(&key) else {
+            return false;
+        };
+        let mut index = 0usize;
+        // Serve the tail of the previous digest block first.
+        if prng.rem_count > 0 {
+            let todo = (out.len() - index).min(SHA1PRNG_DIGEST - prng.rem_count);
+            let mut r = prng.rem_count;
+            for i in 0..todo {
+                out[index + i] = prng.remainder[r];
+                prng.remainder[r] = 0;
+                r += 1;
+            }
+            prng.rem_count += todo;
+            index += todo;
+        }
+        while index < out.len() {
+            let digest = crate::real_sha1(&prng.state);
+            if digest.len() != SHA1PRNG_DIGEST {
+                return false;
+            }
+            let mut output = [0u8; SHA1PRNG_DIGEST];
+            output.copy_from_slice(&digest);
+            sha1prng_update_state(&mut prng.state, &output);
+            let todo = (out.len() - index).min(SHA1PRNG_DIGEST);
+            for b in output.iter_mut().take(todo) {
+                out[index] = *b;
+                index += 1;
+                *b = 0;
+            }
+            prng.rem_count += todo;
+            prng.remainder = output;
+        }
+        prng.rem_count %= SHA1PRNG_DIGEST;
+        true
+    })
+}
+
+/// `SecureRandom.next(int numBits)` — the protected override every inherited
+/// `java.util.Random` method funnels through, so the derived
+/// `nextInt`/`nextLong`/`nextDouble`/`nextFloat`/`nextBoolean` streams match
+/// HotSpot bit for bit and not merely "deterministically".
+fn sha1prng_next(ctx: &mut dyn NativeContext, this: ObjectRef, num_bits: u32) -> Option<i32> {
+    let num_bytes = ((num_bits + 7) / 8) as usize;
+    let mut buf = [0u8; 4];
+    if !sha1prng_next_bytes(ctx, this, &mut buf[..num_bytes]) {
+        return None;
+    }
+    let mut next: u32 = 0;
+    for b in buf.iter().take(num_bytes) {
+        next = (next << 8) | (*b as u32);
+    }
+    Some((next >> (num_bytes * 8 - num_bits as usize)) as i32)
+}
+
+/// `java.util.Random.nextDouble()` over the SHA1PRNG stream.
+fn sha1prng_next_double(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<f64> {
+    let hi = sha1prng_next(ctx, this, 26)? as i64;
+    let lo = sha1prng_next(ctx, this, 27)? as i64;
+    Some(((hi << 27) + lo) as f64 / ((1u64 << 53) as f64))
+}
+
+/// `java.util.Random.nextInt(bound)` over the SHA1PRNG stream — the legacy
+/// power-of-two/rejection algorithm, which is what `Random` still specifies.
+fn sha1prng_next_int_bound(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    bound: i32,
+) -> Option<i32> {
+    let m = bound - 1;
+    let mut u = sha1prng_next(ctx, this, 31)?;
+    if (bound & m) == 0 {
+        return Some(((bound as i64).wrapping_mul(u as i64) >> 31) as i32);
+    }
+    loop {
+        let r = u % bound;
+        if u.wrapping_sub(r).wrapping_add(m) >= 0 {
+            return Some(r);
+        }
+        u = sha1prng_next(ctx, this, 31)?;
+    }
+}
+
+/// `java.util.Random.nextGaussian()` over the SHA1PRNG stream (Marsaglia polar,
+/// including the cached partner deviate — dropping it would desynchronise the
+/// stream from HotSpot's on the very next call).
+fn sha1prng_next_gaussian(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<f64> {
+    if !SHA1PRNG_ANY_SEEDED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let key = obj_key(ctx, this);
+    if let Some(v) = with_prng_write(|t| t.get_mut(&key).and_then(|p| p.next_gaussian.take())) {
+        return Some(v);
+    }
+    // Bounded like `native_secure_random_next_gaussian`: P(reject) ≈ 0.215 per
+    // pair, so 64 rounds is far below any practical failure probability.
+    for _ in 0..64 {
+        let v1 = 2.0 * sha1prng_next_double(ctx, this)? - 1.0;
+        let v2 = 2.0 * sha1prng_next_double(ctx, this)? - 1.0;
+        let s = v1 * v1 + v2 * v2;
+        if s < 1.0 && s != 0.0 {
+            let mult = (-2.0 * s.ln() / s).sqrt();
+            with_prng_write(|t| {
+                if let Some(p) = t.get_mut(&key) {
+                    p.next_gaussian = Some(v2 * mult);
+                }
+            });
+            return Some(v1 * mult);
+        }
+    }
+    None
+}
+
 pub(crate) fn native_secure_random_init(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    // No per-instance state — every operation pulls fresh entropy from
-    // the OS.  Per JDK SecureRandom contract, the no-arg ctor selects
-    // a default provider; we always select "OS-CSPRNG", which is the
-    // strongest possible source.
+    // Per the JDK SecureRandom contract the no-arg ctor selects a default
+    // provider; we always select "OS-CSPRNG", the strongest source available.
+    secure_random_record_algorithm(ctx, args);
     Ok(None)
 }
 
+/// `SecureRandom.setSeed(long)` — the real body is
+/// `if (seed != 0) engineSetSeed(longToByteArray(seed))`, with the zero guard
+/// present because `Random`'s constructor calls this virtually. Reproduced
+/// exactly, including the little-endian long encoding.
+///
+/// For every algorithm other than SHA1PRNG this stays a no-op: their
+/// `engineSetSeed` supplements a state we do not keep (each draw reads the OS
+/// CSPRNG), and the spec forbids only WEAKENING the seed, which skipping the
+/// supplement cannot do.
 pub(crate) fn native_secure_random_set_seed(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    // SecureRandom.setSeed(long) is documented as "supplements,
-    // doesn't replace" the existing seed.  Our implementation never
-    // mixes a user seed in (because doing so would weaken the
-    // OS-CSPRNG output), but skipping the supplement is spec-allowed:
-    // the spec only forbids weakening the seed, which a no-op cannot do.
+    let seed = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => return Ok(None),
+    };
+    if seed == 0 {
+        return Ok(None);
+    }
+    let Some(this) = secure_random_receiver(args) else {
+        return Ok(None);
+    };
+    if !secure_random_is_sha1prng(ctx, this) {
+        return Ok(None);
+    }
+    // `longToByteArray`: least-significant byte first.
+    let mut bytes = [0u8; 8];
+    let mut l = seed as u64;
+    for b in bytes.iter_mut() {
+        *b = l as u8;
+        l >>= 8;
+    }
+    sha1prng_set_seed_bytes(ctx, this, &bytes);
+    Ok(None)
+}
+
+/// `SecureRandom.setSeed(byte[])` — `engineSetSeed(seed)` verbatim for
+/// SHA1PRNG; a no-op for the OS-CSPRNG-backed algorithms, for the reason on
+/// `native_secure_random_set_seed` above.
+pub(crate) fn native_secure_random_set_seed_bytes(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(this) = secure_random_receiver(args) else {
+        return Ok(None);
+    };
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if !secure_random_is_sha1prng(ctx, this) {
+        return Ok(None);
+    }
+    let len = ctx.array_length(arr);
+    let mut seed: Vec<u8> = Vec::with_capacity(len);
+    for i in 0..len {
+        if let Value::Int(b) = ctx.get_array_element(arr, i) {
+            seed.push(b as u8);
+        }
+    }
+    sha1prng_set_seed_bytes(ctx, this, &seed);
     Ok(None)
 }
 
 pub(crate) fn native_secure_random_next_int(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Some(this) = secure_random_receiver(args) {
+        if let Some(v) = sha1prng_next(ctx, this, 32) {
+            return Ok(Some(Value::Int(v)));
+        }
+    }
     // SECURITY FIX (V2): propagate entropy failure instead of silently
     // returning a predictable 0. Matches `native_secure_random_next_bytes`.
     let v = match os_random_u64() {
@@ -577,7 +925,7 @@ pub(crate) fn native_secure_random_next_int(
 }
 
 pub(crate) fn native_secure_random_next_int_bound(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let bound = match args.get(1) {
@@ -591,6 +939,11 @@ pub(crate) fn native_secure_random_next_int_bound(
             }
             .into(),
         );
+    }
+    if let Some(this) = secure_random_receiver(args) {
+        if let Some(v) = sha1prng_next_int_bound(ctx, this, bound) {
+            return Ok(Some(Value::Int(v)));
+        }
     }
     // Rejection sampling on full 32 bits to keep the distribution
     // unbiased for arbitrary bounds (JDK uses the same approach).
@@ -618,9 +971,17 @@ pub(crate) fn native_secure_random_next_int_bound(
 }
 
 pub(crate) fn native_secure_random_next_long(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Some(this) = secure_random_receiver(args) {
+        if let Some(hi) = sha1prng_next(ctx, this, 32) {
+            // `Random.nextLong()`: ((long)next(32) << 32) + next(32) — the low
+            // half is sign-extended, exactly as the JDK's `+` does.
+            let lo = sha1prng_next(ctx, this, 32).unwrap_or(0) as i64;
+            return Ok(Some(Value::Long(((hi as i64) << 32).wrapping_add(lo))));
+        }
+    }
     // SECURITY FIX (V2): propagate entropy failure instead of silently
     // returning a predictable 0. Matches `native_secure_random_next_bytes`.
     let v = match os_random_u64() {
@@ -647,6 +1008,18 @@ pub(crate) fn native_secure_random_next_bytes(
     if len == 0 {
         return Ok(None);
     }
+    if let Some(this) = secure_random_receiver(args) {
+        let mut seeded = vec![0u8; len];
+        if sha1prng_next_bytes(ctx, this, &mut seeded) {
+            for (i, b) in seeded.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int((*b as i8) as i32));
+            }
+            for b in seeded.iter_mut() {
+                *b = 0;
+            }
+            return Ok(None);
+        }
+    }
     // Single bulk OS draw — much more efficient than per-byte LCG and
     // doesn't waste 56 bits/iteration like a u64-based loop would.
     let mut buf = vec![0u8; len];
@@ -671,9 +1044,14 @@ pub(crate) fn native_secure_random_next_bytes(
 }
 
 pub(crate) fn native_secure_random_next_double(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Some(this) = secure_random_receiver(args) {
+        if let Some(d) = sha1prng_next_double(ctx, this) {
+            return Ok(Some(Value::Double(d)));
+        }
+    }
     // 53 bits of entropy → IEEE-754 double in [0, 1).
     // SECURITY FIX (V2): propagate entropy failure instead of silently
     // returning a predictable 0.0. Matches `native_secure_random_next_bytes`.
@@ -692,9 +1070,14 @@ pub(crate) fn native_secure_random_next_double(
 }
 
 pub(crate) fn native_secure_random_next_boolean(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Some(this) = secure_random_receiver(args) {
+        if let Some(b) = sha1prng_next(ctx, this, 1) {
+            return Ok(Some(Value::Int(i32::from(b != 0))));
+        }
+    }
     // SECURITY FIX (V2): propagate entropy failure instead of silently
     // returning a predictable false. Matches `native_secure_random_next_bytes`.
     let v = match os_random_u64() {
@@ -710,9 +1093,14 @@ pub(crate) fn native_secure_random_next_boolean(
 }
 
 pub(crate) fn native_secure_random_next_float(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Some(this) = secure_random_receiver(args) {
+        if let Some(b) = sha1prng_next(ctx, this, 24) {
+            return Ok(Some(Value::Float(b as f32 / ((1u32 << 24) as f32))));
+        }
+    }
     // 24 bits → float in [0, 1).
     // SECURITY FIX (V2): propagate entropy failure instead of silently
     // returning a predictable 0.0. Matches `native_secure_random_next_bytes`.
@@ -731,9 +1119,14 @@ pub(crate) fn native_secure_random_next_float(
 }
 
 pub(crate) fn native_secure_random_next_gaussian(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    if let Some(this) = secure_random_receiver(args) {
+        if let Some(g) = sha1prng_next_gaussian(ctx, this) {
+            return Ok(Some(Value::Double(g)));
+        }
+    }
     // LOW-FIX: SecureRandom must NOT inherit java.util.Random's LCG-backed
     // nextGaussian (which would derive its two uniforms from the predictable
     // linear congruential generator on the synthetic seed field).  Instead we
@@ -890,6 +1283,18 @@ pub(crate) fn native_secure_random_get_instance_with_provider(
         1,
         crate::jca::provider_chain::ProviderArgWording::Shared,
     )?;
+    let algorithm = match args.first() {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    crate::jca::provider_chain::check_provider_ownership(
+        ctx,
+        args,
+        1,
+        "SecureRandom",
+        &algorithm,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     native_secure_random_get_instance(ctx, args)
 }
 
@@ -950,27 +1355,30 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     // when they ask for cryptographic randomness.
     let sr = "java/security/SecureRandom";
     registry.register(sr, "<init>", "()V", native_secure_random_init);
-    registry.register(sr, "<init>", "([B)V", |_ctx, _args| {
-        // SecureRandom(byte[]) takes a seed.  Per JDK, this is a
-        // "supplemental" seed — the stream itself is still drawn
-        // from the OS CSPRNG.  No-op is spec-compliant; we never
-        // weaken the stream by mixing user bytes in.
-        Ok(None)
-    });
+    // `SecureRandom(byte[] seed)`: the seed argument is DISCARDED, and that
+    // matches HotSpot rather than merely being convenient. The JDK ctor selects
+    // the DEFAULT algorithm — DRBG on JDK 9+, never SHA1PRNG — and delivers the
+    // seed through `getDefaultPRNG(true, seed)` → `engineSetSeed`, which for
+    // DRBG reseeds with fresh entropy input. So `new SecureRandom(seed)` is not
+    // reproducible on HotSpot either, and the seeded-SHA1PRNG path implemented
+    // above is deliberately NOT reached from here (this ctor records the
+    // algorithm as "OS-CSPRNG", not "SHA1PRNG"). The ctor is not a no-op: it
+    // records `algorithm` like the no-arg form.
+    //
+    // NOTE for callers porting tests: reproducible replay is available exactly
+    // where the JDK guarantees it — `java.util.Random` (LCG, above) and
+    // `SecureRandom.getInstance("SHA1PRNG")` + `setSeed` (below).
+    registry.register(sr, "<init>", "([B)V", native_secure_random_init);
     registry.register(sr, "setSeed", "(J)V", native_secure_random_set_seed);
-    // KEEP (spec-conformant, not a stub): `SecureRandom.setSeed(byte[])` is
-    // documented as SUPPLEMENTING, never replacing, the existing seed. The
-    // stream here comes from the OS CSPRNG on every draw
-    // (`native_secure_random_next_bytes`), so there is no PRNG state a caller
-    // seed could usefully be folded into — and mixing caller-controlled bytes
-    // in could only ever weaken it. Skipping the supplement is exactly what
-    // the spec permits; see `native_secure_random_set_seed` (the `(J)V`
-    // overload) for the same reasoning. Verified while auditing this file:
-    // every draw path (`nextBytes`/`nextInt`/`nextLong`/`generateSeed`) calls
-    // `os_random_bytes`/`os_random_u64` and raises `SecurityException` on
-    // entropy failure rather than returning zeros, so nothing in this module
-    // is constant-valued.
-    registry.register(sr, "setSeed", "([B)V", |_ctx, _args| Ok(None));
+    // STUB-REMOVAL (wave 4): was a no-op, justified by "engineSetSeed only
+    // SUPPLEMENTS the seed and we keep no PRNG state to supplement". True for
+    // DRBG/NativePRNG/`new SecureRandom()`, and FALSE for SHA1PRNG, whose
+    // entire state is the seed digest — `getInstance("SHA1PRNG")` seeded twice
+    // alike yields identical bytes on HotSpot and yielded different bytes here.
+    // Now routed through the real `sun.security.provider.SecureRandom`
+    // algorithm for that one case; see the SHA1PRNG section above for the exact
+    // scope and for why every other algorithm stays on the OS CSPRNG.
+    registry.register(sr, "setSeed", "([B)V", native_secure_random_set_seed_bytes);
     registry.register(sr, "nextInt", "()I", native_secure_random_next_int);
     registry.register(sr, "nextInt", "(I)I", native_secure_random_next_int_bound);
     registry.register(sr, "nextLong", "()J", native_secure_random_next_long);

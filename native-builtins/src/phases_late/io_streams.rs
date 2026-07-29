@@ -535,15 +535,29 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(oos, "defaultWriteObject", "()V", |_ctx, _args| {
-        // Our OOS implementation writes fields explicitly via writeInt/writeLong/writeUTF/etc.
-        // The "default" path that walks reflectable fields via classDesc is a no-op here —
-        // user code that overrides writeObject() is expected to call the explicit methods.
-        Ok(None)
+        // `defaultWriteObject()` writes the calling class's default-serializable
+        // fields. This fallback OOS has no class-descriptor machinery to walk
+        // them with, and it never enters a per-class `writeObject` callback, so
+        // a no-op here silently DROPPED every field of every class that used the
+        // normal `writeObject`/`defaultWriteObject` idiom. `NotActiveException`
+        // is not a substitute for the real thing — it is what the real JDK
+        // throws in exactly this state ("not in call to writeObject"), so the
+        // caller learns the truth instead of shipping an empty object.
+        Err(RuntimeError::IOException {
+            message: "java.io.NotActiveException: not in call to writeObject".into(),
+        }
+        .into())
     });
-    r.register(oos, "reset", "()V", |_ctx, _args| {
-        // OOS.reset() clears the object handle table used for back-references. We don't
-        // maintain a handle table (each writeObject() emits the bytes directly), so the
-        // only effect is that subsequent writes start fresh — which is already our behaviour.
+    r.register(oos, "reset", "()V", |ctx, args| {
+        // `reset()` is a WIRE-FORMAT operation, not just a bookkeeping one: the
+        // JDK emits TC_RESET so the paired reader drops its back-reference
+        // table at the same point in the byte stream. Skipping the byte left the
+        // two sides disagreeing about stream position. (The matching TC_RESET
+        // skip is in `ObjectInputStream.readObject` below.)
+        let this = obj_arg(args, 0)?;
+        if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+            oos_write_bytes(ctx, stream, &[0x79]); // TC_RESET
+        }
         Ok(None)
     });
 
@@ -564,7 +578,13 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
     r.register(ois, "readObject", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
-            let tc = ois_read_byte(ctx, stream);
+            // TC_RESET carries no payload — skip it and read the next item, or
+            // `ObjectOutputStream.reset()`'s marker would be mis-read as an
+            // unknown type code and answered with a bogus null.
+            let mut tc = ois_read_byte(ctx, stream);
+            while tc == 0x79 {
+                tc = ois_read_byte(ctx, stream);
+            }
             match tc {
                 0x70 => Ok(Some(Value::Object(None))), // TC_NULL
                 0x74 => {
@@ -721,13 +741,29 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(ois, "defaultReadObject", "()V", |_ctx, _args| {
-        // Our OIS reads fields explicitly via readInt/readLong/readUTF/etc.; the "default"
-        // path that auto-reads via classDesc is a no-op here. User code calling
-        // defaultReadObject() from readObject() should instead use the typed read methods.
-        Ok(None)
+        // Mirror of `ObjectOutputStream.defaultWriteObject` above: a no-op here
+        // left every default-serializable field at its default value while the
+        // caller believed it had been restored. This fallback OIS has no class
+        // descriptor to read them from and is never inside a per-class
+        // `readObject` callback, which is precisely the state in which the real
+        // JDK throws `NotActiveException`.
+        Err(RuntimeError::IOException {
+            message: "java.io.NotActiveException: not in call to readObject".into(),
+        }
+        .into())
     });
-    r.register(ois, "available", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // Delegate to the underlying stream, as `close()` above does; a constant 0
+    // told every caller the stream was exhausted while bytes were still queued.
+    r.register(ois, "available", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Value::Object(Some(stream)) = ctx.get_field(this, 0) {
+            match ctx.invoke_virtual(stream, "available", "()I", &[])? {
+                Some(Value::Int(v)) => Ok(Some(Value::Int(v))),
+                _ => Ok(Some(Value::Int(0))),
+            }
+        } else {
+            Ok(Some(Value::Int(0)))
+        }
     });
     r.set_category(__prev_cat);
 }

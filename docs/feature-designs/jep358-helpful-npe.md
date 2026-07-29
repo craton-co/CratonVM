@@ -1,5 +1,67 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 6 landed (2026-07-28) — merge-point blocks.** The last standing
+> divergence-log entry against this feature is closed: the expression
+> reconstruction no longer bails inside a basic block whose *incoming* operand
+> stack is non-empty.
+>
+> `simulate_to` walks straight-line from the trapping instruction's block leader
+> with an empty simulated stack. That models a leader correctly only when the
+> real stack is empty there — which a control-flow **merge** point is not: the
+> join of a ternary, of a `&&`/`||` short-circuit, or of a `switch` arm carries
+> the predecessors' value. The leader is then typically the `astore` of
+> `T x = cond ? a : b;`, whose very first pop underflowed and abandoned the whole
+> reconstruction, so `x.deref()` fell back to the action-only message. That is a
+> valid HotSpot shape, which is why increment 5's 41-case probe (all
+> straight-line) never caught it — but HotSpot itself prints the full
+> `because "x" is null` clause there, and the shape is everywhere in real code.
+>
+> - **Underflow is now information, not failure.** `pop_slot` yields an
+>   `UNKNOWN_SLOT` once the block's own simulated suffix is exhausted, meaning
+>   "this operand predates the block". Entries stay correctly aligned relative to
+>   the **top** of the stack — which is how every caller indexes them — so an
+>   operand that genuinely reaches below the block boundary still reports an
+>   unknown producer and still yields the action-only message. The change can
+>   only turn a bail into "correct" or "still bails"; it can never rename an
+>   operand.
+> - **Arithmetic / conversion / comparison opcodes are modelled.** They carry no
+>   nameable expression (`describe_producer` returns `None` for them) but sit in
+>   the prefix of the trapping statement's own block constantly — `a[i + 1]`,
+>   `sink += a[0]` — where an unmodelled opcode used to abandon the walk. The
+>   category-ambiguous stack shufflers (`dup2`, `dup_x1`, `pop2`, `swap`) are
+>   deliberately left unmodelled: their entry count depends on operand
+>   categories, and a mis-shaped stack would name the *wrong* value.
+> - **Verified** against JDK 25 `getExtendedNPEMessage` with a 40-case fixture
+>   (`vm/tests/resources/cratonvm/DiffNpeMessage.java`, wired into
+>   `differential.rs::diff_npe_messages`) covering every null-deref opcode plus
+>   13 merge-block shapes, byte-identical in the interpreter and after JIT
+>   warm-up. Three unit tests in `exceptions.rs` pin the merge-point, the
+>   arithmetic-prefix and the still-unnamed-operand behaviours.
+> **Increment 6b — the opt-out flag now matches HotSpot.** With
+> `-XX:-ShowCodeDetailsInExceptionMessages`, HotSpot's `getMessage()` is `null`;
+> CratonVM returned the pre-JEP-358 diagnostic text instead, and the invoke site
+> (unconditionally on since increment 1) returned the full JEP-358 string — so
+> the flag whose purpose is HotSpot parity was the one place that diverged.
+>
+> The gate is now three-valued rather than two. `env_cache::helpful_npe_opcodes()`
+> means "handle this the HotSpot way" and is true when the flag is on **or**
+> explicitly off; only the `-1` sentinel (an embedder or the in-process Rust test
+> harness that never wires the flag) is false, which is what preserves the legacy
+> diagnostic strings for exactly the callers increment 3 wanted them for. The new
+> `helpful_npe_suppressed()` is true only for an explicit opt-out
+> (`-XX:-…` or `CRATONVM_HELPFUL_NPE_OPCODES=0`); `helpful_npe_invoke_message`
+> and `helpful_npe_opcode_message_parts` then return the empty string, which
+> `throw_runtime_error`'s NPE arm maps back to a `None` message. The empty-string
+> marker exists because the throw sites must hand a `String` to
+> `pop_object_ref_ctx_with` and cannot pass `None` themselves; no Rust-side path
+> produces a deliberately empty NPE message, and a message user code supplied
+> (`Objects.requireNonNull(x, "charset")`) is untouched — as on HotSpot, whose
+> flag only affects the VM's *implicit* NPEs. `jit_npe_message_gated` checks the
+> suppression first, since the gate it used to consult is now true in that state.
+>
+> - Step 6's remaining bci-gated item is unchanged: a JIT NPE that deopts
+>   without a precise trapping bci still cannot name a field/invoke operand.
+
 > **Increment 5 landed (2026-06-19) — differential compliance pass + default
 > flip to HotSpot parity.** A 41-case lambda-free probe (`scratch/npeprobe/`)
 > covering every null-deref opcode and every expression-reconstruction shape was

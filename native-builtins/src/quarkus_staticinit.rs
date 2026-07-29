@@ -610,10 +610,32 @@ fn register_datasource_runtime_config(registry: &mut NativeMethodRegistry) {
 
 /// Register `io.quarkus.runtime.Application` lifecycle hooks.
 ///
-/// ## INTENTIONAL COMPATIBILITY SHIM (`Application.start/stop/awaitShutdown`)
+/// ## RETIRED SHIM (`Application.start/stop/awaitShutdown`), 2026-07-28
 ///
-/// These three natives are no-ops (`native_app_lifecycle_no_op`). This is a
-/// deliberate Quarkus-boot compatibility shim, NOT an intrinsic.
+/// The three no-op natives below are **no longer registered by default**.
+/// `Application.start([String])` drives the generated
+/// `ApplicationImpl.doStart([String])` -- the RUNTIME_INIT phase that runs the
+/// STARTUP_TASKS: the Vert.x/Netty HTTP server, the datasource connect,
+/// Infinispan, Narayana JTA, Hibernate's SessionFactory, Liquibase. No-op'ing
+/// it meant `start()` returned SUCCESSFULLY having created none of that, so
+/// `main` parked in `waitForExit` with no event loop, no listener, and no
+/// error anywhere -- the failure mode
+/// `docs/internal/keycloak/keycloak-no-vertx-http-runtime-init-20260728.md`
+/// was filed for. A silent, fully-successful-looking non-boot is strictly
+/// worse than a loud one, which is why this shim is retired rather than kept
+/// under the "app-enabling shim" rule.
+///
+/// Verified on the real `keycloak-quarkus-dist-26.6.1`: with the no-ops gone
+/// the boot runs RUNTIME_INIT end to end -- Netty event loops, Vert.x,
+/// Infinispan (`ISPN000556: Starting user marshaller`), Narayana recovery,
+/// the Agroal/H2 datasource, the Hibernate SessionFactory and the full
+/// Liquibase schema migration all execute as real bytecode.
+///
+/// `CRATONVM_SYNTHETIC_QUARKUS_START=1` (or `CRATONVM_REAL=quarkus-start=0`)
+/// restores the old no-ops for A/B diagnosis. The historical rationale for
+/// the shim is kept below.
+///
+/// ## Historical rationale (the shim, now opt-in)
 ///
 /// **What it works around:** In real Quarkus, `Application` is an abstract
 /// class; `start(String[])` is the synchronized boot entry that drives the
@@ -655,10 +677,13 @@ fn register_application_lifecycle(registry: &mut NativeMethodRegistry) {
     // deploy bytecode already runs for `<clinit>` — see Gaps 4–7 — so `doStart` is the
     // same kind of bytecode). Opt-in while the RUNTIME_INIT path is validated; pairs with
     // CRATONVM_REAL_AGROAL / CRATONVM_REAL_VERTX / CRATONVM_REAL_NET_SOCKETS.
-    if crate::nbflags().real_quarkus_start {
+    // Default: DO NOT register the no-ops -- the real `start()` -> `doStart()`
+    // RUNTIME_INIT bytecode runs. Only `CRATONVM_SYNTHETIC_QUARKUS_START=1`
+    // brings the historical shim back.
+    if !crate::nbflags().synthetic_quarkus_start {
         if crate::nbflags().dbg {
             eprintln!(
-                "[cratonvm] CRATONVM_REAL_QUARKUS_START: NOT registering Application.start/stop/awaitShutdown no-ops — real Quarkus lifecycle (doStart RUNTIME_INIT) will run"
+                "[cratonvm] Quarkus lifecycle: NOT registering Application.start/stop/awaitShutdown no-ops — the real doStart RUNTIME_INIT will run (CRATONVM_SYNTHETIC_QUARKUS_START=1 restores the no-ops)"
             );
         }
         return;

@@ -74,7 +74,13 @@ rustls-pemfile = "2"
 rustls-pki-types = "1"
 # T2.7.4: real system trust store enumeration for X509TrustManager.getAcceptedIssuers
 rustls-native-certs = "0.8"
-rusqlite = { version = "0.31", features = ["bundled"] }
+# `column_decltype` gates `Statement::columns()` / `Column::decl_type()` — the
+# only way to read a result column's DECLARED SQLite type. Without it
+# ResultSetMetaData.getColumnType/getColumnTypeName have no data to work from
+# and report a hardcoded VARCHAR/TEXT for every column of every result set.
+# The feature is a pure cfg flag in rusqlite (`column_decltype = []`) — it adds
+# no transitive dependency and no C code.
+rusqlite = { version = "0.31", features = ["bundled", "column_decltype"] }
 # zlib-rs is a pure-Rust (no C toolchain, no system library, no vendored C
 # source) reimplementation of zlib that is bit-for-bit compatible with real
 # zlib's DEFLATE output (unlike the default `rust_backend`/miniz_oxide, which

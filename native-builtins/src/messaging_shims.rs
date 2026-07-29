@@ -2353,22 +2353,19 @@ pub(crate) fn register_netty_internal_tcnative_natives(registry: &mut NativeMeth
         "x509vErrIpAddressMismatch",
         "x509vErrDaneNoMatch",
     ];
-    // KEEP (deliberate constants) with a caveat worth knowing about.
     // `NativeStaticallyReferencedJniMethods` is how tcnative imports the
-    // OpenSSL `SSL_OP_*` / `SSL_ERROR_*` / `X509_V_ERR_*` numeric constants;
-    // its <clinit>-time reads must not throw, hence a value for every name.
-    // Zero is chosen uniformly because there is no OpenSSL behind ANY of this
-    // — `SSL.initialize`/`version` below are stubs too and no handshake ever
-    // runs — so no code path here compares two of these against each other.
+    // OpenSSL `SSL_OP_*` / `SSL_ERROR_*` / `X509_V_ERR_*` numeric constants.
+    // Those are fixed integers in OpenSSL's own headers, so the true values
+    // are knowable without linking OpenSSL — `register_netty_static_int_const`
+    // publishes them.
     //
-    // The caveat: if a real tcnative handshake path is ever wired up, the
-    // uniform zero makes every SSL_ERROR_* compare equal to SSL_ERROR_NONE,
-    // i.e. a failed handshake would read as success. Filling in the true
-    // OpenSSL values is a prerequisite for that work, not an optional
-    // cleanup.
+    // Every name used to answer 0. That made every `SSL_ERROR_*` compare equal
+    // to `SSL_ERROR_NONE` (a failed handshake reading as success), collapsed
+    // the mutually exclusive `SSL_OP_NO_<protocol>` bits onto each other, and
+    // made every `X509_V_ERR_*` compare equal to `X509_V_OK`.
     let nsm = "io/netty/internal/tcnative/NativeStaticallyReferencedJniMethods";
     for name in NETTY_STATIC_INT_NATIVES {
-        registry.register(nsm, name, "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
+        register_netty_static_int_const(registry, nsm, name);
     }
 
     let ssl = "io/netty/internal/tcnative/SSL";
@@ -2393,4 +2390,129 @@ pub(crate) fn register_netty_internal_tcnative_natives(registry: &mut NativeMeth
             ))))
         },
     );
+}
+
+/// Register one `NativeStaticallyReferencedJniMethods.<name>()I` accessor with
+/// the value OpenSSL's headers give it.
+///
+/// Kept as an explicit match so each name maps to a `fn` pointer — the registry
+/// does not accept capturing closures. Sources: `openssl/ssl.h` (`SSL_OP_*`,
+/// `SSL_SESS_CACHE_*`, `SSL_ST_*`, `SSL_MODE_*`, `SSL_*_SHUTDOWN`,
+/// `SSL_ERROR_*`), `openssl/x509v3.h` (`X509_CHECK_FLAG_*`) and
+/// `openssl/x509_vfy.h` (`X509_V_*`), OpenSSL 1.1.1 — the release
+/// `SSL.version()` below reports.
+fn register_netty_static_int_const(r: &mut NativeMethodRegistry, class: &str, name: &str) {
+    let cb: cratonvm_native_api::NativeCallback = match name {
+        // -- SSL_OP_* option bits (ssl.h). SSLv2 support was removed in
+        //    OpenSSL 1.1.0, which is why SSL_OP_NO_SSLv2 is genuinely 0.
+        "sslOpCipherServerPreference" => |_c, _a| Ok(Some(Value::Int(0x0040_0000))),
+        "sslOpNoSSLv2" => |_c, _a| Ok(Some(Value::Int(0x0000_0000))),
+        "sslOpNoSSLv3" => |_c, _a| Ok(Some(Value::Int(0x0200_0000))),
+        "sslOpNoTLSv1" => |_c, _a| Ok(Some(Value::Int(0x0400_0000))),
+        "sslOpNoTLSv11" => |_c, _a| Ok(Some(Value::Int(0x1000_0000))),
+        "sslOpNoTLSv12" => |_c, _a| Ok(Some(Value::Int(0x0800_0000))),
+        "sslOpNoTicket" => |_c, _a| Ok(Some(Value::Int(0x0000_4000))),
+        "sslOpNoCompression" => |_c, _a| Ok(Some(Value::Int(0x0002_0000))),
+        // -- SSL_SESS_CACHE_* (ssl.h)
+        "sslSessCacheOff" => |_c, _a| Ok(Some(Value::Int(0x0000))),
+        "sslSessCacheServer" => |_c, _a| Ok(Some(Value::Int(0x0002))),
+        // -- SSL_ST_* handshake-side bits (ssl.h)
+        "sslStConnect" => |_c, _a| Ok(Some(Value::Int(0x1000))),
+        "sslStAccept" => |_c, _a| Ok(Some(Value::Int(0x2000))),
+        // -- SSL_MODE_* (ssl.h)
+        "sslModeEnablePartialWrite" => |_c, _a| Ok(Some(Value::Int(0x0000_0001))),
+        "sslModeAcceptMovingWriteBuffer" => |_c, _a| Ok(Some(Value::Int(0x0000_0002))),
+        "sslModeReleaseBuffers" => |_c, _a| Ok(Some(Value::Int(0x0000_0010))),
+        // -- SSL_SENT_SHUTDOWN / SSL_RECEIVED_SHUTDOWN (ssl.h)
+        "sslSendShutdown" => |_c, _a| Ok(Some(Value::Int(1))),
+        "sslReceivedShutdown" => |_c, _a| Ok(Some(Value::Int(2))),
+        // -- SSL_ERROR_* (ssl.h). These must be distinct or a failed handshake
+        //    reads as SSL_ERROR_NONE.
+        "sslErrorNone" => |_c, _a| Ok(Some(Value::Int(0))),
+        "sslErrorSSL" => |_c, _a| Ok(Some(Value::Int(1))),
+        "sslErrorWantRead" => |_c, _a| Ok(Some(Value::Int(2))),
+        "sslErrorWantWrite" => |_c, _a| Ok(Some(Value::Int(3))),
+        "sslErrorWantX509Lookup" => |_c, _a| Ok(Some(Value::Int(4))),
+        "sslErrorSyscall" => |_c, _a| Ok(Some(Value::Int(5))),
+        "sslErrorZeroReturn" => |_c, _a| Ok(Some(Value::Int(6))),
+        "sslErrorWantConnect" => |_c, _a| Ok(Some(Value::Int(7))),
+        "sslErrorWantAccept" => |_c, _a| Ok(Some(Value::Int(8))),
+        // -- X509_CHECK_FLAG_* (x509v3.h)
+        "x509CheckFlagAlwaysCheckSubject" => |_c, _a| Ok(Some(Value::Int(0x1))),
+        "x509CheckFlagDisableWildCards" => |_c, _a| Ok(Some(Value::Int(0x2))),
+        "x509CheckFlagNoPartialWildCards" => |_c, _a| Ok(Some(Value::Int(0x4))),
+        "x509CheckFlagMultiLabelWildCards" => |_c, _a| Ok(Some(Value::Int(0x8))),
+        // -- X509_V_OK / X509_V_ERR_* (x509_vfy.h), in header order 0..65.
+        "x509vOK" => |_c, _a| Ok(Some(Value::Int(0))),
+        "x509vErrUnspecified" => |_c, _a| Ok(Some(Value::Int(1))),
+        "x509vErrUnableToGetIssuerCert" => |_c, _a| Ok(Some(Value::Int(2))),
+        "x509vErrUnableToGetCrl" => |_c, _a| Ok(Some(Value::Int(3))),
+        "x509vErrUnableToDecryptCertSignature" => |_c, _a| Ok(Some(Value::Int(4))),
+        "x509vErrUnableToDecryptCrlSignature" => |_c, _a| Ok(Some(Value::Int(5))),
+        "x509vErrUnableToDecodeIssuerPublicKey" => |_c, _a| Ok(Some(Value::Int(6))),
+        "x509vErrCertSignatureFailure" => |_c, _a| Ok(Some(Value::Int(7))),
+        "x509vErrCrlSignatureFailure" => |_c, _a| Ok(Some(Value::Int(8))),
+        "x509vErrCertNotYetValid" => |_c, _a| Ok(Some(Value::Int(9))),
+        "x509vErrCertHasExpired" => |_c, _a| Ok(Some(Value::Int(10))),
+        "x509vErrCrlNotYetValid" => |_c, _a| Ok(Some(Value::Int(11))),
+        "x509vErrCrlHasExpired" => |_c, _a| Ok(Some(Value::Int(12))),
+        "x509vErrErrorInCertNotBeforeField" => |_c, _a| Ok(Some(Value::Int(13))),
+        "x509vErrErrorInCertNotAfterField" => |_c, _a| Ok(Some(Value::Int(14))),
+        "x509vErrErrorInCrlLastUpdateField" => |_c, _a| Ok(Some(Value::Int(15))),
+        "x509vErrErrorInCrlNextUpdateField" => |_c, _a| Ok(Some(Value::Int(16))),
+        "x509vErrOutOfMem" => |_c, _a| Ok(Some(Value::Int(17))),
+        "x509vErrDepthZeroSelfSignedCert" => |_c, _a| Ok(Some(Value::Int(18))),
+        "x509vErrSelfSignedCertInChain" => |_c, _a| Ok(Some(Value::Int(19))),
+        "x509vErrUnableToGetIssuerCertLocally" => |_c, _a| Ok(Some(Value::Int(20))),
+        "x509vErrUnableToVerifyLeafSignature" => |_c, _a| Ok(Some(Value::Int(21))),
+        "x509vErrCertChainTooLong" => |_c, _a| Ok(Some(Value::Int(22))),
+        "x509vErrCertRevoked" => |_c, _a| Ok(Some(Value::Int(23))),
+        "x509vErrInvalidCa" => |_c, _a| Ok(Some(Value::Int(24))),
+        "x509vErrPathLengthExceeded" => |_c, _a| Ok(Some(Value::Int(25))),
+        "x509vErrInvalidPurpose" => |_c, _a| Ok(Some(Value::Int(26))),
+        "x509vErrCertUntrusted" => |_c, _a| Ok(Some(Value::Int(27))),
+        "x509vErrCertRejected" => |_c, _a| Ok(Some(Value::Int(28))),
+        "x509vErrSubjectIssuerMismatch" => |_c, _a| Ok(Some(Value::Int(29))),
+        "x509vErrAkidSkidMismatch" => |_c, _a| Ok(Some(Value::Int(30))),
+        "x509vErrAkidIssuerSerialMismatch" => |_c, _a| Ok(Some(Value::Int(31))),
+        "x509vErrKeyUsageNoCertSign" => |_c, _a| Ok(Some(Value::Int(32))),
+        "x509vErrUnableToGetCrlIssuer" => |_c, _a| Ok(Some(Value::Int(33))),
+        "x509vErrUnhandledCriticalExtension" => |_c, _a| Ok(Some(Value::Int(34))),
+        "x509vErrKeyUsageNoCrlSign" => |_c, _a| Ok(Some(Value::Int(35))),
+        "x509vErrUnhandledCriticalCrlExtension" => |_c, _a| Ok(Some(Value::Int(36))),
+        "x509vErrInvalidNonCa" => |_c, _a| Ok(Some(Value::Int(37))),
+        "x509vErrProxyPathLengthExceeded" => |_c, _a| Ok(Some(Value::Int(38))),
+        "x509vErrKeyUsageNoDigitalSignature" => |_c, _a| Ok(Some(Value::Int(39))),
+        "x509vErrProxyCertificatesNotAllowed" => |_c, _a| Ok(Some(Value::Int(40))),
+        "x509vErrInvalidExtension" => |_c, _a| Ok(Some(Value::Int(41))),
+        "x509vErrInvalidPolicyExtension" => |_c, _a| Ok(Some(Value::Int(42))),
+        "x509vErrNoExplicitPolicy" => |_c, _a| Ok(Some(Value::Int(43))),
+        // tcnative's own spelling of X509_V_ERR_DIFFERENT_CRL_SCOPE.
+        "x509vErrDifferntCrlScope" => |_c, _a| Ok(Some(Value::Int(44))),
+        "x509vErrUnsupportedExtensionFeature" => |_c, _a| Ok(Some(Value::Int(45))),
+        "x509vErrUnnestedResource" => |_c, _a| Ok(Some(Value::Int(46))),
+        "x509vErrPermittedViolation" => |_c, _a| Ok(Some(Value::Int(47))),
+        "x509vErrExcludedViolation" => |_c, _a| Ok(Some(Value::Int(48))),
+        "x509vErrSubtreeMinMax" => |_c, _a| Ok(Some(Value::Int(49))),
+        "x509vErrApplicationVerification" => |_c, _a| Ok(Some(Value::Int(50))),
+        "x509vErrUnsupportedConstraintType" => |_c, _a| Ok(Some(Value::Int(51))),
+        "x509vErrUnsupportedConstraintSyntax" => |_c, _a| Ok(Some(Value::Int(52))),
+        "x509vErrUnsupportedNameSyntax" => |_c, _a| Ok(Some(Value::Int(53))),
+        "x509vErrCrlPathValidationError" => |_c, _a| Ok(Some(Value::Int(54))),
+        "x509vErrPathLoop" => |_c, _a| Ok(Some(Value::Int(55))),
+        "x509vErrSuiteBInvalidVersion" => |_c, _a| Ok(Some(Value::Int(56))),
+        "x509vErrSuiteBInvalidAlgorithm" => |_c, _a| Ok(Some(Value::Int(57))),
+        "x509vErrSuiteBInvalidCurve" => |_c, _a| Ok(Some(Value::Int(58))),
+        "x509vErrSuiteBInvalidSignatureAlgorithm" => |_c, _a| Ok(Some(Value::Int(59))),
+        "x509vErrSuiteBLosNotAllowed" => |_c, _a| Ok(Some(Value::Int(60))),
+        "x509vErrSuiteBCannotSignP384WithP256" => |_c, _a| Ok(Some(Value::Int(61))),
+        "x509vErrHostnameMismatch" => |_c, _a| Ok(Some(Value::Int(62))),
+        "x509vErrEmailMismatch" => |_c, _a| Ok(Some(Value::Int(63))),
+        "x509vErrIpAddressMismatch" => |_c, _a| Ok(Some(Value::Int(64))),
+        "x509vErrDaneNoMatch" => |_c, _a| Ok(Some(Value::Int(65))),
+        // Unknown name: X509_V_ERR_APPLICATION_VERIFICATION is OpenSSL's
+        // catch-all "verification failed for an unnamed reason".
+        _ => |_c, _a| Ok(Some(Value::Int(50))),
+    };
+    r.register(class, name, "()I", cb);
 }

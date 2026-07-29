@@ -3121,9 +3121,13 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
         |ctx, args| {
             // Default: immediately call onSubscribe then onComplete
             if let Some(Value::Object(Some(subscriber))) = args.get(1) {
+                // 2-field layout, matching phase 60 / SubmissionPublisher.subscribe:
+                // 0 = cancelled flag, 1 = accumulated demand (Long). The second
+                // slot is what makes `request(n)` above observable.
                 let sub =
-                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 1);
+                    alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
                 ctx.set_field(sub, 0, Value::Int(0)); // cancelled flag
+                ctx.set_field(sub, 1, Value::Long(0)); // demand
                 let _ = ctx.invoke_virtual(
                     *subscriber,
                     "onSubscribe",
@@ -3137,14 +3141,45 @@ pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry
     );
 
     let flow_sub = "java/util/concurrent/Flow$Subscription";
-    // SUPERSEDED — do not "fix" this in place. `streams::register_stream_overrides`
-    // is called from lib.rs IMMEDIATELY after `register_concurrent_natives`
-    // (in both run modes) precisely to replace this no-op with
-    // `native_flow_request`, a real saturating-add demand counter; a unit test
-    // (`register_stream_overrides_installs_flow_subscription_request`) asserts
-    // that override is installed. The no-op below never runs. It is kept so the
-    // triple exists even if a caller registers only this module.
-    registry.register(flow_sub, "request", "(J)V", |_ctx, _args| Ok(None));
+    // W4: the "SUPERSEDED, never runs" comment that used to sit here was WRONG
+    // for the default (real-JDK) build. `register_stream_overrides` only wins
+    // when it is registered LAST, and it is not: in real-JDK mode
+    // `vm_init.rs` calls `register_essential_natives_with_shims` (which reaches
+    // `register_stream_overrides` via `register_annotation_overrides`) and only
+    // THEN calls `register_concurrent_natives`, i.e. this module. So this
+    // registration is the live one in the default build; only in
+    // `--synthetic-jdk` mode does lib.rs order the stream overrides (and, later
+    // still, `register_p60_flow`) after it.
+    //
+    // Accumulate the demand for real instead of dropping it, using the same
+    // layout phase 60 uses and that `SubmissionPublisher.subscribe` allocates
+    // (field 0 = cancelled flag, field 1 = Long demand). Objects with fewer
+    // slots (older 1-field synthetic subscriptions) keep the no-op behaviour
+    // rather than writing out of bounds.
+    registry.register(flow_sub, "request", "(J)V", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let n = match args.get(1) {
+            Some(Value::Long(v)) => *v,
+            Some(Value::Int(v)) => *v as i64,
+            _ => 0,
+        };
+        // Reactive-streams: a non-positive request is a protocol error; with no
+        // subscriber reference to call `onError` on, ignore it (same choice as
+        // `streams::native_flow_request`).
+        if n <= 0 || ctx.object_num_fields(this) < 2 {
+            return Ok(None);
+        }
+        let cur = match ctx.get_field(this, 1) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        ctx.set_field(this, 1, Value::Long(cur.saturating_add(n)));
+        Ok(None)
+    });
     registry.register(flow_sub, "cancel", "()V", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
@@ -4332,40 +4367,6 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;",
         native_new_cached_pool,
     );
-    let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    registry.register(
-        exec,
-        "defaultThreadFactory",
-        "()Ljava/util/concurrent/ThreadFactory;",
-        |ctx, _args| {
-            let factory = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadFactory", 1);
-            ctx.set_field(factory, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(factory))))
-        },
-    );
-    registry.register(
-        tf,
-        "newThread",
-        "(Ljava/lang/Runnable;)Ljava/lang/Thread;",
-        |ctx, args| {
-            // BUG FIX (2026-07-10, ES executors-factory mainlock NPE, layer 2
-            // residual): this used to allocate a real-shaped Thread object via
-            // alloc_concurrent_synthetic and then poke 5 legacy synthetic
-            // slots — the exact same half-real pattern that made
-            // ThreadPoolExecutor's mainLock/ctl/workQueue null (see
-            // initialize_real_thread_pool_executor in phases_early.rs). A
-            // Thread built this way never runs the real constructor, so
-            // start()/start0() operate on an uninitialized `holder` and the
-            // worker never actually runs — real ThreadPoolExecutor.execute()
-            // silently never executes submitted tasks. Drive the real
-            // Thread(Runnable) constructor instead so start() works.
-            // See docs/known-issues/elasticsearch-suite/ES-FAIL-20260710-executors-factory-synthetic-mainlock-npe.md.
-            let runnable = args.get(1).copied().unwrap_or(Value::Object(None));
-            ctx.new_object_initialized("java/lang/Thread", "(Ljava/lang/Runnable;)V", &[runnable])
-        },
-    );
-    registry.set_category(__prev_cat);
 
     // ExecutorService methods
     registry.register(
@@ -5625,6 +5626,9 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sl, "tryOptimisticRead", "()J", native_stamped_optimistic);
     registry.register(sl, "unlockRead", "(J)V", native_stamped_unlock_read);
     registry.register(sl, "unlockWrite", "(J)V", native_stamped_unlock_write);
+    // See `native_stamped_unlock_by_stamp` — ported from the phase-62
+    // imitation so that block can be deleted without losing `unlock(J)V`.
+    registry.register(sl, "unlock", "(J)V", native_stamped_unlock_by_stamp);
     registry.register(
         sl,
         "unstampedUnlockRead",
@@ -5781,6 +5785,9 @@ fn native_stamped_write_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let stamp = crate::stamped_lock::stamped_write_lock(addr);
     ctx.end_blocking_region();
     mirror_stamped_state(ctx, obj, addr);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
+        eprintln!("[SL-DBG] writeLock addr={addr:#x} stamp={stamp}");
+    }
     Ok(Some(Value::Long(stamp)))
 }
 
@@ -5949,6 +5956,63 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
     Ok(None)
 }
 
+/// `StampedLock.unlock(long stamp)` — the stamp-dispatching release.
+///
+/// Added 2026-07-28. `unlock(J)V` was the one method of the real
+/// `StampedLock` surface that NO registrar provided — it threw
+/// `NoSuchMethodError` in both run modes. Added here alongside disabling
+/// `native-collections`' rival StampedLock block (see the comment at its
+/// call site), which was silently destroying mutual exclusion.
+///
+/// For anyone tracing history: `register_p62_stamped_lock` in
+/// `phases_late/concurrent.rs` looks like the culprit and is NOT — it is
+/// dead code, never called from anywhere in the tree. The live shadower was
+/// `native-collections`, which wins by running after `register_builtins`.
+///
+/// Spec: release whichever mode the stamp represents, and throw
+/// `IllegalMonitorStateException` if the stamp does not match the lock's
+/// current state. Our backend encodes a write hold as the low bit of the
+/// stamp (`STAMPED_ORIGIN` is even), so an odd stamp is a write stamp and
+/// an even non-zero stamp is a read stamp — mirroring the JDK's own
+/// `WBIT` test without depending on the JDK's exact bit layout.
+fn native_stamped_unlock_by_stamp(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(obj) = stamped_obj(args) else {
+        return Ok(None);
+    };
+    let stamp = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        // The verifier guarantees a long here; anything else means the call
+        // did not come through `unlock(J)V`, so refuse rather than guess.
+        _ => {
+            return Err(RuntimeError::IllegalMonitorStateException {
+                message: "unlock: missing stamp argument".to_string(),
+            }
+            .into())
+        }
+    };
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let released = if stamp == 0 {
+        // Stamp 0 is the JDK's "acquisition failed" sentinel and can never
+        // name a held lock.
+        false
+    } else if stamp & 1 != 0 {
+        crate::stamped_lock::stamped_try_unstamped_unlock_write(addr)
+    } else {
+        crate::stamped_lock::stamped_try_unstamped_unlock_read(addr)
+    };
+    if !released {
+        return Err(RuntimeError::IllegalMonitorStateException {
+            message: format!("unlock: stamp {stamp} does not hold this lock"),
+        }
+        .into());
+    }
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(None)
+}
+
 fn native_stamped_unstamped_unlock_read(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -6043,9 +6107,11 @@ fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(a) => a,
         None => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(i32::from(
-        crate::stamped_lock::stamped_is_write_locked(addr),
-    ))))
+    let held = crate::stamped_lock::stamped_is_write_locked(addr);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
+        eprintln!("[SL-DBG] isWriteLocked addr={addr:#x} held={held}");
+    }
+    Ok(Some(Value::Int(i32::from(held))))
 }
 
 fn native_stamped_is_read_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

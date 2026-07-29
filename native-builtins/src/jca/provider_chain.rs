@@ -73,8 +73,12 @@ const COVERAGE_SUN: &str =
 const COVERAGE_SUN_RSA_SIGN: &str = "coverage: KeyPairGenerator{RSA}, KeyFactory{RSA}, \
      Signature{SHA1withRSA,SHA256withRSA,SHA384withRSA,SHA512withRSA}";
 const COVERAGE_SUN_JCE: &str =
-    "coverage: Cipher{AES (ECB/CBC/GCM, PKCS5Padding/NoPadding)} via in-tree AES/GCM \
-     (see jca/cipher.rs); KeyFactory{EC}, Signature{SHA256withECDSA,SHA384withECDSA,Ed25519}";
+    "coverage: Cipher{AES,ChaCha20,RSA,PBE}, KeyFactory{ML-KEM} via direct native JCA routes";
+const COVERAGE_SUN_EC: &str =
+    "coverage: KeyFactory{EC,Ed25519,Ed448,X25519,X448}, Signature{ECDSA,EdDSA}";
+const COVERAGE_SUN_JSSE: &str = "coverage: Signature{MD5andSHA1withRSA}";
+const COVERAGE_SUN_MSCAPI: &str =
+    "coverage: Cipher{RSA}, SecureRandom{Windows-PRNG}, Signature{RSA,ECDSA}";
 const USER_PROVIDER_COVERAGE: &str =
     "coverage: user-registered Provider — Service map (if any) supplied by caller";
 
@@ -94,14 +98,8 @@ fn provider_chain() -> &'static parking_lot::Mutex<Vec<(String, f64, &'static st
         parking_lot::Mutex::new(vec![
             ("SUN".to_string(), 25.0, COVERAGE_SUN),
             ("SunRsaSign".to_string(), 25.0, COVERAGE_SUN_RSA_SIGN),
-            // SunEC: the EC algorithm wiring lives in jca/signature.rs
-            // (ECDSA Signature, EC KeyFactory) but BouncyCastle's EC
-            // <clinit> shim above no-ops EC mapping under WildFly; mark
-            // as unbacked at the provider level since
-            // `getService("KeyPairGenerator","EC")` on the SunEC Provider
-            // returns null (entries land under "BC" only).
-            ("SunEC".to_string(), 25.0, COVERAGE_UNBACKED),
-            ("SunJSSE".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunEC".to_string(), 25.0, COVERAGE_SUN_EC),
+            ("SunJSSE".to_string(), 25.0, COVERAGE_SUN_JSSE),
             ("SunJCE".to_string(), 25.0, COVERAGE_SUN_JCE),
             ("SunJGSS".to_string(), 25.0, COVERAGE_UNBACKED),
             ("SunSASL".to_string(), 25.0, COVERAGE_UNBACKED),
@@ -109,7 +107,7 @@ fn provider_chain() -> &'static parking_lot::Mutex<Vec<(String, f64, &'static st
             ("SunPCSC".to_string(), 25.0, COVERAGE_UNBACKED),
             ("JdkLDAP".to_string(), 25.0, COVERAGE_UNBACKED),
             ("JdkSASL".to_string(), 25.0, COVERAGE_UNBACKED),
-            ("SunMSCAPI".to_string(), 25.0, COVERAGE_UNBACKED),
+            ("SunMSCAPI".to_string(), 25.0, COVERAGE_SUN_MSCAPI),
             ("SunPKCS11".to_string(), 25.0, COVERAGE_UNBACKED),
         ])
     })
@@ -1040,6 +1038,72 @@ fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
         .insert((type_n, algo_n), entry);
 }
 
+/// Seed ownership data for the direct-native KeyFactory, Signature,
+/// SecureRandom, and Cipher routes. These routes bypass GetInstance but must
+/// make the same provider-service decision as the JDK.
+fn seed_direct_native_engine_services() {
+    const SUN: &str = "SUN";
+    for algorithm in ["DSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
+        put_service(SUN, "KeyFactory", algorithm, "sun.security.provider.Native");
+    }
+    for algorithm in ["DRBG", "SHA1PRNG"] {
+        put_service(SUN, "SecureRandom", algorithm, "sun.security.provider.SecureRandom");
+    }
+    for algorithm in ["DSA", "SHA1withDSA", "SHA256withDSA", "ML-DSA", "ML-DSA-44", "ML-DSA-65", "ML-DSA-87"] {
+        put_service(SUN, "Signature", algorithm, "sun.security.provider.Native");
+    }
+    put_alias(SUN, "Signature", "DSS", "DSA");
+
+    const RSA: &str = "SunRsaSign";
+    for algorithm in ["RSA", "RSASSA-PSS"] {
+        put_service(RSA, "KeyFactory", algorithm, "sun.security.rsa.RSAKeyFactory");
+    }
+    for algorithm in [
+        "MD2withRSA", "MD5withRSA", "SHA1withRSA", "SHA224withRSA", "SHA256withRSA",
+        "SHA384withRSA", "SHA512withRSA", "SHA512/224withRSA", "SHA512/256withRSA",
+        "SHA3-224withRSA", "SHA3-256withRSA", "SHA3-384withRSA", "SHA3-512withRSA", "RSASSA-PSS",
+    ] {
+        put_service(RSA, "Signature", algorithm, "sun.security.rsa.RSASignature");
+    }
+
+    seed_sunec_services();
+    for algorithm in ["Ed25519", "Ed448", "EdDSA", "X25519", "X448", "XDH"] {
+        put_service("SunEC", "KeyFactory", algorithm, "sun.security.ec.Native");
+    }
+    for algorithm in ["Ed25519", "Ed448", "EdDSA"] {
+        put_service("SunEC", "Signature", algorithm, "sun.security.ec.Native");
+    }
+
+    const JCE: &str = "SunJCE";
+    // The generic Cipher.AES service owns standard AES transformations; the
+    // Cipher native separately rejects unsupported transformations such as CCM.
+    for algorithm in [
+        "AES", "AES/GCM/NoPadding", "AES/KW/NoPadding", "AES/KW/PKCS5Padding", "AES/KWP/NoPadding",
+        "ChaCha20", "ChaCha20-Poly1305", "RSA", "PBEWithHmacSHA1AndAES_128",
+        "PBEWithHmacSHA1AndAES_256", "PBEWithHmacSHA256AndAES_128", "PBEWithHmacSHA256AndAES_256",
+    ] {
+        put_service(JCE, "Cipher", algorithm, "com.sun.crypto.provider.Native");
+    }
+    for algorithm in ["ML-KEM", "ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
+        put_service(JCE, "KeyFactory", algorithm, "com.sun.crypto.provider.ML_KEM_Impls$KF");
+    }
+    put_alias(JCE, "Cipher", "AESWrap", "AES/KW/NoPadding");
+
+    const MSCAPI: &str = "SunMSCAPI";
+    for algorithm in ["RSA", "RSA/ECB/PKCS1Padding"] {
+        put_service(MSCAPI, "Cipher", algorithm, "sun.security.mscapi.CRSACipher");
+    }
+    put_service(MSCAPI, "SecureRandom", "Windows-PRNG", "sun.security.mscapi.PRNG");
+    for algorithm in [
+        "MD2withRSA", "MD5withRSA", "NONEwithRSA", "RSASSA-PSS", "SHA1withRSA", "SHA256withRSA",
+        "SHA384withRSA", "SHA512withRSA", "SHA1withECDSA", "SHA224withECDSA", "SHA256withECDSA",
+        "SHA384withECDSA", "SHA512withECDSA",
+    ] {
+        put_service(MSCAPI, "Signature", algorithm, "sun.security.mscapi.CSignature");
+    }
+    put_service("SunJSSE", "Signature", "MD5andSHA1withRSA", "sun.security.ssl.RSASignature");
+}
+
 /// Real-JCA bring-up: seed the `SunEC` provider's EC service entries into the
 /// global service map.  SunEC registers these via `putService(Provider$Service)`
 /// (not the legacy `put`/`parseLegacyPut` we intercept), so constructing the
@@ -1494,7 +1558,7 @@ fn apply_legacy_put(provider: &str, key: &str, value: &str) -> bool {
 /// by `Provider.put` / `parseLegacyPut` to key the global service map.
 /// Falls back to `"<unknown>"` if the receiver has no name (which would
 /// only happen for synthetic test fixtures).
-fn provider_name_of(ctx: &dyn NativeContext, prov: ObjectRef) -> String {
+pub(crate) fn provider_name_of(ctx: &dyn NativeContext, prov: ObjectRef) -> String {
     if let Some((name, _)) = read_provider_name_version(ctx, prov) {
         if !name.is_empty() {
             return name;
@@ -2153,6 +2217,47 @@ pub(crate) fn check_named_provider_arg(
     Ok(())
 }
 
+/// Enforce provider ownership for direct-native JCA factories after the
+/// String-provider existence check. Provider-object overloads use the same
+/// service table but need not be installed in `Security`.
+pub(crate) fn check_provider_ownership(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    provider_idx: usize,
+    engine: &str,
+    algorithm: &str,
+    wording: ProviderArgWording,
+) -> Result<(), MethodCallFailed> {
+    let Some(Value::Object(Some(provider_arg))) = args.get(provider_idx) else {
+        return Ok(());
+    };
+    let is_string = ctx
+        .class_name_of_id(ctx.class_id_of_object(*provider_arg))
+        .is_some_and(|n| n == "java/lang/String");
+    let provider = if is_string {
+        ctx.read_string(*provider_arg).unwrap_or_default()
+    } else {
+        provider_name_of(ctx, *provider_arg)
+    };
+    if provider.is_empty() || provider == "<unknown>" {
+        return Ok(());
+    }
+    let owned = get_service_entry(&provider, engine, algorithm).is_some()
+        || (normalize_engine(engine) == "CIPHER"
+            && algorithm
+                .split('/')
+                .next()
+                .is_some_and(|base| get_service_entry(&provider, engine, base).is_some()));
+    if owned {
+        return Ok(());
+    }
+    let message = match wording {
+        ProviderArgWording::Shared => format!("no such algorithm: {algorithm} for provider {provider}"),
+        ProviderArgWording::Cipher => format!("No such algorithm: {algorithm}"),
+    };
+    Err(throw_no_such_algorithm(ctx, &message))
+}
+
 fn throw_missing_provider(
     ctx: &mut dyn NativeContext,
     wording: ProviderArgWording,
@@ -2607,6 +2712,7 @@ fn reset_service_state_for_tests() -> std::sync::MutexGuard<'static, ()> {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn register(r: &mut NativeMethodRegistry) {
+    seed_direct_native_engine_services();
     let prov = "java/security/Provider";
     r.register(prov, "getName", "()Ljava/lang/String;", provider_get_name);
     r.register(prov, "getVersion", "()D", provider_get_version);
@@ -2871,16 +2977,24 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         provider_get_property,
     );
     // KEEP (correct constant, not a stub): this reports a CAPABILITY, not a
-    // security decision — nothing is bypassed by answering it. CratonVM has no
-    // JFR security-event subsystem, so "security logging is off" is the true
-    // answer, and the real JDK returns the same `false` whenever the JFR
-    // security events are not enabled.
-    // jdk.internal.event.EventHelper.isLoggingSecurity() — JFR security-event
+    // security decision — nothing is bypassed by answering it.
+    //
+    // jdk.internal.event.EventHelper.isLoggingSecurity() — the security-event
     // logging gate. Its real body dereferences the static `JUJA`
     // (`SharedSecrets.getJavaUtilJarAccess()`), which is null in our VM, so it
     // NPEs ("Cannot invoke isInitializing on null") on the
     // CertificateFactory.generateCertificate -> JCAUtil.tryCommitCertEvent
-    // path. We don't emit JFR security events, so report logging-off (false).
+    // path.
+    //
+    // VERIFIED against jdk-25 bytecode (`javap -c jdk.internal.event
+    // .EventHelper`): the real body lazily installs `System.getLogger(
+    // "jdk.event.security")` and stores `logger.isLoggable(LOG_LEVEL)` — i.e.
+    // it is a readout of whether DEBUG logging is enabled for that one logger
+    // name, which on a stock JDK with no logging configuration is FALSE. So
+    // `false` is both the real JDK's default answer and factually true here
+    // (CratonVM emits no security events at all). Answering `true` would be
+    // actively harmful: the caller would then go on to `logSecurityEvent`,
+    // straight back into the same null `JUJA`.
     r.register(
         "jdk/internal/event/EventHelper",
         "isLoggingSecurity",
@@ -2957,21 +3071,15 @@ mod tests {
 
     #[test]
     fn c19_seed_chain_marks_unbacked_providers() {
-        // The placeholder providers (SunPKCS11, SunMSCAPI, SunPCSC,
-        // JdkLDAP, JdkSASL, SunJGSS, SunSASL, XMLDSig, SunJSSE, SunEC)
-        // must all expose `COVERAGE_UNBACKED`. SUN, SunRsaSign, SunJCE
-        // expose backed-coverage strings.
+        // Only providers with no registered service surface stay placeholders.
         for unbacked in [
             "SunPKCS11",
-            "SunMSCAPI",
             "SunPCSC",
             "JdkLDAP",
             "JdkSASL",
             "SunJGSS",
             "SunSASL",
             "XMLDSig",
-            "SunJSSE",
-            "SunEC",
         ] {
             assert!(
                 is_unbacked_provider(unbacked),
@@ -2983,7 +3091,7 @@ mod tests {
                 "{unbacked} coverage string must be the canonical unbacked-disclosure constant"
             );
         }
-        for backed in ["SUN", "SunRsaSign", "SunJCE"] {
+        for backed in ["SUN", "SunRsaSign", "SunJCE", "SunEC", "SunJSSE", "SunMSCAPI"] {
             assert!(
                 !is_unbacked_provider(backed),
                 "{backed} backs at least one algorithm and must not be flagged unbacked"
@@ -3306,6 +3414,19 @@ mod tests {
         assert!(get_service_entry("BC", "CIPHER", "AES/GCM/nopadding").is_some());
         // Wrong provider name does NOT hit (provider names are stable).
         assert!(get_service_entry("SUN", "Cipher", "AES/GCM/NoPadding").is_none());
+    }
+
+    #[test]
+    fn direct_native_engine_seed_tracks_real_provider_ownership() {
+        let _lock = reset_service_state_for_tests();
+        seed_direct_native_engine_services();
+        assert!(get_service_entry("SunRsaSign", "KeyFactory", "RSA").is_some());
+        assert!(get_service_entry("SUN", "KeyFactory", "RSA").is_none());
+        assert!(get_service_entry("SunRsaSign", "Signature", "SHA256withRSA").is_some());
+        assert!(get_service_entry("SUN", "SecureRandom", "SHA1PRNG").is_some());
+        assert!(get_service_entry("SunJCE", "Cipher", "AES").is_some());
+        assert!(get_service_entry("SUN", "Cipher", "AES").is_none());
+        assert!(get_service_entry("SunJCE", "Cipher", "AESWrap").is_some());
     }
 
     #[test]
