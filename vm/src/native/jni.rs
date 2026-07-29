@@ -683,7 +683,7 @@ static AIO_DISPATCH_SHUTDOWN: std::sync::atomic::AtomicBool =
 /// `WsRemoteEndpointImplClient.doWrite()`, which blocks on a *Future-form*
 /// `AsynchronousSocketChannel.write(...).get(timeout)` — all still on the
 /// single `cratonvm-aio-dispatch` thread. See
-/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md section 5.8 for the
+/// CRATONVM-SPRING-GENUINE-BUGLIST section 5.8 for the
 /// full trace that root-caused this (Spring's `WebSocketIntegrationTests`,
 /// `TomcatWebSocketClient` parameterization).
 ///
@@ -698,7 +698,7 @@ static AIO_DISPATCH_SHUTDOWN: std::sync::atomic::AtomicBool =
 /// residual occurrences across repeated runs (going as high as 32 did not
 /// reliably improve on 16 further, suggesting the small remaining flake rate
 /// is dominated by host scheduling noise rather than pool size — see
-/// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md section 5.8). Sized
+/// CRATONVM-SPRING-GENUINE-BUGLIST section 5.8). Sized
 /// off CPU count with that floor, matching both real JDK's own approach and
 /// the sizing convention already used for `native-io`'s AIO worker pool
 /// (`async_socket.rs::start_pool`).
@@ -928,7 +928,7 @@ impl ForeignCallGuard {
         // transitively — e.g. `ThreadLocal.get()`'s inherited-value drain)
         // handed back the stale pre-move address. That is the confirmed root
         // cause of the `cratonvm-aio-dispatch-N` "arbitrary call site" SIGSEGV
-        // class (Result 3, docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md
+        // class (Result 3, CRATONVM-SPRING-GENUINE-BUGLIST
         // 5.8 follow-up #2) — reproduced live with
         // `CRATONVM_DBG_STALE_OBJREF=1`: `current_thread_object` ->
         // `identity_hash_code` -> `get_header` panics "stale ObjectRef ...
@@ -999,7 +999,7 @@ impl Drop for ForeignCallGuard {
             // an array-bounds check, ...). That is the "essentially arbitrary
             // native/interpreter call site" `cratonvm-aio-dispatch-N` SIGSEGV
             // class documented as Result 3 in
-            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's 5.8
+            // CRATONVM-SPRING-GENUINE-BUGLIST's 5.8
             // follow-up #2 — confirmed live via `CRATONVM_DBG_STALE_OBJREF=1`,
             // which turns the segfault into a clean panic naming
             // `current_thread_object` -> `identity_hash_code` -> `get_header`

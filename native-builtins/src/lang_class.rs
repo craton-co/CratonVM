@@ -8051,8 +8051,8 @@ pub(crate) fn native_class_get_declared_methods(
             // `MethodGraph.Compiler`, used by Mockito's inline mock maker)
             // answers differently on CratonVM for
             // `AbstractStringBuilder.substring(int)` on a mocked
-            // `StringBuilder` (see docs/known-issues/
-            // CRATONVM-SPRING-GENUINE-BUGLIST.md's MockitoBeanByTypeLookup
+            // `StringBuilder` (see 
+            // CRATONVM-SPRING-GENUINE-BUGLIST's MockitoBeanByTypeLookup
             // entry). Landing this alone does NOT flip that specific
             // `isOverridden` answer -- confirmed by direct A/B: calling
             // Mockito's own `compiler.compile(...)` externally with this fix
@@ -13380,10 +13380,19 @@ pub(crate) fn native_class_get_type_parameters(
         // `AbstractInstantBasedTimeValidator`). Reuse the cached object when
         // one already exists for (this, tp.name); only build+cache a new one
         // on first request.
-        let tv = crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
-            .unwrap_or_else(|| {
-                crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
-            });
+        // A cached entry that is still a PLACEHOLDER - an `Object`-bounded
+        // stand-in published while an EARLIER parameter's bound referenced this
+        // one (`<T extends Thing<S>, S extends Something>`) - is not the
+        // finished parameter. Fall through to `type_param_to_java`, which
+        // repairs that same object in place rather than allocating a new one.
+        let cached = if crate::generics::is_placeholder_type_parameter(ctx, this, &tp.name) {
+            None
+        } else {
+            crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
+        };
+        let tv = cached.unwrap_or_else(|| {
+            crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
+        });
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }

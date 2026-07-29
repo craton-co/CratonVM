@@ -1948,6 +1948,40 @@ impl GenerationalHeap {
         v
     }
 
+    /// Lock-free `[min_base, max_end)` envelope over every arena this heap
+    /// can hold an object in (young-from, young-to, old-gen).
+    ///
+    /// Conservative stack scanning tests one word at a time and the
+    /// overwhelming majority of those words are not heap addresses at all.
+    /// [`Self::is_object_address`] already rejects them, but only after an
+    /// out-of-line call through [`crate::vm_heap::VmHeap`]'s backend dispatch
+    /// and three pairs of `Acquire` loads. Hoisting this envelope out of the
+    /// scan loop lets the caller reject those words with a single compare,
+    /// calling the full validator only for words that could plausibly be
+    /// object headers. Returns `None` when no arena is published yet, which
+    /// callers must read as "no fast filter available" (scan everything).
+    ///
+    /// Only valid while the bounds are stable — they are republished under
+    /// STW at GC start/end, which is exactly when no scan is in flight.
+    pub fn conservative_addr_span(&self) -> Option<(usize, usize)> {
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for (base, end) in self.region_bounds.iter() {
+            let b = base.load(Ordering::Acquire);
+            let e = end.load(Ordering::Acquire);
+            if b == 0 || e <= b {
+                continue;
+            }
+            lo = lo.min(b);
+            hi = hi.max(e);
+        }
+        if hi > lo {
+            Some((lo, hi))
+        } else {
+            None
+        }
+    }
+
     pub fn is_object_address(&self, addr: usize) -> Option<ObjectRef> {
         // Reject obvious garbage.
         if addr == 0 {
