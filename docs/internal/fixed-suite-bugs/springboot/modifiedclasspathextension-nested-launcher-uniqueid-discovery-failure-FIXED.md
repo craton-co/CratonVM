@@ -224,20 +224,20 @@ passing end to end:
 ## Verified
 
 Using release binary
-`cratonvm-modcp-nested-20260728-019fa9e4.exe` and the real-JDK Spring Boot
-fixture, every documented affected class passed in both execution modes:
+`cratonvm-modcp-nested-20260728-019fa9e4.exe` and a rebuilt real-JDK Spring
+Boot fixture, every documented affected class passed in both execution modes:
 
 | Mode | Classes | Tests | Failed | Aborted |
 |---|---:|---:|---:|---:|
-| `--nojit` | 13/13 | 50 | 0 | 0 |
-| JIT | 13/13 | 50 | 0 | 0 |
+| `--nojit` | 13/13 | 52 | 0 | 0 |
+| JIT | 13/13 | 52 | 0 | 0 |
 
 Authoritative runner summaries:
 
-- `full-affected-singleton-nojit-20260728-019fa9e4`: 13 PASS, 910.150 summed
-  class seconds.
-- `full-affected-singleton-jit-20260728-019fa9e4`: 13 PASS, 842.283 summed
-  class seconds.
+- `finaltip-full-nojit-20260728-019fa9e4`: 13 PASS, 523.081 summed class
+  seconds.
+- `finaltip-full-jit-20260728-019fa9e4`: 13 PASS, 523.623 summed class
+  seconds.
 
 This includes `EhCache3CacheAutoConfigurationTests` (2/2 in both modes) and
 the full `HikariDataSourceConfigurationTests` class (13/13 in both modes),
