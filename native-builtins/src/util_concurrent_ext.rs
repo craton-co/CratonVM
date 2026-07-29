@@ -4623,6 +4623,39 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
 /// `ForkJoinTask.fork/invoke/submit(ForkJoinTask)` compute path stays
 /// eager-inline (CPU-bound, must not spawn threads). If the pool can't be
 /// created we fall back to inline so the completion contract still holds.
+static ASYNC_FUTURE_ROOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn track_async_future(ctx: &mut dyn NativeContext, future: ObjectRef) {
+    let handle = ctx.add_global_root(future);
+    if handle != 0 {
+        ASYNC_FUTURE_ROOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+    }
+}
+
+pub(crate) fn async_tasks_quiescent(ctx: &mut dyn NativeContext) -> bool {
+    let mut roots = ASYNC_FUTURE_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = false;
+    roots.retain(|handle| {
+        let done = ctx.resolve_global_root(*handle).and_then(|future| {
+            match ctx.invoke_virtual(future, "isDone", "()Z", &[]) {
+                Ok(Some(Value::Int(done))) => Some(done != 0),
+                _ => None,
+            }
+        });
+        if done == Some(true) {
+            ctx.remove_global_root(*handle);
+            false
+        } else {
+            pending = true;
+            true
+        }
+    });
+    !pending
+}
+
 pub(crate) fn spawn_runnable_on_real_thread(
     ctx: &mut dyn NativeContext,
     runnable: ObjectRef,
@@ -4640,14 +4673,29 @@ pub(crate) fn spawn_runnable_on_real_thread(
         // execute() is the ForkJoinPool.execute contract we are emulating here;
         // avoid wrapping every CompletableFuture async task in a FutureTask.
         let runnable_cur = ctx.read_native_pin(pin, runnable);
+        let future = match ctx.new_object_initialized(
+            "java/util/concurrent/FutureTask",
+            "(Ljava/lang/Runnable;Ljava/lang/Object;)V",
+            &[Value::Object(Some(runnable_cur)), Value::Object(None)],
+        )? {
+            Some(Value::Object(Some(future))) => future,
+            _ => {
+                ctx.unpin_native_roots(pin);
+                return ctx.invoke_virtual(runnable_cur, "run", "()V", &[]);
+            }
+        };
+        let future_pin = ctx.pin_native_root(future);
         let submitted = ctx.invoke_virtual(
             pool,
             "execute",
             "(Ljava/lang/Runnable;)V",
-            &[Value::Object(Some(runnable_cur))],
+            &[Value::Object(Some(ctx.read_native_pin(future_pin, future)))],
         );
+        let future = ctx.read_native_pin(future_pin, future);
+        ctx.unpin_native_roots(future_pin);
         ctx.unpin_native_roots(pin);
         submitted?;
+        track_async_future(ctx, future);
         let grace = async_submit_handoff_grace();
         if grace.is_zero() {
             std::thread::yield_now();
@@ -5149,7 +5197,8 @@ pub(crate) fn transition_real_executor_to_shutdown(
         // worker in the middle of a task must be allowed to finish it. See
         // `interrupt_executor_workers_filtered`.
         let executor = ctx.read_native_pin(executor_pin, executor);
-        let _ = crate::interrupt_executor_workers_filtered(ctx, executor, /* only_idle */ true);
+        let _ =
+            crate::interrupt_executor_workers_filtered(ctx, executor, /* only_idle */ true);
         // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue.
         // Its real `onShutdown()` removes cancelled delayed tasks (including
         // JUnit's cancelled timeout watchdog); without it, the queue stays
@@ -5307,8 +5356,7 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // algorithm intact while placing that one scalar state word in an AtomicI64.
 // The side table is keyed with the same moving-GC-stable identity protocol as
 // the other native lock state tables.
-fn aqls_state_table(
-) -> &'static parking_lot::Mutex<
+fn aqls_state_table() -> &'static parking_lot::Mutex<
     std::collections::HashMap<usize, std::sync::Arc<std::sync::atomic::AtomicI64>>,
 > {
     static TABLE: std::sync::OnceLock<
@@ -5338,8 +5386,7 @@ fn native_aqls_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let Some(Value::Object(Some(synchronizer))) = args.first() else {
         return Ok(Some(Value::Long(0)));
     };
-    let state = aqls_state_slot(ctx, *synchronizer)
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let state = aqls_state_slot(ctx, *synchronizer).load(std::sync::atomic::Ordering::SeqCst);
     Ok(Some(Value::Long(state)))
 }
 
@@ -6014,10 +6061,7 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// stamp (`STAMPED_ORIGIN` is even), so an odd stamp is a write stamp and
 /// an even non-zero stamp is a read stamp — mirroring the JDK's own
 /// `WBIT` test without depending on the JDK's exact bit layout.
-fn native_stamped_unlock_by_stamp(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(obj) = stamped_obj(args) else {
         return Ok(None);
     };
@@ -8053,10 +8097,13 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod concurrency_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn make_ctx() -> MockNativeContext {
         MockNativeContext::new()

@@ -2861,6 +2861,9 @@ impl SharedVm {
                 missing_natives_log: parking_lot::Mutex::new(Vec::new()),
                 flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
                 jfr_dump_on_exit: parking_lot::Mutex::new(None),
+                jfr_java_recording: parking_lot::Mutex::new(None),
+                jfr_java_recording_running: std::sync::atomic::AtomicBool::new(false),
+                jfr_java_output: parking_lot::Mutex::new(None),
                 jcmd_processor: parking_lot::Mutex::new(None),
                 #[cfg(feature = "experimental-debug")]
                 debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
