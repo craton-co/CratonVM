@@ -3402,6 +3402,13 @@ fn tlab_alloc_array(
 }
 
 /// Try to allocate an array, running GC and retrying on failure.
+///
+/// `try_alloc_array_full` is deliberately used rather than the young-only
+/// `try_alloc_array`: it has the same young-first policy, but once a
+/// non-moving JIT-safe sweep has left the young generation fragmented it can
+/// spill the request into old space.  This matches `alloc_object_shared`'s
+/// object path.  Retrying young-only here used to report OOM for a tiny array
+/// while most of the heap was available as old-generation headroom.
 fn gc_alloc_array(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3415,7 +3422,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3435,7 +3442,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3446,7 +3453,7 @@ fn gc_alloc_array(
     shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
         .ok_or_else(|| {
             maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {

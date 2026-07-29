@@ -131,7 +131,7 @@ confirmation/regression notes added rather than re-filing); the remaining
 grounded in `javap` disassembly and direct CratonVM source reading:
 
 - [`basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md) — `String$CaseInsensitiveComparator.apply()` NoSuchMethodError → fatal `checkcast` internal error (CRASH)
-- [`origintrackedyamlloadertests-oom-3mb-parse-crash-20260728.md`](origintrackedyamlloadertests-oom-3mb-parse-crash-20260728.md) — genuine `OutOfMemoryError` parsing a 3MB+ YAML file, tiny (1026-element) failing allocation (CRASH)
+- **Retired 2026-07-29:** [`OriginTrackedYamlLoaderTests` OOM fix](../../internal/fixed-suite-bugs/springboot/origintrackedyamlloadertests-oom-3mb-parse-crash-20260728-FIXED.md) — interpreter array allocation now uses the established young-to-old spill path after a JIT-safe non-moving young sweep.
 - [`ipv6-getbyaddress-dual-registration-jetty-cluster-20260728.md`](ipv6-getbyaddress-dual-registration-jetty-cluster-20260728.md) — two competing `InetAddress.getByAddress(byte[])` native registrations, the wrong one wins and emits RFC-5952-compressed IPv6 strings
 - [`instanttodateconverter-generic-interface-resolution-cluster-20260728.md`](instanttodateconverter-generic-interface-resolution-cluster-20260728.md) — `Class.getGenericInterfaces()` loses generic type args for a class implementing one non-generic + one generic interface
 - [`reflective-aliasfor-mirror-mismatch-20260728.md`](reflective-aliasfor-mirror-mismatch-20260728.md) — `@Reflective`'s `value`/`processors` `@AliasFor` mirror pair disagree for the same annotation instance

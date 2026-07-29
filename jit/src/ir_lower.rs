@@ -2205,23 +2205,31 @@ impl<'a> Lowerer<'a> {
                 // stack-argument path — so an over-wide site falls through to
                 // the unchanged helper dispatch below. `lower_data_node` has no
                 // post-`match` code, so an early `return` fully handles the node.
-                if let Some(&(mic, pic)) = node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc)) {
-                    if mic != 0
-                        && pic != 0
-                        && self.invoke_virtual_mic != 0
-                        && num_args >= 1
-                        && num_args + 1 <= ENTRY_ABI_REGS.len()
-                    {
-                        self.emit_inline_cache_call(
-                            &node.inputs,
-                            slot,
-                            num_args,
-                            mic,
-                            pic,
-                            *info_ptr,
-                            node.ty,
-                        );
-                        return;
+                // The inline cascade, including its hashed megamorphic tail,
+                // calls compiled entries directly.  Keep it under the same
+                // master switch as the baseline backend: the opt-out must
+                // route every virtual call through the helper, not merely
+                // disable the MIC/PIC prefix while leaving the megamorphic
+                // raw-call stub reachable.
+                if crate::direct_jit_callee_calls_enabled() {
+                    if let Some(&(mic, pic)) = node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc)) {
+                        if mic != 0
+                            && pic != 0
+                            && self.invoke_virtual_mic != 0
+                            && num_args >= 1
+                            && num_args + 1 <= ENTRY_ABI_REGS.len()
+                        {
+                            self.emit_inline_cache_call(
+                                &node.inputs,
+                                slot,
+                                num_args,
+                                mic,
+                                pic,
+                                *info_ptr,
+                                node.ty,
+                            );
+                            return;
+                        }
                     }
                 }
                 // 1. Marshal each Java arg into the staging region.
