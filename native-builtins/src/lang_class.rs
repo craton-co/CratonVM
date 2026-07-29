@@ -4102,8 +4102,29 @@ pub(crate) fn coerce_arg_strict(
                                         let near_name = near
                                             .and_then(|n| ctx.class_name_of_id(n))
                                             .unwrap_or_default();
+                                        // The superclass chain is the actual
+                                        // evidence: a rejected value whose
+                                        // chain contains the expected NAME but
+                                        // under a different ClassId is a
+                                        // loader split, not a type error.
+                                        let mut chain = String::new();
+                                        let mut cur = Some(arg_cid);
+                                        let mut hops = 0;
+                                        while let Some(c) = cur {
+                                            if hops > 16 {
+                                                chain.push_str(" -> ...");
+                                                break;
+                                            }
+                                            hops += 1;
+                                            let n = ctx.class_name_of_id(c).unwrap_or_default();
+                                            chain.push_str(&format!(
+                                                " -> {n}(cid={c:?},loader={:?})",
+                                                ctx.loader_id_of_class(c)
+                                            ));
+                                            cur = ctx.superclass_of(c);
+                                        }
                                         eprintln!(
-                                            "[DBG_COERCE] {context}: rejecting -- expected={internal} (cid={expected_cid:?}, loader={:?}) arg_class={arg_name} (cid={arg_cid:?}, loader={:?}) near={near:?}/{near_name} (loader={:?})",
+                                            "[DBG_COERCE] {context}: rejecting -- expected={internal} (cid={expected_cid:?}, loader={:?}) arg_class={arg_name} (cid={arg_cid:?}, loader={:?}) near={near:?}/{near_name} (loader={:?}) chain:{chain}",
                                             ctx.loader_id_of_class(expected_cid),
                                             ctx.loader_id_of_class(arg_cid),
                                             near.map(|n| ctx.loader_id_of_class(n)),
@@ -8051,8 +8072,8 @@ pub(crate) fn native_class_get_declared_methods(
             // `MethodGraph.Compiler`, used by Mockito's inline mock maker)
             // answers differently on CratonVM for
             // `AbstractStringBuilder.substring(int)` on a mocked
-            // `StringBuilder` (see docs/known-issues/
-            // CRATONVM-SPRING-GENUINE-BUGLIST.md's MockitoBeanByTypeLookup
+            // `StringBuilder` (see 
+            // CRATONVM-SPRING-GENUINE-BUGLIST's MockitoBeanByTypeLookup
             // entry). Landing this alone does NOT flip that specific
             // `isOverridden` answer -- confirmed by direct A/B: calling
             // Mockito's own `compiler.compile(...)` externally with this fix
@@ -10483,6 +10504,26 @@ pub fn proxy_last_interfaces() -> Option<ObjectRef> {
 /// scan re-locks this cache вЂ” that would deadlock). On a concurrent first-build
 /// race the loser's proxy is dropped (still reachable from the caller's stack
 /// until the next GC), exactly as `OscCache` documents.
+/// Find the initiating loader that must resolve annotation member values for a
+/// declaring class.  Real-JDK class-definition hooks can omit a direct object
+/// record for generated Ehcache JAXB model classes; their sibling `ConfigType`
+/// in the same namespace retains the authoritative loader identity.
+fn annotation_container_loader(ctx: &mut dyn NativeContext, holder_class_id: ClassId) -> Option<ObjectRef> {
+    let holder_name = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
+    crate::classloader::defining_loader_for(holder_class_id.as_u32()).or_else(|| {
+        holder_name.starts_with("org/ehcache/xml/model/").then(|| {
+            ctx.class_id_by_name_near("org/ehcache/xml/model/ConfigType", holder_class_id)
+                .and_then(|sibling| crate::classloader::defining_loader_for(sibling.as_u32()))
+                .or_else(|| {
+                    let id = ctx.loader_id_of_class(holder_class_id);
+                    (id >= 3)
+                        .then(|| crate::classloader::loader_object_for_namespace_id(id as u32))
+                        .flatten()
+                })
+        }).flatten()
+    })
+}
+
 fn cached_annotation_proxy_for_key(
     ctx: &mut dyn NativeContext,
     holder_class_id: ClassId,
@@ -10502,11 +10543,11 @@ fn cached_annotation_proxy_for_key(
     // (e.g. Spring's OverridingClassLoader / FilteringClassLoader) yield a
     // deferred `TypeNotPresentException` for filtered types. `None` for built-in
     // loaders keeps the global resolution.
-    let container_loader = crate::classloader::defining_loader_for(holder_class_id.as_u32());
+    let holder_name = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
+    let container_loader = annotation_container_loader(ctx, holder_class_id);
     if crate::nbflags().iae_trace_ok {
-        let holder = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
         eprintln!(
-            "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
+            "ANN-HOLDER cid={} holder={holder_name} ann={} container_loader={}",
             holder_class_id.as_u32(),
             ann.type_descriptor,
             if container_loader.is_some() {
@@ -11322,6 +11363,10 @@ fn create_annotation_proxy(
         // delegates to the parent here, so it correctly reports the parent loader.
         // Falls back to the global store for built-in loaders / on any loader
         // failure (preserving the prior best-effort behavior).
+        // Resolve the annotation type through the declaring class's loader.
+        // ModifiedClassPathClassLoader deliberately owns child copies of the
+        // JAXB API and runtime; matching HotSpot requires this exact identity,
+        // not its application-loader sibling.
         let via_loader = container_loader.and_then(|loader| {
             match resolve_annotation_class_via_loader(ctx, loader, class_name) {
                 Ok(mirror) => ctx.class_id_from_mirror(mirror).map(|cid| (cid, mirror)),
@@ -11452,6 +11497,7 @@ fn create_annotation_proxy(
                 ret_desc.as_deref(),
                 container_class_id,
                 container_loader,
+                ann_class_id_opt,
             );
         if crate::nbflags().iae_trace2 {
             let desc = match &java_val {
@@ -11528,7 +11574,7 @@ pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
 ) -> Value {
-    annotation_element_to_java_typed(ctx, val, None, None, None)
+    annotation_element_to_java_typed(ctx, val, None, None, None, None)
 }
 
 /// Preserve the declared array shape when the class-file annotation reader
@@ -11584,6 +11630,7 @@ pub(crate) fn annotation_element_to_java_typed(
     return_type_desc: Option<&str>,
     container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
+    annotation_class_id: Option<ClassId>,
 ) -> Value {
     use cratonvm_native_api::AnnotationElementValue;
     match val {
@@ -11674,12 +11721,25 @@ pub(crate) fn annotation_element_to_java_typed(
                     Err(_) => None,
                 }
             });
+            let annotation_scope = annotation_class_id.and_then(|annotation_class| {
+                ctx.class_id_by_name_near(class_name, annotation_class)
+            });
             // An application-loaded annotation can lack an ObjectRef for its
             // defining loader while its ClassId still carries the correct
             // namespace. Prefer that scoped lookup to the global table.
             let via_container_scope = container_class_id
                 .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
-            let enum_cid_opt = via_loader.or(via_container_scope).or_else(|| {
+            let enum_cid_opt = annotation_scope.or(via_loader).or(via_container_scope).or_else(|| {
+                // Resolve an annotation enum reference through the declaring
+                // member's initiating loader. A bare global lookup can miss an
+                // application dependency that is visible to that member (for
+                // example Mockito's `Mock$Strictness`) and can also lose the
+                // correct identity under an isolated loader.
+                container_class_id.and_then(|holder| {
+                    ctx.class_id_by_name_via_referencing_class(holder, class_name)
+                        .ok()
+                })
+            }).or_else(|| {
                 ctx.class_id_by_name(class_name).or_else(|| {
                     let _ = ctx.load_class(class_name);
                     ctx.class_id_by_name(class_name)
@@ -12093,6 +12153,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     elem_desc.as_deref(),
                     container_class_id,
                     container_loader,
+                    annotation_class_id,
                 );
                 arr = ctx.read_native_pin(arr_pin, arr);
                 if is_class_component && sentinel_index.is_none() {
@@ -12287,8 +12348,7 @@ fn build_annotation_array_for(
         .iter()
         .filter(|a| annotation_type_loadable_near(ctx, a, declaring_class_id))
         .collect();
-    let container_loader =
-        declaring_class_id.and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
+    let container_loader = declaring_class_id.and_then(|cid| annotation_container_loader(ctx, cid));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
         create_annotation_proxy(ctx, resolvable[i], declaring_class_id, container_loader)
@@ -12745,7 +12805,7 @@ fn class_annotations_by_type_impl(
     }
 
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
-    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
+    let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
         create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
@@ -12821,7 +12881,7 @@ pub(crate) fn native_method_get_annotations_by_type(
         directly_and_indirectly_present(&annotations, &target_desc, container_desc.as_deref());
 
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
-    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
+    let container_loader = annotation_container_loader(ctx, class_id);
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
         create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
@@ -12983,7 +13043,7 @@ pub(crate) fn native_field_get_annotation(
     };
     let target_desc = format!("L{};", ann_class_name);
     let annotations = ctx.field_annotations(class_id, &field_name);
-    let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
+    let container_loader = annotation_container_loader(ctx, class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
             let proxy = create_annotation_proxy(ctx, ann, Some(class_id), container_loader);
@@ -13380,10 +13440,19 @@ pub(crate) fn native_class_get_type_parameters(
         // `AbstractInstantBasedTimeValidator`). Reuse the cached object when
         // one already exists for (this, tp.name); only build+cache a new one
         // on first request.
-        let tv = crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
-            .unwrap_or_else(|| {
-                crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
-            });
+        // A cached entry that is still a PLACEHOLDER - an `Object`-bounded
+        // stand-in published while an EARLIER parameter's bound referenced this
+        // one (`<T extends Thing<S>, S extends Something>`) - is not the
+        // finished parameter. Fall through to `type_param_to_java`, which
+        // repairs that same object in place rather than allocating a new one.
+        let cached = if crate::generics::is_placeholder_type_parameter(ctx, this, &tp.name) {
+            None
+        } else {
+            crate::generics::cached_building_type_parameter(ctx, this, &tp.name)
+        };
+        let tv = cached.unwrap_or_else(|| {
+            crate::generics::type_param_to_java(ctx, tp, Value::Object(Some(this)))
+        });
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, tv);
     }

@@ -4394,7 +4394,13 @@ pub fn unsafe_arena_contains(addr: i64) -> bool {
 /// access (mirroring the `copyMemory` real-pointer path). Unlike
 /// [`unsafe_arena_contains`], this is true for freed handles too — it tests the
 /// tag, not liveness.
-pub(crate) fn unsafe_arena_addr_is_tagged(addr: i64) -> bool {
+///
+/// `pub` because the VM's `copy_from_native_memory` / `copy_to_native_memory`
+/// bridge classifies with THIS rather than with `unsafe_arena_contains`: the
+/// liveness test sends a freed handle down the raw-pointer branch, where it is
+/// dereferenced as an OS address. A tag test refuses it instead, and costs one
+/// AND rather than an `RwLock` read plus a `BTreeMap` range probe.
+pub fn unsafe_arena_addr_is_tagged(addr: i64) -> bool {
     addr & unsafe_arena::ARENA_TAG != 0
 }
 

@@ -1949,22 +1949,34 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
 
     // static native void unload0(String name, long handle)
     //
-    // No-op because CratonVM cannot do otherwise, NOT because the real body is
-    // empty — real `unload0` dlcloses/FreeLibrary's the handle. `NativeContext`
-    // exposes `load_native_library` and `find_native_symbol` and nothing else;
-    // the library table is append-only, so there is no index to release.
+    // IMPLEMENTED (was a no-op) via `NativeContext::unload_native_library`, the
+    // escalation this comment used to request. No new handle plumbing was
+    // needed: `load0` above stashes `lib_index + 1`, which is exactly what
+    // `RawNativeLibraryImpl.close()` hands back as `handle`, so the same `- 1`
+    // decode `findEntry0` uses recovers the index.
     //
-    // Staying resident is the safe direction of the two errors: a
-    // `RawNativeLibraries` handle can still back live function pointers
-    // (callers cache `findEntry0` results, and any bound downcall stub holds
-    // one), so unloading underneath them segfaults, while not unloading costs
-    // an address-space mapping.
+    // It is a LOGICAL unload, not a `dlclose`: the VM's library table is an
+    // append-only `Vec<Library>` whose index IS the handle, so an entry cannot
+    // be removed without renumbering every live handle. The VM implementation
+    // therefore tombstones the index — subsequent `find_native_symbol` calls on
+    // it fail, as they would against a closed handle — while leaving the mapping
+    // resident. Staying mapped is the safe direction of the two errors: a
+    // `RawNativeLibraries` handle can still back live function pointers (callers
+    // cache `findEntry0` results, and any bound downcall stub holds one), so
+    // unmapping underneath them segfaults, while not unmapping costs an
+    // address-space mapping.
     //
-    // ESCALATION: add `NativeContext::unload_native_library(lib_index: i64)`
-    // over the same table `load_native_library` appends to. The handle needs no
-    // new plumbing — `load0` above stashes `lib_index + 1`, which is exactly
-    // what `RawNativeLibraryImpl.close()` hands back as `handle`.
-    r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |_ctx, _args| {
+    // Real `unload0` returns void and reports nothing, so the `false` an
+    // implementation without an unload path returns is intentionally ignored.
+    r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |ctx, args| {
+        let handle = match args.get(1) {
+            Some(Value::Long(n)) => *n,
+            Some(Value::Int(n)) => *n as i64,
+            _ => 0,
+        };
+        // Undo the +1 offset applied by load0 to recover the library index; a
+        // handle of 0 ("not loaded") decodes to -1 and is refused.
+        let _unloaded = ctx.unload_native_library(handle - 1);
         Ok(None)
     });
 

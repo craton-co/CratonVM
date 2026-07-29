@@ -1274,23 +1274,49 @@ fn shadow_window_from_frame(
     if ss & 0x7 != 0 {
         return None;
     }
-    // SAFETY: `ss` addresses the `ShadowStack` embedded in the `JvmThread` this
-    // frame cached at entry; the thread outlives its own compiled frames.
-    let top = unsafe {
-        ((ss + cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET) as *const usize).read()
+    // `thread_ptr` came out of a raw frame slot and is trustworthy ONLY when
+    // `cm` really describes the frame at `rbp`. It does not always: an
+    // unguarded JIT->JIT call publishes the CALLEE's frame base into the chain
+    // entry (`chain_entry_rbp_is_foreign`), so `[rbp - shadow_thread_slot_off]`
+    // addresses an arbitrary word of a different frame -- a spilled `long`, a
+    // `Value` discriminant, an interior pointer. Non-zero and 8-aligned (all
+    // this used to require) is a bar such a word clears constantly, and the
+    // three reads below then dereference it. That is a real SIGSEGV, not a
+    // hypothetical: `ApplicationContextAotGeneratorTests
+    // .processAheadOfTimeWithPropertySource` faulted here on `addr=0xefc`
+    // roughly three minutes into every run, taking the whole class's `RESULT`
+    // line with it.
+    //
+    // Read `end` as well and require the exact `#[repr(C)]` invariant
+    // `ShadowStack::ensure_allocated` establishes and `set_top` maintains:
+    // three 8-aligned addresses with `base < end`, `end - base` EXACTLY the
+    // fixed buffer size, and `top` inside `[base, end]`. Garbage that
+    // satisfies all of that would have to be an actual shadow stack.
+    let read_word = |off: usize| -> Option<usize> {
+        let at = ss.checked_add(off)?;
+        // SAFETY: `ss` is the candidate `ShadowStack` address; the caller has
+        // no way to prove it is mapped, which is exactly what the checks below
+        // are for -- but the read itself must not fault. Reject anything that
+        // is not a plausible userspace address before dereferencing.
+        if at < 0x1_0000 || at & 0x7 != 0 {
+            return None;
+        }
+        Some(unsafe { (at as *const usize).read() })
     };
-    let base = unsafe {
-        ((ss + cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET) as *const usize).read()
-    };
-    // `base`/`top` address 8-byte slots in the thread's shadow buffer and the
-    // window can never exceed that buffer. An unaligned or oversized pair is a
-    // read of something that is not a `ShadowStack`, not a window to walk.
-    if base == 0
-        || base & 0x7 != 0
-        || top & 0x7 != 0
-        || top < base
-        || (top - base) / 8 > cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS
-    {
+    if thread_ptr < 0x1_0000 {
+        return None;
+    }
+    let top = read_word(cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET)?;
+    let end = read_word(cratonvm_gc::shadow_stack::ShadowStack::END_OFFSET)?;
+    let base = read_word(cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET)?;
+    const SHADOW_BYTES: usize = cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS * 8;
+    if base < 0x1_0000 || base & 0x7 != 0 || top & 0x7 != 0 || end & 0x7 != 0 {
+        return None;
+    }
+    if end.checked_sub(base) != Some(SHADOW_BYTES) {
+        return None;
+    }
+    if top < base || top > end {
         return None;
     }
     Some((base, top))
@@ -1354,15 +1380,19 @@ pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> boo
                 continue;
             }
             if chain_entry_rbp_is_foreign(rbp, entry_sp, scanner_sp) {
-                // The innermost RBP belongs to a compiled callee reached
-                // through the inline MIC/PIC cascade or the hashed megamorphic
-                // stub, so this entry's `compiled_method` does not describe it
-                // — exactly the case `refresh_moving_young_coverage_for_current_thread`
-                // reports as FOREIGN_INNERMOST_RBP. Using `cm`'s frame layout
-                // here reads `[rbp - shadow_thread_slot_off]` out of an
-                // unrelated frame and hands `shadow_window_from_frame` a
-                // non-thread pointer. Nothing about this frame can be
-                // verified, so take the conservative verdict.
+                // `info.compiled_method` does NOT describe the frame now
+                // standing at `exact_rbp` -- an unguarded JIT->JIT call, or the
+                // inline MIC/PIC cascade, published its own (deeper) base
+                // there. This is the case
+                // `refresh_moving_young_coverage_for_current_thread` reports as
+                // FOREIGN_INNERMOST_RBP. Every offset this loop reads
+                // (`shadow_thread_slot_off`, `osr_frame_size`, the band bounds)
+                // belongs to the wrong method, so nothing here can be verified.
+                // `scan_one_frame_precise` already declines to publish an oop
+                // map under the same condition; declining to VERIFY is the
+                // fail-closed counterpart -- it forces the non-moving sweep for
+                // this cycle instead of trusting a band read out of the wrong
+                // frame.
                 unverified = true;
                 continue;
             }
@@ -2306,11 +2336,25 @@ pub fn scan_active_jit_frames_with_sp(scanner_sp: usize, heap: &VmHeap, out: &mu
             flush_top_rbp_cache_to_chain(chain.as_mut_slice());
         }
         let chain = c.borrow();
+        // Every CONSERVATIVE entry is scanned as `[scanner_sp, entry_sp)` --
+        // they all share the same low bound, so a chain of K conservative
+        // entries used to walk the innermost frames K times over (O(K * depth)
+        // word reads and `is_object_address` calls for a root set that is, by
+        // construction, the union). The union of intervals sharing a low bound
+        // is just the widest one, so take the max `entry_sp` and scan once.
+        // Coverage is identical; only duplicate root pushes disappear (`out` is
+        // a root list -- order and multiplicity are already immaterial to every
+        // consumer). The precise entries keep their per-frame walk: each one
+        // enumerates its OWN frame's oop-map slots, not a range.
+        let mut conservative_high = 0usize;
         for entry in chain.iter() {
             match entry.precise {
                 Some(info) => scan_one_frame_precise(info, heap, out),
-                None => scan_one_frame(scanner_sp, entry.entry_sp, heap, out),
+                None => conservative_high = conservative_high.max(entry.entry_sp),
             }
+        }
+        if conservative_high != 0 {
+            scan_one_frame(scanner_sp, conservative_high, heap, out);
         }
     });
 }
@@ -2977,13 +3021,29 @@ fn scan_one_frame(low_sp: usize, high_sp: usize, heap: &VmHeap, out: &mut Vec<Ob
     // bound was captured at JIT entry on the same thread. Rust stacks are
     // backed by mapped pages for their entire reserved range, so reads in
     // this interval are well-defined. We never write through the pointer.
+    //
+    // Hoist the heap's address envelope out of the loop. `is_object_address`
+    // is an out-of-line call that re-reads the arena bounds (three `Acquire`
+    // load pairs on the generational backend) for EVERY word -- and almost
+    // every word on a stack is a return address, an int, or a native pointer
+    // that fails that very first test. Rejecting those inline against a
+    // hoisted `[lo, hi)` leaves the full validator to run only for words that
+    // could plausibly be object headers. `None` means the backend has no cheap
+    // envelope (ZGC), in which case every word goes through the validator as
+    // before.
+    let span = heap.conservative_addr_span();
     let mut addr = aligned_low;
     while addr + 8 <= aligned_high {
         let qword = unsafe { (addr as *const usize).read() };
+        addr += 8;
+        if let Some((lo, hi)) = span {
+            if qword < lo || qword >= hi {
+                continue;
+            }
+        }
         if let Some(obj) = heap.is_object_address(qword) {
             out.push(obj);
         }
-        addr += 8;
     }
 }
 

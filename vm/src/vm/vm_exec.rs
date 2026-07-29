@@ -3426,7 +3426,7 @@ impl<'a> NativeContextImpl<'a> {
     /// thread construction path itself, so that would loop.
     ///
     /// CONCURRENCY (fixes a confirmed TOCTOU race — see
-    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// CRATONVM-SPRING-GENUINE-BUGLIST, "5.8
     /// follow-up #4"): the body below allocates two `ThreadGroup` objects
     /// and runs their `<init>` (bytecode, can trigger a moving GC), so it
     /// cannot simply hold `main_thread_group`'s write lock across the
@@ -11044,6 +11044,42 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     }
 }
 
+/// Native-library indices retired by `NativeContext::unload_native_library`
+/// (`RawNativeLibraries.unload0`), keyed by `(NativeRealm address, index)`.
+///
+/// `SharedVm.natives.native_libraries` is an append-only `Vec<Library>`: the
+/// index IS the handle (`find_native_symbol` indexes it positionally and
+/// `RawNativeLibraries.load0` hands out `index + 1` as the opaque Java-side
+/// handle), so an element can never be removed without renumbering every live
+/// handle. Unload is therefore recorded out-of-band as a tombstone, and
+/// `find_native_symbol` refuses tombstoned indices — the library stays mapped
+/// (see the `unload_native_library` contract: pointers handed out earlier may
+/// still be live) but is no longer reachable through its handle.
+///
+/// Keying by the realm's address rather than the bare index keeps concurrently
+/// live VMs in one process from seeing each other's tombstones. An address can
+/// be reused by a *later* VM, so `load_native_library` clears the tombstone for
+/// every index it hands out; since indices are assigned densely from 0, any
+/// index a new realm can observe has been cleared by the load that created it.
+/// The set is bounded by the number of unloaded libraries (typically zero).
+fn unloaded_native_libraries() -> &'static std::sync::Mutex<std::collections::HashSet<(usize, i64)>>
+{
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static UNLOADED: OnceLock<Mutex<HashSet<(usize, i64)>>> = OnceLock::new();
+    UNLOADED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+impl<'a> NativeContextImpl<'a> {
+    /// Identity of this VM's [`NativeRealm`](crate::vm::realms::native_realm::NativeRealm)
+    /// for [`unloaded_native_libraries`] keying. The realm is owned by the
+    /// `SharedVm` and never moves while the VM is alive, so its address is a
+    /// stable per-VM key for the lifetime of any handle derived from it.
+    fn native_realm_key(&self) -> usize {
+        std::ptr::from_ref(&self.shared.natives) as usize
+    }
+}
+
 impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     // See the `NativeContext::refresh_root_snapshot` doc comment
     // (native-api/src/registry.rs) for the full rationale — this closes the
@@ -11155,7 +11191,24 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // `DirectByteBuffer.address()` from `Util.getTemporaryDirectBuffer`
         // reaching `Net.read0`/`SocketDispatcher` is such a handle — route it
         // through the off-heap store. Real OS pointers fall through to raw.
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+        //
+        // Classified by the TAG BIT, not by `unsafe_arena_contains`. Two
+        // reasons, in order of importance:
+        //
+        //  1. Correctness. `contains` is a *liveness* test, so a tagged handle
+        //     whose arena had already been freed answered `false` and fell
+        //     through to the raw branch below, where a synthetic handle
+        //     (0x4000_0001_0000_0000-ish) is `copy_nonoverlapping`d as an OS
+        //     pointer. That is a SIGSEGV on exactly the use-after-free the
+        //     single-element `Unsafe.get*(long)` natives already refuse. The
+        //     tag test is true for freed handles too, so the copy is declined
+        //     and the caller raises the Java-visible error.
+        //  2. Cost. `contains` is an `RwLock` read plus a `BTreeMap` range
+        //     probe, and `unsafe_arena_copy_out` then repeats it. On the
+        //     `DirectByteBuffer` per-element path (see `dbb_get_abs` in
+        //     `native-io/src/direct_buffer.rs`) that is two locked map probes
+        //     per byte moved.
+        if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
         }
         // Reject null / negative handles. Returning `false` (not performing the
@@ -11183,7 +11236,8 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+        // Tag bit, not liveness — see `copy_from_native_memory` above for why.
+        if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
         }
         // Reject null / negative handles (failure is signalled by `false`; the
@@ -11653,7 +11707,50 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         let mut libs = self.shared.natives.native_libraries.lock();
         let index = libs.len() as i64;
         libs.push(lib);
+        drop(libs);
+        // Clear any stale tombstone for this index. Live realms never recycle an
+        // index, so this only matters when a previous VM's realm was dropped and
+        // a new one landed at the same address — see `unloaded_native_libraries`.
+        let key = (self.native_realm_key(), index);
+        unloaded_native_libraries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
         Ok(index)
+    }
+
+    /// Logical unload for `RawNativeLibraries.unload0`.
+    ///
+    /// Tombstones the index instead of dropping the `libloading::Library`:
+    /// `native_libraries` is append-only and positional (see
+    /// [`unloaded_native_libraries`]), and dropping the library would `dlclose`
+    /// code that already-issued function pointers (bound FFM downcall stubs,
+    /// cached `findEntry0` results) may still be executing from. After this call
+    /// [`find_native_symbol`](NativeSystemAccess::find_native_symbol) refuses the
+    /// index, which is what the Java-side contract observes.
+    ///
+    /// NOTE: JNI-convention resolution (`resolve_jni_native_in_libraries`)
+    /// iterates the whole table and does not consult the tombstone set — a
+    /// library loaded through `System.loadLibrary` and unloaded through the
+    /// unrelated `RawNativeLibraries` path can still satisfy a `Java_*` symbol
+    /// lookup. That mirrors the current coupling of those two paths and is not
+    /// changed here.
+    fn unload_native_library(&mut self, lib_index: i64) -> bool {
+        if lib_index < 0 {
+            return false;
+        }
+        let live = {
+            let libs = self.shared.natives.native_libraries.lock();
+            (lib_index as usize) < libs.len()
+        };
+        if !live {
+            return false;
+        }
+        let key = (self.native_realm_key(), lib_index);
+        unloaded_native_libraries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key)
     }
 
     fn register_upcall(&mut self, entry: crate::native::ffi::UpcallEntry) -> usize {
@@ -11720,6 +11817,23 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize> {
+        // Indices retired by `unload_native_library` resolve nothing, exactly as
+        // a dlclosed handle would. Snapshot them BEFORE taking the library lock
+        // so the tombstone mutex is never nested inside it. The set is empty in
+        // every run that never unloads, which is the overwhelming majority.
+        let unloaded: Vec<i64> = {
+            let realm = self.native_realm_key();
+            let set = unloaded_native_libraries()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            set.iter()
+                .filter(|(r, _)| *r == realm)
+                .map(|(_, idx)| *idx)
+                .collect()
+        };
+        if lib_index >= 0 && unloaded.contains(&lib_index) {
+            return None;
+        }
         let libs = self.shared.natives.native_libraries.lock();
         let c_name = std::ffi::CString::new(name).ok()?;
 
@@ -11732,8 +11846,13 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                     .map(|sym| *sym as usize)
             }
         } else {
-            // Default/system lookup вЂ” try all loaded libraries
-            for lib in libs.iter() {
+            // Default/system lookup — try all loaded libraries, skipping any
+            // that were unloaded (their symbols are no longer reachable through
+            // this VM's library table).
+            for (idx, lib) in libs.iter().enumerate() {
+                if unloaded.contains(&(idx as i64)) {
+                    continue;
+                }
                 if let Ok(sym) = unsafe { lib.get::<*const ()>(c_name.as_bytes_with_nul()) } {
                     return Some(*sym as usize);
                 }
@@ -12229,6 +12348,76 @@ pub(super) fn convert_element_value(
 }
 
 // ---------------------------------------------------------------------------
+// CRATONVM_DBG_DISPATCH_TALLY — which callees reach the slow resolvers?
+// ---------------------------------------------------------------------------
+//
+// A CPU profile of a dispatch-bound workload is a flat tail of
+// `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
+// proves the VM is dispatching and says nothing about *what*, which is the
+// entire diagnosis: the `nioMemLZF:` residual in
+// `docs/known-issues/h2/h2-jitban-residuals-20260726.md` read as "a long
+// interpreter tail with no second hot spot to attack" for two revisions purely
+// because nobody had the callee histogram.
+//
+// Recorded at the two general resolvers that an inline-cache HIT is supposed
+// to bypass. A callee showing up here with a per-operation count in the tens
+// of thousands is a call site the IC is not serving, and that is actionable in
+// a way that a `slot_for_exact` percentage is not.
+//
+// Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
+// a `String` per call, so it is a diagnosis tool, not something to leave on.
+#[cold]
+pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
+    dispatch_tally::record(site, class_name, method_name, descriptor);
+}
+
+mod dispatch_tally {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DISPATCH_TALLY").is_some()
+        })
+    }
+
+    fn counts() -> &'static Mutex<HashMap<String, u64>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
+        if !enabled() {
+            return;
+        }
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        {
+            let mut guard = counts().lock().unwrap_or_else(|p| p.into_inner());
+            *guard
+                .entry(format!("{site} {class_name}.{method_name}{descriptor}"))
+                .or_insert(0) += 1;
+        }
+        let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % (1 << 20) == 0 {
+            dump(n);
+        }
+    }
+
+    pub(super) fn dump(total: u64) {
+        let guard = counts().lock().unwrap_or_else(|p| p.into_inner());
+        let mut rows: Vec<(u64, String)> = guard.iter().map(|(k, v)| (*v, k.clone())).collect();
+        drop(guard);
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        eprintln!("[dispatch-tally] total={total} distinct={}", rows.len());
+        for (count, key) in rows.into_iter().take(25) {
+            eprintln!("[dispatch-tally] {count:>12}  {key}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // invoke_or_native and helpers
 // ---------------------------------------------------------------------------
 
@@ -12241,6 +12430,7 @@ pub fn invoke_or_native(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
     // get(Class) dispatch entering the general resolver, with its dispatch
     // class and receiver identity, so the failing call's route is visible.
@@ -13265,6 +13455,7 @@ fn invoke_special_shared_impl(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    dbg_dispatch_tally("invoke_special_shared", class_name, method_name, descriptor);
     // Native override always wins -- same priority order as invoke_or_native.
     // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
     // loaded bytecode: invokespecial is how constructors and super-calls
@@ -16181,6 +16372,12 @@ fn invoke_on_class_shared_inner(
     args: &[Value],
     no_retarget: bool,
 ) -> MethodCallResult {
+    dbg_dispatch_tally(
+        "invoke_on_class_shared_inner",
+        "",
+        method_name,
+        descriptor,
+    );
     if method_name != "<init>" && method_name != "<clinit>" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             let recv_cid = shared.mem.heap.class_id_of(recv);

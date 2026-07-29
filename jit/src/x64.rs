@@ -6782,48 +6782,7 @@ fn classify_local_kinds(code: &[u8], code_len: usize, num_locals: usize) -> Vec<
 
     let mut pc = 0usize;
     while pc < code_len {
-        let op = code[pc];
-        // (kind, slot) for a local access at this pc, if the opcode is one.
-        let access: Option<(LocalKind, usize)> = match op {
-            // Widening: u8 operand/opcode-relative index -> usize (value fits).
-            0x15 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
-            0x16 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
-            0x17 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
-            0x18 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
-            0x19 if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
-            0x1a..=0x1d => Some((LocalKind::Int, (op - 0x1a) as usize)),
-            0x1e..=0x21 => Some((LocalKind::Long, (op - 0x1e) as usize)),
-            0x22..=0x25 => Some((LocalKind::Float, (op - 0x22) as usize)),
-            0x26..=0x29 => Some((LocalKind::Double, (op - 0x26) as usize)),
-            0x2a..=0x2d => Some((LocalKind::Ref, (op - 0x2a) as usize)),
-            0x36 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
-            0x37 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
-            0x38 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
-            0x39 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
-            0x3a if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
-            0x3b..=0x3e => Some((LocalKind::Int, (op - 0x3b) as usize)),
-            0x3f..=0x42 => Some((LocalKind::Long, (op - 0x3f) as usize)),
-            0x43..=0x46 => Some((LocalKind::Float, (op - 0x43) as usize)),
-            0x47..=0x4a => Some((LocalKind::Double, (op - 0x47) as usize)),
-            0x4b..=0x4e => Some((LocalKind::Ref, (op - 0x4b) as usize)),
-            // iinc reads+writes an int local.
-            0x84 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
-            // wide (0xc4): code[pc+1] is the real opcode, code[pc+2..4] the index.
-            0xc4 if pc + 3 < code_len => {
-                let real = code[pc + 1];
-                let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
-                match real {
-                    0x15 | 0x36 | 0x84 => Some((LocalKind::Int, idx)),
-                    0x16 | 0x37 => Some((LocalKind::Long, idx)),
-                    0x17 | 0x38 => Some((LocalKind::Float, idx)),
-                    0x18 | 0x39 => Some((LocalKind::Double, idx)),
-                    0x19 | 0x3a => Some((LocalKind::Ref, idx)),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        if let Some((k, slot)) = access {
+        if let Some((k, slot)) = local_access_at(code, code_len, pc) {
             vote(&mut kinds, slot, k);
         }
         pc += bytecode_len_at(code, pc);
@@ -6843,6 +6802,209 @@ fn classify_local_kinds(code: &[u8], code_len: usize, num_locals: usize) -> Vec<
         }
     }
     kinds
+}
+
+/// The `(kind, slot)` of the local access at `pc`, or `None` if the opcode at
+/// `pc` does not touch a local.
+///
+/// Shared by the whole-method classifier ([`classify_local_kinds`]) and the
+/// per-bci refinement ([`refine_ambiguous_local_kinds`]) so the two can never
+/// disagree about what an opcode does — a divergence there would silently make
+/// the refinement unsound rather than merely imprecise.
+fn local_access_at(code: &[u8], code_len: usize, pc: usize) -> Option<(LocalKind, usize)> {
+    let op = code[pc];
+    match op {
+        // Widening: u8 operand/opcode-relative index -> usize (value fits).
+        0x15 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+        0x16 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
+        0x17 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
+        0x18 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
+        0x19 if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
+        0x1a..=0x1d => Some((LocalKind::Int, (op - 0x1a) as usize)),
+        0x1e..=0x21 => Some((LocalKind::Long, (op - 0x1e) as usize)),
+        0x22..=0x25 => Some((LocalKind::Float, (op - 0x22) as usize)),
+        0x26..=0x29 => Some((LocalKind::Double, (op - 0x26) as usize)),
+        0x2a..=0x2d => Some((LocalKind::Ref, (op - 0x2a) as usize)),
+        0x36 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+        0x37 if pc + 1 < code_len => Some((LocalKind::Long, code[pc + 1] as usize)),
+        0x38 if pc + 1 < code_len => Some((LocalKind::Float, code[pc + 1] as usize)),
+        0x39 if pc + 1 < code_len => Some((LocalKind::Double, code[pc + 1] as usize)),
+        0x3a if pc + 1 < code_len => Some((LocalKind::Ref, code[pc + 1] as usize)),
+        0x3b..=0x3e => Some((LocalKind::Int, (op - 0x3b) as usize)),
+        0x3f..=0x42 => Some((LocalKind::Long, (op - 0x3f) as usize)),
+        0x43..=0x46 => Some((LocalKind::Float, (op - 0x43) as usize)),
+        0x47..=0x4a => Some((LocalKind::Double, (op - 0x47) as usize)),
+        0x4b..=0x4e => Some((LocalKind::Ref, (op - 0x4b) as usize)),
+        // iinc reads+writes an int local.
+        0x84 if pc + 1 < code_len => Some((LocalKind::Int, code[pc + 1] as usize)),
+        // wide (0xc4): code[pc+1] is the real opcode, code[pc+2..4] the index.
+        0xc4 if pc + 3 < code_len => {
+            let real = code[pc + 1];
+            let idx = ((code[pc + 2] as usize) << 8) | code[pc + 3] as usize;
+            match real {
+                0x15 | 0x36 | 0x84 => Some((LocalKind::Int, idx)),
+                0x16 | 0x37 => Some((LocalKind::Long, idx)),
+                0x17 | 0x38 => Some((LocalKind::Float, idx)),
+                0x18 | 0x39 => Some((LocalKind::Double, idx)),
+                0x19 | 0x3a => Some((LocalKind::Ref, idx)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Per-bci kinds for the locals the whole-method classifier had to call
+/// [`LocalKind::Ambiguous`].
+///
+/// Empty (`slots.is_empty()`) when the method has no ambiguous local, which is
+/// the overwhelmingly common case — the pass then costs one scan of `kinds`.
+#[derive(Default, Clone)]
+struct AmbiguousLocalKinds {
+    /// The ambiguous local slots, ascending. Index into this is the column of
+    /// [`Self::at`].
+    slots: Vec<usize>,
+    /// `at[pc * slots.len() + col]` — the kind of `slots[col]` on entry to
+    /// `pc`. [`LocalKind::Ambiguous`] where the dataflow could not agree, and
+    /// [`LocalKind::Unknown`] on a pc the dataflow never reached.
+    at: Vec<LocalKind>,
+}
+
+impl AmbiguousLocalKinds {
+    /// The refined kind of `slot` on entry to `pc`, or `None` when this slot is
+    /// not tracked (it was never ambiguous) or the refinement did not settle.
+    ///
+    /// Never answers `Ref`: the flow-sensitive oop mask is the sole authority
+    /// for ref-typed slots and has already had its say by the time a caller
+    /// consults this, so a `Ref` here means "the mask could not prove it live
+    /// as an oop" — the one case that must stay a safe re-run.
+    fn kind_at(&self, pc: usize, slot: usize) -> Option<LocalKind> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let col = self.slots.iter().position(|&s| s == slot)?;
+        let k = *self.at.get(pc * self.slots.len() + col)?;
+        match k {
+            LocalKind::Int | LocalKind::Long | LocalKind::Float | LocalKind::Double => Some(k),
+            _ => None,
+        }
+    }
+}
+
+/// Forward reaching-kind dataflow for the ambiguous locals only.
+///
+/// See the module-level rationale on [`AmbiguousLocalKinds`] and the fix note
+/// in `docs/known-issues/h2/h2-jitban-residuals-20260726.md`. Uses the same
+/// successor relation as the precise oop-mask pass so the two agree about
+/// control flow, and seeds every exception-handler entry TOP because a handler
+/// is reachable from any point in its protected range.
+fn refine_ambiguous_local_kinds(
+    code: &[u8],
+    code_len: usize,
+    kinds: &[LocalKind],
+    exception_ranges: &[(usize, usize, usize)],
+) -> AmbiguousLocalKinds {
+    let slots: Vec<usize> = kinds
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| matches!(k, LocalKind::Ambiguous))
+        .map(|(i, _)| i)
+        .collect();
+    if slots.is_empty() || code_len == 0 {
+        return AmbiguousLocalKinds::default();
+    }
+    let width = slots.len();
+    let col_of = |slot: usize| slots.iter().position(|&s| s == slot);
+
+    // `at` is the IN state; `reached` distinguishes "bottom" from "never seen"
+    // so the first real predecessor seeds instead of merging with bottom.
+    let mut at = vec![LocalKind::Unknown; code_len.saturating_mul(width)];
+    let mut reached = vec![false; code_len];
+    let mut work: Vec<usize> = Vec::new();
+
+    reached[0] = true;
+    work.push(0);
+    // A handler can be entered from ANY pc in its protected range, so no kind
+    // may be assumed on entry to one.
+    for &(_start, _end, handler_pc) in exception_ranges {
+        if handler_pc >= code_len {
+            continue;
+        }
+        for col in 0..width {
+            at[handler_pc * width + col] = LocalKind::Ambiguous;
+        }
+        if !reached[handler_pc] {
+            reached[handler_pc] = true;
+            work.push(handler_pc);
+        }
+    }
+
+    // Bound iterations defensively against any decoding pathology, exactly as
+    // `compute_local_oop_masks` does.
+    let mut guard = code_len.saturating_mul(64).saturating_add(64);
+    while let Some(pc) = work.pop() {
+        if pc >= code_len {
+            continue;
+        }
+        guard = guard.saturating_sub(1);
+        if guard == 0 {
+            // Ran out of budget: report nothing rather than a partial fixpoint.
+            return AmbiguousLocalKinds::default();
+        }
+        let mut out: Vec<LocalKind> = at[pc * width..pc * width + width].to_vec();
+        // A load proves the kind just as a store sets it — and a load is the
+        // only signal for a slot whose value arrived as a parameter.
+        if let Some((k, slot)) = local_access_at(code, code_len, pc) {
+            if let Some(col) = col_of(slot) {
+                out[col] = k;
+            }
+            // The dead upper half of a cat-2 store must not keep a stale kind
+            // from the value that used to live there.
+            if matches!(k, LocalKind::Long | LocalKind::Double) {
+                if let Some(col) = col_of(slot + 1) {
+                    out[col] = LocalKind::HighHalf;
+                }
+            }
+        }
+        for succ in oop_dataflow_successors(code, code_len, pc) {
+            if succ >= code_len {
+                continue;
+            }
+            let mut changed = false;
+            for col in 0..width {
+                let idx = succ * width + col;
+                let merged = if reached[succ] {
+                    merge_local_kind(at[idx], out[col])
+                } else {
+                    out[col]
+                };
+                if merged != at[idx] {
+                    at[idx] = merged;
+                    changed = true;
+                }
+            }
+            if !reached[succ] || changed {
+                reached[succ] = true;
+                work.push(succ);
+            }
+        }
+    }
+
+    // An unreached pc keeps `Unknown`, which `kind_at` reports as "no answer".
+    AmbiguousLocalKinds { slots, at }
+}
+
+/// Join of two reaching kinds. [`LocalKind::Unknown`] is the bottom (a path on
+/// which the slot is undefined, and therefore — by JVMS verification — never
+/// read); disagreement is [`LocalKind::Ambiguous`], the top.
+fn merge_local_kind(a: LocalKind, b: LocalKind) -> LocalKind {
+    if a == b {
+        return a;
+    }
+    match (a, b) {
+        (LocalKind::Unknown, other) | (other, LocalKind::Unknown) => other,
+        _ => LocalKind::Ambiguous,
+    }
 }
 
 /// True iff `op` is a `long`/`float`/`double` bytecode — any op that can put a
@@ -8337,6 +8499,12 @@ struct Compiler {
     /// `Register`/`StackSlot`. Empty unless `deopt_real_enabled()` (the only
     /// consumer is the gated snapshot), so production compiles skip the scan.
     local_kinds: Vec<LocalKind>,
+    /// Per-bci refinement of the `Ambiguous` entries of `local_kinds`. A slot
+    /// the compiler reuses across two disjoint live ranges is ambiguous for the
+    /// METHOD but usually not at the bci a deopt actually happens at, and an
+    /// `Unsupported` slot makes precise resume impossible for the whole frame.
+    /// See `refine_ambiguous_local_kinds`.
+    local_kinds_refined: AmbiguousLocalKinds,
     /// deopt-osr — per-PC local liveness (`regalloc::live_locals_per_pc`),
     /// bit `i` set ⇒ local `i` may still be read at that bci. Indexed by 0's
     /// only when `deopt_real_enabled()` populates it (see `local_kinds`
@@ -8888,6 +9056,7 @@ mod deopt_snapshot_tests {
 
     use super::{
         classify_local_kinds, code_uses_long_float_double, opcode_touches_long_float_double,
+        refine_ambiguous_local_kinds,
         typed_local_frame_value, LocalKind,
     };
 
@@ -8945,6 +9114,93 @@ mod deopt_snapshot_tests {
     }
 
     #[test]
+    /// The `RowDataType.read` shape: slot 1 is an `int` in one arm of a branch
+    /// and a `ref` in the other, so the whole-method classifier must call it
+    /// `Ambiguous` — but at a pc only the `istore` arm reaches, the refinement
+    /// must answer `Int`.
+    #[test]
+    fn refine_resolves_branch_disjoint_slot_reuse() {
+        // 0: iconst_0        (0x03)
+        // 1: ifne 9          (0x9a 0x00 0x08)  -> targets 9
+        // 4: iconst_1        (0x04)
+        // 5: istore_1        (0x3c)            <- Int definition
+        // 6: goto 12         (0xa7 0x00 0x06)  -> targets 12
+        // 9: aconst_null     (0x01)
+        // 10: astore_1       (0x4c)            <- Ref definition
+        // 11: nop            (0x00)
+        // 12: return         (0xb1)
+        let code = [
+            0x03, 0x9a, 0x00, 0x08, 0x04, 0x3c, 0xa7, 0x00, 0x06, 0x01, 0x4c, 0x00, 0xb1,
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 2);
+        assert_eq!(
+            kinds[1],
+            LocalKind::Ambiguous,
+            "the whole-method vote must still be Ambiguous"
+        );
+        let refined = refine_ambiguous_local_kinds(&code, code.len(), &kinds, &[]);
+        // pc 6 is the `goto` right after `istore_1` — only the Int arm reaches
+        // it, so the slot is provably an int there.
+        assert_eq!(refined.kind_at(6, 1), Some(LocalKind::Int));
+        // pc 11 is the `nop` after `astore_1` — the Ref arm. `kind_at` never
+        // answers `Ref`: the oop mask owns ref-typed slots.
+        assert_eq!(refined.kind_at(11, 1), None);
+        // pc 12 is the join of both arms — genuinely ambiguous.
+        assert_eq!(refined.kind_at(12, 1), None);
+        // A slot that was never ambiguous is not tracked at all.
+        assert_eq!(refined.kind_at(6, 0), None);
+    }
+
+    /// A method with no ambiguous local pays nothing and answers nothing.
+    #[test]
+    fn refine_is_empty_without_ambiguity() {
+        // iconst_0; istore_1; return
+        let code = [0x03, 0x3c, 0xb1];
+        let kinds = classify_local_kinds(&code, code.len(), 2);
+        assert_eq!(kinds[1], LocalKind::Int);
+        let refined = refine_ambiguous_local_kinds(&code, code.len(), &kinds, &[]);
+        assert_eq!(refined.kind_at(1, 1), None);
+    }
+
+    /// An exception handler is reachable from anywhere inside its protected
+    /// range, so nothing may be assumed on entry to one — or anywhere the
+    /// handler flows to.
+    #[test]
+    fn refine_seeds_exception_handlers_top() {
+        // Same shape as the branch test, but pc 6 is declared a handler entry.
+        let code = [
+            0x03, 0x9a, 0x00, 0x08, 0x04, 0x3c, 0xa7, 0x00, 0x06, 0x01, 0x4c, 0x00, 0xb1,
+        ];
+        let kinds = classify_local_kinds(&code, code.len(), 2);
+        assert_eq!(kinds[1], LocalKind::Ambiguous);
+        let refined = refine_ambiguous_local_kinds(&code, code.len(), &kinds, &[(0, 13, 6)]);
+        assert_eq!(
+            refined.kind_at(6, 1),
+            None,
+            "a handler entry must not inherit the kind of its protected range"
+        );
+    }
+
+    /// A cat-2 store must clear a stale kind from the slot above it, or a
+    /// reused high-half keeps answering with the value it used to hold.
+    #[test]
+    fn refine_clears_cat2_high_half() {
+        // 0: aconst_null (0x01)
+        // 1: astore_2    (0x4d)          <- Ref definition of slot 2
+        // 2: lconst_0    (0x09)
+        // 3: lstore_1    (0x40)          <- Long at slot 1, high half at slot 2
+        // 4: return      (0xb1)
+        let code = [0x01, 0x4d, 0x09, 0x40, 0xb1];
+        let kinds = classify_local_kinds(&code, code.len(), 3);
+        assert_eq!(kinds[2], LocalKind::Ambiguous);
+        let refined = refine_ambiguous_local_kinds(&code, code.len(), &kinds, &[]);
+        assert_eq!(
+            refined.kind_at(4, 2),
+            None,
+            "the high half of a live cat-2 is not an independently typed slot"
+        );
+    }
+
     fn classify_local_kinds_reuse_is_ambiguous() {
         // local0 stored as int then as float -> Ambiguous (slot reuse).
         let code = [
@@ -9426,6 +9682,7 @@ impl Compiler {
             oop_maps: Vec::new(),
             local_oop_masks: Vec::new(),
             local_kinds: Vec::new(),
+            local_kinds_refined: AmbiguousLocalKinds::default(),
             local_liveness: Vec::new(),
             local_liveness_covered: Vec::new(),
             exception_ranges_dbg_len: 0,
@@ -9912,6 +10169,17 @@ impl Compiler {
                 }
             } else if let Some(&kind) = self.local_kinds.get(i) {
                 // Non-oop slot, width-typed from the classifier (deopt-osr P2).
+                // A slot the whole-method classifier had to call `Ambiguous`
+                // gets one more chance from the per-bci reaching-kind dataflow:
+                // legal slot reuse across two disjoint live ranges is ambiguous
+                // for the METHOD and usually not here. `kind_at` only ever
+                // answers a concrete NON-ref kind, so the oop mask (which ran
+                // above) keeps sole authority over ref-typed slots.
+                let kind = if matches!(kind, LocalKind::Ambiguous) {
+                    self.local_kinds_refined.kind_at(bci, i).unwrap_or(kind)
+                } else {
+                    kind
+                };
                 typed_local_frame_value(reg, xmm, off, kind)
             } else {
                 // No kind table (gate off / unmapped) — Phase-A int/provenance.
@@ -9961,6 +10229,10 @@ impl Compiler {
                         FrameValue::StackSlotRef(-*off)
                     } else if indy_tag == Some(b'J') {
                         FrameValue::StackSlotLong(-*off)
+                    } else if indy_tag == Some(b'D') {
+                        FrameValue::StackSlotDouble(-*off)
+                    } else if indy_tag == Some(b'F') {
+                        FrameValue::StackSlotFloat(-*off)
                     } else if indy_tag == Some(b'I') || !wide_fp {
                         FrameValue::StackSlot(-*off)
                     } else {
@@ -9971,6 +10243,11 @@ impl Compiler {
                 // Object on resume); a non-oop slot is a cat-1 `Register` (Int)
                 // only when the method has no wide/FP value that could occupy it
                 // (or an indy-arg tag proves it's actually int/long).
+                //
+                // An FP indy arg in a GPR is a contradiction (the FP tier keeps
+                // `float`/`double` in XMM or a spill slot), so it stays
+                // `Unsupported` — exactly what `typed_local_frame_value` does
+                // for a `LocalKind::Float`/`Double` that claims a GPR home.
                 StackSlot::CalleeSaved(r) | StackSlot::Scratch(r) => {
                     if is_oop {
                         FrameValue::RegisterRef(*r)
@@ -9982,7 +10259,15 @@ impl Compiler {
                         FrameValue::Unsupported
                     }
                 }
-                StackSlot::Xmm(_) => FrameValue::Unsupported,
+                // An XMM-resident operand is FP, but float-vs-double is not
+                // recoverable from the abstract stack alone — EXCEPT at an
+                // invokedynamic trap bci, where the call site's own descriptor
+                // types each of its arguments exactly.
+                StackSlot::Xmm(n) => match indy_tag {
+                    Some(b'D') => FrameValue::XmmDouble(*n),
+                    Some(b'F') => FrameValue::XmmFloat(*n),
+                    _ => FrameValue::Unsupported,
+                },
             });
         }
 
@@ -12326,6 +12611,71 @@ impl Compiler {
     /// result in RAX while calling the same frame-record hook used by the
     /// prologue.  The extra eight bytes maintain ABI alignment after PUSH; on
     /// Windows `stack_arg_block_size(0)` additionally reserves shadow space.
+    /// After an INLINE call to a cached compiled callee: if it returned the
+    /// `i64::MIN` deopt/exception sentinel, hand it to
+    /// `jit_service_callee_deopt` so the callee's stashed frame is resumed
+    /// here, at the call site that actually made the call.
+    ///
+    /// Emitted only on the direct-entry arms. Without it the sentinel reaches
+    /// the caller's own epilogue as if the CALLER had deopted, and the callee's
+    /// reconstructed frame is left for an unrelated sink to mis-attribute —
+    /// see the helper's doc comment for the H2 `MVMap`/`DataType.read` case
+    /// this was found on.
+    ///
+    /// Cost on the hit path is a `MOV imm64` + `CMP` + a not-taken `JNE`; the
+    /// call is on the sentinel branch only. Emits nothing when the runtime
+    /// offers no helper (unit-test compiles), which restores the previous
+    /// behaviour exactly.
+    fn emit_inline_callee_deopt_check(
+        &mut self,
+        info: *const crate::JitInvokeInfo,
+        n: usize,
+        args_base_offset: i32,
+    ) {
+        let helper = self.helpers.service_callee_deopt;
+        if helper == 0 {
+            return;
+        }
+        // MOV R11, imm64(i64::MIN)  — 49 BB + imm64.
+        self.buf.emit(&[0x49, 0xBB]);
+        self.buf.emit(&i64::MIN.to_le_bytes());
+        // CMP RAX, R11  — REX.WR + 39 /r + ModRM(11, R11, RAX).
+        self.buf.emit(&[0x4C, 0x39, 0xD8]);
+        // JNE rel8 → skip the servicing call. Patched once the body length is
+        // known; the body is a fixed short sequence well inside rel8 range.
+        self.buf.emit(&[0x75, 0x00]);
+        let jne_patch = self.buf.pos() - 1;
+        let body_start = self.buf.pos();
+
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        // Cast: function pointer for JIT call target
+        self.emit_mov_imm64(ARG_REGS[1], info as i64);
+        if n > 0 {
+            // Cast: x86-64 immediate encoding
+            let buf_start = args_base_offset + ((n as i32) - 1) * 8;
+            self.emit_lea_frame_slot(ARG_REGS[2], buf_start);
+        } else {
+            self.emit_xor_reg_self(ARG_REGS[2]);
+        }
+        // Cast: x86-64 immediate encoding
+        self.emit_mov_imm32_sx(ARG_REGS[3], n as i32);
+        self.emit_call_absolute(helper);
+
+        // Widening: usize offset -> i64 (no truncation; for rel/displacement math)
+        let rel = (self.buf.pos() as i64) - (body_start as i64);
+        debug_assert!(
+            (0..=i64::from(i8::MAX)).contains(&rel),
+            "inline callee-deopt check body overflowed rel8 ({rel} bytes)"
+        );
+        if let Ok(rel8) = u8::try_from(rel) {
+            self.buf.try_patch_byte(jne_patch, rel8).ok();
+        } else {
+            // Cannot encode the skip — mark the buffer so the compile bails
+            // rather than emitting a branch into the middle of the call.
+            self.buf.mark_overflowed();
+        }
+    }
+
     fn emit_post_call_rbp_republish(&mut self) {
         if !self.precise_maps || self.helpers.frame_record == 0 {
             return;
@@ -27836,6 +28186,11 @@ impl Compiler {
                                 // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
                                 self.buf.emit(&[0x41, 0xFF, 0xD3]);
                                 self.emit_post_call_rbp_republish();
+                                self.emit_inline_callee_deopt_check(
+                                    info,
+                                    n,
+                                    args_base_offset,
+                                );
 
                                 // JMP rel32 → .done. The root-frame
                                 // republish above makes the distance exceed
@@ -27878,6 +28233,8 @@ impl Compiler {
                                         } else {
                                             0
                                         },
+                                        self.helpers.service_callee_deopt,
+                                        info as usize,
                                     ),
                                 );
                             }
@@ -29384,11 +29741,15 @@ pub fn compile_with_param_slots(
     } else {
         &[]
     };
+    // `param_jvm_slots` (not just `num_params`): a category-2 parameter spans
+    // two JVM slots, so the allocator must know which slots actually hold an
+    // incoming argument. See `regalloc::param_live_in_mask`.
     let alloc_result = super::regalloc::allocate_registers_with_handlers(
         code,
         code_len,
         max_locals,
         num_params,
+        param_jvm_slots,
         &loops,
         ra_handlers,
     );
@@ -29620,6 +29981,7 @@ pub fn compile_with_param_slots(
             code_len,
             max_locals,
             num_params,
+            param_jvm_slots,
             &compiler.local_assignments,
             param_oop_mask,
             ra_handlers,
@@ -29902,6 +30264,13 @@ pub fn compile_with_param_slots(
     // (gated) snapshot consumes it, so skip the scan entirely in production.
     if crate::deopt_real_enabled() || precise_exception_frames {
         compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
+        // Resolve the `Ambiguous` votes per bci where control flow allows it.
+        compiler.local_kinds_refined = refine_ambiguous_local_kinds(
+            code,
+            code_len,
+            &compiler.local_kinds,
+            &exception_ranges,
+        );
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
         // deopt-osr OSR-exit dead-local fix — see `local_liveness`'s doc comment.
@@ -29912,6 +30281,7 @@ pub fn compile_with_param_slots(
             code,
             code_len,
             num_params,
+            param_jvm_slots,
             &exception_ranges,
         );
         compiler.local_liveness = liveness;
@@ -30869,6 +31239,7 @@ mod tests {
             shadow_stack_offset_in_thread: 0,
             throw_exception: sentinel,
             set_throw_bci: sentinel,
+            service_callee_deopt: sentinel,
             jit_npe_with_action: sentinel,
             dispatch_threw: sentinel,
             jit_frem: sentinel,
@@ -42805,7 +43176,7 @@ mod flag_and_header_contracts {
         // Both locals register-homed, as the allocator would do for a hot kernel.
         let assignments = vec![Some(R12), Some(R13)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &[], &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals, 0,
             "an int-only kernel has no reference locals"
@@ -42830,7 +43201,7 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![None, Some(R12)];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &assignments, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &[], &assignments, 0, &[]);
         assert_eq!(
             plan.reference_locals & 0b10,
             0b10,
@@ -42846,7 +43217,7 @@ mod flag_and_header_contracts {
         // already frame-resident, so nothing needs publishing.
         let spilled = vec![None, None];
         let plan_spilled =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &spilled, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &[], &spilled, 0, &[]);
         assert!(plan_spilled.no_reference_in_registers());
         assert!(!reference_local_in_register(Some(&plan_spilled), &spilled));
     }
@@ -42862,20 +43233,13 @@ mod flag_and_header_contracts {
         let code_len = code.len();
         let assignments = vec![Some(R12)];
         let without =
-            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &[], &assignments, 0, &[]);
         assert!(
             without.no_reference_in_registers(),
             "the bytecode scan alone cannot see an unloaded reference parameter"
         );
-        let with = crate::regalloc::plan_safepoint_publication(
-            &code,
-            code_len,
-            1,
-            1,
-            &assignments,
-            0b1, // param_oop_mask: local 0 is a reference parameter
-            &[],
-        );
+        let with = crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &[], &assignments, 0b1, // param_oop_mask: local 0 is a reference parameter
+            &[]);
         assert!(
             !with.no_reference_in_registers(),
             "param_oop_mask must make the never-loaded reference parameter visible; \
@@ -42908,7 +43272,7 @@ mod flag_and_header_contracts {
         let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
         let no_homes = vec![None, None];
         let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &no_homes, 0, &[]);
+            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &[], &no_homes, 0, &[]);
         assert_eq!(
             reference_local_in_register(Some(&plan), &no_homes),
             reference_local_in_register(None, &no_homes),
@@ -42934,15 +43298,7 @@ mod flag_and_header_contracts {
              can_elide_self_call_register_spill's soundness argument breaks"
         );
         // Feeding the allocator's own output back through the plan must agree.
-        let plan = crate::regalloc::plan_safepoint_publication(
-            &code,
-            code.len(),
-            80,
-            0,
-            &alloc.assignments,
-            0,
-            &[],
-        );
+        let plan = crate::regalloc::plan_safepoint_publication(&code, code.len(), 80, 0, &[], &alloc.assignments, 0, &[]);
         assert!(plan.no_reference_in_registers());
     }
 

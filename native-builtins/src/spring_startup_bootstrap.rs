@@ -2691,7 +2691,7 @@ fn try_build_method_injection(
         // A `@Lookup` method may legally be package-private, and a
         // fork-loaded configuration class is not app-loaded, so hardcoding
         // the application loader here was the same latent defect documented in
-        // `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`.
+        // `docs/internal/configproxy-cglib-loaderid-fixed-20260727.md`.
         // No-op for the common app-loaded case (id 2 decodes to `Application`).
         let super_loader_id = ctx.loader_id_of_class(super_cid).max(0) as u32;
         if ctx

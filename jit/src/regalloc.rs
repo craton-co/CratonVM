@@ -848,16 +848,55 @@ fn compute_gen_kill(code: &[u8], block: &mut BasicBlock) {
 /// Maximum number of liveness fixpoint iterations before bailing out.
 const MAX_LIVENESS_ITERATIONS: usize = 1000;
 
-/// Solve liveness to fixpoint using worklist iteration.
-fn solve_liveness(blocks: &mut [BasicBlock], num_params: usize) {
-    // Seed: parameters are live-in at entry block
-    if !blocks.is_empty() {
-        let param_mask: u64 = if num_params >= 64 {
+/// Bitmask of the JVM local slots that hold an incoming parameter.
+///
+/// `param_slots` is the backend's `param_jvm_slots`: the JVM local slot of
+/// parameter `i`, category-2 aware. An empty slice selects the identity layout
+/// `0..num_params`, which is what every category-1-only signature reduces to
+/// (and what the unit tests and the ARM64 backend pass).
+///
+/// Why this is not simply `(1 << num_params) - 1`: a `long`/`double` parameter
+/// occupies TWO JVM local slots (JVMS 2.6.1), so as soon as a signature
+/// contains one, its LAST parameter lives at slot `num_params` or beyond.
+/// Seeding only `0..num_params` left that parameter dead-on-entry; the
+/// colouring was then free to hand it the same register as a live earlier
+/// parameter, and the prologue -- which stores EVERY incoming argument into
+/// its home -- overwrote the live one on the way in.
+///
+/// Reproduced by a lambda body `(long, Object, Void)`, where the trailing
+/// always-null `Void` shared `r12` with the `Object`:
+///
+/// ```text
+///   mov r15, rsi   ; this
+///   mov r14, rdx   ; long
+///   mov r12, rcx   ; Object   <-- live, read by the body
+///   mov r12, r8    ; Void     <-- clobbers it with null
+/// ```
+pub fn param_live_in_mask(num_params: usize, param_slots: &[usize]) -> u64 {
+    if param_slots.is_empty() {
+        return if num_params >= 64 {
             u64::MAX
         } else {
             (1u64 << num_params) - 1
         };
-        blocks[0].gen |= param_mask & !blocks[0].kill;
+    }
+    // The 64-local cap of this module's bitsets: a parameter at slot >= 64
+    // never receives a register home (`color_graph` caps at 64), so its
+    // canonical frame slot is authoritative and omitting it is safe.
+    param_slots
+        .iter()
+        .filter(|&&slot| slot < 64)
+        .fold(0u64, |mask, &slot| mask | (1u64 << slot))
+}
+
+/// Solve liveness to fixpoint using worklist iteration.
+///
+/// `param_live_mask` is [`param_live_in_mask`] -- the slots holding an incoming
+/// parameter, all of which are live-in at the entry block by definition.
+fn solve_liveness(blocks: &mut [BasicBlock], param_live_mask: u64) {
+    // Seed: parameters are live-in at entry block
+    if !blocks.is_empty() {
+        blocks[0].gen |= param_live_mask & !blocks[0].kill;
     }
 
     // Worklist iteration (backward dataflow) with iteration limit
@@ -1444,6 +1483,7 @@ pub fn plan_safepoint_publication(
     code_len: usize,
     num_locals: usize,
     num_params: usize,
+    param_slots: &[usize],
     assignments: &[Option<u8>],
     extra_reference_locals: u64,
     handlers: &[(usize, usize, usize)],
@@ -1466,7 +1506,8 @@ pub fn plan_safepoint_publication(
     // Trusting it would publish nothing at a safepoint in unreached-but-
     // executed code (an exception handler the CFG cannot see) and drop a live
     // oop. Uncovered PCs therefore fall back to the bci-independent set.
-    let (live_at, covered) = live_locals_per_pc_inner(code, code_len, num_params, handlers);
+    let (live_at, covered) =
+        live_locals_per_pc_inner(code, code_len, num_params, param_slots, handlers);
     let publish_at: Vec<u64> = live_at
         .iter()
         .zip(covered.iter())
@@ -1500,6 +1541,7 @@ pub fn allocate_registers(
         code_len,
         num_locals,
         num_params,
+        &[],
         loops,
         &LOCAL_REGS,
         &LOCAL_XMMS,
@@ -1524,6 +1566,7 @@ pub fn allocate_registers_with_handlers(
     code_len: usize,
     num_locals: usize,
     num_params: usize,
+    param_slots: &[usize],
     loops: &[(usize, usize)],
     handlers: &[(usize, usize, usize)],
 ) -> RegAllocResult {
@@ -1532,6 +1575,7 @@ pub fn allocate_registers_with_handlers(
         code_len,
         num_locals,
         num_params,
+        param_slots,
         loops,
         &LOCAL_REGS,
         &LOCAL_XMMS,
@@ -1588,9 +1632,10 @@ pub fn live_locals_per_pc_with_handlers(
     code: &[u8],
     code_len: usize,
     num_params: usize,
+    param_slots: &[usize],
     handlers: &[(usize, usize, usize)],
 ) -> (Vec<u64>, Vec<bool>) {
-    live_locals_per_pc_inner(code, code_len, num_params, handlers)
+    live_locals_per_pc_inner(code, code_len, num_params, param_slots, handlers)
 }
 
 /// [`live_locals_per_pc`] plus the parallel *coverage* bitmap: `covered[pc]` is
@@ -1607,7 +1652,7 @@ fn live_locals_per_pc_with_coverage(
     code_len: usize,
     num_params: usize,
 ) -> (Vec<u64>, Vec<bool>) {
-    live_locals_per_pc_inner(code, code_len, num_params, &[])
+    live_locals_per_pc_inner(code, code_len, num_params, &[], &[])
 }
 
 /// Build the CFG with EXCEPTION EDGES modelled: every handler pc becomes a
@@ -1657,13 +1702,14 @@ fn live_locals_per_pc_inner(
     code: &[u8],
     code_len: usize,
     num_params: usize,
+    param_slots: &[usize],
     handlers: &[(usize, usize, usize)],
 ) -> (Vec<u64>, Vec<bool>) {
     let mut blocks = build_cfg_with_handlers(code, code_len, handlers);
     for block in &mut blocks {
         compute_gen_kill(code, block);
     }
-    solve_liveness(&mut blocks, num_params);
+    solve_liveness(&mut blocks, param_live_in_mask(num_params, param_slots));
 
     let handler_ranges = handler_live_in_ranges(&blocks, handlers);
 
@@ -1714,11 +1760,14 @@ pub fn allocate_registers_arm64(
     num_params: usize,
     loops: &[(usize, usize)],
 ) -> RegAllocResult {
+    // The ARM64 backend does not build a category-2-aware slot map today, and
+    // its own prologue assumes the identity layout too, so both sides agree.
     allocate_registers_with(
         code,
         code_len,
         num_locals,
         num_params,
+        &[],
         loops,
         &ARM64_LOCAL_GPRS,
         &ARM64_LOCAL_FPS,
@@ -1727,11 +1776,13 @@ pub fn allocate_registers_arm64(
 }
 
 /// Platform-generic register allocation entry point.
+#[allow(clippy::too_many_arguments)]
 fn allocate_registers_with(
     code: &[u8],
     code_len: usize,
     num_locals: usize,
     num_params: usize,
+    param_slots: &[usize],
     loops: &[(usize, usize)],
     gpr_regs: &[u8],
     fp_regs: &[u8],
@@ -1760,7 +1811,7 @@ fn allocate_registers_with(
     for block in &mut blocks {
         compute_gen_kill(code, block);
     }
-    solve_liveness(&mut blocks, num_params);
+    solve_liveness(&mut blocks, param_live_in_mask(num_params, param_slots));
 
     // Build full interference graph. The handler ranges keep a local that only
     // the catch block reads from sharing a register with something defined
@@ -2609,6 +2660,48 @@ mod tests {
         }
     }
 
+    /// Every parameter slot must be live-in at entry, including the ones a
+    /// category-2 parameter pushes past `num_params`.
+    ///
+    /// `private void f(long, Object, Void)` on an instance: `this`=0,
+    /// `long`=1..2, `Object`=3, `Void`=4 — four parameters over five slots.
+    /// Seeding liveness with `(1 << 4) - 1` left slot 4 (the `Void`) dead on
+    /// entry, so the colouring was free to give it the same register as the
+    /// live `Object` in slot 3 — and the prologue, which stores EVERY incoming
+    /// argument into its home, then overwrote the `Object` with the always-null
+    /// `Void` on the way in. Observed as `mov r12, rcx ; mov r12, r8`.
+    #[test]
+    fn every_parameter_slot_is_live_in_even_past_a_category_two_parameter() {
+        // aload_0; lload_1; aload_3; aconst_null; invokevirtual #1; return
+        let code = [0x2a, 0x1f, 0x2d, 0x01, 0xb6, 0x00, 0x01, 0xb1];
+        let param_slots = [0usize, 1, 3, 4];
+
+        let result = allocate_registers_with_handlers(&code, code.len(), 5, 4, &param_slots, &[], &[]);
+        let homes: Vec<Option<u8>> = param_slots
+            .iter()
+            .map(|&s| result.assignments.get(s).copied().flatten())
+            .collect();
+        for (i, a) in homes.iter().enumerate() {
+            for (j, b) in homes.iter().enumerate() {
+                if i != j {
+                    if let (Some(x), Some(y)) = (a, b) {
+                        assert_ne!(
+                            x, y,
+                            "parameter slots {} and {} share register {x}; the prologue \
+                             stores both and would clobber the live one",
+                            param_slots[i], param_slots[j]
+                        );
+                    }
+                }
+            }
+        }
+
+        // The mask helper itself: slot-derived, not count-derived.
+        assert_eq!(param_live_in_mask(4, &param_slots), 0b1_1011);
+        // Empty slot map keeps the historical identity layout.
+        assert_eq!(param_live_in_mask(4, &[]), 0b1111);
+    }
+
     // ── live_locals_per_pc (OSR-exit dead-local detection) ──────────────────
 
     #[test]
@@ -2637,7 +2730,7 @@ mod tests {
             "precondition: with no exception edges the handler's read is invisible"
         );
 
-        let (aware, covered) = live_locals_per_pc_with_handlers(&code, len, 1, &[(2, 5, 8)]);
+        let (aware, covered) = live_locals_per_pc_with_handlers(&code, len, 1, &[], &[(2, 5, 8)]);
         assert_ne!(
             aware[2] & (1 << 1),
             0,
@@ -2839,7 +2932,7 @@ mod tests {
         );
 
         // ...and the allocator built on that graph must keep them apart.
-        let modelled = allocate_registers_with_handlers(&code, code_len, 4, 0, &[], &handlers);
+        let modelled = allocate_registers_with_handlers(&code, code_len, 4, 0, &[], &[], &handlers);
         assert!(
             modelled.assignments[1].is_some() && modelled.assignments[2].is_some(),
             "modelling handlers must not de-register-home either local"
@@ -2888,7 +2981,7 @@ mod tests {
         let code_len = code.len();
         // Pretend the colourer gave local 0 a register home.
         let assignments = vec![Some(12u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0, &[]);
+        let plan = plan_safepoint_publication(&code, code_len, 1, 1, &[], &assignments, 0, &[]);
 
         assert_eq!(plan.reference_locals, 0, "no aload/astore anywhere");
         assert_eq!(plan.register_homed_reference_locals, 0);
@@ -2915,7 +3008,7 @@ mod tests {
         let code_len = code.len();
         // Locals 0 and 1 are refs, local 2 is an int; all three get registers.
         let assignments = vec![Some(12u8), Some(13u8), Some(14u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 3, 1, &assignments, 0, &[]);
+        let plan = plan_safepoint_publication(&code, code_len, 3, 1, &[], &assignments, 0, &[]);
 
         assert_eq!(plan.reference_locals, 0b011);
         assert_eq!(plan.register_homed_reference_locals, 0b011);
@@ -2949,7 +3042,7 @@ mod tests {
         ];
         let code_len = code.len();
         let assignments = vec![Some(12u8), Some(13u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &[], &assignments, 0, &[]);
         assert_ne!(plan.register_homed_reference_locals & (1 << 1), 0);
         assert_eq!(
             plan.publish_at_bci(4) & (1 << 1),
@@ -2972,7 +3065,7 @@ mod tests {
         ];
         let code_len = code.len();
         let assignments = vec![Some(12u8), Some(13u8)];
-        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &[], &assignments, 0, &[]);
         // pc past the end of the code is definitionally uncovered.
         assert_eq!(
             plan.publish_at_bci(code_len + 32),
@@ -2994,7 +3087,7 @@ mod tests {
         // Local 1 spilled (no register home) — its canonical frame slot is
         // already authoritative, so it is not part of the publish set.
         let assignments = vec![Some(12u8), None];
-        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0, &[]);
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &[], &assignments, 0, &[]);
         assert_ne!(plan.reference_locals & (1 << 1), 0);
         assert_eq!(
             plan.register_homed_reference_locals & (1 << 1),
@@ -3009,7 +3102,7 @@ mod tests {
         // taints slot 0, so only the caller's descriptor-derived mask knows.
         let code: Vec<u8> = vec![0xb1]; // return
         let assignments = vec![Some(12u8)];
-        let plan = plan_safepoint_publication(&code, code.len(), 1, 1, &assignments, 0b1, &[]);
+        let plan = plan_safepoint_publication(&code, code.len(), 1, 1, &[], &assignments, 0b1, &[]);
         assert_ne!(plan.reference_locals & 1, 0);
         assert_ne!(plan.register_homed_reference_locals & 1, 0);
         assert!(!plan.no_reference_in_registers());
@@ -3073,32 +3166,14 @@ mod tests {
         }
         code.push(0xb1); // return
         let code_len = code.len();
-        let result = allocate_registers_with(
-            &code,
-            code_len,
-            12,
-            12,
-            &[],
-            &ARM64_LOCAL_GPRS,
-            &ARM64_LOCAL_FPS,
-            &[],
-        );
+        let result = allocate_registers_with(&code, code_len, 12, 12, &[], &[], &ARM64_LOCAL_GPRS, &ARM64_LOCAL_FPS, &[]);
         assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
     }
 
     #[test]
     fn save_area_contract_holds_for_the_handler_shaped_method() {
         let code = HANDLER_AFTER_RETURN;
-        let result = allocate_registers_with(
-            &code,
-            code.len(),
-            3,
-            1,
-            &[],
-            &ARM64_LOCAL_GPRS,
-            &ARM64_LOCAL_FPS,
-            &[],
-        );
+        let result = allocate_registers_with(&code, code.len(), 3, 1, &[], &[], &ARM64_LOCAL_GPRS, &ARM64_LOCAL_FPS, &[]);
         assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
     }
 
@@ -3108,7 +3183,7 @@ mod tests {
         // must be empty (a non-empty one would reserve slots the prologue
         // never writes and shift every later frame region).
         let code: Vec<u8> = vec![0x1a, 0x1b, 0x60, 0x3c, 0xb1];
-        let result = allocate_registers_with(&code, code.len(), 2, 2, &[], &[], &[], &[]);
+        let result = allocate_registers_with(&code, code.len(), 2, 2, &[], &[], &[], &[], &[]);
         assert!(result.assignments.iter().all(Option::is_none));
         assert!(result.used_callee_saved.is_empty());
     }
@@ -3159,7 +3234,7 @@ mod handler_liveness_tests {
         let handlers = [(2usize, 9usize, 12usize)];
 
         let (live_with, covered_with) =
-            live_locals_per_pc_with_handlers(&code, code.len(), 1, &handlers);
+            live_locals_per_pc_with_handlers(&code, code.len(), 1, &[], &handlers);
         assert!(covered_with[4], "the throw site must be a covered pc");
         assert!(
             live_with[4] & (1 << 1) != 0,
@@ -3173,7 +3248,7 @@ mod handler_liveness_tests {
         // Control: with no handlers modelled the same local is genuinely dead
         // there, so this test is pinning the exception edge and not a
         // tautology.
-        let (live_without, _) = live_locals_per_pc_with_handlers(&code, code.len(), 1, &[]);
+        let (live_without, _) = live_locals_per_pc_with_handlers(&code, code.len(), 1, &[], &[]);
         assert!(
             live_without[4] & (1 << 1) == 0,
             "without the exception edge local 1 is dead at pc 4 (redefined at \

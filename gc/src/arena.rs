@@ -722,7 +722,7 @@ impl Arena {
     /// it under steady churn). Measured contribution: `needs_gc` (which
     /// inlines this) was 24.5% of ALL sampled CPU time during a live
     /// `RequestMappingMessageConversionIntegrationTests` run — see
-    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md. The
+    /// CRATONVM-SPRING-GENUINE-BUGLIST. The
     /// epoch-gated cache below makes repeated calls between real changes
     /// O(1); the summation itself is unchanged (same tiers, same order),
     /// so a cache miss recomputes byte-identically to the old behavior.

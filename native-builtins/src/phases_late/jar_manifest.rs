@@ -1362,7 +1362,7 @@ pub(crate) fn spring_class_utils_for_name_impl(
     // resulting `Class` object (`AotMergedContextConfiguration.hashCode()`),
     // and ultimately causing a SECOND, uncustomized `ApplicationContext` to
     // be created and used in place of the properly `@TestBean`/`@MockitoBean`
-    // -overridden one (see docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md,
+    // -overridden one (see CRATONVM-SPRING-GENUINE-BUGLIST,
     // AOT cluster, 2026-07-22 bean-override session). Mirror `Class.forName`'s
     // OWN caller-sensitive fallback here too: if the immediate Java caller of
     // this native (i.e. of `ClassUtils.forName` itself) was defined by a

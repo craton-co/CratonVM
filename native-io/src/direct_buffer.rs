@@ -1158,6 +1158,263 @@ fn cleaners_pending_count() -> usize {
 // Public registration
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Per-element absolute accessors — `DirectByteBuffer.get(int)` / `put(int, byte)`
+// ---------------------------------------------------------------------------
+//
+// PERF (H2 `TestFileSystem.testConcurrent` on `nioMemLZF:`, residual 4 of
+// `docs/known-issues/h2/h2-jitban-residuals-20260726.md`). These two methods
+// are real-JDK bytecode, and each one expands to a try/finally around five
+// nested invocations:
+//
+//     get(i) -> session(), checkIndex(i), ix(i), SCOPED_MEMORY_ACCESS.getByte(),
+//               Reference.reachabilityFence(this)
+//
+// `org.h2.compress.CompressLZF` has `(ByteBuffer, ...)` overloads of
+// `compress`/`expand` that move exactly one byte per call, so a 64 KB page is
+// ~65,000 of those chains per pass. Measured end-to-end cost was ~2 us per
+// element — the `byte[]` overload of the identical algorithm is a `baload`
+// with no call at all, which is why `memLZF:` ran 12x against HotSpot while
+// `nioMemLZF:` ran 1,130x. The cost was never LZF, `ByteBuffer` as such, or
+// the spin lock the test wraps around it: it was per-element dispatch.
+//
+// These natives collapse the whole chain into one call that reads `address`
+// and `limit` out of the receiver and performs a single raw access.
+//
+// DELIBERATELY CONSERVATIVE. Every case not fully modelled here bails to the
+// real bytecode via `invoke_virtual_bytecode_only` rather than guessing:
+//
+//   * layout not resolvable (synthetic-jdk mode, or a JDK whose `Buffer`
+//     fields are named differently) — one-time, memoised;
+//   * index outside `[0, limit)` — the JDK throws a *plain*
+//     `IndexOutOfBoundsException` with a message this layer has no
+//     `RuntimeError` variant for, so the bytecode throws it;
+//   * `isReadOnly` receiver on the `put` side — `DirectByteBufferR` overrides
+//     `put(int, byte)`, so normal dispatch never reaches this native with one,
+//     but a defensive check keeps the guarantee independent of that;
+//   * an address the memory layer declines (freed arena handle, non-readable
+//     pointer) — the bytecode path raises whatever the JDK raises.
+//
+// The bail is a real virtual dispatch to the class-file body, so it can never
+// re-enter this native.
+
+/// Field indices this native family reads out of a `DirectByteBuffer`.
+#[derive(Clone, Copy)]
+struct DbbElemFields {
+    /// `java.nio.Buffer.address` — the base of the off-heap region. Already
+    /// includes any slice/duplicate offset, exactly as `ix(int)` assumes.
+    address: usize,
+    /// `java.nio.Buffer.limit` — the bound `Buffer.checkIndex(int)` enforces.
+    /// Note this is the *limit*, not the capacity: `bb.limit(10); bb.get(20)`
+    /// must throw even on a 64-byte buffer.
+    limit: usize,
+    /// `java.nio.ByteBuffer.isReadOnly`.
+    is_read_only: usize,
+    /// `java.nio.Buffer.position` — the cursor the relative accessors bump.
+    position: usize,
+}
+
+/// Resolve (once) the field indices used by the element accessors.
+///
+/// `DirectByteBufferR` adds no instance fields of its own, so a single
+/// resolution against `java/nio/DirectByteBuffer` covers both receivers.
+/// `None` means "this VM's layout is not the one modelled here" and every
+/// caller bails to bytecode.
+fn dbb_elem_fields(ctx: &mut dyn NativeContext) -> Option<DbbElemFields> {
+    static CACHE: OnceLock<Option<DbbElemFields>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        const CLASS: &str = "java/nio/DirectByteBuffer";
+        Some(DbbElemFields {
+            address: ctx.resolve_field_index(CLASS, "address")?,
+            limit: ctx.resolve_field_index(CLASS, "limit")?,
+            is_read_only: ctx.resolve_field_index(CLASS, "isReadOnly")?,
+            position: ctx.resolve_field_index(CLASS, "position")?,
+        })
+    })
+}
+
+/// Shared prologue: validate the receiver + index against the modelled layout
+/// and return the absolute address of the element, or `None` to bail.
+fn dbb_elem_addr(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    index: i32,
+    for_write: bool,
+) -> Option<i64> {
+    let fields = dbb_elem_fields(ctx)?;
+    let limit = match ctx.get_field(this, fields.limit) {
+        Value::Int(v) => v,
+        _ => return None,
+    };
+    if index < 0 || index >= limit {
+        return None;
+    }
+    if for_write {
+        match ctx.get_field(this, fields.is_read_only) {
+            // `Value::Int(0)` is the only shape that proves writability.
+            Value::Int(0) => {}
+            _ => return None,
+        }
+    }
+    let address = match ctx.get_field(this, fields.address) {
+        Value::Long(v) => v,
+        _ => return None,
+    };
+    if address <= 0 {
+        return None;
+    }
+    // `ix(i)` is `address + ((long) i << 0)`; `index` is non-negative and
+    // `address` is positive, so this cannot wrap.
+    address.checked_add(i64::from(index))
+}
+
+/// `java.nio.DirectByteBuffer.get(int)` — absolute single-byte read.
+fn dbb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = arg_obj(args, 0) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => return dbb_elem_bail_get(ctx, this, args),
+    };
+    let Some(addr) = dbb_elem_addr(ctx, this, index, false) else {
+        return dbb_elem_bail_get(ctx, this, args);
+    };
+    let mut byte = [0u8; 1];
+    if !ctx.copy_from_native_memory(addr, &mut byte) {
+        return dbb_elem_bail_get(ctx, this, args);
+    }
+    // `ByteBuffer.get` returns a Java `byte` — signed. Route through `i8` so a
+    // value >= 0x80 sign-extends the way every `b < 0` caller expects.
+    Ok(Some(Value::Int(i32::from(byte[0] as i8))))
+}
+
+/// `java.nio.DirectByteBuffer.put(int, byte)` — absolute single-byte write.
+fn dbb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = arg_obj(args, 0) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let (index, byte) = match (args.get(1), args.get(2)) {
+        (Some(Value::Int(i)), Some(Value::Int(b))) => (*i, *b),
+        _ => return dbb_elem_bail_put(ctx, this, args),
+    };
+    let Some(addr) = dbb_elem_addr(ctx, this, index, true) else {
+        return dbb_elem_bail_put(ctx, this, args);
+    };
+    // Only the low 8 bits are the `byte`; the operand stack widens it to int.
+    if !ctx.copy_to_native_memory(addr, &[byte as u8]) {
+        return dbb_elem_bail_put(ctx, this, args);
+    }
+    // `put(int, byte)` returns `this`.
+    Ok(Some(Value::Object(Some(this))))
+}
+
+fn dbb_elem_bail_get(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_virtual_bytecode_only(this, "get", "(I)B", &args[1..])
+}
+
+fn dbb_elem_bail_put(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    ctx.invoke_virtual_bytecode_only(this, "put", "(IB)Ljava/nio/ByteBuffer;", &args[1..])
+}
+
+/// Shared prologue for the RELATIVE accessors: validate the receiver, and
+/// return `(element_address, position)` so the caller can commit
+/// `position + 1` only after the access has actually succeeded.
+///
+/// The JDK's `nextGetIndex()`/`nextPutIndex()` bump `position` *before* the
+/// memory access, so a failing access still consumes the slot. This does the
+/// opposite deliberately: every failure here is a bail, and the bytecode we
+/// bail to runs `nextGetIndex()` itself. Committing first would advance
+/// `position` twice for one logical element.
+fn dbb_rel_addr(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    for_write: bool,
+) -> Option<(i64, i32)> {
+    let fields = dbb_elem_fields(ctx)?;
+    let position = match ctx.get_field(this, fields.position) {
+        Value::Int(v) => v,
+        _ => return None,
+    };
+    let limit = match ctx.get_field(this, fields.limit) {
+        Value::Int(v) => v,
+        _ => return None,
+    };
+    // `position < 0` cannot happen through the public API, but a bail costs
+    // nothing and keeps the arithmetic below provably non-negative.
+    if position < 0 || position >= limit {
+        // BufferUnderflowException / BufferOverflowException — thrown by the
+        // real `nextGetIndex()` / `nextPutIndex()`.
+        return None;
+    }
+    if for_write {
+        match ctx.get_field(this, fields.is_read_only) {
+            Value::Int(0) => {}
+            _ => return None,
+        }
+    }
+    let address = match ctx.get_field(this, fields.address) {
+        Value::Long(v) => v,
+        _ => return None,
+    };
+    if address <= 0 {
+        return None;
+    }
+    Some((address.checked_add(i64::from(position))?, position))
+}
+
+/// `java.nio.DirectByteBuffer.get()` — relative single-byte read.
+fn dbb_get_rel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = arg_obj(args, 0) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some((addr, position)) = dbb_rel_addr(ctx, this, false) else {
+        return ctx.invoke_virtual_bytecode_only(this, "get", "()B", &[]);
+    };
+    let mut byte = [0u8; 1];
+    if !ctx.copy_from_native_memory(addr, &mut byte) {
+        return ctx.invoke_virtual_bytecode_only(this, "get", "()B", &[]);
+    }
+    dbb_commit_position(ctx, this, position + 1);
+    Ok(Some(Value::Int(i32::from(byte[0] as i8))))
+}
+
+/// `java.nio.DirectByteBuffer.put(byte)` — relative single-byte write.
+fn dbb_put_rel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(this) = arg_obj(args, 0) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let byte = match args.get(1) {
+        Some(Value::Int(b)) => *b,
+        _ => return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]),
+    };
+    let Some((addr, position)) = dbb_rel_addr(ctx, this, true) else {
+        return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]);
+    };
+    if !ctx.copy_to_native_memory(addr, &[byte as u8]) {
+        return ctx.invoke_virtual_bytecode_only(this, "put", "(B)Ljava/nio/ByteBuffer;", &args[1..]);
+    }
+    dbb_commit_position(ctx, this, position + 1);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// Advance `position` after a successful relative access. Split out so the
+/// `dbb_elem_fields` re-resolution is a single memoised call, not an
+/// `Option` the two callers have to re-unwrap.
+fn dbb_commit_position(ctx: &mut dyn NativeContext, this: ObjectRef, new_position: i32) {
+    if let Some(fields) = dbb_elem_fields(ctx) {
+        ctx.set_field(this, fields.position, Value::Int(new_position));
+    }
+}
+
 /// Register the WP3.5 DirectByteBuffer + Cleaner natives.  Idempotent:
 /// safe to call multiple times.  See module docs for FQN list and
 /// caveats around partial WP1.10 Cleaner integration.
@@ -1311,6 +1568,27 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         "freeMemoryExplicit",
         "(JJ)V",
         dbb_free_explicit,
+    );
+
+    // Per-element absolute accessors. See the block comment above
+    // `DbbElemFields` for why these exist and what they deliberately refuse
+    // to model. Registered on `DirectByteBuffer` only: `DirectByteBufferR`
+    // has its own `put(int, byte)` bytecode (which throws), and inherits
+    // `get(int)`, so the hierarchy walk reaches this `get` for a read-only
+    // receiver and never reaches this `put`.
+    r.register("java/nio/DirectByteBuffer", "get", "(I)B", dbb_get_abs);
+    r.register(
+        "java/nio/DirectByteBuffer",
+        "put",
+        "(IB)Ljava/nio/ByteBuffer;",
+        dbb_put_abs,
+    );
+    r.register("java/nio/DirectByteBuffer", "get", "()B", dbb_get_rel);
+    r.register(
+        "java/nio/DirectByteBuffer",
+        "put",
+        "(B)Ljava/nio/ByteBuffer;",
+        dbb_put_rel,
     );
     r.set_category(__prev_cat);
 }
