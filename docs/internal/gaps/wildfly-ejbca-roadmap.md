@@ -31,7 +31,7 @@ Rough budget: ~71 WPs × 0.5-4 dev-days avg ≈ 100-200 focused dev-days. With 4
 
 ## 1. Success criteria (definition of done)
 
-- [ ] **S0**: Stock OpenJDK 25 spec surface complete — no `todo!()` / `unimplemented!()` / `panic!("not yet"|"todo"|"stub")` in `native-*/src/**`, `vm/src/runtime/**` outside `#[cfg(test)]`. Tracked in `docs/stub-census.md`.
+- [ ] **S0**: Stock OpenJDK 25 spec surface complete — no `todo!()` / `unimplemented!()` / `panic!("not yet"|"todo"|"stub")` in `native-*/src/**`, `vm/src/runtime/**` outside `#[cfg(test)]`. Tracked by `vm/tests/tier1_tests.rs::t9b_inline_constant_native_census` (the census doc was retired 2026-07-28).
 - [ ] **S1**: any pure-Java JAR (no JNI) that runs on HotSpot 25 with `java -jar foo.jar` runs on cratonvm with `cratonvm -jar foo.jar`. No JVM-side patches required.
 - [ ] **S2**: 10 forcing-function apps boot to first user interaction. Suggested set: Keycloak 16/26, EJBCA CE 9, Tomcat 10, Jetty 12, Quarkus 3 (dev mode), Spring Boot 3 (Petclinic), Maven 3.9, Gradle 8 (daemon), Apache Kafka 3 (broker), Apache Cassandra 5. Each gets a smoke fixture under `bench/<app>/`.
 - [ ] **S3**: bench-hotspot-compare geomean ≤ 2× HotSpot 25 on representative workloads (DaCapo + Renaissance subset).
@@ -89,7 +89,7 @@ Dispatch: **5 parallel agents**, all WPs pairwise file-disjoint.
 
 ### WP0.4 — stub census  [S, 0.5d]  ✅ DONE
 - **Outcome**: every `todo!()` / `unimplemented!()` / `panic!("not yet"|"todo"|"stub"` in `native-*` and `vm/src/runtime` listed with owner WP and "reachable by app boot? Y/N".
-- **Resolution (session 93)**: `docs/stub-census.md` refreshed — 34 real stubs. CI no-stubs gate at `vm/src/runtime/interpreter.rs:10983-11010` already enforces zero in production paths.
+- **Resolution (session 93)**: the census was refreshed — 34 real stubs at the time; it has since been retired in favour of the t9b gate. CI no-stubs gate at `vm/src/runtime/interpreter.rs:10983-11010` already enforces zero in production paths.
 
 ### WP0.5 — generic enterprise-app smoke harness  [S, 0.5d]  ✅ DONE
 - **Outcome**: a CI-bound script that pins today's reality as a repeatable failure set so regressions are detected.

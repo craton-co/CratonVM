@@ -7106,6 +7106,52 @@ fn thread_default_name(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// receiver use this to decide "answer here" vs. "let the real bytecode run",
 /// which is what keeps a class-level registration from silently disabling the
 /// method for every real subclass (see the logging-handler block).
+/// Hand a shadowing native back to real bytecode WITHOUT looping.
+///
+/// `invoke_virtual_bytecode_only` re-dispatches on the RECEIVER. When the
+/// native is registered on a SUPERCLASS and the receiver's class overrides the
+/// method, that runs the SUBCLASS body -- whose `invokespecial <Super>.m()`
+/// super-call lands right back on this native. Forever.
+///
+/// Live case: `io.quarkus.bootstrap.logging.QuarkusDelayedHandler.setHandlers`
+/// is `super.setHandlers(...); activate();`, and the
+/// `org/jboss/logmanager/ExtHandler.setHandlers` native re-entered it until
+/// the interpreter's 8192-frame ceiling threw `StackOverflowError` -- which
+/// killed the Keycloak 26.6.1 boot with NO diagnostic at all, because that
+/// throw site prints nothing unless `CRATONVM_DBG_SOE` is set. Same shape as
+/// the `ThreadPoolExecutor.shutdown()` / `ScheduledThreadPoolExecutor` case
+/// [`NativeContext::invoke_special_bytecode_only`] was added for.
+///
+/// Tell the two entry shapes apart by the CALLER: only a subclass of `owner`
+/// can issue `invokespecial owner.m()`, so a call arriving from one IS the
+/// super-call and must run `owner`'s own body (invokespecial semantics, native
+/// check skipped). Everything else is an ordinary virtual call and keeps
+/// re-dispatching on the receiver, so a subclass override still wins.
+pub(crate) fn delegate_to_real_bytecode(
+    ctx: &mut dyn NativeContext,
+    owner: &str,
+    this: ObjectRef,
+    method: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    let caller = {
+        let frames = ctx.capture_stack_trace(0);
+        frames.last().and_then(|f| f.class_id)
+    };
+    let is_super_call = match (caller, ctx.class_id_by_name(owner)) {
+        (Some(caller), Some(owner_id)) => caller != owner_id && ctx.is_subclass(caller, owner_id),
+        _ => false,
+    };
+    if is_super_call {
+        let mut full = Vec::with_capacity(args.len() + 1);
+        full.push(Value::Object(Some(this)));
+        full.extend_from_slice(args);
+        return ctx.invoke_special_bytecode_only(owner, method, descriptor, &full);
+    }
+    ctx.invoke_virtual_bytecode_only(this, method, descriptor, args)
+}
+
 fn is_fabricated_blank_instance(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     let field_count = ctx.object_num_fields(obj);
     for index in 0..field_count {
@@ -17583,7 +17629,10 @@ pub fn register_essential_natives_with_shims(
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if !is_fabricated_blank_instance(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(
+                // Same super-call recursion hazard as `setHandlers` above.
+                return delegate_to_real_bytecode(
+                    ctx,
+                    "org/jboss/logmanager/ExtHandler",
                     this,
                     "addHandler",
                     "(Ljava/util/logging/Handler;)V",
@@ -17600,7 +17649,14 @@ pub fn register_essential_natives_with_shims(
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if !is_fabricated_blank_instance(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(
+                // MUST go through `delegate_to_real_bytecode`: a plain
+                // receiver-dispatch here re-entered
+                // `QuarkusDelayedHandler.setHandlers` (which is
+                // `super.setHandlers(...)` + `activate()`) until the 8192-frame
+                // ceiling threw StackOverflowError.
+                return delegate_to_real_bytecode(
+                    ctx,
+                    "org/jboss/logmanager/ExtHandler",
                     this,
                     "setHandlers",
                     "([Ljava/util/logging/Handler;)[Ljava/util/logging/Handler;",

@@ -1887,6 +1887,159 @@ pub(crate) fn compiled_entry_has_indy_trap(
 /// On refusal the sentinel propagates exactly as before — the outer sinks'
 /// identity checks then despeculate + fall back to the safe re-run.
 ///
+
+/// Two method descriptors name the same parameter list, ignoring the return
+/// type.
+///
+/// The covariant-return BRIDGE case, and the reason `try_resume_trapped_callee`
+/// cannot demand descriptor equality. `javac` emits, for
+/// `class RowDataType implements DataType<SearchRow>`:
+///
+/// ```text
+/// public Object      read(ByteBuffer)  { return read(b); }   // the bridge
+/// public SearchRow   read(ByteBuffer)  { ...the real body... }
+/// ```
+///
+/// A call site typed through the interface names the bridge's descriptor,
+/// while the method that actually runs — and therefore the one that traps and
+/// stashes a frame — is the covariant target. Requiring full descriptor
+/// equality refuses precise resume for every such trap, and the stash then
+/// reaches a sink that can only raise `InternalError`.
+///
+/// Matching on the parameter list alone keeps the guard's actual job (reject a
+/// stash from an unrelated method) while admitting the one shape the JVM
+/// guarantees is the same call: same name, same arity, same parameter types.
+/// Nothing downstream trusts `info` — the callee is re-resolved from the
+/// stash's own key and cross-checked against its declaring class.
+fn descriptors_match_modulo_return(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let params = |d: &str| -> Option<usize> { d.find(')') };
+    match (params(a), params(b)) {
+        (Some(ia), Some(ib)) => a.as_bytes()[..=ia] == b.as_bytes()[..=ib],
+        _ => false,
+    }
+}
+
+
+/// Service a compiled callee's `i64::MIN` sentinel returned by a GENERATED
+/// inline call (the MIC/PIC cascade in `jit/src/x64.rs`).
+///
+/// The inline cascade calls the cached compiled entry directly, so unlike every
+/// dispatch-helper arm there is no Rust frame in between to notice the callee
+/// trapped. Without this, the sentinel reached the caller's generated code as
+/// if the CALLER had deopted, and the callee's reconstructed frame stayed in
+/// the thread's one stash slot until an unrelated sink consumed it — which
+/// de-speculates the wrong method and then, correctly, refuses to resume a
+/// frame that is not its own (`InternalError: precise deoptimization
+/// unavailable`). Reproduced on H2 `TestReopen` / `TestPageStoreCoverage`,
+/// where `MVMap` reads every row through the megamorphic `DataType.read`.
+///
+/// Returns the resumed result, or `i64::MIN` unchanged when the sentinel must
+/// keep propagating (no stash of ours, an implicit exception with no local
+/// handler, …) — i.e. the pre-existing behaviour on every path this does not
+/// service.
+///
+/// # Safety
+/// Same contract as the other JIT dispatch helpers: `vm_ptr` a live `SharedVm`,
+/// `info_ptr` a live `JitInvokeInfo`, `args_ptr` the caller's outgoing argument
+/// slots (`num_args` of them).
+#[no_mangle]
+pub unsafe extern "C" fn jit_service_callee_deopt(
+    vm_ptr: i64,
+    info_ptr: i64,
+    args_ptr: i64,
+    num_args: i64,
+) -> i64 {
+    // Rust<->JIT boundary — same bookkeeping the dispatch helpers do.
+    crate::jit::conservative_roots::note_jit_boundary();
+    if vm_ptr == 0 || info_ptr == 0 {
+        return i64::MIN;
+    }
+    let vm = &*(vm_ptr as *const SharedVm);
+    let info = &*(info_ptr as *const JitInvokeInfo);
+    let n = if num_args > 0 { num_args as usize } else { 0 };
+    let args_slice: &[i64] = if n == 0 || args_ptr == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(args_ptr as *const i64, n)
+    };
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return i64::MIN;
+    };
+    // The receiver's class id, for the callee-exception-table probe. `Object`
+    // arg 0 is the receiver for every invoke kind the inline cascade emits
+    // (virtual/interface); a non-object or absent arg 0 simply misses the
+    // probe, which then behaves as "no local handler".
+    let receiver_class_id = args_slice
+        .first()
+        .and_then(|raw| vm.mem.heap.is_object_address(*raw as usize))
+        .map(|obj| vm.mem.heap.class_id_of(obj))
+        .unwrap_or_else(|| ClassId::new(0));
+    match handle_compiled_callee_deopt_sentinel(vm, thread, info, receiver_class_id, || {
+        decode_dispatch_values(vm, info, args_slice)
+    }) {
+        Some(v) => v,
+        None => i64::MIN,
+    }
+}
+
+/// Handle the `i64::MIN` deopt/exception sentinel returned by a direct call
+/// into a compiled callee.
+///
+/// Shared by both direct-entry arms of `jit_invoke_virtual_mic` — the
+/// monomorphic inline cache and the megamorphic PIC. They MUST agree: a
+/// sentinel returned unhandled is indistinguishable, to the compiled caller,
+/// from the caller's own deopt, so the callee's stashed frame travels up to an
+/// unrelated sink that de-speculates the wrong method and cannot resume.
+///
+/// Returns `Some(v)` when the trap was fully serviced here (`v` is the call's
+/// result), `None` when the sentinel should propagate unchanged.
+///
+/// SAFETY: same contract as the callers — `vm` live, `info` a live
+/// `JitInvokeInfo`, `thread` the current thread's exclusive borrow.
+unsafe fn handle_compiled_callee_deopt_sentinel(
+    vm: &SharedVm,
+    thread: &mut JvmThread,
+    info: &JitInvokeInfo,
+    receiver_class_id: ClassId,
+    decode_values: impl FnOnce() -> JitDecodedArgs,
+) -> Option<i64> {
+    // Precise resume of a frame-stashing deopt in the dispatched callee (see
+    // `try_resume_trapped_callee`). Must run BEFORE the implicit-exception
+    // drains below — a pure deopt sets no exception flags.
+    if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+        return Some(v);
+    }
+    // BUG-H: if the receiver-resolved callee threw an implicit exception
+    // (AIOOBE/NPE) its own `catch` should handle, the direct compiled call
+    // bypassed its exception table. Re-execute it in the interpreter so the
+    // exception routes through the callee's table (e.g. Tomcat
+    // `HttpParser.isNotRequestTargetRelaxed`: `IS_NOT_REQUEST_TARGET[c]`
+    // inside `catch (AIOOBE)`).
+    let aioobe = take_jit_pending_aioobe();
+    let npe = if aioobe.is_none() {
+        take_jit_pending_npe()
+    } else {
+        false
+    };
+    if aioobe.is_some() || npe {
+        if mic_callee_has_exception_table(vm, receiver_class_id, info) {
+            let values = decode_values();
+            return Some(bail_to_interpreter(vm, thread, info, &values));
+        }
+        // No local handler — re-stash the consumed flag and propagate the
+        // sentinel unchanged.
+        if let Some((idx, len)) = aioobe {
+            stash_jit_pending_aioobe(idx, len);
+        } else if npe {
+            stash_jit_pending_npe();
+        }
+    }
+    None
+}
+
 /// SAFETY: same contract as the surrounding dispatch helpers — `vm` live,
 /// `info` a live `JitInvokeInfo`, `thread` the current thread's exclusive
 /// borrow (passed in, NOT re-acquired via `jit_thread_mut`, because some call
@@ -1897,25 +2050,49 @@ unsafe fn try_resume_trapped_callee(
     thread: &mut JvmThread,
     info: &JitInvokeInfo,
 ) -> Option<i64> {
-    let (key, bci) = cratonvm_jit::deopt::peek_last_deopt_identity()?;
+    let trc = |why: &str, detail: &dyn std::fmt::Display| {
+        if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DEOPT").is_some() {
+            eprintln!("[cratonvm-deopt] callee-resume refused ({why}): {detail}");
+        }
+    };
+    let Some((key, bci)) = cratonvm_jit::deopt::peek_last_deopt_identity() else {
+        return None;
+    };
     if key.is_empty() || bci == u32::MAX {
+        trc("no usable stash identity", &format_args!("key={key:?} bci={bci}"));
         return None;
     }
     // After a class redefinition the stash (from a pre-redefine artifact) may
     // describe bytecode that no longer matches the class store — refuse and
     // let the conservative re-run handle it (mirrors `try_osr`'s guard).
     if crate::classloading::any_class_redefined() {
+        trc("a class was redefined", &key);
         return None;
     }
-    let (rest, key_desc) = key.rsplit_once(':')?;
-    let (key_class, key_method) = rest.rsplit_once('.')?;
-    if key_method != info.method_name || key_desc != info.descriptor {
+    let Some((rest, key_desc)) = key.rsplit_once(':') else {
+        trc("unparseable stash key", &key);
+        return None;
+    };
+    let Some((key_class, key_method)) = rest.rsplit_once('.') else {
+        trc("unparseable stash key", &key);
+        return None;
+    };
+    if key_method != info.method_name || !descriptors_match_modulo_return(key_desc, info.descriptor)
+    {
+        trc(
+            "stash is not this call site's callee",
+            &format_args!(
+                "stash={key} site={}{}",
+                info.method_name, info.descriptor
+            ),
+        );
         return None;
     }
 
     // Resolve the trapping method from ITS OWN declaring class (baked in the
     // key) — mirrors the `callee_compiler` resolution recipe.
     let cached = {
+        let _resolve_trace = &trc;
         let cm = vm.classes.class_manager.read();
         let class_id = if info.declaring_class_id == 0 {
             cm.find_bootstrap_class_by_name(key_class)?
@@ -1964,6 +2141,10 @@ unsafe fn try_resume_trapped_callee(
         })
     };
     if bci as usize >= cached.code.len() {
+        trc(
+            "resume bci past the method's code",
+            &format_args!("{key} bci={bci} len={}", cached.code.len()),
+        );
         return None;
     }
 
@@ -1980,6 +2161,7 @@ unsafe fn try_resume_trapped_callee(
             // Unmappable — release partial pins, restore the stash, and let
             // the sentinel propagate to the outer (identity-checked) sinks.
             thread.native_pin_roots.truncate(pin_base);
+            trc("frame not materialisable", &format_args!("{key} bci={bci}"));
             cratonvm_jit::deopt::restash_last_deopt(rframe);
             return None;
         }
@@ -8223,6 +8405,24 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                     vm_ptr,
                     args_slice,
                 ) {
+                    // A megamorphically-dispatched callee deopts exactly like a
+                    // monomorphically-dispatched one, and this arm used to
+                    // return its `i64::MIN` straight to the compiled caller —
+                    // which reads it as its OWN deopt, so the callee's stashed
+                    // frame surfaces at an unrelated sink that de-speculates
+                    // the wrong method and cannot resume it. See
+                    // `handle_compiled_callee_deopt_sentinel`.
+                    if result == i64::MIN {
+                        if let Some(v) = handle_compiled_callee_deopt_sentinel(
+                            vm,
+                            thread,
+                            info,
+                            ClassId::new(receiver_cid),
+                            decode_values,
+                        ) {
+                            return v;
+                        }
+                    }
                     return result;
                 }
             }
@@ -8261,39 +8461,15 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 try_call_compiled_entry_reentrant(entry as usize, needs_ctx, vm_ptr, args_slice)
             };
             if let Some(rc) = rc_opt {
-                // BUG-H: if the receiver-resolved callee threw an implicit
-                // exception (AIOOBE/NPE) its own `catch` should handle, the
-                // direct compiled call bypassed its exception table. Re-execute
-                // it in the interpreter so the exception routes through the
-                // callee's table (e.g. Tomcat `HttpParser.isNotRequestTarget
-                // Relaxed`: `IS_NOT_REQUEST_TARGET[c]` in `catch (AIOOBE)`).
                 if rc == i64::MIN {
-                    // jit-invokedynamic-groovy-regression fix — precise resume
-                    // of a frame-stashing deopt in the MIC-dispatched callee
-                    // (see `try_resume_trapped_callee`). Must run BEFORE the
-                    // implicit-exception drains below (a pure deopt sets no
-                    // exception flags).
-                    if let Some(v) = try_resume_trapped_callee(vm, thread, info) {
+                    if let Some(v) = handle_compiled_callee_deopt_sentinel(
+                        vm,
+                        thread,
+                        info,
+                        receiver_class_id,
+                        decode_values,
+                    ) {
                         return v;
-                    }
-                    let aioobe = take_jit_pending_aioobe();
-                    let npe = if aioobe.is_none() {
-                        take_jit_pending_npe()
-                    } else {
-                        false
-                    };
-                    if aioobe.is_some() || npe {
-                        if mic_callee_has_exception_table(vm, receiver_class_id, info) {
-                            let values = decode_values();
-                            return bail_to_interpreter(vm, thread, info, &values);
-                        }
-                        // No local handler — re-stash the consumed flag and
-                        // propagate the sentinel unchanged (existing behavior).
-                        if let Some((idx, len)) = aioobe {
-                            stash_jit_pending_aioobe(idx, len);
-                        } else if npe {
-                            stash_jit_pending_npe();
-                        }
                     }
                 }
                 return rc;
@@ -10458,6 +10634,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         throw_arithmetic: jit_throw_arithmetic as *const () as usize,
         invoke_dispatch: jit_invoke_dispatch as *const () as usize,
         invoke_virtual_mic: jit_invoke_virtual_mic as *const () as usize,
+        service_callee_deopt: jit_service_callee_deopt as *const () as usize,
         lambda_int_to_double: jit_lambda_int_to_double as *const () as usize,
         write_barrier: jit_write_barrier as *const () as usize,
         // Round-7 fix (CRIT, UAF in JIT): SATB pre-write barrier so JIT-

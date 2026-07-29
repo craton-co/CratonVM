@@ -258,6 +258,69 @@ fn class_id_in_generic_scope(
     scoped.or(global)
 }
 
+/// Resolve a signature class through the declaring class's loader before the
+/// process-global fallback. A read-only nearby lookup cannot find a
+/// child-loader class until something else has loaded it; reflective generic
+/// signatures such as `List<ServiceType>` are often the first use. Falling
+/// straight through to the global loader then splits a JAXB/Spring model graph
+/// by class identity.
+fn resolve_class_id_in_generic_scope(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Option<cratonvm_types::ClassId> {
+    if let Some(cid) = class_id_in_generic_scope(ctx, name) {
+        return Some(cid);
+    }
+
+    let declaring_class = GENERIC_DECL_SCOPE
+        .with(|scope| scope.get())
+        .and_then(|decl| ctx.class_id_from_mirror(decl));
+    if let Some(declaring_class) = declaring_class {
+        let loader_id = ctx.loader_id_of_class(declaring_class);
+        let loader =
+            crate::classloader::defining_loader_for(declaring_class.as_u32()).or_else(|| {
+                (loader_id >= 3)
+                    .then(|| crate::classloader::loader_object_for_namespace_id(loader_id as u32))
+                    .flatten()
+            });
+        if let Some(loader) = loader {
+            if let Some(mirror) =
+                crate::classloader::find_loaded_class_for_loader(ctx, loader, name)
+            {
+                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    return Some(cid);
+                }
+            }
+            let loader_pin = ctx.pin_native_root(loader);
+            let name_obj = ctx.create_string(&name.replace('/', "."));
+            let name_pin = ctx.pin_native_root(name_obj);
+            let loader = ctx.read_native_pin(loader_pin, loader);
+            let name_obj = ctx.read_native_pin(name_pin, name_obj);
+            let loaded = ctx.invoke_virtual(
+                loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(name_obj))],
+            );
+            ctx.unpin_native_roots(name_pin);
+            ctx.unpin_native_roots(loader_pin);
+            if let Ok(Some(Value::Object(Some(mirror)))) = loaded {
+                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    return Some(cid);
+                }
+            }
+        }
+    }
+
+    ctx.load_class(name)
+        .ok()
+        .flatten()
+        .and_then(|value| match value {
+            Value::Object(Some(mirror)) => ctx.class_id_from_mirror(mirror),
+            _ => None,
+        })
+}
+
 fn reflective_type_variable_name(ctx: &mut dyn NativeContext, tv: ObjectRef) -> Option<String> {
     let cname = ctx
         .class_name_of_id(ctx.class_id_of_object(tv))
@@ -395,11 +458,9 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // "Unable to determine source type <S> and target type <T>".
             // Real-JDK reifier likewise returns Class mirrors without forcing
             // initialization.
-            if let Some(cid) = class_id_in_generic_scope(ctx, name) {
+            if let Some(cid) = resolve_class_id_in_generic_scope(ctx, name) {
                 let mirror = ctx.get_class_mirror(cid);
                 Value::Object(Some(mirror))
-            } else if let Ok(Some(v)) = ctx.load_class(name) {
-                v
             } else {
                 Value::Object(None)
             }
@@ -438,11 +499,9 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // fill loop (mirrors `build_mirror_array`).
             let pt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 3);
             let pt_pin = ctx.pin_native_root(pt);
-            let raw_val = if let Some(cid) = class_id_in_generic_scope(ctx, name) {
+            let raw_val = if let Some(cid) = resolve_class_id_in_generic_scope(ctx, name) {
                 let m = ctx.get_class_mirror(cid);
                 Value::Object(Some(m))
-            } else if let Ok(Some(v)) = ctx.load_class(name) {
-                v
             } else {
                 Value::Object(None)
             };
@@ -1009,10 +1068,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             owner,
         } if !type_args.is_empty() || owner.is_some() => {
             let slashed = name.replace('.', "/");
-            let raw_cid = class_id_in_generic_scope(ctx, &slashed).or_else(|| {
-                let _ = ctx.load_class(&slashed);
-                class_id_in_generic_scope(ctx, &slashed)
-            });
+            let raw_cid = resolve_class_id_in_generic_scope(ctx, &slashed);
             // GC-safety (2026-07-16): `raw_mirror` is a resolved Class mirror
             // held in a Rust local across every allocation below (`args` and
             // its per-element `typearg_to_real_type` factory calls, the
@@ -1064,10 +1120,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 Some(o) => typesig_to_real_type(ctx, o),
                 None => match slashed.rsplit_once('$') {
                     Some((outer, _)) => {
-                        let owner_id = class_id_in_generic_scope(ctx, outer).or_else(|| {
-                            let _ = ctx.load_class(outer);
-                            class_id_in_generic_scope(ctx, outer)
-                        });
+                        let owner_id = resolve_class_id_in_generic_scope(ctx, outer);
                         owner_id
                             .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
                             .unwrap_or(Value::Object(None))
