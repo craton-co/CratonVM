@@ -18704,9 +18704,11 @@ pub fn register_essential_natives_with_shims(
     // `m.getClassLoader()`. Two layered overrides:
     //
     //   1. `LazyLoggers.getLogger(String, Module)` — short-circuit by
-    //      returning a synthetic `System$Logger` instance (no-op
-    //      logger). KC16 only needs the return value to be non-null
-    //      for `JmxProperties.<clinit>` to populate its static fields.
+    //      returning a CratonVM-minted `System.Logger` (W5: a working one,
+    //      see `register_system_logger_methods`; it used to be an inert
+    //      instance of the interface itself). KC16 only needs the return
+    //      value to be non-null for `JmxProperties.<clinit>` to populate
+    //      its static fields.
     //   2. `DefaultLoggerFinder.isSystem(Module)` — defensive: if any
     //      caller path bypasses (1) and reaches isSystem with null,
     //      return true (system-loader semantics for boot frames).
@@ -18737,152 +18739,28 @@ pub fn register_essential_natives_with_shims(
         "jdk/internal/logger/LazyLoggers",
         "getLogger",
         "(Ljava/lang/String;Ljava/lang/Module;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            let name_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let cid = ctx
-                .ensure_class_initialized("java/lang/System$Logger")
-                .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))?;
-            let logger = ctx.alloc_object(cid, 1);
-            ctx.set_field(logger, 0, name_obj);
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        native_system_get_logger,
     );
     registry.register(
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            let name_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let cid = ctx
-                .ensure_class_initialized("java/lang/System$Logger")
-                .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))?;
-            let logger = ctx.alloc_object(cid, 1);
-            ctx.set_field(logger, 0, name_obj);
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        native_system_get_logger,
     );
     registry.register(
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;Ljava/util/ResourceBundle;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            let name_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let cid = ctx
-                .ensure_class_initialized("java/lang/System$Logger")
-                .or_else(|_| ctx.ensure_class_initialized("java/lang/Object"))?;
-            let logger = ctx.alloc_object(cid, 1);
-            ctx.set_field(logger, 0, name_obj);
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        native_system_get_logger,
     );
 
-    // T19_H11_SYSTEM_LOGGER_INTERFACE — `System$Logger` is an interface;
-    // our synthetic instance has no bytecode for its methods. Register
-    // no-op natives for `getName`, `isLoggable`, and the various `log`
-    // overloads so JmxProperties.<clinit> + Keycloak's own logging
-    // emitters don't NPE on a missing Code attribute.
-    // W4 REACHABILITY CORRECTION. The wave-3 note here said these interface
-    // natives "serve ONLY the deliberate no-op logger that
-    // `LazyLoggers.getLogger` / `System.getLogger` mint above". The first
-    // clause of that is right (a real user implementation declares its own
-    // methods and is never intercepted) but the second is not: the synthetic
-    // receiver is allocated with the INTERFACE itself as its class, so its
-    // resolved declaring class is also `java/lang/System$Logger`, and both
-    // dispatch sites drop a registered native when
-    // `declaring_is_interface && !is_static` unless the triple is force-listed
-    // (`vm/src/vm/vm_exec.rs` `override_cb`; `vm/src/runtime/interpreter.rs`
-    // `try_stackless_invoke` step 6). `java/lang/System$Logger` is in NO force
-    // list — `git grep 'System$Logger' -- vm/ classloading/` matches only unit
-    // tests in `vm.rs`, which call the callback directly and so bypass
-    // dispatch. So the instance natives below are dead on the real-JDK path,
-    // and in synthetic mode `phases_late::register_p67_misc` re-registers the
-    // same triples later (`register_builtins` = essentials then synthetic
-    // overrides, last-write-wins) and supersedes them.
-    //
-    // They are therefore left exactly as they are: flipping `isLoggable` to
-    // `true` here would change nothing observable while implying the default
-    // build now emits `System.Logger` output. The real gap — that in real-JDK
-    // mode `System.getLogger` is shadowed to hand back an object whose class is
-    // an interface, so every subsequent Logger call lands on an abstract
-    // method — is a registration-structure problem reported out of wave 4, not
-    // something a constant here can fix.
-    let logger_iface = "java/lang/System$Logger";
-    registry.register(
-        logger_iface,
-        "getName",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Object(None))),
-            };
-            // Field 0 holds the requested logger name (set by getLogger above).
-            let name = ctx.get_field(this, 0);
-            Ok(Some(name))
-        },
-    );
-    registry.register(
-        logger_iface,
-        "isLoggable",
-        "(Ljava/lang/System$Logger$Level;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    // log(Level, String) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, Supplier<String>) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, Object) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, String, Throwable) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, Supplier<String>, Throwable) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, String, Object...) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;[Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, ResourceBundle, String, Throwable) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // log(Level, ResourceBundle, String, Object...) : void
-    registry.register(
-        logger_iface,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;[Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // T19_H11_SYSTEM_LOGGER_INTERFACE — the instance side of the logger the
+    // three registrations above mint. See `register_system_logger_methods`
+    // (and the block comment above it) for what the receiver is, why it is no
+    // longer stamped with the `java/lang/System$Logger` INTERFACE, and why the
+    // same method set stays registered on the interface name as well.
+    register_system_logger_methods(registry, CRATON_SYSTEM_LOGGER_CLASS);
+    register_system_logger_methods(registry, "java/lang/System$Logger");
 
     // T19_H14_OPENMBEAN — JMX OpenType / MXBean introspector translation
     // natives. Filters `java.lang.Object` methods out of
@@ -25892,6 +25770,478 @@ thread_local! {
 /// carries an exception.  Calling `printStackTrace` here would bypass the
 /// capture stream on some JDK paths; `toString` is sufficient for framework
 /// diagnostics and remains part of the same captured record.
+// ---------------------------------------------------------------------------
+// java.lang.System.Logger — the receiver CratonVM's `System.getLogger` mints
+// ---------------------------------------------------------------------------
+//
+// W5 STUB REMOVAL. `System.getLogger(String)`, its `ResourceBundle` overload
+// and `jdk.internal.logger.LazyLoggers.getLogger(String, Module)` used to mint
+// a receiver whose CLASS was the `java/lang/System$Logger` INTERFACE itself
+// (`alloc_object(<interface ClassId>, 1)`). That object was inert in both
+// directions:
+//
+//   * the interface declares no instance fields, so the `set_field(logger, 0,
+//     name)` meant to record the logger name wrote past the class's declared
+//     layout (the "undersized object layout" hazard `alloc_concurrent_synthetic`
+//     documents), and
+//   * both instance-dispatch sites — `vm_exec::invoke_on_class_shared`'s
+//     `override_cb` and `interpreter::try_stackless_invoke` step 6 — DROP a
+//     registered native when `declaring_is_interface && !is_static` unless the
+//     triple is force-listed, and `java/lang/System$Logger` is in no force list
+//     (those lists live in `vm/`, not here). So the natives registered on the
+//     interface could not reliably serve it either.
+//
+// Measured against HotSpot 25: `System.getLogger("x").isLoggable(Level.ERROR)`
+// answered false (HotSpot: true), while `getName()` and the 4-arg `log`
+// overload resolved to the ABSTRACT interface declarations, so the JDK's
+// default `log(Level,String)` body — which delegates to
+// `log(level, (ResourceBundle) null, msg, (Object[]) null)` — threw
+// `AbstractMethodError`.
+//
+// The receiver is now stamped with a CONCRETE class of our own,
+// [`CRATON_SYSTEM_LOGGER_CLASS`]. It is never present on any classpath, so it
+// is always a plain synthetic stub — in real-JDK mode as well as synthetic-jdk
+// mode — which means:
+//
+//   * nothing drops a native registered on it (it is not an interface), and
+//   * `invoke_on_class_shared` checks the exact-class native FIRST for the
+//     `cratonvm/internal/*` namespace, and its method-not-found arm walks the
+//     receiver's class chain through the native registry, so every dispatch
+//     route lands on the natives below.
+//
+// The same method set stays registered on the `java/lang/System$Logger`
+// interface name: when a call site resolves to the abstract interface
+// declaration, `invoke_on_class_shared` looks the native up under the DECLARING
+// class before it tries the receiver's own class, and any receiver still
+// stamped with the interface (e.g. one minted by an older cached path) keeps
+// working. Registering there can never shadow a genuine `System.Logger`
+// implementation: a concrete implementation declares these methods itself, so
+// dispatch resolves to its own class and never consults the interface entry —
+// and for the one method with a body in the interface (the default
+// `log(Level,String)`) the interface-native drop rule above still applies, so
+// real bytecode wins.
+//
+// NOT fixed by deleting the shadow and letting the real JDK chain run:
+// `System.getLogger` first needs `Reflection.getCallerClass()` (which returns
+// null on CratonVM boot frames — the resulting `IllegalCallerException` /
+// `DefaultLoggerFinder.isSystem` NPE is precisely why this shim exists), then
+// the `LoggerFinderLoader` → `ServiceLoader` → `BootstrapLogger` chain, of
+// which this crate has not one native or shim, i.e. it has never been
+// exercised under CratonVM.
+
+/// Binary name of the concrete class CratonVM stamps onto the `System.Logger`
+/// instances `System.getLogger` / `LazyLoggers.getLogger` hand out.
+pub(crate) const CRATON_SYSTEM_LOGGER_CLASS: &str = "cratonvm/internal/SystemLogger";
+/// Slot 0 — the requested logger name (`getName()`).
+const SYSTEM_LOGGER_SLOT_NAME: usize = 0;
+/// Slot 1 — the severity threshold this logger publishes at, as an int.
+const SYSTEM_LOGGER_SLOT_THRESHOLD: usize = 1;
+const SYSTEM_LOGGER_SLOTS: usize = 2;
+/// `System.Logger.Level.INFO`'s severity, and the default threshold — matching
+/// a stock JDK, whose `DefaultLoggerFinder`/`SimpleConsoleLogger` publishes at
+/// INFO with no logging configuration. `jdk.internal.event.EventHelper`'s
+/// `isLoggable(DEBUG)` readout (see `jca/provider_chain.rs`) documents the same
+/// default from the other side: DEBUG is NOT loggable on a stock JDK.
+const SYSTEM_LOGGER_SEVERITY_INFO: i32 = 800;
+
+/// `System.Logger.Level` severities, by enum constant name.
+fn system_logger_severity_of(name: &str) -> Option<i32> {
+    Some(match name {
+        "ALL" => i32::MIN,
+        "TRACE" => 400,
+        "DEBUG" => 500,
+        "INFO" => SYSTEM_LOGGER_SEVERITY_INFO,
+        "WARNING" => 900,
+        "ERROR" => 1000,
+        "OFF" => i32::MAX,
+        _ => return None,
+    })
+}
+
+/// Bounds-checked slot read: a receiver minted by an older path (or the
+/// interface-stamped shape this file used to produce) can have fewer slots
+/// than we expect.
+fn system_logger_slot(ctx: &mut dyn NativeContext, obj: ObjectRef, slot: usize) -> Value {
+    if ctx.object_num_fields(obj) > slot {
+        ctx.get_field(obj, slot)
+    } else {
+        Value::Object(None)
+    }
+}
+
+fn system_logger_this(args: &[Value]) -> Option<ObjectRef> {
+    match args.first() {
+        Some(Value::Object(Some(obj))) => Some(*obj),
+        _ => None,
+    }
+}
+
+/// Read a `System.Logger.Level`'s constant name: the `name` field on a real
+/// JDK enum, slot 0 on the synthetic one `p57_alloc_enum` builds.
+fn system_logger_level_name(ctx: &mut dyn NativeContext, level: Option<&Value>) -> Option<String> {
+    let level = match level {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return None,
+    };
+    let by_name = match ctx.get_field_by_name(level, "name") {
+        Value::Object(Some(text)) => ctx.read_string(text),
+        _ => None,
+    };
+    by_name.or_else(|| match system_logger_slot(ctx, level, 0) {
+        Value::Object(Some(text)) => ctx.read_string(text),
+        _ => None,
+    })
+}
+
+fn system_logger_threshold(ctx: &mut dyn NativeContext, this: Option<ObjectRef>) -> i32 {
+    let this = match this {
+        Some(this) => this,
+        None => return SYSTEM_LOGGER_SEVERITY_INFO,
+    };
+    match system_logger_slot(ctx, this, SYSTEM_LOGGER_SLOT_THRESHOLD) {
+        Value::Int(severity) => severity,
+        _ => SYSTEM_LOGGER_SEVERITY_INFO,
+    }
+}
+
+/// `System.Logger.isLoggable(Level)`: never true for `OFF`, otherwise true iff
+/// the level is at least as severe as this logger's threshold.
+fn system_logger_is_loggable(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+    level: Option<&Value>,
+) -> bool {
+    let name = system_logger_level_name(ctx, level);
+    if name.as_deref() == Some("OFF") {
+        return false;
+    }
+    let severity = name
+        .as_deref()
+        .and_then(system_logger_severity_of)
+        .unwrap_or(SYSTEM_LOGGER_SEVERITY_INFO);
+    severity >= system_logger_threshold(ctx, this)
+}
+
+fn system_logger_name_of(ctx: &mut dyn NativeContext, this: Option<ObjectRef>) -> String {
+    let this = match this {
+        Some(this) => this,
+        None => return String::new(),
+    };
+    match system_logger_slot(ctx, this, SYSTEM_LOGGER_SLOT_NAME) {
+        Value::Object(Some(name)) => ctx.read_string(name).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Render a message argument: a `String` directly, anything else through its
+/// own `toString()`.
+fn system_logger_text(ctx: &mut dyn NativeContext, value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::Object(Some(obj))) => {
+            let obj = *obj;
+            ctx.read_string(obj).or_else(|| {
+                match ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
+                    _ => None,
+                }
+            })
+        }
+        Some(Value::Object(None)) => Some("null".to_string()),
+        _ => None,
+    }
+}
+
+/// `Supplier<String>.get()`, evaluated only once the record is known loggable
+/// (the JDK's default `log(Level, Supplier)` bodies make the same promise).
+fn system_logger_supplier_text(
+    ctx: &mut dyn NativeContext,
+    supplier: Option<&Value>,
+) -> Option<String> {
+    let supplier = match supplier {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]) {
+        Ok(Some(value)) => system_logger_text(ctx, Some(&value)),
+        _ => None,
+    }
+}
+
+/// `{0}`-style parameter substitution for the `Object...` overloads.
+fn system_logger_format(
+    ctx: &mut dyn NativeContext,
+    message: &str,
+    params: Option<&Value>,
+) -> String {
+    let params = match params {
+        Some(Value::Object(Some(array))) => *array,
+        _ => return message.to_string(),
+    };
+    let len = ctx.array_length(params);
+    let mut rendered = message.to_string();
+    for index in 0..len {
+        let element = ctx.get_array_element(params, index);
+        let text = system_logger_text(ctx, Some(&element)).unwrap_or_default();
+        rendered = rendered.replace(&format!("{{{index}}}"), &text);
+    }
+    rendered
+}
+
+/// Publish one record through the same console sink every other logging shim
+/// in this crate uses (`record_printed_line` + the `System.out` override).
+fn system_logger_emit(
+    ctx: &mut dyn NativeContext,
+    this: Option<ObjectRef>,
+    level: Option<&Value>,
+    message: Option<String>,
+    throwable: Option<&Value>,
+) {
+    let message = match message {
+        Some(message) => message,
+        None => return,
+    };
+    if !system_logger_is_loggable(ctx, this, level) {
+        return;
+    }
+    let level_name = system_logger_level_name(ctx, level).unwrap_or_else(|| "INFO".to_string());
+    let logger_name = system_logger_name_of(ctx, this);
+    emit_framework_log_with_throwable(
+        ctx,
+        &level_name,
+        &format!("[{logger_name}] {message}"),
+        throwable,
+    );
+}
+
+/// Allocate a `System.Logger` receiver named `name`.
+pub(crate) fn craton_alloc_system_logger(ctx: &mut dyn NativeContext, name: Value) -> ObjectRef {
+    // Native stale-local family: `name` must survive the class registration
+    // and the allocation below, both of which can move the young generation.
+    let name_pin = match name {
+        Value::Object(Some(obj)) => Some((ctx.pin_native_root(obj), obj)),
+        _ => None,
+    };
+    let class_id = ctx.class_id_by_name(CRATON_SYSTEM_LOGGER_CLASS).unwrap_or_else(|| {
+        ctx.ensure_synthetic_class(CRATON_SYSTEM_LOGGER_CLASS, SYSTEM_LOGGER_SLOTS)
+    });
+    let slots = SYSTEM_LOGGER_SLOTS.max(ctx.class_num_total_fields(class_id));
+    let logger = ctx
+        .try_alloc_object_gc_safe(class_id, slots)
+        .unwrap_or_else(|| ctx.alloc_object(class_id, slots));
+    let name = match name_pin {
+        Some((handle, obj)) => Value::Object(Some(ctx.read_native_pin(handle, obj))),
+        None => Value::Object(None),
+    };
+    ctx.set_field(logger, SYSTEM_LOGGER_SLOT_NAME, name);
+    ctx.set_field(
+        logger,
+        SYSTEM_LOGGER_SLOT_THRESHOLD,
+        Value::Int(SYSTEM_LOGGER_SEVERITY_INFO),
+    );
+    if let Some((handle, _)) = name_pin {
+        ctx.unpin_native_roots(handle);
+    }
+    logger
+}
+
+/// `System.getLogger(String)`, `System.getLogger(String, ResourceBundle)` and
+/// `LazyLoggers.getLogger(String, Module)` — all static, all with the requested
+/// name in `args[0]`.
+pub(crate) fn native_system_get_logger(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let name = args.first().copied().unwrap_or(Value::Object(None));
+    let logger = craton_alloc_system_logger(ctx, name);
+    Ok(Some(Value::Object(Some(logger))))
+}
+
+fn native_system_logger_get_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match system_logger_this(args) {
+        Some(this) => this,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(system_logger_slot(ctx, this, SYSTEM_LOGGER_SLOT_NAME)))
+}
+
+fn native_system_logger_is_loggable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let loggable = system_logger_is_loggable(ctx, system_logger_this(args), args.get(1));
+    Ok(Some(Value::Int(i32::from(loggable))))
+}
+
+/// `log(Level, String)`
+fn native_system_logger_log_string(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// `log(Level, Object)`
+fn native_system_logger_log_object(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_system_logger_log_string(ctx, args)
+}
+
+/// `log(Level, String, Throwable)`
+fn native_system_logger_log_string_throwable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    Ok(None)
+}
+
+/// `log(Level, String, Object...)`
+fn native_system_logger_log_params(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(2))
+        .map(|message| system_logger_format(ctx, &message, args.get(3)));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// `log(Level, Supplier<String>)`
+fn native_system_logger_log_supplier(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    if !system_logger_is_loggable(ctx, this, args.get(1)) {
+        return Ok(None);
+    }
+    let message = system_logger_supplier_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// `log(Level, Supplier<String>, Throwable)`
+fn native_system_logger_log_supplier_throwable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    if !system_logger_is_loggable(ctx, this, args.get(1)) {
+        return Ok(None);
+    }
+    let message = system_logger_supplier_text(ctx, args.get(2));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(3));
+    Ok(None)
+}
+
+/// `log(Level, ResourceBundle, String, Throwable)` — the resource bundle is
+/// ignored (CratonVM has no logger-scoped bundle lookup); the key is published
+/// as the message, which is what the JDK does for an absent bundle.
+fn native_system_logger_log_bundle_throwable(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(3));
+    system_logger_emit(ctx, this, args.get(1), message, args.get(4));
+    Ok(None)
+}
+
+/// `log(Level, ResourceBundle, String, Object...)` — this is the overload the
+/// JDK's own default `log(Level, String)` body delegates to, so it is the one
+/// that must work for `System.getLogger("x").log(ERROR, "msg")` to emit.
+fn native_system_logger_log_bundle_params(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = system_logger_this(args);
+    let message = system_logger_text(ctx, args.get(3))
+        .map(|message| system_logger_format(ctx, &message, args.get(4)));
+    system_logger_emit(ctx, this, args.get(1), message, None);
+    Ok(None)
+}
+
+/// Register the full `System.Logger` instance surface under `class_name`.
+///
+/// Called for [`CRATON_SYSTEM_LOGGER_CLASS`] (the receiver's real class, which
+/// every dispatch route reaches) and for `java/lang/System$Logger` (the
+/// declaring class a call site resolves to when it lands on the abstract
+/// interface declaration). See the block comment above for why both are needed
+/// and why the interface registration cannot shadow a real implementation.
+pub(crate) fn register_system_logger_methods(
+    registry: &mut NativeMethodRegistry,
+    class_name: &str,
+) {
+    registry.register(
+        class_name,
+        "getName",
+        "()Ljava/lang/String;",
+        native_system_logger_get_name,
+    );
+    registry.register(
+        class_name,
+        "isLoggable",
+        "(Ljava/lang/System$Logger$Level;)Z",
+        native_system_logger_is_loggable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;)V",
+        native_system_logger_log_string,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;)V",
+        native_system_logger_log_supplier,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/Object;)V",
+        native_system_logger_log_object,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        native_system_logger_log_string_throwable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/function/Supplier;Ljava/lang/Throwable;)V",
+        native_system_logger_log_supplier_throwable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;[Ljava/lang/Object;)V",
+        native_system_logger_log_params,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;Ljava/lang/Throwable;)V",
+        native_system_logger_log_bundle_throwable,
+    );
+    registry.register(
+        class_name,
+        "log",
+        "(Ljava/lang/System$Logger$Level;Ljava/util/ResourceBundle;Ljava/lang/String;[Ljava/lang/Object;)V",
+        native_system_logger_log_bundle_params,
+    );
+}
+
 fn emit_framework_log_with_throwable(
     ctx: &mut dyn NativeContext,
     level: &str,

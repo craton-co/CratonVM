@@ -4927,115 +4927,48 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     register_classvalue_natives(r);
 
     // java.lang.System additions
+    //
+    // W5: the synthetic-jdk path shares ONE implementation of the whole
+    // `System.Logger` surface with the real-JDK path (`lib.rs`'s
+    // `register_system_logger_methods` / `native_system_get_logger`). Both used
+    // to mint a receiver stamped with the `java/lang/System$Logger` INTERFACE
+    // and register the instance methods on that interface name; in real-JDK
+    // mode that name resolves to the genuine interface, whose instance natives
+    // both dispatch sites DROP (`declaring_is_interface && !is_static`), so the
+    // object was inert — `isLoggable` false, `getName`/`log` landing on
+    // abstract declarations. The receiver is now a concrete
+    // `cratonvm/internal/SystemLogger`, and the method set is registered on
+    // both that class and the interface name. See the block comment above
+    // `register_system_logger_methods` in `lib.rs` for the full rationale;
+    // keeping the two modes on one implementation is what stops them drifting
+    // apart again.
+    //
+    // Behaviour notes carried over from the registrations this replaces:
+    //   * the requested logger name IS retained (slot 0), so `getName()` and
+    //     the `log` natives can attribute records to it;
+    //   * `isLoggable(OFF)` is false — `OFF` is the one level that is never
+    //     loggable, so a caller probing it as an "is logging disabled" test
+    //     gets the real JDK's answer;
+    //   * `log` publishes through the same console sink
+    //     (`record_printed_line` + the `System.out` override) as every other
+    //     logging shim in this crate, tagged with the level and logger name.
+    // New in W5: the logger carries a severity threshold (default INFO, as on
+    // a stock JDK), so `isLoggable`/`log` agree with each other and with
+    // HotSpot instead of answering "loggable" for everything but `OFF`.
     r.register(
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            // args[0] is the requested logger name (static method). Dropping it
-            // left every System.Logger anonymous, so `getName()` and the `log`
-            // natives below had nothing to attribute records to. Pin it across
-            // the allocation below (native stale-local family).
-            let name = match args.first() {
-                Some(Value::Object(Some(o))) => Some(*o),
-                _ => None,
-            };
-            let name_pin = name.map(|o| (ctx.pin_native_root(o), o));
-            let logger = alloc_concurrent_synthetic(ctx, "java/lang/System$Logger", 1);
-            let name = match name_pin {
-                Some((handle, o)) => Value::Object(Some(ctx.read_native_pin(handle, o))),
-                None => Value::Object(None),
-            };
-            ctx.set_field(logger, 0, name);
-            if let Some((handle, _)) = name_pin {
-                ctx.unpin_native_roots(handle);
-            }
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        crate::native_system_get_logger,
     );
-    let slogger = "java/lang/System$Logger";
-    r.register(slogger, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    // `System.Logger` is an INTERFACE, so this never shadows a user or
-    // real-JDK implementation (the dispatcher declines a native for an
-    // interface instance method) — it only serves the 1-field synthetic
-    // logger `System.getLogger` hands out above, which carries a name and no
-    // level threshold, and whose `log` below emits unconditionally.
-    //
-    // It was a flat `true`, which got `OFF` wrong: `System.Logger.Level.OFF`
-    // is the one level that is never loggable (real JDK maps it to
-    // `java.util.logging.Level.OFF` and `Logger.isLoggable` is false for it),
-    // so a caller probing `isLoggable(OFF)` as a "is logging disabled" test
-    // was told logging was on. Read the level actually passed instead — the
-    // same `name`-by-name / slot-0 pair the `log` registration below uses to
-    // read the enum (`p57_alloc_enum` writes the name into slot 0).
     r.register(
-        slogger,
-        "isLoggable",
-        "(Ljava/lang/System$Logger$Level;)Z",
-        |ctx, args| {
-            let level_name = match args.get(1) {
-                Some(Value::Object(Some(level))) => {
-                    let by_name = match ctx.get_field_by_name(*level, "name") {
-                        Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    };
-                    by_name.or_else(|| match ctx.get_field(*level, 0) {
-                        Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            };
-            let loggable = level_name.as_deref() != Some("OFF");
-            Ok(Some(Value::Int(i32::from(loggable))))
-        },
+        "java/lang/System",
+        "getLogger",
+        "(Ljava/lang/String;Ljava/util/ResourceBundle;)Ljava/lang/System$Logger;",
+        crate::native_system_get_logger,
     );
-    // `System.Logger.log(Level, String)` — the facade's primary entry point.
-    // A no-op here meant every `System.getLogger(...).log(...)` record was
-    // discarded, while `isLoggable` above answers true. Route it to the same
-    // console sink (`record_printed_line` + the System.out override) that every
-    // other logging shim in this crate publishes through, tagged with the
-    // level name and the logger name.
-    r.register(
-        slogger,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;)V",
-        |ctx, args| {
-            let logger_name = match args.first() {
-                Some(Value::Object(Some(this))) => match ctx.get_field(*this, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                },
-                _ => String::new(),
-            };
-            // Level enum: `name` by name on a real enum, slot 0 on the
-            // synthetic one built by `p57_alloc_enum`.
-            let level_name = match args.get(1) {
-                Some(Value::Object(Some(level))) => {
-                    let by_name = match ctx.get_field_by_name(*level, "name") {
-                        Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    };
-                    by_name.or_else(|| match ctx.get_field(*level, 0) {
-                        Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            }
-            .unwrap_or_else(|| "INFO".to_string());
-            let message = match args.get(2) {
-                Some(Value::Object(Some(m))) => ctx.read_string(*m).unwrap_or_default(),
-                Some(Value::Object(None)) => "null".to_string(),
-                _ => return Ok(None),
-            };
-            crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
-            Ok(None)
-        },
-    );
+    crate::register_system_logger_methods(r, crate::CRATON_SYSTEM_LOGGER_CLASS);
+    crate::register_system_logger_methods(r, "java/lang/System$Logger");
 
     // System.Logger.Level enum
     let sll = "java/lang/System$Logger$Level";

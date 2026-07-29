@@ -7,8 +7,11 @@ reproducing the same defect. That commit documented itself only as an addendum
 inside an unrelated OSR write-up; this is the standalone record, plus the
 quantified before/after, the diagnostics, and the regression test added here.
 
-One rarer, differently-shaped fault survives the fix and is tracked in
-`docs/known-issues/jit-wild-jump-page-aligned-pc-20260728.md`.
+One rarer, differently-shaped fault survives the fix — a `pc == addr` at a
+callee's page-aligned ENTRY rather than mid-body. It is NOT a quiescence bug
+(`active_jit_executions_at_free` is 0 for it) but a stale baked direct-call
+target, closed separately by `33827ce9b`; see the retired
+`jit-wild-jump-page-aligned-pc` write-up alongside this one.
 
 ## Symptom
 

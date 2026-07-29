@@ -10,6 +10,7 @@ param(
   # The current Tomcat data provider exposes indexes 0 through 6657.
   [int]$LastIndex = 6657,
   [int]$ShardSize = 200,
+  [switch]$NoJit,
   [string]$LogDirectory = ''
 )
 
@@ -28,7 +29,7 @@ try {
   for ($start = $FirstIndex; $start -le $LastIndex; $start += $ShardSize) {
     $end = [Math]::Min($LastIndex, $start + $ShardSize - 1)
     $log = Join-Path $LogDirectory ("http2-section82-shard-{0:D4}-{1:D4}.log" -f $start, $end)
-    & $runner -Exe $Exe -Main RunMethods -ExtraCp $ProbeDir -Args2 @($class, '--range', "$start", "$end") `
+    & $runner -Exe $Exe -Main RunMethods -ExtraCp $ProbeDir -Args2 @($class, '--range', "$start", "$end") -NoJit:$NoJit `
       -TimeoutSec 900 -LogFile $log
     if ($LASTEXITCODE -ne 0) { throw "range $start..$end runner exit code $LASTEXITCODE" }
 

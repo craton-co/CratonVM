@@ -1819,13 +1819,32 @@ fn install_signal_handlers() {
     // populates the table in the first place.
     static NAME_JIT_FRAMES: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    // Readability probe for the register dump below: `write(2)` to /dev/null
-    // returns EFAULT for an unmapped buffer instead of faulting.
-    static NULL_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-    NULL_FD.store(
-        unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY) },
-        Ordering::SeqCst,
-    );
+    // Readability probe for the memory dumps below: `write(2)` returns EFAULT
+    // for an unreadable buffer instead of faulting.
+    //
+    // This used to write to /dev/null — which does NOT work. The null device's
+    // write handler returns the byte count without ever touching the user
+    // buffer, so the probe called every address readable, and a fault carrying
+    // a non-pointer in R10 (`r10=0x1` is the shape that exposed this) made the
+    // handler dereference address 1, take a nested SIGSEGV, and re-raise with
+    // SIG_DFL — truncating the report at `#  slot[r10]:`.
+    //
+    // A pipe copies from the buffer for real, so a bad address comes back
+    // EFAULT. Non-blocking so a (impossible in practice: one crash per process,
+    // ~120 bytes, 64 KiB of pipe) full pipe cannot wedge the handler; the read
+    // end stays open for the process lifetime so the write can never EPIPE.
+    static PROBE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    {
+        let mut fds = [-1i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+            unsafe {
+                libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK);
+                libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+                libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            PROBE_FD.store(fds[1], Ordering::SeqCst);
+        }
+    }
     NAME_JIT_FRAMES.store(
         cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JIT_NAMES").is_some(),
         Ordering::SeqCst,
@@ -1956,12 +1975,22 @@ fn install_signal_handlers() {
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &filename[..fpos]);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, FOOTER);
 
+        // ORDERING RULE: everything that can be answered WITHOUT dereferencing
+        // a register goes first, and the raw memory dumps go last. A fault
+        // whose registers hold non-pointers is exactly when the provenance
+        // verdicts matter most, and it is also exactly when a dump can fault
+        // again — which costs the whole rest of the report.
+
         // Indirect-call registers. The JIT's inline MIC/PIC cascade and the
         // hashed megamorphic stub all fault as `MOV R11,[R10+disp]; CALL R11`,
-        // so R10 names the cache slot and R11 the entry it produced.
+        // so R10 names the cache slot and R11 the entry it produced. RSP/RBP
+        // separate a CALL (which has already pushed a return address) from a
+        // JMP, a fall-through, or a corrupted RET.
+        let r10 = greg_from_ucontext(ucontext, GREG_R10);
+        let rsp = greg_from_ucontext(ucontext, GREG_RSP);
         {
-            let r10 = greg_from_ucontext(ucontext, GREG_R10);
             let r11 = greg_from_ucontext(ucontext, GREG_R11);
+            let rbp = greg_from_ucontext(ucontext, GREG_RBP);
             let mut rbuf = [0u8; 16];
             let n = hex_into_buf(&mut rbuf, r10);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  r10=0x");
@@ -1969,44 +1998,51 @@ fn install_signal_handlers() {
             let n = hex_into_buf(&mut rbuf, r11);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" r11=0x");
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            let n = hex_into_buf(&mut rbuf, rsp);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" rsp=0x");
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+            let n = hex_into_buf(&mut rbuf, rbp);
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" rbp=0x");
+            async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
             async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
-
-            // Dump the first 8 qwords of the slot R10 points at, when readable.
-            let fd = NULL_FD.load(Ordering::Relaxed);
-            if fd >= 0 && r10 != 0 {
-                let ptr = r10 as usize as *const u8;
-                let readable = unsafe {
-                    libc::write(fd, ptr as *const libc::c_void, 64) == 64
-                };
-                if readable {
-                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  slot[r10]:");
-                    for i in 0..8usize {
-                        let word = unsafe { std::ptr::read_unaligned((ptr as *const u64).add(i)) };
-                        let n = hex_into_buf(&mut rbuf, word);
-                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" 0x");
-                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
-                    }
-                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
-                } else {
-                    async_signal_safe::write_all(
-                        async_signal_safe::STDERR_FD,
-                        b"#  slot[r10]: UNREADABLE (the cache slot itself is gone)\n",
-                    );
-                }
-            }
         }
 
         // Which compiled body does the faulting PC (and, for an indirect call
         // that jumped to an unmapped target, the faulting ADDRESS) belong to?
         // For a stale inline-cache entry those are the same value, and the name
         // is the callee whose body was retired underneath the cache.
+        //
+        // The OUTCOME of every lookup is reported, not just the hits: a silent
+        // absence used to mean either "no compiled body covers this address" or
+        // "the name-registry mutex happened to be held", and those read very
+        // differently in a report.
         if NAME_JIT_FRAMES.load(Ordering::Relaxed) {
-            for (label, addr) in [(b"#  jit pc  : ".as_slice(), fault_pc), (b"#  jit addr: ".as_slice(), fault_addr)] {
-                if let Some(name) = cratonvm_jit::lookup_jit_method_name(addr as usize) {
-                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
-                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, name.as_bytes());
-                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+            for (label, addr) in [
+                (b"#  jit pc  : ".as_slice(), fault_pc),
+                (b"#  jit addr: ".as_slice(), fault_addr),
+            ] {
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
+                match cratonvm_jit::lookup_jit_method_name_detailed(addr as usize) {
+                    cratonvm_jit::JitNameLookup::Found(name) => {
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            name.as_bytes(),
+                        );
+                    }
+                    cratonvm_jit::JitNameLookup::NotFound => {
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            b"<no published body covers this address>",
+                        );
+                    }
+                    cratonvm_jit::JitNameLookup::Locked => {
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            b"<name registry locked - this is NOT a negative>",
+                        );
+                    }
                 }
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
             }
         }
 
@@ -2042,6 +2078,163 @@ fn install_signal_handlers() {
                 let n = hex_into_buf(&mut rbuf, active as u64);
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
                 async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+            } else {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  fault pc is in NO recently freed code buffer\n",
+                );
+            }
+        }
+
+        // Is the faulting PC inside a code buffer this process still HOLDS? The
+        // name registry knows only bodies `JitCache::put` published; every
+        // `ExecutableBuffer` registers here, including OSR trampolines and
+        // bodies a compiler thread is still emitting.
+        {
+            let mut rbuf = [0u8; 16];
+            match cratonvm_jit::jit_code_region_covering(fault_pc as usize) {
+                cratonvm_jit::JitRegionLookup::Found(base, cap) => {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#  fault pc is inside a LIVE registered code buffer: base=0x",
+                    );
+                    let n = hex_into_buf(&mut rbuf, base as u64);
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" cap=0x");
+                    let n = hex_into_buf(&mut rbuf, cap as u64);
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                }
+                cratonvm_jit::JitRegionLookup::NotFound => {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#  fault pc is in NO live registered code buffer\n",
+                    );
+                }
+                cratonvm_jit::JitRegionLookup::Locked => {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#  code-region registry locked - no verdict\n",
+                    );
+                }
+            }
+        }
+
+        // The kernel's own answer, and the one fact a JIT crash report could
+        // not give without a core dump: is the faulting page a hole between
+        // mappings (a wild jump), or a mapping whose permissions forbid
+        // execution (a buffer that is not RX)?
+        #[cfg(target_os = "linux")]
+        report_maps_neighborhood(fault_pc);
+
+        // ── Raw memory dumps. Last, because they can fault. ────────────────
+        {
+            let mut rbuf = [0u8; 16];
+            // The slot R10 points at, when readable. On the MIC/PIC path this
+            // is the cache slot: class id, entry pointer, ABI flag.
+            if r10 != 0 && probe_readable(PROBE_FD.load(Ordering::Relaxed), r10, 64) {
+                let ptr = r10 as usize as *const u8;
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  slot[r10]:");
+                for i in 0..8usize {
+                    let word = unsafe { std::ptr::read_unaligned((ptr as *const u64).add(i)) };
+                    let n = hex_into_buf(&mut rbuf, word);
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" 0x");
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                }
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+            } else {
+                async_signal_safe::write_all(
+                    async_signal_safe::STDERR_FD,
+                    b"#  slot[r10]: UNREADABLE (r10 is not a readable pointer)\n",
+                );
+            }
+
+            // Top of stack. For a CALL to a bad target `[rsp]` is the return
+            // address, which names the CALLER.
+            if rsp != 0 && probe_readable(PROBE_FD.load(Ordering::Relaxed), rsp, 48) {
+                let ptr = rsp as usize as *const u8;
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"#  [rsp]:");
+                for i in 0..6usize {
+                    let word = unsafe { std::ptr::read_unaligned((ptr as *const u64).add(i)) };
+                    let n = hex_into_buf(&mut rbuf, word);
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" 0x");
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                }
+                async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                if NAME_JIT_FRAMES.load(Ordering::Relaxed) {
+                    let ret = unsafe { std::ptr::read_unaligned(ptr as *const u64) };
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#  jit [rsp]: ",
+                    );
+                    match cratonvm_jit::lookup_jit_method_name_detailed(ret as usize) {
+                        cratonvm_jit::JitNameLookup::Found(name) => {
+                            async_signal_safe::write_all(
+                                async_signal_safe::STDERR_FD,
+                                name.as_bytes(),
+                            );
+                        }
+                        cratonvm_jit::JitNameLookup::NotFound => {
+                            async_signal_safe::write_all(
+                                async_signal_safe::STDERR_FD,
+                                b"<not in any published body - caller is native or interpreted>",
+                            );
+                        }
+                        cratonvm_jit::JitNameLookup::Locked => {
+                            async_signal_safe::write_all(
+                                async_signal_safe::STDERR_FD,
+                                b"<name registry locked - this is NOT a negative>",
+                            );
+                        }
+                    }
+                    async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                }
+            }
+
+            // WHO transferred here? `[rsp]` answers that only for a CALL. A
+            // tail-position jump pushes nothing, so the top of stack still
+            // belongs to a frame further out and the compiled caller is a few
+            // words up. Scan a bounded window for the first word that lands in
+            // a compiled body and name it: that is the innermost JIT frame, and
+            // for a fault at a page-aligned ENTRY it is the method holding the
+            // stale call site.
+            if NAME_JIT_FRAMES.load(Ordering::Relaxed) && rsp != 0 {
+                const WORDS: usize = 64;
+                let mut found = false;
+                for i in 0..WORDS {
+                    let at = rsp.wrapping_add((i * 8) as u64);
+                    if !probe_readable(PROBE_FD.load(Ordering::Relaxed), at, 8) {
+                        break;
+                    }
+                    let word = unsafe { std::ptr::read_unaligned(at as usize as *const u64) };
+                    if let cratonvm_jit::JitNameLookup::Found(name) =
+                        cratonvm_jit::lookup_jit_method_name_detailed(word as usize)
+                    {
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            b"#  innermost JIT frame on the stack: [rsp+0x",
+                        );
+                        let n = hex_into_buf(&mut rbuf, (i * 8) as u64);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"]=0x");
+                        let n = hex_into_buf(&mut rbuf, word);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, &rbuf[..n]);
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b" ");
+                        async_signal_safe::write_all(
+                            async_signal_safe::STDERR_FD,
+                            name.as_bytes(),
+                        );
+                        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    async_signal_safe::write_all(
+                        async_signal_safe::STDERR_FD,
+                        b"#  innermost JIT frame on the stack: none in the first 64 words\n",
+                    );
+                }
             }
         }
 
@@ -2103,6 +2296,10 @@ fn install_signal_handlers() {
 const GREG_R10: usize = 0;
 #[cfg(unix)]
 const GREG_R11: usize = 1;
+#[cfg(unix)]
+const GREG_RSP: usize = 2;
+#[cfg(unix)]
+const GREG_RBP: usize = 3;
 
 /// One general-purpose register out of the signal frame, selected by the
 /// pseudo-indices above. Plain loads only — async-signal-safe.
@@ -2114,10 +2311,11 @@ fn greg_from_ucontext(ucontext: *mut std::ffi::c_void, which: usize) -> u64 {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     unsafe {
         let uc = ucontext as *const libc::ucontext_t;
-        let idx = if which == GREG_R10 {
-            libc::REG_R10
-        } else {
-            libc::REG_R11
+        let idx = match which {
+            GREG_R10 => libc::REG_R10,
+            GREG_R11 => libc::REG_R11,
+            GREG_RSP => libc::REG_RSP,
+            _ => libc::REG_RBP,
         };
         (*uc).uc_mcontext.gregs[idx as usize] as u64
     }
@@ -2153,6 +2351,148 @@ fn fault_pc_from_ucontext(ucontext: *mut std::ffi::c_void) -> u64 {
         let _ = ucontext;
         0
     }
+}
+
+/// Is `len` bytes at `addr` readable, without faulting to find out?
+///
+/// `write(2)` copies from the user buffer inside the kernel and returns
+/// `EFAULT` rather than raising SIGSEGV, so a scratch fd answers the question
+/// safely. `fd` must be a PIPE, not `/dev/null`: the null device's write
+/// handler returns the byte count without ever touching the buffer, which makes
+/// it report every address — including `0x1` — as readable.
+#[cfg(unix)]
+fn probe_readable(fd: i32, addr: u64, len: usize) -> bool {
+    if fd < 0 || addr == 0 {
+        return false;
+    }
+    let n = unsafe { libc::write(fd, addr as usize as *const libc::c_void, len) };
+    // Widening: isize -> usize comparison guarded by the sign check.
+    n >= 0 && n as usize == len
+}
+
+/// Print the `/proc/self/maps` neighbourhood of `addr` to stderr.
+///
+/// Async-signal-safe: `open`/`read`/`write`/`close`, fixed stack buffers, no
+/// allocation and no lock. Read in small chunks rather than slurped, because
+/// this runs on the signal alternate stack.
+#[cfg(target_os = "linux")]
+fn report_maps_neighborhood(addr: u64) {
+    const LBL_MAPPED: &[u8] = b"#  maps: fault pc IS MAPPED - perms are on the `here` line\n";
+    const LBL_GAP: &[u8] = b"#  maps: fault pc is NOT MAPPED - it is the hole between these two\n";
+    const LBL_ABOVE: &[u8] = b"#  maps: fault pc is NOT MAPPED - above the last mapping\n";
+    let fd = unsafe {
+        libc::open(
+            b"/proc/self/maps\0".as_ptr() as *const libc::c_char,
+            libc::O_RDONLY,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    let mut chunk = [0u8; 1024];
+    let mut line = [0u8; 256];
+    let mut prev = [0u8; 256];
+    let mut line_len = 0usize;
+    let mut prev_len = 0usize;
+    let mut decided = false;
+    'read: loop {
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        for i in 0..(n as usize) {
+            let b = chunk[i];
+            if b != b'\n' {
+                if line_len < line.len() {
+                    line[line_len] = b;
+                    line_len += 1;
+                }
+                continue;
+            }
+            let (start, end) = parse_maps_range(&line[..line_len]);
+            if end != 0 && addr >= start && addr < end {
+                emit_maps_pair(LBL_MAPPED, &prev[..prev_len], &line[..line_len]);
+                decided = true;
+                break 'read;
+            }
+            if end != 0 && start > addr {
+                emit_maps_pair(LBL_GAP, &prev[..prev_len], &line[..line_len]);
+                decided = true;
+                break 'read;
+            }
+            prev[..line_len].copy_from_slice(&line[..line_len]);
+            prev_len = line_len;
+            line_len = 0;
+        }
+    }
+    unsafe {
+        libc::close(fd);
+    }
+    if !decided {
+        emit_maps_pair(LBL_ABOVE, &prev[..prev_len], b"");
+    }
+}
+
+/// `write(2)` a maps verdict plus the one or two lines it refers to.
+#[cfg(target_os = "linux")]
+fn emit_maps_pair(label: &[u8], prev: &[u8], here: &[u8]) {
+    async_signal_safe::write_all(async_signal_safe::STDERR_FD, label);
+    for (tag, body) in [
+        (b"#    prev: ".as_slice(), prev),
+        (b"#    here: ".as_slice(), here),
+    ] {
+        if body.is_empty() {
+            continue;
+        }
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, tag);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, body);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, b"\n");
+    }
+}
+
+/// Parse the leading `<start>-<end>` hex range of a `/proc/self/maps` line.
+/// Returns `(0, 0)` for anything that is not a range line.
+#[cfg(target_os = "linux")]
+fn parse_maps_range(line: &[u8]) -> (u64, u64) {
+    fn hexval(b: u8) -> Option<u64> {
+        match b {
+            b'0'..=b'9' => Some((b - b'0') as u64),
+            b'a'..=b'f' => Some((b - b'a' + 10) as u64),
+            b'A'..=b'F' => Some((b - b'A' + 10) as u64),
+            _ => None,
+        }
+    }
+    let mut i = 0usize;
+    let mut start = 0u64;
+    while i < line.len() {
+        match hexval(line[i]) {
+            Some(v) => {
+                start = (start << 4) | v;
+                i += 1;
+            }
+            None => break,
+        }
+    }
+    if i == 0 || i >= line.len() || line[i] != b'-' {
+        return (0, 0);
+    }
+    i += 1;
+    let mut end = 0u64;
+    let mut any = false;
+    while i < line.len() {
+        match hexval(line[i]) {
+            Some(v) => {
+                end = (end << 4) | v;
+                i += 1;
+                any = true;
+            }
+            None => break,
+        }
+    }
+    if !any {
+        return (0, 0);
+    }
+    (start, end)
 }
 
 /// Lower-case hex of `n` into `buf` (no `0x` prefix, no leading zeros).
@@ -2570,6 +2910,74 @@ fn get_heap_info() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readability probe must reject a non-pointer.
+    ///
+    /// This is the regression for the defect that truncated every hardware-fault
+    /// report whose registers held a non-pointer: the probe used to write to
+    /// /dev/null, whose driver returns the byte count without ever reading the
+    /// user buffer, so it called address `0x1` readable and the handler then
+    /// dereferenced it and died. A pipe copies for real and returns EFAULT.
+    #[cfg(unix)]
+    #[test]
+    fn probe_readable_rejects_a_non_pointer_through_a_pipe() {
+        let mut fds = [-1i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        unsafe { libc::fcntl(fds[1], libc::F_SETFL, libc::O_NONBLOCK) };
+
+        let live = [0u64; 8];
+        assert!(
+            probe_readable(fds[1], live.as_ptr() as u64, 64),
+            "a live stack buffer must probe readable"
+        );
+        assert!(
+            !probe_readable(fds[1], 1, 64),
+            "address 0x1 must NOT probe readable - this is the whole point"
+        );
+        assert!(!probe_readable(fds[1], 0, 8), "null is never readable");
+        assert!(!probe_readable(-1, live.as_ptr() as u64, 8), "no fd, no verdict");
+
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// /dev/null is what the probe MUST NOT use. Pinning the reason down in a
+    /// test keeps someone from "simplifying" the pipe back into an open of
+    /// /dev/null: this asserts the broken behaviour is real.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dev_null_reports_even_a_bad_address_as_readable() {
+        let fd = unsafe {
+            libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY)
+        };
+        assert!(fd >= 0);
+        assert!(
+            probe_readable(fd, 1, 64),
+            "if this ever fails, /dev/null started faulting on bad buffers and \
+             the pipe is no longer required"
+        );
+        unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maps_range_parses_a_real_line() {
+        let (start, end) =
+            parse_maps_range(b"709281c12000-709281c14000 r-xp 00000000 00:00 0 ");
+        assert_eq!(start, 0x709281c12000);
+        assert_eq!(end, 0x709281c14000);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn maps_range_rejects_non_range_lines() {
+        assert_eq!(parse_maps_range(b""), (0, 0));
+        assert_eq!(parse_maps_range(b"not a maps line"), (0, 0));
+        // A start with no end is not a usable range.
+        assert_eq!(parse_maps_range(b"7f0000000000-"), (0, 0));
+    }
 
     fn sample_crash_info() -> CrashInfo {
         CrashInfo {
