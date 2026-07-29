@@ -31,5 +31,10 @@ from the isolated Azure worktree and target directory.
 - `LongRareTermsTests`: 2/2 JIT and 2/2 `--nojit`, each `OK (7 tests)`.
 - `cargo test -p cratonvm-native-collections --lib`: 85/85 passed.
 
+After merging current `origin/dev`, b13 (SHA-256
+`31bffd4d7a46fca5393e5b503b3485acbde4e390eeb6a1ead6164660446d41b3`)
+re-ran the exact snapshot class: JIT 3/3 and `--nojit` 4/4 clean consecutive
+repetitions (r2-r5), each `OK (10 tests)`.
+
 The issue is retired from `docs/known-issues` because the exact reproducer and
 the linked residual classes are green in both execution modes.
