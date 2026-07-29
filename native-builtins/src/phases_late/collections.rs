@@ -247,8 +247,31 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let am = "java/util/AbstractMap";
+    // `AbstractMap.isEmpty()` is `return size() == 0;` in the real JDK, and
+    // `size()` is ABSTRACT there — every concrete subclass supplies it. Ask for
+    // it virtually, which is both the real body and layout-independent.
+    //
+    // This used to read raw slot 1 as the size, which assumed CratonVM's
+    // synthetic 3-slot map layout. `AbstractMap` is a CLASS, so this native
+    // intercepts every Map subclass that INHERITS `isEmpty` rather than
+    // overriding it — `TreeMap`, `Collections$UnmodifiableMap`, and friends —
+    // and on those, slot 1 is some unrelated field. When it happened to hold 0,
+    // or anything that is not an `Int`, a fully populated map reported itself
+    // EMPTY. That is the root cause behind the Kafka
+    // `MetaPropertiesEnsemble.verify` shim ("No readable meta.properties files
+    // found" — its populated `logDirProps` map looked empty here), and it is
+    // live in the DEFAULT build.
+    //
+    // The slot read survives only as a fallback for a receiver that has no
+    // reachable `size()` — i.e. a bare synthetic `AbstractMap` — so synthetic
+    // behaviour is unchanged. No recursion risk: `size()` is not registered on
+    // `AbstractMap`, so it can only resolve to a concrete subclass's own
+    // implementation.
     r.register(am, "isEmpty", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(this, "size", "()I", &[]) {
+            return Ok(Some(Value::Int(i32::from(n == 0))));
+        }
         let size = match ctx.get_field(this, 1) {
             Value::Int(v) => v,
             _ => 0,
@@ -280,11 +303,19 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         cratonvm_native_collections::native_map_contains_value_pub,
     );
+    // Same raw-slot-1 hazard as `isEmpty` above, and the same fix: ask the
+    // receiver for its own `size()`. This one cannot be made fully faithful
+    // here — the real `AbstractMap.toString()` renders every entry — but
+    // `{size=N}` with the RIGHT N beats `{size=0}` for a populated real map,
+    // which is what a slot read produced.
     r.register(am, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let size = match ctx.get_field(this, 1) {
-            Value::Int(v) => v,
-            _ => 0,
+        let size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => match ctx.get_field(this, 1) {
+                Value::Int(v) => v,
+                _ => 0,
+            },
         };
         let s = ctx.create_string(&format!("{{size={size}}}"));
         Ok(Some(Value::Object(Some(s))))
