@@ -1,16 +1,63 @@
 # Constant-valued native surface — open items, CLOSED
 
 **Status: closed 2026-07-29.** Retired from `docs/known-issues/`. Every item in
-`native-constant-surface-open-items-20260728.md` was either implemented, moved
-onto the path where it runs, or resolved as a decision recorded in the code
-beside the thing it governs. Nothing is tracked here any more; this file exists
-so the reasoning is findable, not so the list is watched.
+`native-constant-surface-open-items-20260728.md` is implemented, moved onto the
+path where it runs, or resolved as a decision recorded in the code beside the
+thing it governs. Nothing is tracked here any more; this file exists so the
+reasoning is findable, not so the list is watched.
 
 The census that produced the list was itself retired a day earlier
 (`docs/stub-census.md`, 2026-07-28), replaced by
-`vm/tests/tier1_tests.rs::t9b_inline_constant_native_census`. This round adds a
-second gate, `t9c_synthetic_field_tables_cover_their_factories`, for the failure
-mode that kept recurring.
+`vm/tests/tier1_tests.rs::t9b_inline_constant_native_census`.
+
+## Two sessions closed this list independently
+
+Worth recording, because the reconciliation is the interesting part.
+
+`6bb5b27eb "fix: close native constant surface residuals"` (27 files) and
+`fix/native-open-items-20260729` (32 files) were written concurrently against the
+same document, on different hosts, neither knowing about the other. Merging them
+produced **36 conflicts across 11 files** — the same features, different field
+names, different call shapes. They were resolved by picking ONE implementation
+per feature (never blending two), keeping whichever was more complete, and
+re-measuring the result.
+
+Each side had things the other did not, and each side had a defect the other
+caught:
+
+* **Only in `6bb5b27eb`:** the `NativeContext` JFR route
+  (`jfr_begin_java_recording` / `jfr_java_recording_active` /
+  `jfr_emit_java_event` / `jfr_set_java_output` / `jfr_dump_java_recording`);
+  the JMX contention shape; the Windows `ext_opt_sys`;
+  `register_real_jdk_charset_contains`;
+  `register_real_jdk_stackwalker_frame_method_type`; a hand-written eight-class
+  field-table manifest.
+* **Only in this branch:** `t9c_synthetic_field_tables_cover_their_factories`
+  (the tree-wide form of that manifest, which found 31 short entries including
+  two no regex pass had seen); the classpath-retraction API
+  (`NativeContext::unregister_dynamic_classpath` → `ClassPath::remove_path`,
+  use-counted); `Document.getElementById` + the DTD internal-subset parse +
+  `Element.setIdAttribute*`; the `java.net.http` carrier reconciliation; the
+  phase-72 `DatagramSocket` deletion; the Windows `Files.getOwner` SID lookup;
+  `DatagramSocket.setOption`/`getOption`; `JVM.emitEvent` and
+  `JVM.getStackTraceId`; the JEP 486 decision written at the decision point.
+* **Caught in `6bb5b27eb` while merging:** `re8_win_ip` took a non-`Copy`
+  `SOCKET_ADDRESS` **by value** out of a borrowed OS list, so `native-builtins`
+  did not compile on Windows at all. The whole arm is `#[cfg(windows)]`, and
+  their validation ran on Linux (plus a `x86_64-pc-windows-gnu` `cargo check` of
+  `native-io` only), so nothing type-checked it.
+* **Also caught while merging:** their `register_real_jdk_files_owner` had **no
+  caller** — defined but never reached, so `Files.getOwner` was still
+  `UnsupportedOperationException` in the default build. Now wired.
+* **Narrowed while merging:** they put the WHOLE `register_p68_jdbc` on the
+  real-JDK path to make `ResultSetMetaData` answer there. The goal is right but
+  `java/sql/DriverManager` is a CONCRETE class, so a native on it INTERCEPTS —
+  `DriverManager.getConnection(url)` would have handed back a rusqlite
+  connection for every URL, shadowing whatever driver the application
+  registered. `DriverManager` is now its own synthetic-only registrar; the rest
+  of the surface is on `java/sql/*` INTERFACES, which do not intercept an
+  implementation class, so it reaches only CratonVM's own synthetic carriers —
+  which is all `ResultSetMetaData` needed.
 
 ---
 
@@ -20,105 +67,78 @@ mode that kept recurring.
 
 The whole JFR surface on `NativeContext` used to be one hard-coded
 `emit_virtual_thread_pinned_jfr(&'static str)`, so every `jdk.jfr.internal.JVM`
-entry point that should carry a payload bottomed out at a constant. There are now
-four: `jfr_is_recording`, `jfr_set_recording`, `jfr_emit(event_type, fields)` and
-`jfr_stack_trace_id` (`native-api/src/registry.rs`), implemented in
-`vm/src/vm/vm_exec.rs` against the `FlightRecorder` the VM already owned.
+entry point that should carry a payload bottomed out at a constant. There is now
+a real route, and `beginRecording` / `endRecording` / `isRecording` / the
+EventWriter path / dump output all go through it.
 
-`beginRecording`/`endRecording`/`isRecording` now start, stop and read a real
-recording; `emitEvent` emits and reports whether it was stored;
-`getStackTraceId` interns by frame list so the same call site gets a stable id.
-
-What is still constant, and why, is now a different statement: `flush`,
-`markChunkFinal`, `emitOldObjectSamples`, `emitDataLoss` and the `set*` buffer
-knobs address a **chunk writer** this VM does not have. That is a feature this VM
-lacks, named at each registration, not a missing route.
+`emitEvent` and `getStackTraceId` were still constants after the first pass and
+are implemented on that same route rather than a second one: `emitEvent` reports
+`true` exactly when a recording is running, and `getStackTraceId` interns by
+rendered frame list so the same call site asked twice gets the same id — the
+property every JFR consumer relies on, since events reference traces by id and a
+chunk carries each trace once.
 
 ### Thread contention timing — IMPLEMENTED
 
 `isThreadContentionMonitoringSupported()` is `true`. `ThreadJmxSnapshot` carries
-`blocked_count` / `blocked_time_ms` / `waited_count` / `waited_time_ms`, fed by
-the two contended-acquire paths in `vm_exec` and by `monitor_wait`;
-`alloc_snapshot_thread_info` writes them into the `ThreadInfo` instead of the old
-`-1`/`0` sentinels.
+blocked/waited counts and times, fed by the contended-acquire paths and by
+`Object.wait`; the `ThreadInfo` gets them instead of the old `-1`/`0` sentinels.
 
-Counts accumulate always (one relaxed add per contended acquisition). The two
-TIMES accumulate only while `setThreadContentionMonitoringEnabled(true)` is in
-effect and read back as the JMM's `-1` sentinel otherwise — which is the
-specified behaviour, and the state HotSpot boots in.
+One subtlety worth keeping: the COUNT is taken when a thread STARTS blocking, not
+when it finishes. A JMX consumer diagnosing a hang reads `getBlockedCount()`
+while the thread is *still* blocked — counting on release leaves exactly that
+case reporting zero, which a three-arm probe showed before the split.
 
 ### `ThreadInfo.getLockedMonitors()` was contended-only — IMPLEMENTED
 
-`isObjectMonitorUsageSupported()` is `true`. Both gaps are closed:
-
-* the UNCONTENDED `monitorenter` publishes ownership too. Both acquire paths call
-  `complete_jmx_monitor_enter` on the `enter_or_contend(..) == None` arm — the arm
-  that used to early-return. The three `monitorexit` sites already removed
-  unconditionally, so the pair is symmetric and the cost is one registry write
-  the exit path has always paid;
-* `set_jmx_waiting_monitor` / `take_jmx_waiting_monitor` are called around
-  `monitor_wait`, so a thread inside `Object.wait()` reports its monitor instead
-  of nothing.
+`isObjectMonitorUsageSupported()` is `true`. The UNCONTENDED `monitorenter`
+publishes ownership too (the arm that used to early-return), and `Object.wait`
+publishes its monitor. The three `monitorexit` sites already removed
+unconditionally, so the pair is symmetric.
 
 ### `URLClassLoader.close()` could not retract a classpath entry — IMPLEMENTED
 
-`NativeContext::unregister_dynamic_classpath` reaches
-`ClassPath::remove_path`, which use-counts each spec (a JAR handed to two live
-loaders survives the first close) and never touches a startup classpath root.
-`close()` retracts the loader's own URLs; classes already defined stay defined,
-matching HotSpot, where `close()` shuts the `URLClassPath` and unloads nothing.
+`NativeContext::unregister_dynamic_classpath` reaches `ClassPath::remove_path`,
+which use-counts each spec (a JAR handed to two live loaders survives the first
+close) and never touches a startup classpath root. `close()` also marks the
+loader closed, and the loader's own class/resource lookups consult that —
+necessary because in real-JDK mode the loader's `ucp` is never populated, so
+closing it has no effect on its own.
 
-The gap the item named — "the native ABI is append-only, so a native cannot name,
-let alone drop, the entries a loader added" — is closed. `close()` also had to be
-registered on the real-JDK path with a layout-free body
-(`servlet::register_url_classloader_close_bridge`, reached from `vm_init`): the
-two existing implementations both read the URL array out of a fixed slot and
-write a `closed` flag into another, which is safe only on the SYNTHETIC carrier.
-
-RESIDUAL, measured and not papered over. A three-arm probe shows a closed loader
-in real-JDK mode still resolving a class it had not already loaded, and
-`findResource` still returning a URL. The cause is a second mechanism, not the
-retraction: in real-JDK mode CratonVM never populates the loader's `ucp`, so the
-searches are served by `classloader_real::ucl_real_find_class` and
-`classloader::ucl_find_resource` instead — both now consult a closed-loader set
-(`ucl_mark_closed` / `ucl_is_closed`, keyed by identity hash so a moving GC
-cannot stale the key), and the probe should be re-run against those. If it still
-resolves, the next thing to check is whether the real-JDK `close()` bridge is the
-registration that wins for a real `java.net.URLClassLoader` receiver — measure
-`findResource` first, since it is the shortest path from `close()` to an
-observable.
+RESIDUAL, measured. `findResource` on a closed loader now returns `null`, as on
+HotSpot. `loadClass` still resolves a class the loader had not already loaded, so
+one more path reaches the bytes — and since `findResource` is refused, that path
+is not the loader's own search. Next step is to find which one, not to add
+another closed-check on spec.
 
 ### `ForkJoinPool.awaitQuiescence` could lie — IMPLEMENTED
 
-Moved from `native-collections` (which cannot see the pool it must observe) to
-`native-builtins::register_forkjoin_quiescence`, installed by `vm_init`
-immediately after `register_concurrent_natives` so it is the registration that
-wins. It polls the async worker pool's active count and queue depth until
-quiescent or the caller's timeout expires. The old `true` remains in
-`native-collections` as the fallback for an embedding that registers only that
-crate, with the reason spelled out there.
+It observes the live async-task count until the caller's deadline instead of
+returning a fabricated `true`. It had to move out of `native-collections`, which
+cannot see the pool it must observe (`cratonvm-native-builtins` depends on
+`cratonvm-native-collections`, not the reverse).
 
 ### `Charset.contains` threw `AbstractMethodError` — FIXED
 
 `contains` is abstract on `java.nio.charset.Charset` and CratonVM's
 `Charset.forName` hands back an instance of that abstract class, so every
-`invokevirtual contains` hit the abstract declaration. Now registered in the
-real-JDK registrar, sharing the per-family answer table with the synthetic-jdk
-one so the two builds cannot drift.
+`invokevirtual contains` hit the abstract declaration. Now registered on the
+real-JDK path, sharing the per-family answer table with the synthetic-jdk
+registrar so the two builds cannot drift.
 
 ### `Files.getOwner` threw `UnsupportedOperationException` — FIXED
 
-Two separate causes:
+Two separate causes, one found by each session:
 
 1. the native lived in the phase-71 bridge, which is synthetic-jdk-only, so the
    real `Files.getOwner` bytecode ran and threw because
    `getFileAttributeView(path, FileOwnerAttributeView.class)` is null for this
-   provider. `register_files_owner_bridge` puts just that one method on the
-   real-JDK path (narrow on purpose — the phase-68 XML umbrella is the standing
-   example of what pulling a whole synthetic surface across costs);
-2. on Windows the attribute object has no `owner()` at all. `win_file_owner_account`
-   asks the OS (`GetNamedSecurityInfoW` + `LookupAccountSidW`) and returns a real
-   `DOMAIN\account`.
+   provider. `register_real_jdk_files_owner` puts just that one method on the
+   real-JDK path — narrow on purpose, since `register_p68_xml` is the standing
+   example of what pulling a whole synthetic surface across costs;
+2. on Windows the attribute object has no `owner()` at all.
+   `win_file_owner_account` asks the OS (`GetNamedSecurityInfoW` +
+   `LookupAccountSidW`) and returns a real `DOMAIN\account`.
 
 ### Three incompatible `HttpClient` carriers — RESOLVED, and quantified first
 
@@ -130,29 +150,24 @@ exactly two concrete things:
 * `sendAsync(request, handler, pushPromiseHandler)` was owned by RE5 alone while
   every sibling key resolved to `http2.rs`'s 10-slot carrier — so that one body
   read RE5's 9-slot layout (SSLContext at slot 3, proxy at 5) off an object whose
-  slots 3 and 5 are `has-SSL`/`has-proxy` booleans. `http2.rs` now covers the key;
+  slots 3 and 5 are `has-SSL`/`has-proxy` booleans;
 * `version()` / `followRedirects()` returned raw slot **ints** from methods
   declared to return `HttpClient$Version` / `HttpClient$Redirect`, and the
   ordinals disagreed with the `$Version`/`$Redirect` statics owned by
-  `net_channels` (`ALWAYS` was 2 here and 1 there). Both now return real enum
-  objects built by the same `p57_alloc_enum`, with JDK declaration-order ordinals.
+  `net_channels` (`ALWAYS` was 2 in one and 1 in the other). Both now return real
+  enum objects built by the same `p57_alloc_enum`, with JDK declaration-order
+  ordinals.
 
 The remaining shared keys (`awaitTermination`, `isTerminated`, `Builder.priority`,
 `BodyHandlers.ofInputStream`, the enum statics) are layout-INDEPENDENT — side
 table lookups, identity returns, fresh allocations — so no cross-shape read is
-left. That is the whole of the hazard, checked rather than assumed.
+left. Checked rather than assumed.
 
-### `ResultSetMetaData` / JDBC is synthetic-jdk only — CORRECT, recorded in code
+### `ResultSetMetaData` / JDBC was synthetic-jdk only — REGISTERED, NARROWLY
 
-Not a gap. In synthetic-jdk mode `java.sql.*` has no bytecode, so the
-rusqlite-backed surface IS the provider; in real-JDK mode the APPLICATION's driver
-supplies the implementation classes, and registering these natives there would
-shadow the driver's own metadata with SQLite's answers about a database it may not
-be talking to. The precedent is `register_p68_xml`, which broke Tomcat's
-`server.xml` parsing when it was put on the real-JDK path. What real-JDK mode
-genuinely needs — driver discovery, SQL date/time conversion — is in
-`native-builtins/src/jdbc.rs`, which IS registered there. The reasoning now lives
-on `register_p68_jdbc`.
+See the reconciliation note above. The interface-typed surface is on the real-JDK
+path (it cannot intercept a real driver's classes, so it reaches only CratonVM's
+own carriers); `java/sql/DriverManager` deliberately is not.
 
 ### `Document.getElementById` needed a parser feature — IMPLEMENTED
 
@@ -168,36 +183,32 @@ already, which a three-arm probe confirms.
 
 ### Windows NIC enumeration and the Linux-only socket options — IMPLEMENTED
 
-`re8_scan_host_ifaces` has a Windows arm built on `GetAdaptersAddresses`, with
-the JDK's own per-`IfType` naming (`eth%d` / `lo%d` / `ppp%d` / `tun%d` /
-`net%d`) so names round-trip through `getByName`. Before it, `getAll()` was
-loopback-only, every `getHardwareAddress()` was null and no MTU was reported.
+`re8_scan_host_ifaces` has a Windows arm on `GetAdaptersAddresses`. Before it,
+`getAll()` was loopback-only, every `getHardwareAddress()` was null and no MTU
+was reported.
 
-`jdk/net/WindowsSocketOptions` keepalive options are implemented against Ws2_32
-`setsockopt`/`getsockopt`, with the `*Supported0` probe asking the running stack
-exactly as the real JNI body does. `TCP_QUICKACK` and `SO_INCOMING_NAPI_ID` stay
-unsupported on Windows because Windows has neither — which is what the real JDK
-reports there too.
+`jdk/net/WindowsSocketOptions` keepalive options are implemented against Ws2_32,
+with the `*Supported0` probe asking the running stack exactly as the real JNI body
+does. `TCP_QUICKACK` and `SO_INCOMING_NAPI_ID` stay unsupported on Windows because
+Windows has neither — which is what the real JDK reports there too.
 
-`IP_DONTFRAGMENT` is implemented on BOTH platforms and verified end to end
-(`DatagramSocket.setOption(IP_DONTFRAGMENT, true)` then `getOption` now answers
-`true`, where before it was `InternalError("Should not get here")`). The old
-justification — "the native is handed no address family" — was factually wrong:
-the JDK signatures are `getIpDontFragment0(int fd, boolean isIPv6)` and
-`setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`. Reaching it also
-needed `DatagramSocket.setOption`/`getOption` themselves, since
+`IP_DONTFRAGMENT` is implemented on BOTH platforms and verified end to end on
+Windows (`DatagramSocket.setOption(IP_DONTFRAGMENT, true)` then `getOption` now
+answers `true`, where before it was `InternalError("Should not get here")`).
+Reaching it also needed `DatagramSocket.setOption`/`getOption` themselves, since
 `java.net.DatagramSocket.setOption` is `delegate().setOption(..)` and a CratonVM
-datagram socket has no delegate.
+datagram socket has no delegate. The old justification — "the native is handed no
+address family" — was factually wrong: the JDK signatures are
+`getIpDontFragment0(int fd, boolean isIPv6)` and
+`setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`.
 
 RESIDUAL, measured. The TCP keepalive options are still refused for a plain
 `java.net.Socket`. The `jdk/net/WindowsSocketOptions` natives ARE reached — the
 refusal now carries CratonVM's own message rather than the JDK's — so what is
-missing is one level up: the handle id the JDK passes resolves in none of the
-four places a CratonVM socket can live (this crate's `net_sockets` and
-`socket_channel::tcp_registry`, and the fd table's UDP and TCP entries, all four
-of which `ext_opt_any_fd` now tries). The next step is to find where a
-`java.net.Socket`'s descriptor is registered and add it there, the same way
-`ext_opt_dgram_fd` was extended for datagram sockets.
+missing is one level up: the handle id resolves in none of the four places a
+CratonVM socket can live (`net_sockets`, `socket_channel::tcp_registry`, and the
+fd table's UDP and TCP entries, all four of which `ext_opt_any_fd` tries). Find
+where a `java.net.Socket`'s descriptor is registered and add it there.
 
 ### `System.setSecurityManager` vs JEP 486 — DECIDED, recorded in code
 
@@ -212,38 +223,41 @@ at the registration in `security_manager.rs`.
 
 ### The synthetic field-table trap had not been audited — AUDITED, and now GATED
 
-`t9c_synthetic_field_tables_cover_their_factories` compares every literal
-`alloc_concurrent_synthetic(ctx, "a/b/C", N)` site against
-`synthetic_stub_instance_field_count("a/b/C")` — calling the real table function
-rather than parsing its source, because the arms use several construction styles
-and no regex over them stays honest. Both halves are exact, so a failure is a real
-disagreement rather than a scanner artifact.
+Two gates, deliberately, and cross-referenced so a third does not appear:
 
-It found 31 short entries, all fixed (`pad_to(..)` preserves named slots and their
-indices and appends anonymous ones). Two of them — `java/lang/String` 2-vs-4 and
-`java/nio/HeapByteBuffer` 6-vs-8 — had been missed by every regex-based pass,
-which is the argument for the gate rather than for another audit.
+* `t9c_synthetic_field_tables_cover_their_factories` compares every literal
+  `alloc_concurrent_synthetic(ctx, "cls", n)` site against
+  `synthetic_stub_instance_field_count("cls")` — calling the real table function
+  rather than parsing its source, because the arms use several construction
+  styles and no regex over them stays honest. It found 31 short entries, two of
+  which (`java/lang/String` 2-vs-4, `java/nio/HeapByteBuffer` 6-vs-8) every
+  regex-based pass had missed;
+* `native_constant_surface_raw_slot_layout_audit` asserts a hand-written minimum
+  for eight named classes. Kept because it covers the one case the sweep cannot
+  see: a factory whose count is not a literal.
+
+A short entry makes `set_field` silently DISCARD the overflow, which is the shape
+of five bugs found in two days.
 
 ### phase-72 `DatagramSocket` shadowed a working implementation — RESOLVED
 
-`net_phase_e::register_re7_datagram_socket` owns `java/net/DatagramSocket`. The
-slot-based phase-72 set is deleted: it registered later and won every overlapping
+`net_phase_e::register_re7_datagram_socket` owns `java/net/DatagramSocket`; the
+slot-based phase-72 set is deleted. It registered later and won every overlapping
 key in synthetic-jdk builds (the broken set beating the side-table-based one), and
-being `#[cfg(feature = "synthetic-jdk")]` it also meant the four keys it owned
-ALONE (`isBound`, `getLocalAddress`, `setBroadcast`, `getBroadcast`) did not exist
-at all in the default build. All four moved to RE7, which now covers the class in
-both builds.
+being `#[cfg(feature = "synthetic-jdk")]` it also meant the keys it owned ALONE
+(`isBound`, `getLocalAddress`, `setBroadcast`, `getBroadcast`) did not exist at
+all in the default build. All of them, plus `isConnected` and the option surface,
+are on the owning registrar now.
 
 ### The phase-72 fixes were LATENT — RESOLVED by moving them to the live path
 
-`DatagramSocket.connect`/`disconnect`/`isConnected` are implemented on RE7,
-against its side table and a real UDP fd (`FdTable::udp_disconnect`).
-`HttpExchange.getLocalAddress`/`getRemoteAddress` moved into
+`DatagramSocket.connect`/`disconnect`/`isConnected` run against the side table and
+a real UDP fd (`FdTable::udp_disconnect`).
+`HttpExchange.getLocalAddress`/`getRemoteAddress` live in
 `net_phase_e::register_re10_http_server` — the registrar that MINTS the exchange
-and captures those addresses. Producer and consumer now live together, which is
-the whole lesson: the producer half was real-JDK-live while the consumer half was
-gated, so the getters resolved to the abstract declaration and threw
-`AbstractMethodError`.
+and captures those addresses. Producer and consumer together, which is the whole
+lesson: the producer half was real-JDK-live while the consumer half was gated, so
+the getters resolved to the abstract declaration and threw `AbstractMethodError`.
 
 ### `StackFrame.getDescriptor()` still threw — FIXED, and the cause was elsewhere
 
@@ -254,49 +268,37 @@ carrier, `invokeinterface getDescriptor` landed on that default and threw on eve
 frame, including one from a walker built WITH `RETAIN_CLASS_REFERENCE`.
 Registering it on the class intercepts the default.
 
-The related `RETAIN_CLASS_REFERENCE` divergence had its own cause:
-`java.lang.StackFrameInfo` is package-private in `java.base`, so when it cannot be
-loaded CratonVM synthesizes a stub with ANONYMOUS fields — and
-`set_field_by_name(sf, "flags", ..)` wrote nothing while
-`get_field_by_name` read back null, so the check failed open on every frame. The
-flag now has a slot that layout does have (`SF_FLAGS_FALLBACK`), used only when
-the named write does not take.
+The related `RETAIN_CLASS_REFERENCE` divergence had its own cause, and finding it
+took a diagnostic rather than a guess: the carrier `StackWalker.walk()` actually
+hands out is `java.lang.StackWalker$StackFrame`, not `java.lang.StackFrameInfo`,
+so the walker's setting had to be recorded on THAT carrier. (On the
+`StackFrameInfo` path there is a second cause: it is package-private in
+`java.base`, so when it cannot be loaded CratonVM synthesizes a stub with
+ANONYMOUS fields and `set_field_by_name(sf, "flags", ..)` writes nothing.)
 
-Found while fixing it and fixed too: a duplicate `StackWalker.getInstance` pair in
+Found while fixing it: a duplicate `StackWalker.getInstance` pair in
 `register_java_lang_extras_natives` that allocated the walker and wrote none of
 its fields — no `options`, no `retainClassRef`. It registered after the real one,
 so in `--synthetic-jdk` builds every walker came back with its options lost.
 
 ---
 
-## What did NOT change, and why that is the finding
-
-Two of the fifteen items are resolved as decisions rather than code:
-
-* **JDBC in real-JDK mode** — registering the synthetic surface there would shadow
-  the application's own driver. The `register_p68_xml`/Tomcat regression is the
-  precedent, and the reasoning is now on the registrar.
-* **JEP 486** — adopting it would disable the only sandbox this VM has.
-
-Both are recorded next to the code they govern rather than in a tracking file,
-which is the same move that let the census document be deleted: a decision with a
-reason at the decision point does not need a document to remember it.
-
 ## Method note
 
 Every behavioural claim above was measured three ways — HotSpot 25, CratonVM
-before, CratonVM after — over three probe programs, 46 assertions:
-**26 FIXED, 0 REGRESSED, 18 already matching, 2 residuals** (both named above,
-both with the next diagnostic step written down rather than a guess). The standing lesson from the
-previous round applied again and earned its keep twice:
+before, CratonVM after — over three probe programs. The standing lesson from the
+previous round applied again and earned its keep three times:
 
 * `Document.getElementById` and `URLClassLoader.close` already matched HotSpot on
   the BEFORE arm for the paths the first probes exercised, so those probes could
   not have detected a regression OR a fix. Both were rewritten until they
   distinguished the arms (`close` needed a class the loader had not yet loaded);
 * the first `Files.getOwner` fix measured as no change at all, and reading the
-  stack trace — not the diff — showed the throw was coming from real JDK bytecode
-  because the native was registered in a synthetic-only registrar.
+  stack trace — not the diff — showed the throw came from real JDK bytecode
+  because the native was registered in a synthetic-only registrar;
+* the `RETAIN_CLASS_REFERENCE` gate was implemented on the wrong carrier, and a
+  one-line diagnostic print that never fired is what showed the walk natives were
+  not on that path at all.
 
-Probe the specific site a change claims to fix, and read the failure, not just
-the verdict.
+Probe the specific site a change claims to fix, and read the failure, not just the
+verdict.

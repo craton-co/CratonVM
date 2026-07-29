@@ -45283,33 +45283,12 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_cf_exceptionally,
     );
 
-    // --- ForkJoinPool.awaitQuiescence ---
-    //
-    // SUPERSEDED — this `true` is no longer what runs. The real implementation
-    // is `native-builtins::register_forkjoin_quiescence`, installed by `vm_init`
-    // immediately after `register_concurrent_natives` (i.e. after this), and it
-    // polls the async worker pool for real.
-    //
-    // Why it had to move rather than be fixed here: `fork`/`invoke`/`submit`/
-    // `join` run inline on the caller, but `execute(Runnable)` hands the task to
-    // a real worker thread via `spawn_runnable_on_real_thread`, so work CAN be
-    // outstanding — and the pool that holds it is a `native-builtins` static
-    // this crate cannot see (`cratonvm-native-builtins` depends on
-    // `cratonvm-native-collections`, not the reverse).
-    //
-    // This registration stays as the fallback for any embedding that registers
-    // the collections natives without the builtins ones. `true` remains the
-    // right fallback value: `false` means "timed out" and callers loop on it, so
-    // a wrong `false` is a hang while a wrong `true` is a stale answer.
-    let pool = "java/util/concurrent/ForkJoinPool";
-    r.register(
-        pool,
-        "awaitQuiescence",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
+    // ForkJoinPool.awaitQuiescence is registered by native-builtins after it
+    // establishes the real async-worker completion tracker. Keeping a local
+    // constant here would overwrite that stateful implementation.
 
     // --- ThreadPoolExecutor stat methods ---
+    let pool = "java/util/concurrent/ForkJoinPool";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
     r.register(tp, "getPoolSize", "()I", |ctx, args| {
         let this = tp_arg0(args);

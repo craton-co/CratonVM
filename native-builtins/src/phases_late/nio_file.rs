@@ -13162,22 +13162,10 @@ fn nio_owner_principal(ctx: &mut dyn NativeContext, path_value: Value) -> Method
     }
 }
 
-/// Register just `Files.getOwner` for the REAL-JDK path.
-///
-/// The rest of `register_p71_files_bridge` (which also registers it) is reached
-/// only from `register_synthetic_overrides`, so in the default build the real
-/// `java.nio.file.Files.getOwner` bytecode ran — and threw
-/// `UnsupportedOperationException` from `Files.java:2016`, because
-/// `getFileAttributeView(path, FileOwnerAttributeView.class)` comes back null
-/// for CratonVM's provider. HotSpot answers on every platform, so shadow the
-/// method itself rather than trying to synthesize a whole attribute view.
-///
-/// Narrow on purpose: pulling in the whole phase-71 umbrella would put a large
-/// synthetic surface on the real-JDK path, the mistake `register_p68_xml`
-/// documents (it pre-empted Tomcat's real SAX parser).
-pub fn register_files_owner_bridge(r: &mut NativeMethodRegistry) {
-    let __prev_cat = r.current_category();
-    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+/// The real-JDK `Files.getOwner` path reaches provider bytecode that is not
+/// presently complete in CratonVM.  Reuse the attribute-backed owner bridge,
+/// but do not promote the surrounding synthetic Files registrar.
+pub fn register_real_jdk_files_owner(r: &mut NativeMethodRegistry) {
     r.register(
         "java/nio/file/Files",
         "getOwner",
@@ -13187,7 +13175,6 @@ pub fn register_files_owner_bridge(r: &mut NativeMethodRegistry) {
             nio_owner_principal(ctx, path_value)
         },
     );
-    r.set_category(__prev_cat);
 }
 
 /// The owner of a file as Windows reports it: `(account, sid, sid_type)`.

@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use crate::alloc_concurrent_synthetic;
@@ -931,6 +931,77 @@ fn jla_find_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Long(addr as i64)))
 }
 
+/// `JavaLangAccess.addReads(from, to)` is the trusted bridge used by the
+/// module bootstrap code. Calling the real `System$1` bytecode reaches
+/// `Module.implAddReads`; delegate to it so both its heap-side bookkeeping
+/// and the `Module.addReads0` registry mirror run.
+fn jla_call_module_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let from = match args.get(1) {
+        Some(Value::Object(Some(module))) => *module,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("JavaLangAccess: from module is null".to_owned()),
+            }
+            .into())
+        }
+    };
+    ctx.invoke_virtual(from, method, descriptor, &args[2..])?;
+    Ok(None)
+}
+
+fn jla_add_reads(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jla_call_module_impl(ctx, args, "implAddReads", "(Ljava/lang/Module;)V")
+}
+
+fn jla_add_reads_all_unnamed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jla_call_module_impl(ctx, args, "implAddReadsAllUnnamed", "()V")
+}
+
+fn jla_add_exports(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let descriptor = if args.len() == 4 {
+        "(Ljava/lang/String;Ljava/lang/Module;)V"
+    } else {
+        "(Ljava/lang/String;)V"
+    };
+    jla_call_module_impl(ctx, args, "implAddExports", descriptor)
+}
+
+fn jla_add_exports_all_unnamed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jla_call_module_impl(
+        ctx,
+        args,
+        "implAddExportsToAllUnnamed",
+        "(Ljava/lang/String;)V",
+    )
+}
+
+fn jla_add_opens(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jla_call_module_impl(
+        ctx,
+        args,
+        "implAddOpens",
+        "(Ljava/lang/String;Ljava/lang/Module;)V",
+    )
+}
+
+fn jla_add_opens_all_unnamed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jla_call_module_impl(
+        ctx,
+        args,
+        "implAddOpensToAllUnnamed",
+        "(Ljava/lang/String;)V",
+    )
+}
+
+fn jla_add_uses(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jla_call_module_impl(ctx, args, "implAddUses", "(Ljava/lang/Class;)V")
+}
+
 fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     let owner = "java/lang/System$1";
     registry.register(
@@ -944,6 +1015,54 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "currentThread0",
         "()Ljava/lang/Thread;",
         jla_current_carrier_thread,
+    );
+    registry.register(
+        owner,
+        "addReads",
+        "(Ljava/lang/Module;Ljava/lang/Module;)V",
+        jla_add_reads,
+    );
+    registry.register(
+        owner,
+        "addReadsAllUnnamed",
+        "(Ljava/lang/Module;)V",
+        jla_add_reads_all_unnamed,
+    );
+    registry.register(
+        owner,
+        "addExports",
+        "(Ljava/lang/Module;Ljava/lang/String;)V",
+        jla_add_exports,
+    );
+    registry.register(
+        owner,
+        "addExports",
+        "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
+        jla_add_exports,
+    );
+    registry.register(
+        owner,
+        "addExportsToAllUnnamed",
+        "(Ljava/lang/Module;Ljava/lang/String;)V",
+        jla_add_exports_all_unnamed,
+    );
+    registry.register(
+        owner,
+        "addOpens",
+        "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V",
+        jla_add_opens,
+    );
+    registry.register(
+        owner,
+        "addOpensToAllUnnamed",
+        "(Ljava/lang/Module;Ljava/lang/String;)V",
+        jla_add_opens_all_unnamed,
+    );
+    registry.register(
+        owner,
+        "addUses",
+        "(Ljava/lang/Module;Ljava/lang/Class;)V",
+        jla_add_uses,
     );
     registry.register(
         owner,
@@ -2348,9 +2467,12 @@ pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn all_factories_listed() {

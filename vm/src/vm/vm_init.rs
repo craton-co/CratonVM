@@ -1363,14 +1363,6 @@ impl SharedVm {
                 cratonvm_native_builtins::phases_late::register_p61_file_handler(
                     &mut native_methods,
                 );
-                // `Files.getOwner` lives in the phase-71 bridge, which is
-                // synthetic-jdk-only; without this the real
-                // `java.nio.file.Files.getOwner` bytecode throws
-                // UnsupportedOperationException (its provider has no
-                // FileOwnerAttributeView) where HotSpot answers.
-                cratonvm_native_builtins::phases_late::register_files_owner_bridge(
-                    &mut native_methods,
-                );
                 // `URLClassLoader.close()` likewise: the synthetic-only versions
                 // are written for the synthetic carrier's slots and cannot run
                 // against a real `java.net.URLClassLoader`.
@@ -1813,9 +1805,6 @@ impl SharedVm {
             // file). Register just the FileHandler natives directly here.
             // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
             cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
-            // See the twin above: `Files.getOwner` would otherwise throw
-            // UnsupportedOperationException from real JDK bytecode.
-            cratonvm_native_builtins::phases_late::register_files_owner_bridge(&mut native_methods);
             // See the twin above.
             cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
                 &mut native_methods,
@@ -2894,6 +2883,9 @@ impl SharedVm {
                 missing_natives_log: parking_lot::Mutex::new(Vec::new()),
                 flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
                 jfr_dump_on_exit: parking_lot::Mutex::new(None),
+                jfr_java_recording: parking_lot::Mutex::new(None),
+                jfr_java_recording_running: std::sync::atomic::AtomicBool::new(false),
+                jfr_java_output: parking_lot::Mutex::new(None),
                 jcmd_processor: parking_lot::Mutex::new(None),
                 #[cfg(feature = "experimental-debug")]
                 debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),

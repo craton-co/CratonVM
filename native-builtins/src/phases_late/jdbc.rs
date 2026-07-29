@@ -1594,30 +1594,23 @@ fn native_prepared_statement_close(
     Ok(None)
 }
 
-/// REACHABILITY, and why this must NOT be pulled onto the real-JDK path.
+/// `java.sql.DriverManager` — registered ONLY in `--synthetic-jdk` builds.
 ///
-/// Reached only from `register_phase68_natives` -> `register_synthetic_overrides`,
-/// i.e. `#[cfg(feature = "synthetic-jdk")]`. That is deliberate, not an
-/// oversight, and it is the answer to "the JDBC surface (including
-/// `ResultSetMetaData`'s column types) does not apply in the default build":
+/// Split out of `register_p68_jdbc` because `DriverManager` is a CONCRETE class:
+/// a native on it INTERCEPTS, so putting it on the real-JDK path would make
+/// `DriverManager.getConnection(url)` hand back a rusqlite connection for every
+/// URL, shadowing whatever driver the application actually registered. The rest
+/// of this surface is registered on `java/sql/*` INTERFACES, which do not
+/// intercept an implementation class, so it only ever reaches CratonVM's own
+/// synthetic carriers and is safe in both builds — which is what lets
+/// `ResultSetMetaData` answer for them in real-JDK mode.
 ///
-///   * in synthetic-jdk mode `java.sql.*` has no bytecode at all, so this
-///     rusqlite-backed implementation IS the JDBC provider;
-///   * in real-JDK mode `java.sql.*` are real interfaces and the APPLICATION's
-///     driver (H2, sqlite-jdbc, the SQL Server driver, ...) supplies the
-///     implementation classes. Registering these natives there would shadow the
-///     driver's own `ResultSetMetaData` with SQLite's answers about a database
-///     the driver may not even be talking to.
-///
-/// The precedent is `register_p68_xml`: putting THAT synthetic surface on the
-/// real-JDK path pre-empted Tomcat's real SAX parser and broke `server.xml`
-/// parsing. What real-JDK mode genuinely needs from us — driver discovery and
-/// the SQL date/time conversions no driver can do without VM help — is in
-/// `native-builtins/src/jdbc.rs`, which IS registered there.
-pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
+/// What real-JDK mode genuinely needs from us that a driver cannot do for
+/// itself — driver discovery, SQL date/time conversion — lives in
+/// `native-builtins/src/jdbc.rs` and is registered there.
+pub(crate) fn register_p68_jdbc_driver_manager(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // DriverManager — real SQLite connection via rusqlite
     let dm = "java/sql/DriverManager";
     r.register(
         dm,
@@ -1706,7 +1699,85 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    r.register(dm, "registerDriver", "(Ljava/sql/Driver;)V", |ctx, args| {
+        let name = match args.first() {
+            Some(Value::Object(Some(obj))) => {
+                let cid = ctx.class_id_of_object(*obj);
+                ctx.class_name_of_id(cid)
+                    .unwrap_or_else(|| "unknown".to_string())
+            }
+            _ => return Ok(None),
+        };
+        jdbc_registry::register_driver(&name);
+        Ok(None)
+    });
+    r.register(
+        dm,
+        "deregisterDriver",
+        "(Ljava/sql/Driver;)V",
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(obj))) => {
+                    let cid = ctx.class_id_of_object(*obj);
+                    ctx.class_name_of_id(cid).unwrap_or_default()
+                }
+                _ => return Ok(None),
+            };
+            jdbc_registry::deregister_driver(&name);
+            Ok(None)
+        },
+    );
+    r.register(
+        dm,
+        "getDrivers",
+        "()Ljava/util/Enumeration;",
+        |ctx, _args| {
+            // Return an Enumeration over the registered driver names. The
+            // Enumeration synthetic has 2 fields (array=0, pos=1) matching
+            // the shape used by other enumerator sites in native-builtins.
+            let drivers = jdbc_registry::list_drivers();
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, drivers.len());
+            for (i, name) in drivers.iter().enumerate() {
+                let s = ctx.create_string(name);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+            }
+            // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
+            let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+            ctx.set_field(en, 0, Value::Object(Some(arr)));
+            ctx.set_field(en, 1, Value::Int(0));
+            Ok(Some(Value::Object(Some(en))))
+        },
+    );
+    r.set_category(__prev_cat);
+}
 
+/// REACHABILITY, and why this must NOT be pulled onto the real-JDK path.
+///
+/// Reached only from `register_phase68_natives` -> `register_synthetic_overrides`,
+/// i.e. `#[cfg(feature = "synthetic-jdk")]`. That is deliberate, not an
+/// oversight, and it is the answer to "the JDBC surface (including
+/// `ResultSetMetaData`'s column types) does not apply in the default build":
+///
+///   * in synthetic-jdk mode `java.sql.*` has no bytecode at all, so this
+///     rusqlite-backed implementation IS the JDBC provider;
+///   * in real-JDK mode `java.sql.*` are real interfaces and the APPLICATION's
+///     driver (H2, sqlite-jdbc, the SQL Server driver, ...) supplies the
+///     implementation classes. Registering these natives there would shadow the
+///     driver's own `ResultSetMetaData` with SQLite's answers about a database
+///     the driver may not even be talking to.
+///
+/// The precedent is `register_p68_xml`: putting THAT synthetic surface on the
+/// real-JDK path pre-empted Tomcat's real SAX parser and broke `server.xml`
+/// parsing. What real-JDK mode genuinely needs from us — driver discovery and
+/// the SQL date/time conversions no driver can do without VM help — is in
+/// `native-builtins/src/jdbc.rs`, which IS registered there.
+pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // DriverManager — real SQLite connection via rusqlite
+    // `DriverManager` lives in its own registrar — see
+    // `register_p68_jdbc_driver_manager` for why it must not reach the
+    // real-JDK path.
     // Connection = 2-field (conn_id=0, closed=1)
     let conn = "java/sql/Connection";
     r.register(
@@ -3188,55 +3259,6 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     // which matches what `driver.getClass().getName()` returns in the
     // real JDK. This works for any Java-land driver that extends
     // `java.sql.Driver`, including the FakeDriver in TckJdbc.
-    r.register(dm, "registerDriver", "(Ljava/sql/Driver;)V", |ctx, args| {
-        let name = match args.first() {
-            Some(Value::Object(Some(obj))) => {
-                let cid = ctx.class_id_of_object(*obj);
-                ctx.class_name_of_id(cid)
-                    .unwrap_or_else(|| "unknown".to_string())
-            }
-            _ => return Ok(None),
-        };
-        jdbc_registry::register_driver(&name);
-        Ok(None)
-    });
-    r.register(
-        dm,
-        "deregisterDriver",
-        "(Ljava/sql/Driver;)V",
-        |ctx, args| {
-            let name = match args.first() {
-                Some(Value::Object(Some(obj))) => {
-                    let cid = ctx.class_id_of_object(*obj);
-                    ctx.class_name_of_id(cid).unwrap_or_default()
-                }
-                _ => return Ok(None),
-            };
-            jdbc_registry::deregister_driver(&name);
-            Ok(None)
-        },
-    );
-    r.register(
-        dm,
-        "getDrivers",
-        "()Ljava/util/Enumeration;",
-        |ctx, _args| {
-            // Return an Enumeration over the registered driver names. The
-            // Enumeration synthetic has 2 fields (array=0, pos=1) matching
-            // the shape used by other enumerator sites in native-builtins.
-            let drivers = jdbc_registry::list_drivers();
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, drivers.len());
-            for (i, name) in drivers.iter().enumerate() {
-                let s = ctx.create_string(name);
-                ctx.set_array_element(arr, i, Value::Object(Some(s)));
-            }
-            // Concrete `Enumeration$Impl`, not the bare `Enumeration` interface.
-            let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
-            ctx.set_field(en, 0, Value::Object(Some(arr)));
-            ctx.set_field(en, 1, Value::Int(0));
-            Ok(Some(Value::Object(Some(en))))
-        },
-    );
 
     // =========================================================================
     // NEW-14.N2 — java.sql.Blob real implementation

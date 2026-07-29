@@ -258,12 +258,18 @@ boots cleanly. That is interpreter throughput and per-object footprint, both
 tracked elsewhere; it is not memory unsafety and it produces no corruption.
 
 One genuinely separate gap was found while reducing Blocker 3 and is **not**
-part of this chain: the *generational* (default, non-G1) young collector has no
-promotion-failure handling. When to-space and old-gen are both full it prints
-`FATAL: OutOfMemoryError: GC could not relocate a live object` and aborts,
-where G1's evacuation path already self-forwards in place. `kc.sh` runs with
-`-XX:+UseG1GC`, so this never affected the Keycloak boot; it needs its own
-session against `gc/src/gen_heap.rs`.
+part of this chain: the *generational* (default, non-G1) young collector
+aborted the process with
+`FATAL: OutOfMemoryError: GC could not relocate a live object` when to-space
+filled mid-copy. `kc.sh` runs with `-XX:+UseG1GC`, so it never affected the
+Keycloak boot. **FIXED 2026-07-29** in a follow-up on the same day: the
+end-of-cycle expansion grew only `young_to` (the arena that had just been
+reset), so after the next swap the semispaces were a full doubling apart and
+Cheney's "to-space must hold all of from-space" invariant no longer held. The
+semispaces are now equalised at the top of each cycle, while to-space is still
+empty and growing it is legal. Heap exhaustion under the generational collector
+now raises a catchable `OutOfMemoryError: Java heap space` and the VM stays
+usable, matching G1 and HotSpot.
 
 ## Fixture notes
 

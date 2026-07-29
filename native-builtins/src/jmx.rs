@@ -119,6 +119,12 @@ fn uptime_ms() -> u64 {
 static THREAD_CPU_TIME_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// JMM contention monitoring is opt-in, like HotSpot. VM-side counters are
+/// reset at each enable transition so pre-enable lock activity is never leaked
+/// into the observable ThreadInfo values.
+static THREAD_CONTENTION_MONITORING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 static VERBOSE_CLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `-verbose:gc`. Deliberately the SAME cell the synthetic-mode
@@ -350,6 +356,19 @@ fn requested_thread_id(args: &[Value]) -> Option<i64> {
         Value::Long(id) => Some(*id),
         _ => None,
     })
+}
+
+fn native_set_thread_contention_monitoring_enabled(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let enabled = args.iter().any(|value| matches!(value, Value::Int(1)));
+    let was_enabled =
+        THREAD_CONTENTION_MONITORING_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed);
+    if enabled && !was_enabled {
+        ctx.reset_thread_jmx_contention_stats();
+    }
+    Ok(None)
 }
 
 /// JVMTI/JMM thread-status bit for "blocked entering a monitor", the value
@@ -1261,10 +1280,21 @@ fn object_name_has_unquoted_wildcard(text: &str) -> bool {
     let mut quoted = false;
     let mut escaped = false;
     for ch in text.chars() {
-        if escaped { escaped = false; continue; }
-        if ch == '\\' && quoted { escaped = true; continue; }
-        if ch == '"' { quoted = !quoted; continue; }
-        if !quoted && matches!(ch, '*' | '?') { return true; }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quoted {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted && matches!(ch, '*' | '?') {
+            return true;
+        }
     }
     false
 }
@@ -1858,8 +1888,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             } else {
                 const AVG_CLASS_METADATA_BYTES: i64 = 4096;
                 const NON_HEAP_INIT_BYTES: i64 = 2 * 1024 * 1024;
-                let used =
-                    (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
+                let used = (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
                 let committed = used + 1024 * 1024;
                 ctx.set_field(obj, 0, Value::Long(NON_HEAP_INIT_BYTES)); // init
                 ctx.set_field(obj, 1, Value::Long(used)); // used (class-count-derived)
@@ -2270,11 +2299,19 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     for (name, desc) in [
         ("getThreadAllocatedMemory1", "([J[J)V"),
         ("setThreadCpuTimeEnabled0", "(Z)V"),
-        ("setThreadContentionMonitoringEnabled0", "(Z)V"),
-        ("resetContentionTimes0", "(J)V"),
     ] {
         r.register(cls, name, desc, void_noop);
     }
+    r.register(
+        cls,
+        "setThreadContentionMonitoringEnabled0",
+        "(Z)V",
+        native_set_thread_contention_monitoring_enabled,
+    );
+    r.register(cls, "resetContentionTimes0", "(J)V", |ctx, _args| {
+        ctx.reset_thread_jmx_contention_stats();
+        Ok(None)
+    });
 
     // REAL — arbitrary-thread CPU/user time on the real-JDK surface, the twin of
     // `ThreadMXBean.getThreadCpuTime(J)` in `register_thread_mxbean`. Now that
@@ -4346,14 +4383,44 @@ fn alloc_snapshot_thread_info(
         }
         ctx.unpin_native_roots(thread_pin);
     }
-    // Real contention counters (was the -1/0 sentinel quartet). The counts come
-    // from the VM's contended-acquire and `Object.wait()` paths; the two times
-    // are `-1` until `setThreadContentionMonitoringEnabled(true)`, which is the
-    // value the JMM specifies while the feature is off.
-    ctx.set_field_by_name(info, "blockedTime", Value::Long(snapshot.blocked_time_ms));
-    ctx.set_field_by_name(info, "blockedCount", Value::Long(snapshot.blocked_count));
-    ctx.set_field_by_name(info, "waitedTime", Value::Long(snapshot.waited_time_ms));
-    ctx.set_field_by_name(info, "waitedCount", Value::Long(snapshot.waited_count));
+    let contention_enabled =
+        THREAD_CONTENTION_MONITORING_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    ctx.set_field_by_name(
+        info,
+        "blockedTime",
+        Value::Long(if contention_enabled {
+            snapshot.blocked_time_ms
+        } else {
+            -1
+        }),
+    );
+    ctx.set_field_by_name(
+        info,
+        "blockedCount",
+        Value::Long(if contention_enabled {
+            snapshot.blocked_count
+        } else {
+            0
+        }),
+    );
+    ctx.set_field_by_name(
+        info,
+        "waitedTime",
+        Value::Long(if contention_enabled {
+            snapshot.waited_time_ms
+        } else {
+            -1
+        }),
+    );
+    ctx.set_field_by_name(
+        info,
+        "waitedCount",
+        Value::Long(if contention_enabled {
+            snapshot.waited_count
+        } else {
+            0
+        }),
+    );
     ctx.set_field_by_name(info, "lockOwnerId", Value::Long(snapshot.lock_owner_id));
     ctx.set_field_by_name(info, "priority", Value::Int(5));
     ctx.set_field_by_name(info, "stackTrace", Value::Object(Some(stack_trace)));
@@ -4688,24 +4755,33 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         THREAD_CPU_TIME_ENABLED.store(enable, std::sync::atomic::Ordering::Relaxed);
         Ok(None)
     });
-    // REAL (was a KEEP-false while the publish was one-sided). Both gaps that
-    // justified `false` are closed in crate `vm`:
+    // KEEP false — CONFIRMED 2026-07-28, and it is now a DIFFERENT reason from
+    // the one below it, so the two must not be re-merged. Tomcat's
+    // Diagnostics.getVMInfo() (manager vminfo command) calls both
+    // unconditionally.
     //
-    //   * the UNCONTENDED `monitorenter` now publishes ownership too. Both
-    //     acquire paths (`vm_exec::monitor_enter_blocking` and
-    //     `monitor_enter_synchronized_method`) call `complete_jmx_monitor_enter`
-    //     on the `enter_or_contend(..) == None` arm, which is the arm that used
-    //     to early-return. The three `monitorexit` sites already removed
-    //     unconditionally, so the pair is now symmetric and
-    //     `getLockedMonitors()` reports every monitor a thread holds, not only
-    //     the ones it had to wait for.
-    //   * `set_jmx_waiting_monitor` / `take_jmx_waiting_monitor` are called
-    //     around `vm_exec::monitor_wait`, so a thread inside `Object.wait()`
-    //     reports its monitor instead of nothing.
+    // The write side landed: `vm_exec::monitor_enter_blocking` (vm_exec.rs:1470
+    // / 1538) and `monitor_enter_synchronized_method` (1571 / 1628) now call
+    // `set_jmx_contended_monitor` / `complete_jmx_monitor_enter`. But BOTH sites
+    // sit behind `monitors.enter_or_contend(...)` returning `Some`, and both
+    // early-return when it returns `None` — which is exactly the UNCONTENDED
+    // acquisition, i.e. the overwhelming majority of `monitorenter`s. So
+    // `jmx_locked_monitors` accumulates only monitors that happened to be
+    // contended when acquired, and `getLockedMonitors()` returns a partial list
+    // with no way for the caller to tell. Claiming support while under-reporting
+    // held monitors is worse than reporting the feature unsupported: a JMX
+    // client diagnosing a hang would read "this thread holds nothing" and rule
+    // out the very lock it holds.
+    // Second, independent gap: `set_jmx_waiting_monitor` /
+    // `take_jmx_waiting_monitor` still have NO callers, so a thread inside
+    // `Object.wait()` reports no waited-on monitor at all.
     //
-    // Tomcat's `Diagnostics.getVMInfo()` (manager vminfo) calls this together
-    // with `isSynchronizerUsageSupported` below; they remain separate questions
-    // and must not be re-merged.
+    // STILL NEEDED (crate `vm`, not this one): publish ownership on the
+    // UNCONTENDED fast path too — wherever `enter_or_contend` returns `None`,
+    // and symmetrically on the recursive-exit path that already calls
+    // `remove_jmx_locked_monitor` (`interpreter.rs` 8052 / 18222 / 39863) —
+    // plus `set_jmx_waiting_monitor`/`take_jmx_waiting_monitor` around
+    // `Object.wait()`.
     r.register(
         cls,
         "isObjectMonitorUsageSupported",
@@ -4736,44 +4812,59 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     r.register(cls, "isSynchronizerUsageSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(i32::from(synchronizer_usage_supported()))))
     });
-    // REAL (all three below; the pair used to be a KEEP-false because nothing
-    // recorded the durations). Contention monitoring means TIMING every blocked
-    // and waiting interval per thread, and the VM now does:
-    // `ThreadJmxSnapshot` carries `blocked_count`/`blocked_time_ms`/
-    // `waited_count`/`waited_time_ms`, fed by the two contended-acquire paths
-    // and by `monitor_wait`, and `alloc_snapshot_thread_info` writes them into
-    // the `ThreadInfo` instead of the old -1/0 sentinels.
-    //
-    // The counts accumulate always (one relaxed add per contended acquire); the
-    // two TIMES only accumulate while this is enabled, and read back as the
-    // JMM's `-1` sentinel while it is off. Off at boot, which is the state
-    // HotSpot boots in.
-    //
+    // KEEP (the two below): false is the measurement, and CONFIRMED 2026-07-28
+    // to be a different datum from the lock OWNERSHIP the two flags above turn
+    // on — contention monitoring means TIMING every blocked and waiting interval
+    // per thread, and nothing in the VM records those durations. Re-checked
+    // after the write side landed: `ThreadJmxSnapshot` carries no blocked/waited
+    // time or count field at all, `alloc_snapshot_thread_info` therefore writes
+    // the -1/0 sentinels for `blockedTime`/`blockedCount`/`waitedTime`/
+    // `waitedCount`, and the only `blocked_count` in the tree
+    // (`threading/gc_barrier.rs`) counts GC-barrier arrivals, not Java monitor
+    // contention. So `ThreadInfo.getBlockedTime()`/`getWaitedTime()` have no
+    // source at all.
+    // The JMM's answer for an unsupported optional feature is exactly `false`,
+    // and a `false` from `...Supported()` makes
+    // `setThreadContentionMonitoringEnabled` throw
+    // `UnsupportedOperationException` from JDK bytecode — which is what keeps
+    // the `...Enabled()` companion permanently false rather than it being an
+    // independent guess. "Not enabled" is also the state HotSpot itself boots
+    // in.
     // ES-FAIL-05 — Elasticsearch `HotThreads.initializeRuntimeMonitoring()` (run
-    // from `ESTestCase.<clinit>`) calls `isThreadContentionMonitoringSupported()`
-    // and, on `true`, goes on to enable it and read `getBlockedTime()`; that now
-    // returns real milliseconds rather than the sentinel it would have logged
-    // "not supported" for.
+    // from `ESTestCase.<clinit>`) calls `isThreadContentionMonitoringSupported()`;
+    // it was unregistered on the synthetic ThreadMXBean → AbstractMethodError
+    // ("no Code attribute"), failing ~every server unit test. Report `false`
+    // (not supported): HotThreads then just logs "not supported" and returns,
+    // never touching setThreadContentionMonitoringEnabled.
+    // The public interface is abstract in the JDK image, while the concrete
+    // implementation varies by release. Register all dispatch owners so an
+    // invokeinterface does not fall through to an abstract Code-less entry.
+    for owner in [
+        "java/lang/management/ThreadMXBean",
+        "sun/management/ThreadImpl",
+        "com/sun/management/internal/HotSpotThreadImpl",
+    ] {
+        r.register(
+            owner,
+            "setThreadContentionMonitoringEnabled",
+            "(Z)V",
+            native_set_thread_contention_monitoring_enabled,
+        );
+    }
     r.register(
         cls,
         "isThreadContentionMonitoringSupported",
         "()Z",
-        |ctx, _args| Ok(Some(Value::Int(i32::from(ctx.thread_contention_supported())))),
+        |_ctx, _args| Ok(Some(Value::Int(1))),
     );
     r.register(
         cls,
         "isThreadContentionMonitoringEnabled",
         "()Z",
-        |ctx, _args| Ok(Some(Value::Int(i32::from(ctx.thread_contention_enabled())))),
-    );
-    r.register(
-        cls,
-        "setThreadContentionMonitoringEnabled",
-        "(Z)V",
-        |ctx, args| {
-            let enable = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-            ctx.set_thread_contention_enabled(enable);
-            Ok(None)
+        |_ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                THREAD_CONTENTION_MONITORING_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+            ))))
         },
     );
     // REAL: every live thread's own `tid`. The previous body returned a
@@ -6514,10 +6605,13 @@ fn track_created_mbean_server(ctx: &mut dyn NativeContext, server: ObjectRef) ->
 
 #[cfg(test)]
 mod jmx_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn registry_with_synthetic_mbean_server() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

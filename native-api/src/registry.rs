@@ -24,7 +24,9 @@ use crate::native_id::{NativeMethodId, NativeMethodKey};
 fn real_net_sockets_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_NET_SOCKETS").is_some()
+    })
 }
 
 /// REAL-FORKJOINPOOL (opt-in `CRATONVM_REAL_FORKJOINPOOL`): when set, the
@@ -53,7 +55,9 @@ fn real_net_sockets_enabled() -> bool {
 fn real_forkjoinpool_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
+    *FLAG.get_or_init(|| {
+        cratonvm_types::flags::runtime_var_os("CRATONVM_REAL_FORKJOINPOOL").is_some()
+    })
 }
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -62,21 +66,6 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
-
-/// One JFR event field value, in the shapes the recorder's own encoder has.
-///
-/// Deliberately a small independent enum rather than a re-export of
-/// `cratonvm_jfr::EventValue`: `native-api` must not depend on the recorder
-/// crate, and this is the whole vocabulary a native emit site needs. The VM's
-/// `NativeContext` translates it.
-#[derive(Clone, Copy, Debug)]
-pub enum JfrValue<'a> {
-    Bool(bool),
-    Int(i32),
-    Long(i64),
-    Double(f64),
-    Str(&'a str),
-}
 
 /// VM-owned data needed to materialize a truthful JMX `ThreadInfo` object.
 ///
@@ -100,23 +89,13 @@ pub struct ThreadJmxSnapshot {
     pub lock_owner_name: Option<String>,
     pub locked_monitors: Vec<ObjectRef>,
     pub locked_synchronizers: Vec<ObjectRef>,
-    /// `ThreadInfo.getBlockedCount()` — contended `monitorenter`s so far.
-    pub blocked_count: i64,
-    /// `ThreadInfo.getBlockedTime()`, in MILLISECONDS, or `-1` when thread
-    /// contention monitoring is disabled (the sentinel the JMM specifies).
+    /// Cumulative monitor-enter blocking, measured only while contention
+    /// monitoring is enabled. Durations are milliseconds per the JMM API.
     pub blocked_time_ms: i64,
-    /// `ThreadInfo.getWaitedCount()` — `Object.wait()` / park episodes.
-    pub waited_count: i64,
-    /// `ThreadInfo.getWaitedTime()`, in MILLISECONDS, or `-1` when disabled.
+    pub blocked_count: i64,
+    /// Cumulative Object.wait parking, also in JMM milliseconds/counts.
     pub waited_time_ms: i64,
-}
-
-impl ThreadJmxSnapshot {
-    /// The `blocked*`/`waited*` defaults for a thread with no counters: zero
-    /// episodes and the "not measured" sentinel for both times.
-    pub fn without_contention_counters() -> (i64, i64, i64, i64) {
-        (0, -1, 0, -1)
-    }
+    pub waited_count: i64,
 }
 
 fn value_matches_primitive_array(element_type: ArrayElementType, value: Value) -> bool {
@@ -480,7 +459,6 @@ impl Drop for NativeHandleScope<'_> {
 /// module dependencies between `native` and `vm`.
 pub trait NativeClassAccess {
     /// Capability boundary: Class identity, metadata, loading, resources, and modules.
-
 
     /// Load a class by name. Returns the ClassId.
     fn load_class(&mut self, name: &str) -> MethodCallResult;
@@ -1153,6 +1131,10 @@ pub trait NativeClassAccess {
         0
     }
 
+    /// Reset per-thread JMM blocked/waited counters when contention monitoring
+    /// is enabled. Contexts without a live VM need no bookkeeping.
+    fn reset_thread_jmx_contention_stats(&mut self) {}
+
     /// Append paths to the BOOTSTRAP class search path so their classes load
     /// with the bootstrap loader (null `Class.getClassLoader()`). Drives
     /// `Instrumentation.appendToBootstrapClassLoaderSearch`. The default
@@ -1551,7 +1533,6 @@ pub trait NativeClassAccess {
 pub trait NativeInvokeAccess: NativeClassAccess {
     /// Capability boundary: Java method invocation and linkage.
 
-
     /// Invoke a method by class name, method name, descriptor, and arguments.
     fn invoke(
         &mut self,
@@ -1594,7 +1575,6 @@ pub trait NativeInvokeAccess: NativeClassAccess {
         let _ = class_id;
         self.invoke(class_name, method_name, descriptor, args)
     }
-
 
     // -- LinkResolver wiring for Java-side reflection natives -----------
     //
@@ -1835,7 +1815,6 @@ pub trait NativeInvokeAccess: NativeClassAccess {
 
 pub trait NativeHeapAccess: NativeInvokeAccess {
     /// Capability boundary: Allocation, roots, object fields, arrays, and strings.
-
 
     /// Create a new object of the given class.
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
@@ -2754,7 +2733,6 @@ pub trait NativeHeapAccess: NativeInvokeAccess {
 pub trait NativeThreadAccess: NativeHeapAccess {
     /// Capability boundary: Threads, monitors, parking, blocking, and scoped values.
 
-
     // -- Threading methods --
 
     /// Get the current thread's ThreadId (as a u64).
@@ -3006,25 +2984,6 @@ pub trait NativeThreadAccess: NativeHeapAccess {
         0
     }
 
-    /// `ThreadMXBean.isThreadContentionMonitoringSupported()`.
-    ///
-    /// True when the VM records blocked/waited durations per thread. The default
-    /// is `false` for a context that keeps no such counters, which is also what
-    /// makes `setThreadContentionMonitoringEnabled` throw from JDK bytecode —
-    /// the JMM's answer for an unsupported optional feature.
-    fn thread_contention_supported(&self) -> bool {
-        false
-    }
-
-    /// `ThreadMXBean.isThreadContentionMonitoringEnabled()`.
-    fn thread_contention_enabled(&self) -> bool {
-        false
-    }
-
-    /// `ThreadMXBean.setThreadContentionMonitoringEnabled(boolean)`. Process
-    /// wide, like the JMM knob it backs. A no-op where it is unsupported.
-    fn set_thread_contention_enabled(&mut self, _enabled: bool) {}
-
     /// Get the Java Thread objects for all alive threads (up to `max` entries).
     /// Returns the number of thread objects written.
     fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef>;
@@ -3122,7 +3081,6 @@ pub trait NativeThreadAccess: NativeHeapAccess {
 pub trait NativeExceptionAccess: NativeHeapAccess {
     /// Capability boundary: Throwable and stack-trace capture.
 
-
     /// Capture the current Java call stack without retaining it. Used by
     /// StackWalker and caller-sensitive helpers.
     fn capture_stack_trace(&mut self, throwable_hash: i32) -> Vec<StackTraceEntry>;
@@ -3165,7 +3123,6 @@ pub trait NativeExceptionAccess: NativeHeapAccess {
 
 pub trait NativeGpuAccess: NativeInvokeAccess {
     /// Capability boundary: Optional GPU submission and result services.
-
 
     /// Phase 5 escape hatch for GPU offload — dispatch the named method
     /// asynchronously on the GPU and return the submission handle. The
@@ -3732,48 +3689,27 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// "Synchronized", "Native", "Thread.sleep while pinned", ...).
     fn emit_virtual_thread_pinned_jfr(&mut self, _reason: &'static str) {}
 
-    /// Is any Flight Recorder recording currently running?
-    ///
-    /// Backs `jdk.jfr.internal.JVM.isRecording()` and lets an emit site skip the
-    /// work of building an event nobody will store.
-    fn jfr_is_recording(&self) -> bool {
+    /// Start the recorder used by the real-JDK jdk.jfr.Event boundary.
+    /// The default keeps lightweight NativeContext mocks independent of JFR.
+    fn jfr_begin_java_recording(&mut self) {}
+
+    /// Stop the recorder used by the real-JDK jdk.jfr.Event boundary.
+    fn jfr_end_java_recording(&mut self) {}
+
+    /// Whether the real-JDK JFR boundary currently has a running recording.
+    fn jfr_java_recording_active(&self) -> bool {
         false
     }
 
-    /// Start / stop a Flight Recorder recording, as
-    /// `jdk.jfr.internal.JVM.beginRecording()` / `endRecording()` do.
-    ///
-    /// Returns `false` where the context owns no recorder.
-    fn jfr_set_recording(&mut self, _running: bool) -> bool {
-        false
-    }
+    /// Record one Java jdk.jfr.Event.commit() through the VM recorder.
+    fn jfr_emit_java_event(&mut self, _event_class: &str, _start_ns: u64, _duration_ns: u64) {}
 
-    /// Emit one event into the VM's Flight Recorder.
-    ///
-    /// This is the door from the native surface into the recorder that did not
-    /// exist before: the whole JFR surface on this trait used to be the single
-    /// hard-coded [`Self::emit_virtual_thread_pinned_jfr`], which is why every
-    /// `jdk.jfr.internal.JVM` entry point that should carry a payload bottomed
-    /// out at a constant.
-    ///
-    /// `event_type` is the JFR event name (e.g. `"jdk.JavaMonitorEnter"`).
-    /// `fields` are name/value pairs; on the FIRST emit of a name the event type
-    /// is registered from the value kinds, and later emits must present the same
-    /// shape (the recorder enforces that, since a mismatched shape corrupts the
-    /// chunk).
-    ///
-    /// Returns whether the event was stored — `false` when nothing is recording,
-    /// the type could not be registered, or the shape did not match.
-    fn jfr_emit(&mut self, _event_type: &str, _fields: &[(&str, JfrValue<'_>)]) -> bool {
-        false
-    }
+    /// Remember the output requested by the JDK recorder so stopping it can
+    /// flush the VM recording to the same path.
+    fn jfr_set_java_output(&mut self, _path: &str) {}
 
-    /// Intern the current thread's stack trace and return its id, as
-    /// `jdk.jfr.internal.JVM.getStackTraceId` does. `0` means "not interned",
-    /// which is the JDK's own "no such trace" answer.
-    fn jfr_stack_trace_id(&mut self, _skip_frames: i32) -> i64 {
-        0
-    }
+    /// Dump the Java-owned recording to a caller-selected path.
+    fn jfr_dump_java_recording(&mut self, _path: &str) {}
 
     // -- VM stats methods (for JMX) --
 
@@ -3966,17 +3902,12 @@ pub trait NativeSystemAccess: NativeThreadAccess {
 /// Complete native-call capability set. Native implementations are split
 /// into the narrow supertraits above; this marker exists only at the
 /// legacy callback ABI boundary.
-pub trait NativeContext:
-    NativeSystemAccess + NativeExceptionAccess + NativeGpuAccess
-{
-}
+pub trait NativeContext: NativeSystemAccess + NativeExceptionAccess + NativeGpuAccess {}
 
 impl<T> NativeContext for T where
     T: NativeSystemAccess + NativeExceptionAccess + NativeGpuAccess + ?Sized
 {
 }
-
-
 
 /// Annotation data extracted from class file attributes.
 #[derive(Debug, Clone)]
@@ -4379,10 +4310,8 @@ impl NativeMethodRegistry {
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
-            registry_epoch: NEXT_REGISTRY_EPOCH.fetch_add(
-                REGISTRY_EPOCH_STRIDE,
-                std::sync::atomic::Ordering::Relaxed,
-            ),
+            registry_epoch: NEXT_REGISTRY_EPOCH
+                .fetch_add(REGISTRY_EPOCH_STRIDE, std::sync::atomic::Ordering::Relaxed),
             registrations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             by_method_desc: FxHashMap::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
@@ -4998,7 +4927,8 @@ impl NativeMethodRegistry {
         // `registrations` push — the one statement pair that must never drift
         // apart, because a class in `registrations` but absent here would make
         // `slot_for_exact` answer `None` for a native that IS registered.
-        self.classes_with_natives.insert(native_class_hash(class_name));
+        self.classes_with_natives
+            .insert(native_class_hash(class_name));
         // Tag this registration with the current category (see `with_category`).
         // Re-registration under a new category — e.g. promoting a fixed stub to
         // `Intrinsic` — takes effect, matching the previous `insert`-not-
@@ -5457,9 +5387,7 @@ impl NativeMethodRegistry {
             let k = native_method_hash(class_name, method_name, candidate_desc);
             // Verify against the REWRITTEN descriptor — that is the triple the
             // native was registered under, and the one the digest encodes.
-            if let Some(idx) =
-                self.slot_index_for_key(k, class_name, method_name, candidate_desc)
-            {
+            if let Some(idx) = self.slot_index_for_key(k, class_name, method_name, candidate_desc) {
                 return Some(NativeMethodId::from_u32(idx));
             }
         }
@@ -5503,7 +5431,9 @@ impl NativeMethodRegistry {
         let entries: Vec<(String, String, NativeCallback)> = matched
             .into_iter()
             .filter_map(|(method, descriptor)| {
-                let callback = self.slot_for_exact(from_class, &method, &descriptor)?.callback;
+                let callback = self
+                    .slot_for_exact(from_class, &method, &descriptor)?
+                    .callback;
                 Some((method, descriptor, callback))
             })
             .collect();
@@ -5623,7 +5553,8 @@ impl NativeMethodRegistry {
         // not in the prefilter — without this the injected collision would be
         // filtered out before `slot_index_for_key` ever ran, and the test
         // would pass for the wrong reason.
-        self.classes_with_natives.insert(native_class_hash(victim.0));
+        self.classes_with_natives
+            .insert(native_class_hash(victim.0));
     }
 }
 
@@ -5864,7 +5795,12 @@ mod tests {
         registry.register("java/lang/Object", "hashCode", "()I", dummy_native);
         registry.register("java/lang/String", "length", "()I", dummy_native_2);
         registry.with_category(NativeKind::Bridge, |r| {
-            r.register("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I", dummy_native);
+            r.register(
+                "sun/misc/Unsafe",
+                "getInt",
+                "(Ljava/lang/Object;J)I",
+                dummy_native,
+            );
         });
         registry.alias_class("java/lang/String", "java/lang/CharSequence");
 
@@ -5889,17 +5825,25 @@ mod tests {
     fn unregistered_class_misses_without_finishing_the_digest() {
         let mut registry = NativeMethodRegistry::new();
         registry.register("java/lang/Object", "hashCode", "()I", dummy_native);
-        assert!(registry.find("org/h2/mvstore/MVMap", "get", "()V").is_none());
-        assert!(registry.kind_of("org/h2/mvstore/MVMap", "put", "()V").is_none());
+        assert!(registry
+            .find("org/h2/mvstore/MVMap", "get", "()V")
+            .is_none());
+        assert!(registry
+            .kind_of("org/h2/mvstore/MVMap", "put", "()V")
+            .is_none());
         assert!(registry
             .find_with_kind("org/h2/mvstore/MVMap", "hashCode", "()I")
             .is_none());
         // …while a registered triple on a registered class still resolves.
-        assert!(registry.find("java/lang/Object", "hashCode", "()I").is_some());
+        assert!(registry
+            .find("java/lang/Object", "hashCode", "()I")
+            .is_some());
         // …and an unregistered METHOD on a registered class still misses,
         // which is the prefilter's false-positive path falling through to the
         // full digest + name verification.
-        assert!(registry.find("java/lang/Object", "toString", "()V").is_none());
+        assert!(registry
+            .find("java/lang/Object", "toString", "()V")
+            .is_none());
     }
 
     /// The split hash must be bit-identical to the one-shot form it replaced:
@@ -6277,7 +6221,11 @@ mod tests {
         let mut registry = NativeMethodRegistry::new();
         let triples = [
             ("java/lang/Object", "hashCode", "()I"),
-            ("java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V"),
+            (
+                "java/lang/System",
+                "arraycopy",
+                "(Ljava/lang/Object;ILjava/lang/Object;II)V",
+            ),
             ("java/lang/String", "length", "()I"),
         ];
         registry.register(triples[0].0, triples[0].1, triples[0].2, dummy_native);
@@ -6285,7 +6233,9 @@ mod tests {
         registry.register(triples[2].0, triples[2].1, triples[2].2, dummy_native);
 
         for (class, method, descriptor) in triples {
-            let by_name = registry.find(class, method, descriptor).expect("registered");
+            let by_name = registry
+                .find(class, method, descriptor)
+                .expect("registered");
             let id = registry
                 .resolve_id(class, method, descriptor)
                 .expect("handle resolves");
@@ -6452,7 +6402,8 @@ mod tests {
             registry.resolve_id("java/lang/String", "length", "()I")
         );
         assert_eq!(
-            registry.find_with_kind_by_key(key, "java/lang/String", "length", "()I")
+            registry
+                .find_with_kind_by_key(key, "java/lang/String", "length", "()I")
                 .map(|(cb, kind)| (cb_addr(cb), kind)),
             registry
                 .find_with_kind("java/lang/String", "length", "()I")
@@ -6475,8 +6426,10 @@ mod tests {
         let mut registry = NativeMethodRegistry::new();
         registry.register("q/Q", "m", "()Ljava/lang/String;", dummy_native_2);
 
-        let quirky = "()Ljava/lang/String";  // missing trailing ';'
-        let by_name = registry.find("q/Q", "m", quirky).expect("quirk rewrite hits");
+        let quirky = "()Ljava/lang/String"; // missing trailing ';'
+        let by_name = registry
+            .find("q/Q", "m", quirky)
+            .expect("quirk rewrite hits");
         let id = registry
             .resolve_id("q/Q", "m", quirky)
             .expect("quirk rewrite yields a handle");
@@ -6485,7 +6438,10 @@ mod tests {
             cb_addr(registry.callback_of(id).expect("redeems"))
         );
         // The handle names the triple actually registered, not the quirky input.
-        assert_eq!(registry.triple_of(id), Some(("q/Q", "m", "()Ljava/lang/String;")));
+        assert_eq!(
+            registry.triple_of(id),
+            Some(("q/Q", "m", "()Ljava/lang/String;"))
+        );
     }
 
     #[test]
@@ -6497,8 +6453,12 @@ mod tests {
         registry.with_category(NativeKind::SyntheticStub, |r| {
             r.register("k/K", "fake", "()I", dummy_native_2);
         });
-        let fast = registry.resolve_id("k/K", "fast", "()I").expect("registered");
-        let fake = registry.resolve_id("k/K", "fake", "()I").expect("registered");
+        let fast = registry
+            .resolve_id("k/K", "fast", "()I")
+            .expect("registered");
+        let fake = registry
+            .resolve_id("k/K", "fake", "()I")
+            .expect("registered");
         assert_eq!(registry.kind_of_id(fast), Some(NativeKind::Intrinsic));
         assert_eq!(registry.kind_of_id(fake), Some(NativeKind::SyntheticStub));
         assert_eq!(

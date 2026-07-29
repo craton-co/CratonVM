@@ -84,7 +84,7 @@ fn value_as_i64_bits(v: Option<&Value>) -> i64 {
 /// (`jdk.internal.vm.StackFrameInfo` / `java.lang.StackFrameInfo`).
 /// The 6 slots match `StackWalker$StackFrame` so the same accessors
 /// work on both types.
-const STACK_FRAME_INFO_FIELDS: usize = 7;
+const STACK_FRAME_INFO_FIELDS: usize = 6;
 
 const SF_CLASSNAME: usize = 0;
 const SF_METHODNAME: usize = 1;
@@ -92,19 +92,6 @@ const SF_FILENAME: usize = 2;
 const SF_LINENUMBER: usize = 3;
 const SF_BCI: usize = 4;
 const SF_DECL_INTERNAL: usize = 5;
-/// Fallback slot for the `flags` word, used ONLY when the carrier has no field
-/// of that name.
-///
-/// `java.lang.StackFrameInfo` is package-private in `java.base`; when it cannot
-/// be loaded, CratonVM synthesizes a stub whose fields are anonymous (`_f0`…),
-/// so `set_field_by_name(sf, "flags", ..)` writes nothing and
-/// `get_field_by_name(sf, "flags")` reads back null. That is why the
-/// `RETAIN_CLASS_REFERENCE` check silently failed open on every frame even after
-/// `populate_sfi` started recording the walker's real setting: the value had
-/// nowhere to live. Writing it to a slot the synthetic layout does have closes
-/// that. On a carrier that DOES declare `flags`, the named field stays
-/// authoritative and this slot is never consulted.
-const SF_FLAGS_FALLBACK: usize = 6;
 
 /// `java.lang.ClassFrameInfo.RETAIN_CLASS_REF` — the bit of the frame's
 /// `flags` field that records whether the `StackWalker` that produced the
@@ -117,73 +104,6 @@ const SF_FLAGS_FALLBACK: usize = 6;
 /// of the same word (`flags & 0x100` = `Modifier.NATIVE`, used by
 /// `isNativeMethod` / `getLineNumber` / `getByteCodeIndex`).
 const SF_FLAG_RETAIN_CLASS_REF: i32 = 0x01;
-
-/// The `ClassFrameInfo.ensureRetainClassRefEnabled()` predicate, shared by every
-/// accessor the real JDK gates on it (`getDeclaringClass()`, `getMethodType()`,
-/// and — through `getMethodType()` — `getDescriptor()`).
-///
-/// FAILS OPEN on a carrier with no readable `flags` word, for the reason spelled
-/// out on [`SF_FLAG_RETAIN_CLASS_REF`]: a frame minted by a path that never saw
-/// a walker keeps the old permissive behaviour rather than throwing on a guess.
-fn retain_class_ref_enabled(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef) -> bool {
-    if let Value::Int(flags) = ctx.get_field_by_name(this, "flags") {
-        return (flags & SF_FLAG_RETAIN_CLASS_REF) != 0;
-    }
-    // Anonymous synthetic carrier — see [`SF_FLAGS_FALLBACK`].
-    if let Value::Int(flags) = ctx.get_field(this, SF_FLAGS_FALLBACK) {
-        return (flags & SF_FLAG_RETAIN_CLASS_REF) != 0;
-    }
-    true
-}
-
-/// The exception `ClassFrameInfo.ensureRetainClassRefEnabled()` throws, verbatim.
-fn no_retain_class_ref() -> MethodCallFailed {
-    MethodCallFailed::from(RuntimeError::UnsupportedOperationException {
-        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-    })
-}
-
-/// The JVM method descriptor of the method a populated `StackFrameInfo` names.
-///
-/// One resolution path shared by `getDescriptor()`, `getMethodType()` and
-/// `expandStackFrameInfo()`, so the three can never disagree. Reads the already
-/// cached `type` slot first (a `String` there IS the descriptor — the shape the
-/// JDK itself stores), then falls back to looking the method up on its declaring
-/// class. Overload disambiguation is "first declared overload of that name": the
-/// `StackTraceEntry` carries no descriptor, and the `getDescriptor()` /
-/// `getMethodType()` javadoc does not pin which overload of an overloaded name a
-/// frame reports.
-fn sfi_descriptor(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef) -> Option<String> {
-    if let Value::Object(Some(cached)) = ctx.get_field_by_name(this, "type") {
-        if let Some(text) = ctx.read_string(cached) {
-            if text.starts_with('(') {
-                return Some(text);
-            }
-        }
-    }
-    let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    if internal.is_empty() {
-        return None;
-    }
-    let method_name = match ctx.get_field_by_name(this, "name") {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => match ctx.get_field(this, SF_METHODNAME) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        },
-    };
-    if method_name.is_empty() {
-        return None;
-    }
-    let class_id = ctx.class_id_by_name(&internal)?;
-    ctx.declared_methods(class_id)
-        .into_iter()
-        .find(|m| m.name == method_name)
-        .map(|m| m.descriptor)
-}
 
 /// Read the `RETAIN_CLASS_REFERENCE` setting of the `StackWalker` that owns an
 /// `AbstractStackWalker` receiver, so `populate_sfi` can record it in each
@@ -346,19 +266,15 @@ fn populate_sfi(
     // the walker), the `Modifier` bits above it are read by `isNativeMethod` /
     // `getLineNumber` / `getByteCodeIndex`. We do not (yet) know a frame's
     // method modifiers here, so only the retain bit is set.
-    let flag_word = if retain_class_ref {
-        SF_FLAG_RETAIN_CLASS_REF
-    } else {
-        0
-    };
-    ctx.set_field_by_name(sf, "flags", Value::Int(flag_word));
-    // A synthetic carrier has no field called `flags`, so the write above is
-    // discarded there. Mirror it into a slot that layout does have — see
-    // [`SF_FLAGS_FALLBACK`] — but only when the named write did not take, so a
-    // real `StackFrameInfo`'s slot 6 (`ste`) is never clobbered.
-    if !matches!(ctx.get_field_by_name(sf, "flags"), Value::Int(_)) {
-        ctx.set_field(sf, SF_FLAGS_FALLBACK, Value::Int(flag_word));
-    }
+    ctx.set_field_by_name(
+        sf,
+        "flags",
+        Value::Int(if retain_class_ref {
+            SF_FLAG_RETAIN_CLASS_REF
+        } else {
+            0
+        }),
+    );
     ctx.set_field_by_name(sf, "name", Value::Object(Some(meth_str)));
     ctx.set_field_by_name(sf, "bci", Value::Int(entry.byte_code_index));
 
@@ -907,14 +823,18 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // The PUBLIC accessor is `ensureRetainClassRefEnabled(); return
-            // declaringClass();` (jdk-25 `ClassFrameInfo.java:79`), so a walker
-            // built without `Option.RETAIN_CLASS_REFERENCE` must be refused here
-            // — HotSpot throws and CratonVM used to hand the class back. The
-            // package-private `declaringClass()` twin below stays unguarded,
-            // which is what the JDK's own internal callers rely on.
-            if !retain_class_ref_enabled(ctx, this) {
-                return Err(no_retain_class_ref());
+            // This method is specified to be available only when the walker
+            // requested RETAIN_CLASS_REFERENCE.  `populate_sfi` records that
+            // option on every frame, so do not let the native override bypass
+            // the JDK guard that the bytecode normally executes first.
+            if let Value::Int(flags) = ctx.get_field_by_name(this, "flags") {
+                if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
+                    return Err(MethodCallFailed::from(
+                        RuntimeError::UnsupportedOperationException {
+                            message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                        },
+                    ));
+                }
             }
             let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
@@ -1027,10 +947,6 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     // call site's `invoke*` instruction, which is more than the JDK contract
     // requires for `StackFrame.getMethodType()` (the javadoc allows returning
     // any valid MethodType for the method).
-    //
-    // Both this and `getDescriptor` below now resolve through [`sfi_descriptor`]
-    // so they cannot disagree, and both apply the same
-    // `ensureRetainClassRefEnabled()` gate the real bodies do.
     registry.register(
         sfi,
         "getMethodType",
@@ -1040,10 +956,38 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            if !retain_class_ref_enabled(ctx, this) {
-                return Err(no_retain_class_ref());
+            // Prefer the internal-name slot we populate at SFI-construct
+            // time so we avoid the dotted-class-name round-trip through
+            // class_id_by_name (which would NPE on synthetic frames).
+            let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if internal.is_empty() {
+                return Ok(Some(Value::Object(None)));
             }
-            let Some(desc) = sfi_descriptor(ctx, this) else {
+            let method_name = match ctx.get_field_by_name(this, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => match ctx.get_field(this, SF_METHODNAME) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                },
+            };
+            if method_name.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let class_id = match ctx.class_id_by_name(&internal) {
+                Some(c) => c,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            // Pick the first declared overload that matches the method name.
+            // See the comment above on overload disambiguation.
+            let descriptor = ctx
+                .declared_methods(class_id)
+                .into_iter()
+                .find(|m| m.name == method_name)
+                .map(|m| m.descriptor);
+            let Some(desc) = descriptor else {
                 return Ok(Some(Value::Object(None)));
             };
             // Delegate to MethodType.fromMethodDescriptorString — the JDK
@@ -1061,36 +1005,44 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         },
     );
 
-    // IMPLEMENTED (was UNREGISTERED, which is worse than a stub). Real
-    // `StackFrameInfo.getDescriptor()` is `getMethodType().descriptorString()`
-    // (jdk-25 `StackFrameInfo.java:101`) — but `StackWalker.StackFrame` declares
-    // `getDescriptor()` as a DEFAULT method whose body is a bare
-    // `throw new UnsupportedOperationException()` (`StackWalker.java:174`). With
-    // no native on the concrete carrier and no bytecode path reaching the
-    // override, `invokeinterface getDescriptor` landed on that default and threw
-    // on EVERY frame, including a walker built WITH
-    // `Option.RETAIN_CLASS_REFERENCE` — which is what the earlier
-    // `expandStackFrameInfo` work was aimed at and could not reach, because the
-    // throw never came from the expansion path at all.
-    //
-    // Registering it on the class intercepts the interface default (a native on
-    // the interface would NOT — an interface instance native does not shadow an
-    // implementation). The gate is `getMethodType()`'s, because that is the call
-    // the real one-line body makes.
+    // The real `StackFrameInfo.getDescriptor()` body goes through
+    // `getMethodType()` and its HotSpot-populated hidden carrier.  CratonVM
+    // records the declaring class and method name instead, so resolve the
+    // descriptor directly from the class store.  This is intentionally
+    // narrower than forcing `getMethodType`: callers asking for a MethodType
+    // retain the existing construction path and its loader semantics.
     registry.register(sfi, "getDescriptor", "()Ljava/lang/String;", |ctx, args| {
         let this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        if !retain_class_ref_enabled(ctx, this) {
-            return Err(no_retain_class_ref());
-        }
-        match sfi_descriptor(ctx, this) {
-            Some(desc) => {
-                let s = ctx.create_string(&desc);
-                Ok(Some(Value::Object(Some(s))))
+        let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let method_name = match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let descriptor = ctx
+            .class_id_by_name(&internal)
+            .map(|class_id| ctx.declared_methods(class_id))
+            .and_then(|methods| {
+                methods
+                    .into_iter()
+                    .find(|method| method.name == method_name)
+                    .map(|method| method.descriptor)
+            });
+        match descriptor {
+            Some(descriptor) => {
+                let descriptor = ctx.create_string(&descriptor);
+                Ok(Some(Value::Object(Some(descriptor))))
             }
-            None => Ok(Some(Value::Object(None))),
+            None => Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: "StackFrame descriptor metadata is unavailable".to_string(),
+                },
+            )),
         }
     });
 
@@ -1117,6 +1069,18 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Keep the package-private bridge aligned with the public accessor:
+        // callers that arrive through ClassFrameInfo must not bypass the
+        // RETAIN_CLASS_REFERENCE contract either.
+        if let Value::Int(flags) = ctx.get_field_by_name(this, "flags") {
+            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
+                return Err(MethodCallFailed::from(
+                    RuntimeError::UnsupportedOperationException {
+                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                    },
+                ));
+            }
+        }
         // Prefer the internal-name slot we always populate.
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
             let internal = ctx.read_string(s).unwrap_or_default();
@@ -1254,7 +1218,32 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some("Ljava/lang/Object;") | Some("Ljava/lang/String;") => {}
             _ => return Ok(None),
         }
-        let Some(desc) = sfi_descriptor(ctx, this) else {
+        let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if internal.is_empty() {
+            return Ok(None);
+        }
+        let method_name = match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => match ctx.get_field(this, SF_METHODNAME) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            },
+        };
+        if method_name.is_empty() {
+            return Ok(None);
+        }
+        let Some(class_id) = ctx.class_id_by_name(&internal) else {
+            return Ok(None);
+        };
+        let descriptor = ctx
+            .declared_methods(class_id)
+            .into_iter()
+            .find(|m| m.name == method_name)
+            .map(|m| m.descriptor);
+        let Some(desc) = descriptor else {
             return Ok(None);
         };
         // GC-SAFETY: `create_string` allocates and can relocate `this` under the
@@ -1283,14 +1272,15 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
     // frames minted by a path that never saw a walker keep the old permissive
     // behaviour rather than throwing.
     //
-    // REACHABILITY (rechecked against jdk-25 bytecode): the three shadowing
-    // accessors that the real JDK routes through this check —
-    // `ClassFrameInfo.getDeclaringClass()`, `StackFrameInfo.getMethodType()` and
-    // `StackFrameInfo.getDescriptor()` — now apply it themselves via
-    // [`retain_class_ref_enabled`], so the option is enforced on the paths that
-    // actually run rather than only on a JDK path we never reach. This
-    // registration stays for any real-JDK caller that reaches `ClassFrameInfo`
-    // bytecode we do not shadow (a subclass, or a shim removal).
+    // REACHABILITY (checked against jdk-25 bytecode): both callers —
+    // `ClassFrameInfo.getDeclaringClass()` and `StackFrameInfo.getMethodType()` —
+    // are themselves natively shadowed above, so in the default configuration
+    // this native is still effectively unreachable and the throw is latent. It
+    // becomes live for any real-JDK path that reaches `ClassFrameInfo` bytecode
+    // we do not shadow (e.g. a subclass, or a shim removal). Note the two
+    // shadowing accessors remain deliberately lax: `getDeclaringClass()` resolves
+    // the Class mirror without consulting the option, matching the documented
+    // choice in `phases_late::reflect_invoke` for the sibling carrier.
     registry.register(
         "java/lang/ClassFrameInfo",
         "ensureRetainClassRefEnabled",
@@ -1300,8 +1290,16 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(None),
             };
-            if !retain_class_ref_enabled(ctx, this) {
-                return Err(no_retain_class_ref());
+            let Value::Int(flags) = ctx.get_field_by_name(this, "flags") else {
+                // No `flags` field on this carrier — fail open.
+                return Ok(None);
+            };
+            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
+                return Err(MethodCallFailed::from(
+                    RuntimeError::UnsupportedOperationException {
+                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                    },
+                ));
             }
             Ok(None)
         },
@@ -1311,10 +1309,13 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn register_lang_stackwalker_adds_natives() {

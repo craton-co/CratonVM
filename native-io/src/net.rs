@@ -2142,6 +2142,8 @@ enum ExtOpt {
     QuickAck,
     /// `SO_INCOMING_NAPI_ID` (read-only).
     IncomingNapiId,
+    // Windows `IP_DONTFRAGMENT` (an IP-level boolean).
+    DontFragment,
 }
 
 impl ExtOpt {
@@ -2153,6 +2155,7 @@ impl ExtOpt {
             ExtOpt::KeepAliveProbes => "TCP_KEEPCOUNT",
             ExtOpt::QuickAck => "TCP_QUICKACK",
             ExtOpt::IncomingNapiId => "SO_INCOMING_NAPI_ID",
+            ExtOpt::DontFragment => "IP_DONTFRAGMENT",
         }
     }
 }
@@ -2209,6 +2212,7 @@ mod ext_opt_sys {
             ExtOpt::KeepAliveIntvl => (libc::IPPROTO_TCP, TCP_KEEPINTVL),
             ExtOpt::KeepAliveProbes => (libc::IPPROTO_TCP, TCP_KEEPCNT),
             ExtOpt::QuickAck => (libc::IPPROTO_TCP, TCP_QUICKACK),
+            ExtOpt::DontFragment => return None,
             ExtOpt::IncomingNapiId => (libc::SOL_SOCKET, SO_INCOMING_NAPI_ID?),
         })
     }
@@ -2223,16 +2227,13 @@ mod ext_opt_sys {
             return Some(stream.as_raw_fd());
         }
         use crate::socket_channel::TcpHandle;
-        if let Some(handle) = crate::socket_channel::tcp_registry().read().get(&id) {
-            match handle {
-                TcpHandle::Stream(stream) => return Some(stream.as_raw_fd()),
-                TcpHandle::Bound(stream) | TcpHandle::Connecting(stream) => {
-                    return Some(stream.as_raw_fd())
-                }
-                _ => {}
+        match crate::socket_channel::tcp_registry().read().get(&id) {
+            Some(TcpHandle::Stream(stream)) => Some(stream.as_raw_fd()),
+            Some(TcpHandle::Bound(stream)) | Some(TcpHandle::Connecting(stream)) => {
+                Some(stream.as_raw_fd())
             }
+            _ => None,
         }
-        None
     }
 
     pub(super) fn get_int(
@@ -2333,45 +2334,20 @@ mod ext_opt_sys {
     }
 }
 
-/// Windows twin of the Linux `ext_opt_sys` above.
-///
-/// Windows 10 1709+ exposes the same three TCP keepalive knobs (`TCP_KEEPIDLE`,
-/// `TCP_KEEPCNT`, `TCP_KEEPINTVL`), which is why the JDK ships a
-/// `jdk.net.WindowsSocketOptions` at all. It has NO analogue for `TCP_QUICKACK`
-/// or `SO_INCOMING_NAPI_ID` — `level_and_name` returns `None` for those, so the
-/// probes report "unsupported" and the getters/setters refuse, which is what the
-/// real JDK does on Windows too.
-///
-/// The Ws2_32 `setsockopt`/`getsockopt` are declared here by hand for the same
-/// reason `fd_table.rs` and `servlet.rs` do it: `libc` is `cfg(unix)`-shaped for
-/// these calls and this crate carries no Windows-specific crate.
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 mod ext_opt_sys {
     use super::{ExtOpt, NetSocketHandle};
     use std::os::windows::io::AsRawSocket;
 
-    pub(super) type RawFd = usize;
-
-    // ws2def.h / ws2ipdef.h.
-    pub(super) const IPPROTO_IP: i32 = 0;
-    pub(super) const IPPROTO_TCP: i32 = 6;
-    pub(super) const IPPROTO_IPV6: i32 = 41;
-    /// `IP_DONTFRAGMENT` (ws2ipdef.h) — a plain boolean on Windows, unlike
-    /// Linux's tri-state `IP_MTU_DISCOVER`.
-    pub(super) const IP_DONTFRAGMENT: i32 = 14;
-    /// `IPV6_DONTFRAG` (ws2ipdef.h).
-    pub(super) const IPV6_DONTFRAG: i32 = 14;
-    // mstcpip.h. Available since Windows 10 1709 (KEEPIDLE since 1703).
-    const TCP_KEEPIDLE: i32 = 3;
+    const IPPROTO_IP: i32 = 0;
+    const IPPROTO_TCP: i32 = 6;
+    const IP_DONTFRAGMENT: i32 = 14;
     const TCP_KEEPCNT: i32 = 16;
     const TCP_KEEPINTVL: i32 = 17;
-
-    const AF_INET: i32 = 2;
-    const SOCK_STREAM: i32 = 1;
-    const INVALID_SOCKET: usize = usize::MAX;
+    const TCP_KEEPIDLE: i32 = 18;
 
     #[link(name = "ws2_32")]
-    extern "system" {
+    unsafe extern "system" {
         fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> i32;
         fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
         fn socket(af: i32, kind: i32, protocol: i32) -> usize;
@@ -2384,108 +2360,47 @@ mod ext_opt_sys {
             ExtOpt::KeepAliveTime => (IPPROTO_TCP, TCP_KEEPIDLE),
             ExtOpt::KeepAliveIntvl => (IPPROTO_TCP, TCP_KEEPINTVL),
             ExtOpt::KeepAliveProbes => (IPPROTO_TCP, TCP_KEEPCNT),
-            // No Windows equivalent exists for either.
+            ExtOpt::DontFragment => (IPPROTO_IP, IP_DONTFRAGMENT),
             ExtOpt::QuickAck | ExtOpt::IncomingNapiId => return None,
         })
     }
 
-    /// The raw SOCKET behind one of CratonVM's handle ids. Same two registries
-    /// as the Linux twin, plus the UDP table — `IP_DONTFRAGMENT` is a datagram
-    /// option, so its fd is a `DatagramSocket`'s.
-    pub(super) fn raw_fd(id: i32) -> Option<RawFd> {
+    pub(super) fn raw_fd(id: i32) -> Option<usize> {
         if let Some(NetSocketHandle::Stream(stream)) = super::net_sockets().read().get(&id) {
             return Some(stream.as_raw_socket() as usize);
         }
         use crate::socket_channel::TcpHandle;
-        if let Some(handle) = crate::socket_channel::tcp_registry().read().get(&id) {
-            match handle {
-                TcpHandle::Stream(stream) => return Some(stream.as_raw_socket() as usize),
-                TcpHandle::Bound(stream) | TcpHandle::Connecting(stream) => {
-                    return Some(stream.as_raw_socket() as usize)
-                }
-                _ => {}
-            }
+        match crate::socket_channel::tcp_registry().read().get(&id) {
+            Some(TcpHandle::Stream(stream)) => Some(stream.as_raw_socket() as usize),
+            Some(TcpHandle::Bound(stream)) | Some(TcpHandle::Connecting(stream)) => Some(stream.as_raw_socket() as usize),
+            _ => None,
         }
-        None
     }
 
-    pub(super) fn get_int(fd: RawFd, level: i32, name: i32) -> std::io::Result<i32> {
-        let mut value: i32 = 0;
+    pub(super) fn get_int(fd: usize, level: i32, name: i32) -> std::io::Result<i32> {
+        let mut value = 0i32;
         let mut len = std::mem::size_of::<i32>() as i32;
-        // SAFETY: `value`/`len` are a valid out-pointer pair for an int-sized
-        // option, and `fd` is a live SOCKET owned by a registry handle for the
-        // duration of the call.
-        let rc = unsafe {
-            getsockopt(
-                fd,
-                level,
-                name,
-                (&mut value as *mut i32).cast::<u8>(),
-                &mut len,
-            )
-        };
-        if rc == 0 {
-            Ok(value)
-        } else {
-            // SAFETY: plain Winsock error read, no pointers involved.
-            Err(std::io::Error::from_raw_os_error(unsafe {
-                WSAGetLastError()
-            }))
-        }
+        let rc = unsafe { getsockopt(fd, level, name, (&mut value as *mut i32).cast(), &mut len) };
+        if rc == 0 { Ok(value) } else { Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })) }
     }
 
-    pub(super) fn set_int(fd: RawFd, level: i32, name: i32, value: i32) -> std::io::Result<()> {
-        let value: i32 = value;
-        // SAFETY: `value` is a live int-sized option value and `fd` a live
-        // SOCKET held by a registry handle for the duration of the call.
-        let rc = unsafe {
-            setsockopt(
-                fd,
-                level,
-                name,
-                (&value as *const i32).cast::<u8>(),
-                std::mem::size_of::<i32>() as i32,
-            )
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            // SAFETY: as above.
-            Err(std::io::Error::from_raw_os_error(unsafe {
-                WSAGetLastError()
-            }))
-        }
+    pub(super) fn set_int(fd: usize, level: i32, name: i32, value: i32) -> std::io::Result<()> {
+        let rc = unsafe { setsockopt(fd, level, name, (&value as *const i32).cast(), std::mem::size_of::<i32>() as i32) };
+        if rc == 0 { Ok(()) } else { Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() })) }
     }
 
-    /// Ask the running Winsock stack whether it accepts an option, the same way
-    /// the real JNI `*Supported0` bodies do: a throwaway socket plus one call.
     pub(super) fn probe(opt: ExtOpt, writable: bool) -> bool {
-        let Some((level, name)) = level_and_name(opt) else {
-            return false;
-        };
-        // SAFETY: constant arguments; the socket is closed on every path below.
-        let s = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
-        if s == INVALID_SOCKET {
-            return false;
-        }
-        let supported = if writable {
-            set_int(s, level, name, 1).is_ok()
-        } else {
-            get_int(s, level, name).is_ok()
-        };
-        // SAFETY: `s` came from the `socket` above and is closed once.
-        unsafe { closesocket(s) };
+        let Some((level, name)) = level_and_name(opt) else { return false; };
+        let fd = unsafe { socket(2, 1, IPPROTO_TCP) };
+        if fd == usize::MAX { return false; }
+        let supported = if writable { set_int(fd, level, name, 1).is_ok() } else { get_int(fd, level, name).is_ok() };
+        unsafe { closesocket(fd) };
         supported
-    }
-
-    /// Windows has no `SO_PEERCRED`; AF_UNIX peer credentials are not exposed.
-    pub(super) fn so_peer_cred(_id: i32) -> Option<i64> {
-        None
     }
 }
 
 /// Does this platform support the TCP keepalive tuning options?
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn ext_opt_keepalive_supported() -> bool {
     static PROBE: OnceLock<bool> = OnceLock::new();
     *PROBE.get_or_init(|| {
@@ -2495,77 +2410,127 @@ fn ext_opt_keepalive_supported() -> bool {
     })
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn ext_opt_keepalive_supported() -> bool {
     false
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn ext_opt_supported(opt: ExtOpt, writable: bool) -> bool {
     ext_opt_sys::probe(opt, writable)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn ext_opt_supported(_opt: ExtOpt, _writable: bool) -> bool {
     false
 }
 
 /// `getXxx0(int fd)` — read an extended option off the real socket.
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_get(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
+#[cfg(target_os = "linux")]
+fn ext_opt_get(args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
     let (Some(id), _) = ext_opt_int_args(args) else {
         return Err(ext_opt_unsupported(opt.label()));
     };
     let (Some((level, name)), Some(fd)) =
-        (ext_opt_sys::level_and_name(opt), ext_opt_any_fd(ctx, id))
+        (ext_opt_sys::level_and_name(opt), ext_opt_sys::raw_fd(id))
     else {
         return Err(ext_opt_unsupported(opt.label()));
     };
     ext_opt_sys::get_int(fd, level, name).map_err(|e| net_err(opt.label(), e))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn ext_opt_get(
-    _ctx: &dyn NativeContext,
-    _args: &[Value],
-    opt: ExtOpt,
-) -> Result<i32, MethodCallFailed> {
+#[cfg(not(target_os = "linux"))]
+fn ext_opt_get(_args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
     Err(ext_opt_unsupported(opt.label()))
 }
 
 /// `setXxx0(int fd, int|boolean value)` — write an extended option through to
 /// the real socket.
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_set(
-    ctx: &dyn NativeContext,
-    args: &[Value],
-    opt: ExtOpt,
-) -> Result<(), MethodCallFailed> {
+#[cfg(target_os = "linux")]
+fn ext_opt_set(args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
     let (Some(id), Some(value)) = ext_opt_int_args(args) else {
         return Err(ext_opt_unsupported(opt.label()));
     };
     let (Some((level, name)), Some(fd)) =
-        (ext_opt_sys::level_and_name(opt), ext_opt_any_fd(ctx, id))
+        (ext_opt_sys::level_and_name(opt), ext_opt_sys::raw_fd(id))
     else {
         return Err(ext_opt_unsupported(opt.label()));
     };
     ext_opt_sys::set_int(fd, level, name, value).map_err(|e| net_err(opt.label(), e))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn ext_opt_set(
-    _ctx: &dyn NativeContext,
-    _args: &[Value],
-    opt: ExtOpt,
-) -> Result<(), MethodCallFailed> {
+#[cfg(not(target_os = "linux"))]
+fn ext_opt_set(_args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
     Err(ext_opt_unsupported(opt.label()))
 }
 
-/// The `int` arguments of an extended-option native, in order, as a list.
+/// Windows extended options receive CratonVM handle ids. TCP ids resolve to
+/// one of the two live-stream registries; DatagramSocket ids resolve through
+/// FileDescriptorTable, which owns the corresponding UdpSocket.
+#[cfg(target_os = "windows")]
+fn win_ext_opt_get(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
+    let (Some(id), _) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
+    let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
+    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+        return ext_opt_sys::get_int(raw, level, name).map_err(|e| net_err(opt.label(), e));
+    }
+    let fd = u32::try_from(id).map_err(|_| ext_opt_unsupported(opt.label()))?;
+    ctx.fd_table().udp_get_socket_option_i32(fd, level, name).map_err(|e| net_err(opt.label(), e))
+}
+
+#[cfg(target_os = "windows")]
+fn win_ext_opt_set(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
+    let (Some(id), Some(value)) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
+    let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
+    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+        return ext_opt_sys::set_int(raw, level, name, value).map_err(|e| net_err(opt.label(), e));
+    }
+    let fd = u32::try_from(id).map_err(|_| ext_opt_unsupported(opt.label()))?;
+    ctx.fd_table().udp_set_socket_option_i32(fd, level, name, value).map_err(|e| net_err(opt.label(), e))
+}
+
+fn windows_keepalive_get_probes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "windows")]
+    { return Ok(Some(Value::Int(win_ext_opt_get(ctx, args, ExtOpt::KeepAliveProbes)?))); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+}
+fn windows_keepalive_get_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "windows")]
+    { return Ok(Some(Value::Int(win_ext_opt_get(ctx, args, ExtOpt::KeepAliveTime)?))); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+}
+fn windows_keepalive_get_intvl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "windows")]
+    { return Ok(Some(Value::Int(win_ext_opt_get(ctx, args, ExtOpt::KeepAliveIntvl)?))); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+}
+fn windows_keepalive_set_probes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "windows")]
+    { win_ext_opt_set(ctx, args, ExtOpt::KeepAliveProbes)?; return Ok(None); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+}
+fn windows_keepalive_set_time(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "windows")]
+    { win_ext_opt_set(ctx, args, ExtOpt::KeepAliveTime)?; return Ok(None); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+}
+fn windows_keepalive_set_intvl(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    #[cfg(target_os = "windows")]
+    { win_ext_opt_set(ctx, args, ExtOpt::KeepAliveIntvl)?; return Ok(None); }
+    #[cfg(not(target_os = "windows"))]
+    { let _ = (ctx, args); Err(ext_opt_unsupported("TCP keepalive options")) }
+}
+
+/// The `int` arguments of an extended-option native, in order.
 ///
-/// `getIpDontFragment0(fd, isIPv6)` and `setIpDontFragment0(fd, optval, isIPv6)`
-/// need three, not the two [`ext_opt_int_args`] returns. Booleans arrive as
-/// `Value::Int`, so `(IZZ)V` reads the same way as `(III)V`.
+/// `setIpDontFragment0(fd, optval, isIPv6)` needs three, not the two
+/// [`ext_opt_int_args`] returns. Booleans arrive as `Value::Int`, so `(IZZ)V`
+/// reads the same way as `(III)V`.
 fn ext_opt_int_arg_list(args: &[Value]) -> Vec<i32> {
     args.iter()
         .filter_map(|v| match v {
@@ -2575,161 +2540,68 @@ fn ext_opt_int_arg_list(args: &[Value]) -> Vec<i32> {
         .collect()
 }
 
-/// `(level, optname)` for `IP_DONTFRAGMENT` on this platform.
-///
-/// This is the one option in the `ExtendedSocketOptions` family that is NOT
-/// gated by a native probe — `ipDontFragmentSupported()` is plain Java returning
-/// `true` — so `DatagramSocket.setOption(IP_DONTFRAGMENT, ..)` really does reach
-/// here. Both platforms used to refuse it, on the stated grounds that "the
-/// native is handed no address family". That was wrong: the JDK signatures are
-/// `getIpDontFragment0(int fd, boolean isIPv6)` and
-/// `setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`, so the family
-/// IS an argument.
-///
-/// Windows has a real boolean option (`IP_DONTFRAGMENT` / `IPV6_DONTFRAG`).
-/// Linux expresses the same thing as the tri-state `IP_MTU_DISCOVER`
-/// (`IP_PMTUDISC_DO` = never fragment; `IP_PMTUDISC_DONT` = fragment freely),
-/// which is exactly the mapping `LinuxSocketOptions.c` applies.
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_dont_fragment(is_ipv6: bool) -> (i32, i32) {
-    #[cfg(target_os = "linux")]
-    {
-        const IP_MTU_DISCOVER: i32 = 10;
-        const IPV6_MTU_DISCOVER: i32 = 23;
-        if is_ipv6 {
-            (libc::IPPROTO_IPV6, IPV6_MTU_DISCOVER)
-        } else {
-            (libc::IPPROTO_IP, IP_MTU_DISCOVER)
-        }
-    }
-    #[cfg(windows)]
-    {
-        if is_ipv6 {
-            (ext_opt_sys::IPPROTO_IPV6, ext_opt_sys::IPV6_DONTFRAG)
-        } else {
-            (ext_opt_sys::IPPROTO_IP, ext_opt_sys::IP_DONTFRAGMENT)
-        }
-    }
-}
-
-/// The platform's encoding of "don't fragment = on".
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_dont_fragment_on() -> i32 {
-    // `IP_PMTUDISC_DO` = 2 on Linux (linux/in.h); a plain boolean on Windows.
-    if cfg!(target_os = "linux") {
-        2
+/// `(level, optname)` for `IP_DONTFRAGMENT` on Linux, where it is expressed as
+/// the tri-state `IP_MTU_DISCOVER` rather than a boolean.
+#[cfg(target_os = "linux")]
+fn linux_dont_fragment_opt(is_ipv6: bool) -> (libc::c_int, libc::c_int) {
+    // linux/in.h / linux/in6.h.
+    const IP_MTU_DISCOVER: libc::c_int = 10;
+    const IPV6_MTU_DISCOVER: libc::c_int = 23;
+    if is_ipv6 {
+        (libc::IPPROTO_IPV6, IPV6_MTU_DISCOVER)
     } else {
-        1
+        (libc::IPPROTO_IP, IP_MTU_DISCOVER)
     }
 }
 
-/// The raw descriptor behind an `IP_DONTFRAGMENT` handle id.
-///
-/// Unlike the keepalive family, this option's socket is a DATAGRAM socket, and
-/// those live in `native-api`'s `FileDescriptorTable` rather than in either TCP
-/// registry — hence the `ctx` parameter and the table probe before the TCP
-/// fallback (a `DatagramChannel` registered as a stream handle still resolves).
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_dgram_fd(ctx: &dyn NativeContext, id: i32) -> Option<ext_opt_sys::RawFd> {
-    if id >= 0 {
-        #[cfg(unix)]
-        if let Some(fd) = ctx.fd_table().udp_raw_fd(id as u32) {
-            return Some(fd);
-        }
-        #[cfg(windows)]
-        if let Some(s) = ctx.fd_table().udp_raw_socket(id as u32) {
-            return Some(s as usize);
-        }
-    }
-    ext_opt_sys::raw_fd(id)
-}
+/// `IP_PMTUDISC_DO` — "never fragment, probe the path MTU". `IP_PMTUDISC_DONT`
+/// is 0.
+#[cfg(target_os = "linux")]
+const LINUX_PMTUDISC_DO: i32 = 2;
 
-/// The raw descriptor behind ANY extended-option handle id.
-///
-/// A CratonVM socket handle can live in one of four places: this crate's
-/// `net_sockets` and `socket_channel::tcp_registry`, or `native-api`'s fd table
-/// as a UDP or a TCP entry. `ext_opt_sys::raw_fd` only knows the first two — it
-/// has no `NativeContext` — which is why the keepalive family reported
-/// "unsupported" for a `java.net.Socket` whose fd the VM had registered in the
-/// fd table. Every option resolves through here so that cannot differ per option.
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_any_fd(ctx: &dyn NativeContext, id: i32) -> Option<ext_opt_sys::RawFd> {
-    if let Some(fd) = ext_opt_sys::raw_fd(id) {
-        return Some(fd);
-    }
-    if id < 0 {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        ctx.fd_table()
-            .tcp_raw_fd(id as u32)
-            .or_else(|| ctx.fd_table().udp_raw_fd(id as u32))
-    }
-    #[cfg(windows)]
-    {
-        ctx.fd_table()
-            .tcp_raw_socket(id as u32)
-            .or_else(|| ctx.fd_table().udp_raw_socket(id as u32))
-            .map(|s| s as usize)
-    }
-}
-
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_dont_fragment_get(
-    ctx: &dyn NativeContext,
-    args: &[Value],
-) -> Result<bool, MethodCallFailed> {
+#[cfg(target_os = "linux")]
+fn linux_dont_fragment_get(args: &[Value]) -> Result<bool, MethodCallFailed> {
     let ints = ext_opt_int_arg_list(args);
     let Some(id) = ints.first().copied() else {
         return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
     };
     let is_ipv6 = ints.get(1).copied().unwrap_or(0) != 0;
-    let Some(fd) = ext_opt_any_fd(ctx, id) else {
+    let Some(fd) = ext_opt_sys::raw_fd(id) else {
         return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
     };
-    let (level, name) = ext_opt_dont_fragment(is_ipv6);
+    let (level, name) = linux_dont_fragment_opt(is_ipv6);
     let raw = ext_opt_sys::get_int(fd, level, name).map_err(|e| net_err("IP_DONTFRAGMENT", e))?;
-    Ok(raw == ext_opt_dont_fragment_on())
+    Ok(raw == LINUX_PMTUDISC_DO)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn ext_opt_dont_fragment_get(
-    _ctx: &dyn NativeContext,
-    _args: &[Value],
-) -> Result<bool, MethodCallFailed> {
-    Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
-}
-
-#[cfg(any(target_os = "linux", windows))]
-fn ext_opt_dont_fragment_set(
-    ctx: &dyn NativeContext,
-    args: &[Value],
-) -> Result<(), MethodCallFailed> {
+#[cfg(target_os = "linux")]
+fn linux_dont_fragment_set(args: &[Value]) -> Result<(), MethodCallFailed> {
     let ints = ext_opt_int_arg_list(args);
     let Some(id) = ints.first().copied() else {
         return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
     };
     let on = ints.get(1).copied().unwrap_or(0) != 0;
     let is_ipv6 = ints.get(2).copied().unwrap_or(0) != 0;
-    let Some(fd) = ext_opt_any_fd(ctx, id) else {
+    let Some(fd) = ext_opt_sys::raw_fd(id) else {
         return Err(ext_opt_unsupported("IP_DONTFRAGMENT"));
     };
-    let (level, name) = ext_opt_dont_fragment(is_ipv6);
-    let value = if on { ext_opt_dont_fragment_on() } else { 0 };
+    let (level, name) = linux_dont_fragment_opt(is_ipv6);
+    let value = if on { LINUX_PMTUDISC_DO } else { 0 };
     ext_opt_sys::set_int(fd, level, name, value).map_err(|e| net_err("IP_DONTFRAGMENT", e))
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn ext_opt_dont_fragment_set(
-    _ctx: &dyn NativeContext,
-    _args: &[Value],
-) -> Result<(), MethodCallFailed> {
+#[cfg(not(target_os = "linux"))]
+fn linux_dont_fragment_get(_args: &[Value]) -> Result<bool, MethodCallFailed> {
+    Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_dont_fragment_set(_args: &[Value]) -> Result<(), MethodCallFailed> {
     Err(ext_opt_unsupported("IP_DONTFRAGMENT"))
 }
 
 /// `getSoPeerCred0(int fd)`.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 fn ext_opt_peer_cred(args: &[Value]) -> i64 {
     match ext_opt_int_args(args).0.and_then(ext_opt_sys::so_peer_cred) {
         Some(encoded) => encoded,
@@ -2737,7 +2609,7 @@ fn ext_opt_peer_cred(args: &[Value]) -> i64 {
     }
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(target_os = "linux"))]
 fn ext_opt_peer_cred(_args: &[Value]) -> i64 {
     -1
 }
@@ -3009,50 +2881,36 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // keepalive getters/setters below are never exercised.
     {
         let wso = "jdk/net/WindowsSocketOptions";
-        // IMPLEMENTED (was a blanket "unsupported"). Windows 10 1709+ exposes
-        // TCP_KEEPIDLE/TCP_KEEPCNT/TCP_KEEPINTVL, which is why the JDK ships a
-        // `WindowsSocketOptions` at all; reaching them needs Ws2_32
-        // `setsockopt`/`getsockopt`, now declared in the `cfg(windows)`
-        // `ext_opt_sys` module above (same raw-FFI approach as `fd_table.rs`
-        // and `servlet.rs`, so no new dependency). The `*Supported0` probe asks
-        // the running Winsock stack the way the real JNI body does, so an older
-        // Windows still answers `false` and `<clinit>` still succeeds.
-        //
-        // `quickAckSupported0`/`incomingNapiIdSupported0` have no Windows
-        // registration because the real `WindowsSocketOptions` has no such
-        // methods — those two options are Linux-only and `level_and_name`
-        // returns `None` for them on this platform.
+        // Windows 10 1703+ exposes TCP_KEEPIDLE/TCP_KEEPCNT/TCP_KEEPINTVL.
+        // The handlers below use Winsock directly for the two live TCP handle
+        // registries and FileDescriptorTable-owned DatagramSockets, keeping
+        // the capability probe and each getter/setter aligned with the actual
+        // socket on which Java requested the option.
         r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| {
             Ok(Some(Value::Int(i32::from(ext_opt_keepalive_supported()))))
         });
-        r.register(wso, "getIpDontFragment0", "(IZ)Z", |c, a| {
-            Ok(Some(Value::Int(i32::from(ext_opt_dont_fragment_get(c, a)?))))
+        // IP_DONTFRAGMENT is NOT gated by a native probe — `ipDontFragmentSupported()`
+        // is plain Java returning true — so unlike the keepalive family below these
+        // two really are reachable from `DatagramSocket.setOption(IP_DONTFRAGMENT, ..)`.
+        // They used to accept the request and drop it on the floor.
+        r.register(wso, "getIpDontFragment0", "(IZ)Z", |ctx, args| {
+            #[cfg(target_os = "windows")]
+            { return Ok(Some(Value::Int(i32::from(win_ext_opt_get(ctx, args, ExtOpt::DontFragment)? != 0)))); }
+            #[cfg(not(target_os = "windows"))]
+            { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
         });
-        r.register(wso, "setIpDontFragment0", "(IZZ)V", |c, a| {
-            ext_opt_dont_fragment_set(c, a)?;
-            Ok(None)
+        r.register(wso, "setIpDontFragment0", "(IZZ)V", |ctx, args| {
+            #[cfg(target_os = "windows")]
+            { win_ext_opt_set(ctx, args, ExtOpt::DontFragment)?; return Ok(None); }
+            #[cfg(not(target_os = "windows"))]
+            { let _ = (ctx, args); Err(ext_opt_unsupported("IP_DONTFRAGMENT")) }
         });
-        r.register(wso, "getTcpKeepAliveProbes0", "(I)I", |c, a| {
-            Ok(Some(Value::Int(ext_opt_get(c, a, ExtOpt::KeepAliveProbes)?)))
-        });
-        r.register(wso, "getTcpKeepAliveTime0", "(I)I", |c, a| {
-            Ok(Some(Value::Int(ext_opt_get(c, a, ExtOpt::KeepAliveTime)?)))
-        });
-        r.register(wso, "getTcpKeepAliveIntvl0", "(I)I", |c, a| {
-            Ok(Some(Value::Int(ext_opt_get(c, a, ExtOpt::KeepAliveIntvl)?)))
-        });
-        r.register(wso, "setTcpKeepAliveProbes0", "(II)V", |c, a| {
-            ext_opt_set(c, a, ExtOpt::KeepAliveProbes)?;
-            Ok(None)
-        });
-        r.register(wso, "setTcpKeepAliveTime0", "(II)V", |c, a| {
-            ext_opt_set(c, a, ExtOpt::KeepAliveTime)?;
-            Ok(None)
-        });
-        r.register(wso, "setTcpKeepAliveIntvl0", "(II)V", |c, a| {
-            ext_opt_set(c, a, ExtOpt::KeepAliveIntvl)?;
-            Ok(None)
-        });
+        r.register(wso, "getTcpKeepAliveProbes0", "(I)I", windows_keepalive_get_probes);
+        r.register(wso, "getTcpKeepAliveTime0", "(I)I", windows_keepalive_get_time);
+        r.register(wso, "getTcpKeepAliveIntvl0", "(I)I", windows_keepalive_get_intvl);
+        r.register(wso, "setTcpKeepAliveProbes0", "(II)V", windows_keepalive_set_probes);
+        r.register(wso, "setTcpKeepAliveTime0", "(II)V", windows_keepalive_set_time);
+        r.register(wso, "setTcpKeepAliveIntvl0", "(II)V", windows_keepalive_set_intvl);
     }
 
     // Linux analogue of the `WindowsSocketOptions` block above (HIB-linux
@@ -3097,26 +2955,28 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         });
         // IP_DONTFRAGMENT is NOT gated by a native probe
         // (`ipDontFragmentSupported()` is plain Java returning true), so these
-        // two are genuinely reachable. They are now implemented rather than
-        // refused: the earlier "the native is handed no address family"
-        // justification was factually wrong — the JDK signatures pass `isIPv6`
-        // — so `IP_MTU_DISCOVER` (v4) / `IPV6_MTU_DISCOVER` (v6) is selectable,
-        // which is exactly what `LinuxSocketOptions.c` does. See
-        // [`ext_opt_dont_fragment`].
-        r.register(lso, "getIpDontFragment0", "(IZ)Z", |c, a| {
-            Ok(Some(Value::Int(i32::from(ext_opt_dont_fragment_get(c, a)?))))
+        // two are genuinely reachable — and they are now IMPLEMENTED rather than
+        // refused. The earlier "the native is handed no address family"
+        // justification was factually wrong: the JDK signatures are
+        // `getIpDontFragment0(int fd, boolean isIPv6)` and
+        // `setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`, so
+        // `IP_MTU_DISCOVER` (v4) / `IPV6_MTU_DISCOVER` (v6) is selectable —
+        // which is exactly what `LinuxSocketOptions.c` does. The Windows twin
+        // above has had a real implementation since the same round.
+        r.register(lso, "getIpDontFragment0", "(IZ)Z", |_c, a| {
+            Ok(Some(Value::Int(i32::from(linux_dont_fragment_get(a)?))))
         });
-        r.register(lso, "setIpDontFragment0", "(IZZ)V", |c, a| {
-            ext_opt_dont_fragment_set(c, a)?;
+        r.register(lso, "setIpDontFragment0", "(IZZ)V", |_c, a| {
+            linux_dont_fragment_set(a)?;
             Ok(None)
         });
-        r.register(lso, "getQuickAck0", "(I)Z", |c, a| {
+        r.register(lso, "getQuickAck0", "(I)Z", |_c, a| {
             Ok(Some(Value::Int(i32::from(
-                ext_opt_get(c, a, ExtOpt::QuickAck)? != 0,
+                ext_opt_get(a, ExtOpt::QuickAck)? != 0,
             ))))
         });
-        r.register(lso, "setQuickAck0", "(IZ)V", |c, a| {
-            ext_opt_set(c, a, ExtOpt::QuickAck)?;
+        r.register(lso, "setQuickAck0", "(IZ)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::QuickAck)?;
             Ok(None)
         });
         // `-1` stays the answer for a socket with no peer credentials, because
@@ -3126,31 +2986,31 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
         // domain socket")` — which is exactly right for the TCP sockets that
         // make up almost every caller. What changed is that a real AF_UNIX
         // socket now gets its real SO_PEERCRED instead of the sentinel.
-        r.register(lso, "getSoPeerCred0", "(I)J", |c, a| {
+        r.register(lso, "getSoPeerCred0", "(I)J", |_c, a| {
             Ok(Some(Value::Long(ext_opt_peer_cred(a))))
         });
-        r.register(lso, "getIncomingNapiId0", "(I)I", |c, a| {
-            Ok(Some(Value::Int(ext_opt_get(c, a, ExtOpt::IncomingNapiId)?)))
+        r.register(lso, "getIncomingNapiId0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::IncomingNapiId)?)))
         });
-        r.register(lso, "getTcpKeepAliveProbes0", "(I)I", |c, a| {
-            Ok(Some(Value::Int(ext_opt_get(c, a, ExtOpt::KeepAliveProbes)?)))
+        r.register(lso, "getTcpKeepAliveProbes0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveProbes)?)))
         });
-        r.register(lso, "getTcpKeepAliveTime0", "(I)I", |c, a| {
-            Ok(Some(Value::Int(ext_opt_get(c, a, ExtOpt::KeepAliveTime)?)))
+        r.register(lso, "getTcpKeepAliveTime0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveTime)?)))
         });
-        r.register(lso, "getTcpKeepAliveIntvl0", "(I)I", |c, a| {
-            Ok(Some(Value::Int(ext_opt_get(c, a, ExtOpt::KeepAliveIntvl)?)))
+        r.register(lso, "getTcpKeepAliveIntvl0", "(I)I", |_c, a| {
+            Ok(Some(Value::Int(ext_opt_get(a, ExtOpt::KeepAliveIntvl)?)))
         });
-        r.register(lso, "setTcpKeepAliveProbes0", "(II)V", |c, a| {
-            ext_opt_set(c, a, ExtOpt::KeepAliveProbes)?;
+        r.register(lso, "setTcpKeepAliveProbes0", "(II)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::KeepAliveProbes)?;
             Ok(None)
         });
-        r.register(lso, "setTcpKeepAliveTime0", "(II)V", |c, a| {
-            ext_opt_set(c, a, ExtOpt::KeepAliveTime)?;
+        r.register(lso, "setTcpKeepAliveTime0", "(II)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::KeepAliveTime)?;
             Ok(None)
         });
-        r.register(lso, "setTcpKeepAliveIntvl0", "(II)V", |c, a| {
-            ext_opt_set(c, a, ExtOpt::KeepAliveIntvl)?;
+        r.register(lso, "setTcpKeepAliveIntvl0", "(II)V", |_c, a| {
+            ext_opt_set(a, ExtOpt::KeepAliveIntvl)?;
             Ok(None)
         });
     }

@@ -11547,7 +11547,7 @@ fn ws2_get_int(s: usize, level: i32, name: i32) -> Option<i32> {
     (rc == 0).then_some(value)
 }
 
-fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     let ds = "java/net/DatagramSocket";
 
     r.register(ds, "<init>", "()V", |ctx, args| {
@@ -11713,6 +11713,61 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             }
         },
     );
+
+    // isBound / getLocalAddress / setBroadcast / getBroadcast — the four keys
+    // the phase-72 `java/net/DatagramSocket` set owned alone. They are here now
+    // so this registrar covers the whole class in BOTH builds: phase-72 is
+    // `#[cfg(feature = "synthetic-jdk")]`, so in the default build these four
+    // did not exist at all and resolved to the abstract declaration.
+    r.register(ds, "isBound", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sd = ds_get(this);
+        // A `DatagramSocket` is bound from construction: every ctor here opens
+        // and binds a real UDP fd. It stays bound after close, which is what
+        // the JDK specifies.
+        Ok(Some(Value::Int(i32::from(sd.fd >= 0 || sd.closed != 0))))
+    });
+    r.register(
+        ds,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sd = ds_get(this);
+            if sd.closed != 0 || sd.fd < 0 {
+                // "If the socket is closed, returns null" — and an unbound
+                // socket answers the wildcard, which is what the fd reports.
+                return Ok(Some(Value::Object(None)));
+            }
+            let addr = ctx
+                .fd_table()
+                .udp_local_addr(sd.fd as u32)
+                .ok()
+                .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
+                .unwrap_or_else(|| "0.0.0.0".to_string());
+            let ia = alloc_inet_address(ctx, &addr, &addr);
+            Ok(Some(Value::Object(Some(ia))))
+        },
+    );
+    r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        let fd = ds_get(this).fd;
+        if fd < 0 {
+            return Err(ioex("DatagramSocket: closed"));
+        }
+        ctx.fd_table()
+            .udp_set_broadcast(fd as u32, on)
+            .map_err(|e| ioex(format!("SO_BROADCAST: {e}")))?;
+        ds_set(this, |sd| sd.broadcast = i32::from(on));
+        Ok(None)
+    });
+    r.register(ds, "getBroadcast", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Never set -> the JDK default, which is false for a plain
+        // DatagramSocket.
+        Ok(Some(Value::Int(i32::from(ds_get(this).broadcast == 1))))
+    });
 
     // isBound / getLocalAddress / setBroadcast / getBroadcast — the four keys
     // the phase-72 `java/net/DatagramSocket` set owned alone. They are here now
@@ -12016,6 +12071,61 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         // `1` only when nobody ever called the setter — the historical answer.
         Ok(Some(Value::Int(if stored < 0 { 1 } else { stored })))
     });
+    // These three real-JDK declarations have bytecode that delegates through
+    // a private DatagramSocket delegate object.  CratonVM's authoritative
+    // socket state is the layout-independent DsSide table above, so force the
+    // constructors and lifecycle operations through this same registration
+    // instead of enabling phase-72's incompatible raw-slot duplicate.
+    r.register(ds, "connect", "(Ljava/net/InetAddress;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_get(this).fd;
+        if fd >= 0 {
+            let host = match args.get(1) {
+                Some(Value::Object(Some(address))) => match ctx.invoke_virtual(
+                    *address,
+                    "getHostAddress",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(value)))) => {
+                        ctx.read_string(value).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            let port = args.get(2).and_then(Value::as_int).unwrap_or(0);
+            if !host.is_empty() && (1..=65535).contains(&port) {
+                // DatagramSocket.connect records asynchronous failures for a
+                // later I/O operation; it must not throw from the connect call.
+                let _ = ctx
+                    .fd_table()
+                    .udp_connect(fd as u32, &format!("{host}:{port}"));
+            }
+        }
+        Ok(None)
+    });
+    // `disconnect()` is specified NOT to throw: "if the socket was not
+    // connected, then this method has no effect". The kernel disassociation
+    // goes through `FdTable::udp_disconnect` (POSIX `connect(AF_UNSPEC)`),
+    // whose error is deliberately swallowed for the same reason.
+    r.register(ds, "disconnect", "()V", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_get(this).fd;
+        if fd >= 0 {
+            let _ = _ctx.fd_table().udp_disconnect(fd as u32);
+        }
+        ds_set(this, |sd| sd.connected = 0);
+        ds_set(this, |sd| sd.connected = 1);
+            Ok(None)
+    });
+    // `isConnected()` had no registration at all, so it reached the abstract
+    // `java.net.DatagramSocket` declaration and threw `InternalError` — right
+    // after a `connect()` that had genuinely succeeded.
+    r.register(ds, "isConnected", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ds_get(this).connected)))
+    });
 }
 
 // ===========================================================================
@@ -12247,233 +12357,177 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     out
 }
 
-/// Windows: enumerate the host's adapters through `iphlpapi`
-/// `GetAdaptersAddresses`, the same call the JDK's own
-/// `NetworkInterface_winXP.c` makes.
+/// Windows uses `GetAdaptersAddresses`, the same IP Helper API family used by
+/// the JDK's Windows network-interface implementation. Keep the raw FFI
+/// layout local: this crate deliberately has no Windows-only dependency.
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinAdapterAddress {
+    length: u32,
+    if_index: u32,
+    next: *mut Re8WinAdapterAddress,
+    adapter_name: *const std::ffi::c_char,
+    first_unicast_address: *mut Re8WinUnicastAddress,
+    first_anycast_address: *mut core::ffi::c_void,
+    first_multicast_address: *mut core::ffi::c_void,
+    first_dns_server_address: *mut core::ffi::c_void,
+    dns_suffix: *const u16,
+    description: *const u16,
+    friendly_name: *const u16,
+    physical_address: [u8; 8],
+    physical_address_length: u32,
+    flags: u32,
+    mtu: u32,
+    interface_type: u32,
+    oper_status: u32,
+    ipv6_if_index: u32,
+    zone_indices: [u32; 16],
+}
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinSocketAddress {
+    address: *const u8,
+    length: i32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinUnicastAddress {
+    length: u32,
+    flags: u32,
+    next: *mut Re8WinUnicastAddress,
+    address: Re8WinSocketAddress,
+}
+
+#[cfg(windows)]
+/// Takes the `SOCKET_ADDRESS` BY REFERENCE.
 ///
-/// This replaces a flat "cannot enumerate", which degraded `getAll()` to
-/// loopback-only on Windows — no MAC (so `getHardwareAddress()` was null for
-/// every adapter), no MTU, and `getByName("eth0")` a guaranteed miss.
-///
-/// Naming mirrors the JDK's, because CratonVM both produces these names (from
-/// `getAll()`) and consumes them (`getByName`): adapters are numbered per
-/// `IfType` as `eth%d` / `lo%d` / `ppp%d` / `tun%d` / `net%d`.
+/// It was by value, which does not compile on Windows at all:
+/// `Re8WinSocketAddress` is not `Copy`, and the caller reads it out of a
+/// `&IP_ADAPTER_UNICAST_ADDRESS` borrowed from the OS-owned list. The whole
+/// Windows arm of this function is `#[cfg(windows)]`, so a Linux-only build
+/// never type-checked it.
+unsafe fn re8_win_ip(address: &Re8WinSocketAddress) -> Option<IpAddr> {
+    if address.address.is_null() || address.length < 2 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([*address.address, *address.address.add(1)]);
+    match family {
+        2 if address.length >= 8 => Some(IpAddr::V4(Ipv4Addr::new(
+            *address.address.add(4),
+            *address.address.add(5),
+            *address.address.add(6),
+            *address.address.add(7),
+        ))),
+        23 if address.length >= 24 => {
+            let mut octets = [0u8; 16];
+            std::ptr::copy_nonoverlapping(address.address.add(8), octets.as_mut_ptr(), 16);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "Iphlpapi")]
+extern "system" {
+    fn GetAdaptersAddresses(
+        family: u32,
+        flags: u32,
+        reserved: *mut core::ffi::c_void,
+        addresses: *mut Re8WinAdapterAddress,
+        size: *mut u32,
+    ) -> u32;
+}
+
 #[cfg(windows)]
 fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
-    const AF_UNSPEC: u32 = 0;
-    const AF_INET: u16 = 2;
-    const AF_INET6: u16 = 23;
-    const GAA_FLAG_SKIP_ANYCAST: u32 = 0x0002;
-    const GAA_FLAG_SKIP_MULTICAST: u32 = 0x0004;
-    const GAA_FLAG_SKIP_DNS_SERVER: u32 = 0x0008;
-    const ERROR_SUCCESS: u32 = 0;
-    const ERROR_BUFFER_OVERFLOW: u32 = 111;
-    // `IFTYPE` values from iptypes.h, and the one `Flags` bit we read.
-    const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
-    const IF_TYPE_PPP: u32 = 23;
-    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
-    const IF_TYPE_TUNNEL: u32 = 131;
-    const IF_TYPE_IEEE80211: u32 = 71;
-    const IP_ADAPTER_NO_MULTICAST: u32 = 0x0010;
-    const IF_OPER_STATUS_UP: u32 = 1;
-
-    /// `SOCKET_ADDRESS`.
-    #[repr(C)]
-    struct SocketAddress {
-        lp_sockaddr: *mut u8,
-        i_sockaddr_length: i32,
-    }
-    /// `IP_ADAPTER_UNICAST_ADDRESS_LH` — only the prefix up to `Address` is
-    /// read, and `#[repr(C)]` fixes those offsets.
-    #[repr(C)]
-    struct IpAdapterUnicastAddress {
-        length: u32,
-        flags: u32,
-        next: *mut IpAdapterUnicastAddress,
-        address: SocketAddress,
-    }
-    /// `IP_ADAPTER_ADDRESSES_LH`, up to and including `OperStatus`. The leading
-    /// `Length`/`IfIndex` pair is the struct arm of the head union, whose
-    /// `ULONGLONG Alignment` arm only forces the 8-byte alignment `repr(C)`
-    /// already gives a struct whose next member is a pointer.
-    #[repr(C)]
-    struct IpAdapterAddresses {
-        length: u32,
-        if_index: u32,
-        next: *mut IpAdapterAddresses,
-        adapter_name: *mut u8,
-        first_unicast_address: *mut IpAdapterUnicastAddress,
-        first_anycast_address: *mut u8,
-        first_multicast_address: *mut u8,
-        first_dns_server_address: *mut u8,
-        dns_suffix: *mut u16,
-        description: *mut u16,
-        friendly_name: *mut u16,
-        physical_address: [u8; 8],
-        physical_address_length: u32,
-        flags: u32,
-        mtu: u32,
-        if_type: u32,
-        oper_status: u32,
-    }
-
-    #[link(name = "Iphlpapi")]
-    extern "system" {
-        fn GetAdaptersAddresses(
-            family: u32,
-            flags: u32,
-            reserved: *mut std::ffi::c_void,
-            addresses: *mut u8,
-            size: *mut u32,
-        ) -> u32;
-    }
-
-    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-    // Two-call idiom, with a retry budget because the adapter set can change
-    // between the sizing call and the fill.
-    let mut size: u32 = 16 * 1024;
-    let mut buffer: Vec<u8> = Vec::new();
-    let mut ok = false;
-    for _ in 0..4 {
-        buffer.clear();
-        buffer.resize(size as usize, 0);
-        // SAFETY: `buffer` is `size` bytes of live, writable, 8-byte-aligned
-        // (Vec<u8> from the global allocator over a >= 16 KiB request) storage,
-        // and `size` is a live out-parameter the OS updates on overflow.
-        let rc = unsafe {
+    let mut needed = 15_000u32;
+    for _ in 0..3 {
+        let words =
+            (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut storage = vec![std::mem::MaybeUninit::<usize>::uninit(); words.max(1)];
+        let mut size = (storage.len() * std::mem::size_of::<usize>()) as u32;
+        let result = unsafe {
             GetAdaptersAddresses(
-                AF_UNSPEC,
-                flags,
+                0,
+                0x10,
                 std::ptr::null_mut(),
-                buffer.as_mut_ptr(),
+                storage.as_mut_ptr() as *mut Re8WinAdapterAddress,
                 &mut size,
             )
         };
-        if rc == ERROR_SUCCESS {
-            ok = true;
-            break;
+        if result == 111 {
+            needed = size.max(needed.saturating_mul(2));
+            continue;
         }
-        if rc != ERROR_BUFFER_OVERFLOW {
+        if result != 0 {
             return Vec::new();
         }
-    }
-    if !ok {
-        return Vec::new();
-    }
-
-    fn read_sockaddr(sa: &SocketAddress) -> Option<IpAddr> {
-        if sa.lp_sockaddr.is_null() || sa.i_sockaddr_length < 8 {
-            return None;
-        }
-        // SAFETY: the OS guarantees `lp_sockaddr` points at `i_sockaddr_length`
-        // readable bytes inside the buffer we still own; the family tag at
-        // offset 0 selects which fixed layout the rest has.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(sa.lp_sockaddr, sa.i_sockaddr_length as usize) };
-        let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
-        match family {
-            AF_INET if bytes.len() >= 8 => {
-                let mut octets = [0u8; 4];
-                octets.copy_from_slice(&bytes[4..8]);
-                Some(IpAddr::V4(Ipv4Addr::from(octets)))
-            }
-            AF_INET6 if bytes.len() >= 24 => {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&bytes[8..24]);
-                Some(IpAddr::V6(Ipv6Addr::from(octets)))
-            }
-            _ => None,
-        }
-    }
-
-    let mut out: Vec<Re8HostIface> = Vec::new();
-    let (mut eth, mut lo, mut ppp, mut tun, mut net) = (0u32, 0u32, 0u32, 0u32, 0u32);
-    let mut cursor = buffer.as_ptr() as *const IpAdapterAddresses;
-    while !cursor.is_null() {
-        // SAFETY: the list lives inside `buffer`, which outlives this loop, and
-        // is walked to its null terminator.
-        let entry = unsafe { &*cursor };
-        cursor = entry.next as *const IpAdapterAddresses;
-
-        let name = match entry.if_type {
-            IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211 => {
-                eth += 1;
-                format!("eth{}", eth - 1)
-            }
-            IF_TYPE_SOFTWARE_LOOPBACK => {
-                lo += 1;
-                format!("lo{}", lo - 1)
-            }
-            IF_TYPE_PPP => {
-                ppp += 1;
-                format!("ppp{}", ppp - 1)
-            }
-            IF_TYPE_TUNNEL => {
-                tun += 1;
-                format!("tun{}", tun - 1)
-            }
-            _ => {
-                net += 1;
-                format!("net{}", net - 1)
-            }
-        };
-
-        // Map the Windows attributes onto the `IFF_*` word the rest of this
-        // module reads. `OperStatus == IfOperStatusUp` is both UP and RUNNING:
-        // Windows has no separate administratively-up bit here.
-        let mut iff = 0u32;
-        if entry.oper_status == IF_OPER_STATUS_UP {
-            iff |= RE8_IFF_UP | RE8_IFF_RUNNING;
-        }
-        if entry.if_type == IF_TYPE_SOFTWARE_LOOPBACK {
-            iff |= RE8_IFF_LOOPBACK;
-        }
-        if entry.if_type == IF_TYPE_PPP || entry.if_type == IF_TYPE_TUNNEL {
-            iff |= RE8_IFF_POINTOPOINT;
-        }
-        if (entry.flags & IP_ADAPTER_NO_MULTICAST) == 0 {
-            iff |= RE8_IFF_MULTICAST;
-        }
-
-        let mac_len = (entry.physical_address_length as usize).min(8);
-        let mac = if mac_len >= 6 && entry.physical_address[..mac_len].iter().any(|b| *b != 0) {
-            entry.physical_address[..mac_len].to_vec()
-        } else {
-            // Same rule as the Linux side: an all-zero or absent hardware
-            // address is "unavailable", never a fabricated MAC.
-            Vec::new()
-        };
-
-        let mut addrs = Vec::new();
-        let mut ucast = entry.first_unicast_address;
-        while !ucast.is_null() {
-            // SAFETY: same buffer, same null-terminated walk.
-            let unicast = unsafe { &*ucast };
-            ucast = unicast.next;
-            if let Some(ip) = read_sockaddr(&unicast.address) {
-                if !addrs.contains(&ip) {
-                    addrs.push(ip);
+        let mut out = Vec::new();
+        let mut current = storage.as_mut_ptr() as *mut Re8WinAdapterAddress;
+        while !current.is_null() {
+            let adapter = unsafe { &*current };
+            let name = if adapter.adapter_name.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(adapter.adapter_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            if !name.is_empty() {
+                let mut flags = 0;
+                if adapter.oper_status == 1 {
+                    flags |= RE8_IFF_UP | RE8_IFF_RUNNING;
                 }
+                if adapter.interface_type == 24 {
+                    flags |= RE8_IFF_LOOPBACK;
+                }
+                if adapter.interface_type == 23 {
+                    flags |= RE8_IFF_POINTOPOINT;
+                }
+                if adapter.flags & 0x20 == 0 {
+                    flags |= RE8_IFF_MULTICAST;
+                }
+                let mac_len =
+                    (adapter.physical_address_length as usize).min(adapter.physical_address.len());
+                let mac = if mac_len >= 6
+                    && !adapter.physical_address[..mac_len]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                {
+                    adapter.physical_address[..mac_len].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut addrs = Vec::new();
+                let mut unicast = adapter.first_unicast_address;
+                while !unicast.is_null() {
+                    let entry = unsafe { &*unicast };
+                    if let Some(ip) = unsafe { re8_win_ip(&entry.address) } {
+                        if !addrs.contains(&ip) {
+                            addrs.push(ip);
+                        }
+                    }
+                    unicast = entry.next;
+                }
+                out.push(Re8HostIface {
+                    name,
+                    index: adapter.if_index.max(adapter.ipv6_if_index) as i32,
+                    flags,
+                    mtu: (adapter.mtu != 0).then_some(adapter.mtu.min(i32::MAX as u32) as i32),
+                    mac,
+                    addrs,
+                });
             }
+            current = adapter.next;
         }
-
-        out.push(Re8HostIface {
-            name,
-            index: entry.if_index as i32,
-            flags: iff,
-            // `Mtu` is `-1` (0xFFFFFFFF) on an adapter that does not report one.
-            mtu: (entry.mtu != u32::MAX && entry.mtu != 0).then_some(entry.mtu as i32),
-            mac,
-            addrs,
-        });
+        return out;
     }
-    out
+    Vec::new()
 }
 
-/// Off Unix and Windows there is no host enumeration binding here. Report
-/// "cannot enumerate" so every caller takes the loopback-only fallback that was
-/// this module's only behaviour before wave 4.
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(not(unix), not(windows)))]
 fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     Vec::new()
 }
@@ -14583,36 +14637,11 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     );
 
     let hex = "com/sun/net/httpserver/HttpExchange";
-    r.register(
-        hex,
-        "getRequestMethod",
-        "()Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        },
-    );
-    // The escalated producer side landed in `net_phase_e.rs`, so these two are
-    // now plain slot reads rather than constant nulls:
-    // `re10_dispatch_pending` — the one place an `HttpExchange` is minted, and
-    // the last point at which it and the accepted `TcpStream` coexist —
-    // captures `local_addr()` / `peer_addr()` into `HEX_LOCAL_ADDR` /
-    // `HEX_REMOTE_ADDR`, `HEX_NUM_FIELDS` is 11, and the matching
-    // `classloading/src/class_manager.rs` entry is `instance_fields(11)` (a
-    // short entry would make `set_field` drop the write silently, which is how
-    // `HEX_PRINCIPAL` sat dead behind `instance_fields(8)`). All three
-    // verified in the tree rather than taken on trust.
-    //
-    // The slots are referenced by symbol, not as literal 9/10 — that is why
-    // they are `pub(crate)`. A null here still means "the endpoint could not
-    // be read off the socket", never a fabricated host: a caller that logs or
-    // rate-limits by peer must not attribute every request to one invented
-    // address.
-    //
-    // Both getters bound-check against the HIGHER of the two indices, matching
-    // the `getPrincipal` reader in `net_phase_e.rs`, so an exchange minted by
-    // some future path with fewer slots reports "unknown" instead of reading
-    // off the end of the object.
+    // These abstract HttpExchange getters must be live in the default
+    // real-JDK registry as well as in the synthetic phase-72 overlay.  The
+    // dispatch path owns the endpoint slots and records them from the accepted
+    // TcpStream; return null only for an exchange minted by an older/foreign
+    // path that does not carry those slots.
     r.register(
         hex,
         "getLocalAddress",
@@ -14622,9 +14651,7 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             if ctx.object_num_fields(this) <= HEX_REMOTE_ADDR {
                 return Ok(Some(Value::Object(None)));
             }
-            Ok(Some(
-                ctx.get_field(this, HEX_LOCAL_ADDR),
-            ))
+            Ok(Some(ctx.get_field(this, HEX_LOCAL_ADDR)))
         },
     );
     r.register(
@@ -14636,9 +14663,16 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
             if ctx.object_num_fields(this) <= HEX_REMOTE_ADDR {
                 return Ok(Some(Value::Object(None)));
             }
-            Ok(Some(
-                ctx.get_field(this, HEX_REMOTE_ADDR),
-            ))
+            Ok(Some(ctx.get_field(this, HEX_REMOTE_ADDR)))
+        },
+    );
+    r.register(
+        hex,
+        "getRequestMethod",
+        "()Ljava/lang/String;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(ctx.get_field(this, 0)))
         },
     );
     r.register(hex, "getRequestURI", "()Ljava/net/URI;", |ctx, args| {
@@ -14928,8 +14962,7 @@ mod tests {
     #[test]
     fn re1_http_parse_url_query_only_and_fragment_do_not_extend_authority() {
         let (https, host, port, path, userinfo) =
-            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false")
-                .unwrap();
+            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false").unwrap();
         assert!(!https);
         assert_eq!(host, "localhost");
         assert_eq!(port, 8080);

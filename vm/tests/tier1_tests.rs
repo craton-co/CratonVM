@@ -2256,6 +2256,11 @@ fn d15_attach_socket_threaddump_operation() {
 /// over them stays honest. Both halves are exact, so a failure here is a real
 /// disagreement, never a scanner artifact.
 ///
+/// Companion: `classloading::class_manager::native_constant_surface_raw_slot_layout_audit`
+/// asserts a hand-written minimum for eight named classes. That list is worth
+/// keeping for a class whose factory count is not a literal — the one case this
+/// gate cannot see — but it is a manifest, not a sweep, and does not replace it.
+///
 /// Rule when this fails: widen the table entry in the SAME change as the native.
 /// Prefer `set_field_by_name` or an ObjectRef-keyed side table over raw slot
 /// indices on a class you do not allocate yourself.

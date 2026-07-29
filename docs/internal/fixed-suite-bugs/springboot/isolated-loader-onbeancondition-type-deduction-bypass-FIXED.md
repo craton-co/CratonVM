@@ -223,3 +223,27 @@ unresolved.
 going forward** — both should be treated as OPEN until someone does the
 `tracing::warn!`-based investigation the "Suggested next step" above already
 called for, which never happened.
+
+## Confirmed still failing 2026-07-28 (craton-rerun-20260728) — identical symptom to the 2026-07-23 regression note
+
+`OnBeanConditionTypeDeductionFailureTests.conditionalOnMissingBeanWithDeducedTypeThatIsPartiallyMissingFromClassPath`
+fails again in the `RunName=craton-rerun-20260728` rerun, with the exact
+same shape the 2026-07-23 note above already described: `OnBeanCondition`'s
+deduction succeeds (no `BeanTypeDeductionException`), the `objectMapper()`
+factory method gets invoked, and it throws with a message that is just the
+bare string `"tools.jackson.databind.ObjectMapper"` (`ObjectMapper`'s own
+class name):
+
+```
+14:46:18.639 [main] WARN ... AnnotationConfigApplicationContext -- Exception encountered during context initialization ...
+  org.springframework.beans.factory.BeanCreationException: Error creating bean with name 'objectMapper' ...:
+  Failed to instantiate [tools.jackson.databind.ObjectMapper]: Factory method 'objectMapper' threw exception with message: tools.jackson.databind.ObjectMapper
+=> org.assertj.core.error.AssertJMultipleFailuresError
+```
+
+Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard1/logs/core_spring-boot-autoconfigure.org.springframework.boot.autoconfigure.condition.OnBeanCondi-ef3749960ee5.out.log`.
+Not re-investigated further this session (log-analysis/triage only, no
+build or test execution performed) — this note only confirms the
+2026-07-23 regression note's symptom is still current 5 days later, not a
+new mechanism.

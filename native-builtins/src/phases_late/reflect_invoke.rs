@@ -9,6 +9,8 @@
 //! is byte-identical to before the split.
 
 use super::*;
+use std::cell::Cell;
+thread_local! { static P59_RETAIN_CLASS_REF: Cell<bool> = const { Cell::new(false) }; }
 
 // ---------------------------------------------------------------------------
 // java.lang.reflect extras: Parameter, Executable
@@ -1534,9 +1536,11 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
             match package_spec_at_least(&spec, &desired) {
                 Some(ok) => Ok(Some(Value::Int(i32::from(ok)))),
                 // Real JDK propagates the Integer.parseInt failure verbatim.
-                None => Err(MethodCallFailed::from(RuntimeError::NumberFormatException {
-                    message: format!("For input string: \"{desired}\""),
-                })),
+                None => Err(MethodCallFailed::from(
+                    RuntimeError::NumberFormatException {
+                        message: format!("For input string: \"{desired}\""),
+                    },
+                )),
             }
         },
     );
@@ -1664,27 +1668,20 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 4)))
     });
     // StackFrame.getDeclaringClass() — resolve the Class mirror via the
-    // stored internal class name (slot 5). RETAIN_CLASS_REFERENCE option
-    // is not enforced here (we always resolve); bootstrap consumers that
-    // don't request the option simply ignore the returned Class.
-    // StackFrame.getDeclaringClass() — return the Class mirror eagerly
-    // resolved and stored at population time (slot 6). RETAIN_CLASS_REFERENCE
-    // option is not enforced here (we always resolve); bootstrap consumers
-    // that don't request the option simply ignore the returned Class.
+    // StackFrame.getDeclaringClass() returns its eagerly resolved mirror (slot 6).
+    // RETAIN_CLASS_REFERENCE is scoped around walk/forEach consumer execution
+    // and is honored below; the JDK otherwise throws UnsupportedOperationException.
     r.register(
         sf,
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // `ClassFrameInfo.getDeclaringClass()` is
-            // `ensureRetainClassRefEnabled(); return declaringClass();`
-            // (jdk-25), so a walker built without
-            // `Option.RETAIN_CLASS_REFERENCE` must be refused. This carrier
-            // records the walker's setting at population time
-            // (`SF7_RETAIN_CLASS_REF`) precisely so the check can be made here.
-            if !sf7_retain_class_ref(ctx, this) {
-                return Err(sf7_no_retain());
+            if !P59_RETAIN_CLASS_REF.with(Cell::get) {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+                }
+                .into());
             }
             Ok(Some(ctx.get_field(this, 6)))
         },
@@ -1695,46 +1692,6 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/invoke/MethodType;",
         p59_sf_get_method_type,
     );
-    // `StackFrame.getDescriptor()` — the real body is
-    // `getMethodType().descriptorString()`, and the INTERFACE default it would
-    // otherwise fall through to is a bare `throw new
-    // UnsupportedOperationException()` (jdk-25 `StackWalker.java:174`). Answer
-    // from the same (class, method) pair `getMethodType` uses, without building a
-    // MethodType just to stringify it. See the `lang_stackwalker.rs` twin for the
-    // real-JDK carrier.
-    r.register(sf, "getDescriptor", "()Ljava/lang/String;", |ctx, args| {
-        let Some(Value::Object(Some(this))) = args.first().copied() else {
-            return Ok(Some(Value::Object(None)));
-        };
-        // `getDescriptor()` is `getMethodType().descriptorString()`, so it
-        // inherits `getMethodType()`'s RETAIN_CLASS_REFERENCE gate.
-        if !sf7_retain_class_ref(ctx, this) {
-            return Err(sf7_no_retain());
-        }
-        let internal = match ctx.get_field(this, 5) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let method_name = match ctx.get_field(this, 1) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        if internal.is_empty() || method_name.is_empty() {
-            return Ok(Some(Value::Object(None)));
-        }
-        let Some(class_id) = ctx.class_id_by_name(&internal) else {
-            return Ok(Some(Value::Object(None)));
-        };
-        let descriptor = ctx
-            .declared_methods(class_id)
-            .into_iter()
-            .find(|m| m.name == method_name)
-            .map(|m| m.descriptor);
-        Ok(Some(match descriptor {
-            Some(desc) => Value::Object(Some(ctx.create_string(&desc))),
-            None => Value::Object(None),
-        }))
-    });
     r.register(sf, "isNativeMethod", "()Z", |ctx, args| {
         // Native iff lineNumber == -2 (per StackTraceElement convention).
         // This used to be a hard `false` with a dead `let _ = this;` and a
@@ -1857,11 +1814,6 @@ pub(crate) fn p59_sf_get_method_type(
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
-    // Real `StackFrameInfo.getMethodType()` opens with
-    // `ensureRetainClassRefEnabled()` (jdk-25).
-    if !sf7_retain_class_ref(ctx, this) {
-        return Err(sf7_no_retain());
-    }
     let internal = match ctx.get_field(this, 5) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -1912,45 +1864,33 @@ pub(crate) fn p59_sf_get_method_type(
 
 /// Populate the 6-slot StackFrame synthetic from a `StackTraceEntry`.
 /// WP1.9: writes bci + declaringClassInternalName in addition to the
+/// Promote only the real-JDK-safe StackWalker carrier accessors without
+/// enabling synthetic reflection layouts in the default registry.
+pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegistry) {
+    const SF: &str = "java/lang/StackWalker$StackFrame";
+    r.register(
+        SF,
+        "getMethodType",
+        "()Ljava/lang/invoke/MethodType;",
+        p59_sf_get_method_type,
+    );
+    r.register(SF, "getDescriptor", "()Ljava/lang/String;", |ctx, args| {
+        match p59_sf_get_method_type(ctx, args)? {
+            Some(Value::Object(Some(method_type))) => {
+                ctx.invoke_virtual(method_type, "descriptorString", "()Ljava/lang/String;", &[])
+            }
+            _ => Err(RuntimeError::UnsupportedOperationException {
+                message: "StackWalker frame descriptor metadata is unavailable".into(),
+            }
+            .into()),
+        }
+    });
+}
+
 /// pre-existing 4 slots.
-/// Slot 7: whether the `StackWalker` that produced this frame was created with
-/// `Option.RETAIN_CLASS_REFERENCE`.
-///
-/// This carrier — NOT `java.lang.StackFrameInfo` — is what `StackWalker.walk()`
-/// actually hands out in this VM (`p59_sw_walk` mints it), so it is where the
-/// option has to be recorded. Without it `getDeclaringClass()` / `getMethodType()`
-/// / `getDescriptor()` answered for a walker built WITHOUT the option, where
-/// HotSpot throws `UnsupportedOperationException`.
-pub(crate) const SF7_RETAIN_CLASS_REF: usize = 7;
-
-/// Does this frame's walker have `RETAIN_CLASS_REFERENCE`?
-///
-/// FAILS OPEN for a frame minted by a path that never saw a walker, matching the
-/// sibling carrier in `lang_stackwalker`: turning an unknown provenance into a
-/// thrown exception on every frame is strictly worse than the old lax answer.
-pub(crate) fn sf7_retain_class_ref(
-    ctx: &mut dyn NativeContext,
-    this: cratonvm_types::ObjectRef,
-) -> bool {
-    match ctx.get_field(this, SF7_RETAIN_CLASS_REF) {
-        Value::Int(v) => v != 0,
-        _ => true,
-    }
-}
-
-/// The exception `ClassFrameInfo.ensureRetainClassRefEnabled()` throws, verbatim.
-pub(crate) fn sf7_no_retain() -> cratonvm_types::error::MethodCallFailed {
-    cratonvm_types::error::MethodCallFailed::from(
-        cratonvm_types::error::RuntimeError::UnsupportedOperationException {
-            message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-        },
-    )
-}
-
 pub(crate) fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
-    retain_class_ref: bool,
 ) -> cratonvm_types::ObjectRef {
     // GC-SAFETY (see `lang_stackwalker::populate_sfi`): allocate every object
     // under a pin first, then read each back through its pin before the
@@ -1974,7 +1914,7 @@ pub(crate) fn populate_stack_frame(
         .class_id
         .or_else(|| ctx.class_id_by_name(&entry.class_name));
 
-    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 8);
+    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 7);
     let base = ctx.pin_native_root(sf);
     let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
     let h_cls = ctx.pin_native_root(cls_str);
@@ -2026,28 +1966,8 @@ pub(crate) fn populate_stack_frame(
         6,
         decl_mirror.map_or(Value::Object(None), |m| Value::Object(Some(m))),
     );
-    ctx.set_field(
-        sf,
-        SF7_RETAIN_CLASS_REF,
-        Value::Int(i32::from(retain_class_ref)),
-    );
     ctx.unpin_native_roots(base);
     sf
-}
-
-/// `RETAIN_CLASS_REFERENCE` as configured on the `StackWalker` receiver.
-///
-/// `alloc_walker` (`stack_walker.rs`) writes the field by RESOLVED index, so it
-/// is readable by name on both the real and the synthetic layout. Fails open
-/// when there is no receiver or no such field — see [`sf7_retain_class_ref`].
-fn p59_walker_retains_class_ref(ctx: &mut dyn NativeContext, this: Option<Value>) -> bool {
-    let Some(Value::Object(Some(walker))) = this else {
-        return true;
-    };
-    match ctx.get_field_by_name(walker, "retainClassRef") {
-        Value::Int(v) => v != 0,
-        _ => true,
-    }
 }
 
 pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2060,7 +1980,19 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     // the caller the raw outer→inner order. Without this, `skip`/`limit`
     // chains over the stream (e.g. Lucene's `TestSecrets.ensureCaller`)
     // land on the wrong frame and misidentify the caller.
-    let retain_class_ref = p59_walker_retains_class_ref(ctx, args.first().copied());
+    let retain_class_ref = args
+        .first()
+        .and_then(|value| match value {
+            Value::Object(Some(walker)) => Some(*walker),
+            _ => None,
+        })
+        .map(|walker| {
+            ctx.get_field_by_name(walker, "retainClassRef")
+                .as_int()
+                .unwrap_or(0)
+                != 0
+        })
+        .unwrap_or(false);
     let raw_trace = ctx.capture_stack_trace(0); // key 0 = temporary
     let frames = crate::lang_stackwalker::ordered_stack_walk_frames(&raw_trace);
     let frame_count = frames.len();
@@ -2071,7 +2003,7 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr_pin = ctx.pin_native_root(arr);
     let mut arr = arr;
     for (i, entry) in frames.iter().enumerate() {
-        let sf = populate_stack_frame(ctx, entry, retain_class_ref);
+        let sf = populate_stack_frame(ctx, entry);
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(sf)));
     }
@@ -2085,12 +2017,19 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.invoke_virtual(
+    let previous = P59_RETAIN_CLASS_REF.with(|flag| {
+        let previous = flag.get();
+        flag.set(retain_class_ref);
+        previous
+    });
+    let result = ctx.invoke_virtual(
         function,
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         &[Value::Object(Some(stream))],
-    )
+    );
+    P59_RETAIN_CLASS_REF.with(|flag| flag.set(previous));
+    result
 }
 
 pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2098,20 +2037,46 @@ pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    let retain_class_ref = p59_walker_retains_class_ref(ctx, args.first().copied());
-    // Same inner→outer ordering as `p59_sw_walk` — see its comment.
+    // Same inner→outer ordering as `p59_sw_walk`; scope the retain option to
+    // consumer execution and restore it before either result path.
+    let retain_class_ref = args
+        .first()
+        .and_then(|value| match value {
+            Value::Object(Some(walker)) => Some(*walker),
+            _ => None,
+        })
+        .map(|walker| {
+            ctx.get_field_by_name(walker, "retainClassRef")
+                .as_int()
+                .unwrap_or(0)
+                != 0
+        })
+        .unwrap_or(false);
+    let previous = P59_RETAIN_CLASS_REF.with(|flag| {
+        let previous = flag.get();
+        flag.set(retain_class_ref);
+        previous
+    });
     let raw_trace = ctx.capture_stack_trace(0);
     let frames = crate::lang_stackwalker::ordered_stack_walk_frames(&raw_trace);
+    let mut failure = None;
     for entry in &frames {
-        let sf = populate_stack_frame(ctx, entry, retain_class_ref);
-        ctx.invoke_virtual(
+        let sf = populate_stack_frame(ctx, entry);
+        if let Err(error) = ctx.invoke_virtual(
             consumer,
             "accept",
             "(Ljava/lang/Object;)V",
             &[Value::Object(Some(sf))],
-        )?;
+        ) {
+            failure = Some(error);
+            break;
+        }
     }
-    Ok(None)
+    P59_RETAIN_CLASS_REF.with(|flag| flag.set(previous));
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn p59_sw_get_caller_class(

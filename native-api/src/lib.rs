@@ -42,7 +42,7 @@ pub use registry::{
     NativeCallback, NativeClassAccess, NativeContext, NativeExceptionAccess, NativeGpuAccess,
     NativeHandle, NativeHandleScope, NativeHeapAccess, NativeInvokeAccess, NativeKind,
     NativeMethodRegistry, NativeSystemAccess, NativeThreadAccess, NativeThreadBlocker,
-    JfrValue, StackTraceEntry, ThreadJmxSnapshot, TypeArgAnnotations,
+    StackTraceEntry, ThreadJmxSnapshot, TypeArgAnnotations,
 };
 
 // ===========================================================================

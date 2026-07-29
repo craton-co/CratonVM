@@ -118,3 +118,31 @@ picked up a binary predating this fix. Worth checking `git log` on
 `native-builtins/src/net_phase_e.rs`/`phases_late.rs` for the relevant
 `uri_percent_decode`/`HUC_JAR_FILE` logic before assuming a fresh
 regression.
+
+## Confirmed still failing 2026-07-28 (craton-rerun-20260728), but improved to 1/3 — only the `JarURLConnection` caching sub-bug remains
+
+`StaticResourceJarsTests`: `SBRUNNER_RESULT tests=7 failed=1 skipped=1` (down
+from `failed=3` at 2026-07-23). Only `closesJarFromNonCachedConnection()`
+still fails, with the exact original "no throwable raised" shape:
+
+```
+Failures (1):
+  JUnit Jupiter:StaticResourceJarsTests:closesJarFromNonCachedConnection()
+    => java.lang.AssertionError:
+Expecting code to raise a throwable.
+       org.springframework.boot.web.server.servlet.StaticResourceJarsTests.closesJarFromNonCachedConnection(StaticResourceJarsTests.java:125)
+```
+
+`includeJarWithStaticResourcesWithUrlEncodedSpaces()` and
+`includeJarWithStaticResourcesWithPlusInItsPath()` — the two `File(URI)`
+percent-decoding failures root cause #1 above fixed — now **pass**,
+suggesting that half of the original fix is holding on current `dev` again
+even though it had regressed as of 2026-07-23. Only root cause #2
+(`JarURLConnection`/`JarFile` caching/closed-state tracking) is still
+broken. Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard1/logs/module_spring-boot-web-server.org.springframework.boot.web.server.servlet.StaticResourceJarsTests.out.log`.
+Not re-investigated further this session (log-analysis/triage only, no
+build or test execution performed) — worth checking `git log` on the
+`HUC_JAR_FILE`/`HUC_USE_CACHES` logic in `net_phase_e.rs` specifically,
+since the URI-decoding half of the fix (a different mechanism, in
+`phases_late.rs`) is the half that's holding.

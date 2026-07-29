@@ -1,6 +1,18 @@
 # `finally` is skipped again on all five dispatch routes (CallPathProbe fully regressed)
 
-**Status:** OPEN. Found 2026-07-28 while fixing the handler-liveness bug in the
+# FIXED 2026-07-29
+
+The lambda and method-reference JIT entry now resumes the target method at its
+own exception handler using the stamped throw BCI, rather than falling through
+to a fresh method-entry execution. The ClassFinder.complete JIT ban was
+removed.
+
+Validated on Azure with cratonvm-finally-019faeeb-r2
+(SHA-256 933859499a13bb8e9b70bf5192ec3215f488459e38895a4eb080a7fbe3dd30d1):
+CallPathProbe, FinallyBalanceProbe, FinallyShapeProbe, and
+FinallyThrowSiteProbe all passed at 200000 iterations in JIT and no-JIT modes.
+
+**Status:** FIXED and retired 2026-07-29. Found 2026-07-28 while fixing the handler-liveness bug in the
 same family. Reproduced on **clean `origin/dev`** (`075fdfc54`) with no local
 changes — this is not a side effect of that fix.
 

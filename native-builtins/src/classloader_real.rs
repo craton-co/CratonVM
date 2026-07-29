@@ -886,6 +886,20 @@ fn cl_real_load_class(
     // that exact public overload before looking for the protected
     // `(String,boolean)` form: Spring Boot's ModifiedClassPathClassLoader
     // overrides only this method to reject @ClassPathExclusions packages.
+    if crate::classloader::ucl_is_closed(ctx, this)
+        && crate::classloader::object_extends(ctx, this, "java/net/URLClassLoader")
+    {
+        let name = ctx.read_string(class_name_obj).unwrap_or_default();
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
+    }
     // Calling it virtually is safe because a real override is present; base
     // ClassLoader receivers continue to the native delegation below.
     if let Some(result) =
@@ -1060,12 +1074,7 @@ pub(crate) fn no_class_def_found_error(
 /// delegation answer with a synthetic stub again, as it did before 2026-07-27.
 fn stub_may_answer_load_class() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("CRATONVM_CL_STUB_DELEGATION")
-            .ok()
-            .as_deref()
-            == Some("1")
-    })
+    *ON.get_or_init(|| std::env::var("CRATONVM_CL_STUB_DELEGATION").ok().as_deref() == Some("1"))
 }
 
 fn cl_real_load_class_base(
@@ -1511,6 +1520,17 @@ pub fn ucl_real_find_class(
         _ => return Ok(Some(Value::Object(None))),
     };
     let class_name = ctx.read_string(name_obj).unwrap_or_default();
+    if crate::classloader::ucl_is_closed(ctx, this) {
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &class_name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
+    }
     let internal = class_name.replace('.', "/");
     // A CLOSED loader must stop finding classes it has not already loaded —
     // that is the whole observable half of `URLClassLoader.close()` (already
