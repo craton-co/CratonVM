@@ -107,6 +107,23 @@ smaller/individual differences not yet clustered.
 
 
 
+
+## 2026-07-28/29 rerun: the 139-class residual, 5x timeout (116 now PASS, 2 new CRASH)
+
+Reran the 139-class residual from the round below (99 FAIL + 40 HANG)
+against current `dev`, after merging/rebuilding, at 5x the normal timeout
+(1500s vs. 300s) to separate genuinely-stuck HANGs from just-slow ones.
+**116/139 (83.5%) now PASS.** Residual down to 20 FAIL + 2 new CRASH + 1
+confirmed-still-stuck HANG. The 2 CRASHes are worth immediate attention:
+`BasicErrorControllerIntegrationTests` (same class as the silently-
+reverted `http_parse_url` fix, now crashing instead of failing) and
+`OriginTrackedYamlLoaderTests` (a genuine `OutOfMemoryError`, previously
+dismissed in the 07-11 round as a suspected runner artifact — that
+dismissal is now questionable given a concrete OOM with a specific
+allocation size). Not re-triaged against the docs below this round — a
+rerun-only pass. Full before/after table and reproduce instructions in
+`apps/spring-boot-suite-runner/RESULTS-20260728.md`.
+
 ## 2026-07-23 rerun: the 429 CratonVM-specific classes, 6 days later (290 now PASS)
 
 Reran exactly the 429 classes confirmed CratonVM-specific in the round
