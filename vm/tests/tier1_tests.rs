@@ -1296,7 +1296,8 @@ fn t1_compare_and_swap_field_is_atomic_under_parallel_load() {
 
 /// T9.8.1 — Comprehensive stub audit. Reads every native-builtins
 /// source file, counts stub registrations by category, and asserts
-/// the counts match the documented census in `docs/stub-census.md`.
+/// the counts stay within their ceilings. See `t9b_inline_constant_native_census`
+/// below for the triage guidance and for the whole-tree counterpart.
 ///
 /// If someone adds a NEW stub without updating the census, this test
 /// fails. If someone converts a stub to a real implementation, the
@@ -1348,7 +1349,7 @@ fn t9_stub_audit_counts_match_census() {
         // Hard error, not `unwrap_or_default()`: a file listed here that does
         // not exist must fail loudly rather than contribute a silent 0.
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            panic!("T9 GATE: cannot read audited file {path}: {e}. If the file was renamed or removed, update this list AND docs/stub-census.md.")
+            panic!("T9 GATE: cannot read audited file {path}: {e}. If the file was renamed or removed, update this list.")
         });
         // Count only actual registrations, not function definitions,
         // imports, comments, or test code.
@@ -1409,7 +1410,7 @@ fn t9_stub_audit_counts_match_census() {
         + total_ret_zero
         + total_ret_true;
 
-    // These counts are the documented census from docs/stub-census.md.
+    // These are the measured actuals, not a copy of anything external.
     // Update BOTH the census doc AND these assertions when stubs change.
     //
     // Direction: counts should only go DOWN (stubs replaced with real
@@ -1430,7 +1431,7 @@ fn t9_stub_audit_counts_match_census() {
     assert!(
         total <= 53,
         "T9 GATE: total stub count ({total}) exceeds census ceiling (53). \
-         If you added a new stub, justify it in docs/stub-census.md. \
+         If you added a new stub, justify it AT THE REGISTRATION SITE. \
          If you converted stubs to real impls, LOWER the ceiling."
     );
     assert!(
@@ -1466,24 +1467,102 @@ fn t9_stub_audit_counts_match_census() {
     );
 }
 
-/// T9.2 — Repo-wide constant-valued-native census.
+/// T9.2 — Repo-wide constant-valued-native census. **This gate is the source
+/// of truth for the constant-valued native surface.** It replaced
+/// `docs/stub-census.md`, which was deleted 2026-07-28: a separate document
+/// could only restate what this test measures, and it had already drifted —
+/// it claimed 67 stubs when the real surface was 669.
 ///
-/// The older `t9_stub_audit_counts_match_census` gate counts only the six
-/// NAMED stub helpers, and only across 13 hand-listed files. That is a small
-/// fraction of the real surface: the same no-op ships just as often as an
-/// INLINE CLOSURE whose entire body is a constant `Ok(..)`, e.g.
+/// # What it counts
+///
+/// Every `.register*(..)` call in every Rust file in the workspace whose
+/// handler is a constant: one of the six NAMED helpers (`native_noop`,
+/// `native_return_zero`, …) or an inline closure whose whole body is a
+/// constant `Ok(..)`:
 ///
 ///     r.register(cls, "m", "()V", |_ctx, _args| Ok(None));
 ///
-/// On 2026-07-28 that inline form accounted for 525 of the 609 constant-valued
-/// registrations in the tree — the named-helper gate saw 84 of them, so the
-/// census understated the surface by ~7x. This gate closes that blind spot: it
-/// parses every `.register*(...)` call across every Rust source file in the
-/// workspace and classifies the handler argument.
+/// The inline form is the one the older `t9_stub_audit_counts_match_census`
+/// cannot see — it accounted for 525 of the original 609 sites, and `t9`
+/// (six named helpers, 12 hand-listed files) saw 84. Keep both: `t9` caps the
+/// named helpers per category, this one caps the whole tree.
 ///
-/// Direction is the same as T9: counts may only go DOWN or stay the same.
-/// A registered native SHADOWS that class+method+descriptor's real bytecode,
-/// so every constant here is a method that silently does nothing.
+/// # A constant here is NOT automatically a defect
+///
+/// About a third of the surface is correct *by definition* and can never go to
+/// zero — driving it there would mean replacing correct code with wrong code:
+///
+/// * `registerNatives()V` / `initIDs()V` — HotSpot installs JNI pointers
+///   there; CratonVM binds in Rust at boot, so the no-op IS the real body.
+/// * Spec field constants: `Types.INTEGER == 4`, `HTTP_OK == 200`,
+///   `Cipher.ENCRYPT_MODE == 1`, TLS record sizes 16384 / 16709.
+/// * Methods whose real JDK body is empty or constant:
+///   `ByteArrayOutputStream.close()` is `{ }`, `SimpleBeanInfo.getIcon()` is
+///   `return null;`, `DatagramChannelImpl.validOps()` is a fixed 5.
+///
+/// So read the number as "how much of the native surface is constant-valued",
+/// never as "how many bugs are left". The per-site justification comment is
+/// what records the judgement; this number only stops the surface growing.
+///
+/// # If this gate fails
+///
+/// Direction is one-way: counts may only go DOWN or stay the same. A failure
+/// means a new constant-valued native was added. Before raising the ceiling,
+/// work through the following — every one of these caught a real bug in the
+/// 2026-07-27/28 sweeps.
+///
+/// **1. A registered native SHADOWS that class+method+descriptor's bytecode.**
+/// A no-op does not leave a method unimplemented; it silently replaces a
+/// working one. Lookup keys on the DECLARING CLASS of the resolved method
+/// (`vm/src/vm/vm_exec.rs`; `interpreter.rs`, `try_stackless_invoke` step 6),
+/// and both then apply
+/// `if declaring_is_interface && !is_static && !force_* { no native }`:
+/// * an INTERFACE instance native does not intercept user implementations —
+///   except for a non-SAM method whose descriptor is `(Liface;)Liface;` or
+///   `()Liface;`;
+/// * a native on an abstract or concrete CLASS *does* intercept a
+///   non-overriding subclass. This is where the real interception bugs live —
+///   constants on `org/jboss/logmanager/ExtHandler`, the BASE handler class,
+///   silently dropped all WildFly/Quarkus log output;
+/// * a native on an abstract method is dead.
+///
+/// **2. Two run modes.** Default is real-JDK; `--synthetic-jdk` loads no real
+/// class library, so the synthetic natives ARE the class library. Deleting a
+/// registration fixes real-JDK and breaks synthetic. Default to implementing.
+///
+/// **3. Reachability.** A registrar reached only from
+/// `register_synthetic_overrides` is `#[cfg(feature = "synthetic-jdk")]` and
+/// does NOTHING in the default build. Several fixes landed there and moved no
+/// probe until the live-path twin was patched too. Trace the call chain to
+/// `vm_init.rs` before claiming a fix is live.
+///
+/// **4. Last-registration-wins.** Grep the WHOLE tree for the same triple —
+/// `git grep -n '"theMethodName"' -- '*.rs'` — including other crates,
+/// which can define a rival registrar under the same function name. About a
+/// dozen such conflicts were found, including no-ops that beat the real
+/// `System.loadLibrary` (so no JNI library could load anywhere in the VM).
+/// Verify a suspected registrar is actually CALLED
+/// (`git grep -c register_fn_name -- '*.rs'`); a lone hit means dead code.
+///
+/// **5. Flipping a capability flag makes bytecode call natives it never
+/// reached.** Before turning an `is*Supported()` true, audit the DESCRIPTORS
+/// of everything it unlocks — `findDeadlockedThreads0` is
+/// `()[Ljava/lang/Thread;`, not `()[J`, and several such registrations would
+/// have become `UnsatisfiedLinkError` the moment the flag moved.
+///
+/// # Verdicts, in order of preference
+///
+/// IMPLEMENT → THROW the spec'd exception → KEEP with a justification comment
+/// at the registration site → DELETE (only when provably dead in BOTH modes).
+/// Prefer a thrown exception over a silent no-op, and prefer `null`/throw over
+/// a FABRICATED plausible value: `getHardwareAddress` used to return an
+/// all-zero MAC, which UUID-v1 and cluster-identity code accepted, giving
+/// every host the same identity instead of taking its documented fallback.
+///
+/// If you keep a constant, say WHY at the registration site. Every one of the
+/// remaining sites carries such a comment; that is what makes a separate
+/// census document unnecessary. Open gaps behind this surface are tracked in
+/// `docs/known-issues/native-constant-surface-open-items-20260728.md`.
 #[test]
 fn t9b_inline_constant_native_census() {
     let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
@@ -1529,14 +1608,13 @@ fn t9b_inline_constant_native_census() {
 
     per_file.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
 
-    // Ceiling: the post-sweep actual, measured 2026-07-28, down from 669
-    // before the wave-3 sweep. Lower it whenever you convert a constant into a
+    // Ceiling: the measured actual. 669 -> 462 -> 350 -> 332 across the
+    // 2026-07-27/28 sweeps. Lower it whenever you convert a constant into a
     // real implementation; raising it requires a justification comment at the
-    // registration site AND an entry in docs/stub-census.md, in the same
-    // change.
+    // registration site, in the same change.
     //
     // Cross-checked against an independently written scanner (Python), which
-    // measured 462 and agrees with this one on every per-file count. The
+    // agrees with this one on every per-file count. The
     // one-site gap is a parser edge case in one of the two. That is fine for a
     // ceiling, but read this number as "approximately this many" rather than
     // as an exact inventory — and note that a CONSTANT here is not
@@ -1558,7 +1636,7 @@ fn t9b_inline_constant_native_census() {
          A registered native SHADOWS that method's real bytecode, so a \
          constant-returning handler silently disables a working method.\n\
          Implement it, throw the spec'd exception, or — if the constant is \
-         genuinely spec-correct — justify it in docs/stub-census.md and raise \
+         genuinely spec-correct — justify it at the registration site and raise \
          this ceiling in the same change.\n\
          Top files: {:?}",
         per_file.iter().take(10).collect::<Vec<_>>()
