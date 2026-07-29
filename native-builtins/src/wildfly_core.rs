@@ -610,6 +610,37 @@ fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
 /// reached by JBossThread's `invokespecial Thread.run()` can still read a
 /// layout-variant direct `Thread.target` slot and silently return.  Bridge the
 /// core behavior by invoking the resolved Runnable directly.
+/// `JBossThread.onExit` hooks awaiting their thread's termination, keyed by VM
+/// thread id. Each hook is held as a global root so the moving collector remaps
+/// it while it waits (a bare `ObjectRef` in a process-global map would go
+/// stale; `pin_native_root` is a per-thread stack and cannot outlive the call
+/// that registered the hook).
+fn jboss_exit_hooks() -> &'static Mutex<HashMap<u64, Vec<usize>>> {
+    static HOOKS: OnceLock<Mutex<HashMap<u64, Vec<usize>>>> = OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run and discard the current thread's exit hooks. jboss-threads runs them in
+/// reverse registration order (they are pushed onto a stack), and a throwing
+/// hook must not stop the rest.
+fn jboss_run_exit_hooks(ctx: &mut dyn NativeContext) {
+    let tid = ctx.thread_id();
+    let hooks = jboss_exit_hooks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&tid);
+    let hooks = match hooks {
+        Some(h) => h,
+        None => return,
+    };
+    for root in hooks.into_iter().rev() {
+        if let Some(hook) = ctx.resolve_global_root(root) {
+            let _ = ctx.invoke_virtual(hook, "run", "()V", &[]);
+        }
+        ctx.remove_global_root(root);
+    }
+}
+
 fn native_jboss_thread_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let mut target = ctx.get_field_by_name(this, "target");
@@ -621,9 +652,15 @@ fn native_jboss_thread_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if matches!(target, Value::Object(None)) && ctx.object_num_fields(this) >= 4 {
         target = ctx.get_field(this, 3);
     }
-    if let Value::Object(Some(runnable)) = target {
-        ctx.invoke_virtual(runnable, "run", "()V", &[])?;
-    }
+    let result = if let Value::Object(Some(runnable)) = target {
+        ctx.invoke_virtual(runnable, "run", "()V", &[]).map(|_| ())
+    } else {
+        Ok(())
+    };
+    // The real `JBossThread.run()` drains its exit handlers in a finally block,
+    // so they run whether or not the task threw.
+    jboss_run_exit_hooks(ctx);
+    result?;
     Ok(None)
 }
 
@@ -1761,6 +1798,44 @@ fn native_async_future_task_await(ctx: &mut dyn NativeContext, args: &[Value]) -
     Ok(Some(status))
 }
 
+/// Identity hashes of synthetic `EnhancedQueueExecutor`s whose `shutdown()` has
+/// been called. Only reachable with `CRATONVM_SYNTHETIC_EQE` set — the default
+/// build runs the real jboss-threads bytecode, which maintains `threadStatus`.
+fn eqe_shutdown_flags() -> &'static Mutex<std::collections::HashSet<i32>> {
+    static FLAGS: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+    FLAGS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// `EnhancedQueueExecutor.shutdown()` / `shutdown(boolean)`. The synthetic
+/// executor drains inline, so there is nothing to interrupt — recording the
+/// request is the whole of the state transition.
+fn native_eqe_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        let key = ctx.identity_hash_code(*this);
+        eqe_shutdown_flags()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+    }
+    Ok(None)
+}
+
+/// Shared body of `isShutdown()`, `isTerminated()` and `awaitTermination(..)`
+/// for the synthetic executor — see the comment at their registration.
+fn native_eqe_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let down = match args.first() {
+        Some(Value::Object(Some(this))) => {
+            let key = ctx.identity_hash_code(*this);
+            eqe_shutdown_flags()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&key)
+        }
+        _ => false,
+    };
+    Ok(Some(Value::Int(i32::from(down))))
+}
+
 /// Register all WildFly Core kernel natives with the method registry.
 pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
     r.register(
@@ -1796,17 +1871,45 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    // KEEP (honest failure, not a stub): `onExit` asks to register a hook to
-    // be run once the calling thread terminates. CratonVM has no per-thread
-    // exit-hook table to put it in, and jboss-threads' contract is that the
-    // boolean says whether the hook WAS registered — so `false` is the true
-    // answer and callers that care can react. Silently returning `true` would
-    // promise an invocation that never happens.
+    // `onExit(hook)` registers a Runnable to be run once the calling thread
+    // terminates, and returns whether it WAS registered. W3 kept `false`
+    // because there was no per-thread exit-hook table; W4 adds one
+    // (`jboss_exit_hooks`), drained by `native_jboss_thread_run` in the same
+    // finally position the real `JBossThread.run()` uses.
+    //
+    // The real method returns false when the current thread is not a
+    // JBossThread — its exit is not something jboss-threads can observe. We
+    // keep that condition, and it is also exactly the condition under which our
+    // drain runs: only a JBossThread's `run()` dispatches to the native above.
     r.register(
         "org/jboss/threads/JBossThread",
         "onExit",
         "(Ljava/lang/Runnable;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            // Static in jboss-threads, so `args` is `[hook]`; if it is ever
+            // dispatched with a receiver the hook is still the last argument.
+            let hook = match args.last() {
+                Some(Value::Object(Some(h))) => *h,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let current = ctx.current_thread_object();
+            let cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(current))
+                .unwrap_or_default();
+            // Accept JBossThread and its jboss-threads subclasses.
+            if !cls.starts_with("org/jboss/threads/") {
+                return Ok(Some(Value::Int(0)));
+            }
+            let tid = ctx.thread_id();
+            let root = ctx.add_global_root(hook);
+            jboss_exit_hooks()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(tid)
+                .or_default()
+                .push(root);
+            Ok(Some(Value::Int(1)))
+        },
     );
     r.register(
         "org/jboss/threads/JBossThreadFactory",
@@ -2111,28 +2214,34 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         // never succeed against an unmaintained field). Shim the lifecycle to
         // clean terminal values so synthetic-mode cleanup completes.
         //
-        // KEEP (deliberate, load-bearing constants), re-confirmed 2026-07-27.
-        // Note what they actually claim: `isShutdown`/`isTerminated`/
-        // `awaitTermination` report terminal state UNCONDITIONALLY — true even
-        // before `shutdown()` is called — because the synthetic executor
-        // drains tasks inline in `native_exec_execute` and therefore has no
-        // in-flight work to wait for at any point. This whole block is gated
-        // behind the default-OFF `CRATONVM_SYNTHETIC_EQE=1`; the default build
-        // runs the real jboss-threads bytecode instead.
+        // W4: these used to report terminal state UNCONDITIONALLY — `true` even
+        // before `shutdown()` was ever called — on the grounds that the
+        // synthetic executor drains tasks inline in `native_exec_execute` and
+        // so never has in-flight work. The second half of that is right; the
+        // first half is not: `ExecutorService.isShutdown()` is defined as "this
+        // executor has been shut down", so answering true up front broke the
+        // ordinary `if (!exec.isShutdown()) exec.execute(task)` guard, which
+        // silently dropped every task. Track the one bit that actually exists.
+        //
+        // `isTerminated` == `isShutdown` here (inline drain ⇒ nothing is ever
+        // pending once shutdown is requested), and `awaitTermination` returns
+        // it immediately rather than sleeping: no work is outstanding, so no
+        // amount of waiting on this thread can change the answer.
+        //
+        // Reachability: this whole block is gated on `nbflags().synthetic_eqe`,
+        // which is PRESENCE-parsed from `CRATONVM_SYNTHETIC_EQE` — the default
+        // build has it unset and runs the real jboss-threads bytecode, and note
+        // that `CRATONVM_SYNTHETIC_EQE=0` still turns it ON.
         let eqe = "org/jboss/threads/EnhancedQueueExecutor";
-        r.register(eqe, "shutdown", "()V", |_ctx, _args| Ok(None));
-        r.register(eqe, "shutdown", "(Z)V", |_ctx, _args| Ok(None));
-        r.register(eqe, "isShutdown", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(1)))
-        });
-        r.register(eqe, "isTerminated", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(1)))
-        });
+        r.register(eqe, "shutdown", "()V", native_eqe_shutdown);
+        r.register(eqe, "shutdown", "(Z)V", native_eqe_shutdown);
+        r.register(eqe, "isShutdown", "()Z", native_eqe_is_shutdown);
+        r.register(eqe, "isTerminated", "()Z", native_eqe_is_shutdown);
         r.register(
             eqe,
             "awaitTermination",
             "(JLjava/util/concurrent/TimeUnit;)Z",
-            |_ctx, _args| Ok(Some(Value::Int(1))),
+            native_eqe_is_shutdown,
         );
     }
 

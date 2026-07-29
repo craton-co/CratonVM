@@ -1949,10 +1949,21 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
 
     // static native void unload0(String name, long handle)
     //
-    // CratonVM keeps loaded libraries resident for the VM lifetime (the
-    // native-library table has no unload), so this is a no-op — matching the
-    // RawNativeLibraries contract, which explicitly permits a library to remain
-    // open after close().
+    // No-op because CratonVM cannot do otherwise, NOT because the real body is
+    // empty — real `unload0` dlcloses/FreeLibrary's the handle. `NativeContext`
+    // exposes `load_native_library` and `find_native_symbol` and nothing else;
+    // the library table is append-only, so there is no index to release.
+    //
+    // Staying resident is the safe direction of the two errors: a
+    // `RawNativeLibraries` handle can still back live function pointers
+    // (callers cache `findEntry0` results, and any bound downcall stub holds
+    // one), so unloading underneath them segfaults, while not unloading costs
+    // an address-space mapping.
+    //
+    // ESCALATION: add `NativeContext::unload_native_library(lib_index: i64)`
+    // over the same table `load_native_library` appends to. The handle needs no
+    // new plumbing — `load0` above stashes `lib_index + 1`, which is exactly
+    // what `RawNativeLibraryImpl.close()` hands back as `handle`.
     r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |_ctx, _args| {
         Ok(None)
     });

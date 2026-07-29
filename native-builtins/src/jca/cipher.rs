@@ -1447,6 +1447,11 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // stock JDK 9+ install reports (`crypto.policy=unlimited` ships by
     // default), and it is factually true of this VM — `crate::crypto_impl`
     // enforces no key-size ceiling at all, so there is nothing to restrict.
+    // REACHABILITY (wave 4 — the `jca/mod.rs` header saying this module is
+    // synthetic-only is stale for THIS registrar): `register_cipher_clinit_shim`
+    // is called from both `register_essential_natives_with_shims` (the default
+    // real-JDK path) and `register_synthetic_overrides`, so it is live in both
+    // modes.
     r.register(
         "javax/crypto/JceSecurity",
         "isRestricted",

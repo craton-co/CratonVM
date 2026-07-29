@@ -9222,6 +9222,19 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "java/nio/channels/DatagramChannel" => instance_fields(5),
         // MulticastSocket = 5 (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
         "java/net/MulticastSocket" => instance_fields(5),
+        // DatagramPacket = 5 (buf=0, length=1, address=2, port=3, offset=4) per
+        // `net_channels::register_p72_datagram`, and Preferences = 5 (backing
+        // map=0, name=1, parent=2, children=3, removed=4) per
+        // `beans_jndi::register_p72_preferences`.
+        //
+        // Both were ABSENT and fell to the `_ => vec![]` arm below, so a
+        // synthetic-mode `new` produced a ZERO-slot object and every raw-slot
+        // native for them was inert — the same failure mode wave 2 found with
+        // DOMSource/DOMResult. Note the silence: `set_field` on a short object
+        // drops the write rather than erroring, so the natives looked
+        // implemented while storing nothing.
+        "java/net/DatagramPacket" => instance_fields(5),
+        "java/util/prefs/Preferences" => instance_fields(5),
         // Wave 3-B (RE.4): InetSocketAddress, HttpServer, HttpExchange,
         // HttpContext, Headers must be pre-sized so that the JVM `new` opcode
         // allocates enough slots for the synthetic-mode field layout used by
@@ -9254,9 +9267,17 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "com/sun/net/httpserver/HttpServer" | "com/sun/net/httpserver/HttpServerImpl" => {
             instance_fields(5)
         }
-        // HttpExchange = 8 (method, uri, reqHeaders, respHeaders, reqBody,
-        // statusCode, owner_socket, response_chunks)
-        "com/sun/net/httpserver/HttpExchange" => instance_fields(8),
+        // HttpExchange = 9 (method, uri, reqHeaders, respHeaders, reqBody,
+        // statusCode, owner_socket, response_chunks, principal)
+        //
+        // This read 8 while `net_phase_e.rs` has used `HEX_NUM_FIELDS = 9`
+        // with `HEX_PRINCIPAL = 8`, so the last slot did not exist and every
+        // write to it went nowhere — losing the authenticated principal on
+        // every synthetic-mode exchange. A too-short object does not fail
+        // loudly here; the store is simply dropped, which is why the
+        // off-by-one survived. If you add a slot in `net_phase_e.rs`, add it
+        // here in the same change.
+        "com/sun/net/httpserver/HttpExchange" => instance_fields(9),
         // HttpExchange$ResponseBody = 2 (owner exchange, dummy)
         "com/sun/net/httpserver/HttpExchange$ResponseBody" => instance_fields(2),
         // HttpContext = 2 (path, handler)

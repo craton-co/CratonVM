@@ -2564,10 +2564,14 @@ pub(crate) fn ws_send_frame(
 // java.net UDP — DatagramPacket, DatagramSocket, MulticastSocket
 // =============================================================================
 
+/// `DatagramPacket` slot 4 — the buffer offset. Guarded at every use: see
+/// `getOffset`'s note on the missing `synthetic_stub_fields` entry.
+const DP_OFFSET: usize = 4;
+
 pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // DatagramPacket = 4-field (data=0, length=1, address=2, port=3)
+    // DatagramPacket = 5-field (data=0, length=1, address=2, port=3, offset=4)
     let dp = "java/net/DatagramPacket";
     r.register(dp, "<init>", "([BI)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2620,6 +2624,17 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             ctx.set_field(this, 3, Value::Int(port));
+            // Slot 4 = offset (the argument this ctor used to drop). Guarded:
+            // see `getOffset` below — the synthetic layout does not always have
+            // the slot, and a packet built without it keeps today's offset-0
+            // behaviour rather than writing out of bounds.
+            if ctx.object_num_fields(this) > DP_OFFSET {
+                let offset = match args.get(2) {
+                    Some(Value::Int(i)) => *i,
+                    _ => 0,
+                };
+                ctx.set_field(this, DP_OFFSET, Value::Int(offset));
+            }
             Ok(None)
         },
     );
@@ -2660,15 +2675,26 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Int(0)));
         Ok(None)
     });
-    // KEEP: the synthetic `DatagramPacket` is a 4-slot object
-    // (data/length/address/port) with no offset slot, and the
-    // `([BIILjava/net/InetAddress;I)V` constructor above deliberately drops its
-    // `offset` argument — every packet this surface builds genuinely starts at
-    // index 0, so 0 is the accurate answer for the object as constructed, not a
-    // placeholder. (The dropped constructor argument is the real defect and is
-    // reported separately; fixing it needs a fifth slot, which is a layout
-    // change shared with `class_manager`'s synthetic field table.)
-    r.register(dp, "getOffset", "()I", |_ctx, _args| {
+    // Reads the offset the 5-arg constructor now stores in slot 4, falling
+    // back to 0 for a packet whose layout has no such slot (the other two
+    // constructors have no offset argument, and 0 is their correct answer).
+    //
+    // ESCALATED (wave 4) — the guard is load-bearing, and correcting wave 3's
+    // account of why: `java/net/DatagramPacket` has NO entry in
+    // `classloading/src/class_manager.rs::synthetic_stub_fields`, so it falls
+    // to that function's `_ => vec![]` arm and gets zero padded slots. It needs
+    // `"java/net/DatagramPacket" => instance_fields(5)` there — which is also
+    // what backs the existing 4-slot data/length/address/port layout this whole
+    // registrar already assumes. That is a cross-crate change; until it lands
+    // the write above is inert and this returns 0, exactly as before.
+    r.register(dp, "getOffset", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > DP_OFFSET {
+            // `unwrap_or(0)` also covers a packet built by one of the two
+            // offset-less constructors, which leave the slot uninitialised.
+            let off = ctx.get_field(this, DP_OFFSET).as_int().unwrap_or(0);
+            return Ok(Some(Value::Int(off)));
+        }
         Ok(Some(Value::Int(0)))
     });
 
@@ -2979,22 +3005,30 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 _ => "127.0.0.1".into(),
             };
             let port = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            // UdpSocket::connect restricts send/recv to the given address
-            // We can't easily call connect on fd_table, but we note the connected state
-            let _ = (host, port);
+            // The wave-3 note here ("we can't easily call connect on fd_table")
+            // was simply wrong: `FdTable::udp_connect` exists
+            // (native-api/src/fd_table.rs) and is what `DatagramChannel.connect`
+            // in this same file already uses. Dropping host/port on the floor
+            // left the socket unassociated, so every subsequent `send` still
+            // accepted an arbitrary destination and `receive` still accepted
+            // datagrams from any peer — the exact filtering `connect` exists to
+            // impose. `java.net.DatagramSocket.connect(InetAddress,int)` is
+            // specified not to throw on a connect failure (the error surfaces
+            // on the following send/receive), so a failure is swallowed here.
+            let target = format!("{host}:{port}");
+            let _ = ctx.fd_table().udp_connect(fd_id as u32, &target);
         }
         Ok(None)
     });
-    // KEEP: there is provably nothing to undo. `connect(InetAddress,int)` above
-    // discards its arguments and never calls `fd_table().udp_connect`, so no
-    // remote association is ever established; and this class registers no
-    // `isConnected` / `getInetAddress` / `getRemoteSocketAddress` reader that
-    // could be made to disagree with the no-op. The defect is the SETTER, not
-    // this method — and it cannot be fixed alone, because `std::net::UdpSocket`
-    // (and socket2's `SockRef`) expose no portable disconnect, so a real
-    // `connect` would leave `disconnect` unable to honour its own contract.
-    // Reported as a residual: needs an `fd_table::udp_disconnect` primitive
-    // (AF_UNSPEC connect) before the pair can be implemented together.
+    // ESCALATED (wave 4): `connect` above is now real, so this no-op is now a
+    // genuine gap rather than a vacuous one — it needs an
+    // `fd_table::udp_disconnect(FdId)` primitive doing the POSIX
+    // `connect(AF_UNSPEC)` that dissolves the association. Neither
+    // `std::net::UdpSocket` nor socket2's `SockRef` exposes it, and this file
+    // cannot add it (native-api crate). Everything else is already here: the
+    // fd is in slot 3 and `DatagramChannel.disconnect` in this same file has
+    // the identical hole. `disconnect()` is specified never to throw, so a
+    // no-op is the least-wrong placeholder until the primitive lands.
     r.register(ds, "disconnect", "()V", |_ctx, _args| Ok(None));
     r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -4115,6 +4149,10 @@ fn http_object_links(
 
 const HTTP_LINK_EXECUTOR: u8 = 0;
 const HTTP_LINK_CONTEXT_SERVER: u8 = 1;
+/// Per-`HttpExchange` attribute map (`get/setAttribute`).
+const HTTP_LINK_EXCHANGE_ATTRS: u8 = 2;
+/// Per-`HttpContext` attribute map (`getAttributes`).
+const HTTP_LINK_CONTEXT_ATTRS: u8 = 3;
 
 fn http_link_set(
     ctx: &mut dyn NativeContext,
@@ -4150,6 +4188,83 @@ fn http_link_get(ctx: &dyn NativeContext, kind: u8, owner: ObjectRef) -> Option<
         .get(&key)
         .copied();
     handle.and_then(|h| ctx.resolve_global_root(h))
+}
+
+/// The attribute `HashMap` bound to `owner` under `kind`, created on first use.
+///
+/// `com.sun.net.httpserver` attributes have no slot in either synthetic layout
+/// (and `HttpExchange` is allocated by `net_phase_e`, whose slots this file
+/// does not own), so they live in the same global-root-backed side table as
+/// the executor / owning-server links above.
+fn http_attribute_map(ctx: &mut dyn NativeContext, kind: u8, owner: ObjectRef) -> ObjectRef {
+    if let Some(existing) = http_link_get(ctx, kind, owner) {
+        return existing;
+    }
+    // Pin across the map alloc/init — a moving young GC there would relocate
+    // `owner` (native stale-local family), and the link table keys on its
+    // identity hash.
+    let owner_pin = ctx.pin_native_root(owner);
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    let map = ctx.read_native_pin(map_pin, map);
+    http_link_set(ctx, kind, owner, Some(map));
+    // `http_link_set` took a global root on the map, so it stays reachable
+    // after the pins below are dropped.
+    let map = ctx.read_native_pin(map_pin, map);
+    ctx.unpin_native_roots(owner_pin);
+    map
+}
+
+/// `HttpExchange.getAttribute(String)`.
+fn http_exchange_get_attribute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let Some(map) = http_link_get(ctx, HTTP_LINK_EXCHANGE_ATTRS, this) else {
+        // Nothing was ever set on this exchange — no map, and no allocation
+        // just to answer a miss.
+        return Ok(Some(Value::Object(None)));
+    };
+    let found =
+        cratonvm_native_collections::native_map_get_pub(ctx, &[Value::Object(Some(map)), key])?;
+    Ok(Some(found.unwrap_or(Value::Object(None))))
+}
+
+/// `HttpExchange.setAttribute(String, Object)` — the missing half of the pair.
+///
+/// A null value removes the binding, matching `ExchangeImpl`, which stores
+/// attributes in a plain `Map` and therefore treats `put(k, null)` as "no
+/// value" for the `getAttribute` that follows.
+fn http_exchange_set_attribute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let val = args.get(2).copied().unwrap_or(Value::Object(None));
+    // Pin the key/value across the (possibly allocating) map creation. Both
+    // pins are taken BEFORE `http_attribute_map`'s own pin, so its
+    // `unpin_native_roots` truncation cannot drop them.
+    let key_pin = pinned_object_value(ctx, key);
+    let val_pin = pinned_object_value(ctx, val);
+    let map = http_attribute_map(ctx, HTTP_LINK_EXCHANGE_ATTRS, this);
+    let key = read_pinned_object_value(ctx, key_pin, key);
+    let val = read_pinned_object_value(ctx, val_pin, val);
+    let result = if matches!(val, Value::Object(None)) {
+        cratonvm_native_collections::native_map_remove_pub(ctx, &[Value::Object(Some(map)), key])
+            .map(|_| ())
+    } else {
+        cratonvm_native_collections::native_map_put_pub(
+            ctx,
+            &[Value::Object(Some(map)), key, val],
+        )
+        .map(|_| ())
+    };
+    if let Some((handle, _)) = key_pin {
+        ctx.unpin_native_roots(handle);
+    } else if let Some((handle, _)) = val_pin {
+        ctx.unpin_native_roots(handle);
+    }
+    result?;
+    Ok(None)
 }
 
 pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
@@ -4379,15 +4494,13 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             ))))
         },
     );
-    r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, _args| {
-        let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        // Pin across the map init below (it allocates the bucket array) — a
-        // moving young GC there would relocate the fresh map (native
-        // stale-local family).
-        let m_pin = ctx.pin_native_root(m);
-        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))]).ok();
-        let m = ctx.read_native_pin(m_pin, m);
-        ctx.unpin_native_roots(m_pin);
+    // getAttributes() is documented to return "a mutable Map" whose contents
+    // persist for the life of the context — handlers use it to share state.
+    // Minting a fresh empty HashMap per call meant every `put` was written to
+    // a map nobody could read back. Bind ONE map per context.
+    r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let m = http_attribute_map(ctx, HTTP_LINK_CONTEXT_ATTRS, this);
         Ok(Some(Value::Object(Some(m))))
     });
 
@@ -4399,22 +4512,20 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // OutputStreams and never wrote a response — that broke real-server probes.
     // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
-    // OPEN (left as a null constant, deliberately): the exchange object is
-    // built by `net_phase_e`'s dispatch loop, which records the request line,
-    // headers and body but never the accepted peer/local socket address — there
-    // is no state on this side to return, and manufacturing an address would be
-    // a worse answer than null (a caller logging or rate-limiting by peer would
-    // silently attribute every request to one fabricated host). Real fix needs
-    // the peer address captured in `parse_http_request`, which is out of this
-    // file. Reported as a residual rather than papered over.
-    //
-    // Wave-3 re-check — the fix is mechanical but lives entirely in
-    // `native-builtins/src/net_phase_e.rs`: `re10_dispatch_pending` is the only
-    // place an `HttpExchange` is allocated and it already holds the accepted
-    // `TcpStream`, so `stream.peer_addr()` / `stream.local_addr()` need two more
-    // slots (`HEX_NUM_FIELDS` 9 -> 11, alongside `HEX_PRINCIPAL`), after which
-    // these two getters become plain slot reads. Not done here because that file
-    // is outside this sweep's edit scope; the pair must land together.
+    // ESCALATED (wave 4) — blocked on state this file cannot create, NOT on a
+    // missing answer. The exchange object is allocated by
+    // `net_phase_e::re10_dispatch_pending`, the one place that holds the
+    // accepted `TcpStream`; `stream.peer_addr()` / `stream.local_addr()` are
+    // right there. What is needed, all inside `native-builtins/src/net_phase_e.rs`:
+    //   * `HEX_NUM_FIELDS` 9 -> 11, adding `HEX_LOCAL_ADDR` / `HEX_REMOTE_ADDR`
+    //     next to `HEX_PRINCIPAL` (and the matching bump of
+    //     `classloading/src/class_manager.rs` `synthetic_stub_fields`, which
+    //     still says `instance_fields(8)` for this class — already one short of
+    //     today's 9);
+    //   * `re10_dispatch_pending` storing an `InetSocketAddress` in each.
+    // These two getters then become plain slot reads. Left as null rather than
+    // fabricated: a caller logging or rate-limiting by peer must not silently
+    // attribute every request to one invented host.
     r.register(
         hex,
         "getLocalAddress",
@@ -4427,17 +4538,23 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
         "()Ljava/net/InetSocketAddress;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
-    // KEEP: `getAttribute` returns null for any key never set, which is the
-    // JDK's own contract — and no `HttpExchange.setAttribute` native exists
-    // anywhere in the tree (grep `"setAttribute"`), so no key can ever have
-    // been set. Null is therefore the correct answer for every possible
-    // argument, not a placeholder. Should a `setAttribute` ever be added, this
-    // registration must be replaced at the same time.
+    // `getAttribute` was constant-null only because its partner did not exist:
+    // no `HttpExchange.setAttribute` was registered anywhere in the tree, so
+    // no key could ever have been set. Registering the PAIR is what makes both
+    // real — the attribute map hangs off the same global-root side table as the
+    // other `com.sun.net.httpserver` links, because the exchange's slots are
+    // owned by `net_phase_e` and this file must not claim one.
     r.register(
         hex,
         "getAttribute",
         "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        http_exchange_get_attribute,
+    );
+    r.register(
+        hex,
+        "setAttribute",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        http_exchange_set_attribute,
     );
 
     // `HttpHandler` is an interface, so under a real JDK the declaring class

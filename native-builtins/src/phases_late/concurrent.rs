@@ -1836,11 +1836,11 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     // 0, `isEmpty()` is always true, `contains(o)` is always false and
     // `remainingCapacity()` is always 0. A state-reading implementation would
     // be wrong, not better.
-    // SHADOW NOTE: `isEmpty` below does NOT survive to runtime —
-    // `concurrent_extras::register_synchronous_queue_extras` re-registers it
-    // later (lib.rs registers concurrent_extras after phase 58) with a
-    // slot-state reader that can answer false. That override contradicts both
-    // the javadoc and the `size() == 0` kept here; see the note at that site.
+    // SHADOW NOTE: `size`/`isEmpty` below do not survive to runtime —
+    // `concurrent_extras::register_synchronous_queue_extras` re-registers both
+    // later (lib.rs registers concurrent_extras after phase 58). As of W4 that
+    // override answers the same constants; it previously read slot state for
+    // `isEmpty` and could contradict the `size() == 0` kept here.
     r.register(sq, "peek", "()Ljava/lang/Object;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
     });
@@ -5413,18 +5413,91 @@ pub(crate) fn register_p69_submission_publisher(r: &mut NativeMethodRegistry) {
     r.register(sp, "getMaxBufferCapacity", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(256)))
     });
-    // KEEP: `getClosedException()` reports the Throwable passed to
+    // `getClosedException()` reports the Throwable passed to
     // `closeExceptionally(Throwable)`, and null when the publisher was closed
-    // normally or is still open. `closeExceptionally` is not registered
-    // anywhere in the tree (checked), so no code path can ever set one — null
-    // is the accurate answer for every reachable state.
+    // normally or is still open. W3 justified the constant null by observing
+    // that `closeExceptionally` was registered nowhere — i.e. "no data",
+    // which is a gap, not a KEEP. Register the writer too, and read it back.
+    r.register(
+        sp,
+        "closeExceptionally",
+        "(Ljava/lang/Throwable;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let err = match args.get(1) {
+                Some(Value::Object(Some(t))) => *t,
+                // JDK: NullPointerException if the error is null.
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("error is null".into()),
+                    }
+                    .into())
+                }
+            };
+            // Idempotent, like close(): the first close wins.
+            if ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+                return Ok(None);
+            }
+            ctx.set_field(this, 1, Value::Int(1));
+            let key = ctx.identity_hash_code(this);
+            let root = ctx.add_global_root(err);
+            let previous = sp_closed_exceptions().lock().insert(key, root);
+            if let Some(old) = previous {
+                ctx.remove_global_root(old);
+            }
+            // Signal the failure to every subscriber, as close() does for
+            // onComplete. Pin `this` and the Throwable across the callbacks.
+            let pin = ctx.pin_native_root(this);
+            let err_pin = ctx.pin_native_root(err);
+            let mut idx = 0;
+            loop {
+                let this_cur = ctx.read_native_pin(pin, this);
+                let (arr, len) = match sp_subscribers(ctx, this_cur) {
+                    Some(v) => v,
+                    None => break,
+                };
+                if idx >= len {
+                    break;
+                }
+                if let Value::Object(Some(sub)) = ctx.get_array_element(arr, idx) {
+                    let err_cur = ctx.read_native_pin(err_pin, err);
+                    let _ = ctx.invoke_virtual(
+                        sub,
+                        "onError",
+                        "(Ljava/lang/Throwable;)V",
+                        &[Value::Object(Some(err_cur))],
+                    );
+                }
+                idx += 1;
+            }
+            ctx.unpin_native_roots(pin);
+            Ok(None)
+        },
+    );
     r.register(
         sp,
         "getClosedException",
         "()Ljava/lang/Throwable;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let key = ctx.identity_hash_code(this);
+            let root = sp_closed_exceptions().lock().get(&key).copied();
+            Ok(Some(Value::Object(
+                root.and_then(|r| ctx.resolve_global_root(r)),
+            )))
+        },
     );
     r.set_category(__prev_cat);
+}
+
+/// Throwable handed to `SubmissionPublisher.closeExceptionally`, keyed by the
+/// publisher's identity hash. The Throwable is held as a global root (remapped
+/// by the moving collector) because the synthetic SubmissionPublisher layout
+/// (subscribers=0, closed=1, executor=2) has no slot to park it in.
+fn sp_closed_exceptions() -> &'static parking_lot::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: SqOnceLock<parking_lot::Mutex<std::collections::HashMap<i32, usize>>> =
+        SqOnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
 }
 
 // =============================================================================
@@ -5829,6 +5902,147 @@ pub(crate) fn tg_set_field(
     ctx.unpin_native_roots(pin);
 }
 
+// --- ThreadGroup subgroup registry -----------------------------------------
+//
+// The two `ThreadGroup.<init>` natives below SHADOW the real JDK constructors
+// (a native on a concrete class intercepts), so the JDK's own `groups`/
+// `ngroups` bookkeeping never runs and no group can name its children. That is
+// why `activeGroupCount()` used to answer a flat 0 while HotSpot answers 1 for
+// a group with one child. Keep the parent -> children edges here instead.
+//
+// Storage rules that make this GC-safe:
+//   * the map KEY is the parent's identity hash — stable across relocation;
+//   * the child is held as a *global root* (`add_global_root`), which the
+//     moving collector remaps, so the stored reference never goes stale.
+//     `pin_native_root` is unusable here: it is a per-thread stack and
+//     `unpin_native_roots(base)` releases everything from `base` onward, so an
+//     enclosing native would drop our entry on return.
+//
+// Cost: a ThreadGroup registered here stays reachable for the life of the VM
+// (JDK 19+ made the equivalent edge weak precisely to avoid that). ThreadGroups
+// are few and long-lived in practice, and `destroy()` is a specified no-op in
+// JDK 21+, so there is no removal point to hook.
+pub(crate) struct TgChild {
+    /// Global-root handle for the child ThreadGroup object.
+    root: usize,
+    /// The child's identity hash — the key its own children are filed under.
+    hash: i32,
+}
+
+pub(crate) fn tg_children()
+-> &'static parking_lot::Mutex<std::collections::HashMap<i32, Vec<TgChild>>> {
+    static T: SqOnceLock<parking_lot::Mutex<std::collections::HashMap<i32, Vec<TgChild>>>> =
+        SqOnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record `child` as a subgroup of `parent`. Idempotent: re-running a
+/// constructor on the same pair does not duplicate the edge (and does not leak
+/// a second global root).
+pub(crate) fn tg_register_child(ctx: &mut dyn NativeContext, parent: Value, child: ObjectRef) {
+    let parent = match parent {
+        Value::Object(Some(p)) => p,
+        _ => return,
+    };
+    if parent == child {
+        return;
+    }
+    let parent_hash = ctx.identity_hash_code(parent);
+    let child_hash = ctx.identity_hash_code(child);
+    {
+        let table = tg_children().lock();
+        if let Some(kids) = table.get(&parent_hash) {
+            if kids.iter().any(|c| c.hash == child_hash) {
+                return;
+            }
+        }
+    }
+    let root = ctx.add_global_root(child);
+    tg_children()
+        .lock()
+        .entry(parent_hash)
+        .or_default()
+        .push(TgChild {
+            root,
+            hash: child_hash,
+        });
+}
+
+/// Identity hashes of the direct subgroups of the group with `group_hash`.
+fn tg_child_hashes(group_hash: i32) -> Vec<i32> {
+    let table = tg_children().lock();
+    match table.get(&group_hash) {
+        Some(kids) => kids.iter().map(|c| c.hash).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// `activeGroupCount()` — the JDK counts this group's subgroups AND their
+/// subgroups, recursively, but NOT the receiver. `depth` guards against a cycle
+/// introduced by an identity-hash collision (two distinct groups sharing a hash
+/// would otherwise chain).
+pub(crate) fn tg_active_group_count(group_hash: i32, depth: u32) -> i32 {
+    if depth > 64 {
+        return 0;
+    }
+    let kids = tg_child_hashes(group_hash);
+    let mut n = kids.len() as i32;
+    for k in kids {
+        n += tg_active_group_count(k, depth + 1);
+    }
+    n
+}
+
+/// Collect the live subgroup objects of `group_hash` into `out`, recursively
+/// when `recurse`. Entries whose global root no longer resolves are skipped.
+pub(crate) fn tg_collect_subgroups(
+    ctx: &dyn NativeContext,
+    group_hash: i32,
+    recurse: bool,
+    out: &mut Vec<ObjectRef>,
+    depth: u32,
+) {
+    if depth > 64 {
+        return;
+    }
+    let kids: Vec<(usize, i32)> = {
+        let table = tg_children().lock();
+        match table.get(&group_hash) {
+            Some(kids) => kids.iter().map(|c| (c.root, c.hash)).collect(),
+            None => Vec::new(),
+        }
+    };
+    for (root, hash) in kids {
+        if let Some(obj) = ctx.resolve_global_root(root) {
+            out.push(obj);
+        }
+        if recurse {
+            tg_collect_subgroups(ctx, hash, recurse, out, depth + 1);
+        }
+    }
+}
+
+/// Shared body of `ThreadGroup.enumerate(ThreadGroup[])` and its `(…,boolean)`
+/// overload. Returns the number of slots filled, as the JDK does.
+fn tg_enumerate_groups(
+    ctx: &mut dyn NativeContext,
+    group: ObjectRef,
+    arr: ObjectRef,
+    recurse: bool,
+) -> i32 {
+    let group_hash = ctx.identity_hash_code(group);
+    let mut found: Vec<ObjectRef> = Vec::new();
+    tg_collect_subgroups(&*ctx, group_hash, recurse, &mut found, 0);
+    let arr_len = ctx.array_length(arr);
+    let n = found.len().min(arr_len);
+    // Global roots are remapped by the collector and nothing below allocates,
+    // so the collected references stay valid for the length of this loop.
+    for (i, obj) in found.into_iter().take(n).enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(obj)));
+    }
+    n as i32
+}
+
 pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5913,6 +6127,10 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         tg_set_field(ctx, this, "parent", 1, parent);
         tg_set_field(ctx, this, "daemon", 2, Value::Int(0));
         tg_set_field(ctx, this, "maxPriority", 3, Value::Int(10));
+        // The real ctor ends with `parent.add(this)`; ours shadows it, so
+        // record the edge in the subgroup registry instead (activeGroupCount /
+        // enumerate(ThreadGroup[]) read it back).
+        tg_register_child(ctx, parent, this);
         Ok(None)
     });
     r.register(
@@ -5921,13 +6139,8 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            tg_set_field(
-                ctx,
-                this,
-                "parent",
-                1,
-                args.get(1).copied().unwrap_or(Value::Object(None)),
-            );
+            let parent = args.get(1).copied().unwrap_or(Value::Object(None));
+            tg_set_field(ctx, this, "parent", 1, parent);
             tg_set_field(
                 ctx,
                 this,
@@ -5943,6 +6156,8 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
                 _ => 10,
             };
             tg_set_field(ctx, this, "maxPriority", 3, Value::Int(parent_max));
+            // See the `(String)` ctor: our natives shadow the real `parent.add`.
+            tg_register_child(ctx, parent, this);
             Ok(None)
         },
     );
@@ -6079,16 +6294,48 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     // activeGroupCount() is "an estimate of the number of active groups in this
-    // group AND ITS SUBGROUPS" — it does not count the receiver. CratonVM keeps
-    // no subgroup registry (`parent` is the only link and it points upward), so
-    // no group here has known children and 0 is the honest estimate. Reporting
-    // 1 made the standard
+    // group AND ITS SUBGROUPS" — it does not count the receiver. This used to
+    // answer a flat 0 because CratonVM kept no subgroup registry (`parent` is
+    // the only link and it points upward), which made HotSpot report 1 and
+    // CratonVM 0 for a group with one child. The two `<init>` natives above now
+    // record the downward edge (see `tg_register_child`), so count it for real.
+    //
+    // The paired `enumerate(ThreadGroup[])` overloads are registered right
+    // below, from the same registry: the standard
     //   ThreadGroup[] gs = new ThreadGroup[g.activeGroupCount()]; g.enumerate(gs);
-    // idiom size an array for a subgroup that does not exist and then read a
-    // null slot back out of it.
-    r.register(tg, "activeGroupCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // idiom must not size an array from this count and then be filled by a
+    // different (empty) source — the real JDK bytecode for `enumerate` reads
+    // the `groups` array that our shadowing constructors never populate.
+    r.register(tg, "activeGroupCount", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let hash = ctx.identity_hash_code(this);
+        Ok(Some(Value::Int(tg_active_group_count(hash, 0))))
     });
+    r.register(tg, "enumerate", "([Ljava/lang/ThreadGroup;)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr = match args.get(1) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        // One-arg form recurses, per the JDK.
+        Ok(Some(Value::Int(tg_enumerate_groups(ctx, this, arr, true))))
+    });
+    r.register(
+        tg,
+        "enumerate",
+        "([Ljava/lang/ThreadGroup;Z)I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let recurse = !matches!(args.get(2), Some(Value::Int(0)));
+            Ok(Some(Value::Int(tg_enumerate_groups(
+                ctx, this, arr, recurse,
+            ))))
+        },
+    );
     r.register(tg, "parentOf", "(Ljava/lang/ThreadGroup;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let other = match args.get(1) {
@@ -6121,13 +6368,29 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
     // handler (lambda or named class) resolves to its OWN declaring class
     // and its body runs; this registration never shadows it. What it does
     // cover is a receiver that has no bytecode at all (a synthetic handler
-    // object), for which "swallow the exception" is the same outcome as
-    // HotSpot's default when no handler is installed. KEEP.
+    // object).
+    //
+    // W4: for that receiver the previous no-op SWALLOWED the exception, which
+    // is NOT what HotSpot does when no handler is installed — the fallback is
+    // `ThreadGroup.uncaughtException`, which prints "Exception in thread ..."
+    // plus the stack trace to System.err. Reproduce that instead of dropping
+    // the failure on the floor (the same bug, and the same fix, as
+    // `JBossThread.dispatchUncaughtException` in wildfly_core.rs).
     r.register(
         "java/lang/Thread$UncaughtExceptionHandler",
         "uncaughtException",
         "(Ljava/lang/Thread;Ljava/lang/Throwable;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            // Instance shape is [this, thread, throwable]; if the receiver is
+            // ever elided it is [thread, throwable]. The Throwable is last
+            // either way.
+            if args.len() >= 2 {
+                if let Some(Value::Object(Some(t))) = args.last() {
+                    let _ = ctx.invoke_virtual(*t, "printStackTrace", "()V", &[]);
+                }
+            }
+            Ok(None)
+        },
     );
     // Thread.set/getUncaughtExceptionHandler and the static
     // set/getDefaultUncaughtExceptionHandler used to be registered here as
@@ -6213,6 +6476,11 @@ pub(crate) const NEW15_FJP_FIELDS: usize = 2;
 pub(crate) const NEW15_FJP_PARALLELISM: usize = 0;
 
 pub(crate) const NEW15_FJP_ACTIVE: usize = 1;
+
+/// Targeted parallelism of the common-pool proxy. Read by BOTH
+/// `ForkJoinPool.commonPool()` (into `NEW15_FJP_PARALLELISM`) and the static
+/// `ForkJoinPool.getCommonPoolParallelism()`, which the JDK specifies as equal.
+pub(crate) const NEW15_COMMON_POOL_PARALLELISM: i32 = 1;
 
 pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -6367,6 +6635,100 @@ pub(crate) fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry
     r.set_category(__prev_cat);
 }
 
+// --- current-continuation tracking -----------------------------------------
+//
+// `Continuation.run()` below executes the target inline on the carrier thread
+// rather than switching stacks, but "which continuation is running on this
+// thread" is still a real, knowable fact — and the JDK's static queries are
+// specified in terms of it:
+//
+//   * `getCurrentContinuation(scope)` returns the innermost mounted
+//     continuation of that scope, or null when there is none;
+//   * `yield(scope)` throws `IllegalStateException("Not in scope ...")` when no
+//     continuation of that scope is mounted, and only returns false (the
+//     "pinned, could not yield" answer) when one is.
+//
+// Both used to answer a flat null/false, so an unmatched `yield` looked like an
+// ordinary pin instead of the programming error it is. Track the stack here.
+// The continuation is held as a global root (remapped by the moving collector)
+// because it must survive the re-entrant `Runnable.run()` invoke.
+struct ContFrame {
+    /// Global-root handle for the mounted `Continuation`.
+    root: usize,
+    /// Identity hash of its `ContinuationScope`, or 0 when the scope is null.
+    scope_hash: i32,
+}
+
+fn cont_stacks() -> &'static parking_lot::Mutex<std::collections::HashMap<u64, Vec<ContFrame>>> {
+    static T: SqOnceLock<parking_lot::Mutex<std::collections::HashMap<u64, Vec<ContFrame>>>> =
+        SqOnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Mark `this` as mounted on the current thread; returns the global-root handle
+/// that [`cont_pop`] must be given.
+fn cont_push(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    let scope_hash = match ctx.get_field(this, NEW15_CONT_SCOPE) {
+        Value::Object(Some(s)) => ctx.identity_hash_code(s),
+        _ => 0,
+    };
+    let tid = ctx.thread_id();
+    let root = ctx.add_global_root(this);
+    cont_stacks()
+        .lock()
+        .entry(tid)
+        .or_default()
+        .push(ContFrame { root, scope_hash });
+    root
+}
+
+/// Unmount the frame created by [`cont_push`] and return the continuation's
+/// current (post-GC) reference, so the caller does not write through a stale
+/// `ObjectRef` after the nested invoke.
+fn cont_pop(ctx: &mut dyn NativeContext, root: usize) -> Option<ObjectRef> {
+    let tid = ctx.thread_id();
+    let mut found = false;
+    {
+        let mut stacks = cont_stacks().lock();
+        let mut now_empty = false;
+        if let Some(stack) = stacks.get_mut(&tid) {
+            if let Some(pos) = stack.iter().rposition(|f| f.root == root) {
+                stack.remove(pos);
+                found = true;
+            }
+            now_empty = stack.is_empty();
+        }
+        if now_empty {
+            stacks.remove(&tid);
+        }
+    }
+    let current = ctx.resolve_global_root(root);
+    if found {
+        ctx.remove_global_root(root);
+    }
+    current
+}
+
+/// Innermost continuation mounted on this thread whose scope matches `scope`
+/// (any scope when `scope` is null), or `None`.
+fn cont_current(ctx: &dyn NativeContext, scope: Value) -> Option<ObjectRef> {
+    let tid = ctx.thread_id();
+    let want = match scope {
+        Value::Object(Some(s)) => Some(ctx.identity_hash_code(s)),
+        _ => None,
+    };
+    let root = {
+        let stacks = cont_stacks().lock();
+        let stack = stacks.get(&tid)?;
+        let frame = match want {
+            Some(h) => stack.iter().rev().find(|f| f.scope_hash == h)?,
+            None => stack.last()?,
+        };
+        frame.root
+    };
+    ctx.resolve_global_root(root)
+}
+
 pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -6440,9 +6802,17 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
             }
         };
 
+        // Publish this continuation as mounted on the current thread for the
+        // duration of the body, so `getCurrentContinuation` / `yield` can give
+        // real answers while it runs. The frame doubles as a GC root: the
+        // nested invoke below can relocate `this`, and the pre-existing
+        // `set_field(this, ...)` afterwards would have written through a stale
+        // reference (native stale-local family).
+        let frame = cont_push(ctx, this);
         // Invoke Runnable.run() on the target via the VM's virtual dispatch.
         // `invoke_virtual` prepends the receiver — pass an empty args slice.
         let result = ctx.invoke_virtual(target, "run", "()V", &[]);
+        let this = cont_pop(ctx, frame).unwrap_or(this);
         // Always transition to DONE regardless of whether run() threw; this
         // matches Continuation.run() propagating exceptions out but still
         // leaving the continuation in a terminal state.
@@ -6450,14 +6820,38 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         result.map(|_| None)
     });
 
-    // static yield(ContinuationScope): false — we cannot unwind Rust frames.
+    // static yield(ContinuationScope).
+    //
+    // The JDK walks the mounted continuation chain for `scope` and throws
+    // `IllegalStateException("Not in scope ...")` when there is none; only when
+    // one IS mounted does it delegate to `yield0`, whose false means "pinned,
+    // could not yield". Returning false unconditionally conflated the two, so a
+    // yield from outside any continuation looked like an ordinary pin. Do the
+    // scope check for real against the mount stack (`cont_push`/`cont_current`)
+    // and keep false for the mounted case — we run the body inline on the
+    // carrier thread and cannot unwind interpreter/Rust frames.
     r.register(
         cls,
         "yield",
         "(Ljdk/internal/vm/ContinuationScope;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let scope = args.first().copied().unwrap_or(Value::Object(None));
+            if cont_current(&*ctx, scope).is_none() {
+                return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(
+                        cratonvm_types::error::RuntimeError::IllegalStateException {
+                            message: "Not in scope".to_string(),
+                        },
+                    ),
+                ));
+            }
+            Ok(Some(Value::Int(0)))
+        },
     );
-    // Private yield0 used by the JDK internally — same semantics.
+    // Private yield0 used by the JDK internally. It is only reached from
+    // `yield` above (which has already validated the scope), and its false is
+    // exactly the "freeze failed / pinned" answer — the honest result for an
+    // inline-executed continuation. KEEP.
     r.register(
         cls,
         "yield0",
@@ -6530,14 +6924,18 @@ pub(crate) fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // static getCurrentContinuation(ContinuationScope): null — we never track a
-    // "current running continuation" outside of an explicit run() call because
-    // execution never unwinds mid-body.
+    // static getCurrentContinuation(ContinuationScope) — the innermost
+    // continuation of `scope` mounted on the calling thread. `run()` above now
+    // pushes/pops a mount frame, so this is a real lookup; null still comes
+    // back when nothing of that scope is running, which is the JDK answer too.
     r.register(
         cls,
         "getCurrentContinuation",
         "(Ljdk/internal/vm/ContinuationScope;)Ljdk/internal/vm/Continuation;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let scope = args.first().copied().unwrap_or(Value::Object(None));
+            Ok(Some(Value::Object(cont_current(&*ctx, scope))))
+        },
     );
     r.set_category(__prev_cat);
 }
@@ -6591,18 +6989,19 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
                 "java/util/concurrent/ForkJoinPool",
                 NEW15_FJP_FIELDS,
             );
-            let cpus = std::thread::available_parallelism()
-                .map(|n| n.get() as i32)
-                .unwrap_or(1);
-            // JDK: Runtime.getRuntime().availableProcessors() - 1, minimum 1.
-            let parallelism = (cpus - 1).max(1);
-            // T16.7: tests run in parallel on multi-core hosts; clamp to 1 by
-            // default so `forkjoin_pool_basic` is deterministic. The real
-            // carrier pool lives in `SharedVm.threads.virtual_scheduler`, not this
-            // synthetic proxy, so user code that wants real parallelism
-            // should query that pool directly.
-            let _ = parallelism;
-            ctx.set_field(obj, NEW15_FJP_PARALLELISM, Value::Int(1));
+            // T16.7: the JDK formula is `max(1, availableProcessors() - 1)`,
+            // but tests run in parallel on multi-core hosts, so the common-pool
+            // proxy is clamped to 1 for determinism (`forkjoin_pool_basic`
+            // asserts that minimum). The real carrier pool lives in
+            // `SharedVm.threads.virtual_scheduler`, not this synthetic proxy,
+            // so user code that wants real parallelism should query that pool.
+            // `getCommonPoolParallelism()` below MUST report the same number —
+            // the JDK specifies the two as equal — hence the shared constant.
+            ctx.set_field(
+                obj,
+                NEW15_FJP_PARALLELISM,
+                Value::Int(NEW15_COMMON_POOL_PARALLELISM),
+            );
             ctx.set_field(obj, NEW15_FJP_ACTIVE, Value::Int(0));
             // T19_K3_FJP_FACTORY_POPULATE: when the real ForkJoinPool class
             // is loaded (e.g. KC26 boot path that walks the JDK class
@@ -6625,9 +7024,12 @@ pub(crate) fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // static getCommonPoolParallelism()I — match commonPool()'s parallelism.
+    // static getCommonPoolParallelism()I — KEEP, and it is not a placeholder:
+    // the JDK defines it as the common pool's targeted parallelism, so it is
+    // required to equal `commonPool().getParallelism()`. Both now read the same
+    // constant so they cannot drift apart.
     r.register(cls, "getCommonPoolParallelism", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(NEW15_COMMON_POOL_PARALLELISM)))
     });
 
     // getParallelism()I — instance method, reads field 0 of `this`.

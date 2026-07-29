@@ -334,6 +334,59 @@ fn build_module(ctx: &mut dyn NativeContext, name: &str, layer: ObjectRef) -> Ob
     module
 }
 
+/// `Module.defineModule0(Module, boolean, String, String, Object[])` — record
+/// the package set the JDK is handing us, and register an open module's
+/// packages as unqualified opens.
+///
+/// Static native: `args[0]` is the Module, `args[1]` the `isOpen` flag,
+/// `args[2]`/`args[3]` version/location (unused — CratonVM keeps no module
+/// descriptor beyond the name), `args[4]` the `Object[]` of package names.
+pub(crate) fn native_module_define_module0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let module = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        // Real `defineModule0(null, ...)` would NPE inside the VM; nothing to
+        // record either way.
+        _ => return Ok(None),
+    };
+    let is_open = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
+
+    let mut packages: Vec<String> = Vec::new();
+    if let Some(Value::Object(Some(arr))) = args.get(4) {
+        let len = ctx.array_length(*arr);
+        packages.reserve(len);
+        for i in 0..len {
+            if let Value::Object(Some(s)) = ctx.get_array_element(*arr, i) {
+                if let Some(pkg) = ctx.read_string(s) {
+                    packages.push(pkg);
+                }
+            }
+        }
+    }
+
+    // An open module opens every package it contains to every other module —
+    // empty target = unqualified, same convention as `addExportsToAll0`.
+    if is_open {
+        let module_name = match ctx.get_field_by_name(module, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        };
+        if let Some(name) = module_name {
+            for pkg in &packages {
+                ctx.module_add_opens(&name, pkg, "");
+            }
+        }
+    }
+
+    let id = ctx.identity_hash_code(module);
+    let mut t = module_packages_table().lock().unwrap();
+    module_packages_evict_if_needed(&mut t, id);
+    t.insert(id, packages);
+    Ok(None)
+}
+
 /// Wrap an ObjectRef as `Optional.of(value)`.
 fn wrap_optional_present(ctx: &mut dyn NativeContext, value: ObjectRef) -> ObjectRef {
     let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
@@ -949,16 +1002,29 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/ModuleLayer;",
         native_module_get_layer,
     );
-    // KEEP (deliberate no-op): `defineModule0` is the VM-sync hook the real
-    // JDK Module constructor calls AFTER it has already initialized the
-    // Java-side Module object. CratonVM's module table is populated by the
-    // class manager as classes are defined, not from this callback, so there
-    // is genuinely nothing to record here.
+    // `defineModule0(Module, boolean isOpen, String version, String location,
+    // Object[] packageNames)` — the VM-sync hook `Module.<init>` calls once the
+    // Java-side object is initialized. STUB-REMOVAL (wave 4): the previous
+    // no-op's justification ("CratonVM's module table is populated by the class
+    // manager, so there is nothing to record") was wrong twice over.
+    //
+    //  1. The package list arrives HERE and nowhere else. Without it
+    //     `native_module_get_packages` finds no `module_packages_table` row and
+    //     falls back to `BOOT_JDK_PACKAGES` — i.e. every real-JDK-defined
+    //     module claimed to contain the whole of java.base.
+    //  2. `isOpen` is the only place the VM learns a module is open, and an
+    //     open module opens all its packages to every other module. That is
+    //     exactly `ModuleRegistry::add_opens(pkg, "" = all)`, the same
+    //     "empty target means unqualified" convention `addExportsToAll0` uses.
+    //
+    // Still missing (ESCALATION, needs a NativeContext accessor): there is no
+    // `module_add_package`, so the package -> module direction consulted by
+    // `module_for_package` is still only whatever the class manager derived.
     registry.register(
         m,
         "defineModule0",
         "(Ljava/lang/Module;ZLjava/lang/String;Ljava/lang/String;[Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        native_module_define_module0,
     );
     // The three `addExports*0` hooks are NOT bookkeeping-free: they are the
     // only place the VM learns about a dynamic export, and CratonVM's own

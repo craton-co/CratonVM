@@ -41,7 +41,9 @@ use cratonvm_types::error::{MethodCallResult, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
 use zstd::zstd_safe::zstd_sys::ZSTD_EndDirective;
-use zstd::zstd_safe::{self, CCtx, CParameter, DCtx, InBuffer, OutBuffer, ResetDirective};
+use zstd::zstd_safe::{
+    self, CCtx, CParameter, DCtx, DParameter, InBuffer, OutBuffer, ResetDirective,
+};
 
 // ---------------------------------------------------------------------------
 // Argument / value / field helpers
@@ -514,6 +516,140 @@ fn zstd_set_compression_level(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// what zstd-jni compares an error return against.
 const ZSTD_ERR_PARAMETER_UNSUPPORTED: i32 = -40;
 
+/// `(size_t)(-ZSTD_error_parameter_outOfBound)`; see
+/// `ZSTD_ERR_PARAMETER_UNSUPPORTED`.
+const ZSTD_ERR_PARAMETER_OUT_OF_BOUND: i32 = -42;
+
+/// Apply one compression parameter to the live `CCtx` behind a zstd-jni stream
+/// handle.
+///
+/// Returns 0 on success and libzstd's own error code otherwise — exactly what
+/// the caller feeds to `Zstd.isError`/`Zstd.getErrorName`. An unknown handle is
+/// reported as success: zstd-jni's setters are also called on a stream that has
+/// not created its context yet, and that is not an error there either.
+fn zstd_apply_cparam(handle: i64, param: CParameter) -> MethodCallResult {
+    let mut table = cctx_table().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(b) = table.get_mut(&handle) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    match b.0.set_parameter(param) {
+        Ok(_) => Ok(Some(Value::Int(0))),
+        Err(code) => Ok(Some(Value::Int(code as i32))),
+    }
+}
+
+/// `zstd_apply_cparam`'s decompression twin (`DCtx` / `DParameter`).
+fn zstd_apply_dparam(handle: i64, param: DParameter) -> MethodCallResult {
+    let mut table = dctx_table().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(b) = table.get_mut(&handle) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    match b.0.set_parameter(param) {
+        Ok(_) => Ok(Some(Value::Int(0))),
+        Err(code) => Ok(Some(Value::Int(code as i32))),
+    }
+}
+
+/// Define one `Zstd.setXxx(long, int|boolean)I` native that maps its second
+/// argument onto a libzstd parameter and applies it. `$build` receives the raw
+/// `int` (a `boolean` arrives as 0/1).
+///
+/// A macro rather than a loop because the registry takes a bare `fn` pointer,
+/// so each name needs its own non-capturing function.
+macro_rules! zstd_param_setter {
+    ($fn_name:ident, $apply:ident, $param_ty:ty, $build:expr) => {
+        fn $fn_name(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+            let build: fn(i32) -> $param_ty = $build;
+            $apply(arg_long(args, 0), build(arg_int(args, 1)))
+        }
+    };
+}
+
+zstd_param_setter!(zstd_set_checksums, zstd_apply_cparam, CParameter, |v| {
+    CParameter::ChecksumFlag(v != 0)
+});
+zstd_param_setter!(zstd_set_workers, zstd_apply_cparam, CParameter, |v| {
+    CParameter::NbWorkers(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_overlap_log, zstd_apply_cparam, CParameter, |v| {
+    CParameter::OverlapSizeLog(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_job_size, zstd_apply_cparam, CParameter, |v| {
+    CParameter::JobSize(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_target_length, zstd_apply_cparam, CParameter, |v| {
+    CParameter::TargetLength(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_min_match, zstd_apply_cparam, CParameter, |v| {
+    CParameter::MinMatch(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_search_log, zstd_apply_cparam, CParameter, |v| {
+    CParameter::SearchLog(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_chain_log, zstd_apply_cparam, CParameter, |v| {
+    CParameter::ChainLog(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_hash_log, zstd_apply_cparam, CParameter, |v| {
+    CParameter::HashLog(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_window_log, zstd_apply_cparam, CParameter, |v| {
+    CParameter::WindowLog(v.max(0) as u32)
+});
+zstd_param_setter!(zstd_set_ldm, zstd_apply_cparam, CParameter, |v| {
+    CParameter::EnableLongDistanceMatching(v != 0)
+});
+zstd_param_setter!(
+    zstd_set_decompression_long_max,
+    zstd_apply_dparam,
+    DParameter,
+    |v| { DParameter::WindowLogMax(v.max(0) as u32) }
+);
+
+/// `Zstd.setCompressionStrategy(long, int)`.
+///
+/// zstd-jni passes libzstd's `ZSTD_strategy` enum value (1..=9); `zstd_safe`
+/// models it as a Rust enum, so map the number back. Anything outside the
+/// documented range is refused rather than silently coerced.
+fn zstd_set_strategy(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let strategy = match arg_int(args, 1) {
+        1 => zstd_safe::Strategy::ZSTD_fast,
+        2 => zstd_safe::Strategy::ZSTD_dfast,
+        3 => zstd_safe::Strategy::ZSTD_greedy,
+        4 => zstd_safe::Strategy::ZSTD_lazy,
+        5 => zstd_safe::Strategy::ZSTD_lazy2,
+        6 => zstd_safe::Strategy::ZSTD_btlazy2,
+        7 => zstd_safe::Strategy::ZSTD_btopt,
+        8 => zstd_safe::Strategy::ZSTD_btultra,
+        9 => zstd_safe::Strategy::ZSTD_btultra2,
+        _ => return Ok(Some(Value::Int(ZSTD_ERR_PARAMETER_OUT_OF_BOUND))),
+    };
+    zstd_apply_cparam(arg_long(args, 0), CParameter::Strategy(strategy))
+}
+
+/// `Zstd.setCompressionLong(long, int windowLog)` — zstd-jni's shorthand for
+/// "enable long-distance matching over this window", and "disable it" when the
+/// window is below libzstd's `ZSTD_WINDOWLOG_MIN` (10).
+fn zstd_set_compression_long(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let handle = arg_long(args, 0);
+    let window_log = arg_int(args, 1);
+    if window_log < 10 {
+        return zstd_apply_cparam(handle, CParameter::EnableLongDistanceMatching(false));
+    }
+    match zstd_apply_cparam(handle, CParameter::EnableLongDistanceMatching(true))? {
+        Some(Value::Int(0)) => {}
+        other => return Ok(other),
+    }
+    zstd_apply_cparam(handle, CParameter::WindowLog(window_log as u32))
+}
+
+/// Parameters that exist only behind libzstd's *experimental* API, which the
+/// bundled `zstd-safe` is not built with. Reporting "unsupported" is the honest
+/// answer; returning 0 told the caller a knob had been applied when nothing
+/// had changed. Same treatment as `zstd_set_magicless` below.
+fn zstd_set_experimental_param(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(ZSTD_ERR_PARAMETER_UNSUPPORTED)))
+}
+
 /// `Zstd.setCompressionMagicless` / `setDecompressionMagicless`.
 fn zstd_set_magicless(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Requesting magicless == false leaves us in the state we are already in.
@@ -944,14 +1080,15 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(z, "getErrorCode", "(J)J", zstd_get_error_code);
     r.register(z, "compressBound", "(J)J", zstd_compress_bound);
-    // KEEP: `3` is not a placeholder — it is libzstd's `ZSTD_CLEVEL_DEFAULT`,
-    // the same constant `ZSTD_defaultCLevel()` returns and the level the
-    // bundled libzstd actually uses when none is given. (Spelled as a literal
-    // rather than calling `ZSTD_defaultCLevel` because that entry point is
-    // behind zstd-sys's `experimental` bindings gate, unlike the min/max
-    // accessors below.)
+    // Ask the linked libzstd, exactly as the min/max accessors below do. (The
+    // previous hard-coded `3` justified itself by claiming
+    // `ZSTD_defaultCLevel` sits behind zstd-sys's `experimental` bindings
+    // gate. It does not: it is declared in `bindings_zstd.rs` three lines
+    // after `ZSTD_minCLevel`/`ZSTD_maxCLevel`.)
     r.register(z, "defaultCompressionLevel", "()I", |_c, _a| {
-        Ok(Some(Value::Int(3)))
+        Ok(Some(Value::Int(unsafe {
+            zstd_safe::zstd_sys::ZSTD_defaultCLevel()
+        })))
     });
     r.register(z, "minCompressionLevel", "()I", |_c, _a| {
         Ok(Some(Value::Int(unsafe {
@@ -964,46 +1101,51 @@ pub fn register_compression_natives(r: &mut NativeMethodRegistry) {
         })))
     });
 
-    // Parameter setters: apply the level (frame-affecting and cheap), accept
-    // the tuning-only knobs, and REFUSE the ones that would change the wire
-    // format if honoured. Each returns an int the caller feeds to
-    // `Zstd.isError`.
+    // Parameter setters: apply each knob to the real context and REFUSE the
+    // ones libzstd cannot honour in this build. Each returns an int the caller
+    // feeds to `Zstd.isError`.
     r.register(
         z,
         "setCompressionLevel",
         "(JI)I",
         zstd_set_compression_level,
     );
-    for name in [
-        // Every parameter below affects only the compressor's speed/ratio
-        // trade-off or its internal window/table sizing. None of them changes
-        // whether the emitted frame is decodable, so accepting and ignoring
-        // them cannot corrupt anything a peer reads — KEEP with that
-        // justification rather than failing a stream Kafka would otherwise
-        // compress correctly.
-        "setCompressionChecksums",
-        "setCompressionLong",
-        "setCompressionWorkers",
-        "setCompressionOverlapLog",
-        "setCompressionJobSize",
-        "setCompressionTargetLength",
-        "setCompressionMinMatch",
-        "setCompressionSearchLog",
-        "setCompressionChainLog",
-        "setCompressionHashLog",
-        "setCompressionWindowLog",
-        "setCompressionStrategy",
-        "setDecompressionLongMax",
-        "setRefMultipleDDicts",
-        "setValidateSequences",
-        "setSequenceProducerFallback",
-        "setSearchForExternalRepcodes",
-        "setEnableLongDistanceMatching",
-    ] {
-        // (long, int) or (long, boolean) — both are `(JI)I` / `(JZ)I` at the
-        // descriptor level; register both shapes so resolution always hits.
-        r.register(z, name, "(JI)I", |_c, _a| Ok(Some(Value::Int(0))));
-        r.register(z, name, "(JZ)I", |_c, _a| Ok(Some(Value::Int(0))));
+    // Each of these now reaches libzstd's real `ZSTD_CCtx_setParameter` /
+    // `ZSTD_DCtx_setParameter` on the context behind the handle and returns
+    // libzstd's own status code. They used to return a blanket 0 while
+    // discarding the request: `setCompressionChecksums(true)` produced a frame
+    // with no checksum, and every window/strategy knob was silently inert
+    // while reporting success.
+    //
+    // The `(JI)I` / `(JZ)I` pair is registered for each name because a
+    // `boolean` second argument is `Z` and an `int` is `I` at the descriptor
+    // level; both shapes route to the same handler, which reads 0/1 either way.
+    let param_setters: [(&str, cratonvm_native_api::NativeCallback); 18] = [
+        ("setCompressionChecksums", zstd_set_checksums),
+        ("setCompressionLong", zstd_set_compression_long),
+        ("setCompressionWorkers", zstd_set_workers),
+        ("setCompressionOverlapLog", zstd_set_overlap_log),
+        ("setCompressionJobSize", zstd_set_job_size),
+        ("setCompressionTargetLength", zstd_set_target_length),
+        ("setCompressionMinMatch", zstd_set_min_match),
+        ("setCompressionSearchLog", zstd_set_search_log),
+        ("setCompressionChainLog", zstd_set_chain_log),
+        ("setCompressionHashLog", zstd_set_hash_log),
+        ("setCompressionWindowLog", zstd_set_window_log),
+        ("setCompressionStrategy", zstd_set_strategy),
+        ("setEnableLongDistanceMatching", zstd_set_ldm),
+        ("setDecompressionLongMax", zstd_set_decompression_long_max),
+        // libzstd exposes these four only through its experimental API, which
+        // the bundled zstd-safe is not built with, so they report
+        // ZSTD_error_parameter_unsupported instead of a fake success.
+        ("setRefMultipleDDicts", zstd_set_experimental_param),
+        ("setValidateSequences", zstd_set_experimental_param),
+        ("setSequenceProducerFallback", zstd_set_experimental_param),
+        ("setSearchForExternalRepcodes", zstd_set_experimental_param),
+    ];
+    for (name, cb) in param_setters {
+        r.register(z, name, "(JI)I", cb);
+        r.register(z, name, "(JZ)I", cb);
     }
     // "Magicless" frames omit the 4-byte ZSTD magic number, so a frame written
     // (or expected) magicless is NOT interchangeable with a normal one.
