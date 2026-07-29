@@ -129,7 +129,7 @@ of the 2026-07-23 rerun, but **not** with this doc's `NoSuchBeanDefinitionExcept
 `DiscoveryIssueException` ("`UniqueIdSelector [...] could not be resolved`")
 during test *discovery*, before the test body (and therefore this doc's
 `ObjectProvider` injection point) ever runs. Root-caused as a new doc:
-[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md).
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md`](modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md).
 This doc's own root-cause hypothesis (`ObjectProvider<X>` generic-identity
 mismatch under an isolated loader) is not confirmed or refuted by this —
 it simply never gets a chance to reproduce anymore, since the new failure

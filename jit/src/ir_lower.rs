@@ -288,6 +288,12 @@ struct Lowerer<'a> {
     /// Shared post-call frame publication used by direct and hashed dispatch
     /// stubs. Zero when precise frame tracking is unavailable.
     frame_record: usize,
+    /// `jit_service_callee_deopt` — services a compiled callee's `i64::MIN`
+    /// deopt sentinel at the megamorphic stub's inline call site, so the
+    /// callee's stashed frame is resumed there instead of escaping to the
+    /// caller as if the caller had deopted. Zero disables the emitted check.
+    /// See `runtime_lowering::emit_callee_deopt_check`.
+    service_callee_deopt: usize,
     /// wire-tiered-manager Step 4 (PGO handoff C1 → C2): per-bytecode-PC branch
     /// bias, keyed by the conditional-branch instruction's bytecode PC (the same
     /// key the IR builder stamps on each `Op::If` via `Node::bytecode_pc`). Value
@@ -424,6 +430,7 @@ impl<'a> Lowerer<'a> {
             ic_slots,
             invoke_virtual_mic: helpers.invoke_virtual_mic,
             frame_record: helpers.frame_record,
+            service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
             sr_map,
         }
@@ -1412,6 +1419,8 @@ impl<'a> Lowerer<'a> {
             self.context_slot_off,
             &arg_offsets,
             self.frame_record,
+            self.service_callee_deopt,
+            info_ptr,
         ));
 
         // ── Slow path: the resolving + cache-populating helper ────────────

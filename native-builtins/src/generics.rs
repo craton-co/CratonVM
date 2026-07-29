@@ -43,6 +43,79 @@ fn type_parameter_build_cache() -> &'static Mutex<HashMap<(usize, i32, String), 
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Keys in [`type_parameter_build_cache`] whose value is a PLACEHOLDER: a
+/// `TypeVariable` synthesized by the `TypeSig::TypeVar` fallback arm for a
+/// variable whose declaration could not be consulted yet, and which therefore
+/// carries the default `Object` bound instead of its declared one.
+///
+/// This happens whenever a type parameter's bound mentions a LATER parameter of
+/// the same list -- `<T extends Thing<S>, S extends Something>`. Building `T`
+/// resolves the nested `S`, `resolve_declared_type_variable` refuses to
+/// re-enter `getTypeParameters()` while the list is under construction, and the
+/// fallback publishes an `Object`-bounded stand-in for `S` under `(decl, "S")`.
+/// Without this marker `Class.getTypeParameters()` then served that stand-in as
+/// the real `S` forever: `Base.class.getTypeParameters()[1].getBounds()` came
+/// back `[Object]` where HotSpot answers `[Something]`, and every consumer that
+/// resolves a type variable to its bound saw the wrong type. Spring's
+/// `ResolvableType.forField(field, declaringClass).resolve()` returned `null`
+/// instead of the bound, so `@MockitoBean S something` in
+/// `AbstractMockitoBeanAndGenericsIntegrationTests` matched by type against
+/// EVERY bean in the context ("found 17 beans of type ?") and AOT processing of
+/// the class failed outright.
+///
+/// A marked entry is a cache MISS for lookups that want the finished article;
+/// [`type_param_to_java`] patches the stand-in in place (preserving identity, so
+/// the reference already baked into `T`'s bound is corrected too) and clears the
+/// mark.
+fn type_parameter_placeholder_set(
+) -> &'static Mutex<std::collections::HashSet<(usize, i32, String)>> {
+    static SET: OnceLock<Mutex<std::collections::HashSet<(usize, i32, String)>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn placeholder_key(
+    ctx: &mut dyn NativeContext,
+    decl: ObjectRef,
+    name: &str,
+) -> (usize, i32, String) {
+    (
+        ctx.vm_identity(),
+        ctx.identity_hash_code(decl),
+        name.to_string(),
+    )
+}
+
+/// Whether the cached `TypeVariable` for `(decl, name)` is an `Object`-bounded
+/// stand-in rather than the declared parameter. See
+/// [`type_parameter_placeholder_set`].
+pub(crate) fn is_placeholder_type_parameter(
+    ctx: &mut dyn NativeContext,
+    decl: ObjectRef,
+    name: &str,
+) -> bool {
+    let key = placeholder_key(ctx, decl, name);
+    type_parameter_placeholder_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key)
+}
+
+fn mark_placeholder_type_parameter(ctx: &mut dyn NativeContext, decl: ObjectRef, name: &str) {
+    let key = placeholder_key(ctx, decl, name);
+    type_parameter_placeholder_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key);
+}
+
+fn clear_placeholder_type_parameter(ctx: &mut dyn NativeContext, decl: ObjectRef, name: &str) {
+    let key = placeholder_key(ctx, decl, name);
+    type_parameter_placeholder_set()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
+}
+
 /// CRITICAL for termination, not just an optimization: `com.sun.beans
 /// .TypeResolver.resolve(TypeVariable, Map)` (real JDK bytecode) detects a
 /// type variable that maps to itself with `map.get(tv) == tv` --
@@ -185,6 +258,69 @@ fn class_id_in_generic_scope(
     scoped.or(global)
 }
 
+/// Resolve a signature class through the declaring class's loader before the
+/// process-global fallback. A read-only nearby lookup cannot find a
+/// child-loader class until something else has loaded it; reflective generic
+/// signatures such as `List<ServiceType>` are often the first use. Falling
+/// straight through to the global loader then splits a JAXB/Spring model graph
+/// by class identity.
+fn resolve_class_id_in_generic_scope(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> Option<cratonvm_types::ClassId> {
+    if let Some(cid) = class_id_in_generic_scope(ctx, name) {
+        return Some(cid);
+    }
+
+    let declaring_class = GENERIC_DECL_SCOPE
+        .with(|scope| scope.get())
+        .and_then(|decl| ctx.class_id_from_mirror(decl));
+    if let Some(declaring_class) = declaring_class {
+        let loader_id = ctx.loader_id_of_class(declaring_class);
+        let loader =
+            crate::classloader::defining_loader_for(declaring_class.as_u32()).or_else(|| {
+                (loader_id >= 3)
+                    .then(|| crate::classloader::loader_object_for_namespace_id(loader_id as u32))
+                    .flatten()
+            });
+        if let Some(loader) = loader {
+            if let Some(mirror) =
+                crate::classloader::find_loaded_class_for_loader(ctx, loader, name)
+            {
+                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    return Some(cid);
+                }
+            }
+            let loader_pin = ctx.pin_native_root(loader);
+            let name_obj = ctx.create_string(&name.replace('/', "."));
+            let name_pin = ctx.pin_native_root(name_obj);
+            let loader = ctx.read_native_pin(loader_pin, loader);
+            let name_obj = ctx.read_native_pin(name_pin, name_obj);
+            let loaded = ctx.invoke_virtual(
+                loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[Value::Object(Some(name_obj))],
+            );
+            ctx.unpin_native_roots(name_pin);
+            ctx.unpin_native_roots(loader_pin);
+            if let Ok(Some(Value::Object(Some(mirror)))) = loaded {
+                if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+                    return Some(cid);
+                }
+            }
+        }
+    }
+
+    ctx.load_class(name)
+        .ok()
+        .flatten()
+        .and_then(|value| match value {
+            Value::Object(Some(mirror)) => ctx.class_id_from_mirror(mirror),
+            _ => None,
+        })
+}
+
 fn reflective_type_variable_name(ctx: &mut dyn NativeContext, tv: ObjectRef) -> Option<String> {
     let cname = ctx
         .class_name_of_id(ctx.class_id_of_object(tv))
@@ -322,11 +458,9 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // "Unable to determine source type <S> and target type <T>".
             // Real-JDK reifier likewise returns Class mirrors without forcing
             // initialization.
-            if let Some(cid) = class_id_in_generic_scope(ctx, name) {
+            if let Some(cid) = resolve_class_id_in_generic_scope(ctx, name) {
                 let mirror = ctx.get_class_mirror(cid);
                 Value::Object(Some(mirror))
-            } else if let Ok(Some(v)) = ctx.load_class(name) {
-                v
             } else {
                 Value::Object(None)
             }
@@ -365,11 +499,9 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // fill loop (mirrors `build_mirror_array`).
             let pt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/ParameterizedType", 3);
             let pt_pin = ctx.pin_native_root(pt);
-            let raw_val = if let Some(cid) = class_id_in_generic_scope(ctx, name) {
+            let raw_val = if let Some(cid) = resolve_class_id_in_generic_scope(ctx, name) {
                 let m = ctx.get_class_mirror(cid);
                 Value::Object(Some(m))
-            } else if let Ok(Some(v)) = ctx.load_class(name) {
-                v
             } else {
                 Value::Object(None)
             };
@@ -504,6 +636,10 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             // possible to key this when an enclosing decl was in scope.
             if let Value::Object(Some(decl)) = current_generic_decl() {
                 cache_building_type_parameter(ctx, decl, name, tv);
+                // This stand-in carries the DEFAULT `Object` bound, not the
+                // declared one - mark it so `Class.getTypeParameters()` does not
+                // serve it as the finished parameter.
+                mark_placeholder_type_parameter(ctx, decl, name);
             }
             ctx.unpin_native_roots(tv_pin);
             Value::Object(Some(tv))
@@ -678,7 +814,25 @@ pub fn type_param_to_java(
     // itself calls the allocating `typesig_to_real_type` per bound) can each
     // trigger a GC that relocates it. Pin it for the whole function and
     // re-read the forwarded reference before every use.
-    let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
+    // Reuse the `Object`-bounded stand-in the fallback arm may already have
+    // published for this name (see `type_parameter_placeholder_set`) and patch
+    // it in place. Allocating a fresh object here instead would leave the
+    // earlier parameter's bound - which baked the stand-in in by reference -
+    // pointing at an object whose bounds stay wrong forever, and would break the
+    // reference identity `com.sun.beans.TypeResolver` depends on.
+    let placeholder = match generic_decl {
+        Value::Object(Some(decl)) if is_placeholder_type_parameter(ctx, decl, &tp.name) => {
+            match cached_building_type_parameter(ctx, decl, &tp.name) {
+                Some(Value::Object(Some(existing))) => Some(existing),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let tv = match placeholder {
+        Some(existing) => existing,
+        None => alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3),
+    };
     let tv_pin = ctx.pin_native_root(tv);
     let name_str = ctx.create_string(&tp.name);
     let tv = ctx.read_native_pin(tv_pin, tv);
@@ -722,6 +876,8 @@ pub fn type_param_to_java(
     if let Value::Object(Some(decl)) = generic_decl {
         let tv = ctx.read_native_pin(tv_pin, tv);
         cache_building_type_parameter(ctx, decl, &tp.name, tv);
+        // Bounds are now the declared ones, so this is no longer a stand-in.
+        clear_placeholder_type_parameter(ctx, decl, &tp.name);
     }
     ctx.unpin_native_roots(tv_pin);
     Value::Object(Some(tv))
@@ -912,10 +1068,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
             owner,
         } if !type_args.is_empty() || owner.is_some() => {
             let slashed = name.replace('.', "/");
-            let raw_cid = class_id_in_generic_scope(ctx, &slashed).or_else(|| {
-                let _ = ctx.load_class(&slashed);
-                class_id_in_generic_scope(ctx, &slashed)
-            });
+            let raw_cid = resolve_class_id_in_generic_scope(ctx, &slashed);
             // GC-safety (2026-07-16): `raw_mirror` is a resolved Class mirror
             // held in a Rust local across every allocation below (`args` and
             // its per-element `typearg_to_real_type` factory calls, the
@@ -967,10 +1120,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 Some(o) => typesig_to_real_type(ctx, o),
                 None => match slashed.rsplit_once('$') {
                     Some((outer, _)) => {
-                        let owner_id = class_id_in_generic_scope(ctx, outer).or_else(|| {
-                            let _ = ctx.load_class(outer);
-                            class_id_in_generic_scope(ctx, outer)
-                        });
+                        let owner_id = resolve_class_id_in_generic_scope(ctx, outer);
                         owner_id
                             .map(|cid| Value::Object(Some(ctx.get_class_mirror(cid))))
                             .unwrap_or(Value::Object(None))

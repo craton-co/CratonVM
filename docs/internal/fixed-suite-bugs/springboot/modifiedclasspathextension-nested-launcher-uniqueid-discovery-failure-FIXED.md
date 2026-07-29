@@ -1,6 +1,6 @@
-# `ModifiedClassPathExtension`'s nested `Launcher.discover()` fails to resolve its own `UniqueIdSelector` — `DiscoveryIssueException` on every `@ClassPathExclusions`/`@ClassPathOverrides` test
+# `ModifiedClassPathExtension` nested `Launcher.discover()` and its generic/Mockito residuals — FIXED
 
-**Status: OPEN — found 2026-07-23 (craton-rerun-20260723)**
+**Status: FIXED — 2026-07-28.**
 
 ## Symptom
 
@@ -201,3 +201,46 @@ Log paths:
 `.../shard5/logs/module_spring-boot-jdbc.org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguratio-9a0d5d108699.out.log`,
 `.../shard3/logs/module_spring-boot-jdbc.org.springframework.boot.jdbc.autoconfigure.HikariDataSourceConfigurationTests.out.log`
 (all under `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/`).
+
+## Resolution (2026-07-28)
+
+The original nested-launcher `UniqueIdSelector` discovery failure was already
+cleared by the earlier isolated-loader/pathing-jar work. This closure fixes
+the two residuals that still prevented the whole affected-class set from
+passing end to end:
+
+- Reflective generic reification now resolves a signature class through the
+  declaring class's defining loader before using the process-global fallback.
+  This preserves child-loader identity for the EhCache JAXB model graph
+  (`List<ServiceType>`), avoiding duplicate JAXB model types.
+- `Instrumentation` now treats Mockito's inline bytecode generator as a
+  process-wide singleton. A temporary `ModifiedClassPathExtension` loader can
+  load a second Mockito copy, but its independently generated dispatcher
+  identifier cannot compose with an already transformed JDK class. The first
+  registered maker remains authoritative for the VM lifetime. Retransformation
+  also restores original class bytes before invoking Java transformers, keeping
+  the byte stream and `classBeingRedefined` metadata coherent.
+
+## Verified
+
+Using release binary
+`cratonvm-modcp-uniqueid-discovery-20260728-019fab6e.exe` and a rebuilt
+real-JDK Spring Boot fixture, every documented affected class passed in both
+execution modes:
+
+| Mode | Classes | Tests | Failed | Aborted |
+|---|---:|---:|---:|---:|
+| `--nojit` | 13/13 | 52 | 0 | 0 |
+| JIT | 13/13 | 52 | 0 | 0 |
+
+Authoritative runner summaries:
+
+- `craton-affected-nojit-fixture-20260728-019fab6e`: 13 PASS, 562.458 summed
+  class seconds.
+- `craton-affected-jit-fixture-20260728-019fab6e`: 13 PASS, 499.675 summed
+  class seconds.
+
+This includes `EhCache3CacheAutoConfigurationTests` (2/2 in both modes) and
+the full `HikariDataSourceConfigurationTests` class (13/13 in both modes),
+not merely its four originally annotated methods. No `DiscoveryIssueException`,
+JAXB identity failure, or Mockito retransformation failure remains.
