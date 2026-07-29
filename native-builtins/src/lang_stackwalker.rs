@@ -94,16 +94,16 @@ const SF_BCI: usize = 4;
 const SF_DECL_INTERNAL: usize = 5;
 
 /// `java.lang.ClassFrameInfo.RETAIN_CLASS_REF` — the bit of the frame's
-/// `flags` field that records whether the `StackWalker` that produced the
-/// frame was created with `Option.RETAIN_CLASS_REFERENCE`.
+/// `flags` field that records whether the `StackWalker` that produced the frame
+/// was created with `Option.RETAIN_CLASS_REFERENCE`.
 ///
-/// The real `ClassFrameInfo(StackWalker)` constructor copies it out of the
-/// walker; `populate_sfi` does the same via [`walker_retains_class_ref`].
-/// It occupies bit 0 and therefore does not collide with the
-/// `java.lang.reflect.Modifier` bits the rest of this file already reads out
-/// of the same word (`flags & 0x100` = `Modifier.NATIVE`, used by
-/// `isNativeMethod` / `getLineNumber` / `getByteCodeIndex`).
-const SF_FLAG_RETAIN_CLASS_REF: i32 = 0x01;
+/// JDK 25's `ClassFrameInfo(StackWalker)` constructor stores
+/// `RETAIN_CLASS_REF_BIT` as `1 << 27`, and `retainClassRef()` tests that exact
+/// mask. The lower 24 bits are member-information flags, including
+/// `java.lang.reflect.Modifier` bits (`0x100` = `Modifier.NATIVE`). Using bit
+/// zero here makes a retained frame look disabled to the JDK and causes
+/// `getDeclaringClass()` to throw `UnsupportedOperationException`.
+const SF_FLAG_RETAIN_CLASS_REF: i32 = 0x0800_0000;
 
 /// Read the `RETAIN_CLASS_REFERENCE` setting of the `StackWalker` that owns an
 /// `AbstractStackWalker` receiver, so `populate_sfi` can record it in each

@@ -9,8 +9,6 @@
 //! is byte-identical to before the split.
 
 use super::*;
-use std::cell::Cell;
-thread_local! { static P59_RETAIN_CLASS_REF: Cell<bool> = const { Cell::new(false) }; }
 
 // ---------------------------------------------------------------------------
 // java.lang.reflect extras: Parameter, Executable
@@ -1633,7 +1631,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         p59_sw_get_caller_class,
     );
 
-    // StackFrame = 7-field synthetic — WP1.9 (+ WP1.10 slot 6):
+    // StackFrame = 8-field synthetic — WP1.9 (+ WP1.10 slots 6-7):
     //   slot 0: className (String, with '/' → '.')
     //   slot 1: methodName (String)
     //   slot 2: fileName (String or null)
@@ -1646,6 +1644,9 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
     //           (see that function's doc comment for why: a fresh by-name
     //           lookup performed later, from `getDeclaringClass()`, can fail
     //           for a frame whose class is still running its own `<clinit>`)
+    //   slot 7: retainClassRef (Int boolean) — copied from the owning walker so
+    //           a StackFrame returned from walk() keeps its access contract
+    //           after the user Function has returned.
     let sf = "java/lang/StackWalker$StackFrame";
     r.register(sf, "getClassName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -1667,17 +1668,17 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 4)))
     });
-    // StackFrame.getDeclaringClass() — resolve the Class mirror via the
-    // StackFrame.getDeclaringClass() returns its eagerly resolved mirror (slot 6).
-    // RETAIN_CLASS_REFERENCE is scoped around walk/forEach consumer execution
-    // and is honored below; the JDK otherwise throws UnsupportedOperationException.
+    // StackFrame.getDeclaringClass() returns its eagerly resolved mirror (slot
+    // 6). RETAIN_CLASS_REFERENCE belongs to the frame, not the dynamic extent
+    // of walk(): callers may legally return a StackFrame (or Optional holding
+    // one) and inspect it after the Function has returned.
     r.register(
         sf,
         "getDeclaringClass",
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if !P59_RETAIN_CLASS_REF.with(Cell::get) {
+            if ctx.get_field(this, 7).as_int().unwrap_or(0) == 0 {
                 return Err(RuntimeError::UnsupportedOperationException {
                     message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
                 }
@@ -1814,6 +1815,12 @@ pub(crate) fn p59_sf_get_method_type(
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
+    if ctx.get_field(this, 7).as_int().unwrap_or(0) == 0 {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+        }
+        .into());
+    }
     let internal = match ctx.get_field(this, 5) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -1862,8 +1869,6 @@ pub(crate) fn p59_sf_get_method_type(
     )))
 }
 
-/// Populate the 6-slot StackFrame synthetic from a `StackTraceEntry`.
-/// WP1.9: writes bci + declaringClassInternalName in addition to the
 /// Promote only the real-JDK-safe StackWalker carrier accessors without
 /// enabling synthetic reflection layouts in the default registry.
 pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegistry) {
@@ -1887,10 +1892,12 @@ pub fn register_real_jdk_stackwalker_frame_method_type(r: &mut NativeMethodRegis
     });
 }
 
-/// pre-existing 4 slots.
+/// Populate the 8-slot StackFrame synthetic from a `StackTraceEntry`, including
+/// the eagerly resolved declaring-class mirror and persistent retain-class bit.
 pub(crate) fn populate_stack_frame(
     ctx: &mut dyn NativeContext,
     entry: &cratonvm_native_api::StackTraceEntry,
+    retain_class_ref: bool,
 ) -> cratonvm_types::ObjectRef {
     // GC-SAFETY (see `lang_stackwalker::populate_sfi`): allocate every object
     // under a pin first, then read each back through its pin before the
@@ -1914,7 +1921,7 @@ pub(crate) fn populate_stack_frame(
         .class_id
         .or_else(|| ctx.class_id_by_name(&entry.class_name));
 
-    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 7);
+    let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 8);
     let base = ctx.pin_native_root(sf);
     let mut cls_str = ctx.create_string(&entry.class_name.replace('/', "."));
     let h_cls = ctx.pin_native_root(cls_str);
@@ -1966,6 +1973,11 @@ pub(crate) fn populate_stack_frame(
         6,
         decl_mirror.map_or(Value::Object(None), |m| Value::Object(Some(m))),
     );
+    ctx.set_field(
+        sf,
+        7,
+        Value::Int(if retain_class_ref { 1 } else { 0 }),
+    );
     ctx.unpin_native_roots(base);
     sf
 }
@@ -2003,7 +2015,7 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let arr_pin = ctx.pin_native_root(arr);
     let mut arr = arr;
     for (i, entry) in frames.iter().enumerate() {
-        let sf = populate_stack_frame(ctx, entry);
+        let sf = populate_stack_frame(ctx, entry, retain_class_ref);
         arr = ctx.read_native_pin(arr_pin, arr);
         ctx.set_array_element(arr, i, Value::Object(Some(sf)));
     }
@@ -2017,19 +2029,12 @@ pub(crate) fn p59_sw_walk(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let previous = P59_RETAIN_CLASS_REF.with(|flag| {
-        let previous = flag.get();
-        flag.set(retain_class_ref);
-        previous
-    });
-    let result = ctx.invoke_virtual(
+    ctx.invoke_virtual(
         function,
         "apply",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         &[Value::Object(Some(stream))],
-    );
-    P59_RETAIN_CLASS_REF.with(|flag| flag.set(previous));
-    result
+    )
 }
 
 pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2037,8 +2042,8 @@ pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    // Same inner→outer ordering as `p59_sw_walk`; scope the retain option to
-    // consumer execution and restore it before either result path.
+    // Same inner→outer ordering as `p59_sw_walk`; copy the retain option into
+    // every frame so consumers can preserve and inspect frames later.
     let retain_class_ref = args
         .first()
         .and_then(|value| match value {
@@ -2052,31 +2057,18 @@ pub(crate) fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 != 0
         })
         .unwrap_or(false);
-    let previous = P59_RETAIN_CLASS_REF.with(|flag| {
-        let previous = flag.get();
-        flag.set(retain_class_ref);
-        previous
-    });
     let raw_trace = ctx.capture_stack_trace(0);
     let frames = crate::lang_stackwalker::ordered_stack_walk_frames(&raw_trace);
-    let mut failure = None;
     for entry in &frames {
-        let sf = populate_stack_frame(ctx, entry);
-        if let Err(error) = ctx.invoke_virtual(
+        let sf = populate_stack_frame(ctx, entry, retain_class_ref);
+        ctx.invoke_virtual(
             consumer,
             "accept",
             "(Ljava/lang/Object;)V",
             &[Value::Object(Some(sf))],
-        ) {
-            failure = Some(error);
-            break;
-        }
+        )?;
     }
-    P59_RETAIN_CLASS_REF.with(|flag| flag.set(previous));
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(None),
-    }
+    Ok(None)
 }
 
 pub(crate) fn p59_sw_get_caller_class(
