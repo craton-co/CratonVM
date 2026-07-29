@@ -133,6 +133,209 @@ pub(crate) fn live_thread_ids(ctx: &mut dyn NativeContext) -> Vec<i64> {
     ids
 }
 
+// ---------------------------------------------------------------------------
+// Arbitrary-thread CPU time
+// ---------------------------------------------------------------------------
+//
+// These live here rather than in `crate::jmx` for the same reason
+// `daemon_thread_count` / `live_thread_ids` do: `jmx.rs` is gated on the
+// `experimental-jmx` feature and this module is not, yet both register the same
+// `ThreadMXBean` triples. One copy of the platform code is what stops the two
+// registrations from drifting apart.
+
+/// Windows per-thread CPU clock. One `extern` block for both the current-thread
+/// and the arbitrary-thread read, so the two can never be declared with
+/// different signatures.
+#[cfg(target_os = "windows")]
+mod win_thread_times {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn OpenThread(desired_access: u32, inherit_handle: i32, thread_id: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn GetThreadTimes(
+            thread: *mut c_void,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+    }
+
+    /// `FILETIME` counts 100-nanosecond intervals.
+    fn to_ns(t: FileTime) -> i64 {
+        ((((t.high as u64) << 32) | (t.low as u64)).saturating_mul(100)) as i64
+    }
+
+    /// `(cpu_ns, user_ns)` for an already-open thread handle.
+    ///
+    /// # Safety
+    /// `handle` must be a live thread handle opened with at least
+    /// `THREAD_QUERY_LIMITED_INFORMATION`, or a pseudo-handle.
+    unsafe fn times_of(handle: *mut c_void) -> Option<(i64, i64)> {
+        let mut creation = FileTime::default();
+        let mut exit = FileTime::default();
+        let mut kernel = FileTime::default();
+        let mut user = FileTime::default();
+        if GetThreadTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        let user_ns = to_ns(user);
+        Some((to_ns(kernel).saturating_add(user_ns), user_ns))
+    }
+
+    /// The CALLING thread, via the `GetCurrentThread()` pseudo-handle (which
+    /// needs no `OpenThread` and no `CloseHandle`).
+    pub(super) fn current() -> Option<(i64, i64)> {
+        unsafe { times_of(GetCurrentThread()) }
+    }
+
+    /// An arbitrary OS thread in this process.
+    pub(super) fn of_os_tid(os_tid: u32) -> Option<(i64, i64)> {
+        // `GetThreadTimes` documents THREAD_QUERY_INFORMATION; Vista+ also
+        // accepts the LIMITED right, which some hardened processes are capped
+        // at. Try the specific one first and fall back rather than reporting
+        // "unavailable" for a thread we can in fact read.
+        const THREAD_QUERY_INFORMATION: u32 = 0x0040;
+        const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
+        for access in [THREAD_QUERY_INFORMATION, THREAD_QUERY_LIMITED_INFORMATION] {
+            unsafe {
+                let handle = OpenThread(access, 0, os_tid);
+                if handle.is_null() {
+                    continue;
+                }
+                let times = times_of(handle);
+                CloseHandle(handle);
+                return times;
+            }
+        }
+        None
+    }
+}
+
+/// The CALLING thread's `(cpu_ns, user_ns)` on Windows — see
+/// [`win_thread_times`]. Exposed so `crate::jmx` shares the one `extern` block.
+#[cfg(target_os = "windows")]
+pub(crate) fn windows_current_thread_cpu_time_ns() -> Option<(i64, i64)> {
+    win_thread_times::current()
+}
+
+/// `(cpu_ns, user_ns)` for the task `/proc/self/task/<tid>`.
+///
+/// Fields 14 (`utime`) and 15 (`stime`) of `stat`, in clock ticks. Field 2
+/// (`comm`) is parenthesised and may itself contain spaces and `)`, so the
+/// split starts after the LAST `)`: what follows is field 3 onwards.
+#[cfg(target_os = "linux")]
+fn linux_task_cpu_time_ns(os_tid: u32) -> Option<(i64, i64)> {
+    let stat = std::fs::read_to_string(format!("/proc/self/task/{os_tid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // `fields[0]` is field 3, so utime (14) is index 11 and stime (15) index 12.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let to_ns = |ticks: u64| -> i64 {
+        ((i128::from(ticks) * 1_000_000_000i128) / i128::from(hz))
+            .try_into()
+            .unwrap_or(i64::MAX)
+    };
+    let user_ns = to_ns(utime);
+    Some((user_ns.saturating_add(to_ns(stime)), user_ns))
+}
+
+/// CPU and user time consumed by an ARBITRARY OS thread of this process, in
+/// nanoseconds — the datum `ThreadMXBean.getThreadCpuTime(long)` needs for an
+/// id that is not the caller's.
+///
+/// `None` on a platform whose per-thread clock we do not read, or for a tid
+/// that has already exited: both are the JMM's "measurement not available"
+/// case, which callers map to `-1`.
+pub(crate) fn os_thread_cpu_time_ns(os_tid: u32) -> Option<(i64, i64)> {
+    #[cfg(target_os = "windows")]
+    {
+        win_thread_times::of_os_tid(os_tid)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_task_cpu_time_ns(os_tid)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = os_tid;
+        None
+    }
+}
+
+/// The live `java.lang.Thread` whose `tid` is `java_tid`.
+///
+/// Same resolution `getThreadInfo(long)` performs, so any id from
+/// [`live_thread_ids`] / `getAllThreadIds()` round-trips here.
+pub(crate) fn thread_object_for_java_tid(
+    ctx: &mut dyn NativeContext,
+    java_tid: i64,
+) -> Option<ObjectRef> {
+    ctx.enumerate_threads(usize::MAX)
+        .into_iter()
+        .find(|thread| match ctx.get_field_by_name(*thread, "tid") {
+            Value::Long(id) => id == java_tid,
+            Value::Int(id) => i64::from(id) == java_tid,
+            _ => false,
+        })
+}
+
+/// Arbitrary-thread CPU time for a Java thread id, or `None` when it cannot be
+/// measured (unknown id, no OS tid on record, or a platform we do not read).
+pub(crate) fn cpu_time_of_java_tid(
+    ctx: &mut dyn NativeContext,
+    java_tid: i64,
+) -> Option<(i64, i64)> {
+    let thread = thread_object_for_java_tid(ctx, java_tid)?;
+    let os_tid = ctx.thread_os_tid(thread)?;
+    os_thread_cpu_time_ns(os_tid)
+}
+
+/// Whether `ThreadMXBean.isThreadCpuTimeSupported()` may honestly answer true.
+///
+/// Not a platform guess: it exercises the ARBITRARY-thread route end to end on
+/// the calling thread — resolve its own mirror to an OS tid via
+/// `NativeContext::thread_os_tid`, then read that tid through exactly the
+/// platform path `getThreadCpuTime(long)` uses for a foreign id. If either step
+/// fails, the honest answer is still `false`.
+pub(crate) fn arbitrary_thread_cpu_time_supported(ctx: &mut dyn NativeContext) -> bool {
+    let current = ctx.current_thread_object();
+    match ctx.thread_os_tid(current) {
+        Some(os_tid) => os_thread_cpu_time_ns(os_tid).is_some(),
+        None => false,
+    }
+}
+
+/// Whether `isSynchronizerUsageSupported()` may honestly answer true.
+///
+/// The write side is `AbstractOwnableSynchronizer.setExclusiveOwnerThread`,
+/// which `crate::jmx::register_thread_impl` intercepts and forwards to
+/// `NativeContext::record_jmx_owned_synchronizer` (a real VM override since
+/// 2026-07-28) → `ThreadRegistry::set_jmx_owned_synchronizer`. That is the
+/// JDK's single authoritative ownership transition for every ownable
+/// synchronizer, so the resulting `lockedSynchronizers` list is complete —
+/// but ONLY while the real AQS is in use. Under `CRATONVM_SYNTHETIC_AQS`,
+/// `ReentrantLock.lock()` is itself a native (`util_concurrent_ext`) that never
+/// reaches `setExclusiveOwnerThread`, so the list would be silently empty and
+/// `true` would be a false claim. Mirrors that module's own gate expression.
+pub(crate) fn synchronizer_usage_supported() -> bool {
+    !crate::nbflags().synthetic_aqs || crate::nbflags().real_aqs
+}
+
 pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -268,15 +471,17 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(arr))))
     });
-    // ESCALATED, in lock-step with the winning `jmx.rs` registration (see the
-    // long note there). This is specifically the ARBITRARY-thread question, and
-    // the spec allows it to be false while `isCurrentThreadCpuTimeSupported()`
-    // is true — but the old reason ("CratonVM's thread table carries no OS
-    // handle") is wrong: `ThreadRegistry` publishes a per-thread `os_tid`
-    // (`GetCurrentThreadId` / `gettid`). What is missing is a `NativeContext`
-    // accessor for it, not the datum.
-    r.register(tmx, "isThreadCpuTimeSupported", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // REAL, in lock-step with the winning `jmx.rs` registration. The accessor
+    // the previous escalation asked for now exists
+    // (`NativeContext::thread_os_tid`), so this is no longer a constant: it
+    // resolves the caller's own mirror to an OS tid and reads that tid through
+    // the same platform path `getThreadCpuTime(long)` takes for a foreign id,
+    // and reports whatever that actually returns. `false` survives as the
+    // honest answer on a platform we do not read.
+    r.register(tmx, "isThreadCpuTimeSupported", "()Z", |ctx, _args| {
+        Ok(Some(Value::Int(i32::from(
+            arbitrary_thread_cpu_time_supported(ctx),
+        ))))
     });
     // KEEP: false is the measurement — contention monitoring needs per-thread
     // blocked/waiting DURATIONS, which nothing in the VM records (unlike lock
@@ -415,22 +620,29 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("CratonVM Native Compiler");
         Ok(Some(Value::Object(Some(s))))
     });
-    // ESCALATED, as a self-consistent pair, in lock-step with the winning
-    // `jmx.rs` registrations. The old claim that "the JIT keeps no cumulative
-    // wall-clock compile timer" is FALSE — `jit/src/tiered.rs` has
-    // `CompilationStats::total_compile_time_ms`, in the JMX spec's own unit.
-    // What is missing is a route: `native-builtins` does not depend on the
-    // `cratonvm-jit` crate and `NativeContext` exposes no JIT statistics. Until
-    // it does, reporting `false` below is what keeps the 0 above legible as
-    // "not measured" rather than "measured and zero".
-    r.register(cmx, "getTotalCompilationTime", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
+    // REAL, as a self-consistent pair, in lock-step with the winning `jmx.rs`
+    // registrations. `jit/src/tiered.rs` keeps
+    // `CompilationStats::total_compile_time_ms` in the JMX spec's own unit, and
+    // `NativeContext::jit_total_compile_time_ms` (added 2026-07-28) is the route
+    // this crate was missing. Both natives read that ONE accessor, so the
+    // support flag can never claim a number that is not kept: `None` (JIT
+    // disabled) keeps the old 0 / `false`, and `Some(ms)` reports the real
+    // total with `true`.
+    r.register(cmx, "getTotalCompilationTime", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(
+            ctx.jit_total_compile_time_ms()
+                .map_or(0, |ms| i64::try_from(ms).unwrap_or(i64::MAX)),
+        )))
     });
     r.register(
         cmx,
         "isCompilationTimeMonitoringSupported",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                ctx.jit_total_compile_time_ms().is_some(),
+            ))))
+        },
     );
     r.set_category(__prev_cat);
 }
