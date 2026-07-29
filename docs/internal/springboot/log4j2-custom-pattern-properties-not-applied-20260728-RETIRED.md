@@ -1,6 +1,37 @@
-# Log4j2: `logging.pattern.correlation`/`spring.application.name`/`spring.application.group` never reach the actual log output; file appender sometimes never created
+# RETIRED — Log4j2 custom-pattern/property failures are not a CratonVM defect
 
-**Status: OPEN — found 2026-07-28**
+**Status: RETIRED 2026-07-29.** The reported 14 failures are reproduced by
+the exact same source fixture on real HotSpot, and CratonVM JIT/no-JIT has
+the identical result. This document must not remain in `known-issues`.
+
+## Retirement evidence (2026-07-29)
+
+The originally supplied Spring Boot root was source-pruned: its
+`core/spring-boot` module had no `src` tree, compiled test class, or
+`cratonvm-test-cp.txt`, so it could not establish fresh VM evidence. A
+complete, disposable upstream checkout was therefore pinned to
+`spring-projects/spring-boot@6ccca4a5f13cbe120954167ef9150d93526d01d9`,
+the revision whose `gradle.properties` exactly matches the supplied
+4.1.0-SNAPSHOT dependency versions. `core` test classes and its direct test
+classpath were freshly generated with the supplied suite runner.
+
+The following all ran the same two-class selection, including the documented
+`Log4j2LoggingSystemPropertiesTests` regression control:
+
+| VM/mode | `Log4j2LoggingSystemPropertiesTests` | `Log4J2LoggingSystemTests` |
+|---|---:|---:|
+| HotSpot JIT | 3/3, 0 failed | 47/61, **14 failed**, 0 aborted/container failures |
+| CratonVM JIT | 3/3, 0 failed | 47/61, **14 failed**, 0 aborted/container failures |
+| CratonVM `--nojit` | 3/3, 0 failed | 47/61, **14 failed**, 0 aborted/container failures |
+
+The HotSpot direct runner and the fixture's normal Gradle `:core:spring-boot:test`
+task both reproduce the same 14-method signature (plain `log4j2-test.xml`
+console pattern and absent file output). Consequently the original
+Environment-to-System/Log4j2 hypothesis is not a VM-only root cause, there is
+no CratonVM implementation fix to make, and there are no CratonVM residuals
+from this document. Any desired behavior change must be resolved in the
+Spring Boot/Log4j2 fixture upstream and only re-filed here if a future
+CratonVM-vs-HotSpot divergence is demonstrated.
 
 ## Symptom
 
