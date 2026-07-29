@@ -7,36 +7,86 @@ made reachable for the first time, not residuals of it.
 
 ## Where the boot stands
 
-With default flags (`bash bin/kc.sh start-dev`, `-Xmx4g`, `--nojit`) the boot
-now runs the whole RUNTIME_INIT phase and stops in Keycloak's **master-realm
-bootstrap**:
+`bash bin/kc.sh start-dev` with default CratonVM flags, `-Xmx4g`, `--nojit`
+now runs the whole RUNTIME_INIT phase as real bytecode: the Quarkus logging
+setup, Netty event loops, Vert.x, Infinispan, the Narayana recovery manager and
+the Agroal/H2 datasource. The Agroal / Vert.x / net-sockets opt-in gates are
+NOT needed to get there.
+
+The blockers below are listed in the order the boot meets them. Blocker 0 is
+fixed; Blocker 1 is the current wall, and it currently hides Blockers 2 and 3
+(both of which were observed and characterised before Blocker 0 appeared, when
+the boot ran all the way through the Liquibase migration into Keycloak's
+master-realm bootstrap).
+
+## Blocker 0 — `StackOverflowError` from `ExtHandler.setHandlers` — FIXED
+
+`origin/dev` at `1af2f0674` regressed this boot: it died right after
+`ISPN000974: Virtual threads support: enabled` with a `StackOverflowError`
+whose Java stack was only 22 frames deep, and **no cause printed at all**, even
+with `--verbose`. Confirmed a `dev` regression, not a RUNTIME_INIT residual, by
+reverting the RUNTIME_INIT commit in the merged tree and reproducing it on pure
+`dev`.
+
+Root cause (`CRATONVM_DBG_SOE=1` names it in one line -- 8192 identical frames):
+the `org/jboss/logmanager/ExtHandler.setHandlers` native delegated back to real
+bytecode with `invoke_virtual_bytecode_only`, which re-dispatches on the
+RECEIVER. The receiver is a `io.quarkus.bootstrap.logging.QuarkusDelayedHandler`,
+whose `setHandlers` is `super.setHandlers(...); activate();` -- so the
+`invokespecial ExtHandler.setHandlers` super-call landed straight back on the
+native. Forever. Exactly the hazard
+`NativeContext::invoke_special_bytecode_only` was added for
+(`ThreadPoolExecutor.shutdown()` via `ScheduledThreadPoolExecutor`).
+
+Fixed by `delegate_to_real_bytecode` (`native-builtins/src/lib.rs`), which tells
+the two entry shapes apart by the CALLER: only a subclass of the owner can issue
+`invokespecial owner.m()`, so a call from one runs the owner's own body with
+invokespecial semantics, and everything else keeps re-dispatching on the
+receiver so a subclass override still wins. Applied to `ExtHandler.setHandlers`
+and `ExtHandler.addHandler`.
+
+**The same hazard is latent on ~10 sibling registrations** in that same block
+(`close`/`flush`/`publish`/`setLevel`/`setFormatter`/`getFormatter`/`isLoggable`
+registered in the `for handler_class in [ExtHandler, QuarkusDelayedHandler]`
+loop). They were left alone because the loop variable cannot be captured by the
+`fn`-pointer closures `registry.register` takes; converting them needs the loop
+unrolled or the owner threaded through differently. Any subclass that overrides
+one of those AND super-calls it will hang the same way.
+
+Note the throw site for the 8192-frame ceiling does not print anything without
+`CRATONVM_DBG_SOE`, which is why this arrived as a silent failure. Making that
+dump unconditional (or at least logging the repeated frame) would have turned a
+multi-hour investigation into a one-line read.
+
+## Blocker 1 — the boot now HANGS in the JPA/Hibernate phase
+
+With Blocker 0 fixed, `--nojit` gets through the Quarkus logging setup (the
+`quarkus.log.console.*` deprecation warnings are new), Netty's event loop, the
+Narayana recovery manager and the Agroal datasource init:
 
 ```
-INFO  [org.infinispan.CONTAINER] ISPN000974: Virtual threads support: enabled
-INFO  [org.infinispan.CONTAINER] ISPN000556: Starting user marshaller '...ImmutableProtoStreamMarshaller'
-INFO  [org.keycloak...QuarkusJpaUpdaterProvider] Initializing database schema. Using changelog META-INF/jpa-changelog-master.xml
-...   (Liquibase migration completes)
-ERROR [org.keycloak...ExecutionExceptionHandler] ERROR: Failed to start server in (development) mode
-ERROR [org.keycloak...ExecutionExceptionHandler] ERROR: Cannot invoke "java.lang.Long.longValue()"
+INFO [com.arjuna.ats.jbossatx] ARJUNA032013: Starting transaction recovery manager
+INFO [io.agroal.pool] Datasource '<default>': Initial size smaller than min. Connections will be created when necessary
 ```
 
-Everything before that is real bytecode: Netty event loops, Vert.x, Infinispan,
-Narayana JTA recovery, the Agroal/H2 datasource, the Hibernate SessionFactory,
-and the full Liquibase schema migration. The Agroal / Vert.x / net-sockets
-opt-in gates are NOT needed to reach this point.
+...and then produces no further output for 35+ minutes (killed by `timeout`,
+exit 124). Before the Blocker-0 regression the same phase completed the whole
+Liquibase migration in ~10 minutes, so this is a genuine hang, not slowness --
+though note the two runs are not otherwise identical (the logging setup now
+actually runs, which changes what handlers exist).
 
-## Blocker 1 — `NullPointerException: Cannot invoke "java.lang.Long.longValue()"`
+Not yet root-caused. Get a thread dump / `CRATONVM_DBG_HANG_SAMPLE` on it first;
+the historical suspect for a hang at exactly this point is the
+`JPAConfig.startAll` -> `CompletableFuture.get` family.
 
-A null-`Long` unboxing during `ApplianceBootstrap.createMasterRealm` ->
+## Blocker 2 — `NullPointerException: Cannot invoke "java.lang.Long.longValue()"`
+
+Reached before the Blocker-0 regression, so it is behind Blocker 1 now. A
+null-`Long` unboxing during `ApplianceBootstrap.createMasterRealm` ->
 `DeclarativeUserProfileProvider.setConfiguration` ->
 `RealmAdapter.updateComponent` ->
 `DeclarativeUserProfileProviderFactory.validateConfiguration` ->
-`UPConfigUtils.validate`. Not yet root-caused. Reproduce with:
-
-```bash
-JAVA_OPTS_KC_HEAP='-Xms512m -Xmx4g' CRATONVM_DISABLE_JIT=1 \
-  bash bin/kc.sh start-dev --http-enabled=true --hostname-strict=false --verbose
-```
+`UPConfigUtils.validate`.
 
 Note the frame list our stack renderer prints for this failure interleaves and
 repeats frames (`initializeProviders:165` appears five times); trust the method
@@ -51,7 +101,7 @@ related:
 * `IllegalStateException: EntityManagerFactory is closed` on
   `CertificateReloadManager.bootReload` (Keycloak logs and ignores it)
 
-## Blocker 2 — heap exhaustion CORRUPTS the heap instead of throwing OOM
+## Blocker 3 — heap exhaustion CORRUPTS the heap instead of throwing OOM
 
 `kc.sh start-dev` defaults to `-Xms64m -Xmx512m`. Under that ceiling the boot
 does not report an `OutOfMemoryError`: it corrupts the heap and dies with
@@ -71,54 +121,15 @@ WARN cratonvm_gc::g1: g1 cleanup: implausible gray entry seen during marking
   nondeterministic corruption underneath the pressure, not only a
   too-small-heap effect.
 
-This is the higher-value of the two blockers: it is a general
-GC-under-pressure defect, it is not Keycloak-specific, and it makes every
-measurement on this boot flaky.
+This is the highest-value of the four: it is a general GC-under-pressure
+defect, it is not Keycloak-specific, and it makes every measurement on this
+boot flaky.
 
 Also note the crash handler truncates: it prints the `SIGILL/SIGSEGV` banner and
 `slot[r10]:` and then stops, and the `hs_err_pid*.log` it claims to have written
 contains only the banner ("truncated: full report requires allocator, unsafe in
 signal handler"). Whatever named the failing JIT method on other crashes did not
 fire here.
-
-## Blocker 0 (NEW, and it now masks the two below) — `StackOverflowError` on `dev`
-
-`origin/dev` at `1af2f0674` regressed this boot: it now dies right after
-`ISPN000974: Virtual threads support: enabled` — earlier than the Liquibase
-migration it used to complete — with
-
-```
-ATHROW class=java/lang/StackOverflowError msg="<no msg>"
-  ATHROW-STK[22] io/quarkus/runtime/Application.start pc=202
-  ...
-ERROR: Failed to start server in (development) mode      <- no cause printed, even with --verbose
-```
-
-**This is not caused by the RUNTIME_INIT work.** Verified by reverting
-`53168f3e7` in the merged tree and rebuilding: pure `origin/dev` (plus the
-then-opt-in `CRATONVM_REAL_QUARKUS_START=1`) reproduces the identical
-`StackOverflowError` at the identical point. The RUNTIME_INIT branch reached
-Keycloak's master-realm bootstrap immediately before merging `origin/dev`.
-
-The Java stack is only **22 frames deep** at the throw, so this is not a
-genuine Java stack overflow: it is the Rust-side re-entrancy ceiling
-(`EXEC_DEPTH_CEILING`, `vm/src/runtime/interpreter.rs`) tripping, which means
-something on `dev` added deep native<->Java ping-pong (or shrank the ceiling)
-on the path that enters the generated `ApplicationImpl.doStart`. Note that
-that ceiling's throw site does NOT call `dump_stack_on_soe`, which is why the
-failure arrives with no diagnostic at all.
-
-Candidate window: the `dev` commits merged on 2026-07-28, notably the
-`fix/stub-removal-w4-20260728` wave and `native-builtins/src/case_map.rs`.
-Bisect that range with
-
-```bash
-JAVA_OPTS_KC_HEAP='-Xms512m -Xmx4g' CRATONVM_DISABLE_JIT=1 CRATONVM_DBG_ATHROW=1 \
-  bash bin/kc.sh start-dev --http-enabled=true --hostname-strict=false
-```
-
-and grep for `ATHROW class=java/lang/StackOverflowError`. Until it is fixed the
-two blockers below are unreachable.
 
 ## Smaller residuals seen on the way
 
