@@ -11892,6 +11892,7 @@ struct Re8WinAdapterAddress {
 }
 #[cfg(windows)]
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Re8WinSocketAddress {
     address: *const u8,
     length: i32,
