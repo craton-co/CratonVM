@@ -3316,6 +3316,12 @@ impl ClassManager {
         if name.contains("$$") || is_jboss_logging_locale_lookup(name) {
             return false;
         }
+        // Must mirror `load_class`'s `package-info` gate below, or callers that
+        // pre-check this predicate would believe a stub is coming when the load
+        // will in fact raise ClassNotFound.
+        if name == "package-info" || name.ends_with("/package-info") {
+            return false;
+        }
         if is_standard_jdk_namespace(name)
             && self.has_real_boot_classes()
             && !is_native_backed_jdk_stub(name)
@@ -3493,6 +3499,21 @@ impl ClassManager {
                 // non-generated class name essentially never contains "$$", so
                 // this can't misclassify a genuine missing-jar case.
                 if name.contains("$$") {
+                    return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                        class_name: name.to_string(),
+                    }));
+                }
+                // `package-info` is a compiler-generated annotation carrier that
+                // exists ONLY when the package actually declares annotations.
+                // `java.lang.Package.getPackageInfo()` probes for it with
+                // `Class.forName(pkg + ".package-info", false, loader)` inside a
+                // `catch (ClassNotFoundException)`, so an absent one is the
+                // normal case, not a missing jar. Fabricating a stub answers
+                // that probe with a bogus non-null `Class` (HotSpot throws), and
+                // it accounted for most of the enterprise-prefix stub fallbacks
+                // on the Keycloak 26.6.1 boot (`io/quarkus/arc/impl/package-info`,
+                // `io/agroal/narayana/package-info`, four `org/infinispan/**`).
+                if name == "package-info" || name.ends_with("/package-info") {
                     return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
                         class_name: name.to_string(),
                     }));

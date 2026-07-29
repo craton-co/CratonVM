@@ -18721,7 +18721,22 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     }
                 }
             }
-            COLLECTOR_TAG_COUNTING => Ok(Some(Value::Long(elements.len() as i64))),
+            COLLECTOR_TAG_COUNTING => {
+                // MUST be a boxed `java.lang.Long`: `collect` is declared
+                // `(Ljava/util/stream/Collector;)Ljava/lang/Object;`, so a bare
+                // primitive `Value` here is coerced away and the caller reads
+                // back NULL. That is what made Keycloak 26.6.1's master-realm
+                // bootstrap die with `NullPointerException: Cannot invoke
+                // "java.lang.Long.longValue()"` -- Keycloak's
+                // `UPConfigUtils.validateAttributeGroups` is
+                // `getGroups().stream().filter(..).collect(Collectors.counting())`
+                // followed immediately by `checkcast Long; longValue()`. The
+                // finisher arm and every groupingBy-downstream COUNTING arm
+                // already box for exactly this reason; this one did not.
+                let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+                ctx.set_field(long_obj, 0, Value::Long(elements.len() as i64));
+                Ok(Some(Value::Object(Some(long_obj))))
+            }
             COLLECTOR_TAG_JOINING => {
                 let mut parts = Vec::with_capacity(elements.len());
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)

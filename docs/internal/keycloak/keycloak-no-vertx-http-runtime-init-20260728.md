@@ -8,7 +8,8 @@ were found and fixed along the way, each with an isolated reproducer.
 
 The boot does not yet reach `Listening on http://localhost:8080`; the chain of
 blockers *downstream* of RUNTIME_INIT is filed separately as
-`docs/known-issues/keycloak/keycloak-boot-chain-after-runtime-init-20260728.md`.
+the retired `keycloak-boot-chain-after-runtime-init-20260728` write-up
+(now in this same folder; the whole chain was closed 2026-07-29).
 Those are new surfaces this fix made reachable, not residuals of this issue.
 
 ## Root cause

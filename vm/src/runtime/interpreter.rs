@@ -1513,6 +1513,49 @@ pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
 }
 
+/// Allocate a dynamically-produced `java.lang.String` under the SAME
+/// heap-exhaustion contract as `new`: collect, retry, and finally raise a
+/// catchable `OutOfMemoryError` -- never abort the process.
+///
+/// `vm_object::create_java_string_uninterned` cannot do this: it takes only a
+/// `&SharedVm`, and every GC entry point needs the calling thread (to retire
+/// its TLAB and contribute its roots). So its exhaustion path was a bare
+/// `eprintln!` + `std::process::abort()`, which turned a plain `"a" + b` on a
+/// full heap into an un-catchable VM kill. HotSpot throws
+/// `OutOfMemoryError: Java heap space` there, and a Java program is entitled to
+/// catch it. Reproduced with a 25-line probe under `-Xmx64m -XX:+UseG1GC`:
+/// `FATAL: heap exhausted allocating java/lang/String (46 units)` (from the
+/// `System.out.println("iter=" + i)` in the allocation loop) followed by
+/// SIGABRT, where HotSpot reports `OutOfMemoryError` and keeps running.
+pub(crate) fn create_string_or_oom(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    text: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    use crate::vm::try_create_java_string_uninterned as try_new_string;
+    if let Some(obj) = try_new_string(shared, text) {
+        return Ok(obj);
+    }
+    // Same escalation ladder as `alloc_object_shared`: forced young/full GC,
+    // then G1's last-ditch complete mark cycle (dead Old/humongous spans are
+    // only reclaimed by a finished cycle's cleanup), then OOM.
+    thread.tlab.retire();
+    maybe_gc_forced(shared, thread);
+    if let Some(obj) = try_new_string(shared, text) {
+        return Ok(obj);
+    }
+    g1_force_full_cycle(shared, thread);
+    if let Some(obj) = try_new_string(shared, text) {
+        return Ok(obj);
+    }
+    maybe_dump_heap_on_oom(shared, thread);
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::OutOfMemoryError {
+            message: format!("Java heap space (String of {} chars)", text.len()),
+        },
+    )))
+}
+
 fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
@@ -11944,28 +11987,37 @@ fn find_exception_handler_impl(
         // in the lazy-load branch just below.
         let catch_class_name_owned = catch_class_name.to_string();
 
-        // Try to find the catch type class on the held lock — `&str`,
-        // no allocation.
-        let catch_class_id =
-            match cm_guard.find_class_by_name_for_class(catch_class_name, frame.class_id) {
-                Some(id) => id,
-                None => {
-                    // Lazy load: must drop the read lock since
-                    // `load_class_concurrent` acquires the write lock.
-                    // Copy the name into an owned String only on this
-                    // (rare) slow path.
-                    let owned = catch_class_name.to_string();
-                    drop(cm_guard);
-                    let loaded = shared.load_class_concurrent(&owned);
-                    cm_guard = shared.classes.class_manager.read();
-                    match loaded {
-                        Ok(id) => id,
-                        Err(_) => continue, // Can't load catch type — skip handler
-                    }
-                }
-            };
+        // Try to find the catch type class on the held lock.
+        let mut catch_class_id =
+            cm_guard.find_class_by_name_for_class(&catch_class_name_owned, frame.class_id);
+        if catch_class_id.is_none() {
+            // A catch type that is not already loaded must NEVER be lazily
+            // loaded through the loader-blind global path when that path would
+            // fabricate a synthetic stub. `load_class_concurrent` searches only
+            // the bootstrap/application classpath, and a class visible solely
+            // through a custom loader (Quarkus's `RunnerClassLoader`, which owns
+            // every `lib/main/*.jar` of a fast-jar distribution) is not on it —
+            // so the "load" succeeded by MINTING a code-less stub and
+            // registering it globally under that name, permanently poisoning it
+            // for the loader that does own the real class. Observed on the
+            // Keycloak 26.6.1 boot: `io/quarkus/runtime/PreventFurtherStepsException`
+            // (in `io.quarkus.quarkus-core-*.jar`) was stubbed from this very
+            // site every time Quarkus's shutdown path unwound.
+            //
+            // Nothing is lost by skipping it: the by-name subclass test below
+            // walks the THROWN object's own superclass chain and needs no
+            // ClassId for the catch type at all.
+            if !cm_guard.would_fabricate_synthetic_stub(&catch_class_name_owned) {
+                // Lazy load: must drop the read lock since
+                // `load_class_concurrent` acquires the write lock.
+                drop(cm_guard);
+                let loaded = shared.load_class_concurrent(&catch_class_name_owned);
+                cm_guard = shared.classes.class_manager.read();
+                catch_class_id = loaded.ok();
+            }
+        }
 
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+        if catch_class_id.is_some_and(|id| cm_guard.is_subclass_of(exc_class_id, id))
             || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
         {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -27966,6 +28018,13 @@ pub(crate) fn is_stamped_lock_native_override(
                 | ("tryWriteLock", "()J")
                 | ("tryConvertToWriteLock", "(J)J")
                 | ("tryConvertToReadLock", "(J)J")
+                | ("tryConvertToOptimisticRead", "(J)J")
+                | ("unlock", "(J)V")
+                | ("readLockInterruptibly", "()J")
+                | ("writeLockInterruptibly", "()J")
+                | ("tryReadLock", "(JLjava/util/concurrent/TimeUnit;)J")
+                | ("tryWriteLock", "(JLjava/util/concurrent/TimeUnit;)J")
+                | ("isLocked", "()Z")
                 | ("isWriteLocked", "()Z")
                 | ("isReadLocked", "()Z")
                 | ("getReadLockCount", "()I")
@@ -46224,6 +46283,13 @@ mod tests {
             ("tryWriteLock", "()J"),
             ("tryConvertToWriteLock", "(J)J"),
             ("tryConvertToReadLock", "(J)J"),
+            ("tryConvertToOptimisticRead", "(J)J"),
+            ("unlock", "(J)V"),
+            ("readLockInterruptibly", "()J"),
+            ("writeLockInterruptibly", "()J"),
+            ("tryReadLock", "(JLjava/util/concurrent/TimeUnit;)J"),
+            ("tryWriteLock", "(JLjava/util/concurrent/TimeUnit;)J"),
+            ("isLocked", "()Z"),
             ("isWriteLocked", "()Z"),
             ("isReadLocked", "()Z"),
             ("getReadLockCount", "()I"),
