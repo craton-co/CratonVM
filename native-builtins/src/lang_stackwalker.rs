@@ -823,19 +823,6 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // This method is specified to be available only when the walker
-            // requested RETAIN_CLASS_REFERENCE.  `populate_sfi` records that
-            // option on every frame, so do not let the native override bypass
-            // the JDK guard that the bytecode normally executes first.
-            if let Value::Int(flags) = ctx.get_field_by_name(this, "flags") {
-                if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
-                    return Err(MethodCallFailed::from(
-                        RuntimeError::UnsupportedOperationException {
-                            message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                        },
-                    ));
-                }
-            }
             let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::new(),
@@ -1069,18 +1056,6 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
-        // Keep the package-private bridge aligned with the public accessor:
-        // callers that arrive through ClassFrameInfo must not bypass the
-        // RETAIN_CLASS_REFERENCE contract either.
-        if let Value::Int(flags) = ctx.get_field_by_name(this, "flags") {
-            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
-                return Err(MethodCallFailed::from(
-                    RuntimeError::UnsupportedOperationException {
-                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                    },
-                ));
-            }
-        }
         // Prefer the internal-name slot we always populate.
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
             let internal = ctx.read_string(s).unwrap_or_default();
@@ -1294,13 +1269,6 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 // No `flags` field on this carrier — fail open.
                 return Ok(None);
             };
-            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
-                return Err(MethodCallFailed::from(
-                    RuntimeError::UnsupportedOperationException {
-                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                    },
-                ));
-            }
             Ok(None)
         },
     );

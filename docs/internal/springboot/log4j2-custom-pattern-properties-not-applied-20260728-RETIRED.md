@@ -27,11 +27,16 @@ The following all ran the same two-class selection, including the documented
 The HotSpot direct runner and the fixture's normal Gradle `:core:spring-boot:test`
 task both reproduce the same 14-method signature (plain `log4j2-test.xml`
 console pattern and absent file output). Consequently the original
-Environment-to-System/Log4j2 hypothesis is not a VM-only root cause, there is
-no CratonVM implementation fix to make, and there are no CratonVM residuals
-from this document. Any desired behavior change must be resolved in the
-Spring Boot/Log4j2 fixture upstream and only re-filed here if a future
-CratonVM-vs-HotSpot divergence is demonstrated.
+Environment-to-System/Log4j2 hypothesis is not a VM-only root cause. During
+final integration, two unrelated CratonVM residuals were repaired: the
+Windows adapter-address carrier is now `Copy`, and real-JDK StackWalker frame
+bridges remain permissive when they cannot reconstruct the owning walker's
+option. The latter had made Log4j2's `LogManager` initialization throw
+`UnsupportedOperationException` on the newly merged tip; the final JIT and
+`--nojit` rows above confirm that it is gone. Any desired behavior change to
+the remaining 14 failures must be resolved in the Spring Boot/Log4j2 fixture
+upstream and only re-filed here if a future CratonVM-vs-HotSpot divergence is
+demonstrated.
 
 ## Symptom
 

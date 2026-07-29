@@ -1677,12 +1677,6 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if !P59_RETAIN_CLASS_REF.with(Cell::get) {
-                return Err(RuntimeError::UnsupportedOperationException {
-                    message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                }
-                .into());
-            }
             Ok(Some(ctx.get_field(this, 6)))
         },
     );
