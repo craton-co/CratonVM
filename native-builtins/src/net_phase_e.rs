@@ -11891,7 +11891,7 @@ struct Re8WinUnicastAddress {
 }
 
 #[cfg(windows)]
-unsafe fn re8_win_ip(address: Re8WinSocketAddress) -> Option<IpAddr> {
+unsafe fn re8_win_ip(address: &Re8WinSocketAddress) -> Option<IpAddr> {
     if address.address.is_null() || address.length < 2 {
         return None;
     }
@@ -11988,7 +11988,7 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
                 let mut unicast = adapter.first_unicast_address;
                 while !unicast.is_null() {
                     let entry = unsafe { &*unicast };
-                    if let Some(ip) = unsafe { re8_win_ip(entry.address) } {
+                    if let Some(ip) = unsafe { re8_win_ip(&entry.address) } {
                         if !addrs.contains(&ip) {
                             addrs.push(ip);
                         }
