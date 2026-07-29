@@ -12015,7 +12015,19 @@ pub fn register_essential_natives_with_shims(
             // `Module.getClassLoader()` bytecode answers the AppClassLoader like
             // HotSpot instead of null. See `lang_class::canonical_unnamed_module`.
             if module_name.is_none() {
-                let m = crate::lang_class::canonical_unnamed_module(ctx);
+                // ... but the unnamed module is PER-LOADER in HotSpot, and
+                // caller-sensitive JDK APIs derive a search ClassLoader from
+                // it (`ResourceBundle.getBundle(String)` above all). Route a
+                // class defined by a user loader to THAT loader's unnamed
+                // module; built-in loaders keep the single canonical one.
+                // Reuse the authoritative `Class.getClassLoader()` resolution
+                // rather than a second, narrower side-table probe -- the two
+                // must never disagree about which loader owns a class.
+                let loader = match crate::lang_class::native_class_get_class_loader(ctx, args) {
+                    Ok(Some(Value::Object(o))) => o,
+                    _ => None,
+                };
+                let m = crate::lang_class::unnamed_module_for_loader(ctx, loader);
                 return Ok(Some(Value::Object(Some(m))));
             }
 

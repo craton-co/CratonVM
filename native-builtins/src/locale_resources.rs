@@ -773,6 +773,49 @@ fn bundle_class_loader(ctx: &dyn NativeContext, args: &[Value]) -> Option<Object
     })
 }
 
+/// The `ClassLoader` of the class that CALLED `ResourceBundle.getBundle`.
+///
+/// `getBundle(String)` and `getBundle(String, Locale)` are `@CallerSensitive`:
+/// the JDK resolves the search loader from the caller's own module
+/// (`getBundleImpl` -> `getLoader(caller.getModule())`), NOT from the
+/// application class path. Our natives replace every `getBundle` overload, and
+/// the no-loader ones fell back to CratonVM's process-wide `-cp` scan -- so a
+/// class defined by a custom loader could not find a bundle that only ITS
+/// loader can serve. Keycloak 26.6.1: Liquibase's
+/// `ResourceBundle.getBundle("liquibase/i18n/liquibase-core")` runs from
+/// classes defined by Quarkus's `RunnerClassLoader`, whose jars are not on the
+/// CratonVM process class path at all, so the boot died with
+/// `MissingResourceException` where HotSpot resolves the bundle fine.
+///
+/// Only USER-DEFINED loaders are reported: for the built-in loaders the `-cp`
+/// scan is the established, well-tested path and answers the same thing.
+/// Because our native IS the `getBundle` frame (no Java frame is pushed for
+/// it), the innermost captured Java frame is the caller.
+fn caller_bundle_class_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let frames = ctx.capture_stack_trace(0);
+    let cid = frames.last()?.class_id?;
+    let mirror = ctx.get_class_mirror(cid);
+    let loader = match crate::lang_class::native_class_get_class_loader(
+        ctx,
+        &[Value::Object(Some(mirror))],
+    ) {
+        Ok(Some(Value::Object(Some(loader)))) => loader,
+        _ => return None,
+    };
+    // Anything other than the application-loader singleton. NOT
+    // `is_user_defined_loader`: that predicate excludes a bare
+    // `java.net.URLClassLoader` BY CLASS NAME for its other call sites, yet
+    // `new URLClassLoader(urls, parent)` is the most ordinary way an
+    // application builds an isolated loader, and HotSpot resolves a bundle
+    // through it. Classes owned by the built-in loaders report `null` here or
+    // the app singleton, and both keep the established `-cp` path.
+    let app = crate::classloader::get_or_create_app_loader(ctx);
+    if loader.as_ptr() == app.as_ptr() {
+        return None;
+    }
+    Some(loader)
+}
+
 /// Locate a `.properties` candidate through the loader supplied to
 /// `ResourceBundle.getBundle`, falling back to the application class path only
 /// for overloads that supplied no loader.  `ClassLoader.getResourceAsStream`
@@ -798,7 +841,11 @@ fn find_bundle_resource(
         Ok(Some(Value::Object(Some(stream)))) => stream,
         _ => {
             ctx.unpin_native_roots(loader_pin);
-            return None;
+            // A loader that cannot serve the candidate must not LOSE one the
+            // process class path can: every no-loader overload searched `-cp`
+            // before the caller-sensitive loader was wired in above, so this
+            // keeps that reach rather than narrowing it.
+            return ctx.find_resource(path);
         }
     };
     ctx.unpin_native_roots(loader_pin);
@@ -995,7 +1042,9 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
 
     let mut chain = build_locale_chain(&bundle_name, &lang, &country, &variant);
-    let loader = bundle_class_loader(ctx, args);
+    // An explicit `ClassLoader` argument wins; otherwise honour the JDK's
+    // caller-sensitive resolution -- see `caller_bundle_class_loader`.
+    let loader = bundle_class_loader(ctx, args).or_else(|| caller_bundle_class_loader(ctx));
 
     // cceres5 (WildFly metrics stale-ResourceBundle, live-captured via
     // CRATONVM_DBG_STALE_RECV): `obj`/`map`/`loader` were carried raw across
