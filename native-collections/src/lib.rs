@@ -45283,39 +45283,12 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_cf_exceptionally,
     );
 
-    // --- ForkJoinPool.awaitQuiescence ---
-    //
-    // ESCALATED (W4) — this constant is NOT safe, and the W2 justification it
-    // replaces was factually wrong. That note claimed every ForkJoinPool entry
-    // point runs its task INLINE on the calling thread, so nothing can be
-    // outstanding. `fork`/`invoke`/`submit`/`join` do, but `execute` does not:
-    // in BOTH run modes it hands the Runnable to a real worker thread —
-    // native-builtins `lib.rs` (inside `register_essential_natives_with_shims`,
-    // i.e. the default real-JDK build) and `concurrent_extras.rs`
-    // (`--synthetic-jdk`) both route `ForkJoinPool.execute(Runnable)` through
-    // `spawn_runnable_on_real_thread`. So a task CAN still be running when
-    // `awaitQuiescence` is called, and `true` then lies about it.
-    //
-    // Left as `true` deliberately rather than flipped: `false` means "timed
-    // out", and callers loop on that, so guessing the other way turns a stale
-    // answer into a hang. The real fix needs the pending/active task count of
-    // native-builtins' async worker pool (`async_worker_pool` /
-    // `note_async_runnable_submitted` in `native-builtins/src/lib.rs`), which
-    // this crate cannot see — `cratonvm-native-builtins` depends on
-    // `cratonvm-native-collections`, not the other way round. Either expose
-    // that count on `NativeContext` (e.g. `fn pending_async_tasks(&self) ->
-    // usize`) so the poll can happen here, or move this registration into
-    // native-builtins next to the pool it must observe. This registration is
-    // the LAST one for the triple tree-wide, so it is what runs.
-    let pool = "java/util/concurrent/ForkJoinPool";
-    r.register(
-        pool,
-        "awaitQuiescence",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
+    // ForkJoinPool.awaitQuiescence is registered by native-builtins after it
+    // establishes the real async-worker completion tracker. Keeping a local
+    // constant here would overwrite that stateful implementation.
 
     // --- ThreadPoolExecutor stat methods ---
+    let pool = "java/util/concurrent/ForkJoinPool";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
     r.register(tp, "getPoolSize", "()I", |ctx, args| {
         let this = tp_arg0(args);

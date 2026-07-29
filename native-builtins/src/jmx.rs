@@ -119,6 +119,12 @@ fn uptime_ms() -> u64 {
 static THREAD_CPU_TIME_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// JMM contention monitoring is opt-in, like HotSpot. VM-side counters are
+/// reset at each enable transition so pre-enable lock activity is never leaked
+/// into the observable ThreadInfo values.
+static THREAD_CONTENTION_MONITORING_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 static VERBOSE_CLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `-verbose:gc`. Deliberately the SAME cell the synthetic-mode
@@ -350,6 +356,19 @@ fn requested_thread_id(args: &[Value]) -> Option<i64> {
         Value::Long(id) => Some(*id),
         _ => None,
     })
+}
+
+fn native_set_thread_contention_monitoring_enabled(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let enabled = args.iter().any(|value| matches!(value, Value::Int(1)));
+    let was_enabled =
+        THREAD_CONTENTION_MONITORING_ENABLED.swap(enabled, std::sync::atomic::Ordering::Relaxed);
+    if enabled && !was_enabled {
+        ctx.reset_thread_jmx_contention_stats();
+    }
+    Ok(None)
 }
 
 /// JVMTI/JMM thread-status bit for "blocked entering a monitor", the value
@@ -1261,10 +1280,21 @@ fn object_name_has_unquoted_wildcard(text: &str) -> bool {
     let mut quoted = false;
     let mut escaped = false;
     for ch in text.chars() {
-        if escaped { escaped = false; continue; }
-        if ch == '\\' && quoted { escaped = true; continue; }
-        if ch == '"' { quoted = !quoted; continue; }
-        if !quoted && matches!(ch, '*' | '?') { return true; }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quoted {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted && matches!(ch, '*' | '?') {
+            return true;
+        }
     }
     false
 }
@@ -1858,8 +1888,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             } else {
                 const AVG_CLASS_METADATA_BYTES: i64 = 4096;
                 const NON_HEAP_INIT_BYTES: i64 = 2 * 1024 * 1024;
-                let used =
-                    (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
+                let used = (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
                 let committed = used + 1024 * 1024;
                 ctx.set_field(obj, 0, Value::Long(NON_HEAP_INIT_BYTES)); // init
                 ctx.set_field(obj, 1, Value::Long(used)); // used (class-count-derived)
@@ -2270,11 +2299,19 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     for (name, desc) in [
         ("getThreadAllocatedMemory1", "([J[J)V"),
         ("setThreadCpuTimeEnabled0", "(Z)V"),
-        ("setThreadContentionMonitoringEnabled0", "(Z)V"),
-        ("resetContentionTimes0", "(J)V"),
     ] {
         r.register(cls, name, desc, void_noop);
     }
+    r.register(
+        cls,
+        "setThreadContentionMonitoringEnabled0",
+        "(Z)V",
+        native_set_thread_contention_monitoring_enabled,
+    );
+    r.register(cls, "resetContentionTimes0", "(J)V", |ctx, _args| {
+        ctx.reset_thread_jmx_contention_stats();
+        Ok(None)
+    });
 
     // REAL — arbitrary-thread CPU/user time on the real-JDK surface, the twin of
     // `ThreadMXBean.getThreadCpuTime(J)` in `register_thread_mxbean`. Now that
@@ -4346,10 +4383,44 @@ fn alloc_snapshot_thread_info(
         }
         ctx.unpin_native_roots(thread_pin);
     }
-    ctx.set_field_by_name(info, "blockedTime", Value::Long(-1));
-    ctx.set_field_by_name(info, "blockedCount", Value::Long(0));
-    ctx.set_field_by_name(info, "waitedTime", Value::Long(-1));
-    ctx.set_field_by_name(info, "waitedCount", Value::Long(0));
+    let contention_enabled =
+        THREAD_CONTENTION_MONITORING_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    ctx.set_field_by_name(
+        info,
+        "blockedTime",
+        Value::Long(if contention_enabled {
+            snapshot.blocked_time_ms
+        } else {
+            -1
+        }),
+    );
+    ctx.set_field_by_name(
+        info,
+        "blockedCount",
+        Value::Long(if contention_enabled {
+            snapshot.blocked_count
+        } else {
+            0
+        }),
+    );
+    ctx.set_field_by_name(
+        info,
+        "waitedTime",
+        Value::Long(if contention_enabled {
+            snapshot.waited_time_ms
+        } else {
+            -1
+        }),
+    );
+    ctx.set_field_by_name(
+        info,
+        "waitedCount",
+        Value::Long(if contention_enabled {
+            snapshot.waited_count
+        } else {
+            0
+        }),
+    );
     ctx.set_field_by_name(info, "lockOwnerId", Value::Long(snapshot.lock_owner_id));
     ctx.set_field_by_name(info, "priority", Value::Int(5));
     ctx.set_field_by_name(info, "stackTrace", Value::Object(Some(stack_trace)));
@@ -4715,7 +4786,7 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         cls,
         "isObjectMonitorUsageSupported",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |_ctx, _args| Ok(Some(Value::Int(1))),
     );
     // REAL — VERIFIED 2026-07-28, and no longer the same question as the
     // monitor flag above. Ownable-synchronizer usage has no "fast path" to miss:
@@ -4765,17 +4836,36 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     // ("no Code attribute"), failing ~every server unit test. Report `false`
     // (not supported): HotThreads then just logs "not supported" and returns,
     // never touching setThreadContentionMonitoringEnabled.
+    // The public interface is abstract in the JDK image, while the concrete
+    // implementation varies by release. Register all dispatch owners so an
+    // invokeinterface does not fall through to an abstract Code-less entry.
+    for owner in [
+        "java/lang/management/ThreadMXBean",
+        "sun/management/ThreadImpl",
+        "com/sun/management/internal/HotSpotThreadImpl",
+    ] {
+        r.register(
+            owner,
+            "setThreadContentionMonitoringEnabled",
+            "(Z)V",
+            native_set_thread_contention_monitoring_enabled,
+        );
+    }
     r.register(
         cls,
         "isThreadContentionMonitoringSupported",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |_ctx, _args| Ok(Some(Value::Int(1))),
     );
     r.register(
         cls,
         "isThreadContentionMonitoringEnabled",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |_ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                THREAD_CONTENTION_MONITORING_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+            ))))
+        },
     );
     // REAL: every live thread's own `tid`. The previous body returned a
     // hard-coded `[1]` regardless of how many threads were running, and the
@@ -6515,10 +6605,13 @@ fn track_created_mbean_server(ctx: &mut dyn NativeContext, server: ObjectRef) ->
 
 #[cfg(test)]
 mod jmx_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn registry_with_synthetic_mbean_server() -> NativeMethodRegistry {
         let mut r = NativeMethodRegistry::new();

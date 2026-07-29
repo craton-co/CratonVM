@@ -11342,7 +11342,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // `phases_late::p59_sw_walk` already allocates 0-field stubs for
         // walker objects; the 6-field layout here upgrades that path.
         "java/lang/StackWalker" => instance_fields(6),
-        "java/lang/StackWalker$StackFrame" => instance_fields(6),
+        "java/lang/StackWalker$StackFrame" => instance_fields(8),
 
         "java/lang/StackWalker$Option" => {
             let mk = |n: &'static str| ClassFileField {
@@ -11388,6 +11388,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "com/sun/jmx/mbeanserver/MappedMXBeanType" => instance_fields(4),
 
         _ => vec![],
+    }
+}
+
+
+#[cfg(test)]
+#[test]
+fn native_constant_surface_raw_slot_layout_audit() {
+    // These issue-surface classes are constructed through bytecode `new` and
+    // handled through positional native fields. Explicit
+    // `alloc_concurrent_synthetic(..., n)` call sites reserve their own
+    // capacity. Keep this manifest beside the fallback allocator so a short
+    // layout cannot silently reappear while these native surfaces evolve.
+    for (class, minimum_slots) in [
+        ("java/net/DatagramSocket", 4),
+        ("java/net/DatagramPacket", 5),
+        ("java/util/prefs/Preferences", 5),
+        ("com/sun/net/httpserver/HttpServer", 6),
+        ("com/sun/net/httpserver/HttpServerImpl", 6),
+        ("sun/net/httpserver/HttpServerImpl", 6),
+        ("com/sun/net/httpserver/HttpExchange", 11),
+        ("java/lang/StackWalker$StackFrame", 8),
+    ] {
+        assert!(
+            synthetic_stub_fields(class).len() >= minimum_slots,
+            "{class} needs at least {minimum_slots} synthetic fields for its native raw-slot surface",
+        );
     }
 }
 
