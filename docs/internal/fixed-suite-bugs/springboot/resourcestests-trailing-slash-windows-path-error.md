@@ -32,6 +32,21 @@
 > `Path`'s raw string, or in the native file-write syscall wrapper behind
 > `Files.writeString` reading the object's string form without normalizing
 > it), then apply the same "strip except for roots" logic there.
+>
+> **Confirmed still failing 2026-07-28 (craton-rerun-20260728)** — identical
+> symptom to the 2026-07-23 note above: same test
+> (`whenAddDirectoryAndResourceAlreadyExistsThenIllegalStateExceptionIsThrown`),
+> same `os error 267`/`ERROR_DIRECTORY`, same failing line
+> (`Resources.addResource(Resources.java:114)`):
+> ```
+> => java.lang.IllegalStateException: IOException: Неверно задано имя папки. (os error 267)
+>    org.springframework.boot.testsupport.classpath.resources.Resources.addResource(Resources.java:114)
+> ```
+> Log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard1/logs/test-support_spring-boot-test-support.org.springframework.boot.testsupport.classpath.resour-c869c3f8368d.out.log`.
+> Not re-investigated further this session (log-analysis/triage only, no
+> build or test execution performed) — the "confirming next step" above
+> (tracing `Path`/`Files` construction rather than `File`) remains
+> un-attempted.
 
 `ResourcesTests.whenAddDirectoryAndResourceAlreadyExistsThenIllegalStateExceptionIsThrown`
 previously failed during its setup call:

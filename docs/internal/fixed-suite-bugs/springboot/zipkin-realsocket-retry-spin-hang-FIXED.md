@@ -65,3 +65,27 @@ is the most likely candidate to have regressed, but this is **not confirmed**
 run with fuller failure capture (e.g. `-Dassertj.printAssertionsMessages` or
 just re-running just this method in isolation) before it can be root-caused
 further.
+
+## Update 2026-07-28 — still failing, identical un-detailed shape; `zlib-rs` is still enabled so this is not simply the compression-backend feature flag reverting
+
+`craton-rerun-20260728` (`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard2/logs/module_spring-boot-zipkin.org.springframework.boot.zipkin.autoconfigure.ZipkinHttpClientSenderTests.out.log`)
+shows `sendShouldCompressData()` failing again, still with a bare
+`AssertJMultipleFailuresError` and no captured sub-assertion detail (same
+gap the 2026-07-23 note above already flagged: "no message body and no
+stack trace past the 3-line call chain"), 6/7 other tests in the class pass.
+
+Checked one thing the 2026-07-23 note didn't: `native-builtins/Cargo.toml`
+(current worktree) still declares
+`flate2 = { version = "1", features = ["zlib-rs"] }` — the exact
+byte-compatible-with-real-zlib backend this doc's own fix relies on, with
+its explanatory comment still present and still citing this test
+("Spring Boot's Zipkin sender verifies the exact bytes produced by
+HotSpot"). This rules out "the `zlib-rs` Cargo feature got reverted/dropped"
+as the regression cause — whatever's failing now is either a different
+byte-level mismatch than the original DEFLATE-encoding gap this doc fixed
+(e.g. the gzip header's OS byte, mtime field, or `FLG` byte, none of which
+`zlib-rs` governs), or one of the three simpler header/method assertions the
+2026-07-23 note already flagged as equally possible. Not re-investigated
+further this session (log-analysis/triage only, no build or test execution
+performed) — still needs the same fuller-capture rerun the 2026-07-23 note
+called for.

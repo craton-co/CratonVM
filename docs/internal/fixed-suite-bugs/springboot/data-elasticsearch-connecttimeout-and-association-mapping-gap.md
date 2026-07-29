@@ -232,3 +232,29 @@ interaction returning a stale 500 instead of a connection failure, then
 never completing the resulting `Mono`) layered on top of or instead of
 Case 1's original gap. Re-diagnosis from the current test source is needed
 before assuming this is the same bug — not done in this session.
+
+## Confirmed still failing 2026-07-28 (craton-rerun-20260728) — identical to the 2026-07-23 shifted symptom, not Case 1's original mechanism
+
+`DataElasticsearchReactiveHealthIndicatorTests.elasticsearchIsDown` still
+fails 1/5 (`RunName=craton-rerun-20260728`), with the same shape the
+2026-07-23 note above already flagged as distinct from Case 1's original
+"immediate refusal vs. timeout text" symptom: a WARN log shows a real HTTP
+500 `ResponseException` from the mock server, followed by a flat 5-second
+`Mono.block()` timeout that never resolves:
+
+```
+15:55:18.479 [elasticsearch-rest-client-2-thread-1] WARN ... DataElasticsearchReactiveHealthIndicator -- Elasticsearch health check failed
+co.elastic.clients.transport.rest5_client.low_level.ResponseException: method [GET], host [http://localhost:63498], URI [/_cluster/health], status line [500]
+...
+=> java.lang.IllegalStateException: Timeout on blocking read for 5000000000 NANOSECONDS
+     reactor.core.publisher.Mono.block(Mono.java:1800)
+     org.springframework.boot.data.elasticsearch.health.DataElasticsearchReactiveHealthIndicatorTests.elasticsearchIsDown(DataElasticsearchReactiveHealthIndicatorTests.java:95)
+```
+
+Log:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard2/logs/module_spring-boot-data-elasticsearch.org.springframework.boot.data.elasticsearch.health.Da-5bb7f2032047.out.log`.
+Confirms the 2026-07-23 note's shifted symptom is stable/reproducible 5 days
+later, not a one-off. Not re-investigated further this session
+(log-analysis/triage only, no build or test execution performed) — the
+2026-07-23 note's "needs re-diagnosis from the current test source" call
+still stands; still not done.

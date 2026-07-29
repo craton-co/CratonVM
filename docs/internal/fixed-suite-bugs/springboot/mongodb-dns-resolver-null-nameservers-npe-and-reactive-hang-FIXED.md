@@ -83,3 +83,48 @@ fix regressing**:
    genuine functional (non-network) assertion failure, not an environment
    confound.
    Log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260723/shard7/logs/module_spring-boot-mongodb.org.springframework.boot.mongodb.autoconfigure.MongoReactiveAutoCon-90a9dc480afa.out.log`.
+
+## Confirmed still failing 2026-07-28 (craton-rerun-20260728) — same two classes/methods, same outer symptom, but the underlying OS error changed from "connection reset" to "timeout"
+
+`PropertiesMongoConnectionDetailsTests.protocolCanBeConfigured()` and
+`MongoAutoConfigurationTests.configuresProtocol()` both still fail with the
+same `com.mongodb.MongoConfigurationException: Failed looking up TXT record
+for host localhost` chain the 2026-07-23 note above already flagged as a
+likely environment/network confound. The immediate cause is now a
+`java.net.SocketTimeoutException` (not the 2026-07-23 note's "connection
+forcibly closed by remote host", os error 10054):
+
+```
+Caused by: javax.naming.CommunicationException: DNS error [Root exception is java.net.SocketTimeoutException]; remaining name 'localhost'
+       com.sun.jndi.dns.DnsClient.query(DnsClient.java:376)
+     Caused by: java.net.SocketTimeoutException
+       com.sun.jndi.dns.DnsClient.doUdpQuery(DnsClient.java:527)
+```
+
+Logs:
+`apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard2/logs/module_spring-boot-mongodb.org.springframework.boot.mongodb.autoconfigure.PropertiesMongoCo-8370d7f3db13.out.log`,
+`.../module_spring-boot-mongodb.org.springframework.boot.mongodb.autoconfigure.MongoAutoConfigurationTests.out.log`.
+This is consistent with (not a refutation of) the 2026-07-23 note's
+"plausibly an environment/network-condition issue — no reachable DNS server"
+hypothesis: a genuinely unreachable/non-responding DNS server produces a
+timeout, while a reachable-but-refusing one produces a reset — both are
+network-layer outcomes upstream of any CratonVM JNDI/DNS code, not
+necessarily the same OS-level event recurring. Not re-investigated further
+this session (log-analysis/triage only, no build or test execution
+performed) — a same-host, same-network HotSpot run against the identical
+`localhost` TXT query would still be the fastest way to settle whether this
+is environmental or a genuine CratonVM regression.
+
+`MongoAutoConfigurationTests`' background server-monitor thread also logs a
+`com.mongodb.MongoException: java.lang.NullPointerException: Cannot enter
+synchronized block because "this.socketLock" is null` (from
+`java.net.Socket.getImpl()` → `setTcpNoDelay()`) while trying to connect to
+a nonexistent real Mongo server at `127.0.0.1:27017`/`localhost:27017` —
+this is background noise from the driver's monitor thread (caught and
+logged by the driver itself, not propagated to the test) and is not the
+cause of `configuresProtocol()`'s failure (that failure is the DNS
+TXT-lookup exception above, confirmed via the actual JUnit `Failures`
+section). Flagged here only because a `Socket.getImpl()` NPE on a
+presumably-non-null `socketLock` field could be a real, separate CratonVM
+`Socket` construction gap worth a follow-up look — not investigated further
+in this pass since it isn't this class's actual test failure.
