@@ -375,13 +375,49 @@ concrete items are left.
 
 | item | where | state |
 |---|---|---|
-| `Field.set` rejects a Spring CGLIB AOP proxy | `mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` | **4/4 fail** (HotSpot 4/4 pass). `BeanCreationException: Could not inject field … dateService`, caused by `IllegalArgumentException: argument type mismatch`. `CRATONVM_DBG_COERCE=1` names it exactly: `expected=…$DateService (cid=1899, loader=3)` vs `arg_class=…$DateService$$SpringCGLIB$$1 (cid=7650, loader=7)` — the CGLIB subclass is defined in a different loader namespace and `is_subclass` cannot walk from it to the `DateService` the test class sees. The same reject fires for log4j's own plugin reflection (`expected=…/log4j/Level (loader=2)` vs `arg_class=…/log4j/Level (loader=3)`), which is why every AOT log is full of `Could not create plugin of type … LoggerConfig` — probably one root cause, not two |
+| A Spring CGLIB AOP proxy inherits the WRONG copy of its superclass | `mockito.integration.MockitoSpyBeanAndSpringAopProxyIntegrationTests` | **4/4 fail** (HotSpot 4/4 pass), root cause named — see below |
 | AssertJ soft assertions cannot build their ByteBuddy proxy | `bean.override.BeanOverrideHandlerTests.forTestClassWith{SingleField,MultipleFields,MultipleFieldsWithIdenticalMetadata}` | **3 fail** in AOT replay only — the class passes **19/19** run normally. `IllegalArgumentException: Could not create type` from `net.bytebuddy.TypeCache.findOrInsert`, reached from `SoftProxies.createSoftAssertionProxyClass` |
 | chunk 4 does not finish | `mockito.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests` and neighbours | AOT processing completes (`PROBE aot-processing OK`) and then the replay hangs; killed at the 2400 s ceiling on three separate runs. HotSpot: 25 found, 24 succeeded, 1 failed (a probe artefact) |
 
 The first two reproduce in **about a minute each** — see below. That is the
 whole reason this section can name them instead of quoting a
 `MultipleFailuresError` count.
+
+### The CGLIB proxy's superclass comes from the wrong loader
+
+`BeanOverrideTestExecutionListener.injectField` fails with
+`BeanCreationException: Could not inject field … dateService`, caused by
+`IllegalArgumentException: argument type mismatch` from `Field.set`.
+`CRATONVM_DBG_COERCE=1` prints the expected/actual ClassIds, their loaders, and
+(since 2026-07-29) the actual value's whole superclass chain:
+
+```
+expected  = …$DateService                    (cid=1899, loader=3)
+arg_class = …$DateService$$SpringCGLIB$$1    (cid=7650, loader=7)
+chain     = …$DateService$$SpringCGLIB$$1 (cid=7650, loader=7)
+         -> …$DateService                 (cid=7629, loader=2)
+         -> java/lang/Object                (cid=0,    loader=0)
+```
+
+So this is not a type error and not a `Field.set` bug: the proxy's superclass
+resolved to a **second, freshly-defined copy of `DateService` in the
+application loader** (`cid=7629`, a very high ClassId — it did not exist before
+this run) instead of the copy the fork-loaded test class holds (`cid=1899`,
+loader 3). `is_subclass` then correctly answers false. Whatever defines the
+CGLIB proxy into namespace 7 resolves its superclass NAME through a delegation
+chain that reaches the app loader rather than the fork, and CratonVM defines a
+fresh class there rather than finding the fork's.
+
+Start from what loader 7 is and what its recorded parent is, and from
+`lookup_define.rs`'s `inherit_lookup_loader` / `define_class_full` — the
+superclass ClassId recorded at define time is the evidence, not the coercion
+guard that reports it. The same reject fires for log4j2's own plugin
+construction (`expected=…/log4j/Level (loader=2)` vs
+`arg_class=…/log4j/Level (loader=3)`), which is why every AOT run's log is full
+of `Could not create plugin of type … LoggerConfig: argument type mismatch` and
+`No factory method found for class … LoggerConfig`; that noise is very
+probably the same defect seen from the other side, and closing this should
+close it too.
 
 ## Reproducing
 
@@ -405,7 +441,8 @@ debugging loop; use the per-class AOT probe instead:
 ```bash
 cd /data/data/aot20260726
 # one class (add its @Nested classes explicitly), ~1 minute
-CP=$(tr -d '' < …/spring-test/build/cratonvm-testcp.txt)
+CP=$(tr -d '
+' < …/spring-test/build/cratonvm-testcp.txt)
 PROBE_STACK=1 <cratonvm> --java-home /home/victor/jdk25 --Xmx 3g   -cp "build2:build:$CP"   org.springframework.core.test.tools.ForkedProbeMain AotE2EProbe2 <Test…>
 # all 150 classes, grouped by top-level class into 20 chunks
 ./bochunks2.sh hs                       # HotSpot baseline first
