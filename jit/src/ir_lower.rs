@@ -288,6 +288,12 @@ struct Lowerer<'a> {
     /// Shared post-call frame publication used by direct and hashed dispatch
     /// stubs. Zero when precise frame tracking is unavailable.
     frame_record: usize,
+    /// `jit_service_callee_deopt` — services a compiled callee's `i64::MIN`
+    /// deopt sentinel at the megamorphic stub's inline call site, so the
+    /// callee's stashed frame is resumed there instead of escaping to the
+    /// caller as if the caller had deopted. Zero disables the emitted check.
+    /// See `runtime_lowering::emit_callee_deopt_check`.
+    service_callee_deopt: usize,
     /// wire-tiered-manager Step 4 (PGO handoff C1 → C2): per-bytecode-PC branch
     /// bias, keyed by the conditional-branch instruction's bytecode PC (the same
     /// key the IR builder stamps on each `Op::If` via `Node::bytecode_pc`). Value
@@ -424,6 +430,7 @@ impl<'a> Lowerer<'a> {
             ic_slots,
             invoke_virtual_mic: helpers.invoke_virtual_mic,
             frame_record: helpers.frame_record,
+            service_callee_deopt: helpers.service_callee_deopt,
             branch_hints,
             sr_map,
         }
@@ -1340,6 +1347,19 @@ impl<'a> Lowerer<'a> {
         self.load_to_rax(self.slot_of(inputs[2]));
         self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
         slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
+        // Array-receiver guard — `ObjectHeader.class_id` (offset 0) holds a
+        // reference array's COMPONENT class id, so `Foo[]` and `Foo` share the
+        // guard word every cached entry below is compared against. Without the
+        // `kind` check a `Foo[]` receiver is dispatched into `Foo`'s method
+        // body. See the matching guard in `x64.rs`'s single-pass cascade.
+        //   CMP BYTE [RAX + OBJECT_KIND_OFFSET], ObjectKind::Object
+        self.buf.emit(&[
+            0x80,
+            0x78,
+            cratonvm_types::OBJECT_KIND_OFFSET as u8,
+            cratonvm_types::ObjectKind::Object as u8,
+        ]);
+        slow_patches.push(self.emit_jcc_rel32(0x85)); // JNE .slow
         self.buf.emit(&[0x8B, 0x00]); // MOV EAX, dword [RAX]
 
         // ── Monomorphic inline cache ────────────────────────────────
@@ -1399,6 +1419,8 @@ impl<'a> Lowerer<'a> {
             self.context_slot_off,
             &arg_offsets,
             self.frame_record,
+            self.service_callee_deopt,
+            info_ptr,
         ));
 
         // ── Slow path: the resolving + cache-populating helper ────────────
@@ -3654,6 +3676,47 @@ mod tests {
         assert!(
             !contains_seq(&code, &0x1111_2222_3333_4440u64.to_le_bytes()),
             "a planned IC site must NOT also emit the blind jit_invoke_dispatch helper"
+        );
+    }
+
+    /// Every cached entry below is selected by the 4-byte
+    /// `ObjectHeader.class_id`, and a reference array stores its COMPONENT
+    /// class id in that same word — so `Foo[]` and `Foo` are indistinguishable
+    /// to a class-id-only guard, and a site warmed on a `Foo` receiver
+    /// dispatched a later `Foo[]` receiver into `Foo`'s own body (whose first
+    /// `checkcast Foo` threw `class [LFoo; cannot be cast to class Foo`).
+    /// `ObjectHeader.kind` is what separates them.
+    #[test]
+    fn ic_cascade_rejects_array_receivers_before_the_class_id_guard() {
+        const MIC: usize = 0x7fff_0000_0000_1000;
+        const PIC: usize = 0x7fff_0000_0000_2000;
+        let mut ic = HashMap::new();
+        ic.insert(2usize, (MIC, PIC));
+        let code = lower_virtual_call_with_ic(&ic);
+
+        // CMP BYTE [RAX + OBJECT_KIND_OFFSET], ObjectKind::Object
+        let guard = [
+            0x80u8,
+            0x78,
+            cratonvm_types::OBJECT_KIND_OFFSET as u8,
+            cratonvm_types::ObjectKind::Object as u8,
+        ];
+        assert!(
+            contains_seq(&code, &guard),
+            "the cascade must reject a non-object receiver kind before trusting the class id"
+        );
+        // ... and it must come BEFORE the single class-id load it protects.
+        let guard_at = code
+            .windows(guard.len())
+            .position(|w| w == guard)
+            .expect("guard present");
+        let load_at = code
+            .windows(2)
+            .position(|w| w == [0x8B, 0x00])
+            .expect("class-id load present");
+        assert!(
+            guard_at < load_at,
+            "the kind guard must precede the class-id load (guard@{guard_at}, load@{load_at})"
         );
     }
 

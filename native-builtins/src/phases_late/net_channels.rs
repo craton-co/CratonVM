@@ -2564,10 +2564,14 @@ pub(crate) fn ws_send_frame(
 // java.net UDP — DatagramPacket, DatagramSocket, MulticastSocket
 // =============================================================================
 
+/// `DatagramPacket` slot 4 — the buffer offset. Guarded at every use: see
+/// `getOffset`'s note on the missing `synthetic_stub_fields` entry.
+const DP_OFFSET: usize = 4;
+
 pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // DatagramPacket = 4-field (data=0, length=1, address=2, port=3)
+    // DatagramPacket = 5-field (data=0, length=1, address=2, port=3, offset=4)
     let dp = "java/net/DatagramPacket";
     r.register(dp, "<init>", "([BI)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2620,6 +2624,17 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             ctx.set_field(this, 3, Value::Int(port));
+            // Slot 4 = offset (the argument this ctor used to drop). Guarded:
+            // see `getOffset` below — the synthetic layout does not always have
+            // the slot, and a packet built without it keeps today's offset-0
+            // behaviour rather than writing out of bounds.
+            if ctx.object_num_fields(this) > DP_OFFSET {
+                let offset = match args.get(2) {
+                    Some(Value::Int(i)) => *i,
+                    _ => 0,
+                };
+                ctx.set_field(this, DP_OFFSET, Value::Int(offset));
+            }
             Ok(None)
         },
     );
@@ -2660,15 +2675,26 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 3, args.get(1).copied().unwrap_or(Value::Int(0)));
         Ok(None)
     });
-    // KEEP: the synthetic `DatagramPacket` is a 4-slot object
-    // (data/length/address/port) with no offset slot, and the
-    // `([BIILjava/net/InetAddress;I)V` constructor above deliberately drops its
-    // `offset` argument — every packet this surface builds genuinely starts at
-    // index 0, so 0 is the accurate answer for the object as constructed, not a
-    // placeholder. (The dropped constructor argument is the real defect and is
-    // reported separately; fixing it needs a fifth slot, which is a layout
-    // change shared with `class_manager`'s synthetic field table.)
-    r.register(dp, "getOffset", "()I", |_ctx, _args| {
+    // Reads the offset the 5-arg constructor now stores in slot 4, falling
+    // back to 0 for a packet whose layout has no such slot (the other two
+    // constructors have no offset argument, and 0 is their correct answer).
+    //
+    // ESCALATED (wave 4) — the guard is load-bearing, and correcting wave 3's
+    // account of why: `java/net/DatagramPacket` has NO entry in
+    // `classloading/src/class_manager.rs::synthetic_stub_fields`, so it falls
+    // to that function's `_ => vec![]` arm and gets zero padded slots. It needs
+    // `"java/net/DatagramPacket" => instance_fields(5)` there — which is also
+    // what backs the existing 4-slot data/length/address/port layout this whole
+    // registrar already assumes. That is a cross-crate change; until it lands
+    // the write above is inert and this returns 0, exactly as before.
+    r.register(dp, "getOffset", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > DP_OFFSET {
+            // `unwrap_or(0)` also covers a packet built by one of the two
+            // offset-less constructors, which leave the slot uninitialised.
+            let off = ctx.get_field(this, DP_OFFSET).as_int().unwrap_or(0);
+            return Ok(Some(Value::Int(off)));
+        }
         Ok(Some(Value::Int(0)))
     });
 
@@ -2979,15 +3005,62 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
                 _ => "127.0.0.1".into(),
             };
             let port = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            // UdpSocket::connect restricts send/recv to the given address
-            // We can't easily call connect on fd_table, but we note the connected state
-            let _ = (host, port);
+            // The wave-3 note here ("we can't easily call connect on fd_table")
+            // was simply wrong: `FdTable::udp_connect` exists
+            // (native-api/src/fd_table.rs) and is what `DatagramChannel.connect`
+            // in this same file already uses. Dropping host/port on the floor
+            // left the socket unassociated, so every subsequent `send` still
+            // accepted an arbitrary destination and `receive` still accepted
+            // datagrams from any peer — the exact filtering `connect` exists to
+            // impose. `java.net.DatagramSocket.connect(InetAddress,int)` is
+            // specified not to throw on a connect failure (the error surfaces
+            // on the following send/receive), so a failure is swallowed here.
+            let target = format!("{host}:{port}");
+            let _ = ctx.fd_table().udp_connect(fd_id as u32, &target);
         }
         Ok(None)
     });
-    r.register(ds, "disconnect", "()V", |_ctx, _args| {
-        // Disconnect the datagram socket — clear any remote association.
-        // Our UdpSocket model doesn't track connected state explicitly, so this is a logical no-op.
+    // The escalated primitive landed: `FdTable::udp_disconnect(FdId)`
+    // (native-api/src/fd_table.rs) issues the POSIX `connect(AF_UNSPEC)` that
+    // dissolves the association, treating the `EAFNOSUPPORT`/`WSAEAFNOSUPPORT`
+    // both platforms report for that form as success. So this is no longer a
+    // no-op: the fd is resolved exactly the way the sibling `connect` above
+    // resolves it, and the kernel-side association is really undone. Without
+    // it the socket stayed connected — still dropping datagrams from every
+    // peer but the old one — while the Java object claimed to be disconnected.
+    //
+    // There is NO Java-side `connected` state to clear here: this class's
+    // layout is port/closed/timeout/fd_id and has no such flag, `connect`
+    // above sets none, and no `isConnected`/`getInetAddress`/`getPort` native
+    // is registered for `java/net/DatagramSocket` to read one. The fd IS the
+    // state, so the two halves agree once the fd is disconnected.
+    //
+    // `DatagramSocket.disconnect()` is specified never to throw and to be a
+    // no-op on a socket that was never connected (the AF_UNSPEC form is itself
+    // a no-op on an unassociated socket), so the result is deliberately
+    // swallowed.
+    //
+    // CAVEAT — read before trusting this at runtime: slot 3 is very probably
+    // out of bounds for a real `new java.net.DatagramSocket()`. There is no
+    // `"java/net/DatagramSocket"` arm in `classloading/src/class_manager.rs`
+    // `synthetic_stub_fields`, so a synthetic-mode instance falls to that
+    // function's `_ => vec![]` arm and gets ZERO slots, and the real JDK 17+
+    // class has a single `delegate` field (which is the documented reason
+    // `net_phase_e::register_re7_datagram_socket` keeps its state in a
+    // `DsSide` side table keyed by ObjectRef instead of in slots). That makes
+    // the whole 4-slot `ds` set here — `<init>`, `send`, `close`, `connect`
+    // and now `disconnect` — inert in the same silent way wave 4 found for
+    // `DatagramPacket.getOffset`: `set_field` past the end DROPS the write.
+    // Fixing that is a cross-crate change (add
+    // `"java/net/DatagramSocket" => instance_fields(4)` there, or better, move
+    // this set onto the RE.7 side table); the call below is correct the moment
+    // the fd is actually stored, and no worse than the old no-op until then.
+    r.register(ds, "disconnect", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
+        if fd_id >= 0 {
+            let _ = ctx.fd_table().udp_disconnect(fd_id as u32);
+        }
         Ok(None)
     });
     r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
@@ -3444,6 +3517,78 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         Some(id)
     }
 
+    /// POSIX `connect(AF_UNSPEC)` — dissolve a UDP socket's peer association.
+    ///
+    /// `FdTable::udp_disconnect` (native-api/src/fd_table.rs) does exactly
+    /// this, but it is keyed by `FdId` and a `DatagramChannel`'s socket is NOT
+    /// in the fd table: `ensure_bound` above binds a bare
+    /// `std::net::UdpSocket` into `servlet::SocketRegistry::dgrams` and slot 4
+    /// holds that registry id, not an fd. There is therefore no `FdId` to hand
+    /// the primitive, and moving the channel onto the fd table would drag
+    /// send/receive/read/write and the Selector's `poll` registration with it.
+    /// The syscall is issued against the registry socket instead — the same
+    /// way `setOption`/`getOption` below already reach under it through
+    /// `socket2::SockRef`.
+    ///
+    /// Neither `std::net::UdpSocket` nor `socket2` exposes the AF_UNSPEC form,
+    /// so it goes through the raw handle. Both platforms report an error for
+    /// it even when it works (Linux `EAFNOSUPPORT`, Winsock
+    /// `WSAEAFNOSUPPORT`); the disassociation still happens, so that one code
+    /// is treated as success. Kept byte-for-byte in step with
+    /// `FdTable::udp_disconnect` — if one changes, change both.
+    fn udp_dissolve_association(sock: &std::net::UdpSocket) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
+            addr.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+            let rc = unsafe {
+                libc::connect(
+                    sock.as_raw_fd(),
+                    &addr as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+                return Ok(());
+            }
+            Err(err)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            const WSAEAFNOSUPPORT: i32 = 10047;
+
+            // Declared locally, matching the `#[link(name = "ws2_32")]` block
+            // in `FdTable::udp_disconnect`. `clashing_extern_declarations` is
+            // denied workspace-wide, so these signatures must not diverge from
+            // any other declaration of the same symbol in THIS crate — there
+            // is currently no other `connect`/`WSAGetLastError` in
+            // native-builtins, and this pair matches native-api's.
+            #[link(name = "ws2_32")]
+            unsafe extern "system" {
+                fn connect(s: usize, name: *const u8, namelen: i32) -> i32;
+                fn WSAGetLastError() -> i32;
+            }
+
+            // `sockaddr` is 16 bytes; all-zero gives sa_family = AF_UNSPEC (0).
+            let addr = [0u8; 16];
+            let rc = unsafe { connect(sock.as_raw_socket() as usize, addr.as_ptr(), 16) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let code = unsafe { WSAGetLastError() };
+            if code == WSAEAFNOSUPPORT {
+                return Ok(());
+            }
+            Err(std::io::Error::from_raw_os_error(code))
+        }
+    }
+
     r.register(
         dc,
         "bind",
@@ -3538,15 +3683,45 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         "()Ljava/nio/channels/DatagramChannel;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Was: clear slot 2 and leave the socket alone, with a comment
+            // calling that "a portable proxy". It was not a proxy for
+            // anything — `connect` above really does associate the socket, so
+            // the kernel kept filtering datagrams to the old peer while
+            // `isConnected()` answered false and `receive` was documented to
+            // accept from anyone again. `udp_dissolve_association` (defined
+            // next to `ensure_bound` above) now issues the AF_UNSPEC connect
+            // that std::net does not expose. Note it takes the registry socket
+            // directly, NOT an `FdId`: `FdTable::udp_disconnect` cannot be
+            // used here because this channel's socket lives in
+            // `servlet::SocketRegistry::dgrams` and never enters the fd table.
+            if ctx.get_field(this, 2).as_int().unwrap_or(0) == 0 {
+                // Never connected — the JDK specifies disconnect() as a no-op
+                // in that case, and the AF_UNSPEC form is pointless anyway.
+                return Ok(Some(Value::Object(Some(this))));
+            }
             let sid = ctx.get_field(this, 4).as_int().unwrap_or(-1);
             if sid >= 0 {
-                let reg = crate::servlet::s2_registry().lock();
-                if let Some(sock) = reg.dgrams.get(&sid) {
-                    // Reset to unspecified address per POSIX semantics by
-                    // connecting to (AF_UNSPEC, 0, 0). Rust's std::net doesn't
-                    // expose this directly; as a portable proxy, the socket
-                    // remains bound but the `connected` flag is cleared.
-                    let _ = sock;
+                // Scoped so the registry lock is released before the field
+                // write below; nothing inside blocks.
+                let outcome = {
+                    let reg = crate::servlet::s2_registry().lock();
+                    match reg.dgrams.get(&sid) {
+                        Some(sock) => udp_dissolve_association(sock),
+                        // Connected flag set but the socket is gone: nothing
+                        // left to disassociate, so fall through and clear it.
+                        None => Ok(()),
+                    }
+                };
+                if let Err(e) = outcome {
+                    // `DatagramChannel.disconnect()` is declared `throws
+                    // IOException`, and the flag deliberately stays SET: the
+                    // peer association is still in place, so answering
+                    // "disconnected" would recreate the exact Java/kernel
+                    // disagreement this change removes.
+                    return Err(RuntimeError::IOException {
+                        message: format!("DatagramChannel.disconnect failed: {e}"),
+                    }
+                    .into());
                 }
             }
             ctx.set_field(this, 2, Value::Int(0));
@@ -4109,6 +4284,10 @@ fn http_object_links(
 
 const HTTP_LINK_EXECUTOR: u8 = 0;
 const HTTP_LINK_CONTEXT_SERVER: u8 = 1;
+/// Per-`HttpExchange` attribute map (`get/setAttribute`).
+const HTTP_LINK_EXCHANGE_ATTRS: u8 = 2;
+/// Per-`HttpContext` attribute map (`getAttributes`).
+const HTTP_LINK_CONTEXT_ATTRS: u8 = 3;
 
 fn http_link_set(
     ctx: &mut dyn NativeContext,
@@ -4146,6 +4325,83 @@ fn http_link_get(ctx: &dyn NativeContext, kind: u8, owner: ObjectRef) -> Option<
     handle.and_then(|h| ctx.resolve_global_root(h))
 }
 
+/// The attribute `HashMap` bound to `owner` under `kind`, created on first use.
+///
+/// `com.sun.net.httpserver` attributes have no slot in either synthetic layout
+/// (and `HttpExchange` is allocated by `net_phase_e`, whose slots this file
+/// does not own), so they live in the same global-root-backed side table as
+/// the executor / owning-server links above.
+fn http_attribute_map(ctx: &mut dyn NativeContext, kind: u8, owner: ObjectRef) -> ObjectRef {
+    if let Some(existing) = http_link_get(ctx, kind, owner) {
+        return existing;
+    }
+    // Pin across the map alloc/init — a moving young GC there would relocate
+    // `owner` (native stale-local family), and the link table keys on its
+    // identity hash.
+    let owner_pin = ctx.pin_native_root(owner);
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    let map_pin = ctx.pin_native_root(map);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    let owner = ctx.read_native_pin(owner_pin, owner);
+    let map = ctx.read_native_pin(map_pin, map);
+    http_link_set(ctx, kind, owner, Some(map));
+    // `http_link_set` took a global root on the map, so it stays reachable
+    // after the pins below are dropped.
+    let map = ctx.read_native_pin(map_pin, map);
+    ctx.unpin_native_roots(owner_pin);
+    map
+}
+
+/// `HttpExchange.getAttribute(String)`.
+fn http_exchange_get_attribute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let Some(map) = http_link_get(ctx, HTTP_LINK_EXCHANGE_ATTRS, this) else {
+        // Nothing was ever set on this exchange — no map, and no allocation
+        // just to answer a miss.
+        return Ok(Some(Value::Object(None)));
+    };
+    let found =
+        cratonvm_native_collections::native_map_get_pub(ctx, &[Value::Object(Some(map)), key])?;
+    Ok(Some(found.unwrap_or(Value::Object(None))))
+}
+
+/// `HttpExchange.setAttribute(String, Object)` — the missing half of the pair.
+///
+/// A null value removes the binding, matching `ExchangeImpl`, which stores
+/// attributes in a plain `Map` and therefore treats `put(k, null)` as "no
+/// value" for the `getAttribute` that follows.
+fn http_exchange_set_attribute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let val = args.get(2).copied().unwrap_or(Value::Object(None));
+    // Pin the key/value across the (possibly allocating) map creation. Both
+    // pins are taken BEFORE `http_attribute_map`'s own pin, so its
+    // `unpin_native_roots` truncation cannot drop them.
+    let key_pin = pinned_object_value(ctx, key);
+    let val_pin = pinned_object_value(ctx, val);
+    let map = http_attribute_map(ctx, HTTP_LINK_EXCHANGE_ATTRS, this);
+    let key = read_pinned_object_value(ctx, key_pin, key);
+    let val = read_pinned_object_value(ctx, val_pin, val);
+    let result = if matches!(val, Value::Object(None)) {
+        cratonvm_native_collections::native_map_remove_pub(ctx, &[Value::Object(Some(map)), key])
+            .map(|_| ())
+    } else {
+        cratonvm_native_collections::native_map_put_pub(
+            ctx,
+            &[Value::Object(Some(map)), key, val],
+        )
+        .map(|_| ())
+    };
+    if let Some((handle, _)) = key_pin {
+        ctx.unpin_native_roots(handle);
+    } else if let Some((handle, _)) = val_pin {
+        ctx.unpin_native_roots(handle);
+    }
+    result?;
+    Ok(None)
+}
+
 pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -4158,8 +4414,9 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // HttpServer. We keep ONLY the HttpServerImpl alias for `create` (Phase E
     // registers `HttpServer` but not the impl class), the no-arg `create()`
     // factory (Phase E only registers the 2-arg form), executor accessors,
-    // bind, removeContext, and the HttpContext / HttpHandler / Headers
-    // helpers that Phase E does not cover.
+    // bind, and the HttpContext / HttpHandler / Headers helpers that Phase E
+    // does not cover. (`removeContext` was on that list until wave 3 found it
+    // shadowing Phase E's real one on the same key — see below.)
     let hs = "com/sun/net/httpserver/HttpServer";
     let hs_simple = "com/sun/net/httpserver/HttpServerImpl";
 
@@ -4282,28 +4539,23 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
                 Ok(None)
             },
         );
-        // removeContext: `createContext(String)` above hands back a standalone
-        // 2-slot context and never files it anywhere, so on THIS layout there
-        // is genuinely nothing to unregister and the no-op is the whole
-        // operation. It is not a silent drop of live routing state — that lives
-        // in `net_phase_e::register_re10_http_server`, whose real
-        // `removeContext(String)` stays in force for servers created through
-        // `HttpServer.create(addr, backlog)` (its natives are aliased onto the
-        // concrete `sun/net/httpserver/HttpServerImpl` receiver those servers
-        // carry, and native dispatch keys on the receiver class, so these
-        // `com/sun/net/httpserver/HttpServer` entries never shadow them).
-        r.register(
-            cls,
-            "removeContext",
-            "(Ljava/lang/String;)V",
-            |_ctx, _args| Ok(None),
-        );
-        r.register(
-            cls,
-            "removeContext",
-            "(Lcom/sun/net/httpserver/HttpContext;)V",
-            |_ctx, _args| Ok(None),
-        );
+        // DELETED (wave 3) — both `removeContext` overloads used to be no-ops
+        // here, on the premise that the real ones in
+        // `net_phase_e::register_re10_http_server` are aliased onto a distinct
+        // `sun/net/httpserver/HttpServerImpl` receiver and so could not be
+        // shadowed. That premise is false: net_phase_e registers them on
+        // `com/sun/net/httpserver/HttpServer` (net_phase_e.rs `let hs = …`),
+        // the SAME key this loop used, and phase 72 runs AFTER phase E
+        // (lib.rs: `register_phase_e_networking` then `register_phase72_natives`),
+        // so last-writer-wins made the no-op shadow the real implementation for
+        // EVERY server — including the `HttpServer.create(addr, backlog)` ones
+        // whose routes it is supposed to edit (ES MultipleHosts
+        // `resetWaitHandlers`). Dropping these two restores it.
+        //
+        // Safe for the 3-slot servers this phase's own `create()` mints: phase
+        // E's body reads the server id from slot `HS_SERVER_ID`, which those
+        // never set, and ids are handed out from 1 — so the registry lookup
+        // misses and the call is the same no-op it was before.
     }
 
     // HttpContext = 2-field (path=0, handler=1)
@@ -4377,15 +4629,13 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             ))))
         },
     );
-    r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, _args| {
-        let m = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-        // Pin across the map init below (it allocates the bucket array) — a
-        // moving young GC there would relocate the fresh map (native
-        // stale-local family).
-        let m_pin = ctx.pin_native_root(m);
-        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(m))]).ok();
-        let m = ctx.read_native_pin(m_pin, m);
-        ctx.unpin_native_roots(m_pin);
+    // getAttributes() is documented to return "a mutable Map" whose contents
+    // persist for the life of the context — handlers use it to share state.
+    // Minting a fresh empty HashMap per call meant every `put` was written to
+    // a map nobody could read back. Bind ONE map per context.
+    r.register(hctx, "getAttributes", "()Ljava/util/Map;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let m = http_attribute_map(ctx, HTTP_LINK_CONTEXT_ATTRS, this);
         Ok(Some(Value::Object(Some(m))))
     });
 
@@ -4397,37 +4647,72 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // OutputStreams and never wrote a response — that broke real-server probes.
     // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
-    // OPEN (left as a null constant, deliberately): the exchange object is
-    // built by `net_phase_e`'s dispatch loop, which records the request line,
-    // headers and body but never the accepted peer/local socket address — there
-    // is no state on this side to return, and manufacturing an address would be
-    // a worse answer than null (a caller logging or rate-limiting by peer would
-    // silently attribute every request to one fabricated host). Real fix needs
-    // the peer address captured in `parse_http_request`, which is out of this
-    // file. Reported as a residual rather than papered over.
+    // The escalated producer side landed in `net_phase_e.rs`, so these two are
+    // now plain slot reads rather than constant nulls:
+    // `re10_dispatch_pending` — the one place an `HttpExchange` is minted, and
+    // the last point at which it and the accepted `TcpStream` coexist —
+    // captures `local_addr()` / `peer_addr()` into `HEX_LOCAL_ADDR` /
+    // `HEX_REMOTE_ADDR`, `HEX_NUM_FIELDS` is 11, and the matching
+    // `classloading/src/class_manager.rs` entry is `instance_fields(11)` (a
+    // short entry would make `set_field` drop the write silently, which is how
+    // `HEX_PRINCIPAL` sat dead behind `instance_fields(8)`). All three
+    // verified in the tree rather than taken on trust.
+    //
+    // The slots are referenced by symbol, not as literal 9/10 — that is why
+    // they are `pub(crate)`. A null here still means "the endpoint could not
+    // be read off the socket", never a fabricated host: a caller that logs or
+    // rate-limits by peer must not attribute every request to one invented
+    // address.
+    //
+    // Both getters bound-check against the HIGHER of the two indices, matching
+    // the `getPrincipal` reader in `net_phase_e.rs`, so an exchange minted by
+    // some future path with fewer slots reports "unknown" instead of reading
+    // off the end of the object.
     r.register(
         hex,
         "getLocalAddress",
         "()Ljava/net/InetSocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= crate::net_phase_e::HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(
+                ctx.get_field(this, crate::net_phase_e::HEX_LOCAL_ADDR),
+            ))
+        },
     );
     r.register(
         hex,
         "getRemoteAddress",
         "()Ljava/net/InetSocketAddress;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= crate::net_phase_e::HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(
+                ctx.get_field(this, crate::net_phase_e::HEX_REMOTE_ADDR),
+            ))
+        },
     );
-    // KEEP: `getAttribute` returns null for any key never set, which is the
-    // JDK's own contract — and no `HttpExchange.setAttribute` native exists
-    // anywhere in the tree (grep `"setAttribute"`), so no key can ever have
-    // been set. Null is therefore the correct answer for every possible
-    // argument, not a placeholder. Should a `setAttribute` ever be added, this
-    // registration must be replaced at the same time.
+    // `getAttribute` was constant-null only because its partner did not exist:
+    // no `HttpExchange.setAttribute` was registered anywhere in the tree, so
+    // no key could ever have been set. Registering the PAIR is what makes both
+    // real — the attribute map hangs off the same global-root side table as the
+    // other `com.sun.net.httpserver` links, because the exchange's slots are
+    // owned by `net_phase_e` and this file must not claim one.
     r.register(
         hex,
         "getAttribute",
         "(Ljava/lang/String;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        http_exchange_get_attribute,
+    );
+    r.register(
+        hex,
+        "setAttribute",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        http_exchange_set_attribute,
     );
 
     // `HttpHandler` is an interface, so under a real JDK the declaring class
@@ -5341,14 +5626,15 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    // KEEP: the no-op IS the spec. `java.net.Socket.setPerformancePreferences`
+    // has an empty body in OpenJDK itself ("Not implemented yet" since 1.5) and
+    // there is no getter anywhere in the JDK that could read the hints back, so
+    // nothing can observe the difference between this and HotSpot.
     r.register(
         sock,
         "setPerformancePreferences",
         "(III)V",
-        |_ctx, _args| {
-            // Performance hints are advisory — accept and ignore.
-            Ok(None)
-        },
+        |_ctx, _args| Ok(None),
     );
     r.register(sock, "setTrafficClass", "(I)V", |ctx, args| {
         use crate::servlet::s2_registry;

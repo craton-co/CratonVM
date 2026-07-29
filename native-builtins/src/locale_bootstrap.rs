@@ -42,6 +42,17 @@ fn synthetic_locale_data(
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The language of a Locale this module synthesised (the cached `getDefault()`
+/// one), or `None` when `obj` is not ours. Companion to `lib.rs`'s
+/// `locale_data_get`: the two side tables are populated independently, so a
+/// caller that needs the language of an arbitrary Locale has to consult both.
+pub(crate) fn synthetic_language(obj: ObjectRef) -> Option<String> {
+    synthetic_locale_data()
+        .lock()
+        .get(&obj)
+        .map(|&(lang, _, _)| lang.to_string())
+}
+
 /// GC root scan for this module's cached synthetic Locale objects. The cached
 /// default Locale (returned by `Locale.getDefault()`) and every key of the
 /// synthetic-locale side-table are live `java/util/Locale` objects reachable
@@ -577,8 +588,36 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // non-null value to synthesise for a provider class this VM does not
     // implement — the honest choices are null or that InternalError, and the
     // JDK's own callers (`LocaleServiceProviderPool.findAdapter`) are written
-    // to skip a null adapter and try the next one. Registered only on the
-    // synthetic path.
+    // to skip a null adapter and try the next one.
+    //
+    // Wave-3 CORRECTION — the wave-2 note ended "Registered only on the
+    // synthetic path", and that is FALSE. `locale_bootstrap::register` has a
+    // single caller, `lib.rs::register_essential_natives_with_shims`, which is
+    // the REAL-JDK path (`vm/src/vm/vm_init.rs`). So this native shadows real
+    // `JRELocaleProviderAdapter` bytecode in the default run mode, and the
+    // blanket null therefore also suppresses the switch's SUCCESS arms — the
+    // ~12 SPI classes real JDK does answer (`DateFormatProvider`,
+    // `DecimalFormatSymbolsProvider`, `BreakIteratorProvider`, …), not just the
+    // unknown ones that would have hit the InternalError.
+    //
+    // Wave-4 verdict: this is NOT a KEEP. The real method is not constant and
+    // `null` has no spec basis — it is an ACCEPTED, ESCALATED DIVERGENCE.
+    // Recorded as such so no later pass re-files it under "justified constant".
+    //
+    // The faithful fix is known and small: switch on `c.getSimpleName()` and
+    // delegate to the matching real `get*Provider()` getter on the receiver,
+    // answering null ONLY on the default arm — the one that would otherwise
+    // `throw new InternalError("should not come down here")`, and which
+    // `LocaleServiceProviderPool.findAdapter` is written to skip.
+    //
+    // It is not landed here because it cannot be landed blind: each
+    // `get*Provider()` calls `getLanguageTagSet(...)` and instantiates the
+    // adapter's inner provider off `LocaleDataMetaInfo`/`LocaleResources` —
+    // precisely the JDK resource-bundle chain this C20 override exists to
+    // bypass for Jackson/H2/`Locale.getDefault()` formatting. Landing it needs
+    // a build plus those suites. Whoever picks it up: delegate ONE SPI at a
+    // time, re-run the formatting suites for each, and do not "simplify" it to
+    // a blanket delegation on the strength of reading the switch.
     registry.register(
         "sun/util/locale/provider/JRELocaleProviderAdapter",
         "getLocaleServiceProvider",

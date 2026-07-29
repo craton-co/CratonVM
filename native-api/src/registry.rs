@@ -569,6 +569,28 @@ pub trait NativeClassAccess {
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
     fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
 
+    /// Whether `class_id`'s static initializer has already run to completion.
+    ///
+    /// This is the query behind `Unsafe.shouldBeInitialized` /
+    /// `shouldBeInitialized0`, which must answer "does this class still need
+    /// initializing?". Before this existed, those natives returned a flat
+    /// `false` ("everything is already initialized") because the VM's real
+    /// `is_class_initialized_*` helpers live in the `vm` crate and were not
+    /// reachable from `native-builtins` — a constant that is right for an
+    /// initialized class and silently wrong for every other one.
+    ///
+    /// Deliberately distinct from `ensure_class_initialized`, which ACTS:
+    /// calling that to answer the question would run the very `<clinit>` the
+    /// caller is asking about, which is precisely what `Unsafe`'s callers are
+    /// trying to avoid.
+    ///
+    /// The default returns `true` so implementations that do not track
+    /// initialization state keep the previous observable behaviour instead of
+    /// suddenly reporting every class as uninitialized.
+    fn is_class_initialized(&self, _class_id: ClassId) -> bool {
+        true
+    }
+
     /// Resolve `name` to a `ClassId`, preferring whichever loaded class is
     /// registered under the SAME classloader as `near`'s own declaring
     /// context, falling back to the normal global (bootstrap-first) search
@@ -649,6 +671,14 @@ pub trait NativeClassAccess {
     /// of null/empty — Gradle's listener type-walk calls
     /// `concreteClass.getSuperclass().isInterface()` and a null superclass NPEs.
     fn lambda_functional_interface(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
+    /// For a synthetic lambda-proxy `ClassId`, return the resolved `ClassId`
+    /// of its functional (SAM) interface when the invokedynamic bootstrap
+    /// recorded one.  This preserves defining-loader identity for reflection
+    /// paths that must not re-resolve a potentially ambiguous interface name.
+    fn lambda_functional_interface_id(&self, _class_id: ClassId) -> Option<ClassId> {
         None
     }
 
@@ -2877,6 +2907,56 @@ pub trait NativeThreadAccess: NativeHeapAccess {
     /// Get the number of alive threads in the VM.
     fn active_thread_count(&self) -> i32;
 
+    /// The OS thread id backing a Java `Thread` mirror, or `None` if unknown.
+    ///
+    /// Enables ARBITRARY-thread CPU time (`ThreadMXBean.getThreadCpuTime(long)`
+    /// and therefore `isThreadCpuTimeSupported()`), which reported `-1`/false
+    /// only because `ThreadRegistry`'s per-thread `os_tid` — published since
+    /// forever by `set_os_tid_current` — was not reachable from a native.
+    /// Current-thread CPU time never needed this and was already real.
+    fn thread_os_tid(&self, _thread_obj: ObjectRef) -> Option<u32> {
+        None
+    }
+
+    /// Total JIT compilation time in milliseconds, or `None` when the VM keeps
+    /// no such accounting.
+    ///
+    /// Backs BOTH `CompilationMXBean.getTotalCompilationTime()` and
+    /// `isCompilationTimeMonitoringSupported()` — returning one value for both
+    /// is deliberate, so they cannot drift into claiming support for a number
+    /// that is not kept. The unit is already milliseconds in
+    /// `jit::tiered::CompilationStats::total_compile_time_ms`, which is also
+    /// the unit the JMM specifies.
+    fn jit_total_compile_time_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// Virtual-thread scheduler counters as `(pool_size, mounted, queued)`,
+    /// or `None` when no scheduler is running.
+    ///
+    /// Returned as ONE triple rather than three accessors so
+    /// `VirtualThreadSchedulerMXBean`'s three getters cannot sample the
+    /// scheduler at three different instants and report a mutually
+    /// inconsistent snapshot.
+    fn vt_scheduler_stats(&self) -> Option<(i32, i32, i64)> {
+        None
+    }
+
+    /// Number of objects queued for finalization but not yet finalized —
+    /// `MemoryMXBean.getObjectPendingFinalizationCount()`.
+    ///
+    /// The datum has always existed (`ReferenceProcessor::finalization_queue`,
+    /// drained by a real `FinalizerThread`); it simply was not reachable from
+    /// `native-builtins`, so the native returned a flat 0. Zero is a
+    /// legitimate ANSWER but was not a legitimate CONSTANT: it reported "no
+    /// finalization backlog" even while the queue was growing, which is
+    /// exactly the condition an operator queries this bean to detect.
+    ///
+    /// Defaults to 0 for implementations with no reference processor.
+    fn pending_finalization_count(&self) -> i32 {
+        0
+    }
+
     /// Get the Java Thread objects for all alive threads (up to `max` entries).
     /// Returns the number of thread objects written.
     fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef>;
@@ -3706,6 +3786,33 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// Find a symbol in a loaded library. Returns the symbol address.
     /// lib_index -1 means search the default/system library.
     fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize>;
+
+    /// Release a library previously returned by
+    /// [`load_native_library`](Self::load_native_library) — the backing for
+    /// `jdk.internal.loader.RawNativeLibraries.unload0`, whose real body
+    /// `dlclose`s / `FreeLibrary`s the handle.
+    ///
+    /// Returns `true` if `lib_index` named a live library that this call
+    /// retired, `false` for an out-of-range index, an already-unloaded one, or
+    /// an implementation that cannot unload.
+    ///
+    /// # Contract
+    ///
+    /// This is a *logical* unload: implementations MUST make subsequent
+    /// [`find_native_symbol`](Self::find_native_symbol) calls for the index
+    /// fail, but are NOT required to unmap the library. Keeping the mapping
+    /// resident is the safe direction of the two errors — a caller can still
+    /// hold function pointers obtained from an earlier lookup (a bound FFM
+    /// downcall stub does), and unmapping underneath those segfaults, while a
+    /// retained mapping costs only address space. Indices are never recycled
+    /// while a load is live, so an unloaded index stays unloaded until
+    /// `load_native_library` hands that index out again.
+    ///
+    /// The default implementation is a no-op returning `false`, preserving the
+    /// behaviour of implementations that have no unload path.
+    fn unload_native_library(&mut self, _lib_index: i64) -> bool {
+        false
+    }
 
     /// Register an upcall entry (Java callback for C). Returns the slot index.
     ///

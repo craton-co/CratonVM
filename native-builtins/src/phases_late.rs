@@ -1695,21 +1695,22 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
     });
 
-    // The `isAlive`/`destroy`/`waitFor(timeout)` constants across this whole
-    // Process surface are all consequences of ONE modelling decision made in
-    // `start()` above: it uses `Child::wait_with_output()`, so the child has
-    // already run to completion and been reaped before the `Process` object
-    // exists. `isAlive()` is therefore genuinely false, `destroy()` genuinely
-    // has nothing to signal, and `waitFor(timeout)` genuinely returns "the
-    // process exited within the timeout". They are consistent with each other
-    // and with `exitValue()`/`waitFor()`, which read the recorded exit code.
-    // `ProcessHandle.isAlive()` is NOT part of this family — it takes a bare
-    // pid that may name any process, so it probes for real.
-    r.register(proc, "isAlive", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0))) // already reaped by start(); see note above
-    });
-
-    r.register(proc, "destroy", "()V", |_ctx, _args| Ok(None));
+    // WAVE-4: `isAlive()`/`destroy()`/`waitFor(long, TimeUnit)` used to be
+    // registered here as the constants `false` / no-op / `true`, justified by
+    // the `Child::wait_with_output()` pre-reap in the `start()` above.
+    //
+    // They are DELETED rather than reimplemented, because the honest version
+    // already exists and already wins: `native-io/src/process.rs`
+    // (`register_process_natives`) keeps the live `std::process::Child` in a
+    // handle side-table and answers all three against it
+    // (`try_exit_handle` / `destroy_handle` / a real polled timeout), and it
+    // registers them for BOTH `java/lang/Process` and
+    // `cratonvm/synthetic/Process` — plus its own `ProcessBuilder.start`, so
+    // no un-handled "pre-reaped" Process object is ever produced any more.
+    // `register_io_natives` runs AFTER `register_essential_natives_with_shims`
+    // in both `vm_init.rs` arms (real-JDK and synthetic), and `register()` is
+    // last-registration-wins, so the constants here could never be reached;
+    // keeping them only preserved a fallback that lies.
 
     r.register(
         proc,
@@ -1815,15 +1816,9 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // Process.waitFor(long, TimeUnit) -> boolean (always returns true since process is done)
-    r.register(
-        proc,
-        "waitFor",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(1))) // always finished
-        },
-    );
+    // Process.waitFor(long, TimeUnit) — see the WAVE-4 note above: the real
+    // polled implementation lives in `native-io::process` and supersedes this
+    // registration in every build, so the constant `true` was removed.
 
     // `alloc_concurrent_synthetic(ctx, "java/lang/Process", ...)` can yield a
     // VM synthetic wrapper whose runtime class is reported as
@@ -1839,12 +1834,9 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, PROC_FIELD_EXIT)))
     });
-    // Mirrors the `java/lang/Process` registrations above, including their
-    // "already reaped by start()" rationale.
-    r.register(synthetic_proc, "isAlive", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(synthetic_proc, "destroy", "()V", |_ctx, _args| Ok(None));
+    // `isAlive`/`destroy` were mirrored here too; removed for the same reason
+    // as the `java/lang/Process` copies above — `native-io::process` registers
+    // real ones on this exact class name (`SYNTHETIC_PROCESS_CLASS`) later.
     r.register(
         synthetic_proc,
         "destroyForcibly",
@@ -1871,12 +1863,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(handle))))
         },
     );
-    r.register(
-        synthetic_proc,
-        "waitFor",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
+    // `waitFor(long, TimeUnit)` likewise removed — see the WAVE-4 note above.
     r.register(
         synthetic_proc,
         "getInputStream",
@@ -2412,14 +2399,23 @@ pub(crate) fn register_p60_match_result(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         }
     });
-    // The synthetic `MatchResult` shape above is (input=1, matchStart=3,
-    // matchEnd=4) — it carries the WHOLE match and no capturing-group table at
-    // all, and no `group(int)`/`start(int)`/`end(int)` overload is registered
-    // for it. Zero is therefore the accurate answer ("this result exposes no
-    // capturing groups"), not a placeholder: there is no group a caller could
-    // reach that this count would be hiding.
-    r.register(mr, "groupCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // Was a constant 0. The wave-3 justification ("this shape carries no
+    // capturing-group table") was reading the wrong end of the problem:
+    // `groupCount()` is a property of the *Pattern*, not of the match, and the
+    // shape these natives serve is the synthetic `Matcher` layout
+    // (`lib.rs`: MAT_FIELD_PATTERN=0, INPUT=1, MATCH_START=3, MATCH_END=4) —
+    // slot 0 is the Pattern, which the sibling `start`/`end`/`group` above
+    // simply never needed. Derive it exactly the way
+    // `regex_matcher::native_matcher_group_count` does for
+    // `Matcher.groupCount()`, so the two can never disagree.
+    r.register(mr, "groupCount", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pattern = match ctx.get_field(this, 0) {
+            Value::Object(Some(p)) => p,
+            _ => return Ok(Some(Value::Int(0))),
+        };
+        let re = crate::regex_matcher::read_pattern_regex(ctx, pattern)?;
+        Ok(Some(Value::Int(re.captures_len() as i32 - 1)))
     });
     r.set_category(__prev_cat);
 }
@@ -3331,17 +3327,29 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("app");
         Ok(Some(Value::Object(Some(s))))
     });
-    // Must agree with `ClassLoader.registerAsParallelCapable()`, which
-    // `deprecated_internal::register_reflection_natives` answers with an
-    // unconditional `true` (see the long rationale there: our WeakReference
-    // -backed `ParallelLoaders` set always looks empty, so a truthful `false`
-    // there made `BuiltinClassLoader.<clinit>` throw
-    // `InternalError("Unable to register as parallel capable")`). With this
-    // reader answering a constant `false`, a loader that had just successfully
-    // registered was told it had not — the register/query pair contradicted
-    // itself. Report the same `true`.
-    r.register(cl, "isRegisteredAsParallelCapable", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // SHADOWED — this registration has no runtime effect: both this function
+    // and `classloader::register_classloader_natives` are reachable only from
+    // `register_synthetic_overrides`, and lib.rs calls the classloader one
+    // LAST, so `classloader::cl_is_registered_as_parallel_capable` wins.
+    //
+    // The wave-3 comment that used to sit here claimed that winner reads a
+    // field "only ever written as 0" and so contradicted
+    // `registerAsParallelCapable()`'s unconditional `true`. That is now STALE:
+    // classloader.rs's four `ClassLoader` initialisers seed
+    // `CL_IS_PARALLEL_CAPABLE = 1`, and its reader falls back to `1` for a
+    // loader allocated without that slot. So stop answering a constant here
+    // and read the same per-loader slot the winner reads, with the same
+    // fallback — the two now agree whatever the registration order.
+    r.register(cl, "isRegisteredAsParallelCapable", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Slot 4 == `classloader.rs::CL_IS_PARALLEL_CAPABLE` (private there).
+        let val = match ctx.get_field(this, 4) {
+            Value::Int(v) => v,
+            // Loader too short to carry the slot: same `true` that
+            // `registerAsParallelCapable()` reports, rather than contradicting it.
+            _ => 1,
+        };
+        Ok(Some(Value::Int(val)))
     });
     r.set_category(__prev_cat);
 }
@@ -4817,9 +4825,16 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
 
     // java.lang.invoke.SerializedLambda — used by lambda serialization support
     let sl = "java/lang/invoke/SerializedLambda";
+    // Named field first (a real `SerializedLambda` built by
+    // `lang_class::build_serialized_lambda`), legacy 2-slot shape second —
+    // matched with `getFunctionalInterfaceClass`/`getCapturedArgCount` below
+    // so all four accessors read the same object consistently.
     r.register(sl, "getImplClass", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        match ctx.get_field_by_name(this, "implClass") {
+            Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+            _ => Ok(Some(ctx.get_field(this, 0))),
+        }
     });
     r.register(
         sl,
@@ -4827,28 +4842,44 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
+            match ctx.get_field_by_name(this, "implMethodName") {
+                Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+                _ => Ok(Some(ctx.get_field(this, 1))),
+            }
         },
     );
-    // This synthetic `SerializedLambda` shape is (implClass=0,
-    // implMethodName=1) and nothing else: it carries no functional-interface
-    // name and no captured-argument array, and no `getCapturedArg(int)` is
-    // registered against it. So `0` captured args is the accurate count for
-    // what this object can expose — there is no argument a caller could
-    // retrieve that the count would be hiding — and `null` matches the fact
-    // that no interface name was ever recorded. The REAL lambda-serialization
-    // metadata path is `NativeClassAccess::lambda_proxy_serial_metadata`
-    // (used by `lang_class.rs`), not this legacy 2-field stub; if a caller
-    // ever needs a faithful `SerializedLambda`, it should be built from that
-    // rather than by widening these two accessors.
+    // The wave-3 comment here asserted that this object "carries no
+    // functional-interface name and no captured-argument array", so `null`/`0`
+    // were accurate. That is wrong about the receiver: `SerializedLambda` is a
+    // CONCRETE class, so these natives intercept EVERY instance — including
+    // the fully-populated one `lang_class::build_serialized_lambda` allocates
+    // from `lambda_proxy_serial_metadata`, which writes `capturingClass`,
+    // `functionalInterfaceClass`, `implClass`, `implMethodName`,
+    // `capturedArgs`, ... all BY NAME. Against that object the constants were
+    // not "accurate for this shape", they were shadowing real data. Read the
+    // named fields first and fall back to the legacy 2-slot shape.
     r.register(
         sl,
         "getFunctionalInterfaceClass",
         "()Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            match ctx.get_field_by_name(this, "functionalInterfaceClass") {
+                Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
+                _ => Ok(Some(Value::Object(None))),
+            }
+        },
     );
-    r.register(sl, "getCapturedArgCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(sl, "getCapturedArgCount", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        match ctx.get_field_by_name(this, "capturedArgs") {
+            Value::Object(Some(a))
+                if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array =>
+            {
+                Ok(Some(Value::Int(ctx.array_length(a) as i32)))
+            }
+            _ => Ok(Some(Value::Int(0))),
+        }
     });
 
     // java.lang.ClassValue — thread-safe lazily computed per-class values (Java 7)
@@ -4896,86 +4927,48 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
     register_classvalue_natives(r);
 
     // java.lang.System additions
+    //
+    // W5: the synthetic-jdk path shares ONE implementation of the whole
+    // `System.Logger` surface with the real-JDK path (`lib.rs`'s
+    // `register_system_logger_methods` / `native_system_get_logger`). Both used
+    // to mint a receiver stamped with the `java/lang/System$Logger` INTERFACE
+    // and register the instance methods on that interface name; in real-JDK
+    // mode that name resolves to the genuine interface, whose instance natives
+    // both dispatch sites DROP (`declaring_is_interface && !is_static`), so the
+    // object was inert — `isLoggable` false, `getName`/`log` landing on
+    // abstract declarations. The receiver is now a concrete
+    // `cratonvm/internal/SystemLogger`, and the method set is registered on
+    // both that class and the interface name. See the block comment above
+    // `register_system_logger_methods` in `lib.rs` for the full rationale;
+    // keeping the two modes on one implementation is what stops them drifting
+    // apart again.
+    //
+    // Behaviour notes carried over from the registrations this replaces:
+    //   * the requested logger name IS retained (slot 0), so `getName()` and
+    //     the `log` natives can attribute records to it;
+    //   * `isLoggable(OFF)` is false — `OFF` is the one level that is never
+    //     loggable, so a caller probing it as an "is logging disabled" test
+    //     gets the real JDK's answer;
+    //   * `log` publishes through the same console sink
+    //     (`record_printed_line` + the `System.out` override) as every other
+    //     logging shim in this crate, tagged with the level and logger name.
+    // New in W5: the logger carries a severity threshold (default INFO, as on
+    // a stock JDK), so `isLoggable`/`log` agree with each other and with
+    // HotSpot instead of answering "loggable" for everything but `OFF`.
     r.register(
         "java/lang/System",
         "getLogger",
         "(Ljava/lang/String;)Ljava/lang/System$Logger;",
-        |ctx, args| {
-            // args[0] is the requested logger name (static method). Dropping it
-            // left every System.Logger anonymous, so `getName()` and the `log`
-            // natives below had nothing to attribute records to. Pin it across
-            // the allocation below (native stale-local family).
-            let name = match args.first() {
-                Some(Value::Object(Some(o))) => Some(*o),
-                _ => None,
-            };
-            let name_pin = name.map(|o| (ctx.pin_native_root(o), o));
-            let logger = alloc_concurrent_synthetic(ctx, "java/lang/System$Logger", 1);
-            let name = match name_pin {
-                Some((handle, o)) => Value::Object(Some(ctx.read_native_pin(handle, o))),
-                None => Value::Object(None),
-            };
-            ctx.set_field(logger, 0, name);
-            if let Some((handle, _)) = name_pin {
-                ctx.unpin_native_roots(handle);
-            }
-            Ok(Some(Value::Object(Some(logger))))
-        },
+        crate::native_system_get_logger,
     );
-    let slogger = "java/lang/System$Logger";
-    r.register(slogger, "getName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
     r.register(
-        slogger,
-        "isLoggable",
-        "(Ljava/lang/System$Logger$Level;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        "java/lang/System",
+        "getLogger",
+        "(Ljava/lang/String;Ljava/util/ResourceBundle;)Ljava/lang/System$Logger;",
+        crate::native_system_get_logger,
     );
-    // `System.Logger.log(Level, String)` — the facade's primary entry point.
-    // A no-op here meant every `System.getLogger(...).log(...)` record was
-    // discarded, while `isLoggable` above answers true. Route it to the same
-    // console sink (`record_printed_line` + the System.out override) that every
-    // other logging shim in this crate publishes through, tagged with the
-    // level name and the logger name.
-    r.register(
-        slogger,
-        "log",
-        "(Ljava/lang/System$Logger$Level;Ljava/lang/String;)V",
-        |ctx, args| {
-            let logger_name = match args.first() {
-                Some(Value::Object(Some(this))) => match ctx.get_field(*this, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                    _ => String::new(),
-                },
-                _ => String::new(),
-            };
-            // Level enum: `name` by name on a real enum, slot 0 on the
-            // synthetic one built by `p57_alloc_enum`.
-            let level_name = match args.get(1) {
-                Some(Value::Object(Some(level))) => {
-                    let by_name = match ctx.get_field_by_name(*level, "name") {
-                        Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    };
-                    by_name.or_else(|| match ctx.get_field(*level, 0) {
-                        Value::Object(Some(s)) => ctx.read_string(s),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            }
-            .unwrap_or_else(|| "INFO".to_string());
-            let message = match args.get(2) {
-                Some(Value::Object(Some(m))) => ctx.read_string(*m).unwrap_or_default(),
-                Some(Value::Object(None)) => "null".to_string(),
-                _ => return Ok(None),
-            };
-            crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
-            Ok(None)
-        },
-    );
+    crate::register_system_logger_methods(r, crate::CRATON_SYSTEM_LOGGER_CLASS);
+    crate::register_system_logger_methods(r, "java/lang/System$Logger");
 
     // System.Logger.Level enum
     let sll = "java/lang/System$Logger$Level";

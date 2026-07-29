@@ -42,32 +42,36 @@ pub fn unload_dead_class_metadata(
         return ClassMetadataUnloadResult::default();
     }
 
-    let loaders: FxHashSet<ClassLoaderId> = {
+    let dead_ids: Vec<ClassId> = {
         let cm = shared.classes.class_manager.read();
         dead_class_hints
             .iter()
-            .filter_map(|id| cm.get_loader_id(ClassId::new(*id)))
-            .filter(|id| matches!(id, ClassLoaderId::UserDefined(_)))
+            .map(|id| ClassId::new(*id))
+            .filter(|id| {
+                cm.get_loader_id(*id)
+                    .is_some_and(|loader| matches!(loader, ClassLoaderId::UserDefined(_)))
+            })
             .collect()
     };
-    if loaders.is_empty() {
+    if dead_ids.is_empty() {
         cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
         return ClassMetadataUnloadResult::default();
     }
 
     let unloaded = {
         let mut cm = shared.classes.class_manager_write();
-        let mut classes = Vec::new();
-        for loader in &loaders {
-            classes.extend(cm.unload_user_loader(*loader));
-        }
-        classes
+        cm.unload_user_classes(&dead_ids)
     };
     if unloaded.is_empty() {
         cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
         return ClassMetadataUnloadResult::default();
     }
 
+    let loaders_unloaded = unloaded
+        .iter()
+        .map(|class| class.loader_id)
+        .collect::<FxHashSet<_>>()
+        .len();
     let ids: FxHashSet<ClassId> = unloaded.iter().map(|class| class.id).collect();
     let raw_ids: Vec<u32> = unloaded.iter().map(|class| class.id.as_u32()).collect();
 
@@ -115,10 +119,7 @@ pub fn unload_dead_class_metadata(
 
     {
         let mut cache = shared.classes.initiating_resolution_cache.write();
-        cache.retain(|loader, entries| {
-            if loaders.contains(loader) {
-                return false;
-            }
+        cache.retain(|_, entries| {
             entries.retain(|_, id| !ids.contains(id));
             !entries.is_empty()
         });
@@ -192,7 +193,7 @@ pub fn unload_dead_class_metadata(
         .fetch_add(unloaded.len() as u64, std::sync::atomic::Ordering::Relaxed);
 
     ClassMetadataUnloadResult {
-        loaders_unloaded: loaders.len(),
+        loaders_unloaded,
         classes_unloaded: unloaded.len(),
         jit_entries_retired,
     }

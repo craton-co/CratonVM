@@ -1,5 +1,21 @@
 # HIB-LONGTAIL.1 (`org/h2/`) — re-verified 2026-07-28, ban STAYS
 
+**SUPERSEDED 2026-07-28 (same day, third pass).** All three "genuine,
+reproducible JIT regressions" recorded below turned out to be ONE root cause in
+the general JIT — a compiled callee's `i64::MIN` deopt sentinel escaping its own
+inline call site, so its reconstructed frame was consumed by an unrelated method
+that de-speculated the wrong target and could not resume — and it is fixed.
+"Bug 1" and "Bug 2" are NOT distinct defects, and neither is an H2 bug:
+`TestPageStoreCoverage`, `TestReopen` and `TestRunscript` all pass with the ban
+lifted now. The precise-deopt coverage gap this page declined to touch was real
+as well (a reused local slot voted `Ambiguous` whole-method) and is also fixed,
+but it was NOT sufficient on its own.
+
+The ban still stays, for one different and PRE-EXISTING reason this page's
+lifted arm never isolated: `org.h2.test.jdbc.TestMetaData`. See
+`docs/known-issues/h2/h2-jitban-residuals-20260726.md` for the current state;
+this page is kept for the A/B numbers it recorded.
+
 **Status**: re-tested against the 2026-07-27 atomic-array RMW fix
 (`ffb8dfa22`, already on `dev`). That fix did NOT clear this ban's
 residuals. Three genuine JIT-caused regressions confirmed via A/B; a

@@ -1892,6 +1892,96 @@ impl FileDescriptorTable {
         }
     }
 
+    /// Set the IP type-of-service / DSCP byte on a UDP socket (IP_TOS).
+    ///
+    /// Added so `DatagramChannel.setTrafficClass` could stop being a silent
+    /// no-op. `FileEntry` and `get_entry` are private to this module and
+    /// `native-io` has no `socket2` dependency, so this could not be written
+    /// on the caller's side.
+    ///
+    /// The option is genuinely advisory — routers may ignore the bits — but
+    /// "the network might not honour it" is not the same as "we never asked",
+    /// and only the latter was true before.
+    pub fn udp_set_tos(&self, fd: FdId, tos: u32) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        match &*entry {
+            FileEntry::UdpSocket(s) => socket2::SockRef::from(s).set_tos(tos),
+            _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp")),
+        }
+    }
+
+    /// Dissolve a UDP socket's association — POSIX `connect(AF_UNSPEC)`.
+    ///
+    /// Backs `DatagramSocket.disconnect()` / `DatagramChannel.disconnect()`,
+    /// which were no-ops that cleared a Java-side `connected` flag while the
+    /// kernel kept filtering datagrams to the old peer. That only became a real
+    /// gap once `connect` was implemented for real: before, both halves were
+    /// vacuous and agreed; after, the socket stayed connected while the object
+    /// claimed otherwise.
+    ///
+    /// Neither `std::net::UdpSocket` nor `socket2::SockRef` exposes this, so it
+    /// goes through the raw fd. Both platforms report an error for the
+    /// AF_UNSPEC form even when it works (Linux commonly `EAFNOSUPPORT`,
+    /// Winsock `WSAEAFNOSUPPORT`) — the disassociation still happens, so that
+    /// one code is treated as success rather than surfaced.
+    pub fn udp_disconnect(&self, fd: FdId) -> Result<(), io::Error> {
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        let FileEntry::UdpSocket(s) = &*entry else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"));
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
+            addr.sa_family = libc::AF_UNSPEC as libc::sa_family_t;
+            let rc = unsafe {
+                libc::connect(
+                    s.as_raw_fd(),
+                    &addr as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+                return Ok(());
+            }
+            Err(err)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            const WSAEAFNOSUPPORT: i32 = 10047;
+
+            // Declared here rather than at module scope to match the local
+            // `#[link(name = "ws2_32")]` blocks already in this file
+            // (`disable_udp_connreset`, and the one near line 316).
+            #[link(name = "ws2_32")]
+            unsafe extern "system" {
+                fn connect(s: usize, name: *const u8, namelen: i32) -> i32;
+                fn WSAGetLastError() -> i32;
+            }
+
+            // `sockaddr` is 16 bytes; all-zero gives sa_family = AF_UNSPEC (0).
+            let addr = [0u8; 16];
+            let rc = unsafe { connect(s.as_raw_socket() as usize, addr.as_ptr(), 16) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let code = unsafe { WSAGetLastError() };
+            if code == WSAEAFNOSUPPORT {
+                return Ok(());
+            }
+            Err(io::Error::from_raw_os_error(code))
+        }
+    }
+
     /// Set SO_RCVBUF on a UDP socket.
     pub fn udp_set_recv_buffer_size(&self, fd: FdId, size: usize) -> Result<(), io::Error> {
         let entry = self

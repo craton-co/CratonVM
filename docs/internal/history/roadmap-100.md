@@ -1524,7 +1524,7 @@ Within each tier:
 >
 > | Deliverable | Evidence |
 > |---|---|
-> | **Stub census** | `docs/stub-census.md` — every stub classified as intentional vs fix-needed |
+> | **Stub census** | `vm/tests/tier1_tests.rs::t9b_inline_constant_native_census` (was `docs/stub-census.md`, retired 2026-07-28) |
 > | **Type-incorrect fix: `equals(Object)Z`** | 2 sites in `phases_early.rs` converted from `native_return_false` to identity comparison |
 > | **CI gate: stub audit** | `t9_stub_audit_counts_match_census` — asserts total ≤ 250, noop ≤ 55, ret_false ≤ 15. Any new stub fails the build. |
 > | **CI gate: equals** | `t9_no_return_false_on_equals` — prevents regression |
@@ -1546,7 +1546,7 @@ a silent no-op at runtime. 156 stubs across 10 files.
 ## T9.1 — `lib.rs` core stubs (76 stubs)
 
 ### T9.1.a — Constructor no-ops (35 `native_noop_with_this`)
-- **T9.1.1** Classify each: "genuine no-op constructor" (keep) vs "missing field init" (implement). Write a spreadsheet in `docs/stub-census.md`.
+- **T9.1.1** Classify each: "genuine no-op constructor" (keep) vs "missing field init" (implement). Classification now lives as a comment at each registration site; the count is enforced by `t9b_inline_constant_native_census`.
 - **T9.1.2** Implement the ~10 constructors that actually need field initialization (e.g. `java.io.File.<init>`, `java.net.URL.<init>`).
 - **T9.1.3** Add a unit test per implemented constructor verifying fields are set.
 - **T9.1.4** Convert the remaining ~25 genuine no-ops from `native_noop_with_this` to documented inline closures with `// Intentional no-op: ...` explaining why.

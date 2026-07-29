@@ -7195,15 +7195,39 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // reach a subclass carrier -- they have to be repeated here (the same
     // reason `setUseCaches` is registered on both URLConnection and
     // HttpURLConnection).
+    // KEEP the no-op `connect()`. The `jrt:` carrier holds no OS connection to
+    // establish — `getInputStream()` below opens the module resource lazily —
+    // so "connected" is already true, and `connect()` on an already-connected
+    // URLConnection is a no-op by contract.
     r.register(JRT_URL_CONNECTION, "connect", "()V", |_ctx, _args| Ok(None));
-    r.register(JRT_URL_CONNECTION, "setUseCaches", "(Z)V", |_ctx, _args| {
+    // Retain the requested value rather than dropping it, exactly as the
+    // `java/net/URLConnection` registration below does — Spring Boot's nested
+    // `JarUrlConnection` reads `useCaches` back to pick its cached-empty-stream
+    // and close-on-close paths.
+    r.register(JRT_URL_CONNECTION, "setUseCaches", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let use_caches = args.get(1).and_then(Value::as_int).unwrap_or(1);
+        ctx.set_field_by_name(this, "useCaches", Value::Int(use_caches));
         Ok(None)
     });
+    // Same body as the `java/net/URLConnection` registration below: the JDK
+    // setter writes the class-wide `defaultUseCaches` static, and the carrier
+    // needs its own copy because native lookup on a synthetic carrier class is
+    // by exact class (see the note above).
     r.register(
         JRT_URL_CONNECTION,
         "setDefaultUseCaches",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let default_use_caches = args.get(1).and_then(Value::as_int).unwrap_or(1);
+            let _ = ctx.ensure_class_initialized("java/net/URLConnection");
+            ctx.set_static_field_by_name(
+                "java/net/URLConnection",
+                "defaultUseCaches",
+                Value::Int(default_use_caches),
+            );
+            Ok(None)
+        },
     );
     r.register(
         JRT_URL_CONNECTION,
@@ -7264,12 +7288,33 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    // JDK: `public void setDefaultUseCaches(boolean b) { defaultUseCaches = b; }`
+    // — an instance method that writes the class-wide static. NO subclass
+    // overrides it, so this registration intercepts every URLConnection in the
+    // VM and the former no-op silently discarded the process-wide default
+    // (`getDefaultUseCaches()` then contradicted every caller who turned it
+    // off). Write the static the real setter writes.
     r.register(
         "java/net/URLConnection",
         "setDefaultUseCaches",
         "(Z)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let default_use_caches = args.get(1).and_then(Value::as_int).unwrap_or(1);
+            let _ = ctx.ensure_class_initialized("java/net/URLConnection");
+            ctx.set_static_field_by_name(
+                "java/net/URLConnection",
+                "defaultUseCaches",
+                Value::Int(default_use_caches),
+            );
+            Ok(None)
+        },
     );
+    // KEEP the no-op. `URLConnection.connect()` is ABSTRACT in the real JDK, so
+    // every concrete subclass declares its own override and native lookup —
+    // which keys on the declaring class of the RESOLVED method — never lands
+    // here for one of them. The only receivers that reach it are CratonVM's own
+    // URLConnection carriers, which hold no OS connection and open lazily in
+    // `getInputStream()`; for them "already connected" is the truthful answer.
     r.register("java/net/URLConnection", "connect", "()V", |_ctx, _args| {
         Ok(None)
     });
@@ -7433,28 +7478,68 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // a missing factory.  Any actual session lookup at runtime would still
     // NPE, but bootstrap can advance past this gate.  This is the same kind
     // of bypass we apply to Tomcat lifecycle classes for the same goal.
+    //
+    // 2026-07-28 (wave 4): NARROWED, not left as blanket no-ops. Each of these
+    // exists to dodge one documented CratonVM autowiring gap (multi-arg
+    // `ObjectProvider` setter injection on a @Configuration class), whose only
+    // observable symptom is a NULL collaborator. So test for that null and run
+    // the REAL bytecode whenever the collaborator is present — same shape as
+    // the `RedisMessageListenerContainer.setConnectionFactory` shim below,
+    // which wave 3 had already narrowed for exactly this reason (the blanket
+    // version was swallowing legitimate injection in Spring Data Redis's own
+    // tests). The bypass now applies only in the state it was written for.
+    //
+    // Note on dispatch: `RedisTemplate` DOES override `afterPropertiesSet`, so
+    // this registration is not reached by resolution on a RedisTemplate
+    // receiver — it is reached through `RedisTemplate.afterPropertiesSet`'s
+    // `super.afterPropertiesSet()` invokespecial, which resolves to
+    // `RedisAccessor`.
     // -----------------------------------------------------------------------
     r.register(
         "org/springframework/data/redis/core/RedisAccessor",
         "afterPropertiesSet",
         "()V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            // The real body is exactly `Assert.state(getConnectionFactory() !=
+            // null, "RedisConnectionFactory is required")`, so with a factory
+            // present, delegating is equivalent — and it keeps any subclass
+            // state the real method would establish in future versions.
+            if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "connectionFactory") {
+                return ctx.invoke_special_bytecode_only(
+                    "org/springframework/data/redis/core/RedisAccessor",
+                    "afterPropertiesSet",
+                    "()V",
+                    args,
+                );
+            }
+            Ok(None)
+        },
     );
 
     // Same chain: RedisOperationsSessionRepository.setApplicationEventPublisher
     // does `Assert.notNull(applicationEventPublisher, "applicationEventPublisher cannot be null")`.
     // Because `@Autowired` setter injection on `RedisHttpSessionConfiguration` is
     // not running under our shim, the publisher is null when
-    // `sessionRepository()` invokes the setter.  No-op on null to let bootstrap
-    // continue.
+    // `sessionRepository()` invokes the setter.
+    //
+    // NARROWED (wave 4): the unconditional no-op also discarded a VALID
+    // publisher, so the repository never published session-created/deleted
+    // events even when injection worked. Run the real setter when the argument
+    // is non-null; only the null case (the assertion this exists to dodge) is
+    // still swallowed.
     r.register(
         "org/springframework/session/data/redis/RedisOperationsSessionRepository",
         "setApplicationEventPublisher",
         "(Lorg/springframework/context/ApplicationEventPublisher;)V",
-        |_ctx, _args| {
-            // Swallow the assert.notNull; field stays uninitialized but that is
-            // acceptable for bootstrap advancement.
-            Ok(None)
+        |ctx, args| match args.get(1) {
+            Some(Value::Object(Some(_))) => ctx.invoke_special_bytecode_only(
+                "org/springframework/session/data/redis/RedisOperationsSessionRepository",
+                "setApplicationEventPublisher",
+                "(Lorg/springframework/context/ApplicationEventPublisher;)V",
+                args,
+            ),
+            _ => Ok(None),
         },
     );
 
@@ -7482,14 +7567,29 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
 
     // Same chain: the `enableRedisKeyspaceNotificationsInitializer` bean's
     // afterPropertiesSet calls `connectionFactory.getConnection()` on its
-    // null factory and NPEs.  Bypass the entire init — equivalent to having
+    // null factory and NPEs.  Bypassing the init is equivalent to having
     // `ConfigureRedisAction.NO_OP` selected, which is the early-return path
     // already supported by Spring.
+    //
+    // NARROWED (wave 4): only bypass when the factory really is null. With a
+    // factory present the real body configures Redis keyspace notifications —
+    // which is the whole point of the bean, and which the blanket no-op
+    // silently disabled even in a fully-wired context (expired-session events
+    // then never fire).
     r.register(
         "org/springframework/session/data/redis/config/annotation/web/http/RedisHttpSessionConfiguration$EnableRedisKeyspaceNotificationsInitializer",
         "afterPropertiesSet",
         "()V",
-        |_ctx, _args| {
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "connectionFactory") {
+                return ctx.invoke_special_bytecode_only(
+                    "org/springframework/session/data/redis/config/annotation/web/http/RedisHttpSessionConfiguration$EnableRedisKeyspaceNotificationsInitializer",
+                    "afterPropertiesSet",
+                    "()V",
+                    args,
+                );
+            }
             Ok(None)
         },
     );
@@ -7515,12 +7615,40 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // cron firing succeeds silently, no error is reported, no shutdown is
     // triggered, and the application stays up.  Same shape as the other
     // session/redis bypasses above.
+    //
+    // NARROWED (wave 4): gate the bypass on the condition that produces the
+    // failure — the repository's `RedisOperations` having no connection
+    // factory. When one IS wired, run the real sweep; suppressing it there
+    // leaks expired sessions in the Redis keyspace forever, which is a data
+    // bug, not a bootstrap concession. `sessionRedisOperations` is the
+    // `RedisTemplate` the repository was built with, and `connectionFactory`
+    // is the `RedisAccessor` field the template inherits.
     // -----------------------------------------------------------------------
     r.register(
         "org/springframework/session/data/redis/RedisOperationsSessionRepository",
         "cleanupExpiredSessions",
         "()V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let wired = match ctx.get_field_by_name(this, "sessionRedisOperations") {
+                Value::Object(Some(ops)) => {
+                    matches!(
+                        ctx.get_field_by_name(ops, "connectionFactory"),
+                        Value::Object(Some(_))
+                    )
+                }
+                _ => false,
+            };
+            if wired {
+                return ctx.invoke_special_bytecode_only(
+                    "org/springframework/session/data/redis/RedisOperationsSessionRepository",
+                    "cleanupExpiredSessions",
+                    "()V",
+                    args,
+                );
+            }
+            Ok(None)
+        },
     );
 
     // -----------------------------------------------------------------------
@@ -7936,12 +8064,36 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // This lets execution fall straight through to con.getInputStream().
     // -----------------------------------------------------------------------
 
-    // ResourceUtils.useCachesIfNecessary — no-op; skips getSimpleName() call
+    // ResourceUtils.useCachesIfNecessary — IMPLEMENTED rather than no-op'd.
+    // Spring's body is
+    //   con.setUseCaches(con.getClass().getSimpleName().startsWith("JNLP"));
+    // The blanket no-op predates `URLConnection.setUseCaches` being implemented
+    // above (it now really writes `useCaches`), so it had become a silent drop
+    // of Spring's "do NOT cache this connection" request — the flag Spring
+    // Boot's nested `JarUrlConnection` reads to pick its close-on-close path,
+    // and the one that keeps a jar from being held open after use. The original
+    // reason for the stub was a `getClass().getSimpleName()` chain that could
+    // throw out of `UrlResource.getInputStream()`'s try block; we sidestep it
+    // entirely by deriving the simple name from the VM's own class table
+    // instead of invoking the Java reflection chain.
     r.register(
         "org/springframework/util/ResourceUtils",
         "useCachesIfNecessary",
         "(Ljava/net/URLConnection;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            let con = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let cid = ctx.class_id_of_object(con);
+            let binary = ctx.class_name_of_id(cid).unwrap_or_default();
+            let simple = binary.rsplit(&['/', '$'][..]).next().unwrap_or("");
+            let use_caches = i32::from(simple.starts_with("JNLP"));
+            // Errors are swallowed: the no-op this replaces did nothing at all,
+            // so a failed setter leaves us exactly where we were before.
+            let _ = ctx.invoke_virtual(con, "setUseCaches", "(Z)V", &[Value::Int(use_caches)]);
+            Ok(None)
+        },
     );
 
     // S111r24 — Some loader paths can hand a null URL into
@@ -8082,6 +8234,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    // KEEP the null. `null` is Spring's own "there is no image banner" answer
+    // (the real method returns null whenever no banner.gif/jpg/png resource is
+    // found), and it is the only honest one here: `ImageBanner` rasterises the
+    // resource through `javax.imageio.ImageIO` + `java.awt.image`, which
+    // CratonVM does not provide — returning a Banner we cannot print would fail
+    // later and further from the cause.
     r.register(
         "org/springframework/boot/SpringApplicationBannerPrinter",
         "getImageBanner",
@@ -8152,13 +8310,35 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // "IllegalStateException: No Scope registered for scope name 'request'/
     // 'session'" (ClassPathBeanDefinitionScannerJsr330ScopeIntegrationTests,
     // ClassPathBeanDefinitionScannerScopeIntegrationTests). Only the
-    // `FacesDependencyRegistrar` probe itself stays stubbed below, as a
+    // `FacesDependencyRegistrar` probe itself stays intercepted below, as a
     // defense-in-depth backstop (it should now be unreachable).
+    //
+    // NARROWED (wave 4): tested against the SAME condition the real caller
+    // tests (`jsfPresent`) instead of no-op'ing unconditionally. As written the
+    // no-op was a landmine: if the `ClassUtils.isPresent` special-case above is
+    // ever removed, this would silently drop the real
+    // `registerResolvableDependency(FacesContext/ExternalContext, ...)` calls on
+    // a genuine JSF classpath and every `@Inject FacesContext` would fail with
+    // no diagnostic. Now the skip happens only when jakarta.faces really is
+    // absent — the case this backstop was written for.
     r.register(
         "org/springframework/web/context/support/WebApplicationContextUtils$FacesDependencyRegistrar",
         "registerFacesDependencies",
         "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| {
+            if ctx
+                .class_id_by_name("jakarta/faces/context/FacesContext")
+                .is_some()
+            {
+                return ctx.invoke_special_bytecode_only(
+                    "org/springframework/web/context/support/WebApplicationContextUtils$FacesDependencyRegistrar",
+                    "registerFacesDependencies",
+                    "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+                    args,
+                );
+            }
+            Ok(None)
+        },
     );
 
     // S111r57 — dispatch to Spring Boot's real generic
@@ -8262,13 +8442,48 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    // No-op the private driver so the downstream `getBeanDefinition(beanName)`
-    // / `isLazyInit()` / `registerSingleton(...)` chain doesn't run.
+    // `createWebServer()` is the private driver that actually BUILDS the
+    // reactive web server: it resolves the factory bean name, reads its bean
+    // definition's `isLazyInit()`, constructs the `WebServerManager` (which,
+    // when not lazy, calls `factory.getWebServer(handler)` and binds the port)
+    // and registers the `webServerGracefulShutdown` / `webServerStartStop`
+    // lifecycle singletons.
+    //
+    // IMPLEMENTED (wave 4). It used to be an unconditional no-op, "so the
+    // downstream getBeanDefinition/isLazyInit/registerSingleton chain doesn't
+    // run" — i.e. a `ReactiveWebServerApplicationContext` reported a successful
+    // refresh with NO web server at all, no lifecycle beans, and
+    // `getWebServer()` null. Nothing about that is a faithful constant; it is
+    // the single largest fabrication left in this file.
+    //
+    // Run the real body. The chain it was avoiding is satisfiable now: the
+    // sibling `getWebServerFactory` registration above hands back a real
+    // `NettyReactiveWebServerFactory`, and `nettyReactiveWebServerFactory` is a
+    // genuine bean definition in any app that pulls in
+    // `ReactiveWebServerFactoryAutoConfiguration`, so `getBeanDefinition` no
+    // longer has to fail. Where it still does (a hand-built context with no
+    // such definition) fall back to the old skip — every failure point in the
+    // real body precedes its first mutation, so the fallback cannot leave a
+    // half-initialised context.
+    fn reactive_create_web_server(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        // `createWebServer` is private, so it is declared ONLY on
+        // ReactiveWebServerApplicationContext even when the receiver is the
+        // AnnotationConfig subclass.
+        match ctx.invoke_special_bytecode_only(
+            "org/springframework/boot/web/reactive/context/ReactiveWebServerApplicationContext",
+            "createWebServer",
+            "()V",
+            args,
+        ) {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(None),
+        }
+    }
     r.register(
         "org/springframework/boot/web/reactive/context/ReactiveWebServerApplicationContext",
         "createWebServer",
         "()V",
-        |_ctx, _args| Ok(None),
+        reactive_create_web_server,
     );
     // The subclass used by Spring Boot's reactive auto-configuration —
     // dispatch resolves on the declaring class, but cover the subclass too
@@ -8277,7 +8492,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "org/springframework/boot/web/reactive/context/AnnotationConfigReactiveWebServerApplicationContext",
         "createWebServer",
         "()V",
-        |_ctx, _args| Ok(None),
+        reactive_create_web_server,
     );
 
     // residual-4 fix: the two `AbstractFileResolvingResource.customizeConnection`
@@ -8330,6 +8545,20 @@ const RE5_CLIENT_AUTHENTICATOR: usize = 6;
 const RE5_CLIENT_COOKIE_HANDLER: usize = 7;
 const RE5_CLIENT_SSL_PARAMETERS: usize = 8;
 const RE5_CLIENT_NUM_FIELDS: usize = 9;
+
+/// `java.net.http.HttpClient` lifecycle state for the JDK 21+ `close()` /
+/// `shutdown()` / `shutdownNow()` / `isTerminated()` / `awaitTermination()`
+/// surface: `true` once a shutdown has been REQUESTED on that client.
+///
+/// Side-tabled rather than kept in a client field slot because HttpClient
+/// carriers are allocated in three different shapes across this crate (9 slots
+/// here, 10 in `http2.rs`, 1 in `phases_late/net_channels.rs`), so no slot index
+/// is safe for all of them. Keyed by identity hash, which — like the
+/// `SSLSessionContext` table above — survives a moving-GC relocation.
+fn re5_client_shutdown_table() -> &'static Mutex<HashMap<i32, bool>> {
+    static T: OnceLock<Mutex<HashMap<i32, bool>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 const RE5_BUILDER_VERSION: usize = 0;
 const RE5_BUILDER_REDIRECT: usize = 1;
@@ -9682,23 +9911,57 @@ fn register_re5_http_client(r: &mut NativeMethodRegistry) {
             }
         },
     );
-    // close()/shutdown()/shutdownNow() (JDK 21+ AutoCloseable surface) — no-ops;
-    // our synthetic client owns no background selector/threads to tear down.
+    // close()/shutdown()/shutdownNow() (JDK 21+ AutoCloseable surface). Our
+    // synthetic client owns no background selector or worker threads, so there
+    // is nothing to interrupt — but the request still has to be RECORDED,
+    // because `isTerminated()`/`awaitTermination()` below are defined purely in
+    // terms of "a shutdown was requested AND all operations have completed".
     for (m, d) in [
         ("close", "()V"),
         ("shutdown", "()V"),
         ("shutdownNow", "()V"),
     ] {
-        r.register(hc, m, d, |_ctx, _args| Ok(None));
+        r.register(hc, m, d, |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = ctx.identity_hash_code(this);
+            re5_client_shutdown_table().lock().insert(id, true);
+            Ok(None)
+        });
     }
-    r.register(hc, "isTerminated", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // A constant `true` here claimed the client had already finished
+    // terminating before anyone asked it to stop — the opposite of the spec'd
+    // answer for a live client, and a `while (!client.isTerminated())` drain
+    // loop exits on the first iteration having shut nothing down. Report the
+    // real state: false until a shutdown is requested, and — since no request
+    // is ever outstanding on this client — terminated immediately after.
+    r.register(hc, "isTerminated", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let id = ctx.identity_hash_code(this);
+        let done = re5_client_shutdown_table()
+            .lock()
+            .get(&id)
+            .copied()
+            .unwrap_or(false);
+        Ok(Some(Value::Int(i32::from(done))))
     });
+    // `awaitTermination(Duration)` returns true iff the client terminated
+    // before the timeout elapsed. Nothing can complete a shutdown that was
+    // never requested, so a still-running client answers false rather than
+    // pretending the wait succeeded.
     r.register(
         hc,
         "awaitTermination",
         "(Ljava/time/Duration;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = ctx.identity_hash_code(this);
+            let done = re5_client_shutdown_table()
+                .lock()
+                .get(&id)
+                .copied()
+                .unwrap_or(false);
+            Ok(Some(Value::Int(i32::from(done))))
+        },
     );
 
     let req = "java/net/http/HttpRequest";
@@ -11347,77 +11610,543 @@ fn re8_enumerate_local_ips() -> Vec<IpAddr> {
             }
         }
     }
+    // Finally the addresses the kernel actually has configured. The three
+    // probes above only find the primary outbound address and whatever DNS
+    // says about our own name, so an address on a secondary NIC (or any
+    // interface with no default route) was invisible — and `boundInetAddress0`
+    // reads a miss as "that address is not mine" and rejects a bind that would
+    // have worked. Appended, not prepended, so the outbound-probe ordering the
+    // other callers see is unchanged.
+    for iface in re8_scan_host_ifaces() {
+        for ip in iface.addrs {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
     out
 }
 
-fn re8_build_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
-    let mut result = Vec::new();
-    let ips = re8_enumerate_local_ips();
+// ---------------------------------------------------------------------------
+// RE.8 — host interface enumeration
+//
+// Everything `java.net.NetworkInterface` reports comes from here. Until wave 4
+// this module modelled exactly ONE interface (loopback), so `isUp0`/`isP2P0`/
+// `supportsMulticast0`/`getMTU0`/`getMacAddr0` were all "loopback's answers"
+// and `getAll()` handed out a single carrier — which is why HotSpot reported
+// several interfaces and a real MAC where CratonVM reported one and none.
+// ---------------------------------------------------------------------------
 
-    let lo = alloc_concurrent_synthetic(ctx, "java/net/NetworkInterface", 5);
-    let lo_name = ctx.create_string("lo");
-    let lo_display = ctx.create_string("Loopback Interface");
-    ctx.set_field(lo, 0, Value::Object(Some(lo_name)));
-    ctx.set_field(lo, 1, Value::Object(Some(lo_display)));
-    let mut lo_addrs: Vec<ObjectRef> = Vec::new();
-    for ip in &ips {
-        if ip.is_loopback() {
-            let a = alloc_inet_address(ctx, "localhost", &ip.to_string());
-            lo_addrs.push(a);
-        }
-    }
-    if lo_addrs.is_empty() {
-        lo_addrs.push(alloc_inet_address(ctx, "localhost", "127.0.0.1"));
-    }
-    let lo_arr = ctx.new_ref_array(ClassId::new(0), lo_addrs.len());
-    for (i, a) in lo_addrs.iter().enumerate() {
-        ctx.set_array_element(lo_arr, i, Value::Object(Some(*a)));
-    }
-    ctx.set_field(lo, 2, Value::Object(Some(lo_arr)));
-    ctx.set_field(lo, 3, Value::Int(1));
-    ctx.set_field(lo, 4, Value::Int(0b111));
-    result.push(lo);
+/// One host network interface, as the OS reports it.
+struct Re8HostIface {
+    name: String,
+    /// Kernel interface index (`if_nametoindex`), 0 when unknown.
+    index: i32,
+    /// `IFF_*` flag word.
+    flags: u32,
+    /// `None` when the platform publishes no per-interface MTU.
+    mtu: Option<i32>,
+    /// Hardware address; empty for loopback and other address-less interfaces.
+    mac: Vec<u8>,
+    addrs: Vec<IpAddr>,
+}
 
-    let hostname = hostname_string();
-    let mut idx = 2;
-    for ip in &ips {
-        if ip.is_loopback() {
+// `IFF_*` bits. The low bits are identical on Linux and the BSDs; only
+// IFF_MULTICAST moved (0x1000 on Linux, 0x8000 on BSD/macOS), so it is selected
+// per target here rather than taken from `libc`, whose export set for these
+// constants varies by platform.
+const RE8_IFF_UP: u32 = 0x1;
+const RE8_IFF_LOOPBACK: u32 = 0x8;
+const RE8_IFF_POINTOPOINT: u32 = 0x10;
+const RE8_IFF_RUNNING: u32 = 0x40;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RE8_IFF_MULTICAST: u32 = 0x1000;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const RE8_IFF_MULTICAST: u32 = 0x8000;
+
+/// Read one `/sys/class/net/<iface>/<file>` attribute (Linux only).
+///
+/// The interface name is rejected if it could escape the directory, so a name
+/// arriving from Java bytecode can never be used to read an arbitrary file.
+fn re8_sys_attr(name: &str, file: &str) -> Option<String> {
+    if name.is_empty() || name.starts_with('.') || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{name}/{file}"))
+        .ok()
+        .map(|text| text.trim().to_string())
+}
+
+/// Parse the kernel's `aa:bb:cc:dd:ee:ff` hardware-address rendering.
+///
+/// Returns an EMPTY vector for "this interface has no hardware address": the
+/// kernel prints all-zero for loopback/tun, and a fabricated 00:00:00:00:00:00
+/// is worse than `null` — it is a syntactically valid MAC, so UUID-v1
+/// generators and cluster-member-id derivations accept it and every host ends
+/// up with the same identity instead of taking the documented "unavailable"
+/// fallback.
+fn re8_parse_mac(text: &str) -> Vec<u8> {
+    let fields = text.split(':').count();
+    let bytes: Vec<u8> = text
+        .split(':')
+        .filter_map(|part| u8::from_str_radix(part, 16).ok())
+        .collect();
+    if bytes.len() != fields || bytes.len() < 6 || bytes.iter().all(|b| *b == 0) {
+        return Vec::new();
+    }
+    bytes
+}
+
+#[cfg(unix)]
+fn re8_iface_index(name: &str) -> i32 {
+    if let Some(index) = re8_sys_attr(name, "ifindex").and_then(|t| t.parse::<i32>().ok()) {
+        return index;
+    }
+    let Ok(cname) = std::ffi::CString::new(name) else {
+        return 0;
+    };
+    // SAFETY: `cname` is a NUL-terminated C string that outlives the call.
+    (unsafe { libc::if_nametoindex(cname.as_ptr()) }) as i32
+}
+
+#[cfg(not(unix))]
+fn re8_iface_index(_name: &str) -> i32 {
+    0
+}
+
+/// Enumerate the host's real network interfaces.
+///
+/// Unix: `getifaddrs(3)` supplies the interface list, per-interface addresses
+/// and the `IFF_*` flags in one pass; Linux additionally publishes the MTU and
+/// the hardware address as plain files under `/sys/class/net`, so those are
+/// read from there rather than by decoding `AF_PACKET` link-layer sockaddrs.
+///
+/// Returns an EMPTY vector when the host cannot be enumerated — the callers
+/// then fall back to the loopback-only model this module has always used.
+#[cfg(unix)]
+fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
+    let mut out: Vec<Re8HostIface> = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `head` is a valid out-parameter; on success the kernel-allocated
+    // list is freed by the `freeifaddrs` below and never escapes this function.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+        return out;
+    }
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: the list is walked to its null terminator while we still own
+        // it (`freeifaddrs` runs after the loop).
+        let entry = unsafe { &*cursor };
+        cursor = entry.ifa_next;
+        if entry.ifa_name.is_null() {
             continue;
         }
-        let iface = alloc_concurrent_synthetic(ctx, "java/net/NetworkInterface", 5);
-        let name = ctx.create_string(if matches!(ip, IpAddr::V4(_)) {
-            "eth0"
+        // SAFETY: `ifa_name` is a NUL-terminated C string owned by the list.
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let flags = entry.ifa_flags as u32;
+        // An interface with no IP address still exists (an unconfigured NIC, or
+        // the AF_PACKET/AF_LINK entry the kernel emits per device), and real
+        // `getAll()` reports it — so record the name whatever the family is and
+        // only push an address for the two families we can decode.
+        let ip = if entry.ifa_addr.is_null() {
+            None
         } else {
-            "eth1"
-        });
-        let display = ctx.create_string("Primary Network Interface");
-        ctx.set_field(iface, 0, Value::Object(Some(name)));
-        ctx.set_field(iface, 1, Value::Object(Some(display)));
-        let a = alloc_inet_address(ctx, &hostname, &ip.to_string());
-        let arr = ctx.new_ref_array(ClassId::new(0), 1);
-        ctx.set_array_element(arr, 0, Value::Object(Some(a)));
-        ctx.set_field(iface, 2, Value::Object(Some(arr)));
-        ctx.set_field(iface, 3, Value::Int(idx));
-        ctx.set_field(iface, 4, Value::Int(0b101));
-        result.push(iface);
-        idx += 1;
+            // SAFETY: `ifa_addr` points at a `sockaddr` whose `sa_family` tag
+            // selects the concrete layout read below; both are list-owned.
+            let family = unsafe { (*entry.ifa_addr).sa_family } as i32;
+            if family == libc::AF_INET {
+                let sin = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in) };
+                Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    sin.sin_addr.s_addr,
+                ))))
+            } else if family == libc::AF_INET6 {
+                let sin6 = unsafe { &*(entry.ifa_addr as *const libc::sockaddr_in6) };
+                Some(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)))
+            } else {
+                None
+            }
+        };
+        // The kernel emits one entry per (interface, address), so fold repeats
+        // of a name together instead of reporting the same NIC several times.
+        let seen = out.iter().position(|existing| existing.name == name);
+        let slot = match seen {
+            Some(index) => index,
+            None => {
+                out.push(Re8HostIface {
+                    name,
+                    index: 0,
+                    flags: 0,
+                    mtu: None,
+                    mac: Vec::new(),
+                    addrs: Vec::new(),
+                });
+                out.len() - 1
+            }
+        };
+        let existing = &mut out[slot];
+        existing.flags |= flags;
+        if let Some(ip) = ip {
+            if !existing.addrs.contains(&ip) {
+                existing.addrs.push(ip);
+            }
+        }
     }
-    result
+    // SAFETY: `head` came from the successful `getifaddrs` above, is still the
+    // list head (the walk advanced a copy), and is freed exactly once.
+    unsafe { libc::freeifaddrs(head) };
+    for iface in &mut out {
+        iface.index = re8_iface_index(&iface.name);
+        iface.mtu = re8_sys_attr(&iface.name, "mtu").and_then(|t| t.parse::<i32>().ok());
+        iface.mac = re8_sys_attr(&iface.name, "address")
+            .map(|t| re8_parse_mac(&t))
+            .unwrap_or_default();
+    }
+    out
+}
+
+/// Off Unix there is no host enumeration without an `iphlpapi`
+/// (`GetAdaptersAddresses`) binding, which this crate does not carry. Report
+/// "cannot enumerate" so every caller takes the loopback-only fallback that was
+/// this module's only behaviour before wave 4.
+#[cfg(not(unix))]
+fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
+    Vec::new()
+}
+
+/// Flags / MTU / hardware address for ONE named interface.
+///
+/// The `*0` natives are handed just `(name, index)`, and on Linux every
+/// attribute they need is a plain file, so answer from `/sys` without paying
+/// for a full `getifaddrs` walk per call. `None` means "this host cannot tell
+/// us about that interface".
+fn re8_host_iface_by_name(name: &str) -> Option<Re8HostIface> {
+    if let Some(text) = re8_sys_attr(name, "flags") {
+        let flags = text
+            .strip_prefix("0x")
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .or_else(|| text.parse::<u32>().ok())?;
+        return Some(Re8HostIface {
+            name: name.to_string(),
+            index: re8_iface_index(name),
+            flags,
+            mtu: re8_sys_attr(name, "mtu").and_then(|t| t.parse::<i32>().ok()),
+            mac: re8_sys_attr(name, "address")
+                .map(|t| re8_parse_mac(&t))
+                .unwrap_or_default(),
+            addrs: Vec::new(),
+        });
+    }
+    re8_scan_host_ifaces()
+        .into_iter()
+        .find(|iface| iface.name == name)
+}
+
+/// Loopback's MTU, per platform — the fallback for a host we cannot query.
+/// `lo` is 65536 on Linux, `lo0` is 16384 on macOS, and Windows loopback is
+/// 1500; one flat 1500 was wrong on two of the three.
+fn re8_loopback_mtu() -> i32 {
+    if cfg!(target_os = "linux") {
+        65536
+    } else if cfg!(target_os = "macos") {
+        16384
+    } else {
+        1500
+    }
+}
+
+/// Read a `String` argument (the `*0` natives are all static, so index 0 is the
+/// interface name, not a receiver).
+fn re8_name_arg(ctx: &mut dyn NativeContext, args: &[Value], index: usize) -> String {
+    match args.get(index).copied() {
+        Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Read the `name` field off a `java/net/NetworkInterface` receiver.
+///
+/// BY NAME, not by slot: the receivers this module hands out are REAL-layout
+/// objects built through the JDK's own constructor, whose field order is not
+/// the synthetic one (mixing the two is what produced the `arraylength null`
+/// NPE in `NetworkInterface$1` documented at `register_re8_network_interface`).
+fn re8_receiver_name(ctx: &mut dyn NativeContext, args: &[Value]) -> String {
+    match args.first().copied() {
+        Some(Value::Object(Some(this))) => match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
+}
+
+/// Materialise a hardware address as a Java `byte[]`, or null when the
+/// interface has none (the value `getHardwareAddress` is specified to return
+/// when the address does not exist or is not accessible).
+fn re8_mac_array(ctx: &mut dyn NativeContext, mac: &[u8]) -> MethodCallResult {
+    if mac.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let arr = ctx.new_array(ArrayElementType::Byte, mac.len());
+    for (i, byte) in mac.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*byte as i8 as i32));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
+/// The fallback interface, used only when the host cannot be enumerated (see
+/// [`re8_scan_host_ifaces`]). `getAll`, `getByName0`, `getByIndex0` and
+/// `getByInetAddress0` all key off the same source, so they cannot contradict
+/// each other in either mode.
+const RE8_LOOPBACK_NAME: &str = "lo";
+const RE8_LOOPBACK_INDEX: i32 = 1;
+
+/// Build one REAL-layout `java.net.NetworkInterface` for a host interface.
+///
+/// Same construction path as [`re8_make_loopback_interface`] — the
+/// package-private `(String,int,InetAddress[])` constructor plus the `childs`
+/// fix-up — so the real `getInetAddresses()`/`toString()`/`getSubInterfaces()`
+/// bytecode reads the fields it expects. Returns `None` when a step fails; the
+/// caller then skips this interface.
+///
+/// GC note: the returned reference is NOT pinned. A caller that allocates again
+/// before using it must pin it across that allocation.
+fn re8_make_interface(ctx: &mut dyn NativeContext, host: &Re8HostIface) -> Option<ObjectRef> {
+    let addr_cid = ctx
+        .class_id_by_name("java/net/InetAddress")
+        .unwrap_or(ClassId::new(0));
+    let mut addrs = ctx.new_ref_array(addr_cid, host.addrs.len());
+    // First pin of the batch: `unpin_native_roots(base_pin)` at the end
+    // releases this and every pin taken after it.
+    let base_pin = ctx.pin_native_root(addrs);
+    let hostname = hostname_string();
+    for (i, ip) in host.addrs.iter().enumerate() {
+        let label = if ip.is_loopback() {
+            "localhost"
+        } else {
+            hostname.as_str()
+        };
+        // Allocates several objects, so re-read the array through its pin
+        // before storing into it (native stale-local family).
+        let addr = alloc_inet_address(ctx, label, &ip.to_string());
+        addrs = ctx.read_native_pin(base_pin, addrs);
+        ctx.set_array_element(addrs, i, Value::Object(Some(addr)));
+    }
+    let name0 = ctx.create_string(&host.name);
+    let name_pin = ctx.pin_native_root(name0);
+    let iface0 = match ctx.new_object("java/net/NetworkInterface") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(base_pin);
+            return None;
+        }
+    };
+    let iface_pin = ctx.pin_native_root(iface0);
+    let name = ctx.read_native_pin(name_pin, name0);
+    let addrs = ctx.read_native_pin(base_pin, addrs);
+    let iface = ctx.read_native_pin(iface_pin, iface0);
+    let _ = ctx.invoke(
+        "java/net/NetworkInterface",
+        "<init>",
+        "(Ljava/lang/String;I[Ljava/net/InetAddress;)V",
+        &[
+            Value::Object(Some(iface)),
+            Value::Object(Some(name)),
+            Value::Int(host.index),
+            Value::Object(Some(addrs)),
+        ],
+    );
+    // The package-private ctor leaves `childs` null and
+    // `NetworkInterface.getSubInterfaces()`'s anonymous Enumeration reads
+    // `childs.length` — see the note in `re8_make_loopback_interface`.
+    let ni_cid = ctx
+        .class_id_by_name("java/net/NetworkInterface")
+        .unwrap_or(ClassId::new(0));
+    let empty_childs = ctx.new_ref_array(ni_cid, 0);
+    let iface = ctx.read_native_pin(iface_pin, iface0);
+    ctx.set_field_by_name(iface, "childs", Value::Object(Some(empty_childs)));
+    // The ctor also leaves `displayName` null (the real JDK's `getAll0` fills
+    // it in). On Linux the display name IS the interface name.
+    let display = ctx.create_string(&host.name);
+    let iface = ctx.read_native_pin(iface_pin, iface0);
+    ctx.set_field_by_name(iface, "displayName", Value::Object(Some(display)));
+    let iface = ctx.read_native_pin(iface_pin, iface0);
+    ctx.unpin_native_roots(base_pin);
+    Some(iface)
+}
+
+/// `getAll()` — one REAL-layout carrier per host interface.
+///
+/// Falls back to the single loopback carrier when the host cannot be
+/// enumerated. An EMPTY array is never returned while any interface exists:
+/// `getNetworkInterfaces()` turns that into
+/// `SocketException("No network interfaces configured")`, which Gradle's
+/// `InetAddressFactory` escalates into "Could not determine a usable wildcard
+/// IP for this machine", killing every user-home-scope service.
+fn re8_all_interfaces(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let ni_cid = ctx
+        .class_id_by_name("java/net/NetworkInterface")
+        .unwrap_or(ClassId::new(0));
+    let hosts = re8_scan_host_ifaces();
+    // Pin each finished carrier: the next one's construction, and the array
+    // allocation below, both allocate and can relocate it.
+    let mut pinned: Vec<(usize, ObjectRef)> = Vec::new();
+    let mut base_pin: Option<usize> = None;
+    for host in &hosts {
+        if let Some(iface) = re8_make_interface(ctx, host) {
+            let pin = ctx.pin_native_root(iface);
+            if base_pin.is_none() {
+                base_pin = Some(pin);
+            }
+            pinned.push((pin, iface));
+        }
+    }
+    if pinned.is_empty() {
+        if let Some(base) = base_pin {
+            ctx.unpin_native_roots(base);
+        }
+        let Some(loopback) = re8_make_loopback_interface(ctx) else {
+            return ctx.new_ref_array(ni_cid, 0);
+        };
+        let pin = ctx.pin_native_root(loopback);
+        let arr = ctx.new_ref_array(ni_cid, 1);
+        let iface = ctx.read_native_pin(pin, loopback);
+        ctx.set_array_element(arr, 0, Value::Object(Some(iface)));
+        ctx.unpin_native_roots(pin);
+        return arr;
+    }
+    let arr = ctx.new_ref_array(ni_cid, pinned.len());
+    for (i, (pin, iface)) in pinned.iter().enumerate() {
+        let current = ctx.read_native_pin(*pin, *iface);
+        ctx.set_array_element(arr, i, Value::Object(Some(current)));
+    }
+    if let Some(base) = base_pin {
+        ctx.unpin_native_roots(base);
+    }
+    arr
+}
+
+/// `getByName0` / `getByIndex0` / `getByInetAddress0` share this: find the host
+/// interface a predicate selects and build its carrier, falling back to the
+/// loopback carrier when the host cannot be enumerated and the predicate is
+/// asking about loopback.
+fn re8_find_interface(
+    ctx: &mut dyn NativeContext,
+    select: impl Fn(&Re8HostIface) -> bool,
+    loopback_fallback: bool,
+) -> Option<ObjectRef> {
+    let hosts = re8_scan_host_ifaces();
+    if hosts.is_empty() {
+        return if loopback_fallback {
+            re8_make_loopback_interface(ctx)
+        } else {
+            None
+        };
+    }
+    let host = hosts.into_iter().find(select)?;
+    re8_make_interface(ctx, &host)
+}
+
+/// Build the single REAL-layout loopback `NetworkInterface` ("lo", index 1,
+/// the loopback address, no sub-interfaces).
+///
+/// Constructed through the package-private `NetworkInterface(String,int,
+/// InetAddress[])` constructor so the real `getInetAddresses()`/`toString()`
+/// bytecode reads the right fields — a synthetic 5-slot object of that class
+/// breaks them (`arraylength null` in `NetworkInterface$1`; see the note at the
+/// top of `register_re8_network_interface`). Returns `None` when any step
+/// fails; the caller then answers "no interfaces" / "no such interface".
+///
+/// GC note: the returned reference is NOT pinned. A caller that allocates again
+/// before using it must pin it across that allocation.
+fn re8_make_loopback_interface(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let lo_addr = match ctx.invoke(
+        "java/net/InetAddress",
+        "getLoopbackAddress",
+        "()Ljava/net/InetAddress;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return None,
+    };
+    let lo_pin = ctx.pin_native_root(lo_addr);
+    let addr_cid = ctx
+        .class_id_by_name("java/net/InetAddress")
+        .unwrap_or(ClassId::new(0));
+    let addrs = ctx.new_ref_array(addr_cid, 1);
+    let lo_addr = ctx.read_native_pin(lo_pin, lo_addr);
+    ctx.set_array_element(addrs, 0, Value::Object(Some(lo_addr)));
+    let addrs_pin = ctx.pin_native_root(addrs);
+    let name = ctx.create_string(RE8_LOOPBACK_NAME);
+    let name_pin = ctx.pin_native_root(name);
+    let iface = match ctx.new_object("java/net/NetworkInterface") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => {
+            ctx.unpin_native_roots(lo_pin);
+            ctx.unpin_native_roots(addrs_pin);
+            ctx.unpin_native_roots(name_pin);
+            return None;
+        }
+    };
+    let iface_pin = ctx.pin_native_root(iface);
+    let name = ctx.read_native_pin(name_pin, name);
+    let addrs = ctx.read_native_pin(addrs_pin, addrs);
+    let _ = ctx.invoke(
+        "java/net/NetworkInterface",
+        "<init>",
+        "(Ljava/lang/String;I[Ljava/net/InetAddress;)V",
+        &[
+            Value::Object(Some(iface)),
+            Value::Object(Some(name)),
+            Value::Int(RE8_LOOPBACK_INDEX),
+            Value::Object(Some(addrs)),
+        ],
+    );
+    let iface = ctx.read_native_pin(iface_pin, iface);
+    let ni_cid = ctx
+        .class_id_by_name("java/net/NetworkInterface")
+        .unwrap_or(ClassId::new(0));
+    // The package-private `(String,int,InetAddress[])` ctor leaves the `childs`
+    // field null — the real JDK's native `getAll0` is what populates it.
+    // `NetworkInterface.getSubInterfaces()` returns an anonymous Enumeration
+    // whose `hasMoreElements()` reads `childs.length`, so a null `childs` throws
+    // `NullPointerException: arraylength null` (NetworkInterface$1). That kills
+    // `NetworkUtils.<clinit>` (its `addAllInterfaces` recursion calls
+    // `Collections.list(intf.getSubInterfaces())`) with an
+    // ExceptionInInitializerError in every Elasticsearch ESTestCase that touches
+    // networking. A loopback interface genuinely has no sub-interfaces, so an
+    // empty `NetworkInterface[]` is the faithful value.
+    let empty_childs = ctx.new_ref_array(ni_cid, 0);
+    let iface = ctx.read_native_pin(iface_pin, iface);
+    ctx.set_field_by_name(iface, "childs", Value::Object(Some(empty_childs)));
+    let iface = ctx.read_native_pin(iface_pin, iface);
+    ctx.unpin_native_roots(lo_pin);
+    ctx.unpin_native_roots(addrs_pin);
+    ctx.unpin_native_roots(name_pin);
+    ctx.unpin_native_roots(iface_pin);
+    Some(iface)
 }
 
 fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     let ni = "java/net/NetworkInterface";
 
     // NOTE: We do NOT register synthetic `getNetworkInterfaces` /
-    // `networkInterfaces` natives. In real-JDK mode the Java methods
-    // call native `getAll()` (registered below) which returns an empty
-    // array, causing `getNetworkInterfaces` to throw SocketException
-    // "No network interfaces configured". Callers like Spring Cloud's
-    // InetUtils.findFirstNonLoopbackAddress() catch that and fall back
-    // to defaults. Returning synthetic NetworkInterface objects here
-    // breaks the real JDK's `getInetAddresses()` because the real
-    // `addrs` field is in a different slot than our synthetic layout,
-    // resulting in `arraylength null` NPE inside NetworkInterface$1.
+    // `networkInterfaces` natives. In real-JDK mode the Java methods call
+    // native `getAll()` (registered below), and the real bytecode wraps the
+    // result. Returning *synthetic* NetworkInterface objects from here would
+    // break the real JDK's `getInetAddresses()`, whose `addrs` field is in a
+    // different slot than our synthetic layout — `arraylength null` NPE inside
+    // NetworkInterface$1. `getAll()` sidesteps that by building REAL-layout
+    // carriers instead (`re8_make_interface` / `re8_make_loopback_interface`).
+    //
+    // STALE-PREMISE WARNING for anyone reading downstream comments: `getAll()`
+    // does NOT return an empty array and does NOT hand out a single loopback
+    // interface any more — it enumerates the host (`re8_scan_host_ifaces`).
+    // `getNetworkInterfaces()` therefore does not throw SocketException("No
+    // network interfaces configured"), and `findFirstNonLoopbackAddress`-style
+    // callers do find a non-loopback address. Any shim that justifies itself
+    // with either premise is working from an outdated one.
 
     // `NetworkInterface.<clinit>` calls the JNI library initializer
     // `init()V` — unregistered it surfaced as UnsatisfiedLinkError and
@@ -11426,184 +12155,172 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // JNI field IDs; a no-op is faithful.
     r.register(ni, "init", "()V", |_ctx, _args| Ok(None));
 
-    r.register(ni, "getHardwareAddress", "()[B", |ctx, _args| {
-        let mac = ctx.new_array(ArrayElementType::Byte, 6);
-        for i in 0..6 {
-            ctx.set_array_element(mac, i, Value::Int(0));
-        }
-        Ok(Some(Value::Object(Some(mac))))
+    // IMPLEMENTED (wave 4). This used to return an unconditional `null`,
+    // justified by "`getAll()` hands out exactly one interface, loopback, which
+    // genuinely has no hardware address". That premise is gone: `getAll()` now
+    // enumerates the host, so most receivers reaching this method DO have a
+    // MAC, and a blanket null is what made CratonVM report no hardware address
+    // where HotSpot reports a real one.
+    //
+    // `null` remains the answer when the interface really has none — the spec'd
+    // value for "the address does not exist or is not accessible" — but it is
+    // now derived rather than assumed. Note what is deliberately NOT returned:
+    // the pre-wave-3 all-zero 00:00:00:00:00:00, which is a syntactically valid
+    // address, so UUID-v1 generators and cluster-member-id derivations accept it
+    // and every host ends up with the same identity (see `re8_parse_mac`).
+    //
+    // NOTE this is the copy that serves DEFAULT real-JDK mode. The twin in
+    // `phases_late/nio_file.rs` (`register_p61_net`) is reachable only through
+    // `register_synthetic_overrides`, i.e. `--synthetic-jdk`.
+    r.register(ni, "getHardwareAddress", "()[B", |ctx, args| {
+        let name = re8_receiver_name(ctx, args);
+        let mac = re8_host_iface_by_name(&name)
+            .map(|host| host.mac)
+            .unwrap_or_default();
+        re8_mac_array(ctx, &mac)
     });
-    // KEEP the constant. `getAll()` below hands out exactly one interface —
-    // loopback — and there is no portable Rust API for a per-interface MTU
-    // query (it needs SIOCGIFMTU / GetAdaptersAddresses per platform). 1500
-    // is the standard Ethernet MTU and the value every caller that reads this
-    // is sizing a buffer against; it is a plausible answer rather than a
-    // wrong one, and no caller branches on it the way they branch on
-    // `isUp`/`isLoopback`.
-    r.register(ni, "getMTU", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1500)))
+    // Real per-interface MTU. Linux publishes it as a plain file — the same
+    // number SIOCGIFMTU returns — so read it rather than guessing; no FFI
+    // needed. The fallback is the per-platform LOOPBACK MTU (65536 on Linux,
+    // 16384 on macOS, 1500 on Windows), because loopback is the only interface
+    // this module can still mint when the host cannot be enumerated. A flat
+    // 1500 was wrong on two of those three.
+    r.register(ni, "getMTU", "()I", |ctx, args| {
+        let name = re8_receiver_name(ctx, args);
+        let mtu = re8_host_iface_by_name(&name)
+            .and_then(|host| host.mtu)
+            .unwrap_or_else(re8_loopback_mtu);
+        Ok(Some(Value::Int(mtu)))
     });
 
-    // Low-level "0" suffixed natives used by NetworkInterface (JDK internals).
-    // Safe no-op defaults — sufficient for environment probing (e.g., Spring's
-    // HostInfoEnvironmentPostProcessor) without performing real OS queries.
-    r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // Low-level "0" suffixed natives (JDK internals). All static, so index 0 is
+    // the interface NAME, not a receiver. Each now answers from the host's real
+    // `IFF_*` flag word instead of restating loopback's answers; the fallback
+    // (host not enumerable) is still the loopback answer, which is what the
+    // fallback carrier `getAll()` mints in that case genuinely reports.
+    //
+    // These mirror the real JNI bodies: `isUp0` is `IFF_UP && IFF_RUNNING`,
+    // `isLoopback0` is `IFF_LOOPBACK`, `isP2P0` is `IFF_POINTOPOINT`,
+    // `supportsMulticast0` is `IFF_MULTICAST`.
+    r.register(ni, "isUp0", "(Ljava/lang/String;I)Z", |ctx, args| {
+        let name = re8_name_arg(ctx, args, 0);
+        let up = match re8_host_iface_by_name(&name) {
+            Some(host) => host.flags & RE8_IFF_UP != 0 && host.flags & RE8_IFF_RUNNING != 0,
+            // Loopback is always up.
+            None => true,
+        };
+        Ok(Some(Value::Int(i32::from(up))))
     });
     r.register(ni, "isLoopback0", "(Ljava/lang/String;I)Z", |ctx, args| {
-        let name = match args.first().copied() {
-            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
+        let name = re8_name_arg(ctx, args, 0);
+        let index = args.get(1).and_then(Value::as_int).unwrap_or(0);
+        let loopback = match re8_host_iface_by_name(&name) {
+            Some(host) => host.flags & RE8_IFF_LOOPBACK != 0,
+            None => name == RE8_LOOPBACK_NAME || index == RE8_LOOPBACK_INDEX,
         };
-        let index = match args.get(1).copied() {
-            Some(Value::Int(i)) => i,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(if name == "lo" || index == 1 {
-            1
-        } else {
-            0
-        })))
+        Ok(Some(Value::Int(i32::from(loopback))))
     });
-    r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(ni, "isP2P0", "(Ljava/lang/String;I)Z", |ctx, args| {
+        let name = re8_name_arg(ctx, args, 0);
+        let p2p = re8_host_iface_by_name(&name)
+            .map(|host| host.flags & RE8_IFF_POINTOPOINT != 0)
+            // Loopback is not point-to-point.
+            .unwrap_or(false);
+        Ok(Some(Value::Int(i32::from(p2p))))
     });
     r.register(
         ni,
         "supportsMulticast0",
         "(Ljava/lang/String;I)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let name = re8_name_arg(ctx, args, 0);
+            let multicast = re8_host_iface_by_name(&name)
+                .map(|host| host.flags & RE8_IFF_MULTICAST != 0)
+                // Loopback does not carry IFF_MULTICAST.
+                .unwrap_or(false);
+            Ok(Some(Value::Int(i32::from(multicast))))
+        },
     );
-    r.register(ni, "getMTU0", "(Ljava/lang/String;I)I", |_ctx, _args| {
-        Ok(Some(Value::Int(1500)))
+    r.register(ni, "getMTU0", "(Ljava/lang/String;I)I", |ctx, args| {
+        let name = re8_name_arg(ctx, args, 0);
+        let mtu = re8_host_iface_by_name(&name)
+            .and_then(|host| host.mtu)
+            .unwrap_or_else(re8_loopback_mtu);
+        Ok(Some(Value::Int(mtu)))
     });
+    // `getMacAddr0(byte[] inAddr, String name, int ind)` — static, so the name
+    // is argument 1. `inAddr` only disambiguates which binding the caller meant
+    // on platforms whose lookup is per-address; the Linux/`/sys` answer is
+    // per-interface, so it is not needed.
     r.register(
         ni,
         "getMacAddr0",
         "([BLjava/lang/String;I)[B",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let name = re8_name_arg(ctx, args, 1);
+            let mac = re8_host_iface_by_name(&name)
+                .map(|host| host.mac)
+                .unwrap_or_default();
+            re8_mac_array(ctx, &mac)
+        },
     );
     r.register(
         ni,
         "getAll",
         "()[Ljava/net/NetworkInterface;",
         |ctx, _args| {
-            // One REAL-layout loopback interface, built via the
-            // package-private NetworkInterface(String,int,InetAddress[])
-            // constructor so the real getInetAddresses()/toString bytecode
-            // reads the right fields (a synthetic 5-slot object breaks them
-            // — see the note above). An empty array here made
-            // getNetworkInterfaces() throw SocketException("No network
-            // interfaces configured"); most callers fall back, but Gradle's
-            // InetAddressFactory turns it into "Could not determine a usable
-            // wildcard IP for this machine" and every user-home-scope
-            // service dies (ProjectBuilder bootstrap).
-            let empty = |ctx: &mut dyn NativeContext| {
-                let arr = ctx.new_ref_array(ClassId::new(0), 0);
-                Ok(Some(Value::Object(Some(arr))))
-            };
-            let lo_addr = match ctx.invoke(
-                "java/net/InetAddress",
-                "getLoopbackAddress",
-                "()Ljava/net/InetAddress;",
-                &[],
-            ) {
-                Ok(Some(Value::Object(Some(a)))) => a,
-                _ => return empty(ctx),
-            };
-            let lo_pin = ctx.pin_native_root(lo_addr);
-            let addr_cid = ctx
-                .class_id_by_name("java/net/InetAddress")
-                .unwrap_or(ClassId::new(0));
-            let addrs = ctx.new_ref_array(addr_cid, 1);
-            let lo_addr = ctx.read_native_pin(lo_pin, lo_addr);
-            ctx.set_array_element(addrs, 0, Value::Object(Some(lo_addr)));
-            let addrs_pin = ctx.pin_native_root(addrs);
-            let name = ctx.create_string("lo");
-            let name_pin = ctx.pin_native_root(name);
-            let iface = match ctx.new_object("java/net/NetworkInterface") {
-                Ok(Some(Value::Object(Some(o)))) => o,
-                _ => {
-                    ctx.unpin_native_roots(lo_pin);
-                    ctx.unpin_native_roots(addrs_pin);
-                    ctx.unpin_native_roots(name_pin);
-                    return empty(ctx);
-                }
-            };
-            let iface_pin = ctx.pin_native_root(iface);
-            let name = ctx.read_native_pin(name_pin, name);
-            let addrs = ctx.read_native_pin(addrs_pin, addrs);
-            let _ = ctx.invoke(
-                "java/net/NetworkInterface",
-                "<init>",
-                "(Ljava/lang/String;I[Ljava/net/InetAddress;)V",
-                &[
-                    Value::Object(Some(iface)),
-                    Value::Object(Some(name)),
-                    Value::Int(1),
-                    Value::Object(Some(addrs)),
-                ],
-            );
-            let iface = ctx.read_native_pin(iface_pin, iface);
-            let ni_cid = ctx
-                .class_id_by_name("java/net/NetworkInterface")
-                .unwrap_or(ClassId::new(0));
-            // The package-private `(String,int,InetAddress[])` ctor leaves the
-            // `childs` field null — the real JDK's native `getAll0` is what
-            // populates it. `NetworkInterface.getSubInterfaces()` returns an
-            // anonymous Enumeration whose `hasMoreElements()` reads
-            // `childs.length`, so a null `childs` throws
-            // `NullPointerException: arraylength null` (NetworkInterface$1).
-            // That kills `NetworkUtils.<clinit>` (its `addAllInterfaces`
-            // recursion calls `Collections.list(intf.getSubInterfaces())`) with
-            // an ExceptionInInitializerError in every Elasticsearch ESTestCase
-            // that touches networking. Set an empty `NetworkInterface[]` so
-            // sub-interface enumeration yields zero elements (a loopback
-            // interface has no sub-interfaces). Done before allocating `arr` so
-            // `empty_childs` stays GC-rooted via `iface.childs`.
-            let empty_childs = ctx.new_ref_array(ni_cid, 0);
-            let iface = ctx.read_native_pin(iface_pin, iface);
-            ctx.set_field_by_name(iface, "childs", Value::Object(Some(empty_childs)));
-            let arr = ctx.new_ref_array(ni_cid, 1);
-            let iface = ctx.read_native_pin(iface_pin, iface);
-            ctx.set_array_element(arr, 0, Value::Object(Some(iface)));
-            ctx.unpin_native_roots(lo_pin);
-            ctx.unpin_native_roots(addrs_pin);
-            ctx.unpin_native_roots(name_pin);
-            ctx.unpin_native_roots(iface_pin);
+            let arr = re8_all_interfaces(ctx);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
-    // KEEP the nulls. These three hand back a `NetworkInterface`, and the one
-    // above (`getAll`) documents at length why a synthetic 5-slot object of
-    // that class breaks the real `getInetAddresses()`/`toString()` bytecode
-    // (`arraylength null` in `NetworkInterface$1`). Building one correctly
-    // needs the package-private `(String,int,InetAddress[])` ctor plus a
-    // `childs` fix-up per interface — the work `getAll` does for the single
-    // loopback interface it returns. Null is the spec'd "no such interface"
-    // answer and every caller (`NetworkInterface.getByName` et al.) already
-    // has to handle it, so it is honest rather than silent.
+    // These three must agree with `getAll()` — a blanket null here used to
+    // contradict it outright (`getByName("lo")` reported "no such interface"
+    // for the interface the very same class had just enumerated). They now
+    // search the same host enumeration `getAll()` uses, and fall back to the
+    // loopback carrier only where `getAll()` itself does. Null stays the answer
+    // for an interface that does not exist — the spec'd "no such interface".
     r.register(
         ni,
         "getByName0",
         "(Ljava/lang/String;)Ljava/net/NetworkInterface;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let name = re8_name_arg(ctx, args, 0);
+            let wanted = name.clone();
+            let iface = re8_find_interface(
+                ctx,
+                move |host| host.name == wanted,
+                name == RE8_LOOPBACK_NAME,
+            );
+            Ok(Some(Value::Object(iface)))
+        },
     );
     r.register(
         ni,
         "getByInetAddress0",
         "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let Some(Value::Object(Some(addr))) = args.first().copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let ip_str = inet_addr_field_string_or(ctx, addr, IA_ADDR, "");
+            let Ok(ip) = ip_str.trim_matches(&['[', ']'][..]).parse::<IpAddr>() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let iface =
+                re8_find_interface(ctx, move |host| host.addrs.contains(&ip), ip.is_loopback());
+            Ok(Some(Value::Object(iface)))
+        },
     );
     // `boundInetAddress0(InetAddress)` — "is this address configured on some
-    // local interface?". Unlike its `getByXxx0` siblings above, this one
-    // answers a QUESTION rather than handing back a `NetworkInterface` whose
-    // real field layout we cannot fake, so there is no reason to keep it a
-    // constant. A constant `false` is the dangerous direction: real
+    // local interface?". This one answers a QUESTION rather than handing back a
+    // `NetworkInterface`, so it can consult the host directly instead of being
+    // restricted to the single carrier its `getByXxx0` siblings can build.
+    // A constant `false` is the dangerous direction: real
     // `InetAddress.isAnyLocalAddress`/bind-validation callers read it as "that
     // address is not mine" and reject a bind or a same-host shortcut that
     // would have worked — for 127.0.0.1, always. Answer from the same local-IP
-    // enumeration `getAll()`/`re8_build_interfaces` use.
+    // enumeration `getAll()` uses (`re8_enumerate_local_ips` now folds in the
+    // host's configured addresses, so a secondary NIC is no longer a miss).
     r.register(
         ni,
         "boundInetAddress0",
@@ -11631,36 +12348,39 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
         ni,
         "getByIndex0",
         "(I)Ljava/net/NetworkInterface;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let index = args.first().and_then(Value::as_int).unwrap_or(0);
+            let iface = re8_find_interface(
+                ctx,
+                move |host| host.index == index,
+                index == RE8_LOOPBACK_INDEX,
+            );
+            Ok(Some(Value::Object(iface)))
+        },
     );
 
-    // R76 (Eureka / Spring Cloud bootstrap fix):
-    // `HostInfoEnvironmentPostProcessor.postProcessEnvironment` calls
-    // `InetUtils.findFirstNonLoopbackHostInfo` -> `findFirstNonLoopbackAddress`
-    // -> `NetworkInterface.getNetworkInterfaces` which throws SocketException
-    // "No network interfaces configured" (because our `getAll()` returns []).
-    // Spring catches it, but the resulting catch path then keeps walking
-    // through Spring's property-binding code with NUMEROUS recursive
-    // `Binder.bind` calls (`ConfigDataEnvironment.processAndApply` ->
-    // `withProfiles` -> `Binder.bindAggregate` -> `IndexedElementsBinder.
-    // bindIndexed` ...). With JIT compilation of these hot paths, the
-    // ConfigurationPropertyName parsing tight loop eventually SEGVs in
-    // JIT-compiled code (round 71 post-main panic visibility hook shows
-    // no Rust panic — it is a native SEGV in JIT, not a panic).
+    // REMOVED (wave 4): the R76 `HostInfoEnvironmentPostProcessor.
+    // postProcessEnvironment` no-op.
     //
-    // Surgical fix: turn `HostInfoEnvironmentPostProcessor.
-    // postProcessEnvironment(ConfigurableEnvironment,SpringApplication)V`
-    // into a no-op. This skips the SocketException-throw + Spring catch
-    // entirely. The cloud post-processor only sets "spring.cloud.client.
-    // ip-address" / ".hostname" properties from the picked interface;
-    // when not set, downstream callers fall back to the same defaults
-    // we'd compute manually, so the bypass is safe.
-    r.register(
-        "org/springframework/cloud/client/HostInfoEnvironmentPostProcessor",
-        "postProcessEnvironment",
-        "(Lorg/springframework/core/env/ConfigurableEnvironment;Lorg/springframework/boot/SpringApplication;)V",
-        |_ctx, _args| Ok(None),
-    );
+    // Its premise was that `getAll()` returned `[]`, so
+    // `InetUtils.findFirstNonLoopbackHostInfo` ->
+    // `NetworkInterface.getNetworkInterfaces()` threw SocketException("No
+    // network interfaces configured"); Spring caught it and the catch path
+    // walked through enough recursive `Binder.bind` work to hit a SEGV in
+    // JIT-compiled `ConfigurationPropertyName` parsing.
+    //
+    // Both halves of that premise are now dead. `getAll()` enumerates the
+    // host's real interfaces, so `getNetworkInterfaces()` does not throw AND
+    // `findFirstNonLoopbackAddress` now actually finds a non-loopback address
+    // instead of exhausting the enumeration — the catch path is never entered.
+    // The shim's cost was real and unconditional: it dropped
+    // `spring.cloud.client.ip-address` and `spring.cloud.client.hostname`,
+    // which the real post-processor publishes and Eureka/Ribbon registration
+    // reads. Letting the real bytecode run restores them.
+    //
+    // If a Spring Cloud boot regresses with a SEGV in
+    // `ConfigurationPropertyName`, that is the JIT bug this shim was hiding —
+    // fix it there, do not reinstate the bypass.
 }
 
 // ===========================================================================
@@ -12298,15 +13018,38 @@ fn re10_read_headers(ctx: &mut dyn NativeContext, map: ObjectRef) -> Vec<(String
 ///
 /// Slots 0..=7 are all taken by the dispatcher (method, URI, request headers,
 /// response headers, request body, status, response chunks, response-length
-/// hint), so the principal takes a ninth. That is safe here because
-/// `re10_dispatch_pending` is the ONLY place an `HttpExchange` is allocated and
-/// `alloc_concurrent_synthetic` sizes the instance from `max(requested, real)` —
-/// `class_manager`'s `instance_fields(8)` is a floor for the class, not a cap on
-/// the instance. Readers still bounds-check with `object_num_fields` so an
-/// exchange minted anywhere else simply reports "no principal" instead of
-/// running off the end of the object.
+/// hint), so the principal takes a ninth. `re10_dispatch_pending` is the ONLY
+/// place an `HttpExchange` is allocated, and readers still bounds-check with
+/// `object_num_fields` so an exchange minted anywhere else simply reports "no
+/// principal" instead of running off the end of the object.
 const HEX_PRINCIPAL: usize = 8;
-const HEX_NUM_FIELDS: usize = 9;
+
+/// Slots holding the connection's local and remote endpoints as
+/// `java/net/InetSocketAddress` objects, captured from the accepted
+/// `TcpStream` in `re10_dispatch_pending` (the one place that still holds it).
+/// `HttpExchange.getLocalAddress()` / `getRemoteAddress()` are plain reads of
+/// these. Null only if the socket is already torn down when the exchange is
+/// minted (`peer_addr()`/`local_addr()` failing) — never fabricated, because a
+/// caller that logs or rate-limits by peer must not attribute every request to
+/// one invented host.
+///
+/// `pub(crate)` because the two getters that read them are registered in
+/// `phases_late::net_channels`, and a hard-coded `9`/`10` over there is exactly
+/// the kind of drift this slot map keeps producing.
+pub(crate) const HEX_LOCAL_ADDR: usize = 9;
+pub(crate) const HEX_REMOTE_ADDR: usize = 10;
+
+/// Number of slots `re10_dispatch_pending` asks `alloc_concurrent_synthetic`
+/// for when it mints an exchange.
+///
+/// KEEP IN LOCK-STEP with the `"com/sun/net/httpserver/HttpExchange"` entry in
+/// `classloading/src/class_manager.rs` `synthetic_stub_fields` — it declares
+/// the class's instance-field count, and a class that declares FEWER fields
+/// than the index being written makes `set_field` DROP the write silently
+/// rather than error. The natives then look implemented while storing nothing;
+/// that is exactly how `HEX_PRINCIPAL` sat dead behind an `instance_fields(8)`
+/// entry. If you add a slot here, add it there in the SAME change.
+const HEX_NUM_FIELDS: usize = 11;
 
 /// The three `Authenticator.Result` subclasses the `com.sun.net.httpserver`
 /// contract defines. None of them is `final` in the JDK, so results are
@@ -12531,6 +13274,49 @@ fn re10_dispatch_pending(
                 // No principal until an `Authenticator.Success` supplies one;
                 // `HttpExchange.getPrincipal` reads this slot.
                 ctx.set_field(ex, HEX_PRINCIPAL, Value::Object(None));
+
+                // Connection endpoints. This is the last point at which the
+                // accepted `TcpStream` and the exchange coexist (`req.stream`
+                // is moved into the responder at the bottom of the loop), so
+                // the addresses must be captured here or not at all. Both are
+                // built as fully-resolved `InetSocketAddress`es the same way
+                // `HttpServer.getAddress()` builds its bound-address echo: the
+                // host string is the IP literal, matching the real
+                // `com.sun.net.httpserver`, whose exchange addresses come
+                // straight off the socket and are never reverse-resolved.
+                //
+                // GC discipline: `alloc_inet_socket_address_resolved` allocates
+                // (holder + InetAddress + strings), so `ex` is re-read from its
+                // pin after each one, and each freshly-built address is stored
+                // immediately (no allocation between its creation and its
+                // `set_field`) so the address itself needs no pin — the same
+                // rule the field writes above follow. Storing local first also
+                // makes it reachable from the pinned exchange before the remote
+                // allocation can move it.
+                let local_sa = req.stream.local_addr().ok();
+                let remote_sa = req.stream.peer_addr().ok();
+                let local_val = match local_sa {
+                    Some(sa) => {
+                        let ip = sa.ip().to_string();
+                        let isa =
+                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
+                        Value::Object(Some(isa))
+                    }
+                    None => Value::Object(None),
+                };
+                let ex = ctx.read_native_pin(ex_pin, ex0);
+                ctx.set_field(ex, HEX_LOCAL_ADDR, local_val);
+                let remote_val = match remote_sa {
+                    Some(sa) => {
+                        let ip = sa.ip().to_string();
+                        let isa =
+                            alloc_inet_socket_address_resolved(ctx, &ip, &ip, sa.port() as i32);
+                        Value::Object(Some(isa))
+                    }
+                    None => Value::Object(None),
+                };
+                let ex = ctx.read_native_pin(ex_pin, ex0);
+                ctx.set_field(ex, HEX_REMOTE_ADDR, remote_val);
 
                 // com.sun.net.httpserver contract: a context with an
                 // Authenticator attached authenticates BEFORE the handler runs,

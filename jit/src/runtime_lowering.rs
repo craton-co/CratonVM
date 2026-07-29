@@ -170,12 +170,72 @@ pub(crate) fn emit_monitor_stub(
 /// Returned rel32 sites are successful-call jumps which the caller patches to
 /// its post-call continuation after emitting the slow helper.  All miss
 /// branches are patched inside this function to the fall-through position.
+/// `LEA reg, [RBP - offset]` — the address of a frame slot.
+fn emit_lea_frame(buf: &mut ExecutableBuffer, reg: u8, offset: i32) {
+    rex_w(buf, reg, 0, 5);
+    buf.emit_byte(0x8D);
+    buf.emit_byte(0x80 | ((reg & 7) << 3) | 5);
+    buf.emit(&(-offset).to_le_bytes());
+}
+
+/// `MOV reg, imm32` sign-extended to 64 bits.
+fn emit_mov_imm32_sx(buf: &mut ExecutableBuffer, reg: u8, value: i32) {
+    rex_w(buf, 0, 0, reg);
+    buf.emit_byte(0xC7);
+    buf.emit_byte(0xC0 | (reg & 7));
+    buf.emit(&value.to_le_bytes());
+}
+
+/// After an inline call to a compiled callee: if it returned the `i64::MIN`
+/// deopt/exception sentinel, route it through `service_helper` so the callee's
+/// stashed frame is resumed at the site that made the call.
+///
+/// Without this the sentinel reaches the caller's own epilogue as if the CALLER
+/// had deopted, and the callee's reconstructed frame is left in the thread's
+/// single stash slot for an unrelated sink to mis-attribute — see
+/// `jit_service_callee_deopt` in `vm/src/jit/helpers.rs`.
+///
+/// No-ops when the runtime supplies no helper (hand-built test tables), which
+/// reproduces the previous behaviour exactly.
+fn emit_callee_deopt_check(
+    buf: &mut ExecutableBuffer,
+    service_helper: usize,
+    info_ptr: usize,
+    context_offset: i32,
+    arg_offsets: &[i32],
+) {
+    if service_helper == 0 || info_ptr == 0 || arg_offsets.is_empty() {
+        return;
+    }
+    // MOV R11, imm64(i64::MIN)
+    emit_mov_imm64(buf, R11, i64::MIN as u64);
+    // CMP RAX, R11 — REX.WR + 39 /r + ModRM(11, R11, RAX)
+    buf.emit(&[0x4C, 0x39, 0xD8]);
+    // JNE over the servicing call.
+    let skip = emit_jcc(buf, 0x85);
+
+    // (vm_ptr, info_ptr, args_ptr, num_args) in the platform C-ABI registers.
+    emit_load_frame(buf, ENTRY_ABI_REGS[0], context_offset);
+    emit_mov_imm64(buf, ENTRY_ABI_REGS[1], info_ptr as u64);
+    // `arg_offsets` descends from the block base, so element 0 is the highest
+    // slot — the same address `x64.rs`'s slow path LEAs for this helper.
+    emit_lea_frame(buf, ENTRY_ABI_REGS[2], arg_offsets[0]);
+    // Cast: argument count to the helper's i32 parameter (bounded by the ABI
+    // register table, so it always fits).
+    emit_mov_imm32_sx(buf, ENTRY_ABI_REGS[3], arg_offsets.len() as i32);
+    emit_call_absolute(buf, service_helper);
+
+    patch_rel32_to_here(buf, skip);
+}
+
 pub(crate) fn emit_hashed_vtable_stub(
     buf: &mut ExecutableBuffer,
     pic: usize,
     context_offset: i32,
     arg_offsets: &[i32],
     frame_record: usize,
+    service_helper: usize,
+    info_ptr: usize,
 ) -> Vec<usize> {
     if arg_offsets.is_empty()
         || arg_offsets.len() + 1 > ENTRY_ABI_REGS.len()
@@ -191,6 +251,20 @@ pub(crate) fn emit_hashed_vtable_stub(
     emit_load_frame(buf, RAX, arg_offsets[0]);
     buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX,RAX
     miss_patches.push(emit_jcc(buf, 0x84)); // JZ slow
+    // Array-receiver guard. The hashed ways below compare only the 4-byte
+    // `ObjectHeader.class_id`, which a reference array fills with its COMPONENT
+    // class id — so a `Foo[]` receiver matches a way published for a `Foo`
+    // receiver and is called into `Foo`'s method body. `ObjectHeader.kind`
+    // (offset 4) separates them; anything not a plain object takes the
+    // resolving helper, which dispatches arrays on `java/lang/Object`.
+    //   CMP BYTE [RAX + OBJECT_KIND_OFFSET], ObjectKind::Object
+    buf.emit(&[
+        0x80,
+        0x78,
+        cratonvm_types::OBJECT_KIND_OFFSET as u8,
+        cratonvm_types::ObjectKind::Object as u8,
+    ]);
+    miss_patches.push(emit_jcc(buf, 0x85)); // JNE slow
     buf.emit(&[0x8B, 0x10]); // MOV EDX,[RAX]
 
     // ECX = ((class_id * golden-ratio hash) >> shift) * 2.
@@ -231,6 +305,7 @@ pub(crate) fn emit_hashed_vtable_stub(
         // so marshalling cannot clobber the target loaded above.
         buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
         emit_post_call_frame_republish(buf, frame_record);
+        emit_callee_deopt_check(buf, service_helper, info_ptr, context_offset, arg_offsets);
         done_patches.push(emit_jmp(buf));
 
         if way == 0 {
@@ -257,6 +332,35 @@ mod tests {
             assert_eq!(base & 1, 0);
             assert!(base + 1 < crate::JIT_MEGA_ENTRIES);
         }
+    }
+
+    /// The hashed ways compare only `ObjectHeader.class_id`, which a reference
+    /// array fills with its COMPONENT class id — so the stub must reject a
+    /// non-object receiver kind before it hashes that word, or a `Foo[]`
+    /// receiver is called into a way published for a `Foo` receiver.
+    #[test]
+    fn hashed_vtable_stub_rejects_array_receivers() {
+        let mut buf = ExecutableBuffer::new(4096).expect("buffer");
+        emit_hashed_vtable_stub(&mut buf, 0x7fff_0000_0000_2000, 24, &[32, 40], 0);
+        let bytes = buf.as_slice();
+        let guard = [
+            0x80u8,
+            0x78,
+            cratonvm_types::OBJECT_KIND_OFFSET as u8,
+            cratonvm_types::ObjectKind::Object as u8,
+        ];
+        let guard_at = bytes
+            .windows(guard.len())
+            .position(|w| w == guard)
+            .expect("the stub must emit CMP BYTE [RAX+kind], Object");
+        let hash_at = bytes
+            .windows(2)
+            .position(|w| w == [0x8B, 0x10])
+            .expect("the stub must load the class id into EDX");
+        assert!(
+            guard_at < hash_at,
+            "the kind guard must precede the class-id load (guard@{guard_at}, load@{hash_at})"
+        );
     }
 
     #[test]

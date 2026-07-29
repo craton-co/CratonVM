@@ -1456,6 +1456,18 @@ pub(crate) fn monitor_enter_blocking(
         return obj;
     };
     let tid = thread.thread_id;
+    // JMX contention tracking. `enter_or_contend` returning `Some` is exactly
+    // the contended case, so this is the point at which the thread becomes
+    // BLOCKED_ON_MONITOR_ENTER. Publishing it here is what makes
+    // `ThreadInfo.getLockName()` / `getLockOwnerId()` and
+    // `findDeadlockedThreads()` work at all: the registry fields were being
+    // READ by `thread_jmx_snapshot` but never written by anyone, so every
+    // snapshot came back empty and the deadlock detector could not observe a
+    // single wait-for edge.
+    shared
+        .threads
+        .thread_registry
+        .set_jmx_contended_monitor(tid, obj);
     let mut ctx = NativeContextImpl { shared, thread };
     ctx.thread
         .gc_block_state
@@ -1516,6 +1528,14 @@ pub(crate) fn monitor_enter_blocking(
         .copied()
         .unwrap_or(obj);
     ctx.thread.native_pin_roots.truncate(pin_base);
+    // Acquisition succeeded: the monitor moves from "contended for" to
+    // "owned". Report the REMAPPED ref — a GC during the blocked region can
+    // move the object, and recording the pre-move address would leave a stale
+    // pointer in the owned-monitor root set.
+    shared
+        .threads
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed);
     fixed
 }
 
@@ -1539,6 +1559,16 @@ pub(crate) fn monitor_enter_synchronized_method(
     else {
         return obj;
     };
+
+    // Same JMX contention publish as `monitor_enter_blocking` — an
+    // `ACC_SYNCHRONIZED` method's monitor contends exactly as a `synchronized`
+    // block's does, and a thread blocked here is just as deadlocked. Tracking
+    // only one of the two entry points would make deadlock detection depend on
+    // which syntax the Java code happened to use.
+    shared
+        .threads
+        .thread_registry
+        .set_jmx_contended_monitor(thread.thread_id, obj);
 
     let pin_base = thread.native_pin_roots.len();
     let monitor_pin = thread.native_pin_roots.len();
@@ -1590,6 +1620,12 @@ pub(crate) fn monitor_enter_synchronized_method(
         }
     }
     ctx.thread.native_pin_roots.truncate(pin_base);
+    // Acquired: contended -> owned, reporting the remapped ref (see the twin
+    // in `monitor_enter_blocking`).
+    shared
+        .threads
+        .thread_registry
+        .complete_jmx_monitor_enter(tid, fixed_monitor);
     fixed_monitor
 }
 
@@ -3390,7 +3426,7 @@ impl<'a> NativeContextImpl<'a> {
     /// thread construction path itself, so that would loop.
     ///
     /// CONCURRENCY (fixes a confirmed TOCTOU race — see
-    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// CRATONVM-SPRING-GENUINE-BUGLIST, "5.8
     /// follow-up #4"): the body below allocates two `ThreadGroup` objects
     /// and runs their `<init>` (bytecode, can trigger a moving GC), so it
     /// cannot simply hold `main_thread_group`'s write lock across the
@@ -4337,6 +4373,15 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .map(|cs| cs.functional_interface.to_string())
     }
 
+    fn lambda_functional_interface_id(&self, class_id: ClassId) -> Option<ClassId> {
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .and_then(|cs| cs.functional_interface_id)
+    }
+
     fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
         self.shared
             .classes
@@ -4452,6 +4497,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .class_manager
             .read()
             .find_unique_class_by_name(name)
+    }
+
+    /// Real initialization state, for `Unsafe.shouldBeInitialized`. Reuses the
+    /// memoised helper the interpreter itself uses, so this is a thread-local
+    /// hit plus (on a miss) one class-manager read — it does NOT run `<clinit>`.
+    fn is_class_initialized(&self, class_id: ClassId) -> bool {
+        super::vm_util::is_class_initialized_via_manager(&self.shared, class_id)
     }
 
     fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
@@ -9795,12 +9847,52 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             5 => 0x0010, // TIMED_WAITING (approximated as WAITING for this bit-field)
             _ => 0,
         };
+        // Lock ownership. This used to be `..Default::default()`, so `lock`,
+        // `lock_owner_id`, `locked_monitors` and `locked_synchronizers` were
+        // ALWAYS empty over the native API even though the registry has
+        // tracked all four for some time. Everything downstream that reads
+        // them was therefore dead by construction: `ThreadInfo.getLockName()`
+        // / `getLockOwnerId()` / `getLockedMonitors()` reported nothing, the
+        // `findDeadlockedThreads` detector could never observe an edge (it
+        // builds its wait-for graph from `lock_owner_id`), and
+        // `isObjectMonitorUsageSupported` / `isSynchronizerUsageSupported`
+        // were correct to answer false only because of this gap.
+        let (contended, waiting, locked_monitors, locked_synchronizers) = self
+            .shared
+            .threads
+            .thread_registry
+            .jmx_lock_snapshot(registry_tid)
+            .unwrap_or((None, None, Vec::new(), Vec::new()));
+        // A thread blocks on the monitor it is contending for, or waits on the
+        // one it called `wait()` on — never both, so prefer the contended one.
+        let lock = contended.or(waiting);
+        let (lock_owner_id, lock_owner_name) = match lock {
+            Some(obj) => match self.shared.threads.monitors.current_owner(obj) {
+                // A thread never reports itself as the owner it is waiting on:
+                // that is the `wait()` case, where the monitor is released.
+                Some(owner) if owner != registry_tid => (
+                    self.shared
+                        .threads
+                        .thread_registry
+                        .java_tid_of(owner)
+                        .map_or(-1, |tid| tid as i64),
+                    self.shared.threads.thread_registry.thread_name(owner),
+                ),
+                _ => (-1, None),
+            },
+            None => (-1, None),
+        };
         Some(cratonvm_native_api::ThreadJmxSnapshot {
             thread_object: Some(thread_obj),
             thread_id,
             thread_name,
             thread_status,
             stack_trace: self.thread_stack_trace(thread_obj),
+            lock,
+            lock_owner_id,
+            lock_owner_name,
+            locked_monitors,
+            locked_synchronizers,
             ..Default::default()
         })
     }
@@ -10203,6 +10295,71 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
 
     fn active_thread_count(&self) -> i32 {
         self.shared.threads.thread_registry.alive_count() as i32
+    }
+
+    /// Record an AQS synchronizer's exclusive owner, for
+    /// `ThreadInfo.getLockedSynchronizers()`.
+    ///
+    /// `native-builtins`' `setExclusiveOwnerThread` native already called
+    /// this on every AQS ownership change, but only the trait's EMPTY DEFAULT
+    /// existed — so the call did nothing and `jmx_locked_synchronizers` was
+    /// permanently empty. That is half of why `isSynchronizerUsageSupported()`
+    /// had to answer false.
+    ///
+    /// `owner: None` means the synchronizer was released; the registry writer
+    /// clears it from every thread before assigning, so a hand-off between
+    /// threads cannot leave it recorded against both.
+    fn record_jmx_owned_synchronizer(&mut self, synchronizer: ObjectRef, owner: Option<ObjectRef>) {
+        let owner_tid = owner.and_then(|o| resolve_thread_id_from_thread_obj(self.shared, o));
+        self.shared
+            .threads
+            .thread_registry
+            .set_jmx_owned_synchronizer(owner_tid, synchronizer);
+    }
+
+    /// OS thread id behind a Java `Thread` mirror, for arbitrary-thread CPU
+    /// time. Same two-step resolve `thread_jmx_snapshot` performs.
+    fn thread_os_tid(&self, thread_obj: ObjectRef) -> Option<u32> {
+        let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
+        self.shared.threads.thread_registry.os_tid_of(tid)
+    }
+
+    /// Total JIT compile time, already in the JMM's own unit (milliseconds).
+    fn jit_total_compile_time_ms(&self) -> Option<u64> {
+        Some(
+            self.shared
+                .jit
+                .tiered_manager
+                .stats()
+                .total_compile_time_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// `(pool_size, mounted, queued)` sampled in ONE call — see the trait doc
+    /// for why the three are not separate accessors.
+    fn vt_scheduler_stats(&self) -> Option<(i32, i32, i64)> {
+        let (pool, mounted, queued) = self
+            .shared
+            .threads
+            .virtual_thread_manager
+            .scheduler_counters();
+        Some((
+            i32::try_from(pool).unwrap_or(i32::MAX),
+            i32::try_from(mounted).unwrap_or(i32::MAX),
+            i64::try_from(queued).unwrap_or(i64::MAX),
+        ))
+    }
+
+    /// Real finalization backlog, for `getObjectPendingFinalizationCount()`.
+    /// `try_lock` rather than `lock`: this is a monitoring read, and blocking a
+    /// JMX query behind an in-progress GC reference pass would be a worse
+    /// failure than briefly reporting the last known-safe answer.
+    fn pending_finalization_count(&self) -> i32 {
+        match self.shared.mem.ref_processor.try_lock() {
+            Some(rp) => rp.pending_finalization_count().min(i32::MAX as usize) as i32,
+            None => 0,
+        }
     }
 
     fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef> {
@@ -10887,6 +11044,42 @@ impl<'a> NativeGpuAccess for NativeContextImpl<'a> {
     }
 }
 
+/// Native-library indices retired by `NativeContext::unload_native_library`
+/// (`RawNativeLibraries.unload0`), keyed by `(NativeRealm address, index)`.
+///
+/// `SharedVm.natives.native_libraries` is an append-only `Vec<Library>`: the
+/// index IS the handle (`find_native_symbol` indexes it positionally and
+/// `RawNativeLibraries.load0` hands out `index + 1` as the opaque Java-side
+/// handle), so an element can never be removed without renumbering every live
+/// handle. Unload is therefore recorded out-of-band as a tombstone, and
+/// `find_native_symbol` refuses tombstoned indices — the library stays mapped
+/// (see the `unload_native_library` contract: pointers handed out earlier may
+/// still be live) but is no longer reachable through its handle.
+///
+/// Keying by the realm's address rather than the bare index keeps concurrently
+/// live VMs in one process from seeing each other's tombstones. An address can
+/// be reused by a *later* VM, so `load_native_library` clears the tombstone for
+/// every index it hands out; since indices are assigned densely from 0, any
+/// index a new realm can observe has been cleared by the load that created it.
+/// The set is bounded by the number of unloaded libraries (typically zero).
+fn unloaded_native_libraries() -> &'static std::sync::Mutex<std::collections::HashSet<(usize, i64)>>
+{
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static UNLOADED: OnceLock<Mutex<HashSet<(usize, i64)>>> = OnceLock::new();
+    UNLOADED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+impl<'a> NativeContextImpl<'a> {
+    /// Identity of this VM's [`NativeRealm`](crate::vm::realms::native_realm::NativeRealm)
+    /// for [`unloaded_native_libraries`] keying. The realm is owned by the
+    /// `SharedVm` and never moves while the VM is alive, so its address is a
+    /// stable per-VM key for the lifetime of any handle derived from it.
+    fn native_realm_key(&self) -> usize {
+        std::ptr::from_ref(&self.shared.natives) as usize
+    }
+}
+
 impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     // See the `NativeContext::refresh_root_snapshot` doc comment
     // (native-api/src/registry.rs) for the full rationale — this closes the
@@ -10998,7 +11191,24 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         // `DirectByteBuffer.address()` from `Util.getTemporaryDirectBuffer`
         // reaching `Net.read0`/`SocketDispatcher` is such a handle — route it
         // through the off-heap store. Real OS pointers fall through to raw.
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+        //
+        // Classified by the TAG BIT, not by `unsafe_arena_contains`. Two
+        // reasons, in order of importance:
+        //
+        //  1. Correctness. `contains` is a *liveness* test, so a tagged handle
+        //     whose arena had already been freed answered `false` and fell
+        //     through to the raw branch below, where a synthetic handle
+        //     (0x4000_0001_0000_0000-ish) is `copy_nonoverlapping`d as an OS
+        //     pointer. That is a SIGSEGV on exactly the use-after-free the
+        //     single-element `Unsafe.get*(long)` natives already refuse. The
+        //     tag test is true for freed handles too, so the copy is declined
+        //     and the caller raises the Java-visible error.
+        //  2. Cost. `contains` is an `RwLock` read plus a `BTreeMap` range
+        //     probe, and `unsafe_arena_copy_out` then repeats it. On the
+        //     `DirectByteBuffer` per-element path (see `dbb_get_abs` in
+        //     `native-io/src/direct_buffer.rs`) that is two locked map probes
+        //     per byte moved.
+        if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
         }
         // Reject null / negative handles. Returning `false` (not performing the
@@ -11026,7 +11236,8 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
-        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+        // Tag bit, not liveness — see `copy_from_native_memory` above for why.
+        if cratonvm_native_builtins::unsafe_arena_addr_is_tagged(addr) {
             return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
         }
         // Reject null / negative handles (failure is signalled by `false`; the
@@ -11496,7 +11707,50 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
         let mut libs = self.shared.natives.native_libraries.lock();
         let index = libs.len() as i64;
         libs.push(lib);
+        drop(libs);
+        // Clear any stale tombstone for this index. Live realms never recycle an
+        // index, so this only matters when a previous VM's realm was dropped and
+        // a new one landed at the same address — see `unloaded_native_libraries`.
+        let key = (self.native_realm_key(), index);
+        unloaded_native_libraries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
         Ok(index)
+    }
+
+    /// Logical unload for `RawNativeLibraries.unload0`.
+    ///
+    /// Tombstones the index instead of dropping the `libloading::Library`:
+    /// `native_libraries` is append-only and positional (see
+    /// [`unloaded_native_libraries`]), and dropping the library would `dlclose`
+    /// code that already-issued function pointers (bound FFM downcall stubs,
+    /// cached `findEntry0` results) may still be executing from. After this call
+    /// [`find_native_symbol`](NativeSystemAccess::find_native_symbol) refuses the
+    /// index, which is what the Java-side contract observes.
+    ///
+    /// NOTE: JNI-convention resolution (`resolve_jni_native_in_libraries`)
+    /// iterates the whole table and does not consult the tombstone set — a
+    /// library loaded through `System.loadLibrary` and unloaded through the
+    /// unrelated `RawNativeLibraries` path can still satisfy a `Java_*` symbol
+    /// lookup. That mirrors the current coupling of those two paths and is not
+    /// changed here.
+    fn unload_native_library(&mut self, lib_index: i64) -> bool {
+        if lib_index < 0 {
+            return false;
+        }
+        let live = {
+            let libs = self.shared.natives.native_libraries.lock();
+            (lib_index as usize) < libs.len()
+        };
+        if !live {
+            return false;
+        }
+        let key = (self.native_realm_key(), lib_index);
+        unloaded_native_libraries()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key)
     }
 
     fn register_upcall(&mut self, entry: crate::native::ffi::UpcallEntry) -> usize {
@@ -11563,6 +11817,23 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
     }
 
     fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize> {
+        // Indices retired by `unload_native_library` resolve nothing, exactly as
+        // a dlclosed handle would. Snapshot them BEFORE taking the library lock
+        // so the tombstone mutex is never nested inside it. The set is empty in
+        // every run that never unloads, which is the overwhelming majority.
+        let unloaded: Vec<i64> = {
+            let realm = self.native_realm_key();
+            let set = unloaded_native_libraries()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            set.iter()
+                .filter(|(r, _)| *r == realm)
+                .map(|(_, idx)| *idx)
+                .collect()
+        };
+        if lib_index >= 0 && unloaded.contains(&lib_index) {
+            return None;
+        }
         let libs = self.shared.natives.native_libraries.lock();
         let c_name = std::ffi::CString::new(name).ok()?;
 
@@ -11575,8 +11846,13 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
                     .map(|sym| *sym as usize)
             }
         } else {
-            // Default/system lookup вЂ” try all loaded libraries
-            for lib in libs.iter() {
+            // Default/system lookup — try all loaded libraries, skipping any
+            // that were unloaded (their symbols are no longer reachable through
+            // this VM's library table).
+            for (idx, lib) in libs.iter().enumerate() {
+                if unloaded.contains(&(idx as i64)) {
+                    continue;
+                }
                 if let Ok(sym) = unsafe { lib.get::<*const ()>(c_name.as_bytes_with_nul()) } {
                     return Some(*sym as usize);
                 }
@@ -12072,6 +12348,76 @@ pub(super) fn convert_element_value(
 }
 
 // ---------------------------------------------------------------------------
+// CRATONVM_DBG_DISPATCH_TALLY — which callees reach the slow resolvers?
+// ---------------------------------------------------------------------------
+//
+// A CPU profile of a dispatch-bound workload is a flat tail of
+// `slot_for_exact` / `find_method_recursive` / `invoke_or_native` samples. It
+// proves the VM is dispatching and says nothing about *what*, which is the
+// entire diagnosis: the `nioMemLZF:` residual in
+// `docs/known-issues/h2/h2-jitban-residuals-20260726.md` read as "a long
+// interpreter tail with no second hot spot to attack" for two revisions purely
+// because nobody had the callee histogram.
+//
+// Recorded at the two general resolvers that an inline-cache HIT is supposed
+// to bypass. A callee showing up here with a per-operation count in the tens
+// of thousands is a call site the IC is not serving, and that is actionable in
+// a way that a `slot_for_exact` percentage is not.
+//
+// Env-gated and `#[cold]`: the enabled path takes a global `Mutex` and formats
+// a `String` per call, so it is a diagnosis tool, not something to leave on.
+#[cold]
+pub fn dbg_dispatch_tally(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
+    dispatch_tally::record(site, class_name, method_name, descriptor);
+}
+
+mod dispatch_tally {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| {
+            cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_DISPATCH_TALLY").is_some()
+        })
+    }
+
+    fn counts() -> &'static Mutex<HashMap<String, u64>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn record(site: &str, class_name: &str, method_name: &str, descriptor: &str) {
+        if !enabled() {
+            return;
+        }
+        static TOTAL: AtomicU64 = AtomicU64::new(0);
+        {
+            let mut guard = counts().lock().unwrap_or_else(|p| p.into_inner());
+            *guard
+                .entry(format!("{site} {class_name}.{method_name}{descriptor}"))
+                .or_insert(0) += 1;
+        }
+        let n = TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % (1 << 20) == 0 {
+            dump(n);
+        }
+    }
+
+    pub(super) fn dump(total: u64) {
+        let guard = counts().lock().unwrap_or_else(|p| p.into_inner());
+        let mut rows: Vec<(u64, String)> = guard.iter().map(|(k, v)| (*v, k.clone())).collect();
+        drop(guard);
+        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        eprintln!("[dispatch-tally] total={total} distinct={}", rows.len());
+        for (count, key) in rows.into_iter().take(25) {
+            eprintln!("[dispatch-tally] {count:>12}  {key}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // invoke_or_native and helpers
 // ---------------------------------------------------------------------------
 
@@ -12084,6 +12430,7 @@ pub fn invoke_or_native(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    dbg_dispatch_tally("invoke_or_native", class_name, method_name, descriptor);
     // Residual-6 diagnosis (env-gated, CRATONVM_TRACE_CLASSVALUE): log every
     // get(Class) dispatch entering the general resolver, with its dispatch
     // class and receiver identity, so the failing call's route is visible.
@@ -13108,6 +13455,7 @@ fn invoke_special_shared_impl(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    dbg_dispatch_tally("invoke_special_shared", class_name, method_name, descriptor);
     // Native override always wins -- same priority order as invoke_or_native.
     // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
     // loaded bytecode: invokespecial is how constructors and super-calls
@@ -16024,6 +16372,12 @@ fn invoke_on_class_shared_inner(
     args: &[Value],
     no_retarget: bool,
 ) -> MethodCallResult {
+    dbg_dispatch_tally(
+        "invoke_on_class_shared_inner",
+        "",
+        method_name,
+        descriptor,
+    );
     if method_name != "<init>" && method_name != "<clinit>" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             let recv_cid = shared.mem.heap.class_id_of(recv);

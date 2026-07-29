@@ -1816,6 +1816,44 @@ fn jnio_get_buffer_base(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     }))
 }
 
+/// JDK-25 `JavaNioAccess.scaleShifts(Buffer)I` — `log2(element width)` of the
+/// buffer's element type, i.e. what the JDK's own `Buffer.scaleShifts()`
+/// overrides return (0 byte, 1 char/short, 2 int/float, 3 long/double).
+///
+/// Decided from the receiver's runtime class name, which is how the JDK's own
+/// pre-25 implementation (`AbstractMemorySegmentImpl.getScaleFactor`) did it
+/// via an `instanceof` chain. View classes are named `ByteBufferAsIntBufferB`,
+/// where the element type is the SECOND token — so take the token with the
+/// greatest index, not the first match.
+fn jnio_scale_shifts(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let buf = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        // Real `scaleShifts(null)` NPEs on the virtual call; nothing on our
+        // paths passes null, and 0 (byte) is the conservative answer.
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let class_id = ctx.class_id_of_object(buf);
+    let name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    const TOKENS: [(&str, i32); 7] = [
+        ("ByteBuffer", 0),
+        ("CharBuffer", 1),
+        ("ShortBuffer", 1),
+        ("IntBuffer", 2),
+        ("FloatBuffer", 2),
+        ("LongBuffer", 3),
+        ("DoubleBuffer", 3),
+    ];
+    let mut best: Option<(usize, i32)> = None;
+    for (token, shift) in TOKENS {
+        if let Some(pos) = name.rfind(token) {
+            if best.is_none_or(|(p, _)| pos > p) {
+                best = Some((pos, shift));
+            }
+        }
+    }
+    Ok(Some(Value::Int(best.map_or(0, |(_, shift)| shift))))
+}
+
 /// JDK-25 `JavaNioAccess.isThreadConfined(Buffer)Z` — whether the buffer's
 /// session is confined to the current thread. CratonVM has no sessions, so
 /// the buffer is never confined.
@@ -1933,21 +1971,26 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/nio/Buffer;)Z",
         jnio_has_session,
     );
-    // JDK NIO buffer views consult JavaNioAccess.scaleShifts(Buffer) to compute
-    // element-size shifts. Heap/direct buffers used by the Spring STOMP/Netty
-    // path are byte-addressed in CratonVM, so zero is the safe default.
-    // KEEP (constant, justified) — and deliberately conservative: this is a
-    // BOOT-PATH accessor (`SharedSecrets`/`JavaNioAccess` is consulted during
-    // early NIO init), and CratonVM addresses every Buffer in bytes, so a
-    // non-zero shift derived from the view's element type would MIS-SCALE the
-    // byte-addressed reads rather than fix them. The approximation is only
-    // wrong for a caller that wants the view's logical element width, and no
-    // such caller exists on our paths today.
+    // `JavaNioAccess.scaleShifts(Buffer)` delegates to the package-private
+    // `Buffer.scaleShifts()`, which every concrete buffer implements as
+    // `Integer.numberOfTrailingZeros(<element width in bytes>)` — verified with
+    // `javap -c` on jdk-25 java.nio.{Char,Short,Int,Long,Float,Double}Buffer.
+    // It is log2(element size), not a constant.
+    //
+    // STUB-REMOVAL (wave 4): the flat `0` was justified as "CratonVM addresses
+    // every Buffer in bytes, so a non-zero shift would MIS-SCALE the reads".
+    // That is backwards for the caller that exists —
+    // `AbstractMemorySegmentImpl.ofBuffer` computes
+    // `offset = address + (position << shift)` and `len = remaining << shift`
+    // precisely BECAUSE `position`/`remaining` are in ELEMENTS, not bytes; a
+    // flat 0 gave an int/long view a segment a quarter/eighth of its real size.
+    // `0` is still the answer for every ByteBuffer, so the Spring STOMP/Netty
+    // paths the old comment worried about are unchanged.
     registry.register(
         owner,
         "scaleShifts",
         "(Ljava/nio/Buffer;)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        jnio_scale_shifts,
     );
     // Some real-JDK builds expose the JavaNioAccess anonymous implementation as
     // Buffer$1 rather than Buffer$2; register both owners to avoid linkage drift.
@@ -1955,7 +1998,7 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         "java/nio/Buffer$1",
         "scaleShifts",
         "(Ljava/nio/Buffer;)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        jnio_scale_shifts,
     );
     registry.register(
         owner,

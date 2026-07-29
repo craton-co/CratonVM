@@ -277,19 +277,81 @@ fn register_beans_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // isDesignTime() / isGuiAvailable() — statements of fact, not placeholders.
-    // Their only mutators are `Beans.setDesignTime`/`setGuiAvailable`, which
-    // this module does not register at all, so no caller can put the VM into a
-    // state either of these would then be misreporting. CratonVM is always a
-    // headless runtime with no BeanBox-style design environment.
-    r.register(beans, "isDesignTime", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0))) // never in design time
-    });
-
-    r.register(beans, "isGuiAvailable", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0))) // no GUI in headless JVM
-    });
+    // isDesignTime() / isGuiAvailable() — now read real, mutable state.
+    //
+    // The previous justification for the constants ("their only mutators are
+    // `setDesignTime`/`setGuiAvailable`, which this module does not register at
+    // all, so no caller can put the VM into a state either would misreport")
+    // had the shadowing rule backwards. NOT registering the setters means the
+    // setters' REAL bytecode runs and updates `ThreadGroupContext`, while these
+    // getters — which DO shadow the real bytecode — keep answering the
+    // constant. Setting design time then silently had no effect.
+    //
+    // Both accessor pairs are therefore registered together and backed by the
+    // statics below, so the getter observes the setter in both run modes.
+    // `isGuiAvailable`'s un-set default follows the real JDK
+    // (`!GraphicsEnvironment.isHeadless()`) rather than a hard `false`;
+    // `system_bootstrap` seeds `java.awt.headless=true`, so an ordinary run
+    // still answers false, but `-Djava.awt.headless=false` is now honoured.
+    r.register(beans, "isDesignTime", "()Z", native_beans_is_design_time);
+    r.register(
+        beans,
+        "setDesignTime",
+        "(Z)V",
+        native_beans_set_design_time,
+    );
+    r.register(beans, "isGuiAvailable", "()Z", native_beans_is_gui_available);
+    r.register(
+        beans,
+        "setGuiAvailable",
+        "(Z)V",
+        native_beans_set_gui_available,
+    );
     r.set_category(__prev_cat);
+}
+
+/// `java.beans.Beans` design-time flag. The real JDK scopes this per
+/// `ThreadGroupContext`; CratonVM has one such context in practice, so a
+/// process-global flag is observationally equivalent.
+static BEANS_DESIGN_TIME: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `java.beans.Beans` GUI-available override: `-1` un-set (fall back to the
+/// headless computation), `0` false, `1` true. Mirrors the real JDK's
+/// `ThreadGroupContext.isGuiAvailable` being a nullable `Boolean`.
+static BEANS_GUI_AVAILABLE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+fn native_beans_is_design_time(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let on = BEANS_DESIGN_TIME.load(Ordering::Relaxed);
+    Ok(Some(Value::Int(i32::from(on))))
+}
+
+fn native_beans_set_design_time(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // static (Z)V — args[0] is the boolean.
+    let on = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
+    BEANS_DESIGN_TIME.store(on, Ordering::Relaxed);
+    Ok(None)
+}
+
+fn native_beans_is_gui_available(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    let available = match BEANS_GUI_AVAILABLE.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        // Un-set: real JDK answers `!GraphicsEnvironment.isHeadless()`. Only an
+        // explicit `java.awt.headless=false` makes this VM non-headless; unset
+        // defaults to headless, matching `native-awt`'s GraphicsEnvironment
+        // natives.
+        _ => ctx
+            .get_system_property("java.awt.headless")
+            .is_some_and(|v| v.eq_ignore_ascii_case("false")),
+    };
+    Ok(Some(Value::Int(i32::from(available))))
+}
+
+fn native_beans_set_gui_available(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let on = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
+    BEANS_GUI_AVAILABLE.store(i8::from(on), Ordering::Relaxed);
+    Ok(None)
 }
 
 // ===========================================================================
@@ -742,6 +804,72 @@ fn native_tracked_copy_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // T8.4.3 — sun.reflect.Reflection.getCallerClass
 // ===========================================================================
 
+/// `jdk.internal.reflect.Reflection.ensureNativeAccess(Class currentClass,
+/// Class owner, String methodName, boolean jni)` — JEP 472's restricted-method
+/// announce point, called by `Linker`, `MemorySegment.reinterpret`,
+/// `SymbolLookup.libraryLookup` and `System.load*` before doing the restricted
+/// thing.
+///
+/// Resolves the caller's module from the `currentClass` mirror and asks the
+/// recorded `--enable-native-access` policy about it. Not granted ⇒ warn once
+/// per module (the JDK 24/25 default `--illegal-native-access=warn`); the
+/// actual denial happens at the operations themselves.
+fn native_reflection_ensure_native_access(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // static (Class, Class, String, Z)V — args[0] is `currentClass`.
+    let module = match args.first() {
+        Some(Value::Object(Some(mirror))) => ctx
+            .class_id_from_mirror(*mirror)
+            .and_then(|cid| ctx.module_name_of_class(cid)),
+        _ => None,
+    };
+    // `java.base` is implicitly granted native access and is never warned about.
+    if module.as_deref() == Some("java.base") {
+        return Ok(None);
+    }
+    if crate::panama::module_native_access_enabled(module.as_deref()) {
+        return Ok(None);
+    }
+
+    static NATIVE_ACCESS_WARNED: std::sync::OnceLock<Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let key = module.unwrap_or_else(|| "ALL-UNNAMED".to_string());
+    let first_time = NATIVE_ACCESS_WARNED
+        .get_or_init(|| Mutex::new(std::collections::BTreeSet::new()))
+        .lock()
+        .map(|mut seen| seen.insert(key.clone()))
+        .unwrap_or(false);
+    if !first_time {
+        return Ok(None);
+    }
+
+    let owner = match args.get(1) {
+        Some(Value::Object(Some(mirror))) => ctx
+            .class_id_from_mirror(*mirror)
+            .and_then(|cid| ctx.class_name_of_id(cid))
+            .map(|n| n.replace('/', "."))
+            .unwrap_or_else(|| "<unknown>".to_string()),
+        _ => "<unknown>".to_string(),
+    };
+    let method = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    tracing::warn!(
+        target: "native_access",
+        "A restricted method in {} has been called: {}.{}; module {} was not \
+         granted --enable-native-access. Restricted methods will be blocked in \
+         a future release.",
+        owner,
+        owner,
+        method,
+        key
+    );
+    Ok(None)
+}
+
 fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -979,16 +1107,30 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(flags.unwrap_or(0x0001))))
         },
     );
-    // `Reflection.ensureNativeAccess` enforces the JEP 442 restricted-method
-    // policy (`--enable-native-access`).  A no-op is CratonVM's actual policy,
-    // not a dropped check: this VM grants native access to every module
-    // unconditionally, and there is no counterpart query that would report
-    // otherwise.  It returns void, so nothing can disagree with it.
+    // `Reflection.ensureNativeAccess` is the JEP 442/472 restricted-method
+    // announce point (`--enable-native-access`). Now implemented, not a no-op.
+    //
+    // Two earlier justifications for the no-op were both wrong. The first
+    // claimed CratonVM "grants native access to every module unconditionally";
+    // it does not — `panama::NativeAccessPolicy` records the
+    // `--enable-native-access` grant faithfully (`None` / `All` / per-module)
+    // and defaults to `None`. The second claimed "the caller's MODULE is not
+    // derivable from a mirror here"; it is —
+    // `NativeContext::module_name_of_class` does exactly that, and is what
+    // `module_native_access_enabled` wants.
+    //
+    // The announce point warns rather than throws, matching the JDK 24/25
+    // default `--illegal-native-access=warn`. The hard denial stays where
+    // CratonVM already enforces it — `panama::require_native_access` on the
+    // downcall and raw-address `MemorySegment` paths — because
+    // `ensureNativeAccess` also fires on paths this VM does not gate
+    // (`System.loadLibrary`, `SymbolLookup.libraryLookup`), and throwing here
+    // under the default `NativeAccessPolicy::None` would break all of them.
     r.register(
         refl2,
         "ensureNativeAccess",
         "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;Z)V",
-        |_ctx, _args| Ok(None),
+        native_reflection_ensure_native_access,
     );
 
     // ClassLoader.registerAsParallelCapable()Z — called from every
@@ -1005,6 +1147,20 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // is a performance hint for the JDK's parallel class-loading lock
     // scheme; returning true is always safe for a single-threaded
     // bootstrap and any later classloader will silently accept it.
+    //
+    // NOT implementable from here, and MOSTLY DEAD.  This is one of three
+    // registrations of the same triple that all answer 1
+    // (`classloader.rs::cl_register_as_parallel_capable`,
+    // `classloader_real.rs`).  `vm_init.rs` calls
+    // `register_classloader_real_natives` AFTER
+    // `register_deprecated_internal_natives` on the real-JDK path, and lib.rs
+    // calls `classloader.rs` last on the synthetic path, so this copy only
+    // wins in a registry built from `register_essential_natives_with_shims`
+    // alone (unit tests).  The real fix is upstream of all three: make
+    // `WeakHashMap`/`WeakReference` retain strongly-reachable `Class` keys so
+    // the real `ParallelLoaders` bytecode works, then delete all three
+    // registrations.  Until then the answer must stay `1` in every copy —
+    // `false` aborts boot with the InternalError above.
     r.register(
         "java/lang/ClassLoader",
         "registerAsParallelCapable",
@@ -1029,6 +1185,13 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // overloads to return null.  The ModuleLoader ends up with a null
     // mxBean field — harmless outside introspection — and <clinit>
     // completes cleanly.
+    //
+    // Classification: WORKAROUND for a VM bug elsewhere, not an unimplemented
+    // stub. There is no "real" value to compute here — the only correct
+    // implementation is to delete both registrations and let the JBoss
+    // bytecode run. Exit criterion: `org.jboss.modules.ref`'s
+    // WeakReference/`Reaper` machinery stops raising IllegalStateException
+    // under CratonVM's concurrency subsystem.
     r.register(
         "org/jboss/modules/ModuleLoader$1",
         "run",
@@ -1294,6 +1457,13 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
     // only path that actually resolves Keycloak's modules.  The JDK's
     // own modules are already loaded by our real-JDK bootstrap and are
     // accessible to bytecode via the regular class loader hierarchy.
+    //
+    // Classification: this is a SPEC-VALID answer, not a placeholder — the
+    // `ModuleFinder` contract explicitly allows a finder to return null for a
+    // module it does not provide, and the fallback finder is the one that
+    // matters. Exit criterion is nonetheless the NPE named above (a
+    // ConcurrentHashMap lookup returning null inside `ModuleSpec$Builder`),
+    // after which both registrations can simply be deleted.
     r.register(
         "org/jboss/modules/JDKModuleFinder",
         "findModule",

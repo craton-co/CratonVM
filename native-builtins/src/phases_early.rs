@@ -838,6 +838,39 @@ mod props_index_cache {
     }
 }
 
+/// `jdk.internal.misc.CDS.dumpClassList(String)`.
+///
+/// HotSpot's `-XX:DumpLoadedClassList` writer: one loaded class per line in
+/// internal (`java/lang/Object`) form. CratonVM cannot build an archive from
+/// the result, but the list itself is real VM state and is what every consumer
+/// of this file actually reads.
+fn native_cds_dump_class_list_to_file(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path = match args.first().copied() {
+        Some(Value::Object(Some(s))) => ctx.read_string(s),
+        _ => None,
+    };
+    let path = match path {
+        Some(p) if !p.is_empty() => p,
+        // No path: HotSpot's dumper has nowhere to write either.
+        _ => return Ok(None),
+    };
+    let mut out = String::new();
+    for name in ctx.list_application_class_names() {
+        out.push_str(&name);
+        out.push('\n');
+    }
+    if let Err(e) = std::fs::write(&path, out) {
+        return Err(RuntimeError::IOException {
+            message: format!("dumpClassList {path}: {e}"),
+        }
+        .into());
+    }
+    Ok(None)
+}
+
 // ===========================================================================
 // Core stdlib utility methods (Collections.emptyList, Arrays.asList, Optional)
 // ===========================================================================
@@ -1963,27 +1996,19 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     });
 
     // --- String.toUpperCase(Locale) / toLowerCase(Locale) ---
+    // Share the locale-aware implementation rather than folding with Rust's
+    // root-locale mapping and dropping `args[1]` on the floor (DIV-001).
     r.register(
         s,
         "toUpperCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let val = ctx.read_string(this).unwrap_or_default();
-            let s = ctx.create_string(&val.to_uppercase());
-            Ok(Some(Value::Object(Some(s))))
-        },
+        crate::lang_string::native_string_to_upper_case_uncached,
     );
     r.register(
         s,
         "toLowerCase",
         "(Ljava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let val = ctx.read_string(this).unwrap_or_default();
-            let s = ctx.create_string(&val.to_lowercase());
-            Ok(Some(Value::Object(Some(s))))
-        },
+        crate::lang_string::native_string_to_lower_case_uncached,
     );
 
     // --- String.getBytes(String charsetName) ---
@@ -2845,16 +2870,20 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     );
 
     // jdk.internal.misc.CDS: CratonVM does not use HotSpot class-data sharing.
-    // Report all dump/sharing modes disabled and make archive hooks no-ops.
+    // Report all dump/sharing modes disabled and make the archive hooks inert.
     //
-    // Every entry in this block is a spec-correct KEEP, not a stub: CDS is an
-    // optional HotSpot feature, and a JVM built or launched without it answers
-    // exactly this way. With `isDumpingClassList0`/`isDumpingArchive0`/
-    // `isSharingEnabled0` all false the JDK's own callers never consult an
-    // archive, so `initializeFromArchive` (fields stay at their <clinit>
-    // values), `defineArchivedModules` (the module graph is built normally),
-    // `logLambdaFormInvoker`, `dumpClassList` and `dumpDynamicArchive` are
-    // inert by definition rather than by omission.
+    // The three `is*0` flags are a spec-correct KEEP, not a stub: CDS is an
+    // optional HotSpot feature, and HotSpot itself answers exactly this way
+    // when built with `INCLUDE_CDS=0` or launched with `-Xshare:off`. With
+    // them all false the JDK's own callers never consult an archive, so
+    // `initializeFromArchive` (fields stay at their <clinit> values),
+    // `defineArchivedModules` (the module graph is built normally) and
+    // `logLambdaFormInvoker` are inert by definition rather than by omission.
+    //
+    // The two `dump*` entry points are different: a caller only reaches them
+    // by explicitly asking for a dump, so "silently did nothing, reported
+    // success" is a lie. `dumpClassList` now writes the real list; the archive
+    // dump refuses. See below.
     let cds_cls = "jdk/internal/misc/CDS";
     r.register(cds_cls, "isDumpingClassList0", "()Z", native_return_false);
     r.register(cds_cls, "isDumpingArchive0", "()Z", native_return_false);
@@ -2884,27 +2913,40 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
     r.register(cds_cls, "getRandomSeedForDumping", "()J", |_ctx, _args| {
         Ok(Some(Value::Long(0)))
     });
+    // The one CDS entry point with a real local answer: HotSpot's
+    // `-XX:DumpLoadedClassList` writer emits one internal-form class name per
+    // line, and the VM knows that list (`list_application_class_names`).
     r.register(
         cds_cls,
         "dumpClassList",
         "(Ljava/lang/String;)V",
-        native_noop,
+        native_cds_dump_class_list_to_file,
     );
+    // THROW rather than pretend. There is no CratonVM archive format at all,
+    // so a no-op reported "archive written" and left the caller with no file.
     r.register(
         cds_cls,
         "dumpDynamicArchive",
         "(Ljava/lang/String;)V",
-        native_noop,
+        |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "CratonVM does not support CDS archives".to_string(),
+            }
+            .into())
+        },
     );
 
     // jdk.internal.misc.VM natives.
     //
     // `VM.initialize()` is a spec-correct KEEP in the same family as
-    // `registerNatives()`: everything HotSpot's counterpart publishes (the
-    // init level, the saved-properties snapshot, page/direct-buffer sizes) is
-    // already established by CratonVM's Rust bootstrap before any Java frame
-    // runs, and is served by the `initLevel`/`awaitInitLevel`/`getSavedProperty`
-    // natives immediately below. There is no VM state left for it to install.
+    // `registerNatives()`. Its real body (libjava's `VM.c`) acquires a handle
+    // to libjvm so that later `JDK_FindJvmEntry` symbol lookups resolve — a
+    // host-linkage step with no analogue here, since CratonVM's "JVM entry
+    // points" are Rust functions. Everything the Java side then reads (the
+    // init level, the saved-properties snapshot) is already established by the
+    // Rust bootstrap before any Java frame runs and is served by the
+    // `initLevel`/`awaitInitLevel`/`getSavedProperty` natives immediately
+    // below. There is no VM state left for it to install.
     r.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);
     // WP1.3: VM.initLevel() reads the process-wide init-level registry
     // (see cratonvm_native_api::init_level).  Advances as the VM
@@ -3504,13 +3546,13 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // close() — KEEP. Every `Scanner` constructor above drains its source
-    // eagerly into the field-0 String and keeps no reference to the underlying
-    // stream/file/reader, so there is no handle left for `close()` to release.
-    // (Residual, not a stub: a closed Scanner still returns tokens instead of
-    // throwing IllegalStateException — that needs a "closed" slot the 3-field
-    // carrier does not have.)
-    r.register(sc, "close", "()V", |_ctx, _args| Ok(None));
+    // `close()V` used to be registered here as a bare no-op. It was dead in
+    // every configuration and strictly worse than the live one: native-io's
+    // `register_scanner_natives` registers the same triple with
+    // `native_scanner_close`, which sets the real `SCAN_FIELD_CLOSED` slot, and
+    // `register_io_natives` runs AFTER `register_builtins` in both modes (see
+    // the same argument for StringReader/StringWriter below). Removed rather
+    // than reimplemented — the live implementation already exists.
 
     // java.io.StringReader / StringWriter registrations used to live here,
     // but this function is only ever reached via `register_synthetic_overrides`
@@ -8181,6 +8223,14 @@ pub(crate) fn register_timer_natives(_r: &mut NativeMethodRegistry) {
 // instances; tasks are reaped on a best-effort basis when their entry has
 // been observed `done==true` and not consulted for >256 calls (see
 // `fjp_state_reap`).
+/// Parallelism of `ForkJoinPool.commonPool()`.
+///
+/// Not a placeholder: the common pool handed out below starts no workers and
+/// runs every task inline on the submitting thread, so it has exactly one.
+/// Kept as a single constant so the pool's parallelism slot and
+/// `getCommonPoolParallelism()` cannot drift apart.
+const FJP_COMMON_PARALLELISM: i32 = 1;
+
 pub(crate) fn fjp_state() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, FjpEntry>> {
     static STATE: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<usize, FjpEntry>>> =
         std::sync::OnceLock::new();
@@ -8276,6 +8326,32 @@ pub(crate) fn fjp_state_cancel(o: ObjectRef) -> bool {
     e.cancelled = true;
     e.result = Value::Object(None);
     true
+}
+
+/// Record a `fork()`ed task as submitted-but-not-yet-run.
+///
+/// `fork()` here is lazy: it queues the task and returns, and the work happens
+/// in the matching `join()`/`get()`/`invoke()`. Entering the task in the side
+/// table with `done == false` is what makes `getQueuedTaskCount()` answerable.
+/// It changes nothing else — every reader already treats a missing key and a
+/// `done == false` entry identically — and it is GC-safe, because
+/// `gc_scan_forkjoin_roots`/`gc_update_forkjoin_refs` root and rekey every
+/// entry in the table.
+pub(crate) fn fjp_state_mark_queued(o: ObjectRef) {
+    fjp_state()
+        .lock()
+        .entry(fjp_key(o))
+        .or_insert_with(FjpEntry::new);
+}
+
+/// Tasks forked but not yet completed — the pool's real queue depth.
+///
+/// The count is over all tasks rather than per-pool: `commonPool()` mints a
+/// fresh carrier on every call and a task is never associated with a pool in
+/// this model, so there is no per-pool partition to report. `getQueuedTask
+/// Count()` is documented as an estimate.
+pub(crate) fn fjp_queued_task_count() -> i64 {
+    fjp_state().lock().values().filter(|e| !e.done).count() as i64
 }
 
 /// `(done, cancelled)` for the given task; `(false, false)` if never seen.
@@ -8397,7 +8473,46 @@ fn fjt_entry_point(ctx: &mut dyn NativeContext, task: ObjectRef) -> FjtEntry {
     }
 }
 
+/// Threads currently inside a task body, i.e. `ForkJoinPool.getActiveThread
+/// Count()`'s "threads stealing or executing tasks". This pool runs every task
+/// inline on the submitting thread, so a thread is an active pool thread for
+/// exactly as long as it is inside `fjp_compute_*`. Nested fork/join on one
+/// thread is still one thread, hence the depth guard.
+static FJP_ACTIVE_THREADS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+thread_local! {
+    static FJP_COMPUTE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard: counts the calling thread as an active pool thread for the
+/// duration of one task body, and only on the outermost entry.
+struct FjpActiveGuard(bool);
+
+impl FjpActiveGuard {
+    fn enter() -> Self {
+        let outermost = FJP_COMPUTE_DEPTH.with(|d| {
+            let n = d.get();
+            d.set(n + 1);
+            n == 0
+        });
+        if outermost {
+            FJP_ACTIVE_THREADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self(outermost)
+    }
+}
+
+impl Drop for FjpActiveGuard {
+    fn drop(&mut self) {
+        FJP_COMPUTE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if self.0 {
+            FJP_ACTIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 fn fjp_compute_object_result(ctx: &mut dyn NativeContext, task: ObjectRef) -> (ObjectRef, Value) {
+    let _active = FjpActiveGuard::enter();
     let task_pin = ctx.pin_native_root(task);
     let mut live_task = task;
     let result = match fjt_entry_point(ctx, live_task) {
@@ -8432,6 +8547,7 @@ fn fjp_compute_object_result(ctx: &mut dyn NativeContext, task: ObjectRef) -> (O
 }
 
 fn fjp_compute_void(ctx: &mut dyn NativeContext, task: ObjectRef) -> ObjectRef {
+    let _active = FjpActiveGuard::enter();
     let task_pin = ctx.pin_native_root(task);
     if fjt_entry_point(ctx, task) == FjtEntry::Exec {
         let _ = ctx.invoke_virtual(task, "exec", "()Z", &[]);
@@ -8509,7 +8625,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinPool;",
         |ctx, _args| {
             let p = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ForkJoinPool", 1);
-            ctx.set_field(p, 0, Value::Int(1));
+            ctx.set_field(p, 0, Value::Int(FJP_COMMON_PARALLELISM));
             Ok(Some(Value::Object(Some(p))))
         },
     );
@@ -8517,11 +8633,12 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    // KEEP: `commonPool()` right above hands out a parallelism-1 pool that runs
-    // every task inline, so 1 is this VM's true common-pool parallelism, not a
-    // placeholder. (It is also the value HotSpot reports on a single-core host.)
+    // KEEP: reads the same constant `commonPool()` right above stamps into the
+    // pool's parallelism slot, so this is a real readout of this VM's common
+    // pool rather than an independent guess. (It is also the value HotSpot
+    // reports on a single-core host.)
     r.register(pool, "getCommonPoolParallelism", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(FJP_COMMON_PARALLELISM)))
     });
     // W2: `shutdown()` was a no-op while `isShutdown()`/`isTerminated()` were
     // constant `false`, so the standard drain loop
@@ -8609,19 +8726,28 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(runnable))))
         },
     );
-    // KEEP (all three): true by construction for an inline-execution pool.
-    // Every task runs on the CALLING thread inside `invoke`/`submit` and has
-    // already finished by the time any of these can be observed, so the pool
-    // owns exactly the one (borrowed) thread, has no task running in a worker,
-    // and never queues anything.
+    // KEEP: this pool starts no worker threads — it borrows whichever thread
+    // called `invoke`/`submit` and runs the task there — so the number of
+    // threads it owns is the one borrowed carrier. HotSpot reports the same 1
+    // for a parallelism-1 pool.
     r.register(pool, "getPoolSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // "Threads stealing or executing tasks", read from the live counter that
+    // `fjp_compute_object_result`/`fjp_compute_void` maintain. The previous
+    // constant 0 was right only between tasks; a `compute()` that asks the
+    // pool how busy it is was told "idle" while it was itself running.
     r.register(pool, "getActiveThreadCount", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+        Ok(Some(Value::Int(
+            FJP_ACTIVE_THREADS.load(std::sync::atomic::Ordering::Relaxed),
+        )))
     });
+    // Real queue depth. The constant 0 assumed nothing is ever outstanding,
+    // but `fork()` is deliberately LAZY here: it queues the task and returns,
+    // and the work only happens at the matching `join()`. Between those two
+    // points the task genuinely is queued.
     r.register(pool, "getQueuedTaskCount", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
+        Ok(Some(Value::Long(fjp_queued_task_count())))
     });
     // W2: this returned a constant `true` ("the pool terminated within the
     // timeout") even for a pool nobody had shut down, which now that
@@ -8653,6 +8779,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
+            fjp_state_mark_queued(this);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -8716,8 +8843,11 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
     // RecursiveTask — done+result tracked in `fjp_state` side-table.
     // WP4.3 fix: switched off field-index access (broken in real-JDK mode).
     let rt = "java/util/concurrent/RecursiveTask";
+    // KEEP: genuinely empty, same as the `RecursiveAction` ctor below. The real
+    // `RecursiveTask()` constructor has an empty body, and this model keeps all
+    // task state in the `fjp_state` side table, which starts empty for an
+    // unseen key — so there is nothing to initialise here.
     r.register(rt, "<init>", "()V", |_ctx, _args| {
-        // No field initialization — side-table starts empty for this task.
         Ok(Some(Value::Object(None)))
     });
     // Lazy fork — see ForkJoinTask.fork above for rationale.
@@ -8727,6 +8857,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
+            fjp_state_mark_queued(this);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -8809,6 +8940,7 @@ pub(crate) fn register_forkjoin_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
+            fjp_state_mark_queued(this);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -8997,6 +9129,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
             tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), "fjt.fork (lazy)");
+            fjp_state_mark_queued(this);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -9102,6 +9235,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             tracing::debug!(target: "fjp", task = format!("0x{:x}", fjp_key(this)), "rt.fork (lazy)");
             // Lazy: do not eagerly compute. The next `join()` / `get()` /
             // `invoke()` on this task will run `compute()` if not done.
+            fjp_state_mark_queued(this);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -9175,6 +9309,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ForkJoinTask;",
         |_ctx, args| {
             let this = obj_arg(args, 0)?;
+            fjp_state_mark_queued(this);
             Ok(Some(Value::Object(Some(this))))
         },
     );
@@ -9233,7 +9368,7 @@ pub fn register_real_jdk_forkjoin_essentials(r: &mut NativeMethodRegistry) {
             // mode the real fields are populated by the real JDK
             // <clinit>. The native invoke() above uses the side-table
             // exclusively, so this field has no functional effect.
-            ctx.set_field(p, 0, Value::Int(1));
+            ctx.set_field(p, 0, Value::Int(FJP_COMMON_PARALLELISM));
             Ok(Some(Value::Object(Some(p))))
         },
     );
@@ -9795,13 +9930,22 @@ pub(crate) fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) 
         Ok(Some(n))
     });
     // KEEP (all three): these are honest for the carrier that can actually
-    // reach them. A REAL ScheduledThreadPoolExecutor never does — these three
-    // are declared on `ThreadPoolExecutor`, so the declaring-class lookup
-    // resolves to native-collections' `tp`-keyed registrations, which delegate
-    // to the genuine JDK bytecode via `invoke_special_bytecode_only`. The only
-    // receiver left here is the synthetic 2-slot carrier, whose `execute`
-    // runs each Runnable inline and returns, so at every observable moment it
-    // has zero active tasks and keeps no task counters at all.
+    // reach them. Re-verified for wave 4: `ScheduledThreadPoolExecutor` does
+    // not override `getActiveCount`/`getTaskCount`/`getCompletedTaskCount`, so
+    // a REAL receiver resolves them on `ThreadPoolExecutor` and the lookup key
+    // is that class — which native-collections registers (`let tp = "java/util
+    // /concurrent/ThreadPoolExecutor"`), routing real pools into the genuine
+    // JDK bytecode via `invoke_special_bytecode_only`. The only receiver that
+    // reaches THIS `ses`-keyed entry is the synthetic 2-slot carrier, whose
+    // `execute` (above) runs each Runnable inline and returns, so it has zero
+    // active tasks at every observable moment.
+    //
+    // Residual, not a stub: `getTaskCount`/`getCompletedTaskCount` are
+    // cumulative, so 0 under-reports work the synthetic carrier has already
+    // run. Counting it needs a GC-stable per-executor key (the carrier has no
+    // spare slot and this table would have to be a GC-scanned side table like
+    // `fjp_state`); a process-global counter would be worse than 0, since it
+    // would attribute every executor's work to each of them.
     r.register(ses, "getActiveCount", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -13037,6 +13181,15 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Cipher,
             )?;
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Cipher",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -13176,10 +13329,18 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, CIPHER_ALGO)))
         },
     );
-    // getBlockSize() -> int
-    r.register(cipher, "getBlockSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16))) // AES block size
-    });
+    // getBlockSize() -> int: REMOVED, it was a dead duplicate. This copy
+    // answered a hard-coded 16 for every transformation (wrong for the DES
+    // family, and for the stream/asymmetric ciphers whose contract is 0), but
+    // it could never run: `register_synthetic_overrides` calls
+    // `register_phase53_natives` (which calls this one) and then
+    // `jca::cipher::register_cipher_clinit_shim` → `register_cipher_dispatch`,
+    // which re-registers the same class+method+descriptor with a
+    // transformation-aware implementation, and the registry is
+    // last-write-wins. In real-JDK mode this function is not called at all and
+    // only the `jca::cipher` entry exists. Deleted rather than fixed in place
+    // so the two cannot drift apart again; the live one is
+    // `jca/cipher.rs::register_cipher_dispatch`.
     // getOutputSize(int inputLen) -> int
     r.register(cipher, "getOutputSize", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -15568,6 +15729,15 @@ pub(crate) fn register_phase53_security(r: &mut NativeMethodRegistry) {
                 crate::jca::provider_chain::ProviderArgWording::Shared,
             )?;
             let algo = obj_arg(args, 0)?;
+            let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Signature",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Shared,
+            )?;
             let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", 4);
             ctx.set_field(obj, 0, Value::Object(Some(algo)));
             ctx.set_field(obj, 1, Value::Int(0));
@@ -15918,11 +16088,101 @@ const SS_BACKLOG: usize = 1;
 const SS_CLOSED: usize = 2;
 const SS_LISTENER_ID: usize = 3;
 
+/// `ServerSocket` SO_TIMEOUT in milliseconds, keyed by listener id.
+///
+/// A side table rather than an instance slot because the synthetic carrier is
+/// allocated exactly four fields wide (above) and rather than the OS
+/// `SO_RCVTIMEO` option because Windows lets an accepted socket inherit the
+/// listener's options, which would silently give every accepted connection a
+/// read timeout the application never asked for.
+///
+/// Keyed by listener id, which is safe against reuse: an id is only handed out
+/// again after its listener leaves `s2_registry()`, and the one place that
+/// removes a `ServerSocket`'s listener (`close`, below) drops the entry with it.
+fn ss_accept_timeouts() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, u32>> {
+    static T: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, u32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+/// Outcome of one `ServerSocket.accept()`, distinguishing an expired SO_TIMEOUT
+/// (which the JDK reports as `SocketTimeoutException`) from a hard failure.
+enum SsAccept {
+    Accepted(i32),
+    TimedOut,
+    Failed,
+}
+
+/// `ServerSocket.accept()` honouring the SO_TIMEOUT `setSoTimeout` stored.
+///
+/// With no timeout this is `s2_blocking_accept`. With one, the listener is
+/// polled in short slices against a deadline — an explicit poll rather than
+/// `SO_RCVTIMEO` because Winsock does not apply the receive timeout to
+/// `accept()`.
+fn ss_accept_with_timeout(lid: i32) -> SsAccept {
+    use crate::servlet::{s2_alloc_stream, s2_registry};
+
+    let timeout = ss_accept_timeouts()
+        .lock()
+        .get(&lid)
+        .copied()
+        .filter(|ms| *ms > 0)
+        .map(|ms| std::time::Duration::from_millis(u64::from(ms)));
+
+    // Clone the listener out under a SHORT lock — never run accept() while
+    // holding the global socket registry (see `s2_blocking_accept`).
+    let listener = {
+        let reg = s2_registry().lock();
+        match reg.listeners.get(&lid).and_then(|l| l.try_clone().ok()) {
+            Some(l) => l,
+            None => return SsAccept::Failed,
+        }
+    };
+
+    let Some(timeout) = timeout else {
+        let _ = listener.set_nonblocking(false);
+        return match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                SsAccept::Accepted(s2_alloc_stream(stream))
+            }
+            Err(_) => SsAccept::Failed,
+        };
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    if listener.set_nonblocking(true).is_err() {
+        return SsAccept::Failed;
+    }
+    let outcome = loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Windows lets the accepted socket inherit the listener's
+                // non-blocking mode; make it blocking explicitly.
+                let _ = stream.set_nonblocking(false);
+                break SsAccept::Accepted(s2_alloc_stream(stream));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break SsAccept::TimedOut;
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(5)));
+            }
+            Err(_) => break SsAccept::Failed,
+        }
+    };
+    // The clone shares the underlying socket, so restore blocking mode for any
+    // other accept() on this listener.
+    let _ = listener.set_nonblocking(false);
+    outcome
+}
+
 // SocketInputStream/OutputStream: stream_id=0
 const SIO_STREAM_ID: usize = 0;
 
 pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
-    use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_blocking_accept, s2_registry};
+    use crate::servlet::{s2_alloc_listener, s2_alloc_stream, s2_registry};
     use std::io::{Read as StdRead, Write as StdWrite};
     use std::net::TcpListener;
     use std::net::TcpStream;
@@ -16842,10 +17102,10 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         // blocking `accept()` must be marked blocked or a concurrent STW
         // waits for a safepoint arrival that can never happen.
         ctx.begin_blocking_region();
-        let stream_id = s2_blocking_accept(lid);
+        let outcome = ss_accept_with_timeout(lid);
         ctx.end_blocking_region();
-        match stream_id {
-            Some(sid) => {
+        match outcome {
+            SsAccept::Accepted(sid) => {
                 let client = alloc_concurrent_synthetic(ctx, "java/net/Socket", 5);
                 // Seed socketLock/closeLock -- this bare allocation skips real
                 // `Socket.<init>`; see net_phase_e::re1_init_socket_locks doc
@@ -16874,7 +17134,11 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                 ctx.set_field(client, SOCK_STREAM_ID, Value::Int(sid));
                 Ok(Some(Value::Object(Some(client))))
             }
-            None => Err(RuntimeError::IOException {
+            SsAccept::TimedOut => Err(RuntimeError::SocketTimeoutException {
+                message: "Accept timed out".into(),
+            }
+            .into()),
+            SsAccept::Failed => Err(RuntimeError::IOException {
                 message: "accept failed".into(),
             }
             .into()),
@@ -16897,33 +17161,49 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
         if lid >= 0 {
             s2_registry().lock().listeners.remove(&lid);
+            // The id can be handed out again now, so its timeout must not
+            // outlive it.
+            ss_accept_timeouts().lock().remove(&lid);
         }
         ctx.set_field(this, SS_CLOSED, Value::Int(1));
         ctx.set_field(this, SS_LISTENER_ID, Value::Int(-1));
         Ok(Some(Value::Object(None)))
     });
+    // `setSoTimeout` used to walk to the listener and then deliberately drop
+    // the value ("real timeout applied at accept time" — nothing applied it),
+    // so synthetic mode silently lost every accept timeout while
+    // `net_phase_e`'s rival RE.2 accept honoured one. Store it, and let
+    // `ss_accept_with_timeout` enforce it.
     r.register(ss, "setSoTimeout", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let millis = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
-        if lid >= 0 {
-            let reg = s2_registry().lock();
-            if let Some(listener) = reg.listeners.get(&lid) {
-                // ServerSocket timeout affects accept(); use nonblocking + poll approach
-                // Store the timeout value — it will be applied in accept()
-                let _ = listener; // real timeout applied at accept time
-            }
+        if lid < 0 {
+            // Not bound: there is no listener to carry the option, and a later
+            // bind() creates a different one. `accept()` on an unbound
+            // ServerSocket is an error anyway.
+            return Ok(None);
+        }
+        let mut table = ss_accept_timeouts().lock();
+        if millis > 0 {
+            table.insert(lid, millis as u32);
+        } else {
+            // 0 is "infinite" — clear rather than store a zero deadline.
+            table.remove(&lid);
         }
         Ok(None)
     });
-    // KEEP. 0 means "infinite" for `ServerSocket.getSoTimeout`, and that is the
-    // truthful answer for this carrier: the `setSoTimeout` above is a
-    // documented no-op (`accept()` calls `s2_blocking_accept`, which has no
-    // timeout), so echoing back a stored value would tell the caller that
-    // `accept()` will time out when it never will. The real gap is
-    // `setSoTimeout`+`accept`, not this getter.
-    r.register(ss, "getSoTimeout", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // Reads back what `setSoTimeout` stored and `accept()` enforces; 0 still
+    // means "infinite", which is now true because it is also the absence of an
+    // entry rather than a value nobody kept.
+    r.register(ss, "getSoTimeout", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+        if lid < 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        let millis = ss_accept_timeouts().lock().get(&lid).copied().unwrap_or(0);
+        Ok(Some(Value::Int(millis as i32)))
     });
     r.register(ss, "setReuseAddress", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -20184,11 +20464,22 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
     // lookup and is disproportionately expensive under the moving collector.
     // Reuse the String-level implementation, which preserves the unchanged
     // receiver and alternates distinct cached results for changed ASCII input.
+    //
+    // The static signature is `(String this, byte[] value, Locale locale)`, so
+    // the receiver is `args[0]` and the locale `args[2]`; both are forwarded —
+    // passing only `args[..1]` made this (JIT-reachable) path root-locale-only.
     r.register(
         c,
         "toLowerCase",
         "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
-        |ctx, args| native_string_to_lower_case(ctx, &args[..1]),
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => Value::Object(Some(*o)),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let locale = args.get(2).cloned().unwrap_or(Value::Object(None));
+            native_string_to_lower_case(ctx, &[this, locale])
+        },
     );
 
     // static char getChar(byte[] val, int index)

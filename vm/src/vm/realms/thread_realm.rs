@@ -44,7 +44,7 @@ pub struct ThreadRealm {
     /// build; every other concurrent caller blocks on the `InProgress`
     /// waiter's condvar instead of redundantly building its own
     /// `ThreadGroup` pair. Fixes a confirmed TOCTOU race (see
-    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
+    /// CRATONVM-SPRING-GENUINE-BUGLIST, "5.8
     /// follow-up #4") where several `cratonvm-aio-dispatch-N` threads
     /// lazily building their first `Thread` mirror at the same instant
     /// could each observe `main_thread_group == None` and independently

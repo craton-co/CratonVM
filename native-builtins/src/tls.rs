@@ -804,9 +804,26 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     });
 
     // isValid() -> boolean
+    //
+    // SHADOWING (wave 3): this registration and `t27_tls::
+    // register_ssl_session_real`'s both key `javax/net/ssl/SSLSession.isValid`;
+    // `register_tls_natives` runs LAST (lib.rs ~23041 vs ~17506), so THIS one
+    // wins for every session shape. Three synthetic shapes reach it:
+    //   * this module's 6-field session          — valid flag at SES_VALID (2)
+    //   * t27's 7-field SSLEngineImpl session    — valid flag also at slot 2
+    //   * t27's 3-field SSLServerSocket.accept() — slot 2 is a *stream id*
+    // Reading slot 2 unconditionally therefore reported `isValid() == false`
+    // for any accept-session whose stream id happened to be 0. Gate on the
+    // field count, mirroring what t27's (shadowed) version did.
     r.register(cls, "isValid", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, SES_VALID)))
+        if ctx.object_num_fields(this) > SES_CREATION_TIME {
+            Ok(Some(ctx.get_field(this, SES_VALID)))
+        } else {
+            // 3-field accept session: no flag slot, and it was just
+            // negotiated — valid.
+            Ok(Some(Value::Int(1)))
+        }
     });
 
     // invalidate() -> void
@@ -856,14 +873,32 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Long(epoch_millis())))
     });
 
-    // getApplicationBufferSize() -> int
+    // getApplicationBufferSize() / getPacketBufferSize()
+    //
+    // KEEP: spec-correct protocol constants, not placeholders. RFC 8446 §5.1
+    // caps a TLSPlaintext fragment at 2^14 = 16384 bytes, and JSSE reports
+    // 16709 = 16384 + 325 bytes of record overhead (5-byte header + up to 256
+    // padding + 68 MAC/IV) — the same pair a stock JDK returns, and both are
+    // session- and layout-independent.
+    //
+    // Real `SSLSessionImpl` varies these only via
+    // `SSLParameters.setMaximumPacketSize` and only for DTLS; CratonVM models
+    // neither (`git grep maximumPacketSize` — no hits), so the real JDK
+    // behaviour is constant here too.
+    //
+    // REACHABILITY + SHADOWING (wave 4 correction — the wave-3 note was wrong):
+    // `register_tls_natives` is reached ONLY from
+    // `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]`. So this pair does NOT exist in the
+    // default real-JDK build — there `t27_tls::register_ssl_session_real`
+    // (reached from `register_essential_natives_with_shims`) is the live copy.
+    // Under `--synthetic-jdk` this registrar runs later and wins. The values
+    // are identical either way; if you change one, change both.
     r.register(cls, "getApplicationBufferSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16384))) // standard TLS max record payload
+        Ok(Some(Value::Int(16384)))
     });
-
-    // getPacketBufferSize() -> int
     r.register(cls, "getPacketBufferSize", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(16709))) // 16384 + header overhead
+        Ok(Some(Value::Int(16709)))
     });
     r.set_category(__prev_cat);
 }
@@ -2697,8 +2732,21 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    r.register(sess_impl, "isValid", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+    // isValid() — read the session's own valid flag instead of answering a
+    // constant `true`. `<init>` above seeds the same 6-slot layout as the
+    // `javax/net/ssl/SSLSession` shim (`init_ssl_session_fields` sets
+    // SES_VALID=1), so anything that invalidates a session by writing that
+    // slot is now honoured; a hardcoded `true` reported invalidated and
+    // expired sessions as still usable.
+    r.register(sess_impl, "isValid", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > SES_VALID {
+            Ok(Some(ctx.get_field(this, SES_VALID)))
+        } else {
+            // Too short to carry the flag (foreign allocation) — a session
+            // handed to us with no state is one that was just negotiated.
+            Ok(Some(Value::Int(1)))
+        }
     });
 
     // --- sun.security.ssl.SSLContextImpl.engineInit ------------------------

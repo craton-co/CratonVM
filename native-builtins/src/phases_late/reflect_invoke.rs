@@ -1420,6 +1420,32 @@ pub(crate) fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// `Package.isCompatibleWith` — is dotted numeric version `spec` at least
+/// `desired`? Component-wise comparison with missing components read as 0,
+/// exactly as `java.lang.Package.isCompatibleWith` does. `None` means a
+/// component would not parse as a non-negative int, which the real method
+/// surfaces as `NumberFormatException`.
+fn package_spec_at_least(spec: &str, desired: &str) -> Option<bool> {
+    fn parts(v: &str) -> Option<Vec<u32>> {
+        // `split('.')` on "" yields one empty component, which is exactly the
+        // parse failure the real method reports.
+        v.split('.').map(|c| c.parse::<u32>().ok()).collect()
+    }
+    let si = parts(spec)?;
+    let di = parts(desired)?;
+    for i in 0..si.len().max(di.len()) {
+        let s = si.get(i).copied().unwrap_or(0);
+        let d = di.get(i).copied().unwrap_or(0);
+        if s < d {
+            return Some(false);
+        }
+        if s > d {
+            return Some(true);
+        }
+    }
+    Some(true)
+}
+
 // =============================================================================
 // java.lang.Package — 6-field synthetic
 // (name=0, specTitle=1, specVersion=2, specVendor=3, implTitle=4, implVersion=5)
@@ -1478,20 +1504,48 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 5)))
         },
     );
-    // KEEP (constant, justified): `Package.getPackage` above mints a 6-slot
-    // synthetic whose specification-version slot is always null. Real JDK
-    // `isCompatibleWith` throws NumberFormatException on a null spec version;
-    // an optimistic `true` is what the WildFly/JBoss-modules boot scan that
-    // motivated the `getPackages` override expects, and turning it into the
-    // spec'd throw would regress that boot with no compatible answer available.
+    // Real dotted-version comparison whenever the receiver actually carries a
+    // specification version (slot 2). `Package.getPackage` below mints one
+    // with a null slot 2, but `definePackage`-style callers and any future
+    // manifest-fed builder can fill it, and for those the answer is
+    // computable — so compute it instead of always saying "compatible".
+    //
+    // The null / empty spec-version case keeps the optimistic `true`: real
+    // JDK throws NumberFormatException("Empty version string") there, but the
+    // WildFly/JBoss-modules boot scan that motivated the `getPackages`
+    // override calls this on exactly such a Package and would regress.
     r.register(
         pkg,
         "isCompatibleWith",
         "(Ljava/lang/String;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let spec = match ctx.get_field(this, 2) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if spec.is_empty() {
+                return Ok(Some(Value::Int(1)));
+            }
+            let desired = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            match package_spec_at_least(&spec, &desired) {
+                Some(ok) => Ok(Some(Value::Int(i32::from(ok)))),
+                // Real JDK propagates the Integer.parseInt failure verbatim.
+                None => Err(MethodCallFailed::from(RuntimeError::NumberFormatException {
+                    message: format!("For input string: \"{desired}\""),
+                })),
+            }
+        },
     );
-    // KEEP (constant, justified): the synthetic Package carries no sealBase,
-    // and an unsealed package is exactly what `isSealed()` reports for one.
+    // KEEP: real `Package.isSealed()` is `sealBase != null`, and nothing in
+    // CratonVM ever seals a package — `Package.getPackage` (below) and the
+    // ClassLoader-side builders in `lang_class.rs` all mint Packages with no
+    // seal base, exactly as the real JDK does for a package defined from a
+    // manifest without a `Sealed` attribute. `false` is the computed answer
+    // for every Package that can reach this native, not a placeholder.
     r.register(pkg, "isSealed", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -1626,23 +1680,11 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 6)))
         },
     );
-    // StackFrame.getMethodType() — we don't yet wire real MethodType
-    // reconstruction; return null to match JDK's UnsupportedOperationException
-    // fallback without throwing, which keeps bootstrap probes quiet.
-    // KEEP (constant, justified): the 7-slot StackFrame carries className /
-    // methodName / fileName / lineNumber / bci / declaringClass — no method
-    // DESCRIPTOR — so there is literally nothing here to build a MethodType
-    // from. And `register_p59_stackwalker` is on the ESSENTIAL path (called
-    // from `register_essential_natives_with_shims`), so this is live in
-    // real-JDK mode too: swapping the null for the spec'd
-    // UnsupportedOperationException would turn quiet bootstrap probes into
-    // throws. Fixing it properly means storing the descriptor at
-    // `populate_stack_frame` time.
     r.register(
         sf,
         "getMethodType",
         "()Ljava/lang/invoke/MethodType;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        p59_sf_get_method_type,
     );
     r.register(sf, "isNativeMethod", "()Z", |ctx, args| {
         // Native iff lineNumber == -2 (per StackTraceElement convention).
@@ -1739,6 +1781,79 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
         },
     );
     r.set_category(__prev_cat);
+}
+
+/// `StackWalker.StackFrame.getMethodType()`.
+///
+/// The 7-slot carrier stores no descriptor, but it does not need to: slot 5
+/// holds the declaring class's INTERNAL name and slot 1 the method name, and
+/// `NativeContext::declared_methods` has the descriptor for every method the
+/// class declares. That is precisely how the sibling carrier's
+/// `StackFrameInfo.getMethodType()` (`lang_stackwalker.rs`) already answers
+/// this, so the earlier "there is literally nothing here to build a
+/// MethodType from" note was wrong — this file just never used the same data.
+///
+/// Overload disambiguation follows the sibling: take the first declared
+/// overload of that name. A `StackTraceEntry` carries no descriptor, and the
+/// `getMethodType()` javadoc does not pin which overload is reported.
+///
+/// Resolution is done HERE rather than at `populate_stack_frame` time on
+/// purpose: `declared_methods` materialises every method of the class, and
+/// stack capture is hot (log4j's `StackLocator` walks on every logger
+/// lookup) while `getMethodType()` is almost never called.
+pub(crate) fn p59_sf_get_method_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let internal = match ctx.get_field(this, 5) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let method_name = match ctx.get_field(this, 1) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if internal.is_empty() || method_name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let Some(class_id) = ctx.class_id_by_name(&internal) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let descriptor = ctx
+        .declared_methods(class_id)
+        .into_iter()
+        .find(|m| m.name == method_name)
+        .map(|m| m.descriptor);
+    let Some(desc) = descriptor else {
+        return Ok(Some(Value::Object(None)));
+    };
+    // Prefer the JDK factory when the real class library is present: it
+    // interns, so the result compares `==` against MethodTypes obtained any
+    // other way. Synthetic mode has no bytecode for it (and no native
+    // registration either), so fall back to the Rust builder, which produces
+    // the same JDK field layout.
+    const FMDS: &str = "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/invoke/MethodType;";
+    if ctx.method_exists(
+        "java/lang/invoke/MethodType",
+        "fromMethodDescriptorString",
+        FMDS,
+    ) {
+        let desc_str = ctx.create_string(&desc);
+        if let Ok(Some(Value::Object(Some(mt)))) = ctx.invoke(
+            "java/lang/invoke/MethodType",
+            "fromMethodDescriptorString",
+            FMDS,
+            &[Value::Object(Some(desc_str)), Value::Object(None)],
+        ) {
+            return Ok(Some(Value::Object(Some(mt))));
+        }
+    }
+    Ok(Some(Value::Object(
+        crate::lang_invoke::build_method_type_from_descriptor(ctx, &desc),
+    )))
 }
 
 /// Populate the 6-slot StackFrame synthetic from a `StackTraceEntry`.
@@ -3049,13 +3164,28 @@ pub(crate) fn render_type_name(ctx: &mut dyn NativeContext, val: &Value) -> Stri
 pub(crate) fn register_p69_switch_bootstraps(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // KEEP (constants, justified): the `invokedynamic` opcode never reaches
-    // these. `vm/src/runtime/invokedynamic.rs` recognises SwitchBootstraps and
-    // ObjectMethods by name and bootstraps them inside the VM, so the only way
-    // into these registrations is an explicit reflective call to the bootstrap
-    // method itself — for which HotSpot's own contract is "the caller does not
-    // get a usable CallSite". `vm/src/vm.rs::switch_bootstraps_stub_p69` pins
-    // the null return, so changing it to a throw needs that test updated too.
+    // ESCALATED, not justified — the previous note here was factually wrong.
+    //
+    // What IS confirmed: `invokedynamic` never reaches these registrations.
+    // `vm/src/runtime/invokedynamic.rs` dispatches on `info.bsm_class` /
+    // `info.bsm_method` (see SWITCH_BOOTSTRAPS / OBJECT_METHODS at lines
+    // 54/63, used at 316-320) and bootstraps both families inside the VM, so
+    // the only route in is an explicit reflective call.
+    //
+    // What was WRONG: HotSpot has no "the caller does not get a usable
+    // CallSite" contract. A reflective `SwitchBootstraps.typeSwitch(...)` on
+    // a real JDK returns a working `ConstantCallSite`, and
+    // `ObjectMethods.bootstrap` returns a MethodHandle or a Class depending
+    // on the requested name. `null` is a fabricated answer, not a spec'd one.
+    //
+    // Why it is still null: implementing this means calling the VM-side
+    // bootstrappers (`invokedynamic::bootstrap_type_switch` /
+    // `bootstrap_enum_switch` / the ObjectMethods path), which take
+    // `&SharedVm`, `&mut JvmThread` and an `IndyInfo` built from the caller's
+    // constant pool. `NativeContext` exposes no equivalent, and a faithful
+    // argument-validating version would also have to throw NPE/IAE on the
+    // all-null arguments that `vm/src/vm.rs::switch_bootstraps_stub_p69`
+    // currently asserts return null. Both are cross-crate changes.
     let sb = "java/lang/runtime/SwitchBootstraps";
     r.register(sb, "typeSwitch",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
@@ -3081,10 +3211,45 @@ pub(crate) fn register_p70_constant_bootstraps(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cb = "java/lang/invoke/ConstantBootstraps";
 
-    // nullConstant — returns null (correct as-is)
+    // `nullConstant` is not purely constant: the real body is
+    //   `if (requireNonNull(type).isPrimitive())
+    //        throw new IllegalArgumentException("not reference: " + type);
+    //    return null;`
+    // The primitive guard is implemented here — a caller asking for a null of
+    // `int.class` has a bug that must surface as IAE, not as a null that
+    // unbox-NPEs somewhere else. The `requireNonNull(type)` arm is
+    // deliberately NOT implemented: `vm/src/vm.rs::constant_bootstraps_
+    // null_constant_p70` calls this with a null type and asserts null back,
+    // and that test lives in another crate (escalated).
+    //
+    // The condy opcode never reaches here anyway — `interpreter.rs` resolves
+    // `ConstantBootstraps.nullConstant` in-VM (~19533) — so this serves
+    // explicit reflective calls only.
     r.register(cb, "nullConstant",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))));
+        |ctx, args| {
+            if let Some(Value::Object(Some(type_mirror))) = args.get(2).copied() {
+                let primitive = matches!(
+                    ctx.invoke_virtual(type_mirror, "isPrimitive", "()Z", &[]),
+                    Ok(Some(Value::Int(n))) if n != 0
+                );
+                if primitive {
+                    let rendered = match ctx.invoke_virtual(
+                        type_mirror,
+                        "getName",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    return Err(MethodCallFailed::from(RuntimeError::IllegalArgumentException {
+                        message: format!("not reference: {rendered}"),
+                    }));
+                }
+            }
+            Ok(Some(Value::Object(None)))
+        });
 
     // primitiveClass — returns the Class object for a primitive type
     r.register(cb, "primitiveClass",

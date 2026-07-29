@@ -586,62 +586,6 @@ fn should_skip_jit_internal(
         return Some(SkipReason::StreamMatchOpsUncommonTrap);
     }
 
-    // SPRING-RT-EQUALS.1 (2026-07-27) — REGRESSION REPAIR, not a new ban.
-    //
-    // `654dfb918` ("retire the inert is_known_miscompile ban block") deleted
-    // ~189 (class, method) entries after finding the block's gate had drifted
-    // and concluding the list was inert. That held for most of it, but not
-    // here: the deleted list covered the `ConcurrentReferenceHashMap` lookup
-    // chain that reaches this method, and dropping it re-enabled a live
-    // miscompile of `ResolvableType.equals`.
-    //
-    // Symptom (~59 Spring Boot classes): `ResolvableType.forType` does
-    // `cache.get(key)` on a `ConcurrentReferenceHashMap` then
-    // `checkcast ResolvableType` (bytecode 61 -> 64). The lookup compares keys
-    // with `ResolvableType.equals`, whose compiled body confuses a
-    // `ResolvableType[]` with a `ResolvableType` element, so the map hands back
-    // the wrong object and the cast throws
-    //   `ClassCastException: class org.springframework.core.ResolvableType
-    //    cannot be cast to class org.springframework.core.ResolvableType`
-    //
-    // That message READS like a duplicate-class / loader-identity split and is
-    // NOT one. The receiver is an ARRAY (`kind=Array`,
-    // `arr_desc="[Lorg/springframework/core/ResolvableType;"`, component cid ==
-    // target cid), and `jit_checkcast` renders an array receiver by its
-    // COMPONENT name. The typecheck refusal is correct; the value reaching it
-    // is not. `jit_typecheck_resolve`'s own comment already warned this shape
-    // "made this look like a class-identity split for far longer than it should
-    // have" — it cost two wrong diagnoses again here, so the checkcast-fail
-    // trace in `vm/src/jit/helpers.rs` now prints kind + array descriptor.
-    //
-    // Isolation (one binary, no rebuilds), witness `ConditionalOnPropertyTests`
-    // (38 tests):
-    //   --nojit                                                     -> 38/38 pass
-    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/core           -> pass
-    //   CRATONVM_JIT_BISECT_ONLY=org/springframework/util           -> pass
-    //   CRATONVM_JIT_BISECT_ONLY=<core>,<util>                      -> FAIL (minimal pair)
-    //   CRATONVM_JIT_BISECT_SKIP=ResolvableType.equals, full JIT    -> 38/38 pass
-    // Not heap/GC dependent (identical at --Xmx 512m and 8g) and not the
-    // pointer-keyed typecheck target cache (instrumented: zero stale hits).
-    //
-    // Scope: this ban is deliberately ONE method. An earlier revision of this
-    // fix banned the whole six-entry `ConcurrentReferenceHashMap` lookup chain
-    // (`get`/`getReference`/`getEntryIfAvailable` +
-    // `$Segment.{getReference,findInChain,restructureIfNecessary}`), which also
-    // works — but only because banning `findInChain` stops `equals` being
-    // INLINED into it. `equals` is the actual defective body: skipping it alone,
-    // with no chain ban at all, passes 38/38. Independently bisected to the same
-    // method by dev's `c7c0ac86e`. Banning one leaf method instead of a hot
-    // map-lookup chain keeps `ConcurrentReferenceHashMap` JIT-eligible.
-    //
-    // Still open as a codegen defect — see
-    // docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md.
-    // Remove this ban when the array-vs-element confusion in the lowerer is
-    // fixed, not before: verified load-bearing on dev at 70f1fddfc (removing it
-    // returns the witness class to 38/38 FAIL).
-    if class_name == "org/springframework/core/ResolvableType" && method_name == "equals" {
-        return Some(SkipReason::JavaUtilCollection);
-    }
 
     // SPRING-TESTCOMPILER.1 (2026-07-18): Spring's TestCompiler performs one
     // in-process javac invocation per fixture. Once the real JDK's
@@ -1259,6 +1203,35 @@ fn should_skip_jit_internal(
     // in BOTH arms (ban active AND lifted) -- ruled OUT as evidence for or
     // against this ban; it is not a JIT regression at all. Full evidence:
     // `docs/known-issues/h2/h2-jitban-longtail1-residuals-20260728.md`.
+    //
+    // 2026-07-28, THIRD pass: all three of those regressions were ONE bug, and
+    // it is fixed. The generated MIC/PIC cascade called its cached compiled
+    // callee and never inspected the result, so a callee that trapped handed
+    // its `i64::MIN` deopt sentinel to the caller as if the CALLER had
+    // deopted, and left its reconstructed frame in the thread's single stash
+    // slot for an unrelated sink to mis-attribute -- which de-speculated the
+    // wrong method and then, correctly, refused to resume a frame that was not
+    // its own. That refusal IS the `InternalError` above; `TestRunscript`'s
+    // script diff is the same escape landing somewhere that did not refuse,
+    // which is why its stack carried no `RowDataType` frames and it read as a
+    // separate defect. Both direct-call sites now service the sentinel through
+    // `jit_service_callee_deopt`. `RowDataType.read`'s frame map was ALSO
+    // imprecise (a reused local slot voted `Ambiguous` whole-method); that is
+    // fixed too, by a per-bci reaching-kind dataflow, but it was not
+    // sufficient on its own.
+    //
+    // The ban nevertheless STAYS, now for exactly ONE class. A full 218-class
+    // A/B (one arm at a time) makes lifting worth +7 PASS -- 155/18/45 banned
+    // vs 162/22/31 lifted, nine classes recovering -- and every per-class
+    // change was re-run in isolation. Only `org.h2.test.jdbc.TestMetaData` is
+    // a real regression (PASS 3/3 banned, FAIL 3/3 lifted), and it is
+    // PRE-EXISTING: the pre-fix binary fails it identically. It is not an H2
+    // bug either -- bisected to `org/h2/command/query/SelectGroups`, whose
+    // `new TreeMap<>(session)` loses its comparator once the allocating method
+    // is compiled, and reproduced in 60 lines of pure JDK code by
+    // `apps/h2database-suite-runner/probes/TreeMapCmpProbe.java` (HotSpot
+    // 40000/40000, CratonVM fails from iteration ~503). LIFT THIS BAN once
+    // that is fixed; everything else is already in place.
     if class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages) {
         return Some(SkipReason::RustJvmTestFixture);
     }
@@ -1891,25 +1864,23 @@ fn should_skip_jit_internal(
         // regression witness for the currently-tested (BigInteger-still-
         // banned) configuration only.
 
-        // HIB-BYTEBUDDY (2026-06-13) — provisional blanket ban for ByteBuddy's
-        // runtime class-build chain (`net/bytebuddy/`). The narrow HIB-PROXY ban
-        // on `ByteBuddyState.make` only covered the lazy-proxy path; Hibernate's
-        // bytecode-enhancement path (`EnhancerImpl.enhance` -> `ByteBuddyState.
-        // rewrite` -> `DynamicType...make` -> `MethodRegistry.prepare` -> deep
-        // `net/bytebuddy/description/type/TypeDescription*` resolution) hangs
-        // forever once those type-description methods are JIT-compiled
-        // (`SimpleEnhancerTests` rc=124; the stack spins in
-        // `TypeDefinition$Sort.describe` / `TypeDescription.represents`). It is
-        // the same "JIT'd build-chain receiver corruption / loop never returns"
-        // miscompile as HIB-PROXY, and `CRATONVM_DISABLE_JIT=1` makes the whole
-        // enhancer pass (ok=1). ByteBuddy is a one-shot code generator, never a
-        // benchmarked hot path, so interpreter-only is the right trade. Lifted
-        // by `CRATONVM_JIT_ALLOW_PACKAGES=net/bytebuddy/`.
-        if class_name.starts_with("net/bytebuddy/")
-            && !package_allowed("net/bytebuddy/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // HIB-BYTEBUDDY -- REMOVED 2026-07-28. Provisional blanket ban since
+        // 2026-06-13 for ByteBuddy's runtime class-build chain
+        // (`net/bytebuddy/`) after `SimpleEnhancerTests` hung (rc=124) with the
+        // stack spinning in `TypeDefinition$Sort.describe` /
+        // `TypeDescription.represents` once those type-description methods
+        // were JIT-compiled -- believed to be the same "JIT'd build-chain
+        // receiver corruption / loop never returns" miscompile as HIB-PROXY.
+        // Re-tested 2026-07-28 against the general JIT correctness fixes that
+        // have landed since (loader_id decode fix, atomic-array RMW, and
+        // others): `SimpleEnhancerTests` (the named regression witness) now
+        // passes cleanly and FASTER than interpreted (1762ms vs. 2511ms
+        // baseline), and a 15-class A/B sample across
+        // `org/hibernate/orm/test/bytecode/enhancement/**` (lazy loading,
+        // proxies, merge, batching) came back byte-identical
+        // found/started/ok/failed counts in both arms -- 0 hangs, 0 new
+        // failures. Full evidence:
+        // `docs/known-issues/hibernate/hib-bytebuddy-removed-20260728.md`.
         // TEST-HARNESS BLANKET BANS -- REMOVED 2026-07-27. Four blanket
         // package bans lived here together:
         //
@@ -2068,8 +2039,11 @@ fn should_skip_jit_internal(
         // gated by it at all; the affected class calls into
         // org/springframework/core/ResolvableType, already unbanned since
         // SPB.2's own removal), so it is not evidence for keeping SPB.4/.4b/.4c
-        // and is tracked as its own new finding:
-        // docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md.
+        // and is tracked as its own new finding. FIXED 2026-07-28 (an inline
+        // cache guarded a virtual call site by class id alone, so an ARRAY
+        // receiver whose header carries its COMPONENT class id was dispatched
+        // into the component's method body) — see
+        // docs/internal/resolvabletype-array-receiver-mic-guard-fixed-20260728.md.
         //
         // No longer reproduces on current dev at real-world JIT thresholds.
 

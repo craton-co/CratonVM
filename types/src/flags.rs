@@ -1449,6 +1449,9 @@ pub struct NativeFlags {
     /// `CRATONVM_SYNTHETIC_PQC`
     pub synthetic_pqc: bool,
 
+    /// `CRATONVM_SYNTHETIC_QUARKUS_START`
+    pub synthetic_quarkus_start: bool,
+
     /// `CRATONVM_SYNTHETIC_RSA`
     pub synthetic_rsa: bool,
 
@@ -1632,6 +1635,7 @@ impl NativeFlags {
             synthetic_ec: present(src, "CRATONVM_SYNTHETIC_EC"),
             synthetic_eqe: present_utf8(src, "CRATONVM_SYNTHETIC_EQE"),
             synthetic_pqc: present(src, "CRATONVM_SYNTHETIC_PQC"),
+            synthetic_quarkus_start: present(src, "CRATONVM_SYNTHETIC_QUARKUS_START"),
             synthetic_rsa: present(src, "CRATONVM_SYNTHETIC_RSA"),
             synthetic_vertx: present(src, "CRATONVM_SYNTHETIC_VERTX"),
             trace_arrays_hashcode: present(src, "CRATONVM_TRACE_ARRAYS_HASHCODE"),

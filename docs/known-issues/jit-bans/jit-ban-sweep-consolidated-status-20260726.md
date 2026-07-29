@@ -65,22 +65,23 @@ lifted):
   loader id got mistagged into a different runtime package, defeating
   package-private `@Bean`-override detection in the vtable builder. Back
   to 8/8 (10/10 scenarios, 95/95 checks, no regressions).
-- `docs/known-issues/resolvabletype-equals-jit-narrowed-20260727.md` —
-  real `ClassCastException` (`ResolvableType[]` cast to `ResolvableType`)
-  in `Profiles.<clinit>`, only under `CRATONVM_JIT_THRESHOLD=1` (a
-  `<clinit>` essentially never reaches real JIT tiers otherwise) — low
-  real-world priority but a genuine live miscompile. **Narrowed
-  further** via precise `CRATONVM_JIT_DENY` bisection across all 10
-  JIT-compiled `ResolvableType` methods down to exactly
-  `ResolvableType.equals(Object)` (not `equalsType`, `hashCode`,
-  `calculateHashCode`, `resolve`, or either `forType` overload). The
-  compiled x86 was disassembled and correlated to the documented 4-way
-  Polymorphic Inline Cache (PIC) codegen in `jit/src/x64.rs` (the
-  `CRIT-8`/`HIGH-7` comment block) — root cause NOT yet confirmed (the
-  PIC mechanism itself is heavily used elsewhere without issue, so the
-  defect is likely specific to this call site's slot state, not the
-  template). Full repro commands, disassembly artifact, and concrete
-  next steps recorded for a future session.
+- **FIXED 2026-07-28** — real `ClassCastException` (`ResolvableType[]`
+  cast to `ResolvableType`) in `Profiles.<clinit>`. Two of this entry's
+  earlier conclusions were wrong and are corrected in the write-up: it
+  was NOT `CRATONVM_JIT_THRESHOLD=1`-only (a standalone probe reproduces
+  it 2881/3000 at the default threshold), and the 4-way PIC codegen
+  template was NOT the defect. Root cause: every inline-cache guard —
+  the single-pass MIC/PIC cascade, the IR cascade, the hashed
+  megamorphic stub, and `jit_invoke_virtual_mic`'s Rust fast paths —
+  selected a cached compiled callee by the 4-byte
+  `ObjectHeader.class_id` alone, and a reference array stores its
+  COMPONENT class id in that same word. A site warmed on a `Foo`
+  receiver therefore dispatched a later `Foo[]` receiver straight into
+  `Foo`'s own body, whose `checkcast Foo` threw
+  `class [LFoo; cannot be cast to class Foo`. All five guards now also
+  check `ObjectHeader.kind`, and the `SPRING-RT-EQUALS.1` ban that had
+  been masking it is removed. See
+  `docs/internal/resolvabletype-array-receiver-mic-guard-fixed-20260728.md`.
 
 ## Removed 2026-07-27, UNVERIFIED (explicit user decision, no fixture)
 

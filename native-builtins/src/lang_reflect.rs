@@ -2189,24 +2189,47 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         registry: &mut NativeMethodRegistry,
         class_name: &'static str,
     ) {
-        // KEEP (constants, justified): `getAnnotation`/`getDeclaredAnnotation`
-        // return null when the requested annotation is ABSENT — that is the
-        // spec'd answer, not a stub. CratonVM's synthetic TypeVariable /
-        // AnnotatedType carriers hold no annotation data at all, so "absent" is
+        // KEEP the null RESULT (constant, justified): `getAnnotation` /
+        // `getDeclaredAnnotation` return null when the requested annotation is
+        // ABSENT — that is the spec'd answer, not a stub. CratonVM's synthetic
+        // TypeVariable / AnnotatedType carriers hold no annotation storage at
+        // all (`getAnnotatedBounds` in `lang_class.rs` builds AnnotatedTypes
+        // with a fixed EMPTY `allOnSameTargetTypeAnnotations`), so "absent" is
         // true for every query, and the sibling `getAnnotations` /
         // `getDeclaredAnnotations` below return a matching EMPTY array (never
-        // null), so the pair is self-consistent for a caller that checks both.
+        // null) — the pair is self-consistent for a caller that checks both.
+        // Revisit only if those carriers ever gain real annotation data; then
+        // these two must scan it instead of answering null.
+        //
+        // Wave 3: what was NOT spec-correct is the argument handling.
+        // `AnnotatedElement.getAnnotation`/`getDeclaredAnnotation` are
+        // documented to throw NullPointerException for a null annotation class
+        // (real `TypeVariableImpl` opens with `Objects.requireNonNull`), and
+        // swallowing that turned a caller bug into an indistinguishable
+        // "annotation absent". Reject null; keep null for a genuine miss.
+        fn annotation_query_null_checked(
+            _ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+            args: &[Value],
+        ) -> MethodCallResult {
+            match args.get(1) {
+                Some(Value::Object(Some(_))) => Ok(Some(Value::Object(None))),
+                _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                    message: Some("annotationClass is null".into()),
+                }
+                .into()),
+            }
+        }
         registry.register(
             class_name,
             "getAnnotation",
             "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            annotation_query_null_checked,
         );
         registry.register(
             class_name,
             "getDeclaredAnnotation",
             "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            annotation_query_null_checked,
         );
         registry.register(
             class_name,

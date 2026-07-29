@@ -477,11 +477,17 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
-    // Native-backed JarFiles do not initialize the real JDK's multi-release
-    // verifier state (`res`/`jv`). They expose physical central-directory
-    // entries, so the compact bridge deliberately has no version remapping.
-    r.register(jf, "isMultiRelease", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // `JarFile.isMultiRelease()` is true iff the manifest's main section
+    // declares `Multi-Release: true` (JEP 238). The old blanket `false` was
+    // stale: the compact bridge DOES remap versioned entries — see
+    // `p59_jar_lookup_versioned_entry`, which drives `META-INF/versions/N/`
+    // resolution off the same `p59_jar_is_multi_release` helper used here.
+    // Answer from the manifest so callers agree with the entries we hand back.
+    r.register(jf, "isMultiRelease", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let path = p59_jar_file_path(ctx, this);
+        let multi_release = !path.is_empty() && p59_jar_is_multi_release(&path);
+        Ok(Some(Value::Int(i32::from(multi_release))))
     });
     // JarFile.stream() — Spring Boot 3 fat-jar launcher
     // (org.springframework.boot.loader.launch.JarFileArchive.getClassPathUrls)
@@ -955,18 +961,19 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "()Ljava/lang/String;",
             sb2_launcher_get_main_class,
         );
-        // KEEP: `isExploded()` asks whether the launcher was started from an
-        // exploded directory rather than a packaged jar. The `createArchive`
-        // native immediately above unconditionally builds a `JarFileArchive`,
-        // so for every launcher object that can reach this native the answer
-        // really is "packaged" — this is derived from our own behaviour, not
-        // a placeholder.
-        r.register(cls, "isExploded", "()Z", |_ctx, _args| {
-            Ok(Some(Value::Int(0)))
-        });
-        // KEEP: Spring Boot's own `ExecutableArchiveLauncher` returns false
-        // here from 2.4 onwards; the hook it gates was deprecated and removed.
-        // `false` matches the class we are shadowing.
+        r.register(cls, "isExploded", "()Z", sb2_launcher_is_exploded);
+        // KEEP: the real method is a `return <boolean literal>;` hook — a
+        // per-class constant in Spring Boot itself, deprecated since 2.4 —
+        // and its value is unobservable here regardless of which literal a
+        // given launcher declares. Its ONLY reader is
+        // `ExecutableArchiveLauncher.getClassPathArchivesIterator()` /
+        // `getClassPathArchives()`, and both are natively replaced on these
+        // same four classes (just below) *and* pinned in `vm_exec.rs`'s
+        // force-native list, so Spring's post-processing branch is never
+        // reached in either run mode. The previous comment's claim that
+        // `ExecutableArchiveLauncher` itself returns false from 2.4 onwards
+        // could not be confirmed against a Spring Boot source tree here; do
+        // not treat it as established.
         r.register(
             cls,
             "isPostProcessingClassPathArchives",
@@ -997,13 +1004,15 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             "(Ljava/util/List;)Ljava/lang/ClassLoader;",
             sb2_launcher_create_class_loader_bypass_archive_walk,
         );
-        // KEEP: getClassPathIndex(Archive) — returns null so no layered-JAR
-        // classpath index is loaded. The index only exists to ORDER the
-        // archives that `getClassPathArchives()` yields, and
-        // `createClassLoader` (registered just above) bypasses the archive
-        // walk entirely in favour of CratonVM's own classpath scanner, which
-        // has already extracted every BOOT-INF/lib entry at startup. Parsing
-        // `classpath.idx` here would produce an ordering nothing consults.
+        // KEEP: `null` is what Spring Boot itself returns for the archive we
+        // hand it. `ExecutableArchiveLauncher.getClassPathIndex(Archive)` is
+        // a literal `return null;`, and the only override — `JarLauncher`'s —
+        // loads `classpath.idx` *only* when `archive instanceof
+        // ExplodedArchive`, falling through to `super` otherwise. Our
+        // `createArchive` native always produces a `JarFileArchive`, so the
+        // real code path being shadowed also returns null here. (Its sole
+        // consumer, `getClassPathArchivesIterator`, is natively replaced
+        // anyway.)
         r.register(
             cls,
             "getClassPathIndex",
@@ -1031,9 +1040,14 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // the setter a no-op preserves correctness while sidestepping the
     // cascading static init failure.
     //
-    // KEEP: the flag it would have set only chooses between a pre-allocated
-    // shared FileNotFoundException and a freshly-filled-in one — a pure
-    // allocation optimisation with no observable behavioural difference.
+    // KEEP: the real body's ONLY effect is the identity of the exception the
+    // next failed nested-jar lookup throws — `JarURLConnection.notFound()`
+    // hands back a shared pre-allocated, stack-trace-less
+    // FileNotFoundException when the flag is set and a freshly filled-in one
+    // when it is not. Both are caught and discarded by the same
+    // `findResource` callers, so a no-op setter is behaviourally equivalent;
+    // it is also the only version of this method that does not detonate
+    // SB2's `JarURLConnection.<clinit>` (see above).
     let sb2_handler = "org/springframework/boot/loader/jar/Handler";
     r.register(
         sb2_handler,
@@ -1348,7 +1362,7 @@ pub(crate) fn spring_class_utils_for_name_impl(
     // resulting `Class` object (`AotMergedContextConfiguration.hashCode()`),
     // and ultimately causing a SECOND, uncustomized `ApplicationContext` to
     // be created and used in place of the properly `@TestBean`/`@MockitoBean`
-    // -overridden one (see docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md,
+    // -overridden one (see CRATONVM-SPRING-GENUINE-BUGLIST,
     // AOT cluster, 2026-07-22 bean-override session). Mirror `Class.forName`'s
     // OWN caller-sensitive fallback here too: if the immediate Java caller of
     // this native (i.e. of `ClassUtils.forName` itself) was defined by a
@@ -2526,6 +2540,27 @@ pub(crate) fn sb2_launcher_jar_path(
     let cid = ctx.class_id_of_object(this);
     let class_name = ctx.class_name_of_id(cid)?;
     ctx.find_class_source_path(&class_name)
+}
+
+/// `org/springframework/boot/loader/ExecutableArchiveLauncher.isExploded()`.
+///
+/// Spring Boot answers this with `this.archive.isExploded()`, i.e. "was the
+/// application started from a directory rather than a packaged fat jar".
+/// `this.archive` is null under CratonVM, but the same fact is directly
+/// observable: [`sb2_launcher_jar_path`] resolves the launcher class's own
+/// classpath source, which is the fat jar in packaged mode and the exploded
+/// root directory otherwise. A directory there IS an exploded launch — the
+/// flag reaches `LaunchedURLClassLoader`, which uses it to skip the
+/// manifest-driven package-definition path that only applies to nested jars.
+pub(crate) fn sb2_launcher_is_exploded(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let exploded = sb2_launcher_jar_path(ctx, this)
+        .map(|p| std::path::Path::new(&p).is_dir())
+        .unwrap_or(false);
+    Ok(Some(Value::Int(i32::from(exploded))))
 }
 
 /// Read the Start-Class manifest entry from the fat-jar and return it as a

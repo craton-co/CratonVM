@@ -102,5 +102,5 @@ been directly fixed, just transiently masked by whatever unrelated commit(s)
 landed between 2026-07-18 and 2026-07-19. Not re-investigated further this
 session (out of scope — see the sibling discovery-failure cluster affecting
 7 other classes from the same `ModifiedClassPathExtension` family,
-[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](../../../known-issues/springboot/modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md),
+[`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md`](modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-FIXED.md),
 found the same session).
