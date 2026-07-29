@@ -729,6 +729,7 @@ pub(crate) fn native_method_get_default_value(
         ret_desc.as_deref(),
         Some(class_id),
         container_loader,
+        Some(class_id),
     )))
 }
 

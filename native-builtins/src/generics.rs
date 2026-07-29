@@ -168,13 +168,25 @@ fn current_generic_decl() -> Value {
 /// from that declaration's own loader, otherwise generic resolvers compare
 /// incompatible class identities.
 fn class_id_in_generic_scope(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     name: &str,
 ) -> Option<cratonvm_types::ClassId> {
     let dbg = crate::nbflags().dbg_lambda_generic && name.contains("ApplicationContextInitializer");
     let decl_opt = GENERIC_DECL_SCOPE.with(|scope| scope.get());
     let near_opt = decl_opt.and_then(|decl| ctx.class_id_from_mirror(decl));
-    let scoped = near_opt.and_then(|near| ctx.class_id_by_name_near(name, near));
+    // `class_id_by_name_near` only looks among classes that are already
+    // registered. If the declaring class belongs to an isolated URL loader and
+    // its signature-only dependency has not been loaded yet, that lookup falls
+    // back to the first global copy. Loading it afterwards cannot repair the
+    // already-created `ParameterizedType`, so JAXB/Spring can end up walking a
+    // graph containing both the application and child-loader copies. Resolve
+    // through the declaring class first: this performs normal parent delegation
+    // and defines the child copy when that is what the declaration sees.
+    let scoped = near_opt.and_then(|near| {
+        ctx.class_id_by_name_via_referencing_class(near, name)
+            .ok()
+            .or_else(|| ctx.class_id_by_name_near(name, near))
+    });
     let global = ctx.class_id_by_name(name);
     if dbg {
         eprintln!(
