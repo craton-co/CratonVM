@@ -1657,9 +1657,24 @@ fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         if path.is_dir() {
             // Skip build output, VCS, vendored deps and test fixtures — none
             // of them register natives into the running VM.
+            //
+            // `.claude` matters as much as `target` here: this repo routinely
+            // hosts dozens of git worktrees under `.claude/worktrees/`, each a
+            // full copy of the tree at some other commit. Walking into them
+            // makes every gate in this file measure OTHER branches' sources —
+            // which is not a hypothetical, it reported three field tables as
+            // short against factory counts that exist only in a stale worktree.
+            // A gate that fails depending on which sibling branches happen to be
+            // checked out is a gate people switch off.
             if matches!(
                 name.as_ref(),
-                "target" | ".git" | "vendor" | "node_modules" | "test_classes" | "apps"
+                "target"
+                    | ".git"
+                    | ".claude"
+                    | "vendor"
+                    | "node_modules"
+                    | "test_classes"
+                    | "apps"
             ) {
                 continue;
             }
