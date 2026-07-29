@@ -3775,6 +3775,72 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // setOption / getOption — the `jdk.net.ExtendedSocketOptions` keepalive
+    // family, served HERE because this registrar owns the socket.
+    //
+    // `native-io`'s `jdk/net/*SocketOptions` natives are reached (proved: the
+    // refusal used to carry CratonVM's own message rather than the JDK's) and
+    // then cannot resolve the handle id, because a plain `java.net.Socket`'s
+    // `TcpStream` lives in `servlet::s2_registry().streams` — a
+    // `native-builtins` registry that crate cannot see. Same resolution as
+    // `DatagramSocket.setOption`: put the option surface where the socket is.
+    //
+    // Dispatch is by `SocketOption.name()`, so one arm serves whichever constant
+    // object the caller passes. An option this registrar cannot serve is named
+    // in the exception rather than silently accepted.
+    r.register(
+        sock,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/Socket;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = ds_socket_option_name(ctx, args.get(1).copied());
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            let Some((level, opt)) = sock_option_level_and_name(&name) else {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("Socket.setOption: {name} is not supported"),
+                }
+                .into());
+            };
+            let Some(fd) = sock_raw_descriptor(ctx, this) else {
+                return Err(ioex("Socket.setOption: socket is not connected"));
+            };
+            let raw = ds_unbox_int(ctx, value);
+            sock_set_option_int(fd, level, opt, raw).map_err(|e| ioex(format!("{name}: {e}")))?;
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        sock,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = ds_socket_option_name(ctx, args.get(1).copied());
+            let Some((level, opt)) = sock_option_level_and_name(&name) else {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("Socket.getOption: {name} is not supported"),
+                }
+                .into());
+            };
+            let Some(fd) = sock_raw_descriptor(ctx, this) else {
+                return Err(ioex("Socket.getOption: socket is not connected"));
+            };
+            let Some(raw) = sock_get_option_int(fd, level, opt) else {
+                return Err(ioex(format!("{name}: option is not readable")));
+            };
+            if name == "SO_KEEPALIVE" {
+                return ctx.invoke(
+                    "java/lang/Boolean",
+                    "valueOf",
+                    "(Z)Ljava/lang/Boolean;",
+                    &[Value::Int(i32::from(raw != 0))],
+                );
+            }
+            ds_box_int(ctx, raw)
+        },
+    );
+
     r.register(sock, "isConnected", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let s = sock_get(ctx, this);
@@ -11352,6 +11418,152 @@ const DP_LENGTH: usize = 1;
 const DP_ADDR: usize = 2;
 const DP_PORT: usize = 3;
 
+/// The raw OS descriptor of a `java.net.Socket`'s connected stream.
+///
+/// The stream lives in `servlet::s2_registry().streams`, keyed by the id in
+/// `SockSide::stream_id`. `native-io`'s extended-option bridge cannot reach it
+/// (wrong crate, and it has no `NativeContext`), which is why
+/// `Socket.setOption(TCP_KEEPIDLE, ..)` resolved to nothing there and fell
+/// through to a UDP-only accessor.
+fn sock_raw_descriptor(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<SockRawFd> {
+    let id = sock_get(ctx, this).stream_id;
+    if id < 0 {
+        return None;
+    }
+    let stream = crate::servlet::s2_registry().lock().streams.get(&id).cloned()?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        Some(stream.as_raw_fd())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        Some(stream.as_raw_socket() as usize)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+#[cfg(unix)]
+type SockRawFd = std::os::fd::RawFd;
+#[cfg(windows)]
+type SockRawFd = usize;
+#[cfg(not(any(unix, windows)))]
+type SockRawFd = i32;
+
+/// `(level, optname)` for the socket options this registrar can serve, or `None`
+/// for one it cannot.
+///
+/// Numbering is per-platform on purpose: `TCP_KEEPIDLE` is 4 on Linux and 3 on
+/// Windows (where it is an alias of the older `TCP_KEEPALIVE`), and getting that
+/// wrong writes a real value into a different option.
+fn sock_option_level_and_name(name: &str) -> Option<(i32, i32)> {
+    #[cfg(target_os = "linux")]
+    {
+        const SOL_SOCKET: i32 = 1;
+        const IPPROTO_TCP: i32 = 6;
+        const SO_KEEPALIVE: i32 = 9;
+        const TCP_KEEPIDLE: i32 = 4;
+        const TCP_KEEPINTVL: i32 = 5;
+        const TCP_KEEPCNT: i32 = 6;
+        return Some(match name {
+            "SO_KEEPALIVE" => (SOL_SOCKET, SO_KEEPALIVE),
+            "TCP_KEEPIDLE" => (IPPROTO_TCP, TCP_KEEPIDLE),
+            "TCP_KEEPINTERVAL" => (IPPROTO_TCP, TCP_KEEPINTVL),
+            "TCP_KEEPCOUNT" => (IPPROTO_TCP, TCP_KEEPCNT),
+            _ => return None,
+        });
+    }
+    #[cfg(windows)]
+    {
+        const SOL_SOCKET: i32 = 0xffff;
+        const IPPROTO_TCP: i32 = 6;
+        const SO_KEEPALIVE: i32 = 0x0008;
+        const TCP_KEEPIDLE: i32 = 3;
+        const TCP_KEEPCNT: i32 = 16;
+        const TCP_KEEPINTVL: i32 = 17;
+        return Some(match name {
+            "SO_KEEPALIVE" => (SOL_SOCKET, SO_KEEPALIVE),
+            "TCP_KEEPIDLE" => (IPPROTO_TCP, TCP_KEEPIDLE),
+            "TCP_KEEPINTERVAL" => (IPPROTO_TCP, TCP_KEEPINTVL),
+            "TCP_KEEPCOUNT" => (IPPROTO_TCP, TCP_KEEPCNT),
+            _ => return None,
+        });
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = name;
+        None
+    }
+}
+
+#[allow(unused_variables)]
+fn sock_set_option_int(fd: SockRawFd, level: i32, name: i32, value: i32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let value: libc::c_int = value;
+        // SAFETY: `value` outlives the call and `fd` is a live descriptor owned
+        // by the stream the registry still holds.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&value as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        ws2_set_int(fd, level, name, value)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket options",
+        ))
+    }
+}
+
+#[allow(unused_variables)]
+fn sock_get_option_int(fd: SockRawFd, level: i32, name: i32) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid out-pointer pair for an int-sized option on a live fd.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                (&mut value as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        (rc == 0).then_some(value)
+    }
+    #[cfg(windows)]
+    {
+        ws2_get_int(fd, level, name)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
 /// The `name()` of a `java.net.SocketOption` argument.
 ///
 /// Every `StandardSocketOptions` / `ExtendedSocketOptions` constant carries its
@@ -11824,40 +12036,14 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(i32::from(ds_get(this).broadcast == 1))))
     });
 
-    // connect / disconnect / isConnected — IMPLEMENTED HERE, on the registrar
-    // that OWNS `java/net/DatagramSocket`.
-    //
-    // A slot-based copy of these lives in `phases_late::net_channels`'s
-    // phase-72 set, which registers LATER and therefore won in
-    // `--synthetic-jdk` builds — the broken set beating the working one, since
-    // this file keeps its state in `ds_side_table` and phase-72 reads raw
-    // slots. It is also `#[cfg(feature = "synthetic-jdk")]`, so in the DEFAULT
-    // build there was no `disconnect` at all and the call reached the real
-    // abstract declaration (`InternalError`). One owner, both builds.
-    r.register(
-        ds,
-        "connect",
-        "(Ljava/net/InetAddress;I)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let host = match args.get(1) {
-                Some(Value::Object(Some(ia))) => {
-                    inet_addr_field_string_or(ctx, *ia, IA_ADDR, "127.0.0.1")
-                }
-                _ => "127.0.0.1".to_string(),
-            };
-            let port = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            let fd = ds_get(this).fd;
-            if fd < 0 {
-                return Err(ioex("DatagramSocket: closed"));
-            }
-            ctx.fd_table()
-                .udp_connect(fd as u32, &format!("{host}:{port}"))
-                .map_err(|e| ioex(format!("UDP connect: {e}")))?;
-            ds_set(this, |sd| sd.connected = 1);
-            Ok(None)
-        },
-    );
+    // `connect(SocketAddress)` — the overload the pair further down does not
+    // cover. Its `(InetAddress,int)` sibling and `disconnect()`/`isConnected()`
+    // are registered there, and this file must not carry two of any of them:
+    // registration is last-write-wins, so a duplicate is silently dead and the
+    // two copies drift. (They did: the second `disconnect` picked up a stray
+    // `connected = 1` while the two independent closures of this list were
+    // merged, and `isConnected()` then read `false` after `connect()` and
+    // `true` after `disconnect()` — backwards, and invisible to the compiler.)
     r.register(
         ds,
         "connect",
@@ -11888,25 +12074,6 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    // `disconnect()` is specified NOT to throw: "if the socket was not
-    // connected, then this method has no effect". The kernel disassociation
-    // goes through `FdTable::udp_disconnect` (POSIX `connect(AF_UNSPEC)`),
-    // whose error is deliberately swallowed for the same reason — a failed
-    // disassociation still leaves the Java-side flag honest, and the JDK gives
-    // the caller no channel to report it through.
-    r.register(ds, "disconnect", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd = ds_get(this).fd;
-        if fd >= 0 {
-            let _ = ctx.fd_table().udp_disconnect(fd as u32);
-        }
-        ds_set(this, |sd| sd.connected = 0);
-        Ok(None)
-    });
-    r.register(ds, "isConnected", "()Z", |_ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(Value::Int(ds_get(this).connected)))
-    });
 
     r.register(ds, "send", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -12101,6 +12268,13 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
                 let _ = ctx
                     .fd_table()
                     .udp_connect(fd as u32, &format!("{host}:{port}"));
+                // `isConnected()` reads this. It is set on the Java-side
+                // transition rather than from the syscall result for the same
+                // reason `connect` does not throw: the JDK reports a connect
+                // failure at the next I/O operation, and `isConnected()` is
+                // specified to keep answering true even after the socket is
+                // closed.
+                ds_set(this, |sd| sd.connected = 1);
             }
         }
         Ok(None)
@@ -12116,8 +12290,7 @@ pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             let _ = _ctx.fd_table().udp_disconnect(fd as u32);
         }
         ds_set(this, |sd| sd.connected = 0);
-        ds_set(this, |sd| sd.connected = 1);
-            Ok(None)
+        Ok(None)
     });
     // `isConnected()` had no registration at all, so it reached the abstract
     // `java.net.DatagramSocket` declaration and threw `InternalError` — right

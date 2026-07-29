@@ -202,13 +202,17 @@ address family" — was factually wrong: the JDK signatures are
 `getIpDontFragment0(int fd, boolean isIPv6)` and
 `setIpDontFragment0(int fd, boolean optval, boolean isIPv6)`.
 
-RESIDUAL, measured. The TCP keepalive options are still refused for a plain
-`java.net.Socket`. The `jdk/net/WindowsSocketOptions` natives ARE reached — the
-refusal now carries CratonVM's own message rather than the JDK's — so what is
-missing is one level up: the handle id resolves in none of the four places a
-CratonVM socket can live (`net_sockets`, `socket_channel::tcp_registry`, and the
-fd table's UDP and TCP entries, all four of which `ext_opt_any_fd` tries). Find
-where a `java.net.Socket`'s descriptor is registered and add it there.
+The TCP keepalive family needed one more step, found the same way. The
+`jdk/net/WindowsSocketOptions` natives ARE reached — the refusal carried
+CratonVM's own message rather than the JDK's — but the handle id resolved in none
+of the four places `native-io` can look, because a plain `java.net.Socket`'s
+`TcpStream` lives in `servlet::s2_registry().streams`, a `native-builtins`
+registry that crate cannot see. `Socket.setOption`/`getOption` are therefore
+served in `net_phase_e` alongside the socket, exactly as
+`DatagramSocket.setOption` is. Two numbering bugs surfaced on the way: the
+Windows fallback used a UDP-ONLY fd-table accessor for a TCP socket (`bad fd for
+udp`), and `TCP_KEEPIDLE` was 18 where Windows defines 3 (an alias of the older
+`TCP_KEEPALIVE`) — a real value written into a different option.
 
 ### `System.setSecurityManager` vs JEP 486 — DECIDED, recorded in code
 
@@ -286,8 +290,18 @@ so in `--synthetic-jdk` builds every walker came back with its options lost.
 ## Method note
 
 Every behavioural claim above was measured three ways — HotSpot 25, CratonVM
-before, CratonVM after — over three probe programs. The standing lesson from the
-previous round applied again and earned its keep three times:
+before, CratonVM after — over three probe programs, 46 assertions.
+
+Final state of the reconciled tree: **27 FIXED, 0 REGRESSED, 0 CHANGED, 18
+already matching, 1 residual.** That is better than either branch measured alone
+(26 FIXED with two loose ends), which is the argument for reconciling rather than
+picking a winner — and the three defects the merge exposed
+(`sw.noRetain.getDescriptor` ungated, `isConnected()` inverted by a duplicate
+registration, `TCP_KEEPIDLE` = 18) were each invisible to the compiler and to
+both sessions' own validation.
+
+The standing lesson from the previous round applied again and earned its keep
+four times:
 
 * `Document.getElementById` and `URLClassLoader.close` already matched HotSpot on
   the BEFORE arm for the paths the first probes exercised, so those probes could
@@ -298,7 +312,11 @@ previous round applied again and earned its keep three times:
   because the native was registered in a synthetic-only registrar;
 * the `RETAIN_CLASS_REFERENCE` gate was implemented on the wrong carrier, and a
   one-line diagnostic print that never fired is what showed the walk natives were
-  not on that path at all.
+  not on that path at all;
+* after the merge, `isConnected()` read `false` after `connect()` and `true`
+  after `disconnect()`. Two registrations of one method: the compiler is silent,
+  the later one simply wins, and only a probe notices. Reduce duplicates to one
+  owner rather than keeping both.
 
 Probe the specific site a change claims to fix, and read the failure, not just the
 verdict.

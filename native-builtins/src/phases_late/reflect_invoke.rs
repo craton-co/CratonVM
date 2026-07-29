@@ -1814,6 +1814,18 @@ pub(crate) fn p59_sf_get_method_type(
     let Some(Value::Object(Some(this))) = args.first().copied() else {
         return Ok(Some(Value::Object(None)));
     };
+    // Real `StackFrameInfo.getMethodType()` opens with
+    // `ensureRetainClassRefEnabled()` (jdk-25), and `getDescriptor()` is
+    // `getMethodType().descriptorString()` — so gating HERE covers both. Only
+    // `getDeclaringClass` consulted `P59_RETAIN_CLASS_REF` before, which left
+    // `getDescriptor()` answering for a walker built WITHOUT
+    // `Option.RETAIN_CLASS_REFERENCE`, where HotSpot throws.
+    if !P59_RETAIN_CLASS_REF.with(Cell::get) {
+        return Err(RuntimeError::UnsupportedOperationException {
+            message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
+        }
+        .into());
+    }
     let internal = match ctx.get_field(this, 5) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),

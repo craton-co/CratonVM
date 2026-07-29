@@ -2344,7 +2344,10 @@ mod ext_opt_sys {
     const IP_DONTFRAGMENT: i32 = 14;
     const TCP_KEEPCNT: i32 = 16;
     const TCP_KEEPINTVL: i32 = 17;
-    const TCP_KEEPIDLE: i32 = 18;
+    /// mstcpip.h — `TCP_KEEPIDLE` is 3 on Windows (an alias of the older
+    /// `TCP_KEEPALIVE`), NOT 18. 18 is a different option entirely, so the
+    /// keepalive-idle getter/setter were addressing the wrong one.
+    const TCP_KEEPIDLE: i32 = 3;
 
     #[link(name = "ws2_32")]
     unsafe extern "system" {
@@ -2471,18 +2474,40 @@ fn ext_opt_set(_args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
 fn win_ext_opt_get(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<i32, MethodCallFailed> {
     let (Some(id), _) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
     let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
-    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+    if let Some(raw) = win_ext_opt_any_socket(ctx, id) {
         return ext_opt_sys::get_int(raw, level, name).map_err(|e| net_err(opt.label(), e));
     }
     let fd = u32::try_from(id).map_err(|_| ext_opt_unsupported(opt.label()))?;
     ctx.fd_table().udp_get_socket_option_i32(fd, level, name).map_err(|e| net_err(opt.label(), e))
 }
 
+/// The raw `SOCKET` behind ANY extended-option handle id.
+///
+/// A CratonVM socket handle can live in four places: this crate's `net_sockets`
+/// and `socket_channel::tcp_registry` (both of which `ext_opt_sys::raw_fd`
+/// knows), or `native-api`'s fd table as a TCP or a UDP entry (which it cannot
+/// see — it has no `NativeContext`). Without the last two, a plain
+/// `java.net.Socket` fell through to the fd table's UDP-ONLY accessor and
+/// `Socket.setOption(TCP_KEEPIDLE, ..)` failed with `bad fd for udp` — a TCP
+/// socket reported as a bad datagram socket. Resolving to a raw `SOCKET` here
+/// means the real `setsockopt` runs for every handle shape.
+#[cfg(target_os = "windows")]
+fn win_ext_opt_any_socket(ctx: &dyn NativeContext, id: i32) -> Option<usize> {
+    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+        return Some(raw);
+    }
+    let fd = u32::try_from(id).ok()?;
+    ctx.fd_table()
+        .tcp_raw_socket(fd)
+        .or_else(|| ctx.fd_table().udp_raw_socket(fd))
+        .map(|s| s as usize)
+}
+
 #[cfg(target_os = "windows")]
 fn win_ext_opt_set(ctx: &dyn NativeContext, args: &[Value], opt: ExtOpt) -> Result<(), MethodCallFailed> {
     let (Some(id), Some(value)) = ext_opt_int_args(args) else { return Err(ext_opt_unsupported(opt.label())); };
     let Some((level, name)) = ext_opt_sys::level_and_name(opt) else { return Err(ext_opt_unsupported(opt.label())); };
-    if let Some(raw) = ext_opt_sys::raw_fd(id) {
+    if let Some(raw) = win_ext_opt_any_socket(ctx, id) {
         return ext_opt_sys::set_int(raw, level, name, value).map_err(|e| net_err(opt.label(), e));
     }
     let fd = u32::try_from(id).map_err(|_| ext_opt_unsupported(opt.label()))?;
