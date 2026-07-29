@@ -13,7 +13,7 @@ silently replaces a working method with one that does nothing.
 | Gate | Scope | Ceiling |
 |---|---|---|
 | `t9_stub_audit_counts_match_census` | the 6 named helpers, in 12 hand-listed `native-builtins/src` files | per-category, total **53** |
-| `t9b_inline_constant_native_census` | **every** `.register*()` call in **every** `.rs` file in the workspace | total **350** |
+| `t9b_inline_constant_native_census` | **every** `.register*()` call in **every** `.rs` file in the workspace | total **332** |
 
 Both live in `vm/tests/tier1_tests.rs`. Direction for both: counts may only go
 DOWN or stay the same. A count going UP means a new stub was added, and the
@@ -30,21 +30,21 @@ mandate to **implement**, with `KEEP` requiring evidence that the real JDK is
 
 | | pre-wave-3 | after wave 3 | **after wave 4** |
 |---|---|---|---|
-| Constant-valued native registrations | 669 | 462 | **350** |
-| — without a justification comment | 243 | 93 | **68** |
+| Constant-valued native registrations | 669 | 462 | **332** |
+| — without a justification comment | 243 | 93 | **66** |
 | Named-helper subset (the old `t9` number) | 84 | 67 | **53** |
 
-### What the remaining 350 are made of
+### What the remaining 332 are made of
 
 | shape | count | can it go to zero? |
 |---|---|---|
-| real methods returning a constant | 245 | partly — see below |
+| real methods returning a constant | 228 | partly — see below |
 | `registerNatives` / `initIDs` family | 51 | **no**, the no-op IS the correct body |
 | spec field constants (`HTTP_OK`, `Types.INTEGER`) | 35 | **no**, the constant IS the value |
 | empty constructors | 19 | **no** where the real JDK ctor is empty |
 
-So ~105 of the 350 are correct *by definition* and this number can never reach
-zero. Of the 245 methods, a large share are verified against the real JDK body
+So ~105 of the 332 are correct *by definition* and this number can never reach
+zero. Of the 228 methods, a large share are verified against the real JDK body
 (`ByteArrayOutputStream.close()` is `{ }`, `SimpleBeanInfo.getIcon()` is
 `return null;`, `EmptyEnumeration.hasMoreElements()` is `return false;`,
 `DatagramChannelImpl.validOps()` is a fixed 5). **Read the ceiling as "how much

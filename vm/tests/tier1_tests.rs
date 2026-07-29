@@ -1544,7 +1544,7 @@ fn t9b_inline_constant_native_census() {
     // spec-correct constants that are deliberately counted, because the cheap
     // reliable thing to measure is "how much of the native surface is
     // constant-valued", not "how much of it is wrong".
-    const CEILING: usize = 350;
+    const CEILING: usize = 332;
 
     eprintln!("[t9b] Constant-valued native registrations: {total} (ceiling {CEILING})");
     for (f, n) in per_file.iter().take(15) {
