@@ -164,6 +164,29 @@ fn tomcat_juli_root_handler_registry() -> &'static Mutex<HashMap<i32, Vec<u64>>>
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// `LogManager.addConfigurationListener(Runnable)` registrations, in
+/// registration order, as raw ObjectRef addresses.
+///
+/// WAVE-4 (2026-07-28): `addConfigurationListener` used to return `this` and
+/// silently DROP the listener, and `removeConfigurationListener` was a no-op
+/// justified as "consistent with the add". That justification was wrong at the
+/// root: the JDK invokes these listeners after every successful
+/// `readConfiguration()` / `readConfiguration(InputStream)` /
+/// `updateConfiguration(...)`, and this module implements all three for real
+/// (`native_read_configuration_no_arg`, `native_read_configuration_with_stream`,
+/// `native_update_configuration_with_stream`) — so there WAS an observable
+/// effect being thrown away. Frameworks that re-derive their logger levels from
+/// such a listener (Spring Boot's `JavaLoggingSystem` reconfiguration, Tomcat
+/// JULI users, Log4j's JUL bridge) never learned that the configuration had
+/// changed.
+///
+/// Rooted/remapped by `gc_scan_logmanager_roots` / `gc_update_logmanager_refs`
+/// like every other ObjectRef side-table in this module.
+fn config_listeners() -> &'static Mutex<Vec<u64>> {
+    static INSTANCE: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 /// Explicit handlers installed on synthetic JUL loggers. The JDK normally
 /// keeps this state in `Logger.ConfigurationData`; our compact Logger mirror
 /// deliberately does not model that private layout, so keep the Java-visible
@@ -984,6 +1007,9 @@ pub(crate) fn reset_state_for_tests() {
     if let Ok(mut h) = logger_handlers().lock() {
         h.clear();
     }
+    if let Ok(mut l) = config_listeners().lock() {
+        l.clear();
+    }
     if let Ok(mut m) = log_record_messages().lock() {
         m.clear();
     }
@@ -1107,6 +1133,20 @@ fn native_add_logger(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// override `readConfiguration` in their own bytecode and never reach here).
 fn native_read_configuration_no_arg(
     ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let result = read_configuration_no_arg_impl(ctx, args);
+    // The JDK notifies configuration listeners after EVERY readConfiguration
+    // call, including the ones that found nothing to read (no config.file, an
+    // unreadable file) — the contract is "the configuration was re-read", not
+    // "the configuration changed". Fire outside the impl so its early returns
+    // cannot skip the notification.
+    fire_configuration_listeners(ctx);
+    result
+}
+
+fn read_configuration_no_arg_impl(
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
     // NOTE on manager subclasses: a `LogManager` subclass that overrides
@@ -1183,6 +1223,16 @@ fn native_read_configuration_with_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let result = read_configuration_with_stream_impl(ctx, args);
+    // Same contract as the no-arg overload — see `native_read_configuration_no_arg`.
+    fire_configuration_listeners(ctx);
+    result
+}
+
+fn read_configuration_with_stream_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0] = this (LogManager), args[1] = the InputStream.
     let Some(Value::Object(Some(stream))) = args.get(1).copied() else {
         return Ok(None);
@@ -1192,6 +1242,98 @@ fn native_read_configuration_with_stream(
     };
     let entries = crate::properties_sidetable::parse_properties_pub(&bytes);
     apply_jul_config_entries(ctx, &entries)
+}
+
+/// `LogManager.addConfigurationListener(Runnable)` — record the listener and
+/// return `this` (the JDK returns the manager to allow chaining).
+///
+/// Real JDK semantics honoured here: a `null` listener throws NPE; a listener
+/// already registered is a no-op (identity comparison, exactly like the JDK's
+/// `IdentityHashMap`-backed set).
+fn native_add_configuration_listener(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = args.first().cloned().unwrap_or(Value::Object(None));
+    let Some(Value::Object(Some(listener))) = args.get(1).copied() else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("LogManager.addConfigurationListener: listener is null".to_string()),
+        }
+        .into());
+    };
+    let addr = listener.as_ptr() as u64;
+    let mut listeners = config_listeners().lock().unwrap_or_else(|e| e.into_inner());
+    if !listeners.contains(&addr) {
+        listeners.push(addr);
+    }
+    Ok(Some(this))
+}
+
+/// `LogManager.removeConfigurationListener(Runnable)` — drop the listener.
+///
+/// Real JDK semantics: removing a listener that was never added is a no-op
+/// (not an error), and a `null` argument throws NPE.
+fn native_remove_configuration_listener(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(listener))) = args.get(1).copied() else {
+        return Err(RuntimeError::NullPointerException {
+            message: Some("LogManager.removeConfigurationListener: listener is null".to_string()),
+        }
+        .into());
+    };
+    let addr = listener.as_ptr() as u64;
+    let mut listeners = config_listeners().lock().unwrap_or_else(|e| e.into_inner());
+    listeners.retain(|&a| a != addr);
+    Ok(None)
+}
+
+/// Invoke every registered configuration listener, in registration order.
+///
+/// The JDK swallows whatever a listener throws (it reports it to the logging
+/// ErrorManager and carries on) so that one bad listener cannot abort the
+/// configuration read for the others — mirrored here by discarding the result
+/// of each `run()`.
+fn fire_configuration_listeners(ctx: &mut dyn NativeContext) {
+    // Re-entrancy guard: a listener whose `run()` itself calls
+    // `readConfiguration`/`updateConfiguration` would otherwise recurse until
+    // the stack blows. One notification per outermost read is the observable
+    // contract either way.
+    if CONFIG_LISTENERS_FIRING.with(|f| f.get()) {
+        return;
+    }
+    // Snapshot under the lock and release it before any Java call: a listener
+    // is free to call add/removeConfigurationListener, which would re-enter.
+    let listeners: Vec<u64> = {
+        let guard = config_listeners().lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_empty() {
+            return;
+        }
+        guard.clone()
+    };
+    CONFIG_LISTENERS_FIRING.with(|f| f.set(true));
+    for addr in listeners {
+        // SAFETY / GC: the addresses come from `as_ptr()` on live ObjectRefs
+        // held by this module's side-table, which `gc_scan_logmanager_roots`
+        // reports as roots and `gc_update_logmanager_refs` repoints after a
+        // move — the same convention `publish_to_jul_handlers` uses for
+        // `logger_handlers`. Pin each one before the GC-capable `run()` call.
+        let listener = unsafe { object_from_u64(addr) };
+        let pin = ctx.pin_native_root(listener);
+        let listener = ctx.read_native_pin(pin, listener);
+        let _ = ctx.invoke_virtual(listener, "run", "()V", &[]);
+        ctx.unpin_native_roots(pin);
+    }
+    CONFIG_LISTENERS_FIRING.with(|f| f.set(false));
+}
+
+thread_local! {
+    /// Set while `fire_configuration_listeners` is walking the chain on this
+    /// thread. Nothing between the set and the clear can return early — the
+    /// only Java call in the loop has its result discarded — so a `Drop` guard
+    /// would buy nothing here.
+    static CONFIG_LISTENERS_FIRING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn parsed_log_properties() -> &'static Mutex<HashMap<String, String>> {
@@ -4824,8 +4966,9 @@ fn native_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// GC root scan for every Java object cached by this module's side-tables.
 /// Companion remap is [`gc_update_logmanager_refs`]. Reports the singleton
-/// `LogManager`, both logger registries, the JBoss `LogContext` singleton, and
-/// every attachment receiver / key / value so a moving collector relocates
+/// `LogManager`, both logger registries, the JBoss `LogContext` singleton,
+/// every registered configuration listener, and every attachment receiver /
+/// key / value so a moving collector relocates
 /// (rather than reclaims) them. Uses blocking locks that are never held across
 /// a Java allocation, so the allocating thread cannot self-deadlock here.
 pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
@@ -4875,6 +5018,16 @@ pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values()
+    {
+        push_addr(addr);
+    }
+    // Configuration listeners are held ONLY by this table between
+    // `addConfigurationListener` and the next `readConfiguration` — a caller
+    // that registers a lambda inline keeps no other reference to it.
+    for &addr in config_listeners()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
     {
         push_addr(addr);
     }
@@ -4955,6 +5108,13 @@ pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, 
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .values_mut()
+    {
+        *addr = remap(*addr);
+    }
+    for addr in config_listeners()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter_mut()
     {
         *addr = remap(*addr);
     }
@@ -5056,33 +5216,38 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/String;",
         native_get_property,
     );
-    // `checkAccess()` is a genuine no-op, not a suppressed check: it existed
-    // only to consult a `SecurityManager`, and JDK 24 removed Security
-    // Manager entirely, so the real JDK 25 body has nothing left to do either.
+    // KEEP (real JDK body has nothing left to do) — re-derived wave 4,
+    // 2026-07-28. `LogManager.checkAccess()`'s entire body was
+    // `SecurityManager sm = System.getSecurityManager(); if (sm == null)
+    // return; sm.checkPermission(new LoggingPermission("control", null));`.
+    // JEP 486 (JDK 24) permanently disabled the Security Manager:
+    // `System.getSecurityManager()` now always returns null, so on a real JDK
+    // 25 the method returns immediately on its first branch for every caller.
+    // An empty body is therefore behaviourally identical, not a suppressed
+    // check — and it must stay empty: `Logger.setLevel`/`addHandler`/`reset`
+    // all call it, so throwing here would break configuration, not secure it.
     registry.register(CLS_JUL_LOG_MANAGER, "checkAccess", "()V", |_ctx, _args| {
         Ok(None)
     });
+    // IMPLEMENTED wave 4 (2026-07-28). Both halves used to be constants: `add`
+    // returned `this` and dropped the listener on the floor, `remove` was a
+    // no-op justified as "consistent with the add". The justification was
+    // wrong — `readConfiguration()`/`readConfiguration(InputStream)`/
+    // `updateConfiguration(...)` are all really implemented in this module, and
+    // the JDK fires the listener chain after each of them, so the drop WAS
+    // observable. They are now backed by `config_listeners()` and fired from
+    // `fire_configuration_listeners`.
     registry.register(
         CLS_JUL_LOG_MANAGER,
         "addConfigurationListener",
         "(Ljava/lang/Runnable;)Ljava/util/logging/LogManager;",
-        |_ctx, args| {
-            // Returns `this` to allow chaining.
-            Ok(args.first().cloned())
-        },
+        native_add_configuration_listener,
     );
-    // Add/remove are a consistent pair of no-ops rather than a dropped
-    // registration: configuration listeners fire only from
-    // `readConfiguration`/`updateConfiguration`, both of which are driven
-    // exclusively by an explicit caller-supplied stream here (see
-    // `native_read_configuration_no_arg`), and neither of those paths
-    // re-enters the listener chain. There is no state a caller could observe
-    // that `removeConfigurationListener` would have had to undo.
     registry.register(
         CLS_JUL_LOG_MANAGER,
         "removeConfigurationListener",
         "(Ljava/lang/Runnable;)V",
-        |_ctx, _args| Ok(None),
+        native_remove_configuration_listener,
     );
     // `updateConfiguration(Function)` re-reads the DEFAULT (filesystem /
     // `java.util.logging.config.file`) configuration — exactly the input
@@ -5157,9 +5322,10 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
         CLS_JBOSS_LOG_MANAGER,
         "checkAccess",
         "()V",
-        // Same reasoning as the `java.util.logging.LogManager.checkAccess`
-        // registration above: with SecurityManager removed in JDK 24 there is
-        // no check left to perform.
+        // KEEP — same reasoning as the `java.util.logging.LogManager.checkAccess`
+        // registration above (JEP 486 leaves the inherited body with nothing to
+        // do). `org.jboss.logmanager.LogManager` does not override it; this
+        // registration exists only so the JBoss class name also resolves.
         |_ctx, _args| Ok(None),
     );
 

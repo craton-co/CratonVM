@@ -638,11 +638,41 @@ pub(crate) fn register_security_manager_natives(r: &mut NativeMethodRegistry) {
 fn register_security_manager(r: &mut NativeMethodRegistry) {
     let sm = "java/lang/SecurityManager";
 
-    // <init>()V — creates SecurityManager with default allow-all policy
-    r.register(sm, "<init>", "()V", |_ctx, _args| {
-        // No fields to initialize — the allow-all policy is implicit.
-        // The SecurityManager object itself is just a marker; the global singleton
-        // is set via System.setSecurityManager.
+    // <init>()V — STUB-REMOVAL (wave 3). This was a bare no-op justified as
+    // "no fields to initialize". That is only half the ctor: real
+    // `java.lang.SecurityManager()` also asks the CURRENTLY installed manager
+    // for `RuntimePermission("createSecurityManager")` before a second one is
+    // allowed to exist. CratonVM models an installable SecurityManager for
+    // real — `get_security_manager` gates `Runtime.exec`/`ProcessBuilder.start`
+    // (`lang_system::check_exec_or_throw`) and the Panama host-call path — so a
+    // no-op here let code running under a restrictive manager mint its own
+    // manager object unchallenged. Run the check through the same policy core
+    // `checkPermission` uses, without needing a Permission instance.
+    //
+    // Nothing changes for the overwhelmingly common cases: no manager
+    // installed (the first `new SecurityManager()`) short-circuits, and with no
+    // `java.policy` loaded `policy_allows_full_generic` is allow-all, exactly
+    // as before.
+    r.register(sm, "<init>", "()V", |ctx, _args| {
+        if get_security_manager(&*ctx).is_some() {
+            let code_base = current_privileged_code_base_arc();
+            let cert_digests = current_privileged_cert_digests_arc();
+            if !policy_allows_full_generic(
+                "java/lang/RuntimePermission",
+                "createSecurityManager",
+                "",
+                code_base.as_deref(),
+                &cert_digests,
+            ) {
+                return Err(throw_access_control_exception(
+                    ctx,
+                    "access denied (\"java/lang/RuntimePermission\" \"createSecurityManager\")"
+                        .to_string(),
+                ));
+            }
+        }
+        // Otherwise nothing to initialise: the object is a marker and the
+        // global singleton is installed by `System.setSecurityManager`.
         Ok(None)
     });
 
@@ -845,12 +875,54 @@ fn register_system_security(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // setSecurityManager(SecurityManager)V
+    // setSecurityManager(SecurityManager)V — STUB-REMOVAL (wave 3).
+    //
+    // This installed the new manager unconditionally. Real
+    // `System.setSecurityManager` first asks the CURRENTLY installed manager
+    // for `RuntimePermission("setSecurityManager")`, which is what stops code
+    // running under a restrictive manager from simply replacing it with a
+    // permissive one — or with `null`, disabling gating altogether.
+    //
+    // That mattered here rather than being cosmetic: CratonVM consults the
+    // installed manager for real, gating `Runtime.exec`/`ProcessBuilder.start`
+    // (`lang_system::check_exec_or_throw`) and the Panama host-call path. So
+    // the missing check was a live sandbox escape, not a fidelity gap. It is
+    // the other half of the `SecurityManager.<init>` gate above; the two are
+    // only meaningful together, since gating construction while leaving
+    // installation open just moves the bypass one call along.
+    //
+    // Deliberately NOT the JDK 24+ (JEP 486) behaviour of throwing
+    // `UnsupportedOperationException` unconditionally: CratonVM still models
+    // an installable manager and depends on it for the gating above, so
+    // adopting JEP 486 here would disable that enforcement rather than
+    // tighten it. That is a design decision about CratonVM's security model,
+    // not a stub to remove, and is left as its own item.
+    //
+    // Unchanged for the common cases: with no manager yet installed the check
+    // short-circuits, and with no `java.policy` loaded
+    // `policy_allows_full_generic` is allow-all.
     r.register(
         sys,
         "setSecurityManager",
         "(Ljava/lang/SecurityManager;)V",
         |ctx, args| {
+            if get_security_manager(&*ctx).is_some() {
+                let code_base = current_privileged_code_base_arc();
+                let cert_digests = current_privileged_cert_digests_arc();
+                if !policy_allows_full_generic(
+                    "java/lang/RuntimePermission",
+                    "setSecurityManager",
+                    "",
+                    code_base.as_deref(),
+                    &cert_digests,
+                ) {
+                    return Err(throw_access_control_exception(
+                        ctx,
+                        "access denied (\"java/lang/RuntimePermission\" \"setSecurityManager\")"
+                            .to_string(),
+                    ));
+                }
+            }
             let sm = match args.get(0) {
                 Some(Value::Object(Some(o))) => Some(*o),
                 _ => None,

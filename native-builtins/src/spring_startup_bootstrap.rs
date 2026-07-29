@@ -1664,22 +1664,46 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // optimization and skipping cleanup is harmless. Also no-op `destroy()`
     // so the bean's lifecycle teardown path doesn't NPE the same way.
     //
-    // KEEP (deliberate no-ops), re-audited 2026-07-27. Both method bodies do
-    // nothing but `metadataReaderFactory.clearCache()`; the field is null
-    // under CratonVM's partial bootstrap, and skipping a cache eviction has
-    // no observable effect on anything but memory. The right end state is to
-    // DELETE these two once `setMetadataReaderFactory` is actually reached
-    // during context refresh — not to reimplement them here.
+    // STUB-REMOVAL (wave 3): these were unconditional no-ops, justified by "the
+    // field is null under CratonVM's partial bootstrap". That premise is a
+    // runtime condition, not a spec fact — the moment `setMetadataReaderFactory`
+    // IS reached during context refresh (the stated end state) the no-op stops
+    // being harmless and starts silently suppressing a real cache eviction with
+    // nothing to signal it. Make them null-TOLERANT instead of null-assuming:
+    // the null case behaves exactly as before (no NPE, nothing done), and the
+    // non-null case runs the real body. That removes the need for a future
+    // sweep to notice the premise changed.
     const SMRF_BEAN: &str = "org/springframework/boot/autoconfigure/\
          SharedMetadataReaderFactoryContextInitializer\
          $SharedMetadataReaderFactoryBean";
+    /// `this.metadataReaderFactory.clearCache()`, skipped when the field is
+    /// still null (CratonVM's partial bootstrap) instead of NPE-ing on it.
+    fn smrf_clear_cache(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let Some(Value::Object(Some(this))) = args.first().copied() else {
+            return Ok(None);
+        };
+        if let Value::Object(Some(factory)) = ctx.get_field_by_name(this, "metadataReaderFactory") {
+            let _ = ctx.invoke_virtual(factory, "clearCache", "()V", &[])?;
+        }
+        Ok(None)
+    }
     registry.register(
         SMRF_BEAN,
         "onApplicationEvent",
         "(Lorg/springframework/context/event/ContextRefreshedEvent;)V",
-        |_ctx, _args| Ok(None),
+        smrf_clear_cache,
     );
-    registry.register(SMRF_BEAN, "destroy", "()V", |_ctx, _args| Ok(None));
+    // `destroy()` is the DisposableBean teardown for the same field. Spring's
+    // body across the 3.x line either clears the cache or drops the reference;
+    // both are subsumed by "evict, then release", and the bean is being
+    // discarded either way. Null field → still a no-op, as before.
+    registry.register(SMRF_BEAN, "destroy", "()V", |ctx, args| {
+        smrf_clear_cache(ctx, args)?;
+        if let Some(Value::Object(Some(this))) = args.first().copied() {
+            ctx.set_field_by_name(this, "metadataReaderFactory", Value::Object(None));
+        }
+        Ok(None)
+    });
 
     // ── BeanWrapperImpl.getWrappedInstance "No wrapped object" (sportme) ──
     // After our tolerant `Assert.notNull` shim above lets a null target pass

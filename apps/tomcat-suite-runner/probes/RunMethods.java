@@ -24,15 +24,31 @@ import org.junit.runner.manipulation.Filter;
  * the pollution being hunted never happens. Methods run in JUnit's own order,
  * which is what the full-class run does too.
  *
- * <p>usage: {@code RunMethods <class> <method1> [<method2> ...]}
+ * <p>usage: {@code RunMethods <class> <method1> [<method2> ...]} or
+ * {@code RunMethods <class> --range <first-index> <last-index>}.
  */
 public final class RunMethods {
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            throw new IllegalArgumentException("usage: <class> <method>...");
+            throw new IllegalArgumentException("usage: <class> <method>... | <class> --range <first> <last>");
         }
         Class<?> testClass = Class.forName(args[0]);
-        final Set<String> wanted = new LinkedHashSet<>(Arrays.asList(args).subList(1, args.length));
+        final boolean rangeMode = args.length == 4 && "--range".equals(args[1]);
+        final int firstIndex;
+        final int lastIndex;
+        final Set<String> wanted;
+        if (rangeMode) {
+            firstIndex = Integer.parseInt(args[2]);
+            lastIndex = Integer.parseInt(args[3]);
+            if (firstIndex < 0 || lastIndex < firstIndex) {
+                throw new IllegalArgumentException("invalid parameterized range " + firstIndex + ".." + lastIndex);
+            }
+            wanted = Set.of();
+        } else {
+            firstIndex = -1;
+            lastIndex = -1;
+            wanted = new LinkedHashSet<>(Arrays.asList(args).subList(1, args.length));
+        }
 
         Filter filter = new Filter() {
             @Override
@@ -44,6 +60,21 @@ public final class RunMethods {
                     }
                     // Parameterized descriptions look like "testFoo[0: x]".
                     int bracket = m.indexOf('[');
+                    if (rangeMode) {
+                        if (bracket < 0) {
+                            return false;
+                        }
+                        int colon = m.indexOf(':', bracket + 1);
+                        if (colon < 0) {
+                            return false;
+                        }
+                        try {
+                            int index = Integer.parseInt(m.substring(bracket + 1, colon));
+                            return index >= firstIndex && index <= lastIndex;
+                        } catch (NumberFormatException ignored) {
+                            return false;
+                        }
+                    }
                     return wanted.contains(bracket < 0 ? m : m.substring(0, bracket));
                 }
                 for (Description child : description.getChildren()) {
@@ -56,7 +87,7 @@ public final class RunMethods {
 
             @Override
             public String describe() {
-                return "methods " + wanted;
+                return rangeMode ? "parameterized range " + firstIndex + ".." + lastIndex : "methods " + wanted;
             }
         };
 

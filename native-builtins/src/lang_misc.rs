@@ -1814,6 +1814,12 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
     // the caller record's `<init>` frame — for compact-canonical records
     // with a validation body, this can shift max_stack and cause the
     // throw branch to be skipped or mis-dispatched. See WP2.6.
+    //
+    // KEEP (genuinely empty, not a stub): `java.lang.Record` declares NO
+    // instance fields and its sole constructor is `protected Record() {}` —
+    // every record's canonical ctor chains here through `invokespecial` and the
+    // real body does nothing but `super()`. Component fields are written by the
+    // subclass ctor, never here. Empty is exact.
     r.register(rec, "<init>", "()V", |_ctx, _args| Ok(None));
     r.register(rec, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         let this = obj_arg(args, 0)?;

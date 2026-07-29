@@ -17,11 +17,25 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallFailed, RuntimeError};
 use cratonvm_types::{ArrayElementType, Value};
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
+/// Mirrors HotSpot's `JfrRecorder::is_created()`: set by `createJFR`, cleared
+/// by `destroyJFR`. Both natives are specified in terms of it (see their
+/// registrations), so it cannot be replaced by a constant.
+static CREATED: AtomicBool = AtomicBool::new(false);
 static CLOCK_ORIGIN: OnceLock<Instant> = OnceLock::new();
 static NEXT_TYPE_ID: AtomicI64 = AtomicI64::new(1);
+
+/// The tick rate `counterTime()` counts in. `counterTime()` returns
+/// nanoseconds, so this is 1e9 — and `getTicksFrequency()` /
+/// `getTimeConversionFactor()` are both DERIVED from it below rather than
+/// written out as independent literals, because OpenJDK's
+/// `JVMSupport.nanosToTicks` multiplies one by the other and any drift between
+/// the three would silently rescale every JFR timestamp.
+const TICKS_PER_SECOND: i64 = 1_000_000_000;
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 fn type_ids() -> &'static Mutex<HashMap<String, i64>> {
     static TYPE_IDS: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
@@ -159,6 +173,89 @@ fn epoch_nanos() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
+/// Host RAM and swap totals, in bytes — the two numbers `JVM.hostTotalMemory()`
+/// and `JVM.hostTotalSwapMemory()` are specified to return ("the total amount
+/// of memory / swap memory of the host system whether or not this JVM runs in a
+/// container", `jdk/jfr/internal/JVM.java`).
+///
+/// The host CAN answer both, so neither is a constant. Probed the same way the
+/// rest of the tree already does it, with no new dependency:
+///   * Windows — `GlobalMemoryStatusEx` via raw FFI (identical `MEMORYSTATUSEX`
+///     layout to `jfr/src/builtin.rs`, `vm/src/runtime/crash_handler.rs` and
+///     `vm-cli/src/main.rs`; `clashing_extern_declarations` is `deny` in the
+///     workspace lints, so the layout must stay identical). `ullTotalPageFile`
+///     is the system commit limit (physical + page file), so the page-file
+///     portion — the thing that corresponds to swap — is the difference.
+///   * Linux — `MemTotal:` / `SwapTotal:` (kB) from `/proc/meminfo`.
+///   * Anything else / probe failure — `None`, and the callers fall back to
+///     the JDK's `0` "unknown" sentinel.
+fn host_memory_totals() -> Option<(i64, i64)> {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+        extern "system" {
+            fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return None;
+        }
+        let total = status.ull_total_phys.min(i64::MAX as u64) as i64;
+        let commit_limit = status.ull_total_page_file.min(i64::MAX as u64) as i64;
+        return Some((total, commit_limit.saturating_sub(total).max(0)));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let mut total_kb: Option<u64> = None;
+        let mut swap_kb: Option<u64> = None;
+        for line in contents.lines() {
+            // Lines look like: "MemTotal:       16331640 kB".
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                total_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("SwapTotal:") {
+                swap_kb = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+            }
+            if total_kb.is_some() && swap_kb.is_some() {
+                break;
+            }
+        }
+        let total = total_kb?.saturating_mul(1024).min(i64::MAX as u64) as i64;
+        // A kernel built without swap support omits SwapTotal entirely; that
+        // really is zero swap, not an unknown.
+        let swap = swap_kb
+            .unwrap_or(0)
+            .saturating_mul(1024)
+            .min(i64::MAX as u64) as i64;
+        return Some((total, swap));
+    }
+    #[allow(unreachable_code)]
+    {
+        None
+    }
+}
+
 fn saved_dump_path(ctx: &mut dyn NativeContext) -> Value {
     let path = dump_path()
         .lock()
@@ -185,6 +282,15 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // Every entry below is `void` and has NO paired reader anywhere on this
     // native surface, so a no-op cannot make any observable answer disagree
     // with it — that is the test each one had to pass to stay here.
+    //
+    // What none of them can do is the thing they exist for on HotSpot: hand
+    // data to the recorder. This crate does not depend on `cratonvm-jfr`, and
+    // the whole `NativeContext` JFR surface is the single hard-coded
+    // `emit_virtual_thread_pinned_jfr(&'static str)` (`native-api/src/registry.rs`),
+    // so there is no door from here into the `FlightRecorder` the VM owns.
+    // That, not any individual entry, is the reason this file tops out at the
+    // lifecycle/clock contract; see the report escalation.
+    //
     // `registerNatives()V` is a genuine no-op on HotSpot too (the JNI
     // registration it performs has no Java-visible effect); the `set*` tuning
     // knobs address a chunk writer this bridge does not own; `log`/`logEvent`/
@@ -241,13 +347,56 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     registry.register(JVM, "isRecording", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(RECORDING.load(Ordering::Acquire) as i32)))
     });
-    registry.register(JVM, "createJFR", "(Z)Z", |_ctx, _args| {
+    // `createJFR(boolean simulateFailure)` is NOT a constant: HotSpot's
+    // `jfr_create_jfr` returns TRUE immediately if the recorder already exists,
+    // otherwise `JfrRecorder::create(simulate_failure)` — which fails on
+    // purpose when the flag is set. The flag has a live Java caller:
+    // `JVMSupport.createFailedNativeJFR()` is exactly `JVM.createJFR(true)` and
+    // is specified to come back `false` (`jdk/jfr/internal/JVMSupport.java`).
+    // Ignoring the argument made that call claim success. Track the same
+    // created/not-created state HotSpot does and honour the flag.
+    registry.register(JVM, "createJFR", "(Z)Z", |_ctx, args| {
+        if CREATED.load(Ordering::Acquire) {
+            return Ok(Some(Value::Int(1)));
+        }
+        let simulate_failure = matches!(args.first(), Some(Value::Int(v)) if *v != 0);
+        if simulate_failure {
+            return Ok(Some(Value::Int(0)));
+        }
+        CREATED.store(true, Ordering::Release);
         Ok(Some(Value::Int(1)))
     });
+    // `destroyJFR` is documented as returning "if an instance was actually
+    // destroyed" and as ignoring the call when nothing was created
+    // (`jdk/jfr/internal/JVM.java`), so a bare `true` was wrong on the
+    // never-created path. `JVMSupport.destroyJFR` feeds the answer straight
+    // into `nativeOK = !result`, i.e. into `hasJFR()`.
     registry.register(JVM, "destroyJFR", "()Z", |_ctx, _args| {
         RECORDING.store(false, Ordering::Release);
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(i32::from(
+            CREATED.swap(false, Ordering::AcqRel),
+        ))))
     });
+    // KEEP, and the real JDK behaviour it matches is now cited rather than
+    // assumed. HotSpot's `jfr_is_available` is `!Jfr::is_disabled()`, i.e. a
+    // read of the `-XX:-FlightRecorder` kill switch and nothing else; CratonVM
+    // has no such switch, so the constant IS that read's only possible answer.
+    //
+    // The wave-3 justification that used to sit here was factually wrong on
+    // both halves and is corrected for the record: `JVMSupport.checkAvailability()`
+    // (JDK 25 source) calls `JVM.isAvailable()` inside a `try` and DISCARDS the
+    // result — only an `UnsatisfiedLinkError`/`Throwable` marks JFR
+    // unavailable — so answering `false` would not have disabled anything; and
+    // `JVMSupport` never throws `UnsupportedOperationException` at all (its
+    // three `ensureWith*` helpers throw `InternalError`, `IOException` and
+    // `IllegalStateException`). The only consumer of the VALUE is the public
+    // `FlightRecorder.isAvailable()`, and `true` is right there: a `Recording`
+    // and a `RecordingStream` really can be constructed and driven on this
+    // boundary. What is absent is event PAYLOAD collection, and the entry
+    // points that would expose it say so without inventing data —
+    // `emitEvent`/`isInstrumented`/`getAllowedToDoEventRetransforms` answer
+    // `false`, `getEventWriter` answers `null` (the JDK's own "not recording
+    // on this thread" reply, see below) and `newEventWriter` throws by name.
     registry.register(JVM, "isAvailable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -262,10 +411,19 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Long(epoch_nanos())))
     });
     registry.register(JVM, "getTicksFrequency", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(1_000_000_000)))
+        Ok(Some(Value::Long(TICKS_PER_SECOND)))
     });
+    // Derived, not a literal. OpenJDK uses this factor as
+    // `nanosToTicks(nanos) = (long)(nanos * factor)`
+    // (`JVMSupport.nanosToTicks`), so it is exactly ticks-per-nanosecond —
+    // `TICKS_PER_SECOND / NANOS_PER_SECOND`. Computing it from the same
+    // constant `getTicksFrequency()` and `counterTime()` use means changing the
+    // tick rate can no longer leave a stale `1.0` behind rescaling every
+    // recorded timestamp.
     registry.register(JVM, "getTimeConversionFactor", "()D", |_ctx, _args| {
-        Ok(Some(Value::Double(1.0)))
+        Ok(Some(Value::Double(
+            TICKS_PER_SECOND as f64 / NANOS_PER_SECOND as f64,
+        )))
     });
     registry.register(JVM, "getPid", "()Ljava/lang/String;", |ctx, _args| {
         Ok(Some(Value::Object(Some(
@@ -316,16 +474,12 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // caller gets on a JVM with no chunk repository: no stack trace has been
     // interned (`getStackTraceId`, `registerStackFilter`), no event has been
     // committed (`commit`), no event class has been unloaded
-    // (`getUnloadedEventClassCount`). `hostTotalMemory`/`hostTotalSwapMemory`
-    // are the one honest gap in this group: CratonVM has no portable host-RAM
-    // probe, and 0 is the JDK's own "unknown" sentinel for them.
-    // `getThreadId` is deliberately NOT in this list — see below.
+    // (`getUnloadedEventClassCount`). `getThreadId` and the two `hostTotal*`
+    // probes are deliberately NOT in this list — see below.
     for (name, descriptor) in [
         ("getUnloadedEventClassCount", "()J"),
         ("getStackTraceId", "(IJ)J"),
         ("commit", "(J)J"),
-        ("hostTotalMemory", "()J"),
-        ("hostTotalSwapMemory", "()J"),
         (
             "registerStackFilter",
             "([Ljava/lang/String;[Ljava/lang/String;)J",
@@ -335,6 +489,24 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Long(0)))
         });
     }
+
+    // These two used to sit in the `0` group above on the grounds that CratonVM
+    // "has no portable host-RAM probe". It does — three of them, already in the
+    // tree (`jfr/src/builtin.rs`, `vm/src/runtime/crash_handler.rs`,
+    // `vm-cli/src/main.rs`). Neither number is CratonVM's to invent: both are
+    // properties of the HOST, which is why `JVM.java` documents them as
+    // reported "whether or not this JVM runs in a container". Probe the host;
+    // fall back to the JDK's `0` sentinel only where the platform has no probe.
+    registry.register(JVM, "hostTotalMemory", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(
+            host_memory_totals().map(|(total, _)| total).unwrap_or(0),
+        )))
+    });
+    registry.register(JVM, "hostTotalSwapMemory", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(
+            host_memory_totals().map(|(_, swap)| swap).unwrap_or(0),
+        )))
+    });
 
     // `exclude`/`include` are the JFR thread filter and `isExcluded` is the
     // guard that reads it. As a no-op/no-op/constant-false trio the guard
@@ -417,12 +589,29 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/List;",
         |ctx, _args| ctx.new_object_initialized("java/util/ArrayList", "()V", &[]),
     );
-    // A null `EventWriter` is the JDK's own "this thread has no chunk buffer"
-    // answer, and it is unreachable rather than merely unimplemented here: the
-    // only caller is the `commit` code that `retransformClasses` bytecode
-    // weaving installs into an event class, and `retransformClasses` /
-    // `isInstrumented` above say no class is ever instrumented. Fabricating a
-    // writer over a buffer that does not exist would be strictly worse.
+    // KEEP for `getEventWriter`, and the JDK caller that makes `null` the right
+    // answer is now named. `jdk.jfr.tracing.MethodTracer` (JDK 25) guards every
+    // emit with `... && JVM.getEventWriter() != null` — i.e. `null` is the
+    // JDK's own encoding of "this thread has no chunk buffer, do not record",
+    // a value it tests for, not a value it trips over. `EventWriter
+    // .getEventWriter()` likewise reads `JVM.getEventWriter()` and only calls
+    // `newEventWriter()` when it is null.
+    //
+    // `newEventWriter` is the opposite end of that same `if`: its result is
+    // used UNCHECKED, so a null there is an NPE at a distance inside woven
+    // event bytecode, and a hand-built `EventWriter` would be worse still —
+    // every `put*` on it writes through raw `startPosition`/`currentPosition`/
+    // `maxPosition` addresses into a chunk buffer that must then be decoded by
+    // `JVM.flush(EventWriter,II)`. Throwing names the gap at the gap.
+    //
+    // Reachability, so the pair is not mistaken for a live lie: the ONLY caller
+    // of either is the `commit()` body that `EventInstrumentation` weaves into
+    // an event class, and weaving goes through `retransformClasses`, a no-op
+    // here — which `isInstrumented`/`getAllowedToDoEventRetransforms` above
+    // already report as `false`. So nothing on this surface contradicts
+    // anything else: no class is instrumented, therefore no writer is ever
+    // requested, therefore `isAvailable() == true` promises only the lifecycle
+    // and clock surface that IS implemented.
     registry.register(
         JVM,
         "getEventWriter",
@@ -433,7 +622,16 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         JVM,
         "newEventWriter",
         "()Ljdk/jfr/internal/event/EventWriter;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |_ctx, _args| {
+            Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: "jdk.jfr.internal.JVM.newEventWriter: CratonVM has no JFR chunk \
+                              buffer; event payloads are recorded by the Rust jfr backend, not \
+                              through this boundary"
+                        .to_owned(),
+                },
+            ))
+        },
     );
     // `setConfiguration` used to report success from the blanket "return 1"
     // group while storing nothing, and `getConfiguration` answered a constant
@@ -544,20 +742,46 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;",
         |ctx, args| Ok(known_jfr_type_for_class_mirror(ctx, args)),
     );
-    // HotSpot's JDKEvents bootstrap registers native mirror events such as
-    // jdk.MethodTrace. CratonVM records through its Rust JFR backend instead;
-    // letting the Java bootstrap validate HotSpot-only mirror fields rejects a
-    // perfectly usable RecordingStream before it can be configured.
+    // NOT a constant-valued stub — a deliberate behavioural OVERRIDE of real
+    // JDK bytecode, and the one entry in this file whose justification could
+    // not be re-derived from source alone. Recorded precisely so it can be
+    // retested rather than re-argued:
+    //
+    // The real `JDKEvents.initialize()` (JDK 25) registers ~30 mirror event
+    // classes through `MetadataRepository.register`, adds five periodic
+    // container events, and calls `JFRTracing.enable()`. Its whole body is
+    // already wrapped in `catch (Exception e) { Logger.log(WARN) }`, so the
+    // wave-3 claim that letting it run "rejects a perfectly usable
+    // RecordingStream" can only hold for an *Error* escaping that catch — the
+    // candidate being the `InternalError` that `JVMSupport.setConfiguration`
+    // throws when `JVM.setConfiguration` returns false. That native answered a
+    // blanket `true` while storing nothing when this override was written and
+    // now round-trips through a real side table (see above), so the failure
+    // this override was added for may well be gone. Removing it needs a run,
+    // which this pass cannot do; flagged for the next JFR bootstrap run.
     registry.register(
         "jdk/jfr/internal/JDKEvents",
         "initialize",
         "()V",
         |_ctx, _args| Ok(None),
     );
-    // Without a HotSpot repository producer, EventDirectoryStream's Java
-    // polling loop has no blocking source and spins forever. A stream with no
-    // producer remains valid: configuration, handlers, and close work, while
-    // startAsync exposes an empty stream instead of consuming a CPU.
+    // Also an OVERRIDE of real bytecode, not a constant. The real body
+    // (JDK 25) is four statements:
+    //     PlatformRecording pr = ...getPlatformRecording(recording);
+    //     long startNanos = pr.start();
+    //     updateOnCompleteHandler();
+    //     directoryStream.startAsync(startNanos);
+    // Only the last one is unsupportable here: `EventDirectoryStream` polls an
+    // on-disk chunk repository that nothing in CratonVM produces, so its loop
+    // has no blocking source and spins a core forever. The first two are the
+    // recording state transition and would be worth keeping — but `pr.start()`
+    // routes into `PlatformRecorder.start`, i.e. chunk creation against that
+    // same absent repository, so it cannot be re-added without a run to prove
+    // it terminates. Left as the whole-method no-op it has been: the stream
+    // stays constructible, configurable and closeable and delivers no events,
+    // which is what every other entry point on this surface also reports.
+    // NOTE for the same follow-up run: `RecordingStream.start()` (the blocking
+    // sibling) is NOT overridden and still reaches `directoryStream.start`.
     registry.register(
         "jdk/jfr/consumer/RecordingStream",
         "startAsync",
@@ -633,6 +857,25 @@ mod tests {
         assert_eq!(string, type_id("java.lang.String"));
         assert_ne!(string, type_id("java.lang.Thread"));
         assert_ne!(string, 0);
+    }
+
+    /// `JVMSupport.nanosToTicks` is `(long)(nanos * getTimeConversionFactor())`
+    /// and `counterTime()` counts nanoseconds, so the factor and the advertised
+    /// tick frequency have to stay in step with `counter_time`'s unit.
+    #[test]
+    fn tick_frequency_and_conversion_factor_agree() {
+        assert_eq!(TICKS_PER_SECOND, NANOS_PER_SECOND);
+        assert_eq!(TICKS_PER_SECOND as f64 / NANOS_PER_SECOND as f64, 1.0);
+    }
+
+    /// The host really can answer `hostTotalMemory`; on the two platforms with
+    /// a probe it must not fall back to the `0` "unknown" sentinel.
+    #[test]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    fn host_memory_totals_are_probed_not_zero() {
+        let (total, swap) = host_memory_totals().expect("host RAM probe");
+        assert!(total > 0, "hostTotalMemory must be a real total");
+        assert!(swap >= 0, "hostTotalSwapMemory must not be negative");
     }
 
     #[test]

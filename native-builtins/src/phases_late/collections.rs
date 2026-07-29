@@ -961,15 +961,29 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Empty enumeration
     let ee = "java/util/Collections$EmptyEnumeration";
-    // KEEP: the class IS the empty enumeration — `hasMoreElements` is false by
-    // definition, exactly as in the real `Collections.EmptyEnumeration`. (Its
-    // `nextElement` right below correctly throws NoSuchElementException.)
+    // KEEP — verbatim real behaviour, verified against JDK 25 source
+    // (`java.base/java/util/Collections.java`):
+    //
+    //     private static class EmptyEnumeration<E> implements Enumeration<E> {
+    //         static final EmptyEnumeration<Object> EMPTY_ENUMERATION = ...;
+    //         public boolean hasMoreElements() { return false; }
+    //         public E nextElement() { throw new NoSuchElementException(); }
+    //     }
+    //
+    // The real body is `return false;`, so there is no receiver state to read:
+    // the class IS the empty enumeration, and it is `private static` with no
+    // subclasses, so the "natives on concrete classes intercept non-overriding
+    // subclasses" hazard does not apply. (Its `nextElement` right below
+    // correctly throws NoSuchElementException, matching the second line.)
     r.register(ee, "hasMoreElements", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
     r.register(ee, "nextElement", "()Ljava/lang/Object;", |_ctx, _args| {
-        Err(RuntimeError::IllegalStateException {
-            message: "NoSuchElementException".into(),
+        // Was `IllegalStateException` carrying the string "NoSuchElementException"
+        // — a caller's `catch (NoSuchElementException)` never matched it. Real
+        // `Collections.EmptyEnumeration.nextElement()` throws the real thing.
+        Err(RuntimeError::NoSuchElementException {
+            message: "EmptyEnumeration has no elements".into(),
         }
         .into())
     });
@@ -1881,13 +1895,20 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // java.lang.AutoCloseable
-    r.register("java/lang/AutoCloseable", "close", "()V", |_ctx, _args| {
-        // AutoCloseable is a marker interface — close() is implemented by concrete classes
-        // (FileInputStream, Socket, etc.). This default registration is a fallback for
-        // callers that hold a raw AutoCloseable reference; the real implementation runs
-        // via virtual dispatch on the concrete subclass.
-        Ok(None)
-    });
+    // STUB-REMOVAL (wave 3) — DELETED: `java/lang/AutoCloseable.close()V` -> no-op.
+    //
+    // Proof it was dead in BOTH modes: `native-io`'s `register_scanner_natives`
+    // (native-io/src/lib.rs ~6061) registers the SAME triple, pointing at
+    // `native_scanner_close`, and `register_io_natives` always runs AFTER
+    // `register_builtins` (vm_init.rs 1252-1254 / 1523 / 1953, and the two test
+    // helpers in vm.rs) — last registration wins, so this no-op never served a
+    // single call. Removing it changes no behaviour and stops the next sweep
+    // re-litigating a registration that cannot fire.
+    //
+    // NOTE for the owner of native-io: the surviving winner is Scanner-specific.
+    // `native_scanner_close` writes `Int(1)` into field index 4 of WHATEVER
+    // receiver reaches `AutoCloseable.close()` / `Closeable.close()`, which is
+    // only meaningful for a synthetic Scanner. That is a separate bug and is
+    // reported upstream rather than papered over here.
     r.set_category(__prev_cat);
 }

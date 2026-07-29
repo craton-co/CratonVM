@@ -15,6 +15,37 @@
 //!
 //! Run with:
 //!     cargo test -p cratonvm-vm --test differential -- --ignored
+//!
+//! # Adding a divergence
+//!
+//! This harness *is* the divergence record — the standing divergence log was
+//! retired on 2026-07-28 once its last entry was fixed, and the JSON report
+//! below replaced it. To pin a newly found divergence: add a fixture class under
+//! `vm/tests/resources/cratonvm/` whose `main` prints everything it checks, then
+//! either an `#[ignore]`d `assert_main_matches_hotspot("cratonvm/YourFixture")`
+//! test (for a permanent regression) or a `DIFFERENTIAL_CLASSES=cratonvm.Your…`
+//! run of [`diff_batch_from_env`] (for an ad-hoc sweep). Mismatches land in
+//! `bench/differential-divergences.json`.
+//!
+//! The three fixtures already here — `DiffLocaleCase`, `DiffFloatFormat`,
+//! `DiffNpeMessage` — pin the three divergences that log recorded:
+//! locale-sensitive case mapping, `Double`/`Float` layout, and JEP 358 NPE
+//! messages.
+//!
+//! # Two ways to get a false divergence
+//!
+//! Both of these were live bugs in this file, and both make the *harness* wrong
+//! rather than the VM:
+//!
+//! 1. **Configuration skew.** The CratonVM side must adopt the launcher's
+//!    VM-flag defaults. `vm-cli` resolves an absent
+//!    `-XX:±ShowCodeDetailsInExceptionMessages` to HotSpot's `on`, but an
+//!    in-process embedder that never calls the setter keeps the pre-JEP-358
+//!    strings — so every NPE fixture "diverged" purely from configuration.
+//! 2. **Formatting skew.** Whatever this file uses to render a return value has
+//!    to match what `System.out.println` prints on the HotSpot side. Rust's
+//!    `Display` for `f64` never emits scientific notation, so `1e7` compared as
+//!    `10000000` against HotSpot's `1.0E7`.
 
 use std::path::Path;
 use std::process::Command;
@@ -59,6 +90,10 @@ pub struct DiffResult {
 
 /// Run a Java static method under both CratonVM and HotSpot, comparing results.
 ///
+/// Both sides use the real JDK: CratonVM boots the launcher configuration
+/// (`VmConfig::for_launcher`), which loads `java.base` from the same
+/// `$JAVA_HOME` the `java` subprocess runs.
+///
 /// # Arguments
 /// - `class`: JVM internal class name (e.g. `"cratonvm/DiffArithmetic"`)
 /// - `method`: method name (e.g. `"add"`)
@@ -86,8 +121,23 @@ pub fn differential_run(class: &str, method: &str, descriptor: &str) -> DiffResu
 
 /// Run a static method under CratonVM, capturing stdout and return value.
 fn run_cratonvm(class: &str, method: &str, descriptor: &str) -> Outcome {
+    // `vm-cli` resolves an absent `-XX:±ShowCodeDetailsInExceptionMessages` to
+    // HotSpot's `on` default and publishes it before `Vm::new`; an in-process
+    // embedder that never calls the setter keeps the legacy (non-JEP-358)
+    // strings instead. A harness comparing against a stock `java` has to adopt
+    // the launcher's defaults, or an NPE-message fixture "diverges" purely
+    // because the two sides were configured differently.
+    cratonvm_vm::runtime::env_cache::set_show_code_details_in_exception_messages(true);
     let classpath = test_resources_dir();
-    let config = VmConfig::new().with_classpath(vec![classpath]);
+    // `for_launcher()`, not `VmConfig::new()`: the latter is the *embedded*
+    // default, which boots the synthetic JDK. Comparing a synthetic-stdlib
+    // CratonVM against a real-JDK HotSpot charges every synthetic-mode gap to
+    // the VM as a "divergence" — a `new Locale("en")` that the synthetic
+    // library cannot construct is not a case-mapping bug. The shipping
+    // `cratonvm` launcher boots real-JDK mode, and this harness already
+    // requires a JDK on PATH for the HotSpot side, so both sides can and should
+    // use the same class library.
+    let config = VmConfig::for_launcher().with_classpath(vec![classpath]);
     let mut vm = Vm::new(config);
 
     // Prepare arguments based on descriptor.
@@ -96,7 +146,7 @@ fn run_cratonvm(class: &str, method: &str, descriptor: &str) -> Outcome {
     match vm.invoke(class, method, descriptor, &args) {
         Ok(Some(value)) => {
             let stdout = vm.main_thread.printed_lines.join("\n");
-            let return_value = format_value(&value);
+            let return_value = format_value(&value, descriptor, &vm);
             Outcome {
                 stdout,
                 return_value,
@@ -119,15 +169,44 @@ fn run_cratonvm(class: &str, method: &str, descriptor: &str) -> Outcome {
     }
 }
 
-/// Format a JVM Value as a string for comparison.
-fn format_value(value: &Value) -> String {
+/// Format a JVM Value the way `System.out.println` prints it on the HotSpot
+/// side, so the two strings are comparable.
+///
+/// Three things have to be undone to get there, and each of them used to
+/// manufacture a divergence out of a correct result:
+///
+/// * **Floating point.** HotSpot prints `Double.toString` / `Float.toString`.
+///   Rust's `Display` for `f64`/`f32` picks the same shortest round-tripping
+///   digits but never switches to scientific notation, so `1e7` formatted as
+///   `10000000` here against `1.0E7` there.
+///   `cratonvm_types::java_{double,float}_to_string` implements the JLS layout
+///   rule and is what the VM's own `Double.toString` native uses.
+/// * **`char` / `boolean`.** Both live in a `Value::Int` on the operand stack,
+///   but `println` prints `d` and `true`, not `100` and `1`. The method
+///   descriptor's return type is the only thing that distinguishes them from an
+///   `int`.
+/// * **References.** A returned `String` printed as the literal `"object"`,
+///   which no HotSpot output can ever equal. Read the actual characters when the
+///   reference is a String; anything else keeps `object` (its HotSpot spelling
+///   would be an identity hash, which is not comparable anyway).
+fn format_value(value: &Value, descriptor: &str, vm: &Vm) -> String {
+    let return_type = parse_return_type(descriptor);
     match value {
-        Value::Int(i) => i.to_string(),
+        Value::Int(i) => match return_type.as_str() {
+            "Z" => (*i != 0).to_string(),
+            "C" => char::from_u32(*i as u32)
+                .map(String::from)
+                .unwrap_or_else(|| i.to_string()),
+            _ => i.to_string(),
+        },
         Value::Long(l) => l.to_string(),
-        Value::Float(f) => format!("{f}"),
-        Value::Double(d) => format!("{d}"),
+        Value::Float(f) => cratonvm_types::java_float_to_string(*f),
+        Value::Double(d) => cratonvm_types::java_double_to_string(*d),
         Value::Object(None) => "null".to_string(),
-        Value::Object(Some(_)) => "object".to_string(),
+        Value::Object(Some(obj)) => {
+            cratonvm_vm::vm::read_java_string(&vm.shared.mem.heap, *obj)
+                .unwrap_or_else(|| "object".to_string())
+        }
         _ => format!("{value:?}"),
     }
 }
@@ -148,6 +227,9 @@ fn args_for_descriptor(descriptor: &str) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 // HotSpot runner
 // ---------------------------------------------------------------------------
+
+/// Distinguishes concurrent `run_hotspot` calls' scratch directories.
+static WRAPPER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Run a static method under HotSpot by invoking `java` on PATH.
 ///
@@ -191,8 +273,16 @@ fn run_hotspot(class: &str, method: &str, descriptor: &str) -> Outcome {
          System.out.println({dotted_class}.{method}()); }} }}"
     );
 
-    // Write wrapper to a temp directory alongside the classpath.
-    let temp_dir = std::env::temp_dir().join("cratonvm_diff_test");
+    // Write the wrapper to a directory of its own. A single shared path would
+    // be raced by concurrently running tests (the default `cargo test` layout):
+    // each call compiles the wrapper and then deletes it, so a neighbour's
+    // `java` invocation can find the class gone and produce empty stdout, which
+    // reads as a divergence against a VM that was right all along.
+    let temp_dir = std::env::temp_dir().join("cratonvm_diff_test").join(format!(
+        "{}-{}",
+        std::process::id(),
+        WRAPPER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&temp_dir).ok();
 
     let wrapper_java = temp_dir.join("DiffWrapper__.java");
@@ -232,18 +322,27 @@ fn run_hotspot(class: &str, method: &str, descriptor: &str) -> Outcome {
         .trim_end_matches('\r')
         .to_string();
 
-    // The wrapper prints the return value on stdout. Parse it back.
-    let return_value = match return_type.as_str() {
-        "V" => "void".to_string(),
-        _ => raw_stdout.clone(),
+    // The wrapper prints the tested method's own output first and the return
+    // value on the LAST line. Splitting them keeps a method that both prints and
+    // returns comparable: the CratonVM runner always reports `printed_lines`, so
+    // discarding HotSpot's stdout here made every such method "diverge".
+    let (stdout, return_value) = match return_type.as_str() {
+        "V" => (raw_stdout, "void".to_string()),
+        _ => match raw_stdout.rfind('\n') {
+            Some(cut) => (
+                raw_stdout[..cut].trim_end_matches('\r').to_string(),
+                raw_stdout[cut + 1..].to_string(),
+            ),
+            None => (String::new(), raw_stdout),
+        },
     };
 
-    // Clean up temp files (best effort).
-    std::fs::remove_file(temp_dir.join("DiffWrapper__.java")).ok();
-    std::fs::remove_file(temp_dir.join("DiffWrapper__.class")).ok();
+    // Clean up (best effort) — the whole per-run directory, not just the two
+    // files, so nothing accumulates under the shared parent.
+    std::fs::remove_dir_all(&temp_dir).ok();
 
     Outcome {
-        stdout: String::new(), // The wrapper only prints the return value
+        stdout,
         return_value,
     }
 }
@@ -451,15 +550,17 @@ fn diff_string_operations() {
             result.matches
         );
         report.record("cratonvm/DiffString", method, descriptor, &result);
-        // String operations may diverge due to incomplete String support.
-        // Log divergences but don't fail the test -- the report captures them.
-        if !result.matches {
-            eprintln!(
-                "  WARNING: String divergence in DiffString.{method}!\n    \
-                 CratonVM: {}\n    HotSpot: {}",
-                result.cratonvm_outcome, result.hotspot_outcome
-            );
-        }
+        // Asserted since 2026-07-28. This used to only warn, on the premise
+        // that "String operations may diverge due to incomplete String
+        // support" — but with the harness rendering `char`, `boolean` and
+        // `String` returns the way `println` does, and both sides booting the
+        // real JDK, all nine match. A regression here is a real one.
+        assert!(
+            result.matches,
+            "String divergence in DiffString.{method}!\n  \
+             CratonVM: {}\n  HotSpot: {}",
+            result.cratonvm_outcome, result.hotspot_outcome
+        );
     }
 
     // Also test main which prints all results to stdout.
@@ -487,24 +588,96 @@ fn diff_string_operations() {
         report.divergences.len()
     );
 
-    // Log integer-returning method results separately. These may diverge
-    // if String methods are not yet implemented in the synthetic JDK.
-    let int_methods: Vec<&str> = methods
-        .iter()
-        .filter(|(_, d)| *d == "()I")
-        .map(|(m, _)| *m)
+}
+
+// ---------------------------------------------------------------------------
+// Divergence-log regression suites
+// ---------------------------------------------------------------------------
+
+/// Run one fixture's `main` under both VMs and assert byte-identical stdout.
+///
+/// These three classes pin the divergences the log recorded: locale-sensitive
+/// case mapping (DIV-001), `Double`/`Float` formatting (DIV-002) and JEP 358
+/// NullPointerException messages (DIV-003). Each prints everything it checks, so
+/// a single stdout comparison covers the whole matrix.
+fn assert_main_matches_hotspot(class: &str) {
+    let result = differential_run(class, "main", "([Ljava/lang/String;)V");
+    assert!(
+        result.matches,
+        "{class}.main diverged from HotSpot.\n  CratonVM: {}\n  HotSpot:  {}",
+        result.cratonvm_outcome, result.hotspot_outcome
+    );
+}
+
+/// DIV-001: `String.to{Lower,Upper}Case(Locale)` must honour the Turkish /
+/// Azeri dotted-I and Lithuanian retained-dot rules, not just the root mapping.
+#[test]
+#[ignore = "requires java/javac on PATH"]
+fn diff_locale_case_mapping() {
+    assert_main_matches_hotspot("cratonvm/DiffLocaleCase");
+}
+
+/// DIV-002: `Double.toString` / `Float.toString` layout (the `10^-3 .. 10^7`
+/// plain-decimal window, subnormals, specials) through every printing path.
+#[test]
+#[ignore = "requires java/javac on PATH"]
+fn diff_float_formatting() {
+    assert_main_matches_hotspot("cratonvm/DiffFloatFormat");
+}
+
+/// DIV-003: JEP 358 helpful NullPointerException messages, including the
+/// `because "<expr>" is null` clause inside control-flow merge blocks.
+#[test]
+#[ignore = "requires java/javac on PATH"]
+fn diff_npe_messages() {
+    assert_main_matches_hotspot("cratonvm/DiffNpeMessage");
+}
+
+// ---------------------------------------------------------------------------
+// Batch runs via the DIFFERENTIAL_CLASSES env var
+// ---------------------------------------------------------------------------
+
+/// Run `main` under both VMs for every class named in `DIFFERENTIAL_CLASSES`
+/// (comma- or space-separated, internal or dotted form), writing the report to
+/// `bench/differential-divergences.json`.
+///
+/// This is the ad-hoc entry point for widening the sweep without editing the
+/// test: point the classpath fixtures directory at new `.class` files and list
+/// them. It reports rather than asserts, so an exploratory batch always
+/// produces a full report instead of stopping at the first divergence.
+#[test]
+#[ignore = "requires java/javac on PATH and DIFFERENTIAL_CLASSES"]
+fn diff_batch_from_env() {
+    let Ok(raw) = std::env::var("DIFFERENTIAL_CLASSES") else {
+        eprintln!("DIFFERENTIAL_CLASSES not set — nothing to do");
+        return;
+    };
+    let classes: Vec<String> = raw
+        .split([',', ' ', ';'])
+        .map(|c| c.trim().replace('.', "/"))
+        .filter(|c| !c.is_empty())
         .collect();
-    for m in &int_methods {
-        let r = differential_run("cratonvm/DiffString", m, "()I");
-        if !r.matches {
-            eprintln!(
-                "  NOTE: Integer String method DiffString.{m} diverged \
-                 (expected once String natives are complete):\n    \
-                 CratonVM: {}\n    HotSpot: {}",
-                r.cratonvm_outcome, r.hotspot_outcome
-            );
-        }
+    assert!(
+        !classes.is_empty(),
+        "DIFFERENTIAL_CLASSES was set but named no classes: {raw:?}"
+    );
+
+    let mut report = DivergenceReport::new();
+    for class in &classes {
+        let result = differential_run(class, "main", "([Ljava/lang/String;)V");
+        eprintln!(
+            "diff_batch: {class}.main match={}\n  CratonVM: {}\n  HotSpot:  {}",
+            result.matches, result.cratonvm_outcome, result.hotspot_outcome
+        );
+        report.record(class, "main", "([Ljava/lang/String;)V", &result);
     }
+    report.write_to_file();
+    eprintln!(
+        "\ndiff_batch_from_env: {}/{} matched ({} divergences)",
+        report.total_matched,
+        report.total_tested,
+        report.divergences.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -630,13 +803,43 @@ mod unit_tests {
         assert!(args.is_empty());
     }
 
+    /// A `Vm` is only needed to resolve reference returns; the scalar
+    /// renderings are pure and are asserted through this helper.
+    fn scalar(value: Value, descriptor: &str) -> String {
+        let vm = Vm::new(VmConfig::new());
+        format_value(&value, descriptor, &vm)
+    }
+
     #[test]
     fn format_value_int() {
-        assert_eq!(format_value(&Value::Int(42)), "42");
+        assert_eq!(scalar(Value::Int(42), "()I"), "42");
     }
 
     #[test]
     fn format_value_null() {
-        assert_eq!(format_value(&Value::Object(None)), "null");
+        assert_eq!(scalar(Value::Object(None), "()Ljava/lang/String;"), "null");
+    }
+
+    /// `char` and `boolean` share `Value::Int` with `int`; only the descriptor
+    /// says which, and `println` prints them as `d` / `true`.
+    #[test]
+    fn format_value_char_and_boolean_follow_the_descriptor() {
+        assert_eq!(scalar(Value::Int(100), "()C"), "d");
+        assert_eq!(scalar(Value::Int(1), "()Z"), "true");
+        assert_eq!(scalar(Value::Int(0), "()Z"), "false");
+        assert_eq!(scalar(Value::Int(100), "()I"), "100");
+    }
+
+    /// `format_value` must produce what `System.out.println` prints on the
+    /// HotSpot side — `Double.toString`, not Rust's `Display` (which never uses
+    /// scientific notation and so mismatched on every value outside the
+    /// `10^-3 .. 10^7` window).
+    #[test]
+    fn format_value_doubles_use_java_tostring() {
+        assert_eq!(scalar(Value::Double(1e7), "()D"), "1.0E7");
+        assert_eq!(scalar(Value::Double(3.0), "()D"), "3.0");
+        assert_eq!(scalar(Value::Double(1e-4), "()D"), "1.0E-4");
+        assert_eq!(scalar(Value::Float(1e8), "()F"), "1.0E8");
+        assert_eq!(scalar(Value::Float(3.0), "()F"), "3.0");
     }
 }

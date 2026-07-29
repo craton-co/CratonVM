@@ -698,8 +698,33 @@ pub(crate) fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         ))))
     });
 
-    // isNative() → boolean (always true for our segments)
-    r.register(ms, "isNative", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    // isNative() → boolean.
+    //
+    // Was an unconditional `true` ("always true for our segments"), which is
+    // wrong for the `ofArray(...)` segments registered further down in THIS
+    // file: those are heap segments, and `isNative()` is exactly the query a
+    // caller uses to decide whether `address()` is meaningful and whether the
+    // segment may be handed to a downcall. They only *look* native from the
+    // inside because CratonVM cannot expose a moving Java array to native code
+    // and so gives them an off-heap mirror (`sync_heap_backed_segment`) — an
+    // implementation detail that must not leak into the spec'd answer.
+    //
+    // The discriminator is the one `sync_heap_backed_segment` already uses:
+    // `SEG_BACKING_ARRAY_FIELD` retains the Java array on an `ofArray` segment
+    // and holds an Arena (or nothing) on every off-heap one.
+    //
+    // NOTE: `foreign_ffm.rs` registers this same class+method+descriptor, and
+    // this registrar runs AFTER it on both paths that reach them
+    // (lib.rs:9736→9740, and :22995→23051), so THIS is the live answer — the
+    // one over there was dead, and said the opposite. They now agree.
+    r.register(ms, "isNative", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let heap_backed = match ctx.get_field(this, SEG_BACKING_ARRAY_FIELD) {
+            Value::Object(Some(array)) => ctx.object_is_array(array),
+            _ => false,
+        };
+        Ok(Some(Value::Int(i32::from(!heap_backed))))
+    });
 
     // get(ValueLayout, long offset) → value
     r.register(
@@ -1924,10 +1949,21 @@ pub(crate) fn register_pe_raw_native_libraries(r: &mut NativeMethodRegistry) {
 
     // static native void unload0(String name, long handle)
     //
-    // CratonVM keeps loaded libraries resident for the VM lifetime (the
-    // native-library table has no unload), so this is a no-op — matching the
-    // RawNativeLibraries contract, which explicitly permits a library to remain
-    // open after close().
+    // No-op because CratonVM cannot do otherwise, NOT because the real body is
+    // empty — real `unload0` dlcloses/FreeLibrary's the handle. `NativeContext`
+    // exposes `load_native_library` and `find_native_symbol` and nothing else;
+    // the library table is append-only, so there is no index to release.
+    //
+    // Staying resident is the safe direction of the two errors: a
+    // `RawNativeLibraries` handle can still back live function pointers
+    // (callers cache `findEntry0` results, and any bound downcall stub holds
+    // one), so unloading underneath them segfaults, while not unloading costs
+    // an address-space mapping.
+    //
+    // ESCALATION: add `NativeContext::unload_native_library(lib_index: i64)`
+    // over the same table `load_native_library` appends to. The handle needs no
+    // new plumbing — `load0` above stashes `lib_index + 1`, which is exactly
+    // what `RawNativeLibraryImpl.close()` hands back as `handle`.
     r.register(rnl, "unload0", "(Ljava/lang/String;J)V", |_ctx, _args| {
         Ok(None)
     });

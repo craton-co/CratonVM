@@ -16,7 +16,9 @@ use crate::{alloc_concurrent_synthetic, native_noop_with_this, obj_arg};
 // here: this module is gated on the `experimental-jmx` feature, that one is
 // not, and both register the same `ThreadMXBean` triples. One copy is what
 // stops the two registrations from drifting apart again.
-use crate::phases_late::management::{daemon_thread_count, live_thread_ids};
+use crate::phases_late::management::{
+    daemon_thread_count, live_thread_ids, peak_thread_count, reset_peak_thread_count,
+};
 
 /// Construct a Java `IOException` with the given message — the standard
 /// way to surface a connection-style failure to JDK callers.
@@ -156,6 +158,278 @@ fn system_load_average() -> f64 {
         }
     }
     -1.0
+}
+
+/// The VM's boot class path, as published in the `sun.boot.class.path` system
+/// property, or `None` when the VM never established one.
+///
+/// This is the single source both `RuntimeMXBean.getBootClassPath()` and
+/// `isBootClassPathSupported()` read, which is what keeps them from
+/// contradicting each other. Note that "present but EMPTY" is a real answer,
+/// not an absence: on a modular JDK with nothing appended via
+/// `-Xbootclasspath/a` HotSpot reports exactly that. Absence means the property
+/// was never populated at all, and only then must `isBootClassPathSupported()`
+/// report false — otherwise a caller would take the empty string for a
+/// measurement.
+fn boot_class_path(ctx: &dyn NativeContext) -> Option<String> {
+    ctx.get_system_property("sun.boot.class.path")
+}
+
+/// `jmm.h`'s `JMM_VMGLOBAL_ORIGIN_ENVIRON_VAR` — the flag value came from an
+/// environment variable, which is precisely how every CratonVM flag is set.
+/// `Flag.getVMOption()` maps this to `VMOption.Origin.ENVIRON_VAR`, and its
+/// `switch` has a `default` arm, so an unrecognised code degrades to
+/// `Origin.OTHER` rather than throwing.
+const JMM_VMGLOBAL_ORIGIN_ENVIRON_VAR: i32 = 4;
+
+/// The real JDK constructor `getFlags` builds its results with:
+/// `Flag(String name, Object value, boolean writeable, boolean external, int origin)`.
+/// Every use of it below is guarded by a `method_exists` check, so if a future
+/// JDK reshapes it the flag surface degrades to the previous "no flags"
+/// answer instead of misreporting one.
+const FLAG_INIT_DESC: &str = "(Ljava/lang/String;Ljava/lang/Object;ZZI)V";
+
+/// `com.sun.management.internal.Flag`'s real JDK class name.
+const FLAG_CLASS: &str = "com/sun/management/internal/Flag";
+
+/// Every CratonVM VM flag that is actually SET in this process, as
+/// `(name, raw value)` pairs sorted by name.
+///
+/// The name set is the declared flag inventory in `cratonvm_types::flag_groups`
+/// — the ten grouped variables, the scalars, and every legacy per-knob key a
+/// group token expands to — i.e. the same set `flags::declared_flag_names()`
+/// gates on. Values come through `flags::runtime_var`, which reads the one
+/// latched `VmFlags` snapshot rather than live `environ`, so this reports what
+/// the VM is actually running with, including keys set indirectly by a grouped
+/// expression such as `CRATONVM_JIT=no-bce`.
+///
+/// Flags left at their built-in default are deliberately ABSENT rather than
+/// listed with a fabricated default: an inventory row records a knob's name and
+/// group but not the predicate its owner parses it with (`truthy_word`,
+/// `present`, `on_unless_zero`, …), so "the default value of this flag" is not
+/// derivable here without guessing one. Reporting only the flags carrying an
+/// explicit value is what `-XX:+PrintCommandLineFlags` shows, and every entry
+/// in it is exact.
+fn craton_vm_flag_settings() -> Vec<(String, String)> {
+    use cratonvm_types::flag_groups;
+    let mut names: Vec<&'static str> = Vec::new();
+    names.extend(
+        flag_groups::Group::ALL
+            .iter()
+            .copied()
+            .map(flag_groups::Group::var),
+    );
+    names.extend(flag_groups::SCALARS.iter().copied());
+    for entry in flag_groups::INVENTORY {
+        names.extend(entry.on_key);
+        names.extend(entry.off_key);
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            cratonvm_types::flags::runtime_var(name)
+                .ok()
+                .map(|value| (name.to_string(), value))
+        })
+        .collect()
+}
+
+/// CPU and user time consumed by the CALLING thread, in nanoseconds.
+///
+/// `(total_cpu_ns, user_ns)`, or `None` on a platform whose per-thread clock we
+/// do not read (the JMM's "measurement unavailable" case, which the callers map
+/// to `-1`). The numbers come from the OS scheduler's own accounting for the
+/// current OS thread — no VM-side bookkeeping is involved, which is exactly why
+/// this is obtainable while ARBITRARY-thread CPU time is not: that would need a
+/// live OS handle for a thread we are not running on, and CratonVM's thread
+/// table carries none. The JMM allows precisely this asymmetry
+/// (`isCurrentThreadCpuTimeSupported()` true with
+/// `isThreadCpuTimeSupported()` false).
+fn current_thread_cpu_time_ns() -> Option<(i64, i64)> {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        extern "system" {
+            fn GetCurrentThread() -> *mut std::ffi::c_void;
+            fn GetThreadTimes(
+                thread: *mut std::ffi::c_void,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+        }
+        // FILETIME counts 100-nanosecond intervals.
+        fn to_ns(t: FileTime) -> i64 {
+            ((((t.high as u64) << 32) | (t.low as u64)).saturating_mul(100)) as i64
+        }
+        unsafe {
+            let mut creation = FileTime::default();
+            let mut exit = FileTime::default();
+            let mut kernel = FileTime::default();
+            let mut user = FileTime::default();
+            if GetThreadTimes(
+                GetCurrentThread(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            ) != 0
+            {
+                let user_ns = to_ns(user);
+                return Some((to_ns(kernel) + user_ns, user_ns));
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let mut usage: libc::rusage = std::mem::zeroed();
+            // RUSAGE_THREAD accounts the CALLING thread only, which is the JMM's
+            // per-thread contract; RUSAGE_SELF would sum the whole process.
+            if libc::getrusage(libc::RUSAGE_THREAD, &mut usage) == 0 {
+                let to_ns = |t: libc::timeval| {
+                    (t.tv_sec as i64) * 1_000_000_000 + (t.tv_usec as i64) * 1_000
+                };
+                let user_ns = to_ns(usage.ru_utime);
+                return Some((user_ns + to_ns(usage.ru_stime), user_ns));
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Whether `requested` names the CALLING thread — i.e. whether the OS
+/// per-thread clock [`current_thread_cpu_time_ns`] reads is the right one to
+/// answer a `getThreadCpuTime(long)` / `getThreadUserTime(long)` call with.
+///
+/// `None` (no `long` in the argument list) is treated as "the current thread",
+/// the same fallback the `getThreadInfo(J)` native below takes. The comparison
+/// is against the live `java.lang.Thread.tid`, which is the identity
+/// `getAllThreadIds()` hands out and `getThreadInfo(long)` resolves, so an id
+/// obtained from either round-trips here.
+fn current_thread_tid_matches(ctx: &mut dyn NativeContext, requested: Option<i64>) -> bool {
+    let Some(requested) = requested else {
+        return true;
+    };
+    let current = ctx.current_thread_object();
+    match ctx.get_field_by_name(current, "tid") {
+        Value::Long(id) => id == requested,
+        Value::Int(id) => i64::from(id) == requested,
+        _ => false,
+    }
+}
+
+/// JVMTI/JMM thread-status bit for "blocked entering a monitor", the value
+/// `vm_exec::thread_jmx_snapshot` writes into `ThreadJmxSnapshot::thread_status`
+/// for a thread contending for a monitor (its `WAITING` sibling is `0x0010`).
+const JMM_THREAD_STATUS_BLOCKED_ON_MONITOR_ENTER: i32 = 0x0400;
+
+/// Wait-for-graph deadlock detection, shared by the four `find*DeadlockedThreads`
+/// registrations (`ThreadMXBean` and `sun.management.ThreadImpl`).
+///
+/// The edge set comes from the VM's own per-thread JMX snapshot:
+/// `ThreadJmxSnapshot::lock_owner_id` is the id of the thread that owns the lock
+/// the snapshotted thread is blocked on — i.e. exactly one wait-for edge. Every
+/// thread lying on a cycle is deadlocked, which is the JMM's own definition, so
+/// this is a real detector rather than the previous unconditional "we found
+/// none". `None` (the spec's `null`, not an empty array) when no cycle exists.
+///
+/// Only a thread BLOCKED ENTERING a monitor contributes an edge — see
+/// [`JMM_THREAD_STATUS_BLOCKED_ON_MONITOR_ENTER`]. `vm_exec::thread_jmx_snapshot`
+/// reports `lock` as `contended.or(waiting)`, so without that filter a thread
+/// sitting in `Object.wait()` would contribute an edge to whichever thread
+/// re-acquired the monitor it released — and two threads in `wait()` on each
+/// other's monitors would be reported as a deadlock even though a `notify()`
+/// frees them. The JMM defines `findMonitorDeadlockedThreads()` over threads
+/// "blocked waiting to ENTER" a monitor, which is exactly this filter.
+///
+/// CAVEAT, stated rather than hidden (re-verified 2026-07-28, after the
+/// `thread_jmx_snapshot` fix): the edge set is still always EMPTY in practice.
+/// `vm_exec::thread_jmx_snapshot` now does read `ThreadRegistry::jmx_lock_snapshot`
+/// and resolve the owner, but that snapshot's four fields are never WRITTEN: of
+/// `set_jmx_contended_monitor` / `complete_jmx_monitor_enter` /
+/// `set_jmx_waiting_monitor` / `set_jmx_owned_synchronizer` /
+/// `remove_jmx_locked_monitor`, only the last has any caller in the whole tree
+/// (`interpreter.rs` 8052 / 18222 / 39852 — a remover with no adder), and
+/// `NativeContext::record_jmx_owned_synchronizer`, which
+/// `register_thread_impl` below already calls on every
+/// `AbstractOwnableSynchronizer.setExclusiveOwnerThread`, is still the trait's
+/// empty default with no VM override. So `jmx_lock_snapshot` returns
+/// `(None, None, [], [])` for every thread, `lock` is `None`, and
+/// `lock_owner_id` is the JMM's `-1`. This detector starts working the moment
+/// the monitor-enter path calls those two setters; nothing further is needed
+/// here.
+fn deadlocked_thread_ids(ctx: &mut dyn NativeContext) -> Option<Vec<i64>> {
+    let mut waits_for: Vec<(i64, i64)> = Vec::new();
+    for thread in ctx.enumerate_threads(usize::MAX) {
+        if let Some(snapshot) = ctx.thread_jmx_snapshot(thread) {
+            let blocked_on_enter =
+                (snapshot.thread_status & JMM_THREAD_STATUS_BLOCKED_ON_MONITOR_ENTER) != 0;
+            if blocked_on_enter && snapshot.thread_id > 0 && snapshot.lock_owner_id > 0 {
+                waits_for.push((snapshot.thread_id, snapshot.lock_owner_id));
+            }
+        }
+    }
+    if waits_for.is_empty() {
+        return None;
+    }
+    let mut deadlocked: Vec<i64> = Vec::new();
+    for &(start, _) in &waits_for {
+        // Follow the chain out of `start`. A thread blocks on at most one lock,
+        // so each node has at most one outgoing edge and the walk either ends,
+        // returns to `start` (a cycle through it), or runs into a cycle that
+        // does not contain `start` — bounded by the edge count either way.
+        let mut cursor = start;
+        let mut on_cycle = false;
+        for _ in 0..waits_for.len() {
+            match waits_for.iter().find(|(t, _)| *t == cursor) {
+                Some(&(_, owner)) => {
+                    cursor = owner;
+                    if cursor == start {
+                        on_cycle = true;
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        if on_cycle && !deadlocked.contains(&start) {
+            deadlocked.push(start);
+        }
+    }
+    if deadlocked.is_empty() {
+        None
+    } else {
+        Some(deadlocked)
+    }
+}
+
+/// `[J` form of [`deadlocked_thread_ids`] — the shared body of all four
+/// `find*DeadlockedThreads` natives. `null` means "no deadlock", per the JMM.
+fn deadlocked_threads_result(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    match deadlocked_thread_ids(ctx) {
+        None => Ok(Some(Value::Object(None))),
+        Some(ids) => {
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, ids.len());
+            for (i, id) in ids.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Long(*id));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,11 +1392,42 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(std::process::id() as i32)))
     });
 
-    // initOptionalSupportFields populates a bag of "isXxxSupported" booleans
-    // on the receiver. OpenJDK writes them via Unsafe + JNI; we no-op so the
-    // synthetic instance stays at its default (all `false`) — accurate, since
-    // we don't claim any optional JMM features.
-    r.register(cls, "initOptionalSupportFields", "()V", |_ctx, _args| {
+    // REAL: seed the ten static `boolean` support fields the JDK's own
+    // `VMManagementImpl` declares, from the same sources the `is*Supported()`
+    // natives below answer from.
+    //
+    // The previous no-op was defensible only because every reader of those
+    // fields (`isCompilationTimeMonitoringSupported()` and its nine siblings)
+    // is itself shadowed by a native registered below — a property that held by
+    // coincidence and that the next person to drop one entry from that batch
+    // would have broken silently, leaving the surviving bytecode getter reading
+    // an un-seeded `false`. Writing the fields removes the coupling. The values
+    // stay in lock-step with the batch below by construction.
+    //
+    // `set_static_field_by_name` resolves class + field by name and no-ops when
+    // either is absent, so this is inert in synthetic-JDK mode (where there is
+    // no real `VMManagementImpl`) and cannot fail during `<clinit>`.
+    r.register(cls, "initOptionalSupportFields", "()V", |ctx, _args| {
+        let current_cpu = i32::from(current_thread_cpu_time_ns().is_some());
+        let boot_cp = i32::from(boot_class_path(ctx).is_some());
+        for (field, supported) in [
+            ("compTimeMonitoringSupport", 0),
+            ("threadContentionMonitoringSupport", 0),
+            ("currentThreadCpuTimeSupport", current_cpu),
+            ("otherThreadCpuTimeSupport", 0),
+            ("bootClassPathSupport", boot_cp),
+            ("objectMonitorUsageSupport", 0),
+            ("synchronizerUsageSupport", 0),
+            ("threadAllocatedMemorySupport", 0),
+            ("gcNotificationSupport", 0),
+            ("remoteDiagnosticCommandsSupport", 0),
+        ] {
+            ctx.set_static_field_by_name(
+                "sun/management/VMManagementImpl",
+                field,
+                Value::Int(supported),
+            );
+        }
         Ok(None)
     });
 
@@ -1139,16 +1444,30 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 
     // -- VMManagementImpl `is*Supported` / `is*Enabled` queries --
     //
-    // These are NOT fabricated: `false`/0 is the TRUTH. CratonVM genuinely
-    // does not implement any of these optional JMM features (thread CPU
-    // time, thread-allocated-memory, contention monitoring, object-monitor
-    // usage, synchronizer usage, boot-class-path reporting, compilation-time
-    // monitoring, remote diagnostic commands, GC notifications). Returning
-    // `false` is exactly what the spec wants for an unsupported feature —
-    // and it keeps the corresponding `get*` natives below honest (a caller
-    // that sees `isThreadCpuTimeSupported()==false` never calls
-    // `getThreadCpuTime`). Done as a batch; the consumer iterates a static
-    // const list at clinit time.
+    // `false`/0 is the TRUTH for every name left in this batch: CratonVM does
+    // not implement the optional JMM feature behind it, and `false` is exactly
+    // what the spec wants for an unsupported feature — it also keeps the
+    // corresponding `get*` natives below honest (a caller that sees
+    // `isThreadCpuTimeSupported()==false` never calls `getThreadCpuTime`).
+    // Done as a batch; the consumer iterates a static const list at clinit time.
+    //
+    // Four of these are BLOCKED on data the VM already keeps but does not
+    // expose to a native, not on the VM lacking the datum — see the matching
+    // notes in `register_thread_mxbean` / `register_compilation_mxbean` below:
+    //   * isThreadCpuTimeSupported / isOtherThreadCpuTimeSupported —
+    //     `ThreadRegistry` publishes a per-thread `os_tid`
+    //     (`GetCurrentThreadId` / `gettid`), which is all an arbitrary-thread
+    //     CPU-time read needs on either platform.
+    //   * isObjectMonitorUsageSupported / isSynchronizerUsageSupported —
+    //     `ThreadRegistry::jmx_lock_snapshot` carries the fields and
+    //     `thread_jmx_snapshot` now reads them, but nothing WRITES them; see
+    //     the full note in `register_thread_mxbean`.
+    //   * isCompilationTimeMonitoringSupported — the JIT keeps
+    //     `CompilationStats::total_compile_time_ms`.
+    // None of the three is reachable through `NativeContext`, so `false` stays
+    // the only answer this crate can back. CURRENT-thread CPU time and
+    // boot-class-path reporting are different questions and are answered for
+    // real just below.
     let false_zero: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Int(0))); // false / 0
     for name in [
@@ -1157,18 +1476,46 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
         "isThreadContentionMonitoringSupported",
         "isThreadContentionMonitoringEnabled",
         "isThreadCpuTimeSupported",
-        "isThreadCpuTimeEnabled",
-        "isCurrentThreadCpuTimeSupported",
         "isOtherThreadCpuTimeSupported",
         "isObjectMonitorUsageSupported",
         "isSynchronizerUsageSupported",
-        "isBootClassPathSupported",
         "isCompilationTimeMonitoringSupported",
         "isRemoteDiagnosticCommandsSupported",
         "isGcNotificationSupported",
     ] {
         r.register(cls, name, "()Z", false_zero);
     }
+    // REAL: `isBootClassPathSupported` left the batch above. It is not an
+    // optional-feature question the VM has no answer to — it asks whether the
+    // VM established a boot class path at all, and `sun.boot.class.path` is
+    // where the VM publishes one. Read that, in lock-step with the
+    // `RuntimeMXBean` pair in `register_runtime_mxbean` and with the field
+    // `initOptionalSupportFields` above now seeds.
+    r.register(cls, "isBootClassPathSupported", "()Z", |ctx, _args| {
+        Ok(Some(Value::Int(i32::from(boot_class_path(ctx).is_some()))))
+    });
+    // REAL: `isCurrentThreadCpuTimeSupported` / `isThreadCpuTimeEnabled` left
+    // the batch above. Unlike arbitrary-thread CPU time (which needs an OS
+    // handle for a thread we are not running on, hence the `false` retained
+    // for `isThreadCpuTimeSupported`/`isOtherThreadCpuTimeSupported`), the
+    // CALLING thread's CPU time is readable straight from the OS scheduler —
+    // so `false` here was not a measurement, it was an unchecked claim. Answer
+    // from whether the platform clock actually reads, so the flag can never
+    // disagree with the `getCurrentThreadCpuTime` numbers on the ThreadMXBean
+    // surface. Kept in lock-step with `register_thread_mxbean` below.
+    let cpu_time_available: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                current_thread_cpu_time_ns().is_some(),
+            ))))
+        };
+    r.register(
+        cls,
+        "isCurrentThreadCpuTimeSupported",
+        "()Z",
+        cpu_time_available,
+    );
+    r.register(cls, "isThreadCpuTimeEnabled", "()Z", cpu_time_available);
 
     // `getVerboseClass` / `getVerboseGC` used to sit in the batch above, which
     // made them constants — but they are NOT feature-support queries, they are
@@ -1258,11 +1605,12 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     r.register(cls, "getLiveThreadCount", "()I", |ctx, _args| {
         Ok(Some(Value::Int(ctx.active_thread_count())))
     });
-    // REAL(best-available): peak thread count. We don't maintain a true
-    // high-water mark, so report the current live count — never lower than
-    // a fabricated 0, and an honest lower bound on the real peak.
+    // REAL: a genuine high-water mark now (`peak_thread_count`). Reporting the
+    // CURRENT live count as the peak, as this used to, is not merely imprecise
+    // — a peak that FALLS when threads exit is not a peak, and it left
+    // `resetPeakThreadCount` below with no state to reset.
     r.register(cls, "getPeakThreadCount", "()I", |ctx, _args| {
-        Ok(Some(Value::Int(ctx.active_thread_count())))
+        Ok(Some(Value::Int(peak_thread_count(ctx))))
     });
     // REAL: daemon-thread count. The previous FLAGGED-0 ("not tracked
     // separately by the VM") was wrong — the flag IS carried, on
@@ -1272,8 +1620,13 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     r.register(cls, "getDaemonThreadCount", "()I", |ctx, _args| {
         Ok(Some(Value::Int(daemon_thread_count(ctx))))
     });
-    // Reset peak counter — no peak state to reset; accept and ignore.
-    r.register(cls, "resetPeakThreadCount", "()V", |_ctx, _args| Ok(None));
+    // REAL: "resets the peak thread count to the current number of live
+    // threads" (JMM). There IS peak state to reset now — the old comment's
+    // premise was the missing high-water mark, not a spec exemption.
+    r.register(cls, "resetPeakThreadCount", "()V", |ctx, _args| {
+        reset_peak_thread_count(ctx);
+        Ok(None)
+    });
 
     // -- VMManagementImpl uptime + processor count --
     //
@@ -1435,81 +1788,56 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // because libmanagement.dll genuinely is not on java.library.path —
     // we ship the JMM natives in-process via NativeMethodRegistry.
     //
-    // RKC16N.12 (Session 97) attempted a fix in vm_exec.rs by adding a
-    // "force-native-override" entry for `System.loadLibrary` /
-    // `Runtime.loadLibrary*`, but in real-JDK mode the *underlying*
-    // overrides for those methods (registered in `lang_system::
-    // register_runtime_natives`) are never wired in: the real-JDK
-    // bootstrap in `vm/src/vm/vm_init.rs` calls `register_essential_natives`
-    // (which omits Runtime + System.loadLibrary) but NOT
-    // `register_runtime_natives` or `register_synthetic_overrides`. So the
-    // override-allowlist in vm_exec finds no native to substitute in and
-    // falls through to the throwing bytecode.
+    // KEEP the `loadNativeLib()V` no-op below: it is the whole fix, and it is
+    // exact rather than approximate. `loadNativeLib` is a private static helper
+    // used only by `ManagementFactory`, its entire body is
+    // `System.loadLibrary("management")`, and CratonVM ships the JMM natives
+    // in-process through `NativeMethodRegistry` — so "libmanagement is already
+    // loaded" IS the post-condition, and returning normally states it.
     //
-    // Cheapest scoped fix: register no-op natives for the three methods in
-    // the loadLibrary chain right here, since `register_vm_management_impl`
-    // IS called from real-JDK init (vm_init.rs line 842). Once any of these
-    // wins the dispatch (try_stackless_invoke checks the native registry
-    // before running bytecode — see vm/src/runtime/interpreter.rs line
-    // 8039), the chain short-circuits and ManagementFactory.<clinit>
-    // completes cleanly.
+    // REMOVED (2026-07-28 stub sweep) the four `System.loadLibrary` /
+    // `System.load` / `Runtime.loadLibrary0` / `Runtime.load0` registrations
+    // that used to sit here as "belt-and-suspenders" (the two `load*` ones were
+    // duplicate bodies, the two `loadLibrary*` ones were pure no-ops).
     //
-    // Registering at all three levels (loadNativeLib, System.loadLibrary,
-    // Runtime.loadLibrary0) is belt-and-suspenders — any single match
-    // suffices. We start the chain at `loadNativeLib` because it is the
-    // narrowest scope (private static helper used only by ManagementFactory)
-    // and least likely to mask real bugs in unrelated app code that calls
-    // `System.loadLibrary` for its own purposes.
+    // They were not redundant, they were HARMFUL, and the comment that
+    // justified them was measurably wrong. It claimed real-JDK mode "calls
+    // `register_essential_natives` ... but NOT `register_runtime_natives`";
+    // `register_essential_natives_with_shims` calls
+    // `lang_system::register_runtime_natives` unconditionally
+    // (`native-builtins/src/lib.rs`), and vm_init runs it BEFORE
+    // `register_vm_management_impl` in both the real-JDK and synthetic
+    // branches. Registration is last-write-wins, so these no-ops silently
+    // replaced `lang_system`'s REAL implementations — the ones that map a bare
+    // library name through `platform_lib_name` and call
+    // `ctx.load_native_library`. Net effect: no JNI library could ever be
+    // loaded by `System.loadLibrary` anywhere in the VM.
+    //
+    // Deleting them is safe in both run modes: `lang_system` registers all four
+    // triples in both, its bodies already swallow load failures
+    // (`let _ = ctx.load_native_library(..)`), so nothing they can do throws —
+    // which is the only property `ManagementFactory.<clinit>` needed — and the
+    // narrow `loadNativeLib` short-circuit above means that chain never reaches
+    // them anyway. `vm_exec.rs`'s force-native-override allowlist for these
+    // triples is unaffected: it forces WHATEVER native is registered, and that
+    // is now the real loader instead of a no-op.
     r.register(
         "java/lang/management/ManagementFactory",
         "loadNativeLib",
         "()V",
         |_ctx, _args| Ok(None),
     );
-    // CratonVM does not install a process-wide seccomp filter. Elasticsearch
-    // probes this only during test bootstrap; treating the optional sandbox as
-    // unavailable keeps native vector access independent from that capability.
+    // KEEP: returning normally without installing anything IS the correct
+    // report. `LinuxNativeAccess.tryInstallExecSandbox()` is defined to *try*,
+    // and to leave `execSandboxState` at its default when it cannot — CratonVM
+    // installs no process-wide seccomp filter, so the untouched default
+    // (`NONE`) is what `getExecSandboxState()` should and does answer. The
+    // method's own contract is why this is not a swallowed failure.
     r.register(
         "org/elasticsearch/nativeaccess/LinuxNativeAccess",
         "tryInstallExecSandbox",
         "()V",
         |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "java/lang/System",
-        "loadLibrary",
-        "(Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "java/lang/System",
-        "load",
-        "(Ljava/lang/String;)V",
-        |ctx, args| {
-            if let Some(Value::Object(Some(path))) = args.first() {
-                let path = ctx.read_string(*path).unwrap_or_default();
-                let _ = ctx.load_native_library(&path);
-            }
-            Ok(None)
-        },
-    );
-    r.register(
-        "java/lang/Runtime",
-        "loadLibrary0",
-        "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
-    r.register(
-        "java/lang/Runtime",
-        "load0",
-        "(Ljava/lang/Class;Ljava/lang/String;)V",
-        |ctx, args| {
-            if let Some(Value::Object(Some(path))) = args.get(1) {
-                let path = ctx.read_string(*path).unwrap_or_default();
-                let _ = ctx.load_native_library(&path);
-            }
-            Ok(None)
-        },
     );
 
     // Wave 1 / Task A: short-circuit `ManagementFactory.getPlatformMXBeans
@@ -1835,13 +2163,16 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // No-op population helpers ([J[J...) — all leave their output
-    // arrays untouched. This is honest, NOT fabricated: per-thread CPU
-    // time, user time, allocated-memory, and contention monitoring are
-    // genuinely unsupported (VMManagementImpl.isThreadCpuTimeSupported etc.
-    // all return false), and the JMM contract for a disabled feature is to
-    // leave the caller-supplied output array at its pre-zeroed state. We
-    // have no real per-thread CPU/alloc accounting in the VM to wire here.
+    // KEEP — no-op population helpers ([J[J...) that leave their output arrays
+    // untouched. Honest, NOT fabricated: every one of these takes an ARBITRARY
+    // id array, and arbitrary-thread CPU time / user time / allocated-memory /
+    // contention timing are genuinely unsupported
+    // (`VMManagementImpl.isThreadCpuTimeSupported` and friends report false),
+    // so the JMM contract for a disabled feature is exactly to leave the
+    // caller-supplied output array at its pre-zeroed state. Note the CURRENT
+    // thread's CPU time IS measurable and is reported on the ThreadMXBean
+    // surface; these bulk natives are not the place for it, because the caller
+    // is asking about a set of ids, not about itself.
     let void_noop: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(None);
     for (name, desc) in [
@@ -1851,10 +2182,18 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
         ("setThreadCpuTimeEnabled0", "(Z)V"),
         ("setThreadContentionMonitoringEnabled0", "(Z)V"),
         ("resetContentionTimes0", "(J)V"),
-        ("resetPeakThreadCount0", "()V"),
     ] {
         r.register(cls, name, desc, void_noop);
     }
+    // REAL: `resetPeakThreadCount0` left the batch above — it is the native
+    // behind `ThreadMXBean.resetPeakThreadCount()`, and there is a real
+    // high-water mark to reset now (see `peak_thread_count`). Shares the one
+    // process-wide counter with the `VMManagementImpl` and `ThreadMXBean`
+    // surfaces so a reset through any of the three is visible from all of them.
+    r.register(cls, "resetPeakThreadCount0", "()V", |ctx, _args| {
+        reset_peak_thread_count(ctx);
+        Ok(None)
+    });
 
     // getThreads()[Ljava/lang/Thread; — REAL: enumerate the live Thread
     // objects the VM is tracking (`enumerate_threads`, the same source
@@ -1893,16 +2232,25 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // findMonitorDeadlockedThreads0 / findDeadlockedThreads0 return null
-    // when no deadlocks (per JMM spec) — match that.
+    // REAL(detector): both now walk the wait-for graph built from the VM's own
+    // per-thread JMX snapshots and report the threads on a cycle — see
+    // `deadlocked_thread_ids`, which also documents why that graph is currently
+    // empty (the VM builds the snapshot without its lock-owner fields). `null`
+    // still means "no deadlock", per the JMM; the difference is that it is now
+    // a checked answer rather than an unconditional constant.
+    //
+    // Both names share one detector because the snapshot carries no lock-KIND
+    // discriminator, so monitor-only deadlocks cannot yet be separated from
+    // ownable-synchronizer ones; when `ThreadJmxSnapshot::lock` starts being
+    // populated the monitor-only variant can filter on it.
     r.register(
         cls,
         "findMonitorDeadlockedThreads0",
         "()[J",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, _args| deadlocked_threads_result(ctx),
     );
-    r.register(cls, "findDeadlockedThreads0", "()[J", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(cls, "findDeadlockedThreads0", "()[J", |ctx, _args| {
+        deadlocked_threads_result(ctx)
     });
     r.set_category(__prev_cat);
 }
@@ -2355,7 +2703,11 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
         r.register(cls, name, "()D", neg_one_double);
     }
 
-    // initialize0()V — sets up native counters; nothing to do here.
+    // KEEP: nothing to establish, provably. The real `initialize0()` opens the
+    // platform perf-counter handles the `get*0()` natives then read through;
+    // every one of ours answers independently (from the `-1` "metric
+    // unavailable" sentinel), so there is no state a body here could set up
+    // that anything would later read. It exists purely so `<clinit>` links.
     r.register(cls, "initialize0", "()V", |_ctx, _args| Ok(None));
 
     // JDK 9+ moved the platform OS-bean implementation to
@@ -2389,6 +2741,9 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     for name in ["getCpuLoad0", "getProcessCpuLoad0"] {
         r.register(mcls, name, "()D", neg_one_double);
     }
+    // KEEP: same reasoning as the legacy class's `initialize0` above — no
+    // counter handles for it to open, and no getter here reads any state it
+    // could establish.
     r.register(mcls, "initialize0", "()V", |_ctx, _args| Ok(None));
 
     // `jdk.internal.platform.CgroupMetrics.isUseContainerSupport()Z` gates
@@ -2402,14 +2757,26 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     // that aborted `ManagementFactory.getPlatformMBeanServer()` before this
     // fix.
     //
-    // KEEP, with one caveat worth stating precisely: CratonVM's *launcher*
-    // does honour a cgroup CPU quota (`available_processor_count()` prefers
-    // `VmConfig::container_effective_processors`), so "no cgroup awareness at
-    // all" would be too strong. What is genuinely absent is the
-    // `CgroupSubsystem` SPI this method gates — answering `true` would send
-    // `Metrics.getInstance()` into `CgroupSubsystemFactory.create()` and its
-    // unimplemented `/sys/fs/cgroup` parsing. `false` is the reachable
-    // truth; a `true` here would be a claim we cannot back.
+    // KEEP, with two things stated precisely rather than hidden.
+    //
+    // (a) CratonVM's *launcher* does honour a cgroup CPU quota
+    // (`available_processor_count()` prefers
+    // `VmConfig::container_effective_processors`) and `VmConfig` carries a real
+    // `use_container_support` toggle (default true, `vm/src/config.rs:482`), so
+    // "no cgroup awareness at all" would be too strong, and that toggle is not
+    // exposed on `NativeContext` — an accessor would be the mechanical fix.
+    //
+    // (b) But an accessor alone would NOT make `true` correct, which is why
+    // this is a KEEP and not an escalation. What this method gates is the
+    // `CgroupSubsystem` SPI: answering `true` sends `Metrics.getInstance()`
+    // into `CgroupSubsystemFactory.create()`, a `/proc/self/mountinfo` +
+    // `/sys/fs/cgroup` walk that is meaningless off Linux and outside a
+    // container and that this VM has never exercised. The honest predicate is
+    // "the toggle is on AND a cgroup hierarchy is actually mounted", and it has
+    // to be validated on a containerised Linux run before
+    // `ManagementFactory.getPlatformMBeanServer()` — which is what reaches this
+    // — is made to depend on it. `false` is the reachable truth today; a `true`
+    // here would be a claim we cannot back.
     r.register(
         "jdk/internal/platform/CgroupMetrics",
         "isUseContainerSupport",
@@ -2461,10 +2828,157 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
-/// `sun.management.Flag` — VM flag enumeration.
+/// Fill `out` with `Flag` objects for the CratonVM flags this process actually
+/// has a value for — the body of
+/// `com.sun.management.internal.Flag.getFlags(String[], Flag[], int)`.
 ///
-/// We don't expose any VM-level manageable flags through JMM, so all
-/// queries return zero / empty.
+/// `names == null` means "every flag" (that is how `Flag.getAllFlags()` calls
+/// it); otherwise only the named ones, and unknown names are simply skipped,
+/// which is what makes `HotSpotDiagnostic.getVMOption("nope")` raise the JDK's
+/// own `IllegalArgumentException` from real bytecode. Returns the number of
+/// slots written, as the JDK's caller expects (`for (i = 0; i < count; i++)`).
+///
+/// Every reported flag is `writeable = false` / `external = false` with origin
+/// `ENVIRON_VAR`: CratonVM's configuration is latched on first read
+/// (`cratonvm_types::flags`), so no VM option is settable at runtime and every
+/// value that is set came from the environment. That is a measurement, not a
+/// placeholder — and it is what makes the four `set*Value` natives below
+/// unreachable for a real reason rather than by accident.
+///
+/// Degrades to 0 written — i.e. exactly the previous behaviour — when there is
+/// no real `Flag` class to construct (synthetic-JDK mode) or when its
+/// constructor does not have the shape [`FLAG_INIT_DESC`] describes, so a JDK
+/// that reshapes it cannot make this misreport.
+fn native_flag_get_flags(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let mut objects = args.iter().filter_map(|v| match v {
+        Value::Object(o) => Some(*o),
+        _ => None,
+    });
+    let requested = objects.next().flatten();
+    let Some(out) = objects.next().flatten() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let limit = args
+        .iter()
+        .find_map(|v| match v {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    if limit <= 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    if ctx.would_fabricate_synthetic_stub(FLAG_CLASS)
+        || !ctx.method_exists(FLAG_CLASS, "<init>", FLAG_INIT_DESC)
+    {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    let all = craton_vm_flag_settings();
+    let wanted: Vec<(String, String)> = match requested {
+        None => all,
+        Some(names) => {
+            let count = ctx.array_length(names);
+            let mut picked = Vec::new();
+            for i in 0..count {
+                let Value::Object(Some(element)) = ctx.get_array_element(names, i) else {
+                    continue;
+                };
+                let Some(name) = ctx.read_string(element) else {
+                    continue;
+                };
+                if let Some(hit) = all.iter().find(|(flag, _)| *flag == name) {
+                    picked.push(hit.clone());
+                }
+            }
+            picked
+        }
+    };
+
+    // `create_string` and `new_object_initialized` both allocate, so `out` (and
+    // the name string, across the second allocation) are pinned and re-read
+    // rather than held in a bare Rust local across a possible moving GC.
+    let capacity = ctx.array_length(out).min(limit as usize);
+    let out_pin = ctx.pin_native_root(out);
+    let mut out = out;
+    let mut written = 0usize;
+    for (name, value) in wanted.into_iter().take(capacity) {
+        let name_obj = ctx.create_string(&name);
+        let name_pin = ctx.pin_native_root(name_obj);
+        let value_obj = ctx.create_string(&value);
+        let name_obj = ctx.read_native_pin(name_pin, name_obj);
+        let flag = ctx.new_object_initialized(
+            FLAG_CLASS,
+            FLAG_INIT_DESC,
+            &[
+                Value::Object(Some(name_obj)),
+                Value::Object(Some(value_obj)),
+                Value::Int(0), // writeable — the configuration is latched
+                Value::Int(0), // external
+                Value::Int(JMM_VMGLOBAL_ORIGIN_ENVIRON_VAR),
+            ],
+        );
+        out = ctx.read_native_pin(out_pin, out);
+        ctx.unpin_native_roots(name_pin);
+        match flag {
+            Ok(Some(Value::Object(Some(flag)))) => {
+                ctx.set_array_element(out, written, Value::Object(Some(flag)));
+                written += 1;
+            }
+            // Constructing one `Flag` failed; report what was written rather
+            // than turning a diagnostic call into a throw.
+            _ => break,
+        }
+    }
+    ctx.unpin_native_roots(out_pin);
+    Ok(Some(Value::Int(written as i32)))
+}
+
+/// `Flag.set{Long,Double,Boolean,String}Value` — CratonVM's configuration is
+/// latched on first read, so no VM option is writeable at runtime.
+///
+/// This is the same `IllegalArgumentException` HotSpot's own native raises for
+/// a non-writeable flag, and the same one `HotSpotDiagnostic.setVMOption`
+/// already raises from bytecode after seeing `Flag.isWriteable() == false` —
+/// so in practice it is a backstop, not the message a caller normally sees. The
+/// previous no-op returned success for a write that never happened.
+fn native_flag_set_value_unsupported(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // The flag name is the first reference argument under either calling
+    // convention (these are static in the JDK, but a synthetic receiver would
+    // shift them by one).
+    let mut name = String::from("<unknown>");
+    for arg in args {
+        if let Value::Object(Some(obj)) = arg {
+            if let Some(text) = ctx.read_string(*obj) {
+                name = text;
+                break;
+            }
+        }
+    }
+    Err(RuntimeError::IllegalArgumentException {
+        message: format!("VM Option \"{name}\" is not writeable"),
+    }
+    .into())
+}
+
+/// `sun.management.Flag` (JDK 8) and `com.sun.management.internal.Flag`
+/// (JDK 9+) — VM flag enumeration.
+///
+/// The JDK 9+ surface is REAL: it reports the CratonVM flags this process
+/// actually has a value for, read out of the one latched `VmFlags` snapshot via
+/// [`craton_vm_flag_settings`]. `getVMOption("CRATONVM_JIT")` on a run that set
+/// it now answers with the value the VM is really running with instead of
+/// "does not exist".
+///
+/// The legacy `sun.management.Flag` triples below stay empty on purpose: that
+/// class was removed in JDK 9, so in real-JDK mode (JDK 25) nothing resolves to
+/// it at all, and there is no `getFlags` counterpart registered for it — a
+/// non-zero `getInternalFlagCount()` there would promise rows that its
+/// `getAllFlags()` could not produce. Empty is the self-consistent answer for a
+/// class that does not exist.
 pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -2497,24 +3011,45 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // JDK 25 exposes the management-flag backend as
-    // `com.sun.management.internal.Flag`. CratonVM does not expose mutable VM
-    // flags through JMM, so mirror the older `sun.management.Flag` surface with
-    // empty/zero answers and no-op mutators.
+    // JDK 9+ exposes the management-flag backend as
+    // `com.sun.management.internal.Flag`. This is the live surface, and it is
+    // wired to CratonVM's real flag inventory (`cratonvm_types::flag_groups`)
+    // rather than to a zero.
     let internal_cls = "com/sun/management/internal/Flag";
+    // KEEP: the real `initialize()` caches the jfieldIDs the other natives
+    // write `Flag`'s fields through. `native_flag_get_flags` constructs each
+    // `Flag` through its constructor and resolves nothing by field id, so there
+    // is no cache to fill and nothing that reads one; the registration exists
+    // so `Flag.<clinit>` links.
     r.register(internal_cls, "initialize", "()V", |_ctx, _args| Ok(None));
+    // REAL: the number of flags `getFlags(null, …)` will produce, so the two
+    // agree. `Flag.getAllFlags()` sizes its `Flag[]` from this value and then
+    // trusts `getFlags`'s return, so a count that over- or under-states the
+    // enumeration is the one way to break that caller.
     r.register(
         internal_cls,
         "getInternalFlagCount",
         "()I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |_ctx, _args| Ok(Some(Value::Int(craton_vm_flag_settings().len() as i32))),
     );
+    // REAL: the names behind that count, same order (sorted).
     r.register(
         internal_cls,
         "getAllFlagNames",
         "()[Ljava/lang/String;",
         |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let names = craton_vm_flag_settings();
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, names.len());
+            // `create_string` allocates, so the array is pinned and re-read
+            // instead of being carried in a bare Rust local across a GC.
+            let pin = ctx.pin_native_root(arr);
+            let mut arr = arr;
+            for (i, (name, _)) in names.iter().enumerate() {
+                let s = ctx.create_string(name);
+                arr = ctx.read_native_pin(pin, arr);
+                ctx.set_array_element(arr, i, Value::Object(Some(s)));
+            }
+            ctx.unpin_native_roots(pin);
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -2522,39 +3057,34 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
         internal_cls,
         "getFlags",
         "([Ljava/lang/String;[Lcom/sun/management/internal/Flag;I)I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        native_flag_get_flags,
     );
-    // KEEP: the four setters below are unreachable through the public API, so
-    // a no-op cannot silently swallow a caller's write.
-    // `HotSpotDiagnostic.setVMOption(name, value)` first resolves the flag via
-    // `getFlags` above, which reports zero flags for every name, and throws
-    // `IllegalArgumentException("VM option \"name\" does not exist")` before
-    // any of these is called. The honest failure a caller sees therefore
-    // already comes from real bytecode; adding a throw here would only
-    // duplicate it on a path nothing takes.
+    // THROW: CratonVM's configuration latches on first read, so no VM option is
+    // writeable at runtime — see `native_flag_set_value_unsupported`. The
+    // previous no-ops reported success for writes that never happened.
     r.register(
         internal_cls,
         "setLongValue",
         "(Ljava/lang/String;J)V",
-        |_ctx, _args| Ok(None),
+        native_flag_set_value_unsupported,
     );
     r.register(
         internal_cls,
         "setDoubleValue",
         "(Ljava/lang/String;D)V",
-        |_ctx, _args| Ok(None),
+        native_flag_set_value_unsupported,
     );
     r.register(
         internal_cls,
         "setBooleanValue",
         "(Ljava/lang/String;Z)V",
-        |_ctx, _args| Ok(None),
+        native_flag_set_value_unsupported,
     );
     r.register(
         internal_cls,
         "setStringValue",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
+        native_flag_set_value_unsupported,
     );
     r.set_category(__prev_cat);
 }
@@ -2835,22 +3365,33 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    // REAL: the boot class path the VM published, not a hard-coded "". Read
+    // through the same `boot_class_path` helper as the support query below so
+    // the pair can never contradict each other.
     r.register(
         cls,
         "getBootClassPath",
         "()Ljava/lang/String;",
         |ctx, _args| {
-            let s = ctx.create_string("");
+            let cp = boot_class_path(ctx).unwrap_or_default();
+            let s = ctx.create_string(&cp);
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    // KEEP: false is the truth and it keeps `getBootClassPath()` above honest.
-    // CratonVM has no boot class path to report (the JDK 9+ module image
-    // replaced it), and the spec says `getBootClassPath()` may only be called
-    // when this returns true — so reporting false is what stops a caller from
-    // ever seeing the empty string above and mistaking it for a real answer.
-    r.register(cls, "isBootClassPathSupported", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // REAL: whether the VM established a boot class path at all — i.e. whether
+    // `sun.boot.class.path` was populated — rather than a flat `false`.
+    //
+    // The previous justification for that `false` was wrong on its own terms:
+    // it claimed CratonVM "has no boot class path to report", but the VM does
+    // establish one (`VmConfig::boot_classpath` / `discover_boot_classpath`,
+    // `-Xbootclasspath`) and publishes the property at every boot
+    // (`system_bootstrap.rs`). On a modular image the published value is the
+    // EMPTY string, which is a real answer — exactly what HotSpot reports with
+    // nothing appended via `-Xbootclasspath/a` — and not the "no answer" the
+    // old `false` implied. Absence of the property is still reported as
+    // unsupported, which is the case the spec's guard actually exists for.
+    r.register(cls, "isBootClassPathSupported", "()Z", |ctx, _args| {
+        Ok(Some(Value::Int(i32::from(boot_class_path(ctx).is_some()))))
     });
     // getSystemProperties() -> Map<String,String>. Used by Elasticsearch's
     // `JvmInfo.<clinit>` (and many frameworks) to snapshot the system props.
@@ -3243,16 +3784,24 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // KEEP: 0 is the measurement, not a placeholder. CratonVM runs no
-    // finalizer thread and maintains no finalization queue, so the number of
-    // objects "pending finalization" is genuinely zero at every instant — the
-    // same value a HotSpot with an idle finalizer queue reports. There is no
-    // richer datum to wire this to.
+    // REAL: the GC's own finalization backlog, through the `NativeContext`
+    // accessor that now exposes `ReferenceProcessor::pending_finalization_count()`
+    // (`gc/src/reference.rs`).
+    //
+    // CratonVM does finalize — `SharedVm::register_finalizable` discovers
+    // finalizable objects into `ref_processor.finalization_queue` and
+    // `drain_finalizers` hands them to a real `FinalizerThread`
+    // (`vm/src/vm/vm_init.rs`) — so the previous flat 0 reported "no
+    // finalization backlog" even while the queue was growing, which is exactly
+    // the condition an operator queries this bean to detect. The accessor is
+    // `try_lock`-based and answers 0 rather than blocking behind a GC pass, so
+    // a monitoring read can never stall its caller. The sibling registration in
+    // `phases_late::management` reads the same accessor.
     r.register(
         cls,
         "getObjectPendingFinalizationCount",
         "()I",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, _args| Ok(Some(Value::Int(ctx.pending_finalization_count()))),
     );
 
     r.register(cls, "gc", "()V", |ctx, _args| {
@@ -3702,12 +4251,18 @@ fn init_thread_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     // daemonThreadCount (real): counted from `Thread.holder.daemon`, the same
     // flag the VM's own shutdown logic reads. Was a hard-coded 0.
     let daemon_count = daemon_thread_count(ctx);
+    let peak_count = peak_thread_count(ctx);
+    // Slots 4/5 are vestigial: `getCurrentThreadCpuTime` /
+    // `getCurrentThreadUserTime` read the OS clock per call rather than a
+    // per-bean snapshot (a cached CPU time would be wrong the instant the bean
+    // was reused), so nothing reads them. Left at the JMM "unavailable"
+    // sentinel.
     ctx.set_field(obj, 0, Value::Int(thread_count)); // threadCount (real)
-    ctx.set_field(obj, 1, Value::Int(thread_count)); // peakThreadCount (real)
+    ctx.set_field(obj, 1, Value::Int(peak_count)); // peakThreadCount (high-water)
     ctx.set_field(obj, 2, Value::Long(thread_count as i64)); // totalStartedThreadCount (real)
     ctx.set_field(obj, 3, Value::Int(daemon_count)); // daemonThreadCount (real)
-    ctx.set_field(obj, 4, Value::Long(-1)); // currentThreadCpuTime (not supported)
-    ctx.set_field(obj, 5, Value::Long(-1)); // currentThreadUserTime
+    ctx.set_field(obj, 4, Value::Long(-1)); // currentThreadCpuTime (unread)
+    ctx.set_field(obj, 5, Value::Long(-1)); // currentThreadUserTime (unread)
 }
 
 fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
@@ -3726,9 +4281,12 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    r.register(cls, "getPeakThreadCount", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+    // REAL: read the live process-wide high-water mark rather than slot 1's
+    // construction-time snapshot — otherwise `resetPeakThreadCount()` is
+    // invisible through this bean and the "peak" is frozen at whatever the
+    // thread count happened to be when the bean was allocated.
+    r.register(cls, "getPeakThreadCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(peak_thread_count(ctx))))
     });
     r.register(cls, "getTotalStartedThreadCount", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -3738,49 +4296,139 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
     });
-    // KEEP: -1 is the spec's own "measurement is off" answer, not a
-    // placeholder. `ThreadMXBean.getCurrentThreadCpuTime()` is defined to
-    // return -1 when CPU-time measurement is disabled, and
-    // `isThreadCpuTimeEnabled()` below reports exactly that — so the pair is
-    // self-consistent and a caller can tell measurement apart from a real 0.
-    // CratonVM has no per-thread CPU accounting to wire in; deliberately NOT
-    // converted to the spec's UnsupportedOperationException, because Tomcat's
-    // Diagnostics formats these unguarded for every thread in a dump and a
-    // throw would turn a working page into a 500.
+    // REAL: the calling thread's CPU and user time, read from the OS
+    // scheduler's own per-thread accounting (`current_thread_cpu_time_ns`).
+    // The previous -1 was justified as the spec's "measurement is disabled"
+    // sentinel, but the premise under it — "CratonVM has no per-thread CPU
+    // accounting to wire in" — was never true for the CURRENT thread: the host
+    // OS has been keeping that number all along and needs no VM bookkeeping to
+    // hand it over. -1 survives only as the genuine fallback on a platform
+    // whose per-thread clock we do not read.
     r.register(cls, "getCurrentThreadCpuTime", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(-1)))
+        Ok(Some(Value::Long(
+            current_thread_cpu_time_ns().map_or(-1, |(cpu, _user)| cpu),
+        )))
     });
     r.register(cls, "getCurrentThreadUserTime", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(-1)))
+        Ok(Some(Value::Long(
+            current_thread_cpu_time_ns().map_or(-1, |(_cpu, user)| user),
+        )))
     });
-    // Per-thread-id variants (same "not supported" sentinel as the
-    // current-thread ones above) -- Tomcat's Diagnostics formats these for
-    // every ThreadInfo in a dump.
-    r.register(cls, "getThreadCpuTime", "(J)J", |_ctx, _args| {
-        Ok(Some(Value::Long(-1)))
-    });
-    r.register(cls, "getThreadUserTime", "(J)J", |_ctx, _args| {
-        Ok(Some(Value::Long(-1)))
-    });
-    // KEEP: false IS the measurement. CratonVM implements no per-thread CPU
-    // accounting, and an unsupported optional JMM feature is exactly what
-    // `false` means here — it is also what keeps the -1 answers above legible.
+    // Per-thread-id variants. An id naming the CALLING thread is answered for
+    // real (it is the same clock as the two getters above — resolving the id
+    // first is what makes the two surfaces agree); any other id keeps the -1
+    // "not available" sentinel, because arbitrary-thread CPU time needs an OS
+    // handle for a thread we are not running on. Deliberately NOT converted to
+    // the spec's UnsupportedOperationException even though
+    // `isThreadCpuTimeSupported()` is false: Tomcat's Diagnostics formats these
+    // for every ThreadInfo in a dump without guarding, and a throw would turn a
+    // working page into a 500.
+    let thread_cpu_time: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
+        let requested = args.iter().find_map(|arg| match arg {
+            Value::Long(id) => Some(*id),
+            _ => None,
+        });
+        Ok(Some(Value::Long(
+            current_thread_tid_matches(ctx, requested)
+                .then(current_thread_cpu_time_ns)
+                .flatten()
+                .map_or(-1, |(cpu, _user)| cpu),
+        )))
+    };
+    let thread_user_time: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = |ctx, args| {
+        let requested = args.iter().find_map(|arg| match arg {
+            Value::Long(id) => Some(*id),
+            _ => None,
+        });
+        Ok(Some(Value::Long(
+            current_thread_tid_matches(ctx, requested)
+                .then(current_thread_cpu_time_ns)
+                .flatten()
+                .map_or(-1, |(_cpu, user)| user),
+        )))
+    };
+    r.register(cls, "getThreadCpuTime", "(J)J", thread_cpu_time);
+    r.register(cls, "getThreadUserTime", "(J)J", thread_user_time);
+    // ESCALATED. This is specifically the ARBITRARY-thread question:
+    // `isThreadCpuTimeSupported()` promises `getThreadCpuTime(id)` works for any
+    // id. The JMM allows it to be false while `isCurrentThreadCpuTimeSupported()`
+    // is true, so `false` is spec-legal — but the wave-3 reason for it ("CratonVM's
+    // thread table carries no OS handle") is WRONG. `ThreadRegistry` publishes a
+    // per-thread `os_tid` for exactly this shape of query
+    // (`vm/src/threading/thread_registry.rs`, `set_os_tid_current`:
+    // `GetCurrentThreadId()` on Windows, `SYS_gettid` on Linux) and keeps it in
+    // the entry alongside the Java `Thread` mirror. From an os_tid,
+    // arbitrary-thread CPU time is one platform call away —
+    // `OpenThread(THREAD_QUERY_INFORMATION)` + `GetThreadTimes` on Windows,
+    // `/proc/self/task/<tid>/stat` fields 14/15 on Linux — i.e. the same two
+    // clocks `current_thread_cpu_time_ns` above already reads for the caller.
+    //
+    // NEEDED: `NativeContext::thread_os_tid(&self, thread_obj: ObjectRef) ->
+    // Option<u32>` (crate `native-api`, `NativeSystemAccess`), implemented in
+    // `vm/src/vm/vm_exec.rs` from `resolve_thread_id_from_thread_obj` plus the
+    // registry entry's `os_tid` — the same two steps `thread_jmx_snapshot`
+    // already takes. With it, this returns true and `getThreadCpuTime(J)` /
+    // `getThreadUserTime(J)` below stop falling back to -1 for other threads.
     r.register(cls, "isThreadCpuTimeSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
-    r.register(cls, "isThreadCpuTimeEnabled", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    // Tomcat's Diagnostics.getVMInfo() (manager vminfo command) calls these
-    // three unconditionally, same family as isThreadCpuTimeSupported above
-    // -- not backed by any real per-thread accounting, so report
-    // conservatively unsupported.
+    // REAL: measurement is "enabled" exactly when the platform clock reads, so
+    // the flag can never disagree with the numbers above. The old constant 0
+    // said the current-thread getters were switched off while they were about
+    // to hand back a real value.
+    let cpu_time_available: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| {
+            Ok(Some(Value::Int(i32::from(
+                current_thread_cpu_time_ns().is_some(),
+            ))))
+        };
+    r.register(cls, "isThreadCpuTimeEnabled", "()Z", cpu_time_available);
     r.register(
         cls,
         "isCurrentThreadCpuTimeSupported",
         "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        cpu_time_available,
     );
+    // ESCALATED (the two below); `false` is still the only answer this crate
+    // can back, and deliberately so. Tomcat's Diagnostics.getVMInfo() (manager
+    // vminfo command) calls these unconditionally.
+    //
+    // Re-derived 2026-07-28 AFTER `vm_exec::thread_jmx_snapshot` stopped using
+    // `..Default::default()`. That fix closed the READ half — the snapshot now
+    // calls `ThreadRegistry::jmx_lock_snapshot` and resolves the owner — but
+    // the WRITE half is still missing, so nothing has actually changed at the
+    // observation point:
+    //   * `set_jmx_contended_monitor`, `complete_jmx_monitor_enter`,
+    //     `set_jmx_waiting_monitor` and `set_jmx_owned_synchronizer` have NO
+    //     callers anywhere in the tree. Only `remove_jmx_locked_monitor` is
+    //     called (`interpreter.rs` 8052 / 18222 / 39852) — a remover with no
+    //     adder, so `jmx_locked_monitors` can only ever be empty.
+    //   * `NativeContext::record_jmx_owned_synchronizer`, which
+    //     `register_thread_impl` below already calls on every
+    //     `AbstractOwnableSynchronizer.setExclusiveOwnerThread`, has no VM
+    //     override — it is still the trait's empty default, so the AQS
+    //     ownership this crate hands over is dropped on the floor.
+    // `jmx_lock_snapshot` therefore returns `(None, None, [], [])` for every
+    // thread. Answering `true` here would promise that
+    // `getThreadInfo(ids, true, true)` returns real `lockedMonitors` /
+    // `lockedSynchronizers` arrays, and it would return EMPTY ones — a
+    // positive claim that a deadlocked JVM holds no locks, which is worse than
+    // the honest "not supported".
+    //
+    // NEEDED (crate `vm`, not this one), and it lights up
+    // `deadlocked_thread_ids` above at the same time:
+    //   1. call `set_jmx_contended_monitor` on entry to
+    //      `vm_exec::monitor_enter_blocking` (vm_exec.rs:1446 — the same
+    //      function that already stores `java_state = 2`, i.e. the BLOCKED bit
+    //      `deadlocked_thread_ids` above filters on) and
+    //      `complete_jmx_monitor_enter` when it succeeds, plus
+    //      `set_jmx_waiting_monitor` / `take_jmx_waiting_monitor` around
+    //      `Object.wait()`, next to the existing `remove_jmx_locked_monitor`
+    //      call sites in `interpreter.rs`;
+    //   2. override `record_jmx_owned_synchronizer` in `vm/src/vm/vm_exec.rs`
+    //      to forward to `ThreadRegistry::set_jmx_owned_synchronizer`.
+    // With (1) alone, `isObjectMonitorUsageSupported` becomes true; (2) makes
+    // `isSynchronizerUsageSupported` true.
     r.register(
         cls,
         "isObjectMonitorUsageSupported",
@@ -3790,6 +4438,19 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
     r.register(cls, "isSynchronizerUsageSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    // KEEP (the two below): false is the measurement, and unlike the monitor
+    // /synchronizer pair above there is no VM-side datum being withheld —
+    // contention monitoring means TIMING every blocked and waiting interval per
+    // thread, and nothing in the VM records those durations (the registry's
+    // blocked-region bookkeeping is a flag, not a clock), so
+    // `ThreadInfo.getBlockedTime()`/`getWaitedTime()` have no source at all.
+    // The JMM's answer for an unsupported optional feature is exactly `false`,
+    // and a `false` from `...Supported()` makes
+    // `setThreadContentionMonitoringEnabled` throw
+    // `UnsupportedOperationException` from JDK bytecode — which is what keeps
+    // the `...Enabled()` companion permanently false rather than it being an
+    // independent guess. "Not enabled" is also the state HotSpot itself boots
+    // in.
     // ES-FAIL-05 — Elasticsearch `HotThreads.initializeRuntimeMonitoring()` (run
     // from `ESTestCase.<clinit>`) calls `isThreadContentionMonitoringSupported()`;
     // it was unregistered on the synthetic ThreadMXBean → AbstractMethodError
@@ -3897,23 +4558,21 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
-    // KEEP: `null` is the JMM's "no deadlocked threads" answer (these methods
-    // return null, not an empty array, when nothing is deadlocked), so callers
-    // that null-check behave correctly. FLAGGED, deliberately: CratonVM runs
-    // no deadlock detector, so this is "we found none" rather than "we
-    // checked and there are none". Answering otherwise would require a real
-    // wait-for-graph walk over the monitor and AQS ownership tables — a
-    // separate piece of work, not a constant to swap out. The same null is
-    // registered on `sun.management.ThreadImpl`'s `*0` natives.
-    r.register(cls, "findDeadlockedThreads", "()[J", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    // REAL(detector): the wait-for-graph walk the old comment here described as
+    // "a separate piece of work" now exists — `deadlocked_thread_ids` — and
+    // these share it with `sun.management.ThreadImpl`'s `*0` natives so all
+    // four surfaces agree. `null` still means "no deadlocked threads" (these
+    // methods return null, not an empty array), so null-checking callers are
+    // unaffected; what changed is that the null is now a checked result.
+    // `deadlocked_thread_ids` documents the one remaining gap: the VM builds
+    // its per-thread snapshot without lock-owner fields, so the graph is empty
+    // until that is plumbed through.
+    r.register(cls, "findDeadlockedThreads", "()[J", |ctx, _args| {
+        deadlocked_threads_result(ctx)
     });
-    r.register(
-        cls,
-        "findMonitorDeadlockedThreads",
-        "()[J",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    r.register(cls, "findMonitorDeadlockedThreads", "()[J", |ctx, _args| {
+        deadlocked_threads_result(ctx)
+    });
     // dumpAllThreads(boolean, boolean) -- Tomcat's Diagnostics.getThreadDump()
     // (manager threaddump command) calls this and greps the result for
     // connector I/O thread names (e.g. "http-nio-..."). Build one
@@ -4137,11 +4796,8 @@ fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 fn init_compilation_mxbean_fields(ctx: &mut dyn NativeContext, obj: ObjectRef) {
     // name = CratonVM's real JIT identity (not a fabricated foreign name).
     // totalCompilationTime stays 0 and isCompilationTimeMonitoringSupported
-    // stays false because the VM does NOT track cumulative JIT wall time —
-    // and per the JMX spec, getTotalCompilationTime is only meaningful when
-    // monitoring is supported, so reporting `unsupported` (false) keeps the
-    // 0 honest rather than implying a measured zero. FLAGGED for follow-up
-    // if the JIT gains compile-time accounting.
+    // stays false — ESCALATED, see `register_compilation_mxbean` below: the JIT
+    // DOES keep the timer, it is just not reachable from this crate.
     let name = ctx.create_string("CratonVM JIT");
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     ctx.set_field(obj, 1, Value::Long(0)); // totalCompilationTime (unsupported)
@@ -4168,6 +4824,26 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
+    // ESCALATED. The wave-3 claim that "the JIT keeps no cumulative wall-clock
+    // compile timer" is FALSE: `jit/src/tiered.rs` has
+    // `CompilationStats::total_compile_time_ms` (an `AtomicU64` on
+    // `TieredCompilationManager::stats()`), and every finished task adds to it
+    // in `CompilerCore::complete_task`. That is precisely the datum
+    // `getTotalCompilationTime()` wants, in the right unit (the JMX spec's
+    // milliseconds).
+    //
+    // What is actually missing is a route to it: `native-builtins` does not
+    // depend on the `cratonvm-jit` crate (see its Cargo.toml), the manager is
+    // per-VM rather than a process global, and `NativeContext` exposes no JIT
+    // statistics at all. So `false` here is what keeps the 0 above legible as
+    // "not measured" rather than "measured and zero".
+    //
+    // NEEDED: `NativeContext::jit_total_compile_time_ms(&self) -> Option<u64>`
+    // (crate `native-api`, `NativeSystemAccess`), implemented in
+    // `vm/src/vm/vm_exec.rs` off the VM's `TieredCompilationManager` as
+    // `stats().total_compile_time_ms.load(Ordering::Relaxed)`, returning `None`
+    // when the JIT is disabled. `Some(_)` then drives BOTH natives here — the
+    // support flag and the value — so they cannot drift apart.
     r.register(
         cls,
         "isCompilationTimeMonitoringSupported",
@@ -4216,9 +4892,50 @@ fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
-    // Accept and ignore: CratonVM doesn't run a separately-sized scheduler
-    // pool to actually resize.
-    r.register(cls, "setParallelism", "(I)V", |_ctx, _args| Ok(None));
+    // REAL(round-trip): `getParallelism()` above reads slot 0, so accepting and
+    // ignoring the write made the JMM's documented
+    // `setParallelism(n)`/`getParallelism()` round-trip dead — a JMX client
+    // could set the target parallelism and read back the old value forever.
+    // Store it, and reject the sizes the spec rejects rather than silently
+    // recording nonsense. (CratonVM still runs no separately-sized carrier pool
+    // to physically resize; what is fixed here is the bean's own state, which
+    // is the part callers observe.)
+    r.register(cls, "setParallelism", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let size = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        if size <= 0 {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!("parallelism must be greater than zero: {size}"),
+            }
+            .into());
+        }
+        ctx.set_field(this, 0, Value::Int(size));
+        Ok(None)
+    });
+    // ESCALATED (the three below). 0 is an honest floor — all three are
+    // legitimately 0 before any virtual thread runs — but it is a floor, not a
+    // measurement, and the wave-3 reason ("CratonVM keeps no per-scheduler
+    // accounting") is FALSE. `vm/src/threading/virtual_threads.rs` has all
+    // three numbers already:
+    //   getPoolSize                  -> `ForkJoinScheduler::live_carriers()`
+    //                                   (base pool + compensating carriers)
+    //   getMountedVirtualThreadCount -> `ForkJoinScheduler::active_count()`
+    //                                   ("virtual threads currently mounted on
+    //                                   carriers", the exact wording of this
+    //                                   getter)
+    //   getQueuedVirtualThreadCount  -> `ForkJoinScheduler::queued_len()`
+    //                                   (global submission queue + every
+    //                                   per-carrier work queue)
+    // What is missing is only the route: `NativeContext` exposes the
+    // virtual-thread MOUNT/PARK verbs (`vt_pin`, `vt_park_for`, …) but no
+    // scheduler statistics.
+    //
+    // NEEDED: one accessor returning the triple, e.g.
+    // `NativeContext::vt_scheduler_stats(&self) -> Option<(i32, i32, i64)>`
+    // (crate `native-api`, `NativeSystemAccess`), implemented in
+    // `vm/src/vm/vm_exec.rs` from the VM's `ForkJoinScheduler`. One call keeps
+    // the three consistent with each other, which three separate accessors
+    // sampled at different instants would not.
     r.register(cls, "getPoolSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -4496,6 +5213,57 @@ fn jmx_instance_not_found(ctx: &mut dyn NativeContext, key: &str) -> MethodCallF
         "javax/management/InstanceNotFoundException",
         key.to_string(),
     )
+}
+
+/// Shared body of `MBeanServer.add/removeNotificationListener(ObjectName,
+/// NotificationListener, NotificationFilter, Object)`; `method` is the name to
+/// forward to the target MBean's own `NotificationBroadcaster` overload.
+///
+/// Resolves the ObjectName against this server's registry, then hands the
+/// listener to the bean when the bean can actually broadcast. A bean that is
+/// not a broadcaster is accepted without recording anything: nothing in this
+/// synthetic registry ever fires a Notification, so there is no delivery to
+/// promise and no listener state worth keeping.
+///
+/// CARVE-OUT: an unregistered name in the `JMImplementation:` domain is
+/// accepted rather than reported missing. That domain holds the
+/// `MBeanServerDelegate` every real `MBeanServer` owns and this registry does
+/// not materialize, and it is exactly what registration-notification listeners
+/// (Tomcat's `StatusManagerServlet.init()`) subscribe to — reporting it absent
+/// would turn a call that succeeds on every real JVM into a servlet 500.
+fn mbs_notification_listener(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+) -> MethodCallResult {
+    // `javax.management.NotificationBroadcaster` / `NotificationEmitter`.
+    const BROADCASTER_DESC: &str = "(Ljavax/management/NotificationListener;Ljavax/management/NotificationFilter;Ljava/lang/Object;)V";
+    let this = obj_arg(args, 0)?;
+    let name_ref = match args.get(1) {
+        Some(Value::Object(opt)) => *opt,
+        _ => None,
+    };
+    let key = object_name_key(ctx, name_ref);
+    let bean = match mbs_lookup_bean(ctx, this, &key) {
+        Some(bean) => bean,
+        None if key.starts_with("JMImplementation:") => return Ok(None),
+        None => return Err(jmx_instance_not_found(ctx, &key)),
+    };
+    let bean_class = ctx
+        .class_name_of_id(ctx.class_id_of_object(bean))
+        .unwrap_or_default();
+    if ctx.method_exists(&bean_class, method, BROADCASTER_DESC) {
+        let listener = args.get(2).copied().unwrap_or(Value::Object(None));
+        let filter = args.get(3).copied().unwrap_or(Value::Object(None));
+        let handback = args.get(4).copied().unwrap_or(Value::Object(None));
+        ctx.invoke_virtual(
+            bean,
+            method,
+            BROADCASTER_DESC,
+            &[listener, filter, handback],
+        )?;
+    }
+    Ok(None)
 }
 
 /// `javax.management.AttributeNotFoundException` for an absent attribute.
@@ -4861,27 +5629,29 @@ pub fn register_mbean_server(r: &mut NativeMethodRegistry) {
     });
 
     // add/removeNotificationListener(ObjectName, NotificationListener,
-    // NotificationFilter, Object). The synthetic registry doesn't implement
-    // real notification broadcasting (no MBean here ever fires a
-    // Notification), so there's nothing to actually wire up -- but real
-    // callers (e.g. Tomcat's StatusManagerServlet.init()/destroy(), which
-    // listens for MBeanServerNotification on the
-    // JMImplementation:type=MBeanServerDelegate delegate) need the call
-    // itself to succeed rather than AbstractMethodError on the un-overridden
-    // interface method. Match the file's existing leniency (unregisterMBean
-    // above no-ops rather than throwing InstanceNotFound too) -- accept
-    // unconditionally.
+    // NotificationFilter, Object).
+    //
+    // These used to accept unconditionally and DROP the registration, so every
+    // listener a JMX client installed through the server was silently connected
+    // to nothing — including listeners on MBeans that DO broadcast. Two things
+    // in the real contract are recoverable here, and `mbs_notification_listener`
+    // implements both: the target MBean has to exist (these methods are declared
+    // `throws InstanceNotFoundException`, which is the answer for an
+    // unregistered ObjectName), and when the target is itself a
+    // NotificationBroadcaster the listener belongs ON THE BEAN, where its own
+    // broadcaster support delivers notifications — the same delegation the real
+    // `DefaultMBeanServerInterceptor` performs.
     r.register(
         cls,
         "addNotificationListener",
         "(Ljavax/management/ObjectName;Ljavax/management/NotificationListener;Ljavax/management/NotificationFilter;Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| mbs_notification_listener(ctx, args, "addNotificationListener"),
     );
     r.register(
         cls,
         "removeNotificationListener",
         "(Ljavax/management/ObjectName;Ljavax/management/NotificationListener;Ljavax/management/NotificationFilter;Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(None),
+        |ctx, args| mbs_notification_listener(ctx, args, "removeNotificationListener"),
     );
 
     // registerMBean(Object, ObjectName) -> ObjectInstance. We store the
@@ -6236,14 +7006,20 @@ mod jmx_tests {
         // System.loadLibrary("management") -> Runtime.loadLibrary0(...) ->
         // ClassLoader.loadLibrary throws UnsatisfiedLinkError because
         // libmanagement.dll is genuinely absent (we ship JMM natives
-        // in-process via NativeMethodRegistry). RKC16N.12's vm_exec.rs
-        // override-allowlist failed because the *target* natives for
-        // System.loadLibrary / Runtime.loadLibrary0 are registered only
-        // in `register_runtime_natives` (synthetic-mode-only), not in
-        // `register_essential_natives` (real-JDK-mode). Pin the no-op
-        // entries here so the chain short-circuits at the narrowest
-        // possible point (loadNativeLib) plus belt-and-suspenders fallbacks
-        // at System / Runtime levels.
+        // in-process via NativeMethodRegistry).
+        //
+        // INVERTED (2026-07-28 stub sweep). This test used to also require
+        // `System.loadLibrary` / `System.load` / `Runtime.loadLibrary0` /
+        // `Runtime.load0` to be registered HERE, on the premise that
+        // "register_runtime_natives is synthetic-mode-only". That premise is
+        // false: `register_essential_natives_with_shims` calls
+        // `lang_system::register_runtime_natives` unconditionally, and vm_init
+        // runs it BEFORE `register_vm_management_impl` in both branches — so
+        // the no-ops registered here silently replaced `lang_system`'s REAL
+        // library loaders (last-registration-wins) and broke
+        // `System.loadLibrary` process-wide. They are gone; the narrow
+        // `loadNativeLib` no-op is the whole fix. Assert BOTH halves so the
+        // shadowing cannot be reintroduced.
         let mut r = NativeMethodRegistry::new();
         register_vm_management_impl(&mut r);
         assert!(
@@ -6257,37 +7033,29 @@ mod jmx_tests {
              without it, ManagementFactory.<clinit> calls into the \
              real-JDK loadLibrary chain which throws UnsatisfiedLinkError."
         );
-        assert!(
-            r.find("java/lang/System", "loadLibrary", "(Ljava/lang/String;)V")
-                .is_some(),
-            "System.loadLibrary must be registered in real-JDK mode (via \
-             register_vm_management_impl) — register_runtime_natives is \
-             synthetic-mode-only."
-        );
-        assert!(
-            r.find("java/lang/System", "load", "(Ljava/lang/String;)V")
-                .is_some(),
-            "System.load must be registered as the no-op companion of loadLibrary."
-        );
-        assert!(
-            r.find(
+        for (cls, name, desc) in [
+            ("java/lang/System", "loadLibrary", "(Ljava/lang/String;)V"),
+            ("java/lang/System", "load", "(Ljava/lang/String;)V"),
+            (
                 "java/lang/Runtime",
                 "loadLibrary0",
-                "(Ljava/lang/Class;Ljava/lang/String;)V"
-            )
-            .is_some(),
-            "Runtime.loadLibrary0 must be registered as a backstop in case \
-             ManagementFactory.loadNativeLib doesn't intercept first."
-        );
-        assert!(
-            r.find(
+                "(Ljava/lang/Class;Ljava/lang/String;)V",
+            ),
+            (
                 "java/lang/Runtime",
                 "load0",
-                "(Ljava/lang/Class;Ljava/lang/String;)V"
-            )
-            .is_some(),
-            "Runtime.load0 must be registered alongside loadLibrary0."
-        );
+                "(Ljava/lang/Class;Ljava/lang/String;)V",
+            ),
+        ] {
+            assert!(
+                r.find(cls, name, desc).is_none(),
+                "{cls}.{name}{desc} must NOT be registered by \
+                 register_vm_management_impl: it runs AFTER \
+                 lang_system::register_runtime_natives in both run modes, so a \
+                 registration here shadows the real library loader and makes \
+                 System.loadLibrary a no-op for the whole VM."
+            );
+        }
     }
 
     #[test]
