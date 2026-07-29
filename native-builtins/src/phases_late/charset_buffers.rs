@@ -552,6 +552,11 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
     // JIS_AUTODETECT) override it to false, and CratonVM's charset table
     // (`cratonvm_native_api::charset::canonical_charset_name`) contains none —
     // every entry has a working `encode_chars` path.
+    // REACHABILITY: `register_p61_charset` is reached only via
+    // `register_phase61_natives` -> `register_synthetic_overrides`, which is
+    // `#[cfg(feature = "synthetic-jdk")]` — so in the default real-JDK build
+    // this registration does not exist and `Charset.canEncode()` runs its own
+    // (identical) bytecode.
     r.register(cs, "canEncode", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });

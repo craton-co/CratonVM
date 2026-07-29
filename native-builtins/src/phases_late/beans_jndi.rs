@@ -19,14 +19,21 @@ use super::*;
 ///   1: name     (String — this node's simple name; "" for a root)
 ///   2: parent   (Preferences — null for a root, per `Preferences.parent()`)
 ///   3: children (HashMap<String,Preferences> — nodes created via `node()`)
+///   4: removed  (int flag — set by `removeNode()`)
 ///
 /// Slots 2 and 3 were added in stub-removal wave 2: without a parent link
 /// `parent()` could only ever answer null, and without a child registry
 /// `nodeExists()` could only ever answer false — and `node("x")` minted a
 /// fresh detached node on every call, so `node("x").put(k,v)` followed by
 /// `node("x").get(k, d)` silently returned the default.
+///
+/// Slot 4 was added in wave 4 together with `removeNode()`. It is the ONLY
+/// state that `sync()` / `flush()` have to report on for a memory-backed store
+/// (`AbstractPreferences.sync2()` is a removed-check, a `syncSpi()` that is
+/// empty when there is no persistent store, and a recursion over cached
+/// children) — without it those two really were unconditional no-ops.
 pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 4);
+    let prefs = alloc_concurrent_synthetic(ctx, "java/util/prefs/Preferences", 5);
     // Pin across the map/string allocs below — a moving young GC there would
     // relocate them (native stale-local family).
     let prefs_pin = ctx.pin_native_root(prefs);
@@ -43,8 +50,45 @@ pub(crate) fn p72_alloc_prefs(ctx: &mut dyn NativeContext) -> ObjectRef {
     // `p72_prefs_children` on the first `node()` call.
     ctx.set_field(prefs, 2, Value::Object(None));
     ctx.set_field(prefs, 3, Value::Object(None));
+    ctx.set_field(prefs, 4, Value::Int(0));
     ctx.unpin_native_roots(prefs_pin);
     prefs
+}
+
+/// Ancestor-walk bound — a `Preferences` tree cannot cycle, but slot 2 is a raw
+/// field a caller could in principle corrupt.
+const PREFS_MAX_DEPTH: usize = 4096;
+
+/// Whether `this`, or any ancestor, has been removed by `removeNode()`.
+///
+/// `removeNode` marks only the node it was invoked on and unlinks it from its
+/// parent's child registry; descendants keep pointing at it through slot 2, so
+/// walking UP is exactly the spec's "this node (or an ancestor) has been
+/// removed" — with no need to mark a whole subtree eagerly.
+fn p72_prefs_removed(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cur = this;
+    for _ in 0..PREFS_MAX_DEPTH {
+        if ctx.object_num_fields(cur) > 4 && ctx.get_field(cur, 4).as_int().unwrap_or(0) != 0 {
+            return true;
+        }
+        if ctx.object_num_fields(cur) < 3 {
+            return false;
+        }
+        match ctx.get_field(cur, 2) {
+            Value::Object(Some(parent)) => cur = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `IllegalStateException("Node has been removed.")` — the exact message
+/// `AbstractPreferences` uses.
+fn p72_prefs_removed_ex() -> MethodCallFailed {
+    RuntimeError::IllegalStateException {
+        message: "Node has been removed.".into(),
+    }
+    .into()
 }
 
 /// The child-node registry of `this`, created on demand in slot 3.
@@ -154,6 +198,10 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             if ctx.object_num_fields(this) > 3 {
                 ctx.set_field(this, 2, Value::Object(None));
                 ctx.set_field(this, 3, Value::Object(None));
+            }
+            // Slot 4 (removed flag) — separately guarded for the same reason.
+            if ctx.object_num_fields(this) > 4 {
+                ctx.set_field(this, 4, Value::Int(0));
             }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
@@ -451,16 +499,73 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             cratonvm_native_collections::native_map_clear_pub(ctx, &[Value::Object(Some(map))])?;
             Ok(None)
         });
-        r.register(cls, "sync", "()V", |_ctx, _args| {
-            // KEEP. Preferences.sync() forces backing-store synchronization. Our impl
-            // uses an in-memory HashMap on field 0 (no disk backing), so there is
-            // nothing to sync; and the one state a real `sync` must honour — a node
-            // removed by `removeNode()`, which makes it throw BackingStoreException —
-            // cannot arise, as `removeNode` is not registered on either class.
+        // `AbstractPreferences.sync()`/`flush()` decompose into exactly three
+        // things: throw `IllegalStateException` if this node or an ancestor was
+        // removed, call `syncSpi()`/`flushSpi()`, and recurse over cached
+        // children. For a memory-backed store the Spi half is genuinely empty
+        // and the recursion is unobservable — the removed-check is the whole
+        // observable contract, and `removeNode()` below now makes it reachable.
+        // (Wave 3 justified the no-op on the grounds that `removeNode` did not
+        // exist. That was true, and was itself the gap.)
+        r.register(cls, "sync", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if p72_prefs_removed(ctx, this) {
+                return Err(p72_prefs_removed_ex());
+            }
             Ok(None)
         });
-        r.register(cls, "flush", "()V", |_ctx, _args| {
-            // KEEP — same: no backing store to flush, no removed-node state to report.
+        r.register(cls, "flush", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if p72_prefs_removed(ctx, this) {
+                return Err(p72_prefs_removed_ex());
+            }
+            Ok(None)
+        });
+        // removeNode() — was registered nowhere, so it surfaced as a
+        // NoSuchMethodError while `nodeExists`/`node`/`parent` all behaved as
+        // if nodes could come and go. Unlink from the parent's child registry
+        // and mark the node removed; `p72_prefs_removed` propagates that to
+        // descendants through their parent links.
+        r.register(cls, "removeNode", "()V", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if p72_prefs_removed(ctx, this) {
+                return Err(p72_prefs_removed_ex());
+            }
+            let parent = if ctx.object_num_fields(this) > 2 {
+                match ctx.get_field(this, 2) {
+                    Value::Object(Some(p)) => Some(p),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            // Per the spec a root node cannot be removed.
+            let Some(parent) = parent else {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: "Can't remove the root!".into(),
+                }
+                .into());
+            };
+            // Pin across `p72_prefs_children` (which allocates when the parent
+            // has no registry yet) and the map call — a moving young GC there
+            // would relocate both (native stale-local family).
+            let this_pin = ctx.pin_native_root(this);
+            let parent_pin = ctx.pin_native_root(parent);
+            let name = ctx.get_field(this, 1);
+            let name_pin = pinned_object_value(ctx, name);
+            let parent = ctx.read_native_pin(parent_pin, parent);
+            if let Some(children) = p72_prefs_children(ctx, parent) {
+                let name = read_pinned_object_value(ctx, name_pin, name);
+                cratonvm_native_collections::native_map_remove_pub(
+                    ctx,
+                    &[Value::Object(Some(children)), name],
+                )?;
+            }
+            let this = ctx.read_native_pin(this_pin, this);
+            if ctx.object_num_fields(this) > 4 {
+                ctx.set_field(this, 4, Value::Int(1));
+            }
+            ctx.unpin_native_roots(this_pin);
             Ok(None)
         });
         r.register(cls, "keys", "()[Ljava/lang/String;", |ctx, args| {
@@ -1259,11 +1364,19 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         introspector_get_bean_info,
     );
     r.register(intro, "flushCaches", "()V", |_ctx, _args| {
-        // KEEP. The real Introspector caches BeanInfo per Class, and callers use
-        // flushCaches to force a re-scan after a class changes. `introspector_get_bean_info`
-        // above holds no cache at all — verified: there is no BeanInfo cache anywhere
-        // in the tree, it re-walks the mirror on every call — so the post-condition
-        // "the next getBeanInfo re-scans" already holds unconditionally.
+        // KEEP. `Introspector.flushCaches` has exactly one observable
+        // post-condition: the NEXT `getBeanInfo` re-scans the class instead of
+        // returning a memoised `BeanInfo`. `introspector_get_bean_info` below
+        // re-walks the class mirror's declared methods and superclass chain on
+        // every single call — re-verified in wave 4, there is no BeanInfo cache
+        // in this file or anywhere else in the tree (`git grep BeanInfo` finds
+        // only this file, JMX's unrelated `MBeanInfo`, and comments) — so that
+        // post-condition holds unconditionally and there is nothing to flush.
+        //
+        // Deliberately NOT resolved by adding a cache: the whole reason a cache
+        // needs flushing is class redefinition, which CratonVM's redefine path
+        // would then have to invalidate. An always-fresh scan is strictly
+        // correct, just slower, so the cache would be pure new risk.
         Ok(None)
     });
     r.register(
@@ -1271,7 +1384,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         "flushFromCaches",
         "(Ljava/lang/Class;)V",
         |_ctx, _args| {
-            // KEEP — same, for one class.
+            // KEEP — same, narrowed to one class.
             Ok(None)
         },
     );
@@ -2864,14 +2977,28 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         )?;
         Ok(None)
     });
-    r.register(ctx_iface, "close", "()V", |_ctx, _args| {
-        // KEEP. Reached only by a receiver whose `close()` resolves on the interface
-        // itself (see the note above); `InitialContext` carries its own real
-        // `close`. Doing nothing is right rather than convenient: the bindings
-        // this interface fallback operates on live in an in-memory map on the
-        // receiver, with no socket, file handle or provider connection to
-        // release — unlike `ObjectInput.close`, which wave 1 deleted precisely
-        // because a no-op there leaked the underlying stream.
+    // The wave-3 KEEP ("no socket or provider connection to release, so doing
+    // nothing is right") missed that `InitialContext.close` — the sibling
+    // registration in THIS file, over the same in-memory bindings map and with
+    // the same absence of OS resources — clears the bindings. Two `close`
+    // implementations of the same model disagreeing is the defect; a closed
+    // context must not keep answering `lookup` with live bindings. Mirror it.
+    r.register(ctx_iface, "close", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if jndi_bindings_map(ctx, this).is_none() {
+            // Foreign/zero-slot receiver: nothing this file owns to release.
+            return Ok(None);
+        }
+        // Pin across the map alloc/init below — a moving young GC there would
+        // relocate them (native stale-local family).
+        let this_pin = ctx.pin_native_root(this);
+        let empty = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+        let empty_pin = ctx.pin_native_root(empty);
+        cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(empty))]).ok();
+        let this = ctx.read_native_pin(this_pin, this);
+        let empty = ctx.read_native_pin(empty_pin, empty);
+        ctx.set_field(this, 0, Value::Object(Some(empty)));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.set_category(__prev_cat);

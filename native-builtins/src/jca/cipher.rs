@@ -1447,6 +1447,11 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // stock JDK 9+ install reports (`crypto.policy=unlimited` ships by
     // default), and it is factually true of this VM — `crate::crypto_impl`
     // enforces no key-size ceiling at all, so there is nothing to restrict.
+    // REACHABILITY (wave 4 — the `jca/mod.rs` header saying this module is
+    // synthetic-only is stale for THIS registrar): `register_cipher_clinit_shim`
+    // is called from both `register_essential_natives_with_shims` (the default
+    // real-JDK path) and `register_synthetic_overrides`, so it is live in both
+    // modes.
     r.register(
         "javax/crypto/JceSecurity",
         "isRestricted",
@@ -1628,6 +1633,14 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             )?;
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Cipher",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             check_transformation_supported(ctx, &algo_str)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))
@@ -1640,6 +1653,14 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let algo = obj_arg(args, 0)?;
             let algo_str = ctx.read_string(algo).unwrap_or_default();
+            crate::jca::provider_chain::check_provider_ownership(
+                ctx,
+                args,
+                1,
+                "Cipher",
+                &algo_str,
+                crate::jca::provider_chain::ProviderArgWording::Cipher,
+            )?;
             check_transformation_supported(ctx, &algo_str)?;
             let obj = cipher_alloc(ctx, algo);
             Ok(Some(Value::Object(Some(obj))))

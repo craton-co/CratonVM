@@ -768,34 +768,22 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // KEEP: `SynchronousQueue.size()` is specified to always return zero —
-    // the queue has no internal capacity, `put` blocks until handoff, so
-    // there is no state a reader could report. This matches the p58
-    // registration in `phases_late::concurrent`.
+    // KEEP (both): `SynchronousQueue` has no internal capacity, so the javadoc
+    // specifies `size()` as always 0 and `isEmpty()` as always true — "a
+    // SynchronousQueue acts as an empty collection". The real JDK bodies are
+    // literally `return 0;` and `return true;`.
     //
-    // DIVERGENCE (deliberately left as-is, flagged for a follow-up): the
-    // javadoc says `isEmpty()` is likewise ALWAYS true, but the reader below
-    // answers false while a producer is parked in the slot, so the pair can
-    // report "not empty, size 0". This registration runs after p58's
-    // always-true `isEmpty`, so this is the version that is live.
+    // W4 FIX: `isEmpty` used to read the rendezvous slot here and answer false
+    // while a producer was parked, so the pair could report "not empty, size 0"
+    // — a state no JDK SynchronousQueue can be in, and one that breaks the
+    // usual `if (!q.isEmpty()) q.poll()` idiom (poll can still return null:
+    // an item only exists for the instant a taker is already waiting). The
+    // parked-producer state is observable through `poll()`/`drainTo()`, which
+    // is exactly where the JDK exposes it. This registration runs after p58's
+    // (`register_concurrent_extras` is called after phase 58), so it is the
+    // live one; both now agree.
     r.register(sq, "size", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(sq, "isEmpty", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let slot = get_or_create_slot(this);
-        let state = slot.state.lock();
-        let empty_in_slot = !state.has_item;
-        // Also check mirror field (p58 compat).
-        let empty_in_mirror = if ctx.object_num_fields(this) > 1 {
-            matches!(ctx.get_field(this, 1), Value::Int(0))
-        } else {
-            true
-        };
-        Ok(Some(Value::Int(if empty_in_slot && empty_in_mirror {
-            1
-        } else {
-            0
-        })))
-    });
+    r.register(sq, "isEmpty", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
     r.set_category(__prev_cat);
 }
 

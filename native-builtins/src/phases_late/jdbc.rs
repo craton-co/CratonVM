@@ -51,6 +51,14 @@ pub(crate) mod jdbc_registry {
         column_names: Vec<String>,
         /// SQLite column type names (TEXT, INTEGER, REAL, BLOB, NULL)
         column_types: Vec<String>,
+        /// The connection that produced this result. `ResultSetMetaData`
+        /// only carries the stmt id, so this is how metadata queries
+        /// (`isNullable`) get back to the live schema.
+        conn_id: i64,
+        /// The SQL text that produced it — read by `column_nullable` to
+        /// decide whether an outer join / union could have introduced NULLs
+        /// into an otherwise NOT NULL column.
+        sql: String,
     }
 
     struct PreparedState {
@@ -308,6 +316,8 @@ pub(crate) mod jdbc_registry {
                 rows,
                 column_names,
                 column_types,
+                conn_id,
+                sql: sql.to_string(),
             },
         );
         Ok((stmt_id, row_count))
@@ -456,11 +466,27 @@ pub(crate) mod jdbc_registry {
         Ok(())
     }
 
-    /// Record a `registerOutParameter(String parameterName, …)` registration.
+    /// Record a `registerOutParameter(String parameterName, int sqlType)`
+    /// registration.
     pub fn register_out_parameter_named(
         ps_id: i64,
         name: &str,
         sql_type: i32,
+    ) -> Result<(), String> {
+        register_out_parameter_named_ext(ps_id, name, sql_type, 0, None)
+    }
+
+    /// The same, for the two three-argument named overloads —
+    /// `(String, int, int)` carries a scale, `(String, int, String)` carries
+    /// a SQL type name. Both are part of `CallableStatement` and were
+    /// previously unregistered, so a caller using them got the class's
+    /// (abstract / absent) body rather than a recorded registration.
+    pub fn register_out_parameter_named_ext(
+        ps_id: i64,
+        name: &str,
+        sql_type: i32,
+        scale: i32,
+        type_name: Option<String>,
     ) -> Result<(), String> {
         if name.is_empty() {
             return Err("registerOutParameter: parameter name is empty".to_string());
@@ -474,8 +500,8 @@ pub(crate) mod jdbc_registry {
             name.to_string(),
             OutParam {
                 sql_type,
-                scale: 0,
-                type_name: None,
+                scale,
+                type_name,
             },
         );
         Ok(())
@@ -579,6 +605,8 @@ pub(crate) mod jdbc_registry {
                 rows,
                 column_names,
                 column_types,
+                conn_id,
+                sql,
             },
         );
         Ok((stmt_id, row_count))
@@ -757,6 +785,85 @@ pub(crate) mod jdbc_registry {
             "BOOLEAN" | "BOOL" => 16,          // Types.BOOLEAN
             _ => 12,                           // Types.VARCHAR
         }
+    }
+
+    /// `ResultSetMetaData.columnNoNulls` / `columnNullable`.
+    const COLUMN_NO_NULLS: i32 = 0;
+    const COLUMN_NULLABLE: i32 = 1;
+
+    /// Answer `ResultSetMetaData.isNullable(col)` from the live SQLite
+    /// schema instead of assuming "nullable".
+    ///
+    /// SQLite records the per-column NOT NULL constraint and exposes it
+    /// through the `pragma_table_info` table-valued function. We report
+    /// `columnNoNulls` only when both hold:
+    ///   * the producing statement has no JOIN and no UNION — an outer join
+    ///     or a union with a nullable arm can put NULLs into a column that
+    ///     is declared NOT NULL in its base table; and
+    ///   * every table in the schema that declares a column of this name
+    ///     declares it NOT NULL (we do not know which table a result column
+    ///     came from, so unanimity is the only sound test).
+    /// Anything else — computed columns, aliases, unknown ids, a pragma
+    /// that will not compile — keeps the permissive `columnNullable`, which
+    /// is what a caller has to assume anyway.
+    pub fn column_nullable(stmt_id: i64, col: usize) -> i32 {
+        let reg = registry().lock();
+        let result = match reg.results.get(&stmt_id) {
+            Some(r) => r,
+            None => return COLUMN_NULLABLE,
+        };
+        let name = match result.column_names.get(col) {
+            Some(n) => n.clone(),
+            None => return COLUMN_NULLABLE,
+        };
+        let upper = result.sql.to_uppercase();
+        if upper.contains("JOIN") || upper.contains("UNION") {
+            return COLUMN_NULLABLE;
+        }
+        let conn = match reg.connections.get(&result.conn_id) {
+            Some(c) => c,
+            None => return COLUMN_NULLABLE,
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT ti.\"notnull\" FROM sqlite_master AS m, \
+             pragma_table_info(m.name) AS ti \
+             WHERE m.type = 'table' AND ti.name = ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return COLUMN_NULLABLE,
+        };
+        let mut rows = match stmt.query([name.as_str()]) {
+            Ok(r) => r,
+            Err(_) => return COLUMN_NULLABLE,
+        };
+        let mut seen = false;
+        while let Ok(Some(row)) = rows.next() {
+            seen = true;
+            if row.get::<_, i64>(0).unwrap_or(0) == 0 {
+                return COLUMN_NULLABLE;
+            }
+        }
+        if seen {
+            COLUMN_NO_NULLS
+        } else {
+            COLUMN_NULLABLE
+        }
+    }
+
+    /// `DatabaseMetaData.isReadOnly()` for a connection id.
+    ///
+    /// `open_connection` always opens read/write (`Connection::open`), so
+    /// SQLite's `query_only` pragma is the only way a connection of ours can
+    /// become read-only — and it is real per-connection state, not a guess.
+    pub fn is_read_only(conn_id: i64) -> bool {
+        let reg = registry().lock();
+        let conn = match reg.connections.get(&conn_id) {
+            Some(c) => c,
+            None => return false,
+        };
+        conn.query_row("PRAGMA query_only", [], |row| row.get::<_, i64>(0))
+            .map(|v| v != 0)
+            .unwrap_or(false)
     }
 
     pub fn get_row_count(stmt_id: i64) -> usize {
@@ -1095,6 +1202,21 @@ pub(crate) mod jdbc_registry {
     /// Driver version string.
     pub fn driver_version() -> &'static str {
         "1.0"
+    }
+
+    /// `getDriverMajorVersion` / `getDriverMinorVersion`, parsed out of
+    /// `driver_version()` so the three answers cannot drift apart.
+    pub fn driver_version_parts() -> (i32, i32) {
+        let mut parts = driver_version().split('.');
+        let major = parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        let minor = parts
+            .next()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        (major, minor)
     }
 }
 
@@ -2463,15 +2585,27 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(I)Ljava/lang/String;",
         |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string(""))))),
     );
-    // KEEP (deliberate constant): `1` is `ResultSetMetaData.columnNullable`.
-    // We do not record per-column NOT NULL constraints, and a SQLite column
-    // is nullable unless explicitly declared otherwise, so columnNullable is
-    // the correct default for the overwhelming majority of columns — and it
-    // is the permissive direction: a caller told "nullable" null-checks, a
-    // caller told "not nullable" would not.
-    r.register(rsmd, "isNullable", "(I)I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
-    }); // columnNullable
+    // Real answer, read back from the SQLite schema: the wave-3 note that
+    // "we do not record per-column NOT NULL constraints" was wrong — SQLite
+    // does record them and `pragma_table_info` exposes them. See
+    // `jdbc_registry::column_nullable` for the (deliberately conservative)
+    // rule; it still falls back to columnNullable whenever the answer is not
+    // provable.
+    r.register(rsmd, "isNullable", "(I)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let stmt_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        let col = match args.get(1) {
+            Some(Value::Int(c)) => (*c - 1) as usize,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(jdbc_registry::column_nullable(
+            stmt_id, col,
+        ))))
+    });
 
     // KEEP (deliberate constants): these are the `java.sql.Types` int
     // constants, fixed by the JDBC specification — every value below matches
@@ -2542,15 +2676,15 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    // KEEP (deliberate constants): the major/minor split of
-    // `jdbc_registry::driver_version()` ("1.0"), which `getDriverVersion`
-    // above reports as a string. These describe OUR driver, so a literal is
-    // the right answer — they must stay in step with `driver_version`.
+    // Derived from `jdbc_registry::driver_version()` rather than duplicated
+    // as literals, so `getDriverVersion` / `getDriverMajorVersion` /
+    // `getDriverMinorVersion` cannot drift apart when the driver version
+    // string changes.
     r.register(dbmd, "getDriverMajorVersion", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(1)))
+        Ok(Some(Value::Int(jdbc_registry::driver_version_parts().0)))
     });
     r.register(dbmd, "getDriverMinorVersion", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+        Ok(Some(Value::Int(jdbc_registry::driver_version_parts().1)))
     });
     r.register(dbmd, "getURL", "()Ljava/lang/String;", |ctx, _args| {
         // Our DriverManager opens `jdbc:sqlite:<path>` URLs. Without
@@ -2562,19 +2696,30 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("");
         Ok(Some(Value::Object(Some(s))))
     });
-    // KEEP (deliberate constants). Each of these is a true statement about
-    // THIS driver, not a placeholder:
-    //   isReadOnly          — `open_connection` always opens read/write
-    //                         (`rusqlite::Connection::open`); we never open a
-    //                         database in read-only mode.
+    // Real per-connection state: field 0 of the DatabaseMetaData synthetic
+    // is the connection id, and `is_read_only` reads SQLite's `query_only`
+    // pragma off that connection. (We always open read/write, so the pragma
+    // is the only route to a read-only connection — but it IS a route, and
+    // the old unconditional `false` could not see it.)
+    r.register(dbmd, "isReadOnly", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let conn_id = match ctx.get_field(this, 0) {
+            Value::Long(v) => v,
+            Value::Int(v) => v as i64,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(i32::from(jdbc_registry::is_read_only(
+            conn_id,
+        )))))
+    });
+    // KEEP (capability answers, constant in every real driver too). Each is
+    // a compile-time-true statement about THIS driver, and the reference
+    // SQLite JDBC driver hardcodes the same three:
     //   supportsTransactions— backed by real BEGIN/COMMIT/ROLLBACK in
     //                         `set_auto_commit` / `commit` / `rollback`.
     //   supportsSavepoints  — backed by `savepoint_create` /
     //                         `savepoint_rollback` / `savepoint_release`.
     //   supportsBatchUpdates— backed by `add_batch` / `execute_batch`.
-    r.register(dbmd, "isReadOnly", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
     r.register(dbmd, "supportsTransactions", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -2584,9 +2729,12 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     r.register(dbmd, "supportsBatchUpdates", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    // KEEP: `0` is the JDBC spec's encoding for "no limit, or the limit is
+    // unknown" (java.sql.DatabaseMetaData#getMaxConnections). Neither SQLite
+    // nor this registry imposes a connection cap, so 0 is the *correct*
+    // answer, not a placeholder — the reference SQLite JDBC driver returns 0
+    // here as well.
     r.register(dbmd, "getMaxConnections", "()I", |_ctx, _args| {
-        // rusqlite doesn't impose a hard connection limit; 0 means
-        // "no limit or unknown" per the JDBC spec.
         Ok(Some(Value::Int(0)))
     });
 
@@ -3098,6 +3246,56 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
             };
             let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
             jdbc_registry::register_out_parameter_named(ps_id, &name, sql_type)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
+    );
+    // The two remaining named overloads. Without these, a caller using the
+    // scale or type-name form fell through to the class body (there is none
+    // in synthetic mode) and the registration was lost.
+    r.register(
+        cstmt,
+        "registerOutParameter",
+        "(Ljava/lang/String;II)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let scale = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
+            jdbc_registry::register_out_parameter_named_ext(ps_id, &name, sql_type, scale, None)
+                .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
+            Ok(None)
+        },
+    );
+    r.register(
+        cstmt,
+        "registerOutParameter",
+        "(Ljava/lang/String;ILjava/lang/String;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ps_id = match ctx.get_field(this, 0) {
+                Value::Long(v) => v,
+                Value::Int(v) => v as i64,
+                _ => 0,
+            };
+            let name = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let sql_type = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            let type_name = match args.get(3) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s),
+                _ => None,
+            };
+            jdbc_registry::register_out_parameter_named_ext(ps_id, &name, sql_type, 0, type_name)
                 .map_err(|e| RuntimeError::IllegalStateException { message: e })?;
             Ok(None)
         },

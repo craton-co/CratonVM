@@ -50089,7 +50089,15 @@ mod tests {
         .unwrap();
         assert!(matches!(chars, Value::Int(_)));
 
-        // trySplit returns null (no splitting)
+        // trySplit MUST actually split. This asserted `null` while the native
+        // was a hardcoded "cannot split" — the test pinned the stub rather
+        // than the contract, and a permanently unsplittable Spliterator
+        // silently disables all parallel-stream decomposition.
+        //
+        // The receiver is the JDK's ArraySpliterator shape (0 = array,
+        // 1 = cursor, 2 = fence), so 3 elements split at
+        // mid = (0 + 3) >>> 1 = 1: the returned prefix covers [0, 1) and the
+        // receiver advances to [1, 3).
         let split = call_native(
             &shared,
             &mut thread,
@@ -50100,7 +50108,32 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(split, Value::Object(None));
+        let Value::Object(Some(prefix)) = split else {
+            panic!("trySplit must return a prefix spliterator, got {split:?}");
+        };
+        // The two halves must partition the original range exactly — nothing
+        // duplicated, nothing dropped.
+        assert_eq!(shared.mem.heap.get_field(prefix, 1), Value::Int(0));
+        assert_eq!(shared.mem.heap.get_field(prefix, 2), Value::Int(1));
+        assert_eq!(shared.mem.heap.get_field(obj, 1), Value::Int(1));
+        assert_eq!(shared.mem.heap.get_field(obj, 2), Value::Int(3));
+
+        // A single-element range still cannot split: lo >= mid.
+        let tiny = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(tiny, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(tiny, 1, Value::Int(2));
+        shared.mem.heap.set_field(tiny, 2, Value::Int(3));
+        let none = call_native(
+            &shared,
+            &mut thread,
+            sp,
+            "trySplit",
+            "()Ljava/util/Spliterator;",
+            &[Value::Object(Some(tiny))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(none, Value::Object(None));
     }
 
     #[test]

@@ -12,8 +12,8 @@ silently replaces a working method with one that does nothing.
 
 | Gate | Scope | Ceiling |
 |---|---|---|
-| `t9_stub_audit_counts_match_census` | the 6 named helpers, in 12 hand-listed `native-builtins/src` files | per-category, total **67** |
-| `t9b_inline_constant_native_census` | **every** `.register*()` call in **every** `.rs` file in the workspace | total **463** |
+| `t9_stub_audit_counts_match_census` | the 6 named helpers, in 12 hand-listed `native-builtins/src` files | per-category, total **53** |
+| `t9b_inline_constant_native_census` | **every** `.register*()` call in **every** `.rs` file in the workspace | total **350** |
 
 Both live in `vm/tests/tier1_tests.rs`. Direction for both: counts may only go
 DOWN or stay the same. A count going UP means a new stub was added, and the
@@ -22,23 +22,33 @@ gate failing is the intended signal to justify it here first.
 `t9b` was added in the wave-3 sweep (2026-07-28) because `t9` alone was
 measuring roughly an eighth of the problem — see "Why t9b exists" below.
 
-## Current counts (2026-07-28, wave 3)
+## Current counts (2026-07-28, after wave 4)
 
-| | before | after |
+Wave 3 triaged the whole surface and justified most of it. Wave 4 changed the
+mandate to **implement**, with `KEEP` requiring evidence that the real JDK is
+*also* constant there.
+
+| | pre-wave-3 | after wave 3 | **after wave 4** |
+|---|---|---|---|
+| Constant-valued native registrations | 669 | 462 | **350** |
+| — without a justification comment | 243 | 93 | **68** |
+| Named-helper subset (the old `t9` number) | 84 | 67 | **53** |
+
+### What the remaining 350 are made of
+
+| shape | count | can it go to zero? |
 |---|---|---|
-| Constant-valued native registrations, repo-wide | **669** | **462** |
-| — of those, carrying a justification comment | 426 | 369 |
-| — **without** one | **243** | **93** |
-| Named-helper subset (the old `t9` number) | 84 | 67 |
+| real methods returning a constant | 245 | partly — see below |
+| `registerNatives` / `initIDs` family | 51 | **no**, the no-op IS the correct body |
+| spec field constants (`HTTP_OK`, `Types.INTEGER`) | 35 | **no**, the constant IS the value |
+| empty constructors | 19 | **no** where the real JDK ctor is empty |
 
-Two independently written scanners were used (the Rust gate, and a Python one
-used to cross-check it). They agree on every per-file count and differ by one
-site in the total; the gate's own figure is 463. Treat these as "about this
-many", not as an exact inventory.
-
-Most of the remaining 93 "without a justification" are members of a *block*
-that carries one comment for the whole group — the `HTTP_*` constants, the
-`java.sql.Types` constants — rather than genuinely unreviewed sites.
+So ~105 of the 350 are correct *by definition* and this number can never reach
+zero. Of the 245 methods, a large share are verified against the real JDK body
+(`ByteArrayOutputStream.close()` is `{ }`, `SimpleBeanInfo.getIcon()` is
+`return null;`, `EmptyEnumeration.hasMoreElements()` is `return false;`,
+`DatagramChannelImpl.validOps()` is a fixed 5). **Read the ceiling as "how much
+of the native surface is constant-valued", not as "how many bugs are left".**
 
 ## A constant is not automatically a defect
 
@@ -156,25 +166,63 @@ and in `tier1_tests.rs` in the same change.
 
 ## Known-open items (not stubs, but adjacent)
 
-Recorded so the next sweep does not re-derive them:
+Recorded so the next sweep does not re-derive them. **Resolved in wave 4** and
+struck from this list: the missing `is_class_initialized` accessor, the
+unreachable finalization count, and the JMX lock-ownership gap (all three are
+now implemented and probe-verified against HotSpot 25).
 
-- `NativeContext` exposes no `is_class_initialized` query, so
-  `Unsafe.shouldBeInitialized` cannot be answered truthfully.
-- `NativeContext` exposes no reachable finalization-queue count, so
-  `getObjectPendingFinalizationCount` cannot be answered — the datum exists
-  (`ReferenceProcessor::pending_finalization_count`), it just is not plumbed.
-- `vm_exec.rs::thread_jmx_snapshot` builds `ThreadJmxSnapshot` with
-  `..Default::default()`, leaving lock ownership empty. That is why
-  `isObjectMonitorUsageSupported` is false and why the deadlock detector added
-  in wave 3 reports nothing until the two are joined up.
-- `java/net/http/HttpClient` carriers are allocated in three incompatible
-  shapes (9, 10 and 1 slots) across `net_phase_e.rs`, `http2.rs` and
-  `net_channels.rs` — a live last-registration-wins hazard independent of
-  stubs.
-- `java/nio/charset/Charset.contains` throws `AbstractMethodError` in real-JDK
-  mode: the receiver's class resolves to the abstract `Charset` rather than a
-  concrete `sun.nio.cs.*`. A class-identity bug, not a stub.
+Still open:
+
+- **`System.getLogger` mints an interface-classed object** in real-JDK mode, so
+  every subsequent `Logger` call resolves to an abstract method:
+  `isLoggable`/`getName` fail and the default `log` bodies hit
+  `AbstractMethodError`. This is a registration-structure fix (drop the
+  `getLogger` shadow, or mint a concrete synthetic class) — not a constant, and
+  changing the `isLoggable` constant would not help.
+- **`java/nio/charset/Charset.contains` throws `AbstractMethodError`** in
+  real-JDK mode: the receiver resolves to the abstract `Charset` rather than a
+  concrete `sun.nio.cs.*`. A class-identity bug.
+- **Windows host-interface enumeration** needs `GetAdaptersAddresses`. The
+  wave-4 `NetworkInterface` implementation reads `/sys/class/net`, so on
+  Windows `getAll()`/MAC/MTU still degrade to loopback-only. Same for the
+  Linux-only `TCP_KEEPIDLE`/`TCP_QUICKACK`/`IP_DONTFRAGMENT` socket options.
+- **Arbitrary-thread CPU time** (`isThreadCpuTimeSupported`) needs
+  `NativeContext::thread_os_tid`; `ThreadRegistry` already publishes `os_tid`.
+- **`isCompilationTimeMonitoringSupported`** needs
+  `NativeContext::jit_total_compile_time_ms`; `jit/src/tiered.rs` already keeps
+  `CompilationStats::total_compile_time_ms` in the spec's own unit.
+- **VirtualThreadScheduler counters** need one accessor returning
+  `ForkJoinScheduler::{live_carriers, active_count, queued_len}` as a triple,
+  so the three cannot be sampled inconsistently.
+- **`isObjectMonitorUsageSupported` stays false deliberately.** Owned-monitor
+  tracking fires only on the CONTENDED path, so `getLockedMonitors()` would be
+  partial; claiming support and returning an incomplete list is worse than
+  reporting the feature unsupported. Deadlock detection is unaffected and does
+  work. Making it complete means recording every uncontended `monitorenter` —
+  a hot-path registry write. HotSpot stack-walks at query time instead.
+- **JFR event writing** has no route from `native-builtins` into the VM's
+  recorder (the whole surface on `NativeContext` is one hard-coded
+  `emit_virtual_thread_pinned_jfr`). `FlightRecorder.isAvailable()` is
+  nonetheless correct as `true`.
+- **`ResultSetMetaData.getColumnType` reports VARCHAR for every column** —
+  both JDBC execute paths build `vec!["TEXT"; n]`. Needs rusqlite's
+  `column_decltype` feature.
+- **`URLClassLoader.close()`** cannot retract a dynamic-classpath entry:
+  `register_dynamic_classpath` is append-only and returns no ids.
+- `java/net/http/HttpClient` carriers exist in three incompatible shapes
+  (9, 10 and 1 slots) across `net_phase_e.rs`, `http2.rs`, `net_channels.rs`.
 - `System.setSecurityManager` now checks `RuntimePermission`, but CratonVM
-  still models an installable SecurityManager at all, which JDK 24 (JEP 486)
+  still models an installable SecurityManager, which JDK 24 (JEP 486)
   permanently disabled. Adopting JEP 486 would disable CratonVM's own
-  `Runtime.exec`/Panama gating and is a design decision, not a stub fix.
+  `Runtime.exec`/Panama gating — a design decision, not a stub fix.
+
+## A field-table entry that is too short fails SILENTLY
+
+Wave 4 found `com/sun/net/httpserver/HttpExchange` declared 8 slots in
+`classloading::synthetic_stub_fields` while `net_phase_e.rs` used
+`HEX_NUM_FIELDS = 9` — so every write of the authenticated principal went
+nowhere. `java/net/DatagramPacket` and `java/util/prefs/Preferences` had no
+entry at all and fell to `_ => vec![]`, making every raw-slot native for them
+inert. `set_field` past the end of a short object DROPS the write rather than
+erroring, so this class of bug looks like a working implementation. If you add
+a slot constant in a native file, add it to the field table in the same change.

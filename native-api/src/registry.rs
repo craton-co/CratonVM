@@ -569,6 +569,28 @@ pub trait NativeClassAccess {
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
     fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
 
+    /// Whether `class_id`'s static initializer has already run to completion.
+    ///
+    /// This is the query behind `Unsafe.shouldBeInitialized` /
+    /// `shouldBeInitialized0`, which must answer "does this class still need
+    /// initializing?". Before this existed, those natives returned a flat
+    /// `false` ("everything is already initialized") because the VM's real
+    /// `is_class_initialized_*` helpers live in the `vm` crate and were not
+    /// reachable from `native-builtins` — a constant that is right for an
+    /// initialized class and silently wrong for every other one.
+    ///
+    /// Deliberately distinct from `ensure_class_initialized`, which ACTS:
+    /// calling that to answer the question would run the very `<clinit>` the
+    /// caller is asking about, which is precisely what `Unsafe`'s callers are
+    /// trying to avoid.
+    ///
+    /// The default returns `true` so implementations that do not track
+    /// initialization state keep the previous observable behaviour instead of
+    /// suddenly reporting every class as uninitialized.
+    fn is_class_initialized(&self, _class_id: ClassId) -> bool {
+        true
+    }
+
     /// Resolve `name` to a `ClassId`, preferring whichever loaded class is
     /// registered under the SAME classloader as `near`'s own declaring
     /// context, falling back to the normal global (bootstrap-first) search
@@ -2884,6 +2906,21 @@ pub trait NativeThreadAccess: NativeHeapAccess {
 
     /// Get the number of alive threads in the VM.
     fn active_thread_count(&self) -> i32;
+
+    /// Number of objects queued for finalization but not yet finalized —
+    /// `MemoryMXBean.getObjectPendingFinalizationCount()`.
+    ///
+    /// The datum has always existed (`ReferenceProcessor::finalization_queue`,
+    /// drained by a real `FinalizerThread`); it simply was not reachable from
+    /// `native-builtins`, so the native returned a flat 0. Zero is a
+    /// legitimate ANSWER but was not a legitimate CONSTANT: it reported "no
+    /// finalization backlog" even while the queue was growing, which is
+    /// exactly the condition an operator queries this bean to detect.
+    ///
+    /// Defaults to 0 for implementations with no reference processor.
+    fn pending_finalization_count(&self) -> i32 {
+        0
+    }
 
     /// Get the Java Thread objects for all alive threads (up to `max` entries).
     /// Returns the number of thread objects written.
