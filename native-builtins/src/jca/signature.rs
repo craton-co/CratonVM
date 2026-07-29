@@ -767,6 +767,14 @@ fn sig_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         crate::jca::provider_chain::ProviderArgWording::Shared,
     )?;
     let alg = read_string(ctx, args, 0);
+    crate::jca::provider_chain::check_provider_ownership(
+        ctx,
+        args,
+        1,
+        "Signature",
+        &alg,
+        crate::jca::provider_chain::ProviderArgWording::Shared,
+    )?;
     let idx = algo_idx(&alg);
     let base = synthetic_base_offset(ctx, "java/security/Signature");
     let obj = alloc_concurrent_synthetic(ctx, "java/security/Signature", base + SIG_PRIVATE_SLOTS);

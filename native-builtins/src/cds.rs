@@ -726,15 +726,33 @@ fn native_cds_initialize_from_archive(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // No-op: sharing is disabled; nothing to load.
-    Ok(Some(Value::Int(0)))
+    // Nothing to restore: CratonVM's archive stores class BYTES only, with no
+    // archived heap subgraph, so "the archived object was absent" is the
+    // truthful outcome and every `java.base` caller is written for that case.
+    //
+    // The descriptor is `(Ljava/lang/Class;)V` — VOID. This used to return
+    // `Ok(Some(Value::Int(0)))`, handing back an operand for a method whose
+    // caller emits no pop. Void natives must return `Ok(None)`.
+    Ok(None)
 }
 
 fn native_cds_get_random_seed_for_dumping(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Long(12_345_678)))
+    // MUST be 0 when not dumping a static archive — and CratonVM never dumps
+    // one. HotSpot returns 0 outside `-Xshare:dump`, and `ImmutableCollections`
+    // depends on that: it seeds its SALT from this value and falls back to
+    // `System.nanoTime()` only when the seed is 0.
+    //
+    // This used to return a fixed 12_345_678, which made SALT32L identical on
+    // every run and removed the per-JVM iteration-order randomisation of
+    // `Set.of` / `Map.of`. That is worse than a fidelity gap: the
+    // randomisation exists so that code accidentally depending on
+    // immutable-collection iteration order fails visibly rather than passing
+    // here and breaking elsewhere. Pinning the seed hides precisely the class
+    // of bug it was designed to expose.
+    Ok(Some(Value::Long(0)))
 }
 
 fn native_cds_log_lambda_form_invoker(

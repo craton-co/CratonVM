@@ -8319,10 +8319,13 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Int(pos + skipped as i32));
         Ok(Some(Value::Long(skipped)))
     });
-    // KEEP (constant, justified): `ByteArrayInputStream.close()` is documented
-    // as having no effect — the real JDK body is empty too, so this is the
-    // behaviour, not a stub.
-    r.register(bais, "close", "()V", |_ctx, _args| Ok(None));
+    // DELETED wave 4 (2026-07-28): `ByteArrayInputStream.close()V` was
+    // registered here as a no-op. It was a DEAD registration —
+    // `native-io::register_io_natives` registers the same triple (bound to
+    // `native_bais_close`, itself `Ok(None)`) and runs strictly after this
+    // registrar in every VM init path (`vm/src/vm/vm_init.rs`). The surviving
+    // native-io copy carries the justification: the real JDK body is empty and
+    // the class documents that closing has no effect.
     r.register(bais, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let mark = ctx.get_field(this, 2).as_int().unwrap_or(0);
@@ -8335,9 +8338,13 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 2, Value::Int(pos)); // mark = pos
         Ok(None)
     });
-    // KEEP (constant, justified): `ByteArrayInputStream.markSupported()` is
-    // `return true` in the real JDK, and the `mark`/`reset` natives registered
-    // just above genuinely implement it against slot 2.
+    // KEEP (real JDK body is `return true;`) — re-verified wave 4, 2026-07-28.
+    // `ByteArrayInputStream` is backed by an in-memory byte[], so mark/reset
+    // is always supported; the `mark`/`reset` natives registered just above
+    // genuinely implement it against slot 2, and this triple has no rival
+    // registration anywhere in the tree (native-io registers BAIS
+    // read/available/skip/reset/close but NOT markSupported), so this really
+    // is the answer callers get.
     r.register(bais, "markSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
@@ -8863,9 +8870,13 @@ pub(crate) fn register_classloader_natives(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    // KEEP (constant, justified): `BufferedInputStream.markSupported()` is
-    // `return true` in the real JDK, and the `mark`/`reset` natives registered
-    // just above genuinely implement it against `markpos`/`marklimit`.
+    // KEEP (real JDK body is `return true;`) — re-verified wave 4, 2026-07-28.
+    // `BufferedInputStream` overrides `markSupported` with an unconditional
+    // `true`, and the `mark`/`reset` natives registered just above genuinely
+    // implement it against `markpos`/`marklimit`. Shadowing note: `lib.rs`
+    // registers this same triple (also `1`) from the essential-natives path;
+    // the two agree, so last-registration-wins is harmless — but change both
+    // together if the answer ever stops being constant.
     r.register(bis, "markSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });

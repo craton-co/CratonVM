@@ -1011,6 +1011,163 @@ fn xslt_write_result(
     Ok(false)
 }
 
+// ---------------------------------------------------------------------------
+// DOM namespace resolution
+//
+// The synthetic DOM keeps namespace declarations as ordinary attributes, so
+// `Node.getNamespaceURI` / `getPrefix` / `getLocalName` are answerable without
+// any parser change: split the qualified name in slot 0, then resolve the
+// prefix against the `xmlns*` attributes of the node and its ancestors.
+// ---------------------------------------------------------------------------
+
+/// The one namespace URI DOM binds unconditionally, without any declaration.
+const DOM_XML_NS_URI: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// Ancestor-walk bound. A parsed document is a tree, but the parent link is a
+/// raw slot a caller could in principle cycle; the bound keeps a corrupted
+/// document from hanging the VM.
+const DOM_NS_MAX_DEPTH: usize = 4096;
+
+/// Split a DOM qualified name into `(prefix, local)`.
+///
+/// A name with no colon — or a degenerate leading/trailing one, which is not a
+/// legal QName — has no prefix, exactly as `Node.getPrefix` specifies.
+fn dom_split_qname(qname: &str) -> (Option<&str>, &str) {
+    match qname.find(':') {
+        Some(i) if i > 0 && i + 1 < qname.len() => (Some(&qname[..i]), &qname[i + 1..]),
+        _ => (None, qname),
+    }
+}
+
+/// Whether `node` has the 5-slot Element layout (tag/attrs/children/count/parent).
+///
+/// Text and Attr nodes are 2-slot, and their slot 0 is content/name rather
+/// than a qualified name — so the namespace accessors must not read it.
+fn dom_is_element_shaped(ctx: &dyn NativeContext, node: ObjectRef) -> bool {
+    ctx.object_num_fields(node) >= 5
+}
+
+/// The element's qualified name (slot 0).
+fn dom_qualified_name(ctx: &dyn NativeContext, node: ObjectRef) -> Option<String> {
+    match ctx.get_field(node, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Resolve `prefix` (or the default namespace, when `None`) against the
+/// `xmlns` / `xmlns:p` attributes declared on `node` and its ancestors.
+///
+/// Returns the declaration's value String **as it already lives on the heap**
+/// — no allocation, so no GC can move the receiver mid-walk. An `xmlns=""`
+/// declaration undeclares the default namespace, which DOM reports as null.
+fn dom_lookup_namespace_uri(
+    ctx: &dyn NativeContext,
+    node: ObjectRef,
+    prefix: Option<&str>,
+) -> Option<ObjectRef> {
+    let wanted = match prefix {
+        Some(p) => format!("xmlns:{p}"),
+        None => "xmlns".to_string(),
+    };
+    let mut cur = node;
+    for _ in 0..DOM_NS_MAX_DEPTH {
+        if !dom_is_element_shaped(ctx, cur) {
+            return None;
+        }
+        if let Value::Object(Some(attrs)) = ctx.get_field(cur, 1) {
+            let len = ctx.array_length(attrs);
+            for i in 0..len {
+                let Value::Object(Some(attr)) = ctx.get_array_element(attrs, i) else {
+                    continue;
+                };
+                if ctx.object_num_fields(attr) < 2 {
+                    continue;
+                }
+                let Value::Object(Some(name)) = ctx.get_field(attr, 0) else {
+                    continue;
+                };
+                if ctx.read_string(name).as_deref() != Some(wanted.as_str()) {
+                    continue;
+                }
+                let Value::Object(Some(value)) = ctx.get_field(attr, 1) else {
+                    return None;
+                };
+                // `xmlns=""` (and `xmlns:p=""`) undeclares the binding.
+                if ctx.read_string(value).unwrap_or_default().is_empty() {
+                    return None;
+                }
+                return Some(value);
+            }
+        }
+        match ctx.get_field(cur, 4) {
+            Value::Object(Some(parent)) => cur = parent,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `Node.getPrefix()` — the part of the qualified name before the colon.
+fn dom_node_prefix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if !dom_is_element_shaped(ctx, this) {
+        return Ok(Some(Value::Object(None)));
+    }
+    let Some(qname) = dom_qualified_name(ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    match dom_split_qname(&qname).0 {
+        Some(prefix) => {
+            let s = ctx.create_string(prefix);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+/// `Node.getLocalName()` — the qualified name with any prefix stripped.
+///
+/// Unprefixed names (the overwhelmingly common case, and every name in a
+/// document that uses no namespaces) return the same String object as before.
+fn dom_node_local_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let raw = ctx.get_field(this, 0);
+    if !dom_is_element_shaped(ctx, this) {
+        return Ok(Some(raw));
+    }
+    let Some(qname) = dom_qualified_name(ctx, this) else {
+        return Ok(Some(raw));
+    };
+    let (prefix, local) = dom_split_qname(&qname);
+    if prefix.is_none() {
+        return Ok(Some(raw));
+    }
+    let s = ctx.create_string(local);
+    Ok(Some(Value::Object(Some(s))))
+}
+
+/// `Node.getNamespaceURI()` — the URI bound to this node's prefix, or to the
+/// default namespace when it has none.
+fn dom_node_namespace_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    if !dom_is_element_shaped(ctx, this) {
+        return Ok(Some(Value::Object(None)));
+    }
+    let Some(qname) = dom_qualified_name(ctx, this) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let prefix = dom_split_qname(&qname).0;
+    // `xml` is bound by the Namespaces spec itself and needs no declaration.
+    if prefix == Some("xml") {
+        let s = ctx.create_string(DOM_XML_NS_URI);
+        return Ok(Some(Value::Object(Some(s))));
+    }
+    Ok(Some(Value::Object(dom_lookup_namespace_uri(
+        ctx, this, prefix,
+    ))))
+}
+
 pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1436,13 +1593,23 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    // getElementById returns null, and that is the SPEC answer here rather
-    // than a shortcut: DOM Level 2 matches only attributes whose *declared
-    // type* is ID, which requires a DTD or schema. This parser is
-    // non-validating and processes no DTD, so no attribute is ever of type ID
-    // — exactly like Xerces' `CoreDocumentImpl`, whose identifier table stays
-    // empty for a DTD-less document. Matching any attribute literally spelled
-    // "id" would be a heuristic that DISAGREES with HotSpot.
+    // getElementById returns null. DOM Level 2 matches only attributes whose
+    // *declared type* is ID, and there are exactly two ways an attribute can
+    // acquire that type — neither of which can happen here:
+    //   * a DTD `<!ATTLIST elem attr ID …>` declaration. `XmlParser::skip_prolog`
+    //     (this file, ~L93) skips `<!DOCTYPE …>` wholesale, INCLUDING the
+    //     internal subset it brace-counts over, so no declaration survives the
+    //     parse in any form;
+    //   * `Element.setIdAttribute*`, which is registered nowhere in the tree.
+    // So the identifier table Xerces' `CoreDocumentImpl` consults is
+    // unconditionally empty for every document this parser can build, and null
+    // is the right answer for every argument. Matching any attribute literally
+    // spelled "id" would be a heuristic that DISAGREES with HotSpot.
+    //
+    // RESIDUAL (reported, not papered over): making this genuinely
+    // content-dependent needs `skip_prolog` to retain the internal subset's
+    // ATTLIST ID declarations and a document-level id→element table. That is a
+    // parser feature, not a native-shim gap.
     r.register(
         doc_cls,
         "getElementById",
@@ -1668,32 +1835,30 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
 
     // Node interface (registered on both Element and generic Node)
     //
-    // `getNamespaceURI` / `getPrefix` return null, which is the DOM Level 2
-    // answer for a node created by a NAMESPACE-UNAWARE parse — and that is
-    // what this parser is: `xml_parse` records `xmlns` declarations as plain
-    // attributes and never builds a prefix→URI scope stack, so slot 0 holds
-    // the raw qualified name and there is no binding to resolve a prefix
-    // against. Reporting a prefix while `getNamespaceURI()` stayed null would
-    // put the (namespaceURI, localName, prefix) triple into a state the DOM
-    // spec does not allow, so the three accessors stay consistently
-    // namespace-unaware together. Making them real means teaching `xml_parse`
-    // lexical namespace scoping first (`xml_stax::NsScopes` is the model);
-    // tracked as an open residual in the wave-2 report, deliberately not
-    // attempted here because it also changes `getLocalName`.
+    // The wave-2/3 justification for the constant nulls here ("the parser
+    // never builds a prefix→URI scope stack, so there is nothing to resolve
+    // against") was wrong about what is *required*: a parse-time scope stack
+    // is a convenience, not a precondition. `xml_parse` records every
+    // `xmlns` / `xmlns:p` declaration as an ordinary attribute (Element slot
+    // 1) and every element carries its parent (slot 4), so the lexical scope
+    // DOM Level 2 asks for is fully reconstructible at query time by walking
+    // ancestors — which is what `dom_lookup_namespace_uri` does. The three
+    // accessors still move together; they are now consistently
+    // namespace-AWARE instead of consistently unaware.
     for cls in ["org/w3c/dom/Node", "org/w3c/dom/Element"] {
         r.register(
             cls,
             "getNamespaceURI",
             "()Ljava/lang/String;",
-            |_ctx, _args| Ok(Some(Value::Object(None))),
+            dom_node_namespace_uri,
         );
-        r.register(cls, "getLocalName", "()Ljava/lang/String;", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
-        });
-        r.register(cls, "getPrefix", "()Ljava/lang/String;", |_ctx, _args| {
-            Ok(Some(Value::Object(None)))
-        });
+        r.register(
+            cls,
+            "getLocalName",
+            "()Ljava/lang/String;",
+            dom_node_local_name,
+        );
+        r.register(cls, "getPrefix", "()Ljava/lang/String;", dom_node_prefix);
     }
 
     // Text/CharacterData

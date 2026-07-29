@@ -2334,6 +2334,17 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
     // JDK bytecode stores it in `structPointer` and treats 0 as "native
     // allocation failed", throwing from the constructor. `1` is that
     // never-dereferenced token, not a placeholder value.
+    //
+    // RE-VERIFIED wave 4 (2026-07-28) — DO NOT convert these to throws:
+    //   * `JPEGImageReader.read` (registered ~40 lines below) is bound to
+    //     `imageio_reader_read`, which resolves the reader's `input` stream,
+    //     drains it and decodes with the Rust `image` crate. It takes no
+    //     handle argument and reads no handle field.
+    //   * `structPointer` occurs exactly ONCE in the whole repository: in
+    //     this comment. Nothing — Rust side or Java side — ever dereferences
+    //     the token, and there is no per-handle table to key it into.
+    // Throwing from any of the six below would break a JPEG decoder that
+    // works today, purely to remove a constant that is load-bearing.
     registry.register(
         "com/sun/imageio/plugins/jpeg/JPEGImageReader",
         "initJPEGImageReader",

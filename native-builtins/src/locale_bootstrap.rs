@@ -600,15 +600,24 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // `DecimalFormatSymbolsProvider`, `BreakIteratorProvider`, …), not just the
     // unknown ones that would have hit the InternalError.
     //
-    // Still a KEEP, but now for the honest reason: the faithful fix is to
-    // switch on `c.getSimpleName()` and delegate to the matching real
-    // `get*Provider()` getter, answering null ONLY on the default arm. That
-    // was NOT done here because those getters instantiate the adapter's inner
-    // provider classes off the JDK resource bundles — precisely the chain this
-    // C20 override exists to bypass for Jackson/H2/`Locale.getDefault()`
-    // formatting — and it cannot be landed without running those suites.
-    // Anyone doing it must re-run them; do not "simplify" it to a delegation
-    // on the strength of the switch alone.
+    // Wave-4 verdict: this is NOT a KEEP. The real method is not constant and
+    // `null` has no spec basis — it is an ACCEPTED, ESCALATED DIVERGENCE.
+    // Recorded as such so no later pass re-files it under "justified constant".
+    //
+    // The faithful fix is known and small: switch on `c.getSimpleName()` and
+    // delegate to the matching real `get*Provider()` getter on the receiver,
+    // answering null ONLY on the default arm — the one that would otherwise
+    // `throw new InternalError("should not come down here")`, and which
+    // `LocaleServiceProviderPool.findAdapter` is written to skip.
+    //
+    // It is not landed here because it cannot be landed blind: each
+    // `get*Provider()` calls `getLanguageTagSet(...)` and instantiates the
+    // adapter's inner provider off `LocaleDataMetaInfo`/`LocaleResources` —
+    // precisely the JDK resource-bundle chain this C20 override exists to
+    // bypass for Jackson/H2/`Locale.getDefault()` formatting. Landing it needs
+    // a build plus those suites. Whoever picks it up: delegate ONE SPI at a
+    // time, re-run the formatting suites for each, and do not "simplify" it to
+    // a blanket delegation on the strength of reading the switch.
     registry.register(
         "sun/util/locale/provider/JRELocaleProviderAdapter",
         "getLocaleServiceProvider",
