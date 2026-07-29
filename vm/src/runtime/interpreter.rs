@@ -27817,6 +27817,10 @@ pub(crate) fn is_forkjoin_native_override(
                 )
                 | ("execute", "(Ljava/lang/Runnable;)V")
                 | ("execute", "(Ljava/util/concurrent/ForkJoinTask;)V")
+                | (
+                    "awaitQuiescence",
+                    "(JLjava/util/concurrent/TimeUnit;)Z"
+                )
         )
     {
         return true;
@@ -28653,6 +28657,22 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Real-JDK constant-surface bridges. Keep in sync with vm_exec.rs.
+    if matches!(
+        (class_name, method_name, method_descriptor),
+        ("java/nio/charset/Charset", "contains", "(Ljava/nio/charset/Charset;)Z")
+            | ("java/nio/file/Files", "getOwner", "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/UserPrincipal;")
+            | ("java/lang/StackFrameInfo", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+            | ("java/net/DatagramSocket", "<init>", "()V")
+            | ("java/net/DatagramSocket", "<init>", "(I)V")
+            | ("java/net/DatagramSocket", "<init>", "(ILjava/net/InetAddress;)V")
+            | ("java/net/DatagramSocket", "connect", "(Ljava/net/InetAddress;I)V")
+            | ("java/net/DatagramSocket", "disconnect", "()V")
+            | ("java/lang/StackWalker$StackFrame", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+            | ("java/lang/StackWalker$StackFrame", "getDescriptor", "()Ljava/lang/String;")
+    ) {
+        return true;
+    }
     // JDK 25's public Class.getProtectionDomain() reads a VM-populated private
     // mirror field directly. CratonVM's mirrors retain class provenance in the
     // class store instead, so force the registered class-id-backed native.
@@ -28833,6 +28853,15 @@ fn force_native_over_real_jdk_bytecode(
     // mirror, so run the registered bridge which canonicalises through the VM
     // ClassId before delegating to JFR's String-keyed lookup.
     if is_jfr_metadata_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Reflective Method mirrors may expose stale physical returnType slots in
+    // the real JDK. The registered accessor derives the answer from the
+    // member descriptor, which is authoritative for JFR annotation metadata.
+    if class_name == "java/lang/reflect/Method"
+        && method_name == "getReturnType"
+        && method_descriptor == "()Ljava/lang/Class;"
+    {
         return true;
     }
     // The platform-server bridge returns a synthetic MBeanServer receiver.
@@ -29560,6 +29589,36 @@ fn force_native_over_real_jdk_bytecode(
                 | "implAddExportsNoSync"
                 | "implAddOpens"
                 | "implAddOpensToAllUnnamed"
+        )
+    {
+        return true;
+    }
+    // JavaLangAccess is implemented by the concrete System$1 singleton. The
+    // JDK module bootstrap calls these ordinary Java methods through that
+    // receiver, so native registrations must win over its real bytecode.
+    if class_name == "java/lang/System$1"
+        && matches!(
+            (method_name, method_descriptor),
+            ("addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")
+                | ("addReadsAllUnnamed", "(Ljava/lang/Module;)V")
+                | ("addExports", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                | (
+                    "addExports",
+                    "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V"
+                )
+                | (
+                    "addExportsToAllUnnamed",
+                    "(Ljava/lang/Module;Ljava/lang/String;)V"
+                )
+                | (
+                    "addOpens",
+                    "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V"
+                )
+                | (
+                    "addOpensToAllUnnamed",
+                    "(Ljava/lang/Module;Ljava/lang/String;)V"
+                )
+                | ("addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
         )
     {
         return true;
@@ -30721,7 +30780,7 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL")
+            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL" | "close")
                 || (method_name == "<init>"
                     && matches!(
                         method_descriptor,
@@ -30988,7 +31047,21 @@ fn is_jfr_metadata_native_override(
             "getValidType",
             "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;"
         ) | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
+            | ("jdk/jfr/internal/instrument/JDKEvents", "initialize", "()V")
             | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
+            | ("jdk/jfr/Event", "begin", "()V")
+            | ("jdk/jfr/Event", "end", "()V")
+            | ("jdk/jfr/Event", "commit", "()V")
+            | ("jdk/jfr/Event", "isEnabled", "()Z")
+            | ("jdk/jfr/Event", "shouldCommit", "()Z")
+            | (
+                "jdk/jfr/AnnotationElement",
+                "checkType",
+                "(Ljava/lang/Class;)V"
+            )
+            | ("jdk/jfr/Recording", "start", "()V")
+            | ("jdk/jfr/Recording", "stop", "()Z")
+            | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
     )
 }
 

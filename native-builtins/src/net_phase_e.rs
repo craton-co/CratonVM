@@ -11339,7 +11339,7 @@ const DP_LENGTH: usize = 1;
 const DP_ADDR: usize = 2;
 const DP_PORT: usize = 3;
 
-fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
+pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     let ds = "java/net/DatagramSocket";
 
     r.register(ds, "<init>", "()V", |ctx, args| {
@@ -11575,6 +11575,48 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         // `1` only when nobody ever called the setter — the historical answer.
         Ok(Some(Value::Int(if stored < 0 { 1 } else { stored })))
     });
+    // These three real-JDK declarations have bytecode that delegates through
+    // a private DatagramSocket delegate object.  CratonVM's authoritative
+    // socket state is the layout-independent DsSide table above, so force the
+    // constructors and lifecycle operations through this same registration
+    // instead of enabling phase-72's incompatible raw-slot duplicate.
+    r.register(ds, "connect", "(Ljava/net/InetAddress;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_get(this).fd;
+        if fd >= 0 {
+            let host = match args.get(1) {
+                Some(Value::Object(Some(address))) => match ctx.invoke_virtual(
+                    *address,
+                    "getHostAddress",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(value)))) => {
+                        ctx.read_string(value).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            let port = args.get(2).and_then(Value::as_int).unwrap_or(0);
+            if !host.is_empty() && (1..=65535).contains(&port) {
+                // DatagramSocket.connect records asynchronous failures for a
+                // later I/O operation; it must not throw from the connect call.
+                let _ = ctx
+                    .fd_table()
+                    .udp_connect(fd as u32, &format!("{host}:{port}"));
+            }
+        }
+        Ok(None)
+    });
+    r.register(ds, "disconnect", "()V", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_get(this).fd;
+        if fd >= 0 {
+            let _ = _ctx.fd_table().udp_disconnect(fd as u32);
+        }
+        Ok(None)
+    });
 }
 
 // ===========================================================================
@@ -11806,11 +11848,170 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     out
 }
 
-/// Off Unix there is no host enumeration without an `iphlpapi`
-/// (`GetAdaptersAddresses`) binding, which this crate does not carry. Report
-/// "cannot enumerate" so every caller takes the loopback-only fallback that was
-/// this module's only behaviour before wave 4.
-#[cfg(not(unix))]
+/// Windows uses `GetAdaptersAddresses`, the same IP Helper API family used by
+/// the JDK's Windows network-interface implementation. Keep the raw FFI
+/// layout local: this crate deliberately has no Windows-only dependency.
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinAdapterAddress {
+    length: u32,
+    if_index: u32,
+    next: *mut Re8WinAdapterAddress,
+    adapter_name: *const std::ffi::c_char,
+    first_unicast_address: *mut Re8WinUnicastAddress,
+    first_anycast_address: *mut core::ffi::c_void,
+    first_multicast_address: *mut core::ffi::c_void,
+    first_dns_server_address: *mut core::ffi::c_void,
+    dns_suffix: *const u16,
+    description: *const u16,
+    friendly_name: *const u16,
+    physical_address: [u8; 8],
+    physical_address_length: u32,
+    flags: u32,
+    mtu: u32,
+    interface_type: u32,
+    oper_status: u32,
+    ipv6_if_index: u32,
+    zone_indices: [u32; 16],
+}
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinSocketAddress {
+    address: *const u8,
+    length: i32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinUnicastAddress {
+    length: u32,
+    flags: u32,
+    next: *mut Re8WinUnicastAddress,
+    address: Re8WinSocketAddress,
+}
+
+#[cfg(windows)]
+unsafe fn re8_win_ip(address: Re8WinSocketAddress) -> Option<IpAddr> {
+    if address.address.is_null() || address.length < 2 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([*address.address, *address.address.add(1)]);
+    match family {
+        2 if address.length >= 8 => Some(IpAddr::V4(Ipv4Addr::new(
+            *address.address.add(4),
+            *address.address.add(5),
+            *address.address.add(6),
+            *address.address.add(7),
+        ))),
+        23 if address.length >= 24 => {
+            let mut octets = [0u8; 16];
+            std::ptr::copy_nonoverlapping(address.address.add(8), octets.as_mut_ptr(), 16);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "Iphlpapi")]
+extern "system" {
+    fn GetAdaptersAddresses(
+        family: u32,
+        flags: u32,
+        reserved: *mut core::ffi::c_void,
+        addresses: *mut Re8WinAdapterAddress,
+        size: *mut u32,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
+    let mut needed = 15_000u32;
+    for _ in 0..3 {
+        let words =
+            (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut storage = vec![std::mem::MaybeUninit::<usize>::uninit(); words.max(1)];
+        let mut size = (storage.len() * std::mem::size_of::<usize>()) as u32;
+        let result = unsafe {
+            GetAdaptersAddresses(
+                0,
+                0x10,
+                std::ptr::null_mut(),
+                storage.as_mut_ptr() as *mut Re8WinAdapterAddress,
+                &mut size,
+            )
+        };
+        if result == 111 {
+            needed = size.max(needed.saturating_mul(2));
+            continue;
+        }
+        if result != 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut current = storage.as_mut_ptr() as *mut Re8WinAdapterAddress;
+        while !current.is_null() {
+            let adapter = unsafe { &*current };
+            let name = if adapter.adapter_name.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(adapter.adapter_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            if !name.is_empty() {
+                let mut flags = 0;
+                if adapter.oper_status == 1 {
+                    flags |= RE8_IFF_UP | RE8_IFF_RUNNING;
+                }
+                if adapter.interface_type == 24 {
+                    flags |= RE8_IFF_LOOPBACK;
+                }
+                if adapter.interface_type == 23 {
+                    flags |= RE8_IFF_POINTOPOINT;
+                }
+                if adapter.flags & 0x20 == 0 {
+                    flags |= RE8_IFF_MULTICAST;
+                }
+                let mac_len =
+                    (adapter.physical_address_length as usize).min(adapter.physical_address.len());
+                let mac = if mac_len >= 6
+                    && !adapter.physical_address[..mac_len]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                {
+                    adapter.physical_address[..mac_len].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut addrs = Vec::new();
+                let mut unicast = adapter.first_unicast_address;
+                while !unicast.is_null() {
+                    let entry = unsafe { &*unicast };
+                    if let Some(ip) = unsafe { re8_win_ip(entry.address) } {
+                        if !addrs.contains(&ip) {
+                            addrs.push(ip);
+                        }
+                    }
+                    unicast = entry.next;
+                }
+                out.push(Re8HostIface {
+                    name,
+                    index: adapter.if_index.max(adapter.ipv6_if_index) as i32,
+                    flags,
+                    mtu: (adapter.mtu != 0).then_some(adapter.mtu.min(i32::MAX as u32) as i32),
+                    mac,
+                    addrs,
+                });
+            }
+            current = adapter.next;
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     Vec::new()
 }
@@ -13920,6 +14121,35 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     );
 
     let hex = "com/sun/net/httpserver/HttpExchange";
+    // These abstract HttpExchange getters must be live in the default
+    // real-JDK registry as well as in the synthetic phase-72 overlay.  The
+    // dispatch path owns the endpoint slots and records them from the accepted
+    // TcpStream; return null only for an exchange minted by an older/foreign
+    // path that does not carry those slots.
+    r.register(
+        hex,
+        "getLocalAddress",
+        "()Ljava/net/InetSocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(ctx.get_field(this, HEX_LOCAL_ADDR)))
+        },
+    );
+    r.register(
+        hex,
+        "getRemoteAddress",
+        "()Ljava/net/InetSocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(ctx.get_field(this, HEX_REMOTE_ADDR)))
+        },
+    );
     r.register(
         hex,
         "getRequestMethod",
@@ -14216,8 +14446,7 @@ mod tests {
     #[test]
     fn re1_http_parse_url_query_only_and_fragment_do_not_extend_authority() {
         let (https, host, port, path, userinfo) =
-            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false")
-                .unwrap();
+            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false").unwrap();
         assert!(!https);
         assert_eq!(host, "localhost");
         assert_eq!(port, 8080);

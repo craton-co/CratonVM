@@ -13135,6 +13135,21 @@ fn nio_owner_principal(ctx: &mut dyn NativeContext, path_value: Value) -> Method
     }
 }
 
+/// The real-JDK `Files.getOwner` path reaches provider bytecode that is not
+/// presently complete in CratonVM.  Reuse the attribute-backed owner bridge,
+/// but do not promote the surrounding synthetic Files registrar.
+pub fn register_real_jdk_files_owner(r: &mut NativeMethodRegistry) {
+    r.register(
+        "java/nio/file/Files",
+        "getOwner",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/UserPrincipal;",
+        |ctx, args| {
+            let path_value = args.first().copied().unwrap_or(Value::Object(None));
+            nio_owner_principal(ctx, path_value)
+        },
+    );
+}
+
 /// Same identity key as `basic_file_attributes_file_key`, but computed straight
 /// from a host path — for attribute objects that record their backing path
 /// instead of the raw `stat` fields (`DosFileAttributes`, slot 5).
