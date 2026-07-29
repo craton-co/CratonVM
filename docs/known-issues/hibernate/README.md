@@ -1,5 +1,14 @@
 # Hibernate ORM suite — open known issues
 
+## Resolved (2026-07-29)
+
+- **HIB-BYTEBUDDY ban re-instated** — the 2026-07-28 removal of the `net/bytebuddy/` blanket JIT
+  ban was premature (15-class sample too narrow); a full 4548-class run surfaced 302 CRASH-status
+  classes as a result. Re-instated the ban, reran all 302: 298/302 (98.7%) now PASS, zero crashes.
+  See `docs/internal/fixed-suite-bugs/hibernate/hib-bytebuddy-reinstated-20260729-FIXED.md`. The
+  stale removal doc (`hib-bytebuddy-removed-20260728.md`, still in this directory) is marked
+  SUPERSEDED — do not act on its original claim.
+
 ## Open
 
 - [`action.queue` GRAPH-default tests — blocked by flush-planner throughput](actionqueue-graph-default-tests-legacy-tradeoff-20260727.md)
