@@ -2176,32 +2176,45 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
 /// touching `org.jboss.logmanager.Logger.logRaw` (which our null-safe
 /// stub previously swallowed). By printing here we surface the boot
 /// progress without needing LogRecord field-offset guesses.
-/// `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER=1` — OPT-IN level filtering for
-/// [`native_jboss_logging_logger_do_log`] / `..._do_logf`.
+/// DEBUG/TRACE level filtering for [`native_jboss_logging_logger_do_log`] /
+/// `..._do_logf`. **Default ON**; `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER=0`
+/// turns it off.
 ///
-/// Default OFF, deliberately. These natives stand in for the concrete
-/// backend's `doLog`/`doLogf`, whose real implementations start with an
-/// `isEnabled(level)` check (`org.jboss.logging.Logger.debugf` and friends do
-/// NOT check the level themselves — they delegate that to `doLog`/`doLogf`).
-/// Ours check nothing, so every `tracef`/`debugf` in the process is formatted
-/// and written no matter how the application configured logging: the real
-/// Keycloak 26.6.1 boot emits 2992 lines against HotSpot's 10.
+/// Corrects the record from the 2026-07-27 write-up, which claimed
+/// "`org.jboss.logging.Logger.debugf` and friends do NOT check the level
+/// themselves". They DO -- `Logger.debugf` is
+/// `if (isEnabled(DEBUG)) doLogf(...)`, straight from the 3.6.2 bytecode.
 ///
-/// Turning the check on by default is NOT safe yet, because CratonVM cannot
-/// currently see the application's real configuration: it ignores
-/// `-Djava.util.logging.manager`, so Quarkus/Keycloak's
-/// `org.jboss.logmanager.LogManager` is never installed, jboss-logging falls
-/// back to `JDKLoggerProvider`, and everything those frameworks configure
-/// (including `kc.sh --log-level=debug`) is invisible to us. Filtering on the
-/// only thresholds we CAN see would then silently discard output the user
-/// explicitly asked for — verified: with this filter forced on,
-/// `--log-level=debug` produced zero DEBUG lines.
+/// The actual reason the Keycloak 26.6.1 boot emitted 2992 lines against
+/// HotSpot's 10 is that these natives ARE the sink: they print every record
+/// they are handed straight to stderr, bypassing the backend's HANDLER chain,
+/// which is where a real jboss-logmanager setup filters. `isEnabled` answers
+/// `true` on both VMs (Quarkus runs its root logger at ALL and filters at the
+/// console handler), so HotSpot drops those records at the handler and we
+/// printed them all. Verified with an isolated jboss-logging probe: under
+/// `-Djava.util.logging.manager=org.jboss.logmanager.LogManager` HotSpot
+/// prints NOTHING for `tracef`/`debugf`/`infof` (no handler configured) while
+/// CratonVM printed all three.
 ///
-/// The real fix is to honour `java.util.logging.manager`; until then this flag
-/// exists so a noisy investigation can opt into HotSpot-like quiet.
+/// So the filter models the missing handler threshold: a default console
+/// handler at INFO, unless the application explicitly configured a lower level
+/// on the logger (or an ancestor), which `jul_ancestor_explicit_level` sees
+/// via the `setLevel` natives. INFO and above are never touched, so the
+/// WildFly/JBoss boot visibility these natives exist for (`WFLYSRV*`,
+/// `WFLYCTL*`, the throwable dump) is unaffected either way.
+///
+/// Measured on the real Keycloak 26.6.1 boot: 11331 -> 307 lines, with every
+/// INFO/WARN/ERROR retained and the startup markedly faster (the formatting
+/// and I/O of ~11k TRACE lines is a pure-overhead tax on the slowest phase of
+/// the run).
 fn jboss_logger_level_filter() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_JBOSS_LOGGER_LEVEL_FILTER").is_some())
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("CRATONVM_JBOSS_LOGGER_LEVEL_FILTER").as_deref(),
+            Ok("0")
+        )
+    })
 }
 
 /// Would the real backend have DROPPED this record for being below the
@@ -2245,6 +2258,71 @@ fn jboss_record_suppressed_by_level(level_name: &str, logger_name: &str) -> bool
     record_value < threshold
 }
 
+/// Render `format` + `params` through the REAL `java.lang.String.format`.
+///
+/// That is exactly what jboss-logging's concrete backends do for the `logf`
+/// family (`JBossLogManagerLogger` builds an `ExtLogRecord` with
+/// `FormatStyle.PRINTF`, which `String.format`s it). Returns `None` when the
+/// call is unavailable or throws -- e.g. a genuinely malformed format string,
+/// where HotSpot would propagate an `IllegalFormatException` out of the log
+/// call -- so the caller can fall back to the approximate in-Rust pass rather
+/// than lose the line entirely.
+fn jboss_printf_format(
+    ctx: &mut dyn NativeContext,
+    format: &str,
+    params_pin: usize,
+    params: ObjectRef,
+) -> Option<String> {
+    let fmt_obj = ctx.create_string(format);
+    let fmt_pin = ctx.pin_native_root(fmt_obj);
+    // `create_string` can collect: re-derive BOTH references from their pins.
+    let params = ctx.read_native_pin(params_pin, params);
+    let fmt_obj = ctx.read_native_pin(fmt_pin, fmt_obj);
+    match ctx.invoke(
+        "java/lang/String",
+        "format",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+        &[Value::Object(Some(fmt_obj)), Value::Object(Some(params))],
+    ) {
+        Ok(Some(Value::Object(Some(rendered)))) => ctx.read_string(rendered),
+        _ => None,
+    }
+}
+
+/// Apply `java.text.MessageFormat` parameters to a `doLog` message.
+///
+/// `Logger.logv(...)` and `Logger.log(Level, Object, Object[], Throwable)`
+/// carry `{0}`-style parameters that the concrete backend applies via
+/// `ExtLogRecord`'s `FormatStyle.MESSAGE_FORMAT`. Returns `None` when there is
+/// nothing to substitute or the call fails, leaving the raw pattern in place.
+fn jboss_message_format(
+    ctx: &mut dyn NativeContext,
+    pattern: &str,
+    params_pin: usize,
+    params: ObjectRef,
+) -> Option<String> {
+    if !pattern.contains('{') {
+        return None;
+    }
+    let params_probe = ctx.read_native_pin(params_pin, params);
+    if ctx.array_length(params_probe) == 0 {
+        return None;
+    }
+    let pat_obj = ctx.create_string(pattern);
+    let pat_pin = ctx.pin_native_root(pat_obj);
+    let params = ctx.read_native_pin(params_pin, params);
+    let pat_obj = ctx.read_native_pin(pat_pin, pat_obj);
+    match ctx.invoke(
+        "java/text/MessageFormat",
+        "format",
+        "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
+        &[Value::Object(Some(pat_obj)), Value::Object(Some(params))],
+    ) {
+        Ok(Some(Value::Object(Some(rendered)))) => ctx.read_string(rendered),
+        _ => None,
+    }
+}
+
 fn native_jboss_logging_logger_do_log(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -2259,6 +2337,10 @@ fn native_jboss_logging_logger_do_log(
         _ => None,
     };
     let message_obj = match args.get(3) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let params_obj = match args.get(4) {
         Some(Value::Object(o)) => *o,
         _ => None,
     };
@@ -2279,6 +2361,7 @@ fn native_jboss_logging_logger_do_log(
     let this_pin = pin(ctx, this);
     let level_pin = pin(ctx, level_obj);
     let message_pin = pin(ctx, message_obj);
+    let params_pin = pin(ctx, params_obj);
     let throwable_pin = pin(ctx, throwable_obj);
 
     let level_name = level_pin
@@ -2305,6 +2388,13 @@ fn native_jboss_logging_logger_do_log(
         .map(|(p, o)| ctx.read_native_pin(p, o))
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
+    // args[4] carries the MessageFormat parameters and was ignored outright,
+    // so every `logv`-family line printed its raw pattern -- e.g. Agroal's
+    // `{0}: Validation test on connection {1}` on the Keycloak boot.
+    let message = match params_pin {
+        Some((p, o)) => jboss_message_format(ctx, &message, p, o).unwrap_or(message),
+        None => message,
+    };
     crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
     if let Some((p, original)) = throwable_pin {
         let t = ctx.read_native_pin(p, original);
@@ -2409,9 +2499,17 @@ fn native_jboss_logging_logger_do_logf(
             ctx.read_string(object)
         })
         .unwrap_or_default();
-    // Substitute %s/%% /%n from the params Object[] so structured messages
-    // (e.g. WFLYCTL0013 failure description) are visible in the output.
+    // Render through the REAL `String.format` -- what the concrete backends
+    // do. The in-Rust pass below only ever understood `%s`/`%%`/`%n`, so any
+    // other conversion (`%d`, `%b`, `%x`, `%.2f`, `%c`, ...) BOTH survived
+    // into the output verbatim AND desynchronised the parameter cursor,
+    // shifting every later `%s` onto the wrong argument
+    // (`"d=%d s=%s", 42, "str"` printed `d=%d s=42`). It is kept as a
+    // fallback for a failed/absent `String.format` only.
     let message = if let Some((params_pin, params)) = params_pin {
+        if let Some(rendered) = jboss_printf_format(ctx, &format, params_pin, params) {
+            rendered
+        } else {
         let params = ctx.read_native_pin(params_pin, params);
         let n = ctx.array_length(params);
         // Snapshot and root every object element before invoking even the
@@ -2462,29 +2560,39 @@ fn native_jboss_logging_logger_do_logf(
         let mut param_idx = 0usize;
         let mut chars = format.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '%' {
-                match chars.peek().copied() {
-                    Some('s') | Some('S') => {
-                        chars.next();
-                        result
-                            .push_str(param_strs.get(param_idx).map(|s| s.as_str()).unwrap_or("?"));
-                        param_idx += 1;
-                    }
-                    Some('%') => {
-                        chars.next();
-                        result.push('%');
-                    }
-                    Some('n') => {
-                        chars.next();
-                        result.push('\n');
-                    }
-                    _ => result.push('%'),
-                }
-            } else {
+            if c != '%' {
                 result.push(c);
+                continue;
+            }
+            // Consume a whole `%[argument_index$][flags][width][.precision]c`
+            // spec. Anything that is not `%%` or `%n` consumes one parameter,
+            // even when we cannot reproduce its exact rendering -- keeping the
+            // cursor aligned matters more than the individual conversion.
+            let mut spec = String::new();
+            let mut conversion = None;
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next.is_ascii_alphabetic() || next == '%' {
+                    conversion = Some(next);
+                    break;
+                }
+                spec.push(next);
+            }
+            match conversion {
+                Some('%') => result.push('%'),
+                Some('n') => result.push('\n'),
+                Some(_) => {
+                    result.push_str(param_strs.get(param_idx).map(|s| s.as_str()).unwrap_or("?"));
+                    param_idx += 1;
+                }
+                None => {
+                    result.push('%');
+                    result.push_str(&spec);
+                }
             }
         }
         result
+        }
     } else {
         format
     };
