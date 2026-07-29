@@ -36985,11 +36985,13 @@ fn jit_method_calls_native_shadowed(
 /// caller. They must continue through interpreter dispatch, which chooses the
 /// Signature-attribute native implementation over the real-JDK bytecode.
 ///
-/// The caller already owns the class-manager read guard while borrowing the
-/// method bytecode. Reuse that guard rather than acquiring a recursive read:
-/// `parking_lot::RwLock` blocks new readers behind a queued writer, so an
-/// outer read + queued class-definition writer + nested read forms a permanent
-/// cycle. WildFly parallel extension boot reliably exercises that ordering.
+/// The caller must pass its existing class-manager guard. Do not make this
+/// helper acquire the lock itself: `try_jit_compile_callee_slow` already holds
+/// a read guard while extracting the method body. If a class-loading writer
+/// queues between that guard and a nested `read()`, parking_lot's task-fair
+/// `RwLock` parks the nested read behind the writer while the outer read keeps
+/// the writer parked forever. Hibernate model/ByteBuddy generation and
+/// WildFly parallel extension boot both exercise that ordering.
 fn jit_method_calls_forced_class_generic_metadata(
     cm: &crate::classloading::ClassManager,
     caller_class_id: ClassId,
@@ -39804,6 +39806,23 @@ fn resolve_inline_site(
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
+    // A registered native shadows the classfile body. Inlining that bytecode
+    // would bypass the native completely, just as compiling the method itself
+    // would. This must precede even the "tiny constructor" path below:
+    // ConcurrentHashMap.<init>()V is only five bytes, but CratonVM's native
+    // constructor installs the segmented backing store. Background C1 used to
+    // inline the empty-looking JDK body, so a JIT-created map silently dropped
+    // every put after tier-up. The callee compiler already has this own-class
+    // guard; keep the inline resolver aligned with it.
+    if shared
+        .natives
+        .native_methods
+        .find(callee_class, callee_method, callee_desc)
+        .is_some()
+    {
+        return None;
+    }
+
     let cm = shared.classes.class_manager.read();
     let callee_class_id = cm.find_class_by_name_for_class(callee_class, requesting_class_id)?;
     let store = cm.class_store();
@@ -39813,6 +39832,21 @@ fn resolve_inline_site(
         callee_desc,
         store,
     )?;
+    // Same rule for an inherited native: resolution may start at a subclass
+    // while the executable override is registered on the declaring class.
+    // Checking exactly the declaring class still permits a real bytecode
+    // override on an intermediate subclass, matching
+    // `try_jit_compile_callee_slow`.
+    let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+    if declaring_class_name != callee_class
+        && shared
+            .natives
+            .native_methods
+            .find(declaring_class_name, callee_method, callee_desc)
+            .is_some()
+    {
+        return None;
+    }
 
     if method.is_synchronized() {
         return None;
@@ -46026,6 +46060,16 @@ mod wave1_adoption_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forced_generic_metadata_scan_reuses_the_callers_class_manager_guard() {
+        let _guard_reusing_signature: fn(
+            &crate::classloading::ClassManager,
+            ClassId,
+            &[u8],
+            usize,
+        ) -> bool = jit_method_calls_forced_class_generic_metadata;
+    }
 
     #[test]
     fn invoke_args_root_guard_refreshes_forwarded_pins_and_restores_watermark() {
