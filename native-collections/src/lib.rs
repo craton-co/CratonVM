@@ -45285,28 +45285,22 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
 
     // --- ForkJoinPool.awaitQuiescence ---
     //
-    // ESCALATED (W4) — this constant is NOT safe, and the W2 justification it
-    // replaces was factually wrong. That note claimed every ForkJoinPool entry
-    // point runs its task INLINE on the calling thread, so nothing can be
-    // outstanding. `fork`/`invoke`/`submit`/`join` do, but `execute` does not:
-    // in BOTH run modes it hands the Runnable to a real worker thread —
-    // native-builtins `lib.rs` (inside `register_essential_natives_with_shims`,
-    // i.e. the default real-JDK build) and `concurrent_extras.rs`
-    // (`--synthetic-jdk`) both route `ForkJoinPool.execute(Runnable)` through
-    // `spawn_runnable_on_real_thread`. So a task CAN still be running when
-    // `awaitQuiescence` is called, and `true` then lies about it.
+    // SUPERSEDED — this `true` is no longer what runs. The real implementation
+    // is `native-builtins::register_forkjoin_quiescence`, installed by `vm_init`
+    // immediately after `register_concurrent_natives` (i.e. after this), and it
+    // polls the async worker pool for real.
     //
-    // Left as `true` deliberately rather than flipped: `false` means "timed
-    // out", and callers loop on that, so guessing the other way turns a stale
-    // answer into a hang. The real fix needs the pending/active task count of
-    // native-builtins' async worker pool (`async_worker_pool` /
-    // `note_async_runnable_submitted` in `native-builtins/src/lib.rs`), which
-    // this crate cannot see — `cratonvm-native-builtins` depends on
-    // `cratonvm-native-collections`, not the other way round. Either expose
-    // that count on `NativeContext` (e.g. `fn pending_async_tasks(&self) ->
-    // usize`) so the poll can happen here, or move this registration into
-    // native-builtins next to the pool it must observe. This registration is
-    // the LAST one for the triple tree-wide, so it is what runs.
+    // Why it had to move rather than be fixed here: `fork`/`invoke`/`submit`/
+    // `join` run inline on the caller, but `execute(Runnable)` hands the task to
+    // a real worker thread via `spawn_runnable_on_real_thread`, so work CAN be
+    // outstanding — and the pool that holds it is a `native-builtins` static
+    // this crate cannot see (`cratonvm-native-builtins` depends on
+    // `cratonvm-native-collections`, not the reverse).
+    //
+    // This registration stays as the fallback for any embedding that registers
+    // the collections natives without the builtins ones. `true` remains the
+    // right fallback value: `false` means "timed out" and callers loop on it, so
+    // a wrong `false` is a hang while a wrong `true` is a stale answer.
     let pool = "java/util/concurrent/ForkJoinPool";
     r.register(
         pool,

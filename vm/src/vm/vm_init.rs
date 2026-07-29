@@ -1342,6 +1342,12 @@ impl SharedVm {
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
                 cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
+                // MUST follow `register_concurrent_natives`: that call registers
+                // the old constant `ForkJoinPool.awaitQuiescence` -> true, and
+                // registration is last-write-wins. The real one polls this
+                // crate's async worker pool, which `native-collections` cannot
+                // see.
+                cratonvm_native_builtins::register_forkjoin_quiescence(&mut native_methods);
                 cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
                 // java.util.logging.FileHandler's natives are registered
                 // (as part of register_p61_logging) only under
@@ -1355,6 +1361,20 @@ impl SharedVm {
                 // file). Register just the FileHandler natives directly here.
                 // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
                 cratonvm_native_builtins::phases_late::register_p61_file_handler(
+                    &mut native_methods,
+                );
+                // `Files.getOwner` lives in the phase-71 bridge, which is
+                // synthetic-jdk-only; without this the real
+                // `java.nio.file.Files.getOwner` bytecode throws
+                // UnsupportedOperationException (its provider has no
+                // FileOwnerAttributeView) where HotSpot answers.
+                cratonvm_native_builtins::phases_late::register_files_owner_bridge(
+                    &mut native_methods,
+                );
+                // `URLClassLoader.close()` likewise: the synthetic-only versions
+                // are written for the synthetic carrier's slots and cannot run
+                // against a real `java.net.URLClassLoader`.
+                cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
                     &mut native_methods,
                 );
 
@@ -1774,6 +1794,12 @@ impl SharedVm {
             // above. Real-JDK apps still need ReentrantLock / Condition / LBQ
             // drainTo natives (SLF4J replayEvents, Spring thread pools).
             cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
+                // MUST follow `register_concurrent_natives`: that call registers
+                // the old constant `ForkJoinPool.awaitQuiescence` -> true, and
+                // registration is last-write-wins. The real one polls this
+                // crate's async worker pool, which `native-collections` cannot
+                // see.
+                cratonvm_native_builtins::register_forkjoin_quiescence(&mut native_methods);
             cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
             // java.util.logging.FileHandler's natives are registered
             // (as part of register_p61_logging) only under
@@ -1787,6 +1813,13 @@ impl SharedVm {
             // file). Register just the FileHandler natives directly here.
             // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
             cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
+            // See the twin above: `Files.getOwner` would otherwise throw
+            // UnsupportedOperationException from real JDK bytecode.
+            cratonvm_native_builtins::phases_late::register_files_owner_bridge(&mut native_methods);
+            // See the twin above.
+            cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
+                &mut native_methods,
+            );
 
             fn real_jdk_lbq_drain_to_bounded(
                 ctx: &mut dyn cratonvm_native_api::NativeContext,

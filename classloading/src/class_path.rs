@@ -285,6 +285,40 @@ impl CanonicalizeCache {
         self.order.push_back(key.clone());
         self.paths.insert(key, value);
     }
+
+    /// Drop every memoized canonicalization. Used when a classpath root is
+    /// retracted, since a cached hit may name a file the classpath can no
+    /// longer serve.
+    fn clear(&mut self) {
+        self.paths.clear();
+        self.order.clear();
+    }
+}
+
+/// Does `entry` come from the filesystem root `root`?
+///
+/// Every variant carries the path it was built from: the archive/directory
+/// itself for the flat forms, and the OUTER jar for the two nested forms — which
+/// is the right answer for retraction, because one `add_path` of a fat JAR
+/// appends one entry per nested archive inside it.
+fn entry_derives_from(entry: &ClassPathEntry, root: &Path) -> bool {
+    let source = match entry {
+        ClassPathEntry::Directory(path)
+        | ClassPathEntry::JarFile { path, .. }
+        | ClassPathEntry::JmodFile { path, .. }
+        | ClassPathEntry::JImageFile { path, .. } => path,
+        ClassPathEntry::NestedDirectory { parent_jar, .. }
+        | ClassPathEntry::NestedJar { parent_jar, .. } => parent_jar,
+    };
+    if source == root {
+        return true;
+    }
+    // A spec and the recorded entry can spell the same file differently
+    // (relative vs absolute, `/` vs `\`), so fall back to a canonical compare.
+    match (source.canonicalize(), root.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Represents the classpath used to find `.class` files.
@@ -309,6 +343,20 @@ pub struct ClassPath {
     /// [`CanonicalizeCache`]). Long-running processes that probe many
     /// distinct paths can no longer grow this map without bound.
     canonicalize_cache: Mutex<CanonicalizeCache>,
+    /// Specs handed to [`ClassPath::add_path`], with a use count.
+    ///
+    /// `URLClassLoader.close()` must stop a closed loader serving new classes,
+    /// which means retracting the roots that loader added — and until this
+    /// existed there was no way to name them, so `close()` could only ever be a
+    /// no-op. The count is what makes retraction safe when two loaders were
+    /// handed the same JAR: the last one to close is the one that removes it.
+    dynamic_specs: HashMap<String, u32>,
+    /// `entries.len()` immediately before the FIRST [`ClassPath::add_path`].
+    ///
+    /// Retraction only ever considers entries at or past this index, so a JAR
+    /// that is both a startup classpath root and a dynamically added one keeps
+    /// its startup entry when the dynamic loader closes.
+    static_len: Option<usize>,
 }
 
 /// Per-archive memoized signing state for a signed JAR.
@@ -1461,6 +1509,8 @@ impl ClassPath {
         Self {
             entries,
             canonicalize_cache: Mutex::new(CanonicalizeCache::new()),
+            dynamic_specs: HashMap::new(),
+            static_len: None,
         }
     }
 
@@ -2096,6 +2146,10 @@ impl ClassPath {
     /// (e.g. JBoss module loader, Maven plugin loaders) get every JAR in
     /// the directory instead of silently dropping the entry.
     pub fn add_path(&mut self, path: &str) {
+        if self.static_len.is_none() {
+            self.static_len = Some(self.entries.len());
+        }
+        *self.dynamic_specs.entry(path.to_string()).or_insert(0) += 1;
         for expanded in Self::expand_classpath_wildcard(path) {
             // DaCapo-style URL handoff: a URL of the form
             // `jar:file:/<jar>!/<prefix>/` extracted by URLClassLoader will
@@ -2181,6 +2235,67 @@ impl ClassPath {
                 debug!("Dynamic classpath: skipping non-existent entry {expanded}");
             }
         }
+    }
+
+    /// Retract a spec previously handed to [`Self::add_path`].
+    ///
+    /// This is the other half of the `URLClassLoader.close()` contract: a closed
+    /// loader must stop serving classes and resources it had not already
+    /// loaded. Already-defined classes stay defined, exactly as on HotSpot —
+    /// `close()` shuts the loader's `URLClassPath`, it does not unload anything.
+    ///
+    /// Returns the number of classpath entries actually removed. Zero is the
+    /// normal answer for a spec that another live loader still holds (the use
+    /// count from [`Self::add_path`] has not reached zero), for one that was
+    /// never added, and for one whose files did not resolve to any entry.
+    pub fn remove_path(&mut self, path: &str) -> usize {
+        match self.dynamic_specs.get_mut(path) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                return 0;
+            }
+            Some(_) => {
+                self.dynamic_specs.remove(path);
+            }
+            None => return 0,
+        }
+        let Some(static_len) = self.static_len else {
+            return 0;
+        };
+        // Every filesystem root this spec could have contributed, in the same
+        // two forms `add_path` accepts: a plain path (possibly wildcarded) and
+        // the `<jar>!/<prefix>/` nested form, whose root is the outer JAR.
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for expanded in Self::expand_classpath_wildcard(path) {
+            if let Some((jar_part, _prefix)) = parse_jar_subdir_spec(&expanded) {
+                roots.push(PathBuf::from(jar_part));
+            } else {
+                roots.push(PathBuf::from(&expanded));
+            }
+        }
+        if roots.is_empty() {
+            return 0;
+        }
+        let before = self.entries.len();
+        let mut index = 0usize;
+        self.entries.retain(|entry| {
+            let position = index;
+            index += 1;
+            // Startup roots are never retractable — see `static_len`.
+            if position < static_len {
+                return true;
+            }
+            !roots.iter().any(|root| entry_derives_from(entry, root))
+        });
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            // A retracted root may have been the only source of a name that is
+            // now absent again, and vice versa for anything memoized while it
+            // was present.
+            self.canonicalize_cache.lock().clear();
+            debug!("Dynamic classpath: retracted {removed} entrie(s) for {path}");
+        }
+        removed
     }
 
     /// Build a [`ClassPathEntry::NestedJar`] from an archive entry that is

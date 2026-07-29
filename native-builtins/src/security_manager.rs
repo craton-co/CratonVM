@@ -891,12 +891,25 @@ fn register_system_security(r: &mut NativeMethodRegistry) {
     // only meaningful together, since gating construction while leaving
     // installation open just moves the bypass one call along.
     //
-    // Deliberately NOT the JDK 24+ (JEP 486) behaviour of throwing
-    // `UnsupportedOperationException` unconditionally: CratonVM still models
-    // an installable manager and depends on it for the gating above, so
-    // adopting JEP 486 here would disable that enforcement rather than
-    // tighten it. That is a design decision about CratonVM's security model,
-    // not a stub to remove, and is left as its own item.
+    // DECIDED (2026-07-29), deliberately NOT the JDK 24+ (JEP 486) behaviour of
+    // throwing `UnsupportedOperationException` unconditionally.
+    //
+    // JEP 486 permanently disabled the SecurityManager on HotSpot, so a faithful
+    // JDK 25 would refuse this call. CratonVM does not follow it, and the reason
+    // is that here the manager is not decorative: `Runtime.exec` /
+    // `ProcessBuilder.start` (`lang_system::check_exec_or_throw`) and the Panama
+    // host-call path both ASK the installed manager before proceeding. Adopting
+    // JEP 486 would make `System.setSecurityManager` throw and leave those two
+    // gates permanently un-consulted — i.e. it would REMOVE enforcement in the
+    // name of fidelity. Between "matches HotSpot's refusal" and "keeps the only
+    // sandbox this VM has", the second wins.
+    //
+    // The cost is named rather than hidden: an application that expects JEP 486
+    // semantics (catching `UnsupportedOperationException` to detect that
+    // security managers are gone) sees an install succeed instead. Revisit only
+    // together with a replacement for the exec/Panama gating — the two cannot
+    // be separated, which is why this is a security-model decision and not a
+    // stub to remove.
     //
     // Unchanged for the common cases: with no manager yet installed the check
     // short-circuits, and with no `java.policy` loaded

@@ -284,21 +284,19 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // with it — that is the test each one had to pass to stay here.
     //
     // What none of them can do is the thing they exist for on HotSpot: hand
-    // data to the recorder. This crate does not depend on `cratonvm-jfr`, and
-    // the whole `NativeContext` JFR surface is the single hard-coded
-    // `emit_virtual_thread_pinned_jfr(&'static str)` (`native-api/src/registry.rs`),
-    // so there is no door from here into the `FlightRecorder` the VM owns.
-    // That, not any individual entry, is the reason this file tops out at the
-    // lifecycle/clock contract; see the report escalation.
-    //
-    // `registerNatives()V` is a genuine no-op on HotSpot too (the JNI
-    // registration it performs has no Java-visible effect); the `set*` tuning
-    // knobs address a chunk writer this bridge does not own; `log`/`logEvent`/
-    // `subscribeLogLevel` are JFR's own internal trace channel, not the
-    // application's logging; `flush`/`markChunkFinal`/`emitOldObjectSamples`/
-    // `emitDataLoss` operate on chunks that do not exist. The two that would
-    // otherwise belong here — `exclude`/`include` — were pulled OUT because
-    // `isExcluded` reads them back; see their registrations further down.
+    // data to the recorder. That is no longer true of the file as a whole —
+    // `NativeContext::jfr_emit` / `jfr_is_recording` / `jfr_set_recording` /
+    // `jfr_stack_trace_id` are the door into the VM's `FlightRecorder`, and
+    // `beginRecording`/`endRecording`/`isRecording`/`emitEvent`/
+    // `getStackTraceId` all go through it. These specific entries stay no-ops
+    // because each addresses a CHUNK WRITER this VM does not have: `flush`,
+    // `markChunkFinal`, `emitOldObjectSamples` and `emitDataLoss` operate on
+    // chunks that do not exist, the `set*` knobs tune that writer's buffers,
+    // `log`/`logEvent`/`subscribeLogLevel` are JFR's internal trace channel
+    // rather than the application's logging, and `registerNatives()V` is a
+    // genuine no-op on HotSpot too. The two that would otherwise belong here —
+    // `exclude`/`include` — were pulled OUT because `isExcluded` reads them
+    // back; see their registrations further down.
     for (name, descriptor) in [
         ("registerNatives", "()V"),
         ("markChunkFinal", "()V"),
@@ -336,16 +334,24 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         registry.register(JVM, name, descriptor, |_ctx, _args| Ok(None));
     }
 
-    registry.register(JVM, "beginRecording", "()V", |_ctx, _args| {
+    // These three now drive the VM's real `FlightRecorder` rather than a local
+    // boolean: `jfr_set_recording` starts/stops a recording, and
+    // `jfr_is_recording` reads back whether one is running. The local
+    // `RECORDING` flag is kept in step so a context with no recorder (mocks,
+    // embeddings) still answers consistently.
+    registry.register(JVM, "beginRecording", "()V", |ctx, _args| {
+        ctx.jfr_set_recording(true);
         RECORDING.store(true, Ordering::Release);
         Ok(None)
     });
-    registry.register(JVM, "endRecording", "()V", |_ctx, _args| {
+    registry.register(JVM, "endRecording", "()V", |ctx, _args| {
+        ctx.jfr_set_recording(false);
         RECORDING.store(false, Ordering::Release);
         Ok(None)
     });
-    registry.register(JVM, "isRecording", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(RECORDING.load(Ordering::Acquire) as i32)))
+    registry.register(JVM, "isRecording", "()Z", |ctx, _args| {
+        let running = ctx.jfr_is_recording() || RECORDING.load(Ordering::Acquire);
+        Ok(Some(Value::Int(i32::from(running))))
     });
     // `createJFR(boolean simulateFailure)` is NOT a constant: HotSpot's
     // `jfr_create_jfr` returns TRUE immediately if the recorder already exists,
@@ -431,12 +437,40 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ))))
     });
 
+    // `emitEvent(long eventTypeId, long timestamp, long when)` — IMPLEMENTED
+    // (was a flat `false`, i.e. "nothing was emitted"). It is now true whenever
+    // a recording is running: `NativeContext::jfr_emit` is the route from this
+    // crate into the VM's `FlightRecorder` that did not exist before, and the
+    // three longs the JDK passes ARE the event's whole payload for this
+    // entry point (it is the periodic-event door, not the EventWriter one).
+    registry.register(JVM, "emitEvent", "(JJJ)Z", |ctx, args| {
+        let longs: Vec<i64> = args
+            .iter()
+            .filter_map(|v| match v {
+                Value::Long(l) => Some(*l),
+                _ => None,
+            })
+            .collect();
+        let (type_id, timestamp, when) = (
+            longs.first().copied().unwrap_or(0),
+            longs.get(1).copied().unwrap_or(0),
+            longs.get(2).copied().unwrap_or(0),
+        );
+        let emitted = ctx.jfr_emit(
+            "jdk.PeriodicEvent",
+            &[
+                ("eventTypeId", cratonvm_native_api::JfrValue::Long(type_id)),
+                ("timestamp", cratonvm_native_api::JfrValue::Long(timestamp)),
+                ("when", cratonvm_native_api::JfrValue::Long(when)),
+            ],
+        );
+        Ok(Some(Value::Int(i32::from(emitted))))
+    });
+
     // Constant `false` answers that are STATEMENTS OF FACT about this VM, not
     // placeholders — each names the CratonVM property that makes it true:
-    //   * `emitEvent`/`setThreshold`  — the Java-side per-event recorder is not
-    //     wired to a chunk writer here (payload collection is owned by the Rust
-    //     `jfr` crate), so no event is emitted through this boundary and the
-    //     honest answer to "did you emit it?" is no;
+    //   * `setThreshold` — tunes a per-event threshold this bridge does not
+    //     consume, and there is no getter that could disagree;
     //   * `getAllowedToDoEventRetransforms`/`isInstrumented` — `retransform
     //     Classes` above is a no-op, so no event class is ever instrumented;
     //     answering `true` to either would contradict that no-op;
@@ -445,7 +479,6 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // `isExcluded(Thread)` is deliberately NOT in this list: it is a guard whose
     // answer must follow `exclude`/`include` (see below).
     for (name, descriptor) in [
-        ("emitEvent", "(JJJ)Z"),
         ("setThreshold", "(JJ)Z"),
         ("getAllowedToDoEventRetransforms", "()Z"),
         ("isExcluded", "(Ljava/lang/Class;)Z"),
@@ -470,15 +503,30 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         registry.register(JVM, name, descriptor, |_ctx, _args| Ok(Some(Value::Int(1))));
     }
 
+    // `getStackTraceId(int skipFrames, long hash)` — IMPLEMENTED (was a flat
+    // `0`, i.e. "no trace interned"). The id must be STABLE, because events
+    // reference traces by id and a chunk carries each trace once;
+    // `NativeContext::jfr_stack_trace_id` interns by rendered frame list, so the
+    // same call site asked twice gets the same number. `0` is still the answer
+    // when there is no walkable stack, which is the JDK's own "no such trace".
+    registry.register(JVM, "getStackTraceId", "(IJ)J", |ctx, args| {
+        let skip = args.iter().find_map(|v| v.as_int()).unwrap_or(0);
+        Ok(Some(Value::Long(ctx.jfr_stack_trace_id(skip))))
+    });
+    // JDK 25 also declares the one-argument form.
+    registry.register(JVM, "getStackTraceId", "(I)J", |ctx, args| {
+        let skip = args.iter().find_map(|v| v.as_int()).unwrap_or(0);
+        Ok(Some(Value::Long(ctx.jfr_stack_trace_id(skip))))
+    });
+
     // Zero here means "no such id / nothing recorded", which is what a Java
-    // caller gets on a JVM with no chunk repository: no stack trace has been
-    // interned (`getStackTraceId`, `registerStackFilter`), no event has been
-    // committed (`commit`), no event class has been unloaded
+    // caller gets on a JVM with no chunk repository: no event has been
+    // committed through the EventWriter (`commit`), no stack filter registered
+    // (`registerStackFilter`), no event class unloaded
     // (`getUnloadedEventClassCount`). `getThreadId` and the two `hostTotal*`
     // probes are deliberately NOT in this list — see below.
     for (name, descriptor) in [
         ("getUnloadedEventClassCount", "()J"),
-        ("getStackTraceId", "(IJ)J"),
         ("commit", "(J)J"),
         (
             "registerStackFilter",

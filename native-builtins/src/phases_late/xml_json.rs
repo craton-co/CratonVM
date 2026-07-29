@@ -38,6 +38,19 @@ pub(crate) const NODE_DOCUMENT: i32 = 9;
 /// Simple recursive-descent XML parser. Returns (tag, attributes, children, tail).
 /// Supports elements, text, CDATA, comments, processing instructions, and XML declarations.
 pub(crate) fn xml_parse(input: &str) -> Option<XmlNode> {
+    xml_parse_with_ids(input).map(|(node, _)| node)
+}
+
+/// Parse, and also report the `(element, attribute)` pairs the DOCTYPE's
+/// internal subset declares with attribute type `ID`.
+///
+/// DOM Level 2 matches `getElementById` only against attributes whose DECLARED
+/// type is `ID`, and there are exactly two ways an attribute acquires that type:
+/// an `<!ATTLIST elem attr ID …>` declaration, or `Element.setIdAttribute*`.
+/// `skip_prolog` used to brace-count over the internal subset and throw it away,
+/// so no declaration survived the parse in any form and `getElementById` could
+/// only ever return null. It is retained now.
+pub(crate) fn xml_parse_with_ids(input: &str) -> Option<(XmlNode, Vec<(String, String)>)> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
@@ -45,15 +58,69 @@ pub(crate) fn xml_parse(input: &str) -> Option<XmlNode> {
     let mut parser = XmlParser {
         input: trimmed,
         pos: 0,
+        id_attributes: Vec::new(),
     };
-    // Skip XML declaration and DOCTYPE
+    // Skip the XML declaration and DOCTYPE, keeping the internal subset's ID
+    // declarations.
     parser.skip_prolog();
-    parser.parse_node()
+    let ids = std::mem::take(&mut parser.id_attributes);
+    parser.parse_node().map(|node| (node, ids))
+}
+
+/// Extract `(element, attribute)` ID declarations from a DTD internal subset.
+///
+/// Handles the two spellings the XML spec allows for an ID-typed attribute in
+/// an `<!ATTLIST>`: the bare `ID` type, and `ID` followed by a default
+/// declaration (`#REQUIRED`, `#IMPLIED`, `#FIXED "v"`, or a literal). One
+/// `<!ATTLIST>` may declare several attributes for the same element, so the
+/// scan walks the whole declaration rather than stopping at the first type.
+///
+/// `IDREF`/`IDREFS`/`NMTOKEN`… are deliberately NOT matched: only `ID` makes an
+/// attribute a `getElementById` key, and matching a prefix would make every
+/// `IDREF` attribute a false key.
+fn parse_attlist_id_declarations(subset: &str, out: &mut Vec<(String, String)>) {
+    let mut rest = subset;
+    while let Some(start) = rest.find("<!ATTLIST") {
+        let after = &rest[start + "<!ATTLIST".len()..];
+        let Some(end) = after.find('>') else {
+            return;
+        };
+        let body = &after[..end];
+        rest = &after[end + 1..];
+        let mut tokens = body.split_whitespace();
+        let Some(element) = tokens.next() else {
+            continue;
+        };
+        // Each attribute definition is `name type default…`; walk them in
+        // triples, treating a `#FIXED` default as consuming one extra token.
+        let tokens: Vec<&str> = tokens.collect();
+        let mut i = 0usize;
+        while i + 1 < tokens.len() {
+            let attr = tokens[i];
+            let att_type = tokens[i + 1];
+            let mut consumed = 2;
+            if let Some(default) = tokens.get(i + 2) {
+                if default.eq_ignore_ascii_case("#FIXED") {
+                    consumed += 2;
+                } else {
+                    consumed += 1;
+                }
+            }
+            if att_type == "ID" {
+                out.push((element.to_string(), attr.to_string()));
+            }
+            i += consumed;
+        }
+    }
 }
 
 pub(crate) struct XmlParser<'a> {
     input: &'a str,
     pos: usize,
+    /// `(element, attribute)` pairs the DOCTYPE internal subset declares with
+    /// attribute type `ID`. Filled by `skip_prolog`; drained by
+    /// [`xml_parse_with_ids`].
+    id_attributes: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -91,19 +158,40 @@ impl<'a> XmlParser<'a> {
                     break;
                 }
             } else if rem.starts_with("<!DOCTYPE") {
-                // DOCTYPE — skip to >
+                // DOCTYPE — skip to the '>' that closes it, brace-counting over
+                // the internal subset. The subset is HARVESTED on the way past
+                // (`<!ATTLIST … ID …>`) rather than discarded: those
+                // declarations are what makes `Document.getElementById` able to
+                // match anything at all.
                 let mut depth = 0;
+                let mut subset_start = None;
+                let mut subset: Option<String> = None;
+                let mut consumed = None;
                 for (i, b) in rem.bytes().enumerate() {
                     if b == b'[' {
+                        if depth == 0 {
+                            subset_start = Some(i + 1);
+                        }
                         depth += 1;
                     }
                     if b == b']' {
                         depth -= 1;
+                        if depth == 0 {
+                            if let Some(start) = subset_start.take() {
+                                subset = Some(rem[start..i].to_string());
+                            }
+                        }
                     }
                     if b == b'>' && depth <= 0 {
-                        self.pos += i + 1;
+                        consumed = Some(i + 1);
                         break;
                     }
+                }
+                if let Some(subset) = subset {
+                    parse_attlist_id_declarations(&subset, &mut self.id_attributes);
+                }
+                if let Some(consumed) = consumed {
+                    self.pos += consumed;
                 }
             } else if rem.starts_with("<!--") {
                 if let Some(end) = rem.find("-->") {
@@ -306,7 +394,7 @@ pub(crate) fn xml_build_dom(ctx: &mut dyn NativeContext, node: &XmlNode) -> Obje
             );
             let attrs_pin = ctx.pin_native_root(attrs_arr);
             for (i, (name, value)) in attributes.iter().enumerate() {
-                let attr = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Attr", 2);
+                let attr = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Attr", 3);
                 let attr_pin = ctx.pin_native_root(attr);
                 let n = ctx.create_string(name);
                 let n_pin = ctx.pin_native_root(n);
@@ -386,11 +474,14 @@ pub(crate) fn xml_read_input_stream(ctx: &mut dyn NativeContext, is: ObjectRef) 
 
 /// Parse XML string and build DOM document
 pub(crate) fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str) -> ObjectRef {
-    let mut doc = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 2);
+    // Slot 2 carries the DTD-declared ID attributes — see `DOC_ID_ATTRS`.
+    let mut doc = alloc_concurrent_synthetic(ctx, "org/w3c/dom/Document", 3);
     // Pin across the DOM build below — a moving young GC there would relocate
     // the fresh Document (native stale-local family).
     let doc_pin = ctx.pin_native_root(doc);
-    if let Some(root_node) = xml_parse(xml_text) {
+    let mut id_attributes = Vec::new();
+    if let Some((root_node, ids)) = xml_parse_with_ids(xml_text) {
+        id_attributes = ids;
         let root_obj = xml_build_dom(ctx, &root_node);
         doc = ctx.read_native_pin(doc_pin, doc);
         ctx.set_field(doc, 0, Value::Object(Some(root_obj)));
@@ -398,8 +489,110 @@ pub(crate) fn xml_parse_to_document(ctx: &mut dyn NativeContext, xml_text: &str)
         ctx.set_field(doc, 0, Value::Object(None));
     }
     ctx.set_field(doc, 1, Value::Object(None)); // doc_type
+    if id_attributes.is_empty() {
+        ctx.set_field(doc, DOC_ID_ATTRS, Value::Object(None));
+    } else {
+        let encoded = encode_id_attributes(&id_attributes);
+        let s = ctx.create_string(&encoded);
+        // `create_string` allocates, so re-read the document through its pin
+        // before the (allocation-free) field write.
+        doc = ctx.read_native_pin(doc_pin, doc);
+        ctx.set_field(doc, DOC_ID_ATTRS, Value::Object(Some(s)));
+    }
     ctx.unpin_native_roots(doc_pin);
     doc
+}
+
+/// Document slot 2: the DTD-declared ID attributes, or null when the document
+/// declared none.
+///
+/// Stored as one String (`element\tattribute\n` per declaration) rather than as
+/// a Java collection: it is written once at parse time and read only by
+/// `getElementById`, and a String is a single reference the GC already tracks.
+pub(crate) const DOC_ID_ATTRS: usize = 2;
+
+/// `Attr` slot 2: set by `Element.setIdAttribute*`, the second of DOM Level 2's
+/// two routes to an ID-typed attribute (the first being a DTD `<!ATTLIST>`).
+pub(crate) const ATTR_IS_ID: usize = 2;
+
+fn encode_id_attributes(pairs: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (element, attribute) in pairs {
+        out.push_str(element);
+        out.push('\t');
+        out.push_str(attribute);
+        out.push('\n');
+    }
+    out
+}
+
+fn decode_id_attributes(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let (element, attribute) = line.split_once('\t')?;
+            (!attribute.is_empty()).then(|| (element.to_string(), attribute.to_string()))
+        })
+        .collect()
+}
+
+/// Depth-first search for the element whose DTD-declared ID attribute equals
+/// `id`. Returns the FIRST match in document order, which is what a valid
+/// document (where IDs are unique) makes unambiguous anyway.
+fn dom_find_by_id(
+    ctx: &mut dyn NativeContext,
+    elem: ObjectRef,
+    declarations: &[(String, String)],
+    id: &str,
+) -> Option<ObjectRef> {
+    let tag = match ctx.get_field(elem, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    // Attributes are an array of `org/w3c/dom/Attr` (name = 0, value = 1,
+    // ATTR_IS_ID = 2), built by `xml_build_dom`.
+    if let Value::Object(Some(attrs)) = ctx.get_field(elem, 1) {
+        for i in 0..ctx.array_length(attrs) {
+            let Value::Object(Some(attr)) = ctx.get_array_element(attrs, i) else {
+                continue;
+            };
+            let name = match ctx.get_field(attr, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => continue,
+            };
+            // Two ways an attribute becomes an ID key, per DOM Level 2: a DTD
+            // `<!ATTLIST … ID …>` declaration, or `Element.setIdAttribute*`.
+            let declared = declarations
+                .iter()
+                .any(|(e, a)| a == &name && (e == "*" || e == &tag))
+                || matches!(ctx.get_field(attr, ATTR_IS_ID), Value::Int(1));
+            if !declared {
+                continue;
+            }
+            let value = match ctx.get_field(attr, 1) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if value == id {
+                return Some(elem);
+            }
+        }
+    }
+    let count = ctx.get_field(elem, 3).as_int().unwrap_or(0) as usize;
+    if let Value::Object(Some(children)) = ctx.get_field(elem, 2) {
+        for i in 0..count {
+            if let Value::Object(Some(child)) = ctx.get_array_element(children, i) {
+                // Elements are the children that themselves carry a child array
+                // (text/comment nodes do not) — same discriminator
+                // `dom_collect_by_tag` uses.
+                if matches!(ctx.get_field(child, 2), Value::Object(Some(_))) {
+                    if let Some(found) = dom_find_by_id(ctx, child, declarations, id) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Walk a DOM tree for SAX callbacks
@@ -1593,28 +1786,44 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
-    // getElementById returns null. DOM Level 2 matches only attributes whose
-    // *declared type* is ID, and there are exactly two ways an attribute can
-    // acquire that type — neither of which can happen here:
-    //   * a DTD `<!ATTLIST elem attr ID …>` declaration. `XmlParser::skip_prolog`
-    //     (this file, ~L93) skips `<!DOCTYPE …>` wholesale, INCLUDING the
-    //     internal subset it brace-counts over, so no declaration survives the
-    //     parse in any form;
-    //   * `Element.setIdAttribute*`, which is registered nowhere in the tree.
-    // So the identifier table Xerces' `CoreDocumentImpl` consults is
-    // unconditionally empty for every document this parser can build, and null
-    // is the right answer for every argument. Matching any attribute literally
-    // spelled "id" would be a heuristic that DISAGREES with HotSpot.
+    // getElementById — IMPLEMENTED (was an unconditional null).
     //
-    // RESIDUAL (reported, not papered over): making this genuinely
-    // content-dependent needs `skip_prolog` to retain the internal subset's
-    // ATTLIST ID declarations and a document-level id→element table. That is a
-    // parser feature, not a native-shim gap.
+    // DOM Level 2 matches only attributes whose *declared type* is ID, and there
+    // are exactly two ways an attribute acquires that type. Both now exist:
+    //   * a DTD `<!ATTLIST elem attr ID …>` declaration. `XmlParser::skip_prolog`
+    //     used to brace-count over the DOCTYPE's internal subset and throw it
+    //     away, so no declaration survived the parse in any form; it now
+    //     harvests them (`parse_attlist_id_declarations`) and
+    //     `xml_parse_to_document` stores them on the document (`DOC_ID_ATTRS`);
+    //   * `Element.setIdAttribute*`, registered below, which flags the `Attr`
+    //     itself (`ATTR_IS_ID`).
+    // A document that declares neither still gets null for every argument —
+    // which is correct, and is why matching any attribute literally spelled
+    // "id" would be a heuristic that DISAGREES with HotSpot.
     r.register(
         doc_cls,
         "getElementById",
         "(Ljava/lang/String;)Lorg/w3c/dom/Element;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let id = match args.get(1) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let Value::Object(Some(root)) = ctx.get_field(this, 0) else {
+                return Ok(Some(Value::Object(None)));
+            };
+            let declarations = match ctx.get_field(this, DOC_ID_ATTRS) {
+                Value::Object(Some(s)) => {
+                    decode_id_attributes(&ctx.read_string(s).unwrap_or_default())
+                }
+                _ => Vec::new(),
+            };
+            Ok(Some(match dom_find_by_id(ctx, root, &declarations, &id) {
+                Some(found) => Value::Object(Some(found)),
+                None => Value::Object(None),
+            }))
+        },
     );
     r.register(
         doc_cls,
@@ -1726,6 +1935,68 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
             let _ = (ctx, args);
             Ok(None)
         },
+    );
+    // `setIdAttribute(String name, boolean isId)` — the second of DOM Level 2's
+    // two routes to an ID-typed attribute, and the only one available to a
+    // document with no DTD. Registered because `getElementById` consults it
+    // (`ATTR_IS_ID`) alongside the DTD declarations, and because leaving it off
+    // the concrete carrier meant an `AbstractMethodError` for any caller that
+    // used it. `setIdAttributeNS` ignores the namespace URI for the same reason
+    // the rest of this DOM does: attributes are stored by qualified name only.
+    fn dom_set_id_attribute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = obj_arg(args, 0)?;
+        // (this, [uri,] name, isId) — the name is the LAST String argument and
+        // the flag the last Int, so both overloads read the same way.
+        let name = args
+            .iter()
+            .rev()
+            .find_map(|v| match v {
+                Value::Object(Some(s)) => ctx.read_string(*s),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let is_id = args
+            .iter()
+            .rev()
+            .find_map(|v| match v {
+                Value::Int(i) => Some(*i != 0),
+                _ => None,
+            })
+            .unwrap_or(true);
+        let Value::Object(Some(attrs)) = ctx.get_field(this, 1) else {
+            return Ok(None);
+        };
+        for i in 0..ctx.array_length(attrs) {
+            let Value::Object(Some(attr)) = ctx.get_array_element(attrs, i) else {
+                continue;
+            };
+            let attr_name = match ctx.get_field(attr, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => continue,
+            };
+            if attr_name == name {
+                ctx.set_field(attr, ATTR_IS_ID, Value::Int(i32::from(is_id)));
+                return Ok(None);
+            }
+        }
+        // DOM specifies NOT_FOUND_ERR for an attribute this element does not
+        // carry.
+        Err(RuntimeError::IllegalArgumentException {
+            message: format!("setIdAttribute: no attribute named {name}"),
+        }
+        .into())
+    }
+    r.register(
+        elem_cls,
+        "setIdAttribute",
+        "(Ljava/lang/String;Z)V",
+        dom_set_id_attribute,
+    );
+    r.register(
+        elem_cls,
+        "setIdAttributeNS",
+        "(Ljava/lang/String;Ljava/lang/String;Z)V",
+        dom_set_id_attribute,
     );
     r.register(
         elem_cls,

@@ -15,7 +15,7 @@ use super::*;
 /// `register_p61_charset`); it is run through `canonical_charset_name` so
 /// aliases (`UTF8`, `latin1`, `ASCII`, …) compare equal to their canonical
 /// spelling. Unknown names are returned verbatim.
-fn charset_name_field(ctx: &dyn NativeContext, cs: ObjectRef) -> String {
+pub(crate) fn charset_name_field(ctx: &dyn NativeContext, cs: ObjectRef) -> String {
     let raw = match ctx.get_field(cs, 0) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
         _ => String::new(),
@@ -34,7 +34,7 @@ fn charset_name_field(ctx: &dyn NativeContext, cs: ObjectRef) -> String {
 /// (`IBM500`, `IBM1047`), which are NOT ASCII supersets, so a blanket
 /// assumption would be wrong for them. A false negative only makes a caller
 /// transcode when it could have aliased; a false positive corrupts data.
-fn charset_contains(this: &str, other: &str) -> bool {
+pub(crate) fn charset_contains(this: &str, other: &str) -> bool {
     if this.eq_ignore_ascii_case(other) {
         return true;
     }

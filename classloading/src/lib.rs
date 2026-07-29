@@ -52,6 +52,7 @@ pub use class::{
     RECORD_OBJ_COMPUTED, RECORD_OBJ_EQUALS, RECORD_OBJ_HASH_CODE, RECORD_OBJ_TO_STRING,
 };
 pub use class_manager::is_bootstrap_appended_class;
+pub use class_manager::synthetic_stub_instance_field_count;
 pub use class_manager::{
     any_class_redefined,
     bump_jit_supersede_epoch,

@@ -1594,6 +1594,26 @@ fn native_prepared_statement_close(
     Ok(None)
 }
 
+/// REACHABILITY, and why this must NOT be pulled onto the real-JDK path.
+///
+/// Reached only from `register_phase68_natives` -> `register_synthetic_overrides`,
+/// i.e. `#[cfg(feature = "synthetic-jdk")]`. That is deliberate, not an
+/// oversight, and it is the answer to "the JDBC surface (including
+/// `ResultSetMetaData`'s column types) does not apply in the default build":
+///
+///   * in synthetic-jdk mode `java.sql.*` has no bytecode at all, so this
+///     rusqlite-backed implementation IS the JDBC provider;
+///   * in real-JDK mode `java.sql.*` are real interfaces and the APPLICATION's
+///     driver (H2, sqlite-jdbc, the SQL Server driver, ...) supplies the
+///     implementation classes. Registering these natives there would shadow the
+///     driver's own `ResultSetMetaData` with SQLite's answers about a database
+///     the driver may not even be talking to.
+///
+/// The precedent is `register_p68_xml`: putting THAT synthetic surface on the
+/// real-JDK path pre-empted Tomcat's real SAX parser and broke `server.xml`
+/// parsing. What real-JDK mode genuinely needs from us — driver discovery and
+/// the SQL date/time conversions no driver can do without VM help — is in
+/// `native-builtins/src/jdbc.rs`, which IS registered there.
 pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);

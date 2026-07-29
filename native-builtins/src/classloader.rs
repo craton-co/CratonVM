@@ -6446,6 +6446,13 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let resource_name = name.trim_start_matches('/');
     if let Some(Value::Object(Some(this))) = args.first().copied() {
+        // A CLOSED loader finds nothing new — `URLClassLoader.close()` shuts its
+        // `URLClassPath`, and this native is what stands in for that search in
+        // real-JDK mode (the `ucp` CratonVM hands the loader is never
+        // populated, so closing it has no effect on its own).
+        if crate::classloader_real::ucl_is_closed(ctx, this) {
+            return Ok(Some(Value::Object(None)));
+        }
         let local_urls = loader_local_resource_urls(ctx, this, resource_name);
         if let Some(first) = local_urls.first() {
             let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);

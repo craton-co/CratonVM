@@ -485,12 +485,20 @@ fn huffman_lookup(code: u32, len: u8) -> Option<u16> {
 // Version / redirect policy constants
 // ---------------------------------------------------------------------------
 
+// These are ENUM ORDINALS, not private encodings: `version()` and
+// `followRedirects()` hand back real `HttpClient$Version` / `HttpClient$Redirect`
+// objects built by `p57_alloc_enum`, and the `HTTP_1_1` / `NEVER` / ... statics
+// registered below mint the same ones. Declaration order in the JDK is
+// `HTTP_1_1, HTTP_2` and `NEVER, ALWAYS, NORMAL`; NEVER, ALWAYS and NORMAL used
+// to be 0/2/1 here, which disagreed with the `phases_late::net_channels`
+// registrar that owns those statics — so `client.followRedirects() ==
+// HttpClient.Redirect.ALWAYS` compared two different ordinals.
 const HTTP_VERSION_1_1: i32 = 0;
 const HTTP_VERSION_2: i32 = 1;
 
 const REDIRECT_NEVER: i32 = 0;
-const REDIRECT_NORMAL: i32 = 1;
-const REDIRECT_ALWAYS: i32 = 2;
+const REDIRECT_ALWAYS: i32 = 1;
+const REDIRECT_NORMAL: i32 = 2;
 
 // Default connection pool size
 const DEFAULT_POOL_SIZE: i32 = 20;
@@ -994,6 +1002,102 @@ fn alloc_body_handler(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
 // 1. java.net.http.HttpClient
 // ---------------------------------------------------------------------------
 
+/// `HttpClient.sendAsync` — one body shared by the two-argument and the
+/// three-argument (push-promise) overloads, so neither can fall through to a
+/// different registrar's carrier layout.
+fn http2_send_async(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+            let req = match args.get(1) {
+                Some(Value::Object(Some(r))) => *r,
+                _ => {
+                    let resp = alloc_http_response(ctx, 0);
+                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
+                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
+                    ctx.set_field(cf, 1, Value::Int(1));
+                    return Ok(Some(Value::Object(Some(cf))));
+                }
+            };
+            let method_idx = match ctx.get_field(req, REQ_METHOD) {
+                Value::Int(n) => n,
+                _ => METHOD_GET,
+            };
+            let method_str = method_idx_to_name(method_idx);
+            let uri_obj = match ctx.get_field(req, REQ_URI) {
+                Value::Object(Some(u)) => u,
+                _ => {
+                    let resp = alloc_http_response(ctx, 0);
+                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
+                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
+                    ctx.set_field(cf, 1, Value::Int(1));
+                    return Ok(Some(Value::Object(Some(cf))));
+                }
+            };
+            let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
+                Some(parts) => parts,
+                None => {
+                    let resp = alloc_http_response(ctx, 0);
+                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
+                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
+                    ctx.set_field(cf, 1, Value::Int(1));
+                    return Ok(Some(Value::Object(Some(cf))));
+                }
+            };
+            let use_tls = match ctx.get_field(uri_obj, URI_SCHEME) {
+                Value::Object(Some(s)) => ctx.read_string(s).as_deref() == Some("https"),
+                _ => port == 443,
+            };
+            // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body.
+            ensure_no_dropped_payload(ctx, req)?;
+            // [VULN fix nb-http2 (2)] Reject CR/LF/NUL in request-line values.
+            validate_no_crlf("method", method_str)?;
+            validate_no_crlf("request-target", &path)?;
+            validate_no_crlf("Host header", &host)?;
+            let result = if use_tls {
+                https_request(&host, port, method_str, &path)
+            } else {
+                http11_request(&host, port, method_str, &path)
+            };
+            let resp = match result {
+                Ok((status, body)) => {
+                    let r = alloc_http_response(ctx, status);
+                    let body_str = ctx.create_string(&body);
+                    ctx.set_field(r, RESP_BODY_OBJ, Value::Object(Some(body_str)));
+                    r
+                }
+                Err(_) => alloc_http_response(ctx, 0),
+            };
+            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
+            ctx.set_field(cf, 0, Value::Object(Some(resp)));
+            ctx.set_field(cf, 1, Value::Int(1)); // completed
+            Ok(Some(Value::Object(Some(cf))))
+}
+
+/// `HttpClient.Version` for an ordinal, as a real enum object.
+///
+/// Shares `p57_alloc_enum` with the `phases_late::net_channels` registrar that
+/// owns the `HTTP_1_1` / `HTTP_2` statics, so an object from either side has the
+/// same (name, ordinal) shape and the two compare equal.
+fn version_enum(ctx: &mut dyn NativeContext, ordinal: i32) -> cratonvm_types::error::MethodCallResult {
+    let name = if ordinal == HTTP_VERSION_1_1 {
+        "HTTP_1_1"
+    } else {
+        "HTTP_2"
+    };
+    crate::phases_late::p57_alloc_enum(ctx, "java/net/http/HttpClient$Version", name, ordinal)
+}
+
+/// `HttpClient.Redirect` for an ordinal. See [`version_enum`].
+fn redirect_enum(ctx: &mut dyn NativeContext, ordinal: i32) -> cratonvm_types::error::MethodCallResult {
+    let name = match ordinal {
+        REDIRECT_ALWAYS => "ALWAYS",
+        REDIRECT_NORMAL => "NORMAL",
+        _ => "NEVER",
+    };
+    crate::phases_late::p57_alloc_enum(ctx, "java/net/http/HttpClient$Redirect", name, ordinal)
+}
+
 fn register_http_client(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1122,77 +1226,34 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // sendAsync(HttpRequest, BodyHandler, PushPromiseHandler) — the same request
+    // with the push-promise handler ignored, which is exactly what the two-arg
+    // overload's contract already is (a client that never receives a server push
+    // never invokes the handler).
+    //
+    // Registered HERE, on this carrier, because `net_phase_e`'s RE5 registrar
+    // owned this key alone. In a `--synthetic-jdk` build this file registers
+    // LAST, so every other `HttpClient` key resolved to the 10-slot carrier
+    // while this one fell through to RE5's body — which reads the 9-slot RE5
+    // layout (`RE5_CLIENT_SSL_CONTEXT` at slot 3, `RE5_CLIENT_PROXY` at 5) off
+    // an object whose slots 3 and 5 are this file's `has-SSL` / `has-proxy`
+    // booleans. That cross-shape read is the concrete form of the
+    // three-carriers hazard; covering the key closes it without deleting a
+    // registrar either build depends on.
+    r.register(
+        cls,
+        "sendAsync",
+        "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;Ljava/net/http/HttpResponse$PushPromiseHandler;)Ljava/util/concurrent/CompletableFuture;",
+        http2_send_async,
+    );
+
     // sendAsync(HttpRequest, BodyHandler) -> CompletableFuture<HttpResponse>
     // Performs the same real HTTP request as send(), then wraps result in a completed CF.
     r.register(
         cls,
         "sendAsync",
         "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/util/concurrent/CompletableFuture;",
-        |ctx, args| {
-            let req = match args.get(1) {
-                Some(Value::Object(Some(r))) => *r,
-                _ => {
-                    let resp = alloc_http_response(ctx, 0);
-                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
-                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
-                    ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
-                }
-            };
-            let method_idx = match ctx.get_field(req, REQ_METHOD) {
-                Value::Int(n) => n,
-                _ => METHOD_GET,
-            };
-            let method_str = method_idx_to_name(method_idx);
-            let uri_obj = match ctx.get_field(req, REQ_URI) {
-                Value::Object(Some(u)) => u,
-                _ => {
-                    let resp = alloc_http_response(ctx, 0);
-                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
-                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
-                    ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
-                }
-            };
-            let (host, port, path) = match extract_uri_parts(ctx, uri_obj) {
-                Some(parts) => parts,
-                None => {
-                    let resp = alloc_http_response(ctx, 0);
-                    let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
-                    ctx.set_field(cf, 0, Value::Object(Some(resp)));
-                    ctx.set_field(cf, 1, Value::Int(1));
-                    return Ok(Some(Value::Object(Some(cf))));
-                }
-            };
-            let use_tls = match ctx.get_field(uri_obj, URI_SCHEME) {
-                Value::Object(Some(s)) => ctx.read_string(s).as_deref() == Some("https"),
-                _ => port == 443,
-            };
-            // [HIGH fix nb-http2 (1)] Don't silently drop caller headers/body.
-            ensure_no_dropped_payload(ctx, req)?;
-            // [VULN fix nb-http2 (2)] Reject CR/LF/NUL in request-line values.
-            validate_no_crlf("method", method_str)?;
-            validate_no_crlf("request-target", &path)?;
-            validate_no_crlf("Host header", &host)?;
-            let result = if use_tls {
-                https_request(&host, port, method_str, &path)
-            } else {
-                http11_request(&host, port, method_str, &path)
-            };
-            let resp = match result {
-                Ok((status, body)) => {
-                    let r = alloc_http_response(ctx, status);
-                    let body_str = ctx.create_string(&body);
-                    ctx.set_field(r, RESP_BODY_OBJ, Value::Object(Some(body_str)));
-                    r
-                }
-                Err(_) => alloc_http_response(ctx, 0),
-            };
-            let cf = alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 2);
-            ctx.set_field(cf, 0, Value::Object(Some(resp)));
-            ctx.set_field(cf, 1, Value::Int(1)); // completed
-            Ok(Some(Value::Object(Some(cf))))
-        },
+        http2_send_async,
     );
 
     // version() -> HttpClient$Version
@@ -1206,7 +1267,9 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => HTTP_VERSION_2,
             };
-            Ok(Some(Value::Int(v)))
+            // Declared to return `HttpClient$Version`; returning the raw slot
+            // int handed an Int where every caller dereferences an object.
+            version_enum(ctx, v)
         },
     );
 
@@ -1239,7 +1302,8 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
                 Value::Int(n) => n,
                 _ => REDIRECT_NEVER,
             };
-            Ok(Some(Value::Int(r)))
+            // Declared to return `HttpClient$Redirect` — see `version()` above.
+            redirect_enum(ctx, r)
         },
     );
 
@@ -3164,9 +3228,14 @@ mod http2_tests {
 
     #[test]
     fn test_redirect_constants() {
+        // These are `java.net.http.HttpClient.Redirect` ORDINALS, in the JDK's
+        // declaration order — NEVER, ALWAYS, NORMAL. They used to be 0/2/1,
+        // which disagreed with the `NEVER`/`ALWAYS`/`NORMAL` statics owned by
+        // `phases_late::net_channels`, so `client.followRedirects() ==
+        // HttpClient.Redirect.ALWAYS` compared two different numbers.
         assert_eq!(REDIRECT_NEVER, 0);
-        assert_eq!(REDIRECT_NORMAL, 1);
-        assert_eq!(REDIRECT_ALWAYS, 2);
+        assert_eq!(REDIRECT_ALWAYS, 1);
+        assert_eq!(REDIRECT_NORMAL, 2);
     }
 
     #[test]

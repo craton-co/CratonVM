@@ -1561,8 +1561,11 @@ fn t9_stub_audit_counts_match_census() {
 ///
 /// If you keep a constant, say WHY at the registration site. Every one of the
 /// remaining sites carries such a comment; that is what makes a separate
-/// census document unnecessary. Open gaps behind this surface are tracked in
-/// `docs/known-issues/native-constant-surface-open-items-20260728.md`.
+/// census document unnecessary. The gaps that once sat behind this surface were
+/// all closed on 2026-07-29 and the tracking file retired to
+/// `docs/internal/native-constant-surface-open-items-closed-20260729.md`; the
+/// companion gate `t9c_synthetic_field_tables_cover_their_factories` enforces
+/// the one failure mode among them that kept recurring.
 #[test]
 fn t9b_inline_constant_native_census() {
     let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
@@ -2225,4 +2228,146 @@ fn d15_attach_socket_threaddump_operation() {
     assert!(response.contains("\"main\""));
 
     let _ = &vm;
+}
+
+/// A synthesized class's field table must be at least as wide as its own
+/// factory allocates.
+///
+/// `classloading::synthetic_stub_fields` sizes objects created by bytecode
+/// `new` for classes that have no class file (synthetic-jdk mode, and any class
+/// genuinely absent from the classpath). Natives create the SAME classes through
+/// `alloc_concurrent_synthetic(ctx, name, n)`, which takes `max(n, real)`. When
+/// the table declares fewer slots than `n`, the two shapes disagree: a native
+/// written against the factory shape writes past the end of a `new`-created
+/// object, and `set_field` DISCARDS that write instead of erroring. The native
+/// then looks implemented and stores nothing.
+///
+/// Five separate bugs of exactly this shape were found in two days
+/// (`HttpExchange` 8-vs-9, `HttpServer` 5-vs-6,
+/// `sun/net/httpserver/HttpServerImpl` keyed under the wrong package,
+/// `java/net/DatagramSocket` with no entry at all so its whole phase-72 set
+/// including the ctor's fd write was inert, and `DatagramPacket`/`Preferences`
+/// likewise). The rate is why this is a gate rather than a fix-as-they-surface
+/// habit.
+///
+/// Only LITERAL `alloc_concurrent_synthetic(ctx, "a/b/C", N)` sites count, and
+/// the declared width is read by CALLING the real table function rather than by
+/// parsing its source — the arms use several construction styles and no regex
+/// over them stays honest. Both halves are exact, so a failure here is a real
+/// disagreement, never a scanner artifact.
+///
+/// Rule when this fails: widen the table entry in the SAME change as the native.
+/// Prefer `set_field_by_name` or an ObjectRef-keyed side table over raw slot
+/// indices on a class you do not allocate yourself.
+#[test]
+fn t9c_synthetic_field_tables_cover_their_factories() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    files.sort();
+    assert!(
+        files.len() > 100,
+        "T9C GATE: only found {} .rs files — the walker is broken, not the tree",
+        files.len()
+    );
+
+    // class name -> (largest literal request, where it was made)
+    let mut wanted: std::collections::BTreeMap<String, (usize, String)> =
+        std::collections::BTreeMap::new();
+    for path in &files {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let src = strip_comments(&raw);
+        for (class_name, count) in literal_synthetic_allocations(&src) {
+            let site = format!("{}", path.strip_prefix(root).unwrap_or(path).display());
+            let entry = wanted.entry(class_name).or_insert((0, site.clone()));
+            if count > entry.0 {
+                *entry = (count, site);
+            }
+        }
+    }
+    assert!(
+        wanted.len() > 50,
+        "T9C GATE: only {} literal alloc_concurrent_synthetic sites found — the \
+         scanner is broken, not the tree",
+        wanted.len()
+    );
+
+    let mut short: Vec<String> = Vec::new();
+    for (class_name, (requested, site)) in &wanted {
+        let declared =
+            cratonvm_classloading::synthetic_stub_instance_field_count(class_name);
+        // A class with NO entry declares zero and is not exposed: the table is
+        // consulted only for classes CratonVM synthesizes, and a name with no
+        // arm has no synthesized form for `new` to size. Only a class that HAS
+        // an entry can be too short.
+        if declared == 0 {
+            continue;
+        }
+        if declared < *requested {
+            short.push(format!(
+                "  {class_name}: table declares {declared}, factory asks for \
+                 {requested} ({site})"
+            ));
+        }
+    }
+
+    assert!(
+        short.is_empty(),
+        "T9C GATE: {} synthetic field table(s) are narrower than their own \
+         factory, so every native slot past the declared width is silently \
+         DISCARDED on a bytecode-`new` instance:\n{}",
+        short.len(),
+        short.join("\n")
+    );
+}
+
+/// Every literal `alloc_concurrent_synthetic(ctx, "a/b/C", N)` in `src`.
+///
+/// Literal-only on purpose: resolving a class name through a local `let`
+/// binding gets the answer wrong whenever the binding is reused for a second
+/// class later in the same file, and a gate that reports phantom failures gets
+/// switched off. Sites that pass a variable are simply not checked.
+fn literal_synthetic_allocations(src: &str) -> Vec<(String, usize)> {
+    const NEEDLE: &str = "alloc_concurrent_synthetic(";
+    let mut out = Vec::new();
+    let bytes = src.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find(NEEDLE) {
+        let open = from + rel + NEEDLE.len();
+        from = open;
+        // (ctx, "name", n)
+        let Some(rest) = src.get(open..) else { break };
+        let Some(close_rel) = rest.find(')') else { break };
+        let args = &rest[..close_rel];
+        let mut parts = args.split(',');
+        // The first argument must be exactly `ctx`. Production sites pass the
+        // native's own `&mut dyn NativeContext` parameter, which is always
+        // called `ctx`; the `#[cfg(test)]` fixtures pass `&mut ctx` from a mock
+        // context and allocate shapes that no bytecode `new` can ever produce.
+        // Matching on the receiver spelling keeps the gate on production sites
+        // without needing a `#[cfg(test)]` stripper — the brace matcher that
+        // would take is exactly the one that silently swallowed ~100 real sites
+        // when T9B tried it.
+        if parts.next().map(str::trim) != Some("ctx") {
+            continue;
+        }
+        let Some(name_part) = parts.next() else {
+            continue;
+        };
+        let name_part = name_part.trim();
+        if !(name_part.starts_with('"') && name_part.ends_with('"') && name_part.len() > 2) {
+            continue;
+        }
+        let Some(count_part) = parts.next() else {
+            continue;
+        };
+        let Ok(count) = count_part.trim().parse::<usize>() else {
+            continue;
+        };
+        let _ = bytes;
+        out.push((name_part[1..name_part.len() - 1].to_string(), count));
+    }
+    out
 }

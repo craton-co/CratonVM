@@ -63,6 +63,21 @@ use cratonvm_types::ClassId;
 use cratonvm_types::{ArrayElementType, ObjectKind};
 use cratonvm_types::{ObjectRef, Value};
 
+/// One JFR event field value, in the shapes the recorder's own encoder has.
+///
+/// Deliberately a small independent enum rather than a re-export of
+/// `cratonvm_jfr::EventValue`: `native-api` must not depend on the recorder
+/// crate, and this is the whole vocabulary a native emit site needs. The VM's
+/// `NativeContext` translates it.
+#[derive(Clone, Copy, Debug)]
+pub enum JfrValue<'a> {
+    Bool(bool),
+    Int(i32),
+    Long(i64),
+    Double(f64),
+    Str(&'a str),
+}
+
 /// VM-owned data needed to materialize a truthful JMX `ThreadInfo` object.
 ///
 /// The object references are strong, GC-remapped registry roots for the short
@@ -85,6 +100,23 @@ pub struct ThreadJmxSnapshot {
     pub lock_owner_name: Option<String>,
     pub locked_monitors: Vec<ObjectRef>,
     pub locked_synchronizers: Vec<ObjectRef>,
+    /// `ThreadInfo.getBlockedCount()` — contended `monitorenter`s so far.
+    pub blocked_count: i64,
+    /// `ThreadInfo.getBlockedTime()`, in MILLISECONDS, or `-1` when thread
+    /// contention monitoring is disabled (the sentinel the JMM specifies).
+    pub blocked_time_ms: i64,
+    /// `ThreadInfo.getWaitedCount()` — `Object.wait()` / park episodes.
+    pub waited_count: i64,
+    /// `ThreadInfo.getWaitedTime()`, in MILLISECONDS, or `-1` when disabled.
+    pub waited_time_ms: i64,
+}
+
+impl ThreadJmxSnapshot {
+    /// The `blocked*`/`waited*` defaults for a thread with no counters: zero
+    /// episodes and the "not measured" sentinel for both times.
+    pub fn without_contention_counters() -> (i64, i64, i64, i64) {
+        (0, -1, 0, -1)
+    }
 }
 
 fn value_matches_primitive_array(element_type: ArrayElementType, value: Value) -> bool {
@@ -1103,6 +1135,23 @@ pub trait NativeClassAccess {
     /// JAR/ZIP file. Paths are appended to the application class finder so that
     /// subsequent `ensure_class_initialized` and `find_resource` calls search them.
     fn register_dynamic_classpath(&mut self, paths: &[String]);
+
+    /// Retract paths previously passed to [`Self::register_dynamic_classpath`].
+    ///
+    /// The other half of `URLClassLoader.close()`: a closed loader must stop
+    /// serving classes and resources it has not already loaded. Classes already
+    /// defined stay defined, matching HotSpot — `close()` shuts the loader's
+    /// `URLClassPath`, it does not unload anything.
+    ///
+    /// Returns the number of classpath entries removed. A path handed to more
+    /// than one live loader is only retracted when the last of them releases it,
+    /// so `0` is a normal answer and not an error.
+    ///
+    /// The default is `0` ("this context cannot retract"), which is the
+    /// behaviour every caller had before the VM implementation existed.
+    fn unregister_dynamic_classpath(&mut self, _paths: &[String]) -> usize {
+        0
+    }
 
     /// Append paths to the BOOTSTRAP class search path so their classes load
     /// with the bootstrap loader (null `Class.getClassLoader()`). Drives
@@ -2957,6 +3006,25 @@ pub trait NativeThreadAccess: NativeHeapAccess {
         0
     }
 
+    /// `ThreadMXBean.isThreadContentionMonitoringSupported()`.
+    ///
+    /// True when the VM records blocked/waited durations per thread. The default
+    /// is `false` for a context that keeps no such counters, which is also what
+    /// makes `setThreadContentionMonitoringEnabled` throw from JDK bytecode —
+    /// the JMM's answer for an unsupported optional feature.
+    fn thread_contention_supported(&self) -> bool {
+        false
+    }
+
+    /// `ThreadMXBean.isThreadContentionMonitoringEnabled()`.
+    fn thread_contention_enabled(&self) -> bool {
+        false
+    }
+
+    /// `ThreadMXBean.setThreadContentionMonitoringEnabled(boolean)`. Process
+    /// wide, like the JMM knob it backs. A no-op where it is unsupported.
+    fn set_thread_contention_enabled(&mut self, _enabled: bool) {}
+
     /// Get the Java Thread objects for all alive threads (up to `max` entries).
     /// Returns the number of thread objects written.
     fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef>;
@@ -3663,6 +3731,49 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// Round-4: `reason` is `&'static str` (JEP 491 pin-reason taxonomy:
     /// "Synchronized", "Native", "Thread.sleep while pinned", ...).
     fn emit_virtual_thread_pinned_jfr(&mut self, _reason: &'static str) {}
+
+    /// Is any Flight Recorder recording currently running?
+    ///
+    /// Backs `jdk.jfr.internal.JVM.isRecording()` and lets an emit site skip the
+    /// work of building an event nobody will store.
+    fn jfr_is_recording(&self) -> bool {
+        false
+    }
+
+    /// Start / stop a Flight Recorder recording, as
+    /// `jdk.jfr.internal.JVM.beginRecording()` / `endRecording()` do.
+    ///
+    /// Returns `false` where the context owns no recorder.
+    fn jfr_set_recording(&mut self, _running: bool) -> bool {
+        false
+    }
+
+    /// Emit one event into the VM's Flight Recorder.
+    ///
+    /// This is the door from the native surface into the recorder that did not
+    /// exist before: the whole JFR surface on this trait used to be the single
+    /// hard-coded [`Self::emit_virtual_thread_pinned_jfr`], which is why every
+    /// `jdk.jfr.internal.JVM` entry point that should carry a payload bottomed
+    /// out at a constant.
+    ///
+    /// `event_type` is the JFR event name (e.g. `"jdk.JavaMonitorEnter"`).
+    /// `fields` are name/value pairs; on the FIRST emit of a name the event type
+    /// is registered from the value kinds, and later emits must present the same
+    /// shape (the recorder enforces that, since a mismatched shape corrupts the
+    /// chunk).
+    ///
+    /// Returns whether the event was stored — `false` when nothing is recording,
+    /// the type could not be registered, or the shape did not match.
+    fn jfr_emit(&mut self, _event_type: &str, _fields: &[(&str, JfrValue<'_>)]) -> bool {
+        false
+    }
+
+    /// Intern the current thread's stack trace and return its id, as
+    /// `jdk.jfr.internal.JVM.getStackTraceId` does. `0` means "not interned",
+    /// which is the JDK's own "no such trace" answer.
+    fn jfr_stack_trace_id(&mut self, _skip_frames: i32) -> i64 {
+        0
+    }
 
     // -- VM stats methods (for JMX) --
 

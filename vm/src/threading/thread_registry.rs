@@ -166,6 +166,24 @@ struct ThreadEntry {
     jmx_waiting_monitor: Mutex<Option<ObjectRef>>,
     jmx_locked_monitors: Mutex<Vec<ObjectRef>>,
     jmx_locked_synchronizers: Mutex<Vec<ObjectRef>>,
+    /// JMX contention counters, backing `ThreadInfo.getBlockedCount()` /
+    /// `getBlockedTime()` / `getWaitedCount()` / `getWaitedTime()`.
+    ///
+    /// Counts are always maintained — HotSpot does the same, and they are one
+    /// relaxed add per contended acquisition. The two TIMES only accumulate
+    /// while contention monitoring is switched on
+    /// ([`ThreadRegistry::set_contention_monitoring_enabled`]), which is exactly
+    /// the JMM contract: `getBlockedTime()` reports `-1` until a caller enables
+    /// it, and enabling it is what makes the clock reads worth paying for.
+    ///
+    /// Written only by the owning thread, read by any JMX consumer, so plain
+    /// relaxed atomics rather than a lock: a snapshot that races an in-flight
+    /// acquisition may miss that one interval, which is inherent to sampling a
+    /// running thread and is what HotSpot's own counters do.
+    jmx_blocked_count: std::sync::atomic::AtomicI64,
+    jmx_blocked_time_ns: std::sync::atomic::AtomicI64,
+    jmx_waited_count: std::sync::atomic::AtomicI64,
+    jmx_waited_time_ns: std::sync::atomic::AtomicI64,
     /// T1.5.1 — pending async exception slot. Set by cross-thread
     /// `Thread.stop` / `Thread.stop0` calls; consumed by the target
     /// thread's next `safepoint_check`.
@@ -218,6 +236,25 @@ struct ThreadEntry {
 ///
 /// Tracks spawned threads, their Java Thread objects, join handles, and
 /// liveness. Thread-safe via `parking_lot::Mutex`.
+/// `ThreadMXBean.setThreadContentionMonitoringEnabled(boolean)`.
+///
+/// Process-wide, exactly like the JMM knob it backs, and off at boot — which is
+/// the state HotSpot itself starts in. While it is off the blocked/waited COUNTS
+/// still accumulate (they cost one relaxed add) but the TIMES are neither
+/// measured nor reported: `jmx_contention_counters` hands back `-1`, the
+/// sentinel `ThreadInfo.getBlockedTime()` is specified to return.
+static CONTENTION_MONITORING: AtomicBool = AtomicBool::new(false);
+
+/// Is thread contention monitoring switched on?
+pub fn contention_monitoring_enabled() -> bool {
+    CONTENTION_MONITORING.load(Ordering::Relaxed)
+}
+
+/// `ThreadMXBean.setThreadContentionMonitoringEnabled`.
+pub fn set_contention_monitoring_enabled(enabled: bool) {
+    CONTENTION_MONITORING.store(enabled, Ordering::Relaxed);
+}
+
 pub struct ThreadRegistry {
     /// T10.9.B: FxHashMap — ThreadId is internal.
     ///
@@ -400,6 +437,10 @@ impl ThreadRegistry {
             gc_block_state: Arc::new(GcBlockState::new()),
             jmx_contended_monitor: Mutex::new(None),
             jmx_waiting_monitor: Mutex::new(None),
+            jmx_blocked_count: std::sync::atomic::AtomicI64::new(0),
+            jmx_blocked_time_ns: std::sync::atomic::AtomicI64::new(0),
+            jmx_waited_count: std::sync::atomic::AtomicI64::new(0),
+            jmx_waited_time_ns: std::sync::atomic::AtomicI64::new(0),
             jmx_locked_monitors: Mutex::new(Vec::new()),
             jmx_locked_synchronizers: Mutex::new(Vec::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1145,6 +1186,71 @@ impl ThreadRegistry {
                 .lock()
                 .retain(|o| o.as_ptr() != monitor.as_ptr());
         }
+    }
+
+    /// Record one contended `monitorenter`: `+1` blocked count, and the blocked
+    /// interval when contention monitoring is on.
+    ///
+    /// Call sites are the two contended-acquire paths in `vm_exec` — the same
+    /// two that publish the contended monitor — so `getBlockedCount()` counts
+    /// exactly the acquisitions that had to wait, which is what the JMM
+    /// specifies ("the total number of times that the thread blocked to enter or
+    /// reenter a monitor").
+    pub fn record_jmx_block_started(&self, thread_id: ThreadId) {
+        use std::sync::atomic::Ordering;
+        if let Some(entry) = self.threads.read().get(&thread_id) {
+            entry.jmx_blocked_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Add the blocked interval once the acquisition completes.
+    ///
+    /// Split from the COUNT deliberately: the JMM counts a thread as having
+    /// blocked the moment it starts waiting, and a JMX consumer diagnosing a
+    /// hang reads `getBlockedCount()` while the thread is STILL blocked. Adding
+    /// the count here instead would leave every currently-blocked thread
+    /// reporting zero — which is exactly the case that matters.
+    pub fn record_jmx_block_finished(&self, thread_id: ThreadId, elapsed_ns: Option<u64>) {
+        use std::sync::atomic::Ordering;
+        let Some(ns) = elapsed_ns else { return };
+        if let Some(entry) = self.threads.read().get(&thread_id) {
+            entry
+                .jmx_blocked_time_ns
+                .fetch_add(ns as i64, Ordering::Relaxed);
+        }
+    }
+
+    /// Record one `Object.wait()` / park: `+1` waited count, plus the interval
+    /// when contention monitoring is on.
+    pub fn record_jmx_waited(&self, thread_id: ThreadId, elapsed_ns: Option<u64>) {
+        use std::sync::atomic::Ordering;
+        if let Some(entry) = self.threads.read().get(&thread_id) {
+            entry.jmx_waited_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(ns) = elapsed_ns {
+                entry
+                    .jmx_waited_time_ns
+                    .fetch_add(ns as i64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// `(blockedCount, blockedTimeMs, waitedCount, waitedTimeMs)` for one
+    /// thread, with `-1` for either time while contention monitoring is off —
+    /// the sentinel `ThreadInfo.getBlockedTime()` is specified to return then.
+    pub fn jmx_contention_counters(&self, thread_id: ThreadId) -> (i64, i64, i64, i64) {
+        use std::sync::atomic::Ordering;
+        let threads = self.threads.read();
+        let Some(entry) = threads.get(&thread_id) else {
+            return (0, -1, 0, -1);
+        };
+        let timing = contention_monitoring_enabled();
+        let ms = |ns: i64| if timing { ns / 1_000_000 } else { -1 };
+        (
+            entry.jmx_blocked_count.load(Ordering::Relaxed),
+            ms(entry.jmx_blocked_time_ns.load(Ordering::Relaxed)),
+            entry.jmx_waited_count.load(Ordering::Relaxed),
+            ms(entry.jmx_waited_time_ns.load(Ordering::Relaxed)),
+        )
     }
 
     pub fn set_jmx_waiting_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
