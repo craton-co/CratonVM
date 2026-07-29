@@ -17941,6 +17941,12 @@ pub fn register_essential_natives_with_shims(
     // phases. See `native-builtins/src/net_phase_e.rs`.
     net_phase_e::register_phase_e_networking(registry);
 
+    // Real-JDK JDBC metadata and StackFrame descriptor consumers are not part
+    // of the synthetic phase overlay; register their compatible bridges here.
+    crate::phases_late::jdbc::register_p68_jdbc(registry);
+    crate::phases_late::reflect_invoke::register_real_jdk_stackwalker_frame_method_type(registry);
+    crate::phases_late::charset_buffers::register_real_jdk_charset_contains(registry);
+    crate::phases_late::nio_file::register_real_jdk_files_owner(registry);
     // CGLIB / Spring `ConfigurationClassEnhancer.enhance` minimal bytecode
     // emitter. Registered AFTER `net_phase_e::register_phase_e_networking`
     // so the real emitter at `cglib_enhancer.rs` overrides the older
@@ -18150,6 +18156,14 @@ pub fn register_essential_natives_with_shims(
         "getURLs",
         "()[Ljava/net/URL;",
         classloader::ucl_get_urls,
+    );
+    // Real URLClassLoader.close() must set the same receiver-local state
+    // consulted by findClass/findResource/findResources.
+    registry.register(
+        "java/net/URLClassLoader",
+        "close",
+        "()V",
+        classloader::ucl_close,
     );
     // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
     // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
@@ -23324,6 +23338,10 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Phase 72: Preferences, Beans, JNDI, Datagram, HttpServer, ServerSocket extras ---
     register_phase72_natives(registry);
+    // Phase 72's raw-slot DatagramSocket overlay is synthetic-only. Reassert
+    // the moving-GC-safe side-table implementation afterwards so it is the
+    // final owner of every overlapping native key.
+    net_phase_e::register_re7_datagram_socket(registry);
 
     // --- NEW-15: Virtual threads / Loom (JEP 444 / 491) ---
     // Continuation, ContinuationScope, ForkJoinPool.commonPool.

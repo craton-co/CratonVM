@@ -33,6 +33,35 @@ fn local_url_class_path_cache(
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+// Real JDK URLClassLoader instances have the JDK's own object layout, so the
+// synthetic UCL_CLOSED slot is not available there. Identity hashes survive a
+// moving collection and do not keep the loader alive; use one to carry the
+// close state for both layout families.
+fn closed_url_classloader_ids() -> &'static Mutex<std::collections::HashSet<i32>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashSet<i32>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+pub(crate) fn ucl_is_closed(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
+    closed_url_classloader_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&ctx.identity_hash_code(loader))
+}
+
+fn ucl_mark_open(ctx: &dyn NativeContext, loader: ObjectRef) {
+    closed_url_classloader_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&ctx.identity_hash_code(loader));
+}
+fn ucl_mark_closed(ctx: &dyn NativeContext, loader: ObjectRef) {
+    closed_url_classloader_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(ctx.identity_hash_code(loader));
+}
+
 fn cached_local_url_class_path(paths: &[String]) -> Arc<cratonvm_classloading::ClassPath> {
     if let Some(existing) = local_url_class_path_cache()
         .lock()
@@ -95,6 +124,10 @@ pub fn reset_loader_singletons() {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
     *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
+    closed_url_classloader_ids()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     class_data_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -5301,6 +5334,7 @@ fn ucl_setup(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value, parent: 
     ctx.set_field(this, UCL_LOADER_TYPE, Value::Int(LOADER_CUSTOM));
     ctx.set_field(this, UCL_PARENT_REF, parent);
     ctx.set_field(this, UCL_CLOSED, Value::Int(0));
+    ucl_mark_open(ctx, this);
 
     let url_arr = match urls {
         Value::Object(Some(arr)) => arr,
@@ -5421,6 +5455,24 @@ fn ucl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // loadClass and calls `super.findClass`/`findClass` from inside that
     // override would otherwise recurse back into its own loadClass.
     let this = obj_arg(args, 0)?;
+    if ucl_is_closed(ctx, this) {
+        let name = args
+            .get(1)
+            .and_then(|value| match value {
+                Value::Object(Some(name)) => ctx.read_string(*name),
+                _ => None,
+            })
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        let exception = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exception,
+        ));
+    }
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -5996,8 +6048,10 @@ fn loader_has_recorded_url_set(ctx: &mut dyn NativeContext, loader: ObjectRef) -
     if !is_url_loader {
         return false;
     }
-    matches!(ctx.get_field(loader, UCL_URLS_ARRAY), Value::Object(Some(_)))
-        || matches!(ctx.get_field_by_name(loader, "ucp"), Value::Object(Some(_)))
+    matches!(
+        ctx.get_field(loader, UCL_URLS_ARRAY),
+        Value::Object(Some(_))
+    ) || matches!(ctx.get_field_by_name(loader, "ucp"), Value::Object(Some(_)))
 }
 
 /// Is a package with class files under `class_glob` (e.g.
@@ -6031,7 +6085,9 @@ pub(crate) fn package_class_files_visible_to_loader(
     };
     let is_builtin = ctx
         .class_name_of_id(ctx.class_id_of_object(loader))
-        .is_some_and(|n| n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$"));
+        .is_some_and(|n| {
+            n.starts_with("jdk/internal/loader/") || n.starts_with("sun/misc/Launcher$")
+        });
     if is_builtin {
         return !ctx.find_all_resource_urls(class_glob).is_empty();
     }
@@ -6439,6 +6495,11 @@ pub(crate) fn ucp_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 }
 
 pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if ucl_is_closed(ctx, this) {
+            return Ok(Some(Value::Object(None)));
+        }
+    }
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
@@ -6578,6 +6639,12 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(o))) => o,
         _ => return cl_get_resources_impl(ctx, args, false),
     };
+    // `close()` makes this loader incapable of discovering any further
+    // resources. Do this before the shared flat-classpath scan: consulting
+    // that scan after close leaks resources from unrelated live loaders.
+    if ucl_is_closed(ctx, this) {
+        return Ok(Some(Value::Object(Some(empty_enumeration_impl(ctx)))));
+    }
     let name = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => return cl_get_resources_impl(ctx, args, false),
@@ -6685,11 +6752,7 @@ fn ucl_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let this = obj_arg(args, 0)?;
 
     // Check if closed
-    let closed = match ctx.get_field(this, UCL_CLOSED) {
-        Value::Int(v) => v != 0,
-        _ => false,
-    };
-    if closed {
+    if ucl_is_closed(ctx, this) {
         tracing::warn!("URLClassLoader.addURL called on closed loader");
         return Ok(None);
     }
@@ -6738,9 +6801,12 @@ fn ucl_add_url(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     Ok(None)
 }
 
-fn ucl_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn ucl_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    ctx.set_field(this, UCL_CLOSED, Value::Int(1));
+    // The identity-keyed state is authoritative for both synthetic and real
+    // URLClassLoader layouts. Writing synthetic slot 3 on a real JDK object
+    // would instead corrupt an implementation-private field.
+    ucl_mark_closed(ctx, this);
     Ok(None)
 }
 

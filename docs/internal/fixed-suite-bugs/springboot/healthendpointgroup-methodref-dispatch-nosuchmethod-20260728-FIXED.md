@@ -1,6 +1,31 @@
-# `HealthEndpointGroup::getAdditionalPath` method-reference lambda dispatches against erased `Object`, not the real target type
+# `HealthEndpointGroup::getAdditionalPath` method-reference lambda dispatches against erased `Object`, not the real target type — FIXED
 
-**Status: OPEN — found 2026-07-28**
+> Retired 2026-07-29. The original report does not reproduce on current `dev`; the status below records the completed current-revision verification.
+
+## Retirement evidence
+
+An isolated current-`origin/dev` CratonVM build
+`cratonvm-healthendpoint-methodref-20260729-019faf00.exe`
+(SHA-256 `BE6C4875C59A3F523AAAA76430F45A5236573DD62D377D12C7056712EFFD94E8`)
+was tested against a complete local Spring Boot fixture. The supplied
+`C:\craton\CratonVM\apps\spring-boot` fixture has an obsolete July 11 module
+classpath and lacks `build-plugin/spring-boot-antlib`, so it could not load
+`AutoConfigurations` or refresh the classpath. The equivalent verified fixture
+was `C:\craton\CratonVM-spring-boot-residual-20260728\apps\spring-boot`.
+
+| VM / mode | Full-class result | Evidence |
+|---|---:|---|
+| CratonVM JIT, run 1 | 10/10 | `SBRUNNER_RESULT tests=10 failed=0 aborted=0 skipped=0 containersFailed=0` (209.046s) |
+| CratonVM `--nojit` | 10/10 | `SBRUNNER_RESULT tests=10 failed=0 aborted=0 skipped=0 containersFailed=0` (186.504s) |
+| CratonVM JIT, independent run 2 | 10/10 | `SBRUNNER_RESULT tests=10 failed=0 aborted=0 skipped=0 containersFailed=0` (193.329s) |
+| HotSpot JIT control | 10/10 | `SBRUNNER_RESULT tests=10 failed=0 aborted=0 skipped=0 containersFailed=0` (13.643s) |
+
+Both CratonVM JIT runs exercised `withAdditionalPathsOnSamePort` as part of
+the ten-test class and emitted no `NoSuchMethodError`. The repeated JIT pass
+and the interpreter pass refute an active JIT/indy residual at this revision;
+no new VM source change was required.
+
+**Status: RETIRED — verified current-`dev` behavior on 2026-07-29**
 
 ## Symptom
 
