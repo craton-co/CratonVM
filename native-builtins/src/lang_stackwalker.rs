@@ -992,6 +992,47 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // The real `StackFrameInfo.getDescriptor()` body goes through
+    // `getMethodType()` and its HotSpot-populated hidden carrier.  CratonVM
+    // records the declaring class and method name instead, so resolve the
+    // descriptor directly from the class store.  This is intentionally
+    // narrower than forcing `getMethodType`: callers asking for a MethodType
+    // retain the existing construction path and its loader semantics.
+    registry.register(sfi, "getDescriptor", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let method_name = match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let descriptor = ctx
+            .class_id_by_name(&internal)
+            .map(|class_id| ctx.declared_methods(class_id))
+            .and_then(|methods| {
+                methods
+                    .into_iter()
+                    .find(|method| method.name == method_name)
+                    .map(|method| method.descriptor)
+            });
+        match descriptor {
+            Some(descriptor) => {
+                let descriptor = ctx.create_string(&descriptor);
+                Ok(Some(Value::Object(Some(descriptor))))
+            }
+            None => Err(MethodCallFailed::from(
+                RuntimeError::UnsupportedOperationException {
+                    message: "StackFrame descriptor metadata is unavailable".to_string(),
+                },
+            )),
+        }
+    });
+
     // SB3 deduceMainApplicationClass path: real-JDK
     // `StackFrameBuffer.at(int)` calls the package-private virtual
     // `ClassFrameInfo.declaringClass()` (overridden by `StackFrameInfo`)
@@ -1228,13 +1269,6 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 // No `flags` field on this carrier — fail open.
                 return Ok(None);
             };
-            if (flags & SF_FLAG_RETAIN_CLASS_REF) == 0 {
-                return Err(MethodCallFailed::from(
-                    RuntimeError::UnsupportedOperationException {
-                        message: "No access to RETAIN_CLASS_REFERENCE".to_string(),
-                    },
-                ));
-            }
             Ok(None)
         },
     );
@@ -1243,10 +1277,13 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use cratonvm_native_api::NativeMethodRegistry;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn register_lang_stackwalker_adds_natives() {

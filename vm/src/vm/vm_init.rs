@@ -1342,6 +1342,12 @@ impl SharedVm {
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
                 cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
+                // MUST follow `register_concurrent_natives`: that call registers
+                // the old constant `ForkJoinPool.awaitQuiescence` -> true, and
+                // registration is last-write-wins. The real one polls this
+                // crate's async worker pool, which `native-collections` cannot
+                // see.
+                cratonvm_native_builtins::register_forkjoin_quiescence(&mut native_methods);
                 cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
                 // java.util.logging.FileHandler's natives are registered
                 // (as part of register_p61_logging) only under
@@ -1355,6 +1361,12 @@ impl SharedVm {
                 // file). Register just the FileHandler natives directly here.
                 // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
                 cratonvm_native_builtins::phases_late::register_p61_file_handler(
+                    &mut native_methods,
+                );
+                // `URLClassLoader.close()` likewise: the synthetic-only versions
+                // are written for the synthetic carrier's slots and cannot run
+                // against a real `java.net.URLClassLoader`.
+                cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
                     &mut native_methods,
                 );
 
@@ -1774,6 +1786,12 @@ impl SharedVm {
             // above. Real-JDK apps still need ReentrantLock / Condition / LBQ
             // drainTo natives (SLF4J replayEvents, Spring thread pools).
             cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
+                // MUST follow `register_concurrent_natives`: that call registers
+                // the old constant `ForkJoinPool.awaitQuiescence` -> true, and
+                // registration is last-write-wins. The real one polls this
+                // crate's async worker pool, which `native-collections` cannot
+                // see.
+                cratonvm_native_builtins::register_forkjoin_quiescence(&mut native_methods);
             cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
             // java.util.logging.FileHandler's natives are registered
             // (as part of register_p61_logging) only under
@@ -1787,6 +1805,10 @@ impl SharedVm {
             // file). Register just the FileHandler natives directly here.
             // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
             cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
+            // See the twin above.
+            cratonvm_native_builtins::servlet::register_url_classloader_close_bridge(
+                &mut native_methods,
+            );
 
             fn real_jdk_lbq_drain_to_bounded(
                 ctx: &mut dyn cratonvm_native_api::NativeContext,
@@ -2861,6 +2883,9 @@ impl SharedVm {
                 missing_natives_log: parking_lot::Mutex::new(Vec::new()),
                 flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
                 jfr_dump_on_exit: parking_lot::Mutex::new(None),
+                jfr_java_recording: parking_lot::Mutex::new(None),
+                jfr_java_recording_running: std::sync::atomic::AtomicBool::new(false),
+                jfr_java_output: parking_lot::Mutex::new(None),
                 jcmd_processor: parking_lot::Mutex::new(None),
                 #[cfg(feature = "experimental-debug")]
                 debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),

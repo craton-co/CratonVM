@@ -580,6 +580,17 @@ pub(crate) struct DsSide {
     pub closed: i32,  // 0 = open, 1 = closed (was DS_CLOSED)
     pub timeout: i32, // SO_TIMEOUT ms (was DS_TIMEOUT)
     pub fd: i32,      // udp fd handle; -1 = closed/unset (was DS_FD)
+    /// SO_BROADCAST as last requested through `setBroadcast`. Pushed to the
+    /// real UDP fd too, but `FileDescriptorTable` exposes no read-back, so the
+    /// getter answers from here. `-1` = never set, which reads back as the
+    /// JDK's default of `false`.
+    pub broadcast: i32,
+    /// 1 once `connect()` has associated the socket with a peer, 0 after
+    /// `disconnect()`. Tracked here rather than derived from the OS because
+    /// `isConnected()` must keep answering after the peer goes away, which is
+    /// what the JDK specifies ("this method will continue to return true after
+    /// the socket is closed").
+    pub connected: i32,
     /// SO_REUSEADDR as last requested through `setReuseAddress`. The option is
     /// pushed to the real UDP fd as well, but `FileDescriptorTable` exposes no
     /// read-back for it, so the getter answers from here. `-1` = never set.
@@ -670,6 +681,8 @@ fn ds_default() -> DsSide {
         closed: 0,
         timeout: 0,
         fd: -1,
+        broadcast: -1,
+        connected: 0,
         reuse_address: -1,
     }
 }
@@ -1668,6 +1681,38 @@ fn alloc_inet_address(ctx: &mut dyn NativeContext, host: &str, ip: &str) -> Obje
     // shape instead of dereferencing a null `holder`.
     populate_inet_holder(ctx, ia, host, ip);
     ia
+}
+
+/// `InetAddress.getByAddress(byte[])` — construct a concrete, layout-correct
+/// address mirror from exactly four or sixteen raw octets.
+///
+/// Keep this as the sole implementation and registration of the one-argument
+/// factory. In particular, IPv6 must pass through [`alloc_inet_address`],
+/// which applies HotSpot's uncompressed eight-group text representation.
+fn native_inet_get_by_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let arr = obj_arg(args, 0)?;
+    let len = ctx.array_length(arr);
+    let ip_str = if len == 4 {
+        let b = java_byte_array_to_vec(ctx, arr, 0, 4)?;
+        Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()
+    } else if len == 16 {
+        let b = java_byte_array_to_vec(ctx, arr, 0, 16)?;
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&b);
+        Ipv6Addr::from(octets).to_string()
+    } else {
+        return Err(iae(format!("addr is of illegal length: {len}")));
+    };
+    // `getByAddress` has no separately supplied hostname. Use the same
+    // HotSpot-normalized numeric text for both logical fields; otherwise a
+    // caller that reads the host-side value (such as Jetty's connector setup)
+    // can still observe Rust's RFC-5952-compressed IPv6 form.
+    let ip_text = hotspot_ip_string(&ip_str);
+    let obj = alloc_inet_address(ctx, &ip_text, &ip_text);
+    Ok(Some(Value::Object(Some(obj))))
 }
 
 fn alloc_inet_socket_address(ctx: &mut dyn NativeContext, host: &str, port: i32) -> ObjectRef {
@@ -3762,6 +3807,72 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
+    // setOption / getOption — the `jdk.net.ExtendedSocketOptions` keepalive
+    // family, served HERE because this registrar owns the socket.
+    //
+    // `native-io`'s `jdk/net/*SocketOptions` natives are reached (proved: the
+    // refusal used to carry CratonVM's own message rather than the JDK's) and
+    // then cannot resolve the handle id, because a plain `java.net.Socket`'s
+    // `TcpStream` lives in `servlet::s2_registry().streams` — a
+    // `native-builtins` registry that crate cannot see. Same resolution as
+    // `DatagramSocket.setOption`: put the option surface where the socket is.
+    //
+    // Dispatch is by `SocketOption.name()`, so one arm serves whichever constant
+    // object the caller passes. An option this registrar cannot serve is named
+    // in the exception rather than silently accepted.
+    r.register(
+        sock,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/Socket;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = ds_socket_option_name(ctx, args.get(1).copied());
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            let Some((level, opt)) = sock_option_level_and_name(&name) else {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("Socket.setOption: {name} is not supported"),
+                }
+                .into());
+            };
+            let Some(fd) = sock_raw_descriptor(ctx, this) else {
+                return Err(ioex("Socket.setOption: socket is not connected"));
+            };
+            let raw = ds_unbox_int(ctx, value);
+            sock_set_option_int(fd, level, opt, raw).map_err(|e| ioex(format!("{name}: {e}")))?;
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        sock,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = ds_socket_option_name(ctx, args.get(1).copied());
+            let Some((level, opt)) = sock_option_level_and_name(&name) else {
+                return Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("Socket.getOption: {name} is not supported"),
+                }
+                .into());
+            };
+            let Some(fd) = sock_raw_descriptor(ctx, this) else {
+                return Err(ioex("Socket.getOption: socket is not connected"));
+            };
+            let Some(raw) = sock_get_option_int(fd, level, opt) else {
+                return Err(ioex(format!("{name}: option is not readable")));
+            };
+            if name == "SO_KEEPALIVE" {
+                return ctx.invoke(
+                    "java/lang/Boolean",
+                    "valueOf",
+                    "(Z)Ljava/lang/Boolean;",
+                    &[Value::Int(i32::from(raw != 0))],
+                );
+            }
+            ds_box_int(ctx, raw)
+        },
+    );
+
     r.register(sock, "isConnected", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let s = sock_get(ctx, this);
@@ -5040,23 +5151,7 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
         ia,
         "getByAddress",
         "([B)Ljava/net/InetAddress;",
-        |ctx, args| {
-            let arr = obj_arg(args, 0)?;
-            let len = ctx.array_length(arr);
-            let ip_str = if len == 4 {
-                let b = java_byte_array_to_vec(ctx, arr, 0, 4)?;
-                Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string()
-            } else if len == 16 {
-                let b = java_byte_array_to_vec(ctx, arr, 0, 16)?;
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&b);
-                Ipv6Addr::from(octets).to_string()
-            } else {
-                return Err(iae(format!("addr is of illegal length: {len}")));
-            };
-            let obj = alloc_inet_address(ctx, &ip_str, &ip_str);
-            Ok(Some(Value::Object(Some(obj))))
-        },
+        native_inet_get_by_address,
     );
 
     // `equals`, `hashCode`, `toString` — registered for `InetAddress` and
@@ -11339,7 +11434,348 @@ const DP_LENGTH: usize = 1;
 const DP_ADDR: usize = 2;
 const DP_PORT: usize = 3;
 
-fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
+/// The raw OS descriptor of a `java.net.Socket`'s connected stream.
+///
+/// The stream lives in `servlet::s2_registry().streams`, keyed by the id in
+/// `SockSide::stream_id`. `native-io`'s extended-option bridge cannot reach it
+/// (wrong crate, and it has no `NativeContext`), which is why
+/// `Socket.setOption(TCP_KEEPIDLE, ..)` resolved to nothing there and fell
+/// through to a UDP-only accessor.
+fn sock_raw_descriptor(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<SockRawFd> {
+    let id = sock_get(ctx, this).stream_id;
+    if id < 0 {
+        return None;
+    }
+    let stream = crate::servlet::s2_registry().lock().streams.get(&id).cloned()?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        Some(stream.as_raw_fd())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        Some(stream.as_raw_socket() as usize)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+#[cfg(unix)]
+type SockRawFd = std::os::fd::RawFd;
+#[cfg(windows)]
+type SockRawFd = usize;
+#[cfg(not(any(unix, windows)))]
+type SockRawFd = i32;
+
+/// `(level, optname)` for the socket options this registrar can serve, or `None`
+/// for one it cannot.
+///
+/// Numbering is per-platform on purpose: `TCP_KEEPIDLE` is 4 on Linux and 3 on
+/// Windows (where it is an alias of the older `TCP_KEEPALIVE`), and getting that
+/// wrong writes a real value into a different option.
+fn sock_option_level_and_name(name: &str) -> Option<(i32, i32)> {
+    #[cfg(target_os = "linux")]
+    {
+        const SOL_SOCKET: i32 = 1;
+        const IPPROTO_TCP: i32 = 6;
+        const SO_KEEPALIVE: i32 = 9;
+        const TCP_KEEPIDLE: i32 = 4;
+        const TCP_KEEPINTVL: i32 = 5;
+        const TCP_KEEPCNT: i32 = 6;
+        return Some(match name {
+            "SO_KEEPALIVE" => (SOL_SOCKET, SO_KEEPALIVE),
+            "TCP_KEEPIDLE" => (IPPROTO_TCP, TCP_KEEPIDLE),
+            "TCP_KEEPINTERVAL" => (IPPROTO_TCP, TCP_KEEPINTVL),
+            "TCP_KEEPCOUNT" => (IPPROTO_TCP, TCP_KEEPCNT),
+            _ => return None,
+        });
+    }
+    #[cfg(windows)]
+    {
+        const SOL_SOCKET: i32 = 0xffff;
+        const IPPROTO_TCP: i32 = 6;
+        const SO_KEEPALIVE: i32 = 0x0008;
+        const TCP_KEEPIDLE: i32 = 3;
+        const TCP_KEEPCNT: i32 = 16;
+        const TCP_KEEPINTVL: i32 = 17;
+        return Some(match name {
+            "SO_KEEPALIVE" => (SOL_SOCKET, SO_KEEPALIVE),
+            "TCP_KEEPIDLE" => (IPPROTO_TCP, TCP_KEEPIDLE),
+            "TCP_KEEPINTERVAL" => (IPPROTO_TCP, TCP_KEEPINTVL),
+            "TCP_KEEPCOUNT" => (IPPROTO_TCP, TCP_KEEPCNT),
+            _ => return None,
+        });
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = name;
+        None
+    }
+}
+
+#[allow(unused_variables)]
+fn sock_set_option_int(fd: SockRawFd, level: i32, name: i32, value: i32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let value: libc::c_int = value;
+        // SAFETY: `value` outlives the call and `fd` is a live descriptor owned
+        // by the stream the registry still holds.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&value as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        ws2_set_int(fd, level, name, value)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "socket options",
+        ))
+    }
+}
+
+#[allow(unused_variables)]
+fn sock_get_option_int(fd: SockRawFd, level: i32, name: i32) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid out-pointer pair for an int-sized option on a live fd.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                (&mut value as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        (rc == 0).then_some(value)
+    }
+    #[cfg(windows)]
+    {
+        ws2_get_int(fd, level, name)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// The `name()` of a `java.net.SocketOption` argument.
+///
+/// Every `StandardSocketOptions` / `ExtendedSocketOptions` constant carries its
+/// JDK name, so dispatching on it serves whichever constant object a caller
+/// passes without this file needing to know their identities.
+fn ds_socket_option_name(ctx: &mut dyn NativeContext, arg: Option<Value>) -> String {
+    let Some(Value::Object(Some(opt))) = arg else {
+        return String::new();
+    };
+    match ctx.invoke_virtual(opt, "name", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => match ctx.get_field_by_name(opt, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        },
+    }
+}
+
+/// Unwrap a `setOption` value that arrives either as a raw int or as a boxed
+/// `Boolean`/`Integer`.
+fn ds_unbox_bool(ctx: &mut dyn NativeContext, v: Value) -> bool {
+    match v {
+        Value::Int(i) => i != 0,
+        Value::Object(Some(o)) => {
+            matches!(ctx.get_field_by_name(o, "value"), Value::Int(i) if i != 0)
+        }
+        _ => false,
+    }
+}
+
+fn ds_unbox_int(ctx: &mut dyn NativeContext, v: Value) -> i32 {
+    match v {
+        Value::Int(i) => i,
+        Value::Object(Some(o)) => ctx.get_field_by_name(o, "value").as_int().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn ds_box_bool(ctx: &mut dyn NativeContext, b: bool) -> MethodCallResult {
+    ctx.invoke(
+        "java/lang/Boolean",
+        "valueOf",
+        "(Z)Ljava/lang/Boolean;",
+        &[Value::Int(i32::from(b))],
+    )
+}
+
+fn ds_box_int(ctx: &mut dyn NativeContext, n: i32) -> MethodCallResult {
+    ctx.invoke(
+        "java/lang/Integer",
+        "valueOf",
+        "(I)Ljava/lang/Integer;",
+        &[Value::Int(n)],
+    )
+}
+
+/// `IP_DONTFRAGMENT` on a UDP fd. Windows has a boolean option; Linux expresses
+/// the same thing as the tri-state `IP_MTU_DISCOVER` -- the identical mapping
+/// the `jdk/net/*SocketOptions` bridge in `native-io` applies for the fd form.
+#[allow(unused_variables)]
+fn ds_set_dont_fragment(
+    ctx: &mut dyn NativeContext,
+    fd: i32,
+    on: bool,
+) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let Some(raw) = ctx.fd_table().udp_raw_fd(fd as u32) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no raw fd"));
+        };
+        // linux/in.h: IP_MTU_DISCOVER = 10, IP_PMTUDISC_DO = 2, _DONT = 0.
+        let value: libc::c_int = if on { 2 } else { 0 };
+        // SAFETY: `value` outlives the call and `raw` is a live descriptor
+        // owned by the fd table for its duration.
+        let rc = unsafe {
+            libc::setsockopt(
+                raw,
+                libc::IPPROTO_IP,
+                10,
+                (&value as *const libc::c_int).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(windows)]
+    {
+        let Some(raw) = ctx.fd_table().udp_raw_socket(fd as u32) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no raw socket",
+            ));
+        };
+        // ws2ipdef.h: IPPROTO_IP = 0, IP_DONTFRAGMENT = 14.
+        ws2_set_int(raw as usize, 0, 14, i32::from(on))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "IP_DONTFRAGMENT",
+        ))
+    }
+}
+
+#[allow(unused_variables)]
+fn ds_get_dont_fragment(ctx: &mut dyn NativeContext, fd: i32) -> bool {
+    #[cfg(unix)]
+    {
+        let Some(raw) = ctx.fd_table().udp_raw_fd(fd as u32) else {
+            return false;
+        };
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid out-pointer pair for an int-sized option on a live fd.
+        let rc = unsafe {
+            libc::getsockopt(
+                raw,
+                libc::IPPROTO_IP,
+                10,
+                (&mut value as *mut libc::c_int).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        rc == 0 && value == 2
+    }
+    #[cfg(windows)]
+    {
+        let Some(raw) = ctx.fd_table().udp_raw_socket(fd as u32) else {
+            return false;
+        };
+        ws2_get_int(raw as usize, 0, 14)
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
+/// Winsock `setsockopt` for an int option, declared by hand for the same reason
+/// `fd_table.rs` and `servlet.rs` do it: `libc` is `cfg(unix)`-shaped for these
+/// calls and this crate carries no Windows-specific crate.
+#[cfg(windows)]
+fn ws2_set_int(s: usize, level: i32, name: i32, value: i32) -> Result<(), std::io::Error> {
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+    // SAFETY: `value` outlives the call and `s` is a live SOCKET owned by the
+    // fd table for its duration.
+    let rc = unsafe {
+        setsockopt(
+            s,
+            level,
+            name,
+            (&value as *const i32).cast::<u8>(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        // SAFETY: plain Winsock error read, no pointers involved.
+        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+    }
+}
+
+#[cfg(windows)]
+fn ws2_get_int(s: usize, level: i32, name: i32) -> Option<i32> {
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn getsockopt(s: usize, level: i32, optname: i32, optval: *mut u8, optlen: *mut i32) -> i32;
+    }
+    let mut value: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as i32;
+    // SAFETY: valid out-pointer pair for an int-sized option on a live SOCKET.
+    let rc = unsafe {
+        getsockopt(
+            s,
+            level,
+            name,
+            (&mut value as *mut i32).cast::<u8>(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(value)
+}
+
+pub(crate) fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     let ds = "java/net/DatagramSocket";
 
     r.register(ds, "<init>", "()V", |ctx, args| {
@@ -11411,6 +11847,249 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         });
         Ok(None)
     });
+
+    // setOption / getOption.
+    //
+    // `java.net.DatagramSocket.setOption` is `delegate().setOption(..)`, and a
+    // CratonVM datagram socket has no delegate, so every call landed in the
+    // JDK InternalError("Should not get here") -- including
+    // `setOption(IP_DONTFRAGMENT, ..)`, which is the ONE extended option not
+    // gated by a native support probe and therefore the one applications
+    // actually reach. Implementing the option surface here is what makes the
+    // `jdk/net/*SocketOptions` family reachable from a DatagramSocket at all.
+    //
+    // Dispatch is by `SocketOption.name()`, the JDK own identity for these
+    // (both `StandardSocketOptions` and `ExtendedSocketOptions` name them), so
+    // one arm serves whichever constant object the caller passes.
+    r.register(
+        ds,
+        "setOption",
+        "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/net/DatagramSocket;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = ds_socket_option_name(ctx, args.get(1).copied());
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            let fd = ds_get(this).fd;
+            if fd < 0 {
+                return Err(ioex("DatagramSocket: closed"));
+            }
+            let on = ds_unbox_bool(ctx, value);
+            let n = ds_unbox_int(ctx, value);
+            let outcome = match name.as_str() {
+                "IP_DONTFRAGMENT" => ds_set_dont_fragment(ctx, fd, on),
+                "SO_BROADCAST" => {
+                    let r = ctx.fd_table().udp_set_broadcast(fd as u32, on);
+                    if r.is_ok() {
+                        ds_set(this, |sd| sd.broadcast = i32::from(on));
+                    }
+                    r
+                }
+                "SO_REUSEADDR" => {
+                    let r = ctx.fd_table().udp_set_reuse_address(fd as u32, on);
+                    if r.is_ok() {
+                        ds_set(this, |sd| sd.reuse_address = i32::from(on));
+                    }
+                    r
+                }
+                "SO_RCVBUF" => ctx
+                    .fd_table()
+                    .udp_set_recv_buffer_size(fd as u32, n.max(0) as usize),
+                "SO_SNDBUF" => ctx
+                    .fd_table()
+                    .udp_set_send_buffer_size(fd as u32, n.max(0) as usize),
+                "IP_TOS" => ctx.fd_table().udp_set_tos(fd as u32, n.max(0) as u32),
+                "IP_MULTICAST_TTL" => ctx
+                    .fd_table()
+                    .udp_set_multicast_ttl_v4(fd as u32, n.max(0) as u32),
+                _ => {
+                    // The JDK throws for an option its provider does not
+                    // support; naming it is what lets a caller tell that from
+                    // a failure to apply one we do support.
+                    return Err(RuntimeError::UnsupportedOperationException {
+                        message: format!("DatagramSocket.setOption: {name} is not supported"),
+                    }
+                    .into());
+                }
+            };
+            outcome.map_err(|e| ioex(format!("{name}: {e}")))?;
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    r.register(
+        ds,
+        "getOption",
+        "(Ljava/net/SocketOption;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = ds_socket_option_name(ctx, args.get(1).copied());
+            let sd = ds_get(this);
+            if sd.fd < 0 {
+                return Err(ioex("DatagramSocket: closed"));
+            }
+            match name.as_str() {
+                "IP_DONTFRAGMENT" => {
+                    let on = ds_get_dont_fragment(ctx, sd.fd);
+                    ds_box_bool(ctx, on)
+                }
+                "SO_BROADCAST" => ds_box_bool(ctx, sd.broadcast == 1),
+                "SO_REUSEADDR" => ds_box_bool(ctx, sd.reuse_address == 1),
+                "SO_TIMEOUT" => ds_box_int(ctx, sd.timeout),
+                _ => Err(RuntimeError::UnsupportedOperationException {
+                    message: format!("DatagramSocket.getOption: {name} is not supported"),
+                }
+                .into()),
+            }
+        },
+    );
+
+    // isBound / getLocalAddress / setBroadcast / getBroadcast — the four keys
+    // the phase-72 `java/net/DatagramSocket` set owned alone. They are here now
+    // so this registrar covers the whole class in BOTH builds: phase-72 is
+    // `#[cfg(feature = "synthetic-jdk")]`, so in the default build these four
+    // did not exist at all and resolved to the abstract declaration.
+    r.register(ds, "isBound", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sd = ds_get(this);
+        // A `DatagramSocket` is bound from construction: every ctor here opens
+        // and binds a real UDP fd. It stays bound after close, which is what
+        // the JDK specifies.
+        Ok(Some(Value::Int(i32::from(sd.fd >= 0 || sd.closed != 0))))
+    });
+    r.register(
+        ds,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sd = ds_get(this);
+            if sd.closed != 0 || sd.fd < 0 {
+                // "If the socket is closed, returns null" — and an unbound
+                // socket answers the wildcard, which is what the fd reports.
+                return Ok(Some(Value::Object(None)));
+            }
+            let addr = ctx
+                .fd_table()
+                .udp_local_addr(sd.fd as u32)
+                .ok()
+                .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
+                .unwrap_or_else(|| "0.0.0.0".to_string());
+            let ia = alloc_inet_address(ctx, &addr, &addr);
+            Ok(Some(Value::Object(Some(ia))))
+        },
+    );
+    r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        let fd = ds_get(this).fd;
+        if fd < 0 {
+            return Err(ioex("DatagramSocket: closed"));
+        }
+        ctx.fd_table()
+            .udp_set_broadcast(fd as u32, on)
+            .map_err(|e| ioex(format!("SO_BROADCAST: {e}")))?;
+        ds_set(this, |sd| sd.broadcast = i32::from(on));
+        Ok(None)
+    });
+    r.register(ds, "getBroadcast", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Never set -> the JDK default, which is false for a plain
+        // DatagramSocket.
+        Ok(Some(Value::Int(i32::from(ds_get(this).broadcast == 1))))
+    });
+
+    // isBound / getLocalAddress / setBroadcast / getBroadcast — the four keys
+    // the phase-72 `java/net/DatagramSocket` set owned alone. They are here now
+    // so this registrar covers the whole class in BOTH builds: phase-72 is
+    // `#[cfg(feature = "synthetic-jdk")]`, so in the default build these four
+    // did not exist at all and resolved to the abstract declaration.
+    r.register(ds, "isBound", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sd = ds_get(this);
+        // A `DatagramSocket` is bound from construction: every ctor here opens
+        // and binds a real UDP fd. It stays bound after close, which is what
+        // the JDK specifies.
+        Ok(Some(Value::Int(i32::from(sd.fd >= 0 || sd.closed != 0))))
+    });
+    r.register(
+        ds,
+        "getLocalAddress",
+        "()Ljava/net/InetAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sd = ds_get(this);
+            if sd.closed != 0 || sd.fd < 0 {
+                // "If the socket is closed, returns null" — and an unbound
+                // socket answers the wildcard, which is what the fd reports.
+                return Ok(Some(Value::Object(None)));
+            }
+            let addr = ctx
+                .fd_table()
+                .udp_local_addr(sd.fd as u32)
+                .ok()
+                .and_then(|s| s.rsplit_once(':').map(|(h, _)| h.to_string()))
+                .unwrap_or_else(|| "0.0.0.0".to_string());
+            let ia = alloc_inet_address(ctx, &addr, &addr);
+            Ok(Some(Value::Object(Some(ia))))
+        },
+    );
+    r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        let fd = ds_get(this).fd;
+        if fd < 0 {
+            return Err(ioex("DatagramSocket: closed"));
+        }
+        ctx.fd_table()
+            .udp_set_broadcast(fd as u32, on)
+            .map_err(|e| ioex(format!("SO_BROADCAST: {e}")))?;
+        ds_set(this, |sd| sd.broadcast = i32::from(on));
+        Ok(None)
+    });
+    r.register(ds, "getBroadcast", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        // Never set -> the JDK default, which is false for a plain
+        // DatagramSocket.
+        Ok(Some(Value::Int(i32::from(ds_get(this).broadcast == 1))))
+    });
+
+    // `connect(SocketAddress)` — the overload the pair further down does not
+    // cover. Its `(InetAddress,int)` sibling and `disconnect()`/`isConnected()`
+    // are registered there, and this file must not carry two of any of them:
+    // registration is last-write-wins, so a duplicate is silently dead and the
+    // two copies drift. (They did: the second `disconnect` picked up a stray
+    // `connected = 1` while the two independent closures of this list were
+    // merged, and `isConnected()` then read `false` after `connect()` and
+    // `true` after `disconnect()` — backwards, and invisible to the compiler.)
+    r.register(
+        ds,
+        "connect",
+        "(Ljava/net/SocketAddress;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let Some(Value::Object(Some(sa))) = args.get(1).copied() else {
+                return Err(ioex("DatagramSocket.connect: null address"));
+            };
+            let host = match ctx.get_field(sa, 0) {
+                Value::Object(Some(h)) => ctx.read_string(h).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let port = ctx.get_field(sa, 1).as_int().unwrap_or(0);
+            let host = if host.is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                host
+            };
+            let fd = ds_get(this).fd;
+            if fd < 0 {
+                return Err(ioex("DatagramSocket: closed"));
+            }
+            ctx.fd_table()
+                .udp_connect(fd as u32, &format!("{host}:{port}"))
+                .map_err(|e| ioex(format!("UDP connect: {e}")))?;
+            ds_set(this, |sd| sd.connected = 1);
+            Ok(None)
+        },
+    );
 
     r.register(ds, "send", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -11574,6 +12253,67 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let stored = ds_get(this).reuse_address;
         // `1` only when nobody ever called the setter — the historical answer.
         Ok(Some(Value::Int(if stored < 0 { 1 } else { stored })))
+    });
+    // These three real-JDK declarations have bytecode that delegates through
+    // a private DatagramSocket delegate object.  CratonVM's authoritative
+    // socket state is the layout-independent DsSide table above, so force the
+    // constructors and lifecycle operations through this same registration
+    // instead of enabling phase-72's incompatible raw-slot duplicate.
+    r.register(ds, "connect", "(Ljava/net/InetAddress;I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_get(this).fd;
+        if fd >= 0 {
+            let host = match args.get(1) {
+                Some(Value::Object(Some(address))) => match ctx.invoke_virtual(
+                    *address,
+                    "getHostAddress",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(value)))) => {
+                        ctx.read_string(value).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            let port = args.get(2).and_then(Value::as_int).unwrap_or(0);
+            if !host.is_empty() && (1..=65535).contains(&port) {
+                // DatagramSocket.connect records asynchronous failures for a
+                // later I/O operation; it must not throw from the connect call.
+                let _ = ctx
+                    .fd_table()
+                    .udp_connect(fd as u32, &format!("{host}:{port}"));
+                // `isConnected()` reads this. It is set on the Java-side
+                // transition rather than from the syscall result for the same
+                // reason `connect` does not throw: the JDK reports a connect
+                // failure at the next I/O operation, and `isConnected()` is
+                // specified to keep answering true even after the socket is
+                // closed.
+                ds_set(this, |sd| sd.connected = 1);
+            }
+        }
+        Ok(None)
+    });
+    // `disconnect()` is specified NOT to throw: "if the socket was not
+    // connected, then this method has no effect". The kernel disassociation
+    // goes through `FdTable::udp_disconnect` (POSIX `connect(AF_UNSPEC)`),
+    // whose error is deliberately swallowed for the same reason.
+    r.register(ds, "disconnect", "()V", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let fd = ds_get(this).fd;
+        if fd >= 0 {
+            let _ = _ctx.fd_table().udp_disconnect(fd as u32);
+        }
+        ds_set(this, |sd| sd.connected = 0);
+        Ok(None)
+    });
+    // `isConnected()` had no registration at all, so it reached the abstract
+    // `java.net.DatagramSocket` declaration and threw `InternalError` — right
+    // after a `connect()` that had genuinely succeeded.
+    r.register(ds, "isConnected", "()Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(ds_get(this).connected)))
     });
 }
 
@@ -11806,11 +12546,178 @@ fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     out
 }
 
-/// Off Unix there is no host enumeration without an `iphlpapi`
-/// (`GetAdaptersAddresses`) binding, which this crate does not carry. Report
-/// "cannot enumerate" so every caller takes the loopback-only fallback that was
-/// this module's only behaviour before wave 4.
-#[cfg(not(unix))]
+/// Windows uses `GetAdaptersAddresses`, the same IP Helper API family used by
+/// the JDK's Windows network-interface implementation. Keep the raw FFI
+/// layout local: this crate deliberately has no Windows-only dependency.
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinAdapterAddress {
+    length: u32,
+    if_index: u32,
+    next: *mut Re8WinAdapterAddress,
+    adapter_name: *const std::ffi::c_char,
+    first_unicast_address: *mut Re8WinUnicastAddress,
+    first_anycast_address: *mut core::ffi::c_void,
+    first_multicast_address: *mut core::ffi::c_void,
+    first_dns_server_address: *mut core::ffi::c_void,
+    dns_suffix: *const u16,
+    description: *const u16,
+    friendly_name: *const u16,
+    physical_address: [u8; 8],
+    physical_address_length: u32,
+    flags: u32,
+    mtu: u32,
+    interface_type: u32,
+    oper_status: u32,
+    ipv6_if_index: u32,
+    zone_indices: [u32; 16],
+}
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Re8WinSocketAddress {
+    address: *const u8,
+    length: i32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Re8WinUnicastAddress {
+    length: u32,
+    flags: u32,
+    next: *mut Re8WinUnicastAddress,
+    address: Re8WinSocketAddress,
+}
+
+#[cfg(windows)]
+/// Takes the `SOCKET_ADDRESS` BY REFERENCE.
+///
+/// It was by value, which does not compile on Windows at all:
+/// `Re8WinSocketAddress` is not `Copy`, and the caller reads it out of a
+/// `&IP_ADAPTER_UNICAST_ADDRESS` borrowed from the OS-owned list. The whole
+/// Windows arm of this function is `#[cfg(windows)]`, so a Linux-only build
+/// never type-checked it.
+unsafe fn re8_win_ip(address: &Re8WinSocketAddress) -> Option<IpAddr> {
+    if address.address.is_null() || address.length < 2 {
+        return None;
+    }
+    let family = u16::from_ne_bytes([*address.address, *address.address.add(1)]);
+    match family {
+        2 if address.length >= 8 => Some(IpAddr::V4(Ipv4Addr::new(
+            *address.address.add(4),
+            *address.address.add(5),
+            *address.address.add(6),
+            *address.address.add(7),
+        ))),
+        23 if address.length >= 24 => {
+            let mut octets = [0u8; 16];
+            std::ptr::copy_nonoverlapping(address.address.add(8), octets.as_mut_ptr(), 16);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "Iphlpapi")]
+extern "system" {
+    fn GetAdaptersAddresses(
+        family: u32,
+        flags: u32,
+        reserved: *mut core::ffi::c_void,
+        addresses: *mut Re8WinAdapterAddress,
+        size: *mut u32,
+    ) -> u32;
+}
+
+#[cfg(windows)]
+fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
+    let mut needed = 15_000u32;
+    for _ in 0..3 {
+        let words =
+            (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut storage = vec![std::mem::MaybeUninit::<usize>::uninit(); words.max(1)];
+        let mut size = (storage.len() * std::mem::size_of::<usize>()) as u32;
+        let result = unsafe {
+            GetAdaptersAddresses(
+                0,
+                0x10,
+                std::ptr::null_mut(),
+                storage.as_mut_ptr() as *mut Re8WinAdapterAddress,
+                &mut size,
+            )
+        };
+        if result == 111 {
+            needed = size.max(needed.saturating_mul(2));
+            continue;
+        }
+        if result != 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut current = storage.as_mut_ptr() as *mut Re8WinAdapterAddress;
+        while !current.is_null() {
+            let adapter = unsafe { &*current };
+            let name = if adapter.adapter_name.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(adapter.adapter_name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            if !name.is_empty() {
+                let mut flags = 0;
+                if adapter.oper_status == 1 {
+                    flags |= RE8_IFF_UP | RE8_IFF_RUNNING;
+                }
+                if adapter.interface_type == 24 {
+                    flags |= RE8_IFF_LOOPBACK;
+                }
+                if adapter.interface_type == 23 {
+                    flags |= RE8_IFF_POINTOPOINT;
+                }
+                if adapter.flags & 0x20 == 0 {
+                    flags |= RE8_IFF_MULTICAST;
+                }
+                let mac_len =
+                    (adapter.physical_address_length as usize).min(adapter.physical_address.len());
+                let mac = if mac_len >= 6
+                    && !adapter.physical_address[..mac_len]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                {
+                    adapter.physical_address[..mac_len].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let mut addrs = Vec::new();
+                let mut unicast = adapter.first_unicast_address;
+                while !unicast.is_null() {
+                    let entry = unsafe { &*unicast };
+                    if let Some(ip) = unsafe { re8_win_ip(&entry.address) } {
+                        if !addrs.contains(&ip) {
+                            addrs.push(ip);
+                        }
+                    }
+                    unicast = entry.next;
+                }
+                out.push(Re8HostIface {
+                    name,
+                    index: adapter.if_index.max(adapter.ipv6_if_index) as i32,
+                    flags,
+                    mtu: (adapter.mtu != 0).then_some(adapter.mtu.min(i32::MAX as u32) as i32),
+                    mac,
+                    addrs,
+                });
+            }
+            current = adapter.next;
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn re8_scan_host_ifaces() -> Vec<Re8HostIface> {
     Vec::new()
 }
@@ -13920,6 +14827,35 @@ fn register_re10_http_server(r: &mut NativeMethodRegistry) {
     );
 
     let hex = "com/sun/net/httpserver/HttpExchange";
+    // These abstract HttpExchange getters must be live in the default
+    // real-JDK registry as well as in the synthetic phase-72 overlay.  The
+    // dispatch path owns the endpoint slots and records them from the accepted
+    // TcpStream; return null only for an exchange minted by an older/foreign
+    // path that does not carry those slots.
+    r.register(
+        hex,
+        "getLocalAddress",
+        "()Ljava/net/InetSocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(ctx.get_field(this, HEX_LOCAL_ADDR)))
+        },
+    );
+    r.register(
+        hex,
+        "getRemoteAddress",
+        "()Ljava/net/InetSocketAddress;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) <= HEX_REMOTE_ADDR {
+                return Ok(Some(Value::Object(None)));
+            }
+            Ok(Some(ctx.get_field(this, HEX_REMOTE_ADDR)))
+        },
+    );
     r.register(
         hex,
         "getRequestMethod",
@@ -14216,8 +15152,7 @@ mod tests {
     #[test]
     fn re1_http_parse_url_query_only_and_fragment_do_not_extend_authority() {
         let (https, host, port, path, userinfo) =
-            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false")
-                .unwrap();
+            http_parse_url("http://alice:secret@localhost:8080?trace=false&message=false").unwrap();
         assert!(!https);
         assert_eq!(host, "localhost");
         assert_eq!(port, 8080);
@@ -14380,6 +15315,37 @@ mod tests {
         // Plain IPv4 and non-IP hosts: untouched.
         assert_eq!(hotspot_ip_string("127.0.0.1"), "127.0.0.1");
         assert_eq!(hotspot_ip_string("example.com"), "example.com");
+    }
+
+    #[test]
+    fn re3_get_by_address_uses_hotspot_ipv6_text_and_concrete_layout() {
+        let mut ctx = MockNativeContext::new();
+        let bytes = ctx.new_array(ArrayElementType::Byte, 16);
+        for (i, byte) in [
+            0xfeu8, 0x80, 0, 0, 0, 0, 0, 0, 0x67, 0xb0, 0x09, 0x9e, 0x5a, 0x9b, 0x28,
+            0x7e,
+        ]
+        .iter()
+        .enumerate()
+        {
+            ctx.set_array_element(bytes, i, Value::Int((*byte as i8) as i32));
+        }
+
+        let result = native_inet_get_by_address(&mut ctx, &[Value::Object(Some(bytes))])
+            .expect("a sixteen-byte address must be accepted");
+        let address = match result {
+            Some(Value::Object(Some(address))) => address,
+            other => panic!("expected InetAddress, got {other:?}"),
+        };
+
+        assert_eq!(
+            inet_addr_resolve(&ctx, address),
+            Some((
+                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+                "fe80:0:0:0:67b0:99e:5a9b:287e".to_string(),
+            )),
+            "getByAddress must preserve HotSpot's uncompressed IPv6 text"
+        );
     }
 
     #[test]

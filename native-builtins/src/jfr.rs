@@ -314,7 +314,8 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ("setMethodSamplingPeriod", "(JJ)V"),
         ("setCPURate", "(D)V"),
         ("setCPUPeriod", "(J)V"),
-        ("setOutput", "(Ljava/lang/String;)V"),
+        ("setRepositoryLocation", "(Ljava/lang/String;)V"),
+        ("setDumpPath", "(Ljava/lang/String;)V"),
         ("setForceInstrumentation", "(Z)V"),
         ("setCompressedIntegers", "(Z)V"),
         ("setStackDepth", "(I)V"),
@@ -336,16 +337,43 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         registry.register(JVM, name, descriptor, |_ctx, _args| Ok(None));
     }
 
-    registry.register(JVM, "beginRecording", "()V", |_ctx, _args| {
-        RECORDING.store(true, Ordering::Release);
+    registry.register(JVM, "beginRecording", "()V", |ctx, _args| {
+        ctx.jfr_begin_java_recording();
+        RECORDING.store(ctx.jfr_java_recording_active(), Ordering::Release);
         Ok(None)
     });
-    registry.register(JVM, "endRecording", "()V", |_ctx, _args| {
+    registry.register(JVM, "endRecording", "()V", |ctx, _args| {
+        ctx.jfr_end_java_recording();
         RECORDING.store(false, Ordering::Release);
         Ok(None)
     });
-    registry.register(JVM, "isRecording", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(RECORDING.load(Ordering::Acquire) as i32)))
+    registry.register(JVM, "isRecording", "()Z", |ctx, _args| {
+        Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
+    });
+    for (name, descriptor) in [("begin", "()V"), ("end", "()V")] {
+        registry.register("jdk/jfr/Event", name, descriptor, |_ctx, _args| Ok(None));
+    }
+    registry.register("jdk/jfr/Event", "isEnabled", "()Z", |ctx, _args| {
+        Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
+    });
+    registry.register("jdk/jfr/Event", "shouldCommit", "()Z", |ctx, _args| {
+        Ok(Some(Value::Int(ctx.jfr_java_recording_active() as i32)))
+    });
+    registry.register("jdk/jfr/Event", "commit", "()V", |ctx, args| {
+        if !ctx.jfr_java_recording_active() {
+            return Ok(None);
+        }
+        let event_class = args
+            .first()
+            .and_then(|value| match value {
+                Value::Object(Some(obj)) => Some(*obj),
+                _ => None,
+            })
+            .map(|obj| ctx.class_name_of_id(ctx.class_id_of_object(obj)))
+            .flatten()
+            .unwrap_or_else(|| "jdk/jfr/Event".to_owned());
+        ctx.jfr_emit_java_event(&event_class, epoch_nanos().max(0) as u64, 0);
+        Ok(None)
     });
     // `createJFR(boolean simulateFailure)` is NOT a constant: HotSpot's
     // `jfr_create_jfr` returns TRUE immediately if the recorder already exists,
@@ -355,6 +383,41 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // is specified to come back `false` (`jdk/jfr/internal/JVMSupport.java`).
     // Ignoring the argument made that call claim success. Track the same
     // created/not-created state HotSpot does and honour the flag.
+    registry.register(JVM, "setOutput", "(Ljava/lang/String;)V", |ctx, args| {
+        if let Some(Value::Object(Some(path))) = args.first() {
+            if let Some(path) = ctx.read_string(*path) {
+                ctx.jfr_set_java_output(&path);
+            }
+        }
+        Ok(None)
+    });
+
+    registry.register("jdk/jfr/Recording", "start", "()V", |ctx, _args| {
+        ctx.jfr_begin_java_recording();
+        Ok(None)
+    });
+    registry.register("jdk/jfr/Recording", "stop", "()Z", |ctx, _args| {
+        ctx.jfr_end_java_recording();
+        Ok(Some(Value::Int(1)))
+    });
+    registry.register(
+        "jdk/jfr/Recording",
+        "dump",
+        "(Ljava/nio/file/Path;)V",
+        |ctx, args| {
+            if let Some(Value::Object(Some(path))) = args.get(1) {
+                if let Ok(Some(Value::Object(Some(text)))) =
+                    ctx.invoke_virtual(*path, "toString", "()Ljava/lang/String;", &[])
+                {
+                    if let Some(text) = ctx.read_string(text) {
+                        ctx.jfr_dump_java_recording(&text);
+                    }
+                }
+            }
+            Ok(None)
+        },
+    );
+
     registry.register(JVM, "createJFR", "(Z)Z", |_ctx, args| {
         if CREATED.load(Ordering::Acquire) {
             return Ok(Some(Value::Int(1)));
@@ -431,12 +494,36 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         ))))
     });
 
+    // `emitEvent(long eventTypeId, long timestamp, long when)` — IMPLEMENTED
+    // (was a flat `false`, i.e. "nothing was emitted"). It goes through the SAME
+    // `NativeContext` JFR route `beginRecording`/`isRecording` use, so there is
+    // one door into the recorder rather than two: the answer is now "yes"
+    // exactly when a recording is running.
+    //
+    // The three longs the JDK passes ARE this entry point's whole payload — it
+    // is the periodic-event door, not the EventWriter one, which still has no
+    // chunk writer behind it (see `newEventWriter`).
+    registry.register(JVM, "emitEvent", "(JJJ)Z", |ctx, args| {
+        let longs: Vec<i64> = args
+            .iter()
+            .filter_map(|v| match v {
+                Value::Long(l) => Some(*l),
+                _ => None,
+            })
+            .collect();
+        if !ctx.jfr_java_recording_active() {
+            return Ok(Some(Value::Int(0)));
+        }
+        let timestamp = longs.get(1).copied().unwrap_or(0).max(0) as u64;
+        ctx.jfr_emit_java_event("jdk.PeriodicEvent", timestamp, 0);
+        Ok(Some(Value::Int(1)))
+    });
+
     // Constant `false` answers that are STATEMENTS OF FACT about this VM, not
     // placeholders — each names the CratonVM property that makes it true:
     //   * `emitEvent`/`setThreshold`  — the Java-side per-event recorder is not
-    //     wired to a chunk writer here (payload collection is owned by the Rust
-    //     `jfr` crate), so no event is emitted through this boundary and the
-    //     honest answer to "did you emit it?" is no;
+    //   * `setThreshold` — tunes a per-event threshold this bridge does not
+    //     consume, and there is no getter that could disagree;
     //   * `getAllowedToDoEventRetransforms`/`isInstrumented` — `retransform
     //     Classes` above is a no-op, so no event class is ever instrumented;
     //     answering `true` to either would contradict that no-op;
@@ -445,7 +532,6 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // `isExcluded(Thread)` is deliberately NOT in this list: it is a guard whose
     // answer must follow `exclude`/`include` (see below).
     for (name, descriptor) in [
-        ("emitEvent", "(JJJ)Z"),
         ("setThreshold", "(JJ)Z"),
         ("getAllowedToDoEventRetransforms", "()Z"),
         ("isExcluded", "(Ljava/lang/Class;)Z"),
@@ -476,9 +562,47 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // committed (`commit`), no event class has been unloaded
     // (`getUnloadedEventClassCount`). `getThreadId` and the two `hostTotal*`
     // probes are deliberately NOT in this list — see below.
+    // `getStackTraceId(int skipFrames[, long hash])` — IMPLEMENTED (was a flat
+    // `0`, "no trace interned"). The id has to be STABLE: events reference
+    // traces by id and a chunk carries each trace once, so the same call site
+    // asked twice must get the same number back. Interning by the rendered
+    // frame list gives that without a VM-side table — `capture_stack_trace` is
+    // already on the native ABI.
+    //
+    // `0` remains the answer when there is no walkable stack, which is the
+    // JDK's own "no such trace".
+    fn jfr_stack_trace_id(ctx: &mut dyn NativeContext, skip: i32) -> i64 {
+        static IDS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, i64>>,
+        > = std::sync::OnceLock::new();
+        let frames = ctx.capture_stack_trace(0);
+        let skip = skip.max(0) as usize;
+        if frames.len() <= skip {
+            return 0;
+        }
+        let mut key = String::new();
+        for frame in frames.iter().skip(skip) {
+            key.push_str(&frame.class_name);
+            key.push('.');
+            key.push_str(&frame.method_name);
+            key.push(':');
+            key.push_str(&frame.line_number.to_string());
+            key.push('\n');
+        }
+        let table = IDS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut table = table.lock().unwrap_or_else(|e| e.into_inner());
+        let next = table.len() as i64 + 1;
+        *table.entry(key).or_insert(next)
+    }
+    for descriptor in ["(IJ)J", "(I)J"] {
+        registry.register(JVM, "getStackTraceId", descriptor, |ctx, args| {
+            let skip = args.iter().find_map(|v| v.as_int()).unwrap_or(0);
+            Ok(Some(Value::Long(jfr_stack_trace_id(ctx, skip))))
+        });
+    }
+
     for (name, descriptor) in [
         ("getUnloadedEventClassCount", "()J"),
-        ("getStackTraceId", "(IJ)J"),
         ("commit", "(J)J"),
         (
             "registerStackFilter",
@@ -546,24 +670,19 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // or joins records by thread collapsed the whole process onto one thread.
     // Report the receiver's own id, exactly as `java/lang/Thread.getId` does
     // (`tid` field, falling back to the executing VM thread).
-    registry.register(
-        JVM,
-        "getThreadId",
-        "(Ljava/lang/Thread;)J",
-        |ctx, args| {
-            let receiver_tid = match args.first() {
-                Some(Value::Object(Some(thread))) => match ctx.get_field_by_name(*thread, "tid") {
-                    Value::Long(tid) if tid > 0 => Some(tid),
-                    Value::Int(tid) if tid > 0 => Some(tid as i64),
-                    _ => None,
-                },
+    registry.register(JVM, "getThreadId", "(Ljava/lang/Thread;)J", |ctx, args| {
+        let receiver_tid = match args.first() {
+            Some(Value::Object(Some(thread))) => match ctx.get_field_by_name(*thread, "tid") {
+                Value::Long(tid) if tid > 0 => Some(tid),
+                Value::Int(tid) if tid > 0 => Some(tid as i64),
                 _ => None,
-            };
-            Ok(Some(Value::Long(
-                receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
-            )))
-        },
-    );
+            },
+            _ => None,
+        };
+        Ok(Some(Value::Long(
+            receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
+        )))
+    });
 
     // OpenJDK's Type table uses these IDs as map-key identity.  Returning the
     // same placeholder for every type silently collapses the table and makes
@@ -723,13 +842,47 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
             let Some(name) = name else {
                 return Ok(Some(Value::Object(None)));
             };
-            let name = Value::Object(Some(ctx.create_string(&name)));
-            ctx.invoke(
-                "jdk/jfr/internal/Type",
-                "getKnownType",
-                "(Ljava/lang/String;)Ljdk/jfr/internal/Type;",
-                &[name],
-            )
+            if let Some(known) = known_jfr_type_for_class_mirror(ctx, args) {
+                return Ok(Some(known));
+            }
+            // During TypeLibrary.<clinit> the Java known-types map has not yet
+            // been populated, although a ValueDescriptor still needs the
+            // canonical primitive/String/Thread/Class type object. Construct
+            // the same public Type shape directly from the stable native id;
+            // later Java-side metadata lookups use its name and id, not map
+            // identity. Unknown classes deliberately stay null, matching the
+            // Java `Type.getKnownType` lookup that this replaces.
+            if matches!(
+                name.as_str(),
+                "boolean"
+                    | "byte"
+                    | "char"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "float"
+                    | "double"
+                    | "java.lang.Class"
+                    | "java.lang.String"
+                    | "java.lang.Thread"
+            ) {
+                let name_object = ctx.create_string(&name);
+                let pin = ctx.pin_native_root(name_object);
+                let name_object = ctx.read_native_pin(pin, name_object);
+                let result = ctx.new_object_initialized(
+                    "jdk/jfr/internal/Type",
+                    "(Ljava/lang/String;Ljava/lang/String;JLjava/lang/Boolean;)V",
+                    &[
+                        Value::Object(Some(name_object)),
+                        Value::Object(None),
+                        Value::Long(type_id(&name)),
+                        Value::Object(None),
+                    ],
+                );
+                ctx.unpin_native_roots(pin);
+                return result;
+            }
+            Ok(Some(Value::Object(None)))
         },
     );
     // MetadataLoader asks Utils to validate the value class.  On a real JVM
@@ -740,7 +893,120 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
         "jdk/jfr/internal/util/Utils",
         "getValidType",
         "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;",
-        |ctx, args| Ok(known_jfr_type_for_class_mirror(ctx, args)),
+        |ctx, args| {
+            let raw_name = match args.first() {
+                Some(Value::Object(Some(mirror))) => class_name_for_mirror(ctx, *mirror),
+                _ => None,
+            };
+            let Some(mut name) = raw_name else {
+                return Ok(Some(Value::Object(None)));
+            };
+            if let Some(known) = known_jfr_type_for_class_mirror(ctx, args) {
+                return Ok(Some(known));
+            }
+            // `ValueDescriptor` permits arrays and asks us about the component
+            // type. The real `Utils.getValidType` performs that unwrapping
+            // before consulting Type's known-type table. Class.getName()
+            // exposes arrays in descriptor form, so decode precisely that
+            // representation without allocating another Class mirror.
+            while let Some(component) = name.strip_prefix('[') {
+                name = component.to_owned();
+            }
+            if let Some(reference) = name
+                .strip_prefix('L')
+                .and_then(|reference| reference.strip_suffix(';'))
+            {
+                name = reference.replace('/', ".");
+            } else if name.len() == 1 {
+                name = match name.as_str() {
+                    "Z" => "boolean",
+                    "B" => "byte",
+                    "C" => "char",
+                    "S" => "short",
+                    "I" => "int",
+                    "J" => "long",
+                    "F" => "float",
+                    "D" => "double",
+                    _ => return Ok(Some(Value::Object(None))),
+                }
+                .to_owned();
+            }
+            if !matches!(
+                name.as_str(),
+                "boolean"
+                    | "byte"
+                    | "char"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "float"
+                    | "double"
+                    | "java.lang.Class"
+                    | "java.lang.String"
+                    | "java.lang.Thread"
+            ) {
+                return Ok(Some(Value::Object(None)));
+            }
+            let name_object = ctx.create_string(&name);
+            let pin = ctx.pin_native_root(name_object);
+            let name_object = ctx.read_native_pin(pin, name_object);
+            let result = ctx.new_object_initialized(
+                "jdk/jfr/internal/Type",
+                "(Ljava/lang/String;Ljava/lang/String;JLjava/lang/Boolean;)V",
+                &[
+                    Value::Object(Some(name_object)),
+                    Value::Object(None),
+                    Value::Long(type_id(&name)),
+                    Value::Object(None),
+                ],
+            );
+            ctx.unpin_native_roots(pin);
+            result
+        },
+    );
+    registry.register(
+        "jdk/jfr/AnnotationElement",
+        "checkType",
+        "(Ljava/lang/Class;)V",
+        |ctx, args| {
+            let name = match args.first() {
+                Some(Value::Object(Some(mirror))) => class_name_for_mirror(ctx, *mirror),
+                _ => None,
+            }
+            .unwrap_or_else(|| "<unknown>".to_owned());
+            let mut component = name.as_str();
+            while let Some(rest) = component.strip_prefix('[') {
+                component = rest;
+            }
+            let component = component
+                .strip_prefix('L')
+                .and_then(|value| value.strip_suffix(';'))
+                .map(|value| value.replace('/', "."))
+                .unwrap_or_else(|| component.to_owned());
+            let allowed = matches!(
+                component.as_str(),
+                "boolean"
+                    | "byte"
+                    | "char"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "float"
+                    | "double"
+                    | "java.lang.String"
+            );
+            if allowed {
+                Ok(None)
+            } else {
+                Err(MethodCallFailed::from(
+                    RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "Only primitive, String, or arrays thereof are allowed (got {name})"
+                        ),
+                    },
+                ))
+            }
+        },
     );
     // NOT a constant-valued stub — a deliberate behavioural OVERRIDE of real
     // JDK bytecode, and the one entry in this file whose justification could
@@ -761,6 +1027,12 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
     // which this pass cannot do; flagged for the next JFR bootstrap run.
     registry.register(
         "jdk/jfr/internal/JDKEvents",
+        "initialize",
+        "()V",
+        |_ctx, _args| Ok(None),
+    );
+    registry.register(
+        "jdk/jfr/internal/instrument/JDKEvents",
         "initialize",
         "()V",
         |_ctx, _args| Ok(None),
@@ -807,9 +1079,12 @@ pub fn register_jfr_natives(registry: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     #[test]
     fn registers_the_recordingstream_bootstrap_boundary() {
@@ -845,7 +1120,9 @@ mod tests {
             ("getThreadId", "(Ljava/lang/Thread;)J"),
         ] {
             assert!(
-                registry.find("jdk/jfr/internal/JVM", name, descriptor).is_some(),
+                registry
+                    .find("jdk/jfr/internal/JVM", name, descriptor)
+                    .is_some(),
                 "jdk/jfr/internal/JVM.{name}{descriptor} must stay registered"
             );
         }

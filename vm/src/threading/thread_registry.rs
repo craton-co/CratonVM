@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
@@ -166,6 +167,12 @@ struct ThreadEntry {
     jmx_waiting_monitor: Mutex<Option<ObjectRef>>,
     jmx_locked_monitors: Mutex<Vec<ObjectRef>>,
     jmx_locked_synchronizers: Mutex<Vec<ObjectRef>>,
+    jmx_contended_started: Mutex<Option<Instant>>,
+    jmx_wait_started: Mutex<Option<Instant>>,
+    jmx_blocked_count: AtomicU64,
+    jmx_blocked_nanos: AtomicU64,
+    jmx_waited_count: AtomicU64,
+    jmx_waited_nanos: AtomicU64,
     /// T1.5.1 — pending async exception slot. Set by cross-thread
     /// `Thread.stop` / `Thread.stop0` calls; consumed by the target
     /// thread's next `safepoint_check`.
@@ -402,6 +409,12 @@ impl ThreadRegistry {
             jmx_waiting_monitor: Mutex::new(None),
             jmx_locked_monitors: Mutex::new(Vec::new()),
             jmx_locked_synchronizers: Mutex::new(Vec::new()),
+            jmx_contended_started: Mutex::new(None),
+            jmx_wait_started: Mutex::new(None),
+            jmx_blocked_count: AtomicU64::new(0),
+            jmx_blocked_nanos: AtomicU64::new(0),
+            jmx_waited_count: AtomicU64::new(0),
+            jmx_waited_nanos: AtomicU64::new(0),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tlab_addr: std::sync::atomic::AtomicUsize::new(0),
             jvm_thread_addr: std::sync::atomic::AtomicUsize::new(0),
@@ -1123,6 +1136,15 @@ impl ThreadRegistry {
     pub fn set_jmx_contended_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
         if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_contended_monitor.lock() = Some(monitor);
+            *entry.jmx_contended_started.lock() = Some(Instant::now());
+            // Count the block HERE, not on release. The JMM counts a thread as
+            // having blocked the moment it starts waiting, and a JMX consumer
+            // diagnosing a hang reads `getBlockedCount()` while the thread is
+            // STILL blocked — counting on the way out leaves exactly that case
+            // reporting zero, which is the case that matters. Measured: a
+            // thread parked on a held monitor reported `blockedCount == 0` on
+            // every thread in the VM until this moved.
+            entry.jmx_blocked_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1131,6 +1153,16 @@ impl ThreadRegistry {
     pub fn complete_jmx_monitor_enter(&self, thread_id: ThreadId, monitor: ObjectRef) {
         if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_contended_monitor.lock() = None;
+            // Only the DURATION is added here — the count was taken when the
+            // block began. `jmx_contended_started` is `None` on the uncontended
+            // arm (which calls this to publish ownership), so nothing accrues
+            // for an acquisition that never waited.
+            if let Some(start) = entry.jmx_contended_started.lock().take() {
+                entry.jmx_blocked_nanos.fetch_add(
+                    start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+            }
             let mut owned = entry.jmx_locked_monitors.lock();
             if !owned.iter().any(|o| o.as_ptr() == monitor.as_ptr()) {
                 owned.push(monitor);
@@ -1150,14 +1182,22 @@ impl ThreadRegistry {
     pub fn set_jmx_waiting_monitor(&self, thread_id: ThreadId, monitor: ObjectRef) {
         if let Some(entry) = self.threads.read().get(&thread_id) {
             *entry.jmx_waiting_monitor.lock() = Some(monitor);
+            *entry.jmx_wait_started.lock() = Some(Instant::now());
         }
     }
 
     pub fn take_jmx_waiting_monitor(&self, thread_id: ThreadId) -> Option<ObjectRef> {
-        if let Some(entry) = self.threads.read().get(&thread_id) {
-            return entry.jmx_waiting_monitor.lock().take();
+        let threads = self.threads.read();
+        let entry = threads.get(&thread_id)?;
+        let monitor = entry.jmx_waiting_monitor.lock().take();
+        if let Some(start) = entry.jmx_wait_started.lock().take() {
+            entry.jmx_waited_count.fetch_add(1, Ordering::Relaxed);
+            entry.jmx_waited_nanos.fetch_add(
+                start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
         }
-        None
+        monitor
     }
 
     /// `AbstractOwnableSynchronizer` has one exclusive owner. Remove a
@@ -1185,6 +1225,10 @@ impl ThreadRegistry {
         Option<ObjectRef>,
         Vec<ObjectRef>,
         Vec<ObjectRef>,
+        i64,
+        i64,
+        i64,
+        i64,
     )> {
         let threads = self.threads.read();
         let entry = threads.get(&thread_id)?;
@@ -1193,8 +1237,23 @@ impl ThreadRegistry {
             *entry.jmx_waiting_monitor.lock(),
             entry.jmx_locked_monitors.lock().clone(),
             entry.jmx_locked_synchronizers.lock().clone(),
+            (entry.jmx_blocked_nanos.load(Ordering::Relaxed) / 1_000_000) as i64,
+            entry.jmx_blocked_count.load(Ordering::Relaxed) as i64,
+            (entry.jmx_waited_nanos.load(Ordering::Relaxed) / 1_000_000) as i64,
+            entry.jmx_waited_count.load(Ordering::Relaxed) as i64,
         );
         Some(snapshot)
+    }
+
+    pub fn reset_jmx_contention_stats(&self) {
+        for entry in self.threads.read().values() {
+            entry.jmx_blocked_count.store(0, Ordering::Relaxed);
+            entry.jmx_blocked_nanos.store(0, Ordering::Relaxed);
+            entry.jmx_waited_count.store(0, Ordering::Relaxed);
+            entry.jmx_waited_nanos.store(0, Ordering::Relaxed);
+            *entry.jmx_contended_started.lock() = None;
+            *entry.jmx_wait_started.lock() = None;
+        }
     }
 
     /// Return all (ThreadId, name) pairs for currently registered threads.
@@ -1482,7 +1541,9 @@ impl ThreadRegistry {
         if let Some(entry) = threads.get(&thread_id) {
             {
                 let mut f = entry.gc_block_state.fixup.lock();
-                if !f.is_empty() && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                if !f.is_empty()
+                    && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_BLOCKGC").is_some()
+                {
                     eprintln!(
                         "[blockgc] native-unblock DISCARDS {} fixups tid={}",
                         f.len(),

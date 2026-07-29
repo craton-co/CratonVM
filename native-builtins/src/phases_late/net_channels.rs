@@ -2699,327 +2699,41 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     });
 
     // DatagramSocket = 4-field (port=0, closed=1, timeout=2, fd_id=3)
-    let ds = "java/net/DatagramSocket";
-    r.register(ds, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        match ctx.fd_table().open_udp(Some("0.0.0.0:0")) {
-            Ok(fd_id) => {
-                let actual_port = ctx
-                    .fd_table()
-                    .udp_local_addr(fd_id)
-                    .ok()
-                    .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
-                    .unwrap_or(0);
-                ctx.set_field(this, 0, Value::Int(actual_port));
-                ctx.set_field(this, 1, Value::Int(0));
-                ctx.set_field(this, 2, Value::Int(0));
-                ctx.set_field(this, 3, Value::Int(fd_id as i32));
-            }
-            Err(e) => {
-                ctx.set_field(this, 0, Value::Int(0));
-                ctx.set_field(this, 1, Value::Int(0));
-                ctx.set_field(this, 2, Value::Int(0));
-                ctx.set_field(this, 3, Value::Int(-1));
-                return Err(RuntimeError::IOException {
-                    message: format!("DatagramSocket: {e}"),
-                }
-                .into());
-            }
-        }
-        Ok(None)
-    });
-    r.register(ds, "<init>", "(I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let port = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => 0,
-        };
-        let bind_addr = format!("0.0.0.0:{port}");
-        match ctx.fd_table().open_udp(Some(&bind_addr)) {
-            Ok(fd_id) => {
-                let actual_port = ctx
-                    .fd_table()
-                    .udp_local_addr(fd_id)
-                    .ok()
-                    .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
-                    .unwrap_or(port);
-                ctx.set_field(this, 0, Value::Int(actual_port));
-                ctx.set_field(this, 1, Value::Int(0));
-                ctx.set_field(this, 2, Value::Int(0));
-                ctx.set_field(this, 3, Value::Int(fd_id as i32));
-            }
-            Err(e) => {
-                ctx.set_field(this, 3, Value::Int(-1));
-                return Err(RuntimeError::IOException {
-                    message: format!("DatagramSocket bind :{port}: {e}"),
-                }
-                .into());
-            }
-        }
-        Ok(None)
-    });
-    r.register(ds, "<init>", "(ILjava/net/InetAddress;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let port = match args.get(1) {
-            Some(Value::Int(i)) => *i,
-            _ => 0,
-        };
-        let host = match args.get(2) {
-            Some(Value::Object(Some(ia))) => match ctx.get_field(*ia, 1) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into()),
-                _ => "0.0.0.0".into(),
-            },
-            _ => "0.0.0.0".into(),
-        };
-        let bind_addr = format!("{host}:{port}");
-        match ctx.fd_table().open_udp(Some(&bind_addr)) {
-            Ok(fd_id) => {
-                let actual_port = ctx
-                    .fd_table()
-                    .udp_local_addr(fd_id)
-                    .ok()
-                    .and_then(|a| a.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
-                    .unwrap_or(port);
-                ctx.set_field(this, 0, Value::Int(actual_port));
-                ctx.set_field(this, 1, Value::Int(0));
-                ctx.set_field(this, 2, Value::Int(0));
-                ctx.set_field(this, 3, Value::Int(fd_id as i32));
-            }
-            Err(e) => {
-                ctx.set_field(this, 3, Value::Int(-1));
-                return Err(RuntimeError::IOException {
-                    message: format!("DatagramSocket bind {host}:{port}: {e}"),
-                }
-                .into());
-            }
-        }
-        Ok(None)
-    });
+    // The `java/net/DatagramSocket` set that used to live here is DELETED.
+    // `net_phase_e::register_re7_datagram_socket` owns the class: it keeps its
+    // state in `ds_side_table` and drives a real UDP fd, while this set wrote
+    // raw slots on the same objects. This file registers LATER, so in a
+    // `--synthetic-jdk` build the slot-based set won every overlapping key and
+    // the working implementation was shadowed; and because this registrar is
+    // `#[cfg(feature = "synthetic-jdk")]`, the four keys it owned ALONE
+    // (`isBound`, `getLocalAddress`, `setBroadcast`, `getBroadcast`) did not
+    // exist at all in the default build. All four moved to RE7, so one owner
+    // now covers the whole class in both builds. `DatagramPacket` and
+    // `DatagramChannel` below are unaffected — RE7 does not register those.
+
+    
+    
+    
     // send(DatagramPacket) — real UDP send via fd_table
-    r.register(ds, "send", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let packet = obj_arg(args, 1)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "DatagramSocket not bound".into(),
-            }
-            .into());
-        }
-        let dest_addr = match ctx.get_field(packet, 2) {
-            Value::Object(Some(ia)) => match ctx.get_field(ia, 1) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
-                _ => "127.0.0.1".into(),
-            },
-            _ => {
-                return Err(RuntimeError::IOException {
-                    message: "DatagramPacket has no destination address".into(),
-                }
-                .into())
-            }
-        };
-        let dest_port = ctx.get_field(packet, 3).as_int().unwrap_or(0);
-        let data_arr = match ctx.get_field(packet, 0) {
-            Value::Object(Some(a)) => a,
-            _ => return Ok(None),
-        };
-        let data_len = ctx.get_field(packet, 1).as_int().unwrap_or(0) as usize;
-        let mut buf = vec![0u8; data_len];
-        for i in 0..data_len {
-            if let Value::Int(b) = ctx.get_array_element(data_arr, i) {
-                buf[i] = b as u8;
-            }
-        }
-        let target = format!("{dest_addr}:{dest_port}");
-        if let Err(e) = ctx.fd_table().udp_send(fd_id as u32, &buf, &target) {
-            return Err(RuntimeError::IOException {
-                message: format!("send: {e}"),
-            }
-            .into());
-        }
-        Ok(None)
-    });
+    
     // receive(DatagramPacket) — real UDP receive via fd_table
-    r.register(
-        ds,
-        "receive",
-        "(Ljava/net/DatagramPacket;)V",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let packet = obj_arg(args, 1)?;
-            let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-            if fd_id < 0 {
-                return Err(RuntimeError::IOException {
-                    message: "DatagramSocket not bound".into(),
-                }
-                .into());
-            }
-            let timeout_ms = ctx.get_field(this, 2).as_int().unwrap_or(0);
-            if timeout_ms > 0 {
-                let _ = ctx.fd_table().udp_set_read_timeout(
-                    fd_id as u32,
-                    Some(std::time::Duration::from_millis(timeout_ms as u64)),
-                );
-            } else {
-                let _ = ctx.fd_table().udp_set_read_timeout(fd_id as u32, None);
-            }
-            let mut buf = vec![0u8; 65536];
-            match ctx.fd_table().udp_recv(fd_id as u32, &mut buf) {
-                Ok((n, src_addr_str)) => {
-                    let data_arr = match ctx.get_field(packet, 0) {
-                        Value::Object(Some(a)) => a,
-                        _ => {
-                            let a = ctx.new_array(cratonvm_types::ArrayElementType::Byte, n);
-                            ctx.set_field(packet, 0, Value::Object(Some(a)));
-                            a
-                        }
-                    };
-                    let copy_len = n.min(ctx.array_length(data_arr));
-                    for i in 0..copy_len {
-                        ctx.set_array_element(data_arr, i, Value::Int(buf[i] as i8 as i32));
-                    }
-                    ctx.set_field(packet, 1, Value::Int(copy_len as i32));
-                    // Parse source address "ip:port"
-                    let (src_ip, src_port) = if let Some(colon) = src_addr_str.rfind(':') {
-                        (
-                            &src_addr_str[..colon],
-                            src_addr_str[colon + 1..].parse::<i32>().unwrap_or(0),
-                        )
-                    } else {
-                        (src_addr_str.as_str(), 0)
-                    };
-                    let ia = crate::net_phase_e::alloc_inet_address_external(ctx, src_ip, src_ip);
-                    ctx.set_field(packet, 2, Value::Object(Some(ia)));
-                    ctx.set_field(packet, 3, Value::Int(src_port));
-                }
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::TimedOut
-                        || e.kind() == std::io::ErrorKind::WouldBlock
-                    {
-                        return Err(RuntimeError::IOException {
-                            message: "Receive timed out".into(),
-                        }
-                        .into());
-                    }
-                    return Err(RuntimeError::IOException {
-                        message: format!("receive: {e}"),
-                    }
-                    .into());
-                }
-            }
-            Ok(None)
-        },
-    );
-    r.register(ds, "close", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id >= 0 {
-            let _ = ctx.fd_table().close(fd_id as u32);
-        }
-        ctx.set_field(this, 1, Value::Int(1));
-        Ok(None)
-    });
-    r.register(ds, "isClosed", "()Z", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 1)))
-    });
-    r.register(ds, "isBound", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        Ok(Some(Value::Int(if fd_id >= 0 { 1 } else { 0 })))
-    });
-    r.register(ds, "getLocalPort", "()I", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 0)))
-    });
-    r.register(
-        ds,
-        "getLocalAddress",
-        "()Ljava/net/InetAddress;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-            if fd_id >= 0 {
-                if let Ok(addr_str) = ctx.fd_table().udp_local_addr(fd_id as u32) {
-                    let (ip, _port) = if let Some(colon) = addr_str.rfind(':') {
-                        (&addr_str[..colon], &addr_str[colon + 1..])
-                    } else {
-                        (addr_str.as_str(), "0")
-                    };
-                    let ia = crate::net_phase_e::alloc_inet_address_external(ctx, ip, ip);
-                    return Ok(Some(Value::Object(Some(ia))));
-                }
-            }
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(ds, "getSoTimeout", "()I", |ctx, args| {
-        Ok(Some(ctx.get_field(obj_arg(args, 0)?, 2)))
-    });
-    r.register(ds, "setSoTimeout", "(I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Int(0)));
-        Ok(None)
-    });
+    
+    
+    
+    
+    
+    
+    
+    
     // setReuseAddress / getReuseAddress were a discard-then-lie pair: the setter
     // threw the flag away and the getter always answered `false`, so
     // `s.setReuseAddress(true); s.getReuseAddress()` returned false. Both halves
     // now go to the real socket — `fd_table` already exposes the setter, and the
     // getter reads SO_REUSEADDR back through socket2 on a dup of the fd (dup'ing
     // shares the option state; dropping the dup closes only the duplicate).
-    r.register(ds, "setReuseAddress", "(Z)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id >= 0 {
-            let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-            let _ = ctx.fd_table().udp_set_reuse_address(fd_id as u32, on);
-        }
-        Ok(None)
-    });
-    r.register(ds, "getReuseAddress", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "getReuseAddress: socket is closed".into(),
-            }
-            .into());
-        }
-        let on = ctx
-            .fd_table()
-            .udp_try_clone(fd_id as u32)
-            .ok()
-            .and_then(|s| socket2::SockRef::from(&s).reuse_address().ok())
-            .unwrap_or(false);
-        Ok(Some(Value::Int(if on { 1 } else { 0 })))
-    });
-    r.register(ds, "connect", "(Ljava/net/InetAddress;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id >= 0 {
-            let host = match args.get(1) {
-                Some(Value::Object(Some(ia))) => match ctx.get_field(*ia, 1) {
-                    Value::Object(Some(s)) => {
-                        ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into())
-                    }
-                    _ => "127.0.0.1".into(),
-                },
-                _ => "127.0.0.1".into(),
-            };
-            let port = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
-            // The wave-3 note here ("we can't easily call connect on fd_table")
-            // was simply wrong: `FdTable::udp_connect` exists
-            // (native-api/src/fd_table.rs) and is what `DatagramChannel.connect`
-            // in this same file already uses. Dropping host/port on the floor
-            // left the socket unassociated, so every subsequent `send` still
-            // accepted an arbitrary destination and `receive` still accepted
-            // datagrams from any peer — the exact filtering `connect` exists to
-            // impose. `java.net.DatagramSocket.connect(InetAddress,int)` is
-            // specified not to throw on a connect failure (the error surfaces
-            // on the following send/receive), so a failure is swallowed here.
-            let target = format!("{host}:{port}");
-            let _ = ctx.fd_table().udp_connect(fd_id as u32, &target);
-        }
-        Ok(None)
-    });
+    
+    
+    
     // The escalated primitive landed: `FdTable::udp_disconnect(FdId)`
     // (native-api/src/fd_table.rs) issues the POSIX `connect(AF_UNSPEC)` that
     // dissolves the association, treating the `EAFNOSUPPORT`/`WSAEAFNOSUPPORT`
@@ -3055,43 +2769,12 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
     // `"java/net/DatagramSocket" => instance_fields(4)` there, or better, move
     // this set onto the RE.7 side table); the call below is correct the moment
     // the fd is actually stored, and no worse than the old no-op until then.
-    r.register(ds, "disconnect", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id >= 0 {
-            let _ = ctx.fd_table().udp_disconnect(fd_id as u32);
-        }
-        Ok(None)
-    });
-    r.register(ds, "setBroadcast", "(Z)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let on = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id >= 0 {
-            let _ = ctx.fd_table().udp_set_broadcast(fd_id as u32, on);
-        }
-        Ok(None)
-    });
+    
+    
     // `setBroadcast` above really does set SO_BROADCAST on the fd, so a constant
     // `false` getter contradicted the setter that had just run. Read the option
     // back off the socket (via a dup, which shares option state).
-    r.register(ds, "getBroadcast", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 3).as_int().unwrap_or(-1);
-        if fd_id < 0 {
-            return Err(RuntimeError::IOException {
-                message: "getBroadcast: socket is closed".into(),
-            }
-            .into());
-        }
-        let on = ctx
-            .fd_table()
-            .udp_try_clone(fd_id as u32)
-            .ok()
-            .and_then(|s| s.broadcast().ok())
-            .unwrap_or(false);
-        Ok(Some(Value::Int(if on { 1 } else { 0 })))
-    });
+    
 
     // MulticastSocket = 5-field (port=0, closed=1, timeout=2, fd_id=3, ttl=4)
     let ms = "java/net/MulticastSocket";
@@ -4647,55 +4330,16 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
     // OutputStreams and never wrote a response — that broke real-server probes.
     // We keep only the ancillary getters Phase E does not register.
     let hex = "com/sun/net/httpserver/HttpExchange";
-    // The escalated producer side landed in `net_phase_e.rs`, so these two are
-    // now plain slot reads rather than constant nulls:
-    // `re10_dispatch_pending` — the one place an `HttpExchange` is minted, and
-    // the last point at which it and the accepted `TcpStream` coexist —
-    // captures `local_addr()` / `peer_addr()` into `HEX_LOCAL_ADDR` /
-    // `HEX_REMOTE_ADDR`, `HEX_NUM_FIELDS` is 11, and the matching
-    // `classloading/src/class_manager.rs` entry is `instance_fields(11)` (a
-    // short entry would make `set_field` drop the write silently, which is how
-    // `HEX_PRINCIPAL` sat dead behind `instance_fields(8)`). All three
-    // verified in the tree rather than taken on trust.
-    //
-    // The slots are referenced by symbol, not as literal 9/10 — that is why
-    // they are `pub(crate)`. A null here still means "the endpoint could not
-    // be read off the socket", never a fabricated host: a caller that logs or
-    // rate-limits by peer must not attribute every request to one invented
-    // address.
-    //
-    // Both getters bound-check against the HIGHER of the two indices, matching
-    // the `getPrincipal` reader in `net_phase_e.rs`, so an exchange minted by
-    // some future path with fewer slots reports "unknown" instead of reading
-    // off the end of the object.
-    r.register(
-        hex,
-        "getLocalAddress",
-        "()Ljava/net/InetSocketAddress;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) <= crate::net_phase_e::HEX_REMOTE_ADDR {
-                return Ok(Some(Value::Object(None)));
-            }
-            Ok(Some(
-                ctx.get_field(this, crate::net_phase_e::HEX_LOCAL_ADDR),
-            ))
-        },
-    );
-    r.register(
-        hex,
-        "getRemoteAddress",
-        "()Ljava/net/InetSocketAddress;",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if ctx.object_num_fields(this) <= crate::net_phase_e::HEX_REMOTE_ADDR {
-                return Ok(Some(Value::Object(None)));
-            }
-            Ok(Some(
-                ctx.get_field(this, crate::net_phase_e::HEX_REMOTE_ADDR),
-            ))
-        },
-    );
+    // MOVED to `net_phase_e::register_re10_http_server`, which is the
+    // real-JDK-live registrar and the one that MINTS the exchange
+    // (`re10_dispatch_pending` captures `local_addr()`/`peer_addr()` into
+    // `HEX_LOCAL_ADDR`/`HEX_REMOTE_ADDR`). Registering the consumer half here —
+    // in a `#[cfg(feature = "synthetic-jdk")]` registrar — meant the producer
+    // ran in the default build while the getters did not exist there at all, so
+    // `getLocalAddress()`/`getRemoteAddress()` resolved to the abstract
+    // `com.sun.net.httpserver.HttpExchange` declaration and threw
+    // `AbstractMethodError`. Producer and consumer now live together.
+
     // `getAttribute` was constant-null only because its partner did not exist:
     // no `HttpExchange.setAttribute` was registered anywhere in the tree, so
     // no key could ever have been set. Registering the PAIR is what makes both

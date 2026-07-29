@@ -3402,6 +3402,13 @@ fn tlab_alloc_array(
 }
 
 /// Try to allocate an array, running GC and retrying on failure.
+///
+/// `try_alloc_array_full` is deliberately used rather than the young-only
+/// `try_alloc_array`: it has the same young-first policy, but once a
+/// non-moving JIT-safe sweep has left the young generation fragmented it can
+/// spill the request into old space.  This matches `alloc_object_shared`'s
+/// object path.  Retrying young-only here used to report OOM for a tiny array
+/// while most of the heap was available as old-generation headroom.
 fn gc_alloc_array(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3415,7 +3422,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3435,7 +3442,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3446,7 +3453,7 @@ fn gc_alloc_array(
     shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
         .ok_or_else(|| {
             maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
@@ -7255,13 +7262,43 @@ pub fn execute(
                                 // rather than leave it for a later invocation to
                                 // mis-claim. A callee's frame is left alone: its
                                 // exception is still in flight.
+                                if lambda_dispatch_active() {
+                                    let cached = Arc::new(CachedBytecodeMethod {
+                                        declaring_class_id: class_id,
+                                        class_name: Arc::from(class_name_str.as_str()),
+                                        method_name: Arc::from(method_name),
+                                        method_descriptor: Arc::from(method_descriptor),
+                                        source_file: source_file.as_deref().map(Arc::from),
+                                        code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+                                        exception_table: Arc::from(code_attr.exception_table.as_slice()),
+                                        max_stack: code_attr.max_stack,
+                                        max_locals: code_attr.max_locals,
+                                        num_params: count_method_params(method_descriptor) as u16,
+                                        is_synchronized,
+                                        is_static,
+                                        force_native_cache: std::sync::OnceLock::new(),
+                                        native_callback_cache: std::sync::OnceLock::new(),
+                                        invoc_key: std::sync::OnceLock::new(),
+                                        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                                        quickened: std::sync::OnceLock::new(),
+                                    });
+                                    let throw_pc = jit_local_athrow_pc(
+                                        &cached,
+                                        crate::jit::helpers::peek_jit_athrow_bci(),
+                                    );
+                                    crate::jit::helpers::clear_jit_athrow_bci();
+                                    if let Some(result) = run_jit_callee_handler(
+                                        shared, thread, &cached, throw_pc, exc, args,
+                                    ) {
+                                        return result;
+                                    }
+                                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                                }
                                 drop_own_exceptional_frame(
                                     &class_name_str,
                                     method_name,
                                     method_descriptor,
                                 );
-                                // Stash the exception in a variable visible to the interpreter
-                                // loop that runs below (after frame push).
                                 jit_early_exception = Some(exc);
                             } else {
                                 let result = match jit_result {
@@ -24987,6 +25024,14 @@ fn try_invoke_cached_lambda_impl(
 /// `invoke_or_native` fallback would mis-route to the abstract
 /// `java/lang/reflect/InvocationHandler.invoke` (which has no Code
 /// attribute).
+thread_local! {
+    static LAMBDA_DISPATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn lambda_dispatch_active() -> bool {
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.get() != 0)
+}
+
 pub(crate) fn try_lambda_dispatch(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -25030,6 +25075,15 @@ pub(crate) fn try_lambda_dispatch(
         )));
     }
     let _lambda_depth_guard = LambdaDepthGuard;
+
+    struct LambdaDispatchGuard;
+    impl Drop for LambdaDispatchGuard {
+        fn drop(&mut self) {
+            LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _lambda_dispatch_guard = LambdaDispatchGuard;
 
     // Look up the lambda proxy metadata for this ClassId.
     let call_site = {
@@ -27770,6 +27824,10 @@ pub(crate) fn is_forkjoin_native_override(
                 )
                 | ("execute", "(Ljava/lang/Runnable;)V")
                 | ("execute", "(Ljava/util/concurrent/ForkJoinTask;)V")
+                | (
+                    "awaitQuiescence",
+                    "(JLjava/util/concurrent/TimeUnit;)Z"
+                )
         )
     {
         return true;
@@ -28606,6 +28664,22 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Real-JDK constant-surface bridges. Keep in sync with vm_exec.rs.
+    if matches!(
+        (class_name, method_name, method_descriptor),
+        ("java/nio/charset/Charset", "contains", "(Ljava/nio/charset/Charset;)Z")
+            | ("java/nio/file/Files", "getOwner", "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/UserPrincipal;")
+            | ("java/lang/StackFrameInfo", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+            | ("java/net/DatagramSocket", "<init>", "()V")
+            | ("java/net/DatagramSocket", "<init>", "(I)V")
+            | ("java/net/DatagramSocket", "<init>", "(ILjava/net/InetAddress;)V")
+            | ("java/net/DatagramSocket", "connect", "(Ljava/net/InetAddress;I)V")
+            | ("java/net/DatagramSocket", "disconnect", "()V")
+            | ("java/lang/StackWalker$StackFrame", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+            | ("java/lang/StackWalker$StackFrame", "getDescriptor", "()Ljava/lang/String;")
+    ) {
+        return true;
+    }
     // JDK 25's public Class.getProtectionDomain() reads a VM-populated private
     // mirror field directly. CratonVM's mirrors retain class provenance in the
     // class store instead, so force the registered class-id-backed native.
@@ -28786,6 +28860,15 @@ fn force_native_over_real_jdk_bytecode(
     // mirror, so run the registered bridge which canonicalises through the VM
     // ClassId before delegating to JFR's String-keyed lookup.
     if is_jfr_metadata_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Reflective Method mirrors may expose stale physical returnType slots in
+    // the real JDK. The registered accessor derives the answer from the
+    // member descriptor, which is authoritative for JFR annotation metadata.
+    if class_name == "java/lang/reflect/Method"
+        && method_name == "getReturnType"
+        && method_descriptor == "()Ljava/lang/Class;"
+    {
         return true;
     }
     // The platform-server bridge returns a synthetic MBeanServer receiver.
@@ -29513,6 +29596,36 @@ fn force_native_over_real_jdk_bytecode(
                 | "implAddExportsNoSync"
                 | "implAddOpens"
                 | "implAddOpensToAllUnnamed"
+        )
+    {
+        return true;
+    }
+    // JavaLangAccess is implemented by the concrete System$1 singleton. The
+    // JDK module bootstrap calls these ordinary Java methods through that
+    // receiver, so native registrations must win over its real bytecode.
+    if class_name == "java/lang/System$1"
+        && matches!(
+            (method_name, method_descriptor),
+            ("addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")
+                | ("addReadsAllUnnamed", "(Ljava/lang/Module;)V")
+                | ("addExports", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                | (
+                    "addExports",
+                    "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V"
+                )
+                | (
+                    "addExportsToAllUnnamed",
+                    "(Ljava/lang/Module;Ljava/lang/String;)V"
+                )
+                | (
+                    "addOpens",
+                    "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V"
+                )
+                | (
+                    "addOpensToAllUnnamed",
+                    "(Ljava/lang/Module;Ljava/lang/String;)V"
+                )
+                | ("addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
         )
     {
         return true;
@@ -30674,7 +30787,7 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL")
+            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL" | "close")
                 || (method_name == "<init>"
                     && matches!(
                         method_descriptor,
@@ -30941,7 +31054,21 @@ fn is_jfr_metadata_native_override(
             "getValidType",
             "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;"
         ) | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
+            | ("jdk/jfr/internal/instrument/JDKEvents", "initialize", "()V")
             | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
+            | ("jdk/jfr/Event", "begin", "()V")
+            | ("jdk/jfr/Event", "end", "()V")
+            | ("jdk/jfr/Event", "commit", "()V")
+            | ("jdk/jfr/Event", "isEnabled", "()Z")
+            | ("jdk/jfr/Event", "shouldCommit", "()Z")
+            | (
+                "jdk/jfr/AnnotationElement",
+                "checkType",
+                "(Ljava/lang/Class;)V"
+            )
+            | ("jdk/jfr/Recording", "start", "()V")
+            | ("jdk/jfr/Recording", "stop", "()Z")
+            | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
     )
 }
 

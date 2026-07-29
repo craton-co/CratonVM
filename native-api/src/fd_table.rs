@@ -1892,6 +1892,54 @@ impl FileDescriptorTable {
         }
     }
 
+    /// The raw OS descriptor of a UDP socket, for the options no portable
+    /// wrapper exposes.
+    ///
+    /// `jdk.net.ExtendedSocketOptions`' `IP_DONTFRAGMENT` is a datagram option,
+    /// so `native-io`'s extended-option bridge has to reach a socket that lives
+    /// in THIS table rather than in either TCP registry. `None` for a handle
+    /// that is not a UDP socket.
+    #[cfg(unix)]
+    pub fn udp_raw_fd(&self, fd: FdId) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        match &*self.get_entry(fd)? {
+            FileEntry::UdpSocket(s) => Some(s.as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    /// Windows twin of [`Self::udp_raw_fd`], returning the raw `SOCKET`.
+    #[cfg(windows)]
+    pub fn udp_raw_socket(&self, fd: FdId) -> Option<u64> {
+        use std::os::windows::io::AsRawSocket;
+        match &*self.get_entry(fd)? {
+            FileEntry::UdpSocket(s) => Some(s.as_raw_socket()),
+            _ => None,
+        }
+    }
+
+    /// The raw OS descriptor of a TCP stream, for the same reason as
+    /// [`Self::udp_raw_fd`]: `jdk.net.ExtendedSocketOptions`' keepalive knobs
+    /// have no portable wrapper and must reach `setsockopt` directly.
+    #[cfg(unix)]
+    pub fn tcp_raw_fd(&self, fd: FdId) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        match &*self.get_entry(fd)? {
+            FileEntry::TcpStream(s) => Some(s.lock().as_raw_fd()),
+            _ => None,
+        }
+    }
+
+    /// Windows twin of [`Self::tcp_raw_fd`], returning the raw `SOCKET`.
+    #[cfg(windows)]
+    pub fn tcp_raw_socket(&self, fd: FdId) -> Option<u64> {
+        use std::os::windows::io::AsRawSocket;
+        match &*self.get_entry(fd)? {
+            FileEntry::TcpStream(s) => Some(s.lock().as_raw_socket()),
+            _ => None,
+        }
+    }
+
     /// Set the IP type-of-service / DSCP byte on a UDP socket (IP_TOS).
     ///
     /// Added so `DatagramChannel.setTrafficClass` could stop being a silent
@@ -1979,6 +2027,97 @@ impl FileDescriptorTable {
                 return Ok(());
             }
             Err(io::Error::from_raw_os_error(code))
+        }
+    }
+
+    /// Read an integer Winsock option from a UDP socket by its Java fd-table id.
+    ///
+    /// This is intentionally Windows-only: `WindowsSocketOptions` receives
+    /// CratonVM handle ids, not raw `SOCKET` values, so native-io needs this
+    /// table-owned bridge for DatagramSocket/IP_DONTFRAGMENT.
+    #[cfg(windows)]
+    pub fn udp_get_socket_option_i32(
+        &self,
+        fd: FdId,
+        level: i32,
+        option: i32,
+    ) -> Result<i32, io::Error> {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn getsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *mut u8,
+                optlen: *mut i32,
+            ) -> i32;
+            fn WSAGetLastError() -> i32;
+        }
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        let FileEntry::UdpSocket(socket) = &*entry else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"));
+        };
+        let mut value = 0i32;
+        let mut size = std::mem::size_of::<i32>() as i32;
+        let rc = unsafe {
+            getsockopt(
+                socket.as_raw_socket() as usize,
+                level,
+                option,
+                (&mut value as *mut i32).cast(),
+                &mut size,
+            )
+        };
+        if rc == 0 {
+            Ok(value)
+        } else {
+            Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        }
+    }
+
+    /// Set an integer Winsock option on a UDP socket by its Java fd-table id.
+    #[cfg(windows)]
+    pub fn udp_set_socket_option_i32(
+        &self,
+        fd: FdId,
+        level: i32,
+        option: i32,
+        value: i32,
+    ) -> Result<(), io::Error> {
+        use std::os::windows::io::AsRawSocket;
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn setsockopt(
+                s: usize,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+            fn WSAGetLastError() -> i32;
+        }
+        let entry = self
+            .get_entry(fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"))?;
+        let FileEntry::UdpSocket(socket) = &*entry else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "bad fd for udp"));
+        };
+        let rc = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                level,
+                option,
+                (&value as *const i32).cast(),
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
         }
     }
 
