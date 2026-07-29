@@ -3787,6 +3787,33 @@ pub trait NativeSystemAccess: NativeThreadAccess {
     /// lib_index -1 means search the default/system library.
     fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize>;
 
+    /// Release a library previously returned by
+    /// [`load_native_library`](Self::load_native_library) — the backing for
+    /// `jdk.internal.loader.RawNativeLibraries.unload0`, whose real body
+    /// `dlclose`s / `FreeLibrary`s the handle.
+    ///
+    /// Returns `true` if `lib_index` named a live library that this call
+    /// retired, `false` for an out-of-range index, an already-unloaded one, or
+    /// an implementation that cannot unload.
+    ///
+    /// # Contract
+    ///
+    /// This is a *logical* unload: implementations MUST make subsequent
+    /// [`find_native_symbol`](Self::find_native_symbol) calls for the index
+    /// fail, but are NOT required to unmap the library. Keeping the mapping
+    /// resident is the safe direction of the two errors — a caller can still
+    /// hold function pointers obtained from an earlier lookup (a bound FFM
+    /// downcall stub does), and unmapping underneath those segfaults, while a
+    /// retained mapping costs only address space. Indices are never recycled
+    /// while a load is live, so an unloaded index stays unloaded until
+    /// `load_native_library` hands that index out again.
+    ///
+    /// The default implementation is a no-op returning `false`, preserving the
+    /// behaviour of implementations that have no unload path.
+    fn unload_native_library(&mut self, _lib_index: i64) -> bool {
+        false
+    }
+
     /// Register an upcall entry (Java callback for C). Returns the slot index.
     ///
     /// # Security (M4c — confused deputy via slot reuse)

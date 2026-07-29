@@ -87,12 +87,86 @@ separate defect were fixed.
   Panama gating, so it is a decision about the security model rather than a
   stub to remove.
 
-## A trap worth keeping in mind
+## OPEN: the synthetic field-table trap has not been audited systematically
 
-A synthetic field-table entry that is **too short fails silently**.
-`set_field` past the end of an object DROPS the write rather than erroring, so
-the native looks implemented while storing nothing. `HttpExchange` declared 8
-slots while the code used 9 (losing the authenticated principal);
-`DatagramPacket` and `Preferences` had no entry at all and allocated zero-slot
-objects. If you add a slot constant in a native file, add it to
-`classloading::synthetic_stub_fields` in the same change.
+A `classloading::synthetic_stub_fields` entry that is **too short fails
+silently**. `set_field` past the end of an object DISCARDS the write rather
+than erroring, so the natives look implemented and store nothing.
+
+**Five confirmed instances, all fixed 2026-07-28** — the rate is the point,
+which is why this needs an audit rather than fixing them as they surface:
+
+| class | declared | needed | effect of the gap |
+|---|---|---|---|
+| `HttpExchange` | 8 | 9 (now 11) | authenticated principal lost |
+| `HttpServer` | 5 | 6 | `setExecutor` discarded |
+| `sun/net/httpserver/HttpServerImpl` | *absent* (table keyed `com/...`) | 6 | wrong package entirely |
+| `java/net/DatagramSocket` | *absent* | 4 | whole phase-72 set inert, incl. the ctor's fd |
+| `DatagramPacket`, `Preferences` | *absent* | 5 | every raw-slot native inert |
+
+**Who is exposed**: only classes whose instances are created by **bytecode
+`new`**, since that path sizes the object from this table. Call sites using
+`alloc_concurrent_synthetic(ctx, name, n)` pass an explicit count and take
+`max(requested, real)`, so they are safe — of 504 such sites, 368 name a class
+with no table entry, and that is FINE. Do not read that number as a bug count.
+
+**What has NOT been done**: nobody has enumerated the classes that are both
+`new`-instantiated from Java AND read by raw slot index from a native. That
+intersection is where any remaining instances live. Until then the rule is:
+**add the slot to `synthetic_stub_fields` in the same change as the constant in
+the native file**, and prefer `set_field_by_name` or an ObjectRef-keyed side
+table (as `net_phase_e::register_re7_datagram_socket` does) over raw slot
+indices on a class you do not allocate yourself.
+
+## OPEN: phase-72 DatagramSocket shadows a working implementation
+
+`phases_late::net_channels`'s phase-72 `java/net/DatagramSocket` set (slot
+based) registers *after* `net_phase_e::register_re7_datagram_socket` (side
+table based), so it wins in `--synthetic-jdk` builds for every overlapping key
+(`<init>`, `send`, `close`, `isClosed`, `getLocalPort`, `get/setSoTimeout`,
+`get/setReuseAddress`) — the broken set beating the working one. The field
+entry above makes the slot-based set functional, but the duplication remains
+and the two can drift. The StampedLock precedent applies: pick which registrar
+owns the class rather than leaving both.
+
+## OPEN: the phase-72 fixes are LATENT — synthetic-jdk only, unverified
+
+`DatagramSocket.connect/disconnect`, `DatagramChannel.disconnect` and the
+`HttpExchange.getLocalAddress/getRemoteAddress` getters were implemented
+2026-07-29, but they live in `phases_late::net_channels`'s phase-72 registrar,
+which is reached only from `register_synthetic_overrides` —
+`#[cfg(feature = "synthetic-jdk")]`, a non-default feature. Measured before and
+after against HotSpot 25 in the DEFAULT build, the probe output is byte
+identical:
+
+    http.exchange.localAddress   THREW:AbstractMethodError   (both)
+    http.exchange.remoteAddress  THREW:AbstractMethodError   (both)
+    udp.connect.then.disconnect  THREW:InternalError         (both)
+
+In the default build there is no native for these at all, so resolution lands
+on the abstract declaration. The producer half (`net_phase_e
+::re10_dispatch_pending` capturing the accepted socket's addresses) IS
+real-JDK-live; only the consumer half is gated. **Anyone finishing this needs
+to decide whether the phase-72 HTTP/datagram surface belongs on the live path,
+or whether the real-JDK path needs its own registrations.**
+
+Consequence for reviewers: these implementations are type-checked and reasoned
+but NOT behaviourally verified. Do not treat them as proven.
+
+## OPEN: `StackFrame.getDescriptor()` still throws (fix did not land)
+
+`StackWalker.getInstance(RETAIN_CLASS_REFERENCE).walk(.. getDescriptor())`
+throws `UnsupportedOperationException` where HotSpot 25 returns
+`()Ljava/lang/Object;`. `expandStackFrameInfo` was implemented on 2026-07-29
+specifically to fix this by filling the frame's `type` slot lazily — and the
+before/after probe is unchanged, so the exception originates somewhere other
+than the path that was changed. The `expandStackFrameInfo` work is still
+correct in itself; it is simply not what this call reaches. Next step is to
+find the actual thrower rather than to re-implement expansion.
+
+Related and also unchanged: `StackWalker.getInstance()` WITHOUT
+`RETAIN_CLASS_REFERENCE` still allows `getDeclaringClass()` where HotSpot
+throws. `ClassFrameInfo.ensureRetainClassRefEnabled()` now implements the check
+honestly and `populate_sfi` propagates the walker's flag, but the shadowing
+`getDeclaringClass()` native deliberately does not consult it (matching the
+documented choice for the sibling carrier in `phases_late::reflect_invoke`).
