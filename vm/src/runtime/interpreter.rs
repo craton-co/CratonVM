@@ -1513,6 +1513,49 @@ pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
     maybe_gc_forced(shared, thread);
 }
 
+/// Allocate a dynamically-produced `java.lang.String` under the SAME
+/// heap-exhaustion contract as `new`: collect, retry, and finally raise a
+/// catchable `OutOfMemoryError` -- never abort the process.
+///
+/// `vm_object::create_java_string_uninterned` cannot do this: it takes only a
+/// `&SharedVm`, and every GC entry point needs the calling thread (to retire
+/// its TLAB and contribute its roots). So its exhaustion path was a bare
+/// `eprintln!` + `std::process::abort()`, which turned a plain `"a" + b` on a
+/// full heap into an un-catchable VM kill. HotSpot throws
+/// `OutOfMemoryError: Java heap space` there, and a Java program is entitled to
+/// catch it. Reproduced with a 25-line probe under `-Xmx64m -XX:+UseG1GC`:
+/// `FATAL: heap exhausted allocating java/lang/String (46 units)` (from the
+/// `System.out.println("iter=" + i)` in the allocation loop) followed by
+/// SIGABRT, where HotSpot reports `OutOfMemoryError` and keeps running.
+pub(crate) fn create_string_or_oom(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    text: &str,
+) -> Result<ObjectRef, MethodCallFailed> {
+    use crate::vm::try_create_java_string_uninterned as try_new_string;
+    if let Some(obj) = try_new_string(shared, text) {
+        return Ok(obj);
+    }
+    // Same escalation ladder as `alloc_object_shared`: forced young/full GC,
+    // then G1's last-ditch complete mark cycle (dead Old/humongous spans are
+    // only reclaimed by a finished cycle's cleanup), then OOM.
+    thread.tlab.retire();
+    maybe_gc_forced(shared, thread);
+    if let Some(obj) = try_new_string(shared, text) {
+        return Ok(obj);
+    }
+    g1_force_full_cycle(shared, thread);
+    if let Some(obj) = try_new_string(shared, text) {
+        return Ok(obj);
+    }
+    maybe_dump_heap_on_oom(shared, thread);
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::OutOfMemoryError {
+            message: format!("Java heap space (String of {} chars)", text.len()),
+        },
+    )))
+}
+
 fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
     // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
@@ -3359,6 +3402,13 @@ fn tlab_alloc_array(
 }
 
 /// Try to allocate an array, running GC and retrying on failure.
+///
+/// `try_alloc_array_full` is deliberately used rather than the young-only
+/// `try_alloc_array`: it has the same young-first policy, but once a
+/// non-moving JIT-safe sweep has left the young generation fragmented it can
+/// spill the request into old space.  This matches `alloc_object_shared`'s
+/// object path.  Retrying young-only here used to report OOM for a tiny array
+/// while most of the heap was available as old-generation headroom.
 fn gc_alloc_array(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -3372,7 +3422,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3392,7 +3442,7 @@ fn gc_alloc_array(
     if let Some(arr) = shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
     {
         return Ok(arr);
     }
@@ -3403,7 +3453,7 @@ fn gc_alloc_array(
     shared
         .mem
         .heap
-        .try_alloc_array(class_id, element_type, length)
+        .try_alloc_array_full(class_id, element_type, length)
         .ok_or_else(|| {
             maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
@@ -7212,13 +7262,43 @@ pub fn execute(
                                 // rather than leave it for a later invocation to
                                 // mis-claim. A callee's frame is left alone: its
                                 // exception is still in flight.
+                                if lambda_dispatch_active() {
+                                    let cached = Arc::new(CachedBytecodeMethod {
+                                        declaring_class_id: class_id,
+                                        class_name: Arc::from(class_name_str.as_str()),
+                                        method_name: Arc::from(method_name),
+                                        method_descriptor: Arc::from(method_descriptor),
+                                        source_file: source_file.as_deref().map(Arc::from),
+                                        code: crate::runtime::frame::padded_bytecode(&code_attr.code),
+                                        exception_table: Arc::from(code_attr.exception_table.as_slice()),
+                                        max_stack: code_attr.max_stack,
+                                        max_locals: code_attr.max_locals,
+                                        num_params: count_method_params(method_descriptor) as u16,
+                                        is_synchronized,
+                                        is_static,
+                                        force_native_cache: std::sync::OnceLock::new(),
+                                        native_callback_cache: std::sync::OnceLock::new(),
+                                        invoc_key: std::sync::OnceLock::new(),
+                                        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                                        quickened: std::sync::OnceLock::new(),
+                                    });
+                                    let throw_pc = jit_local_athrow_pc(
+                                        &cached,
+                                        crate::jit::helpers::peek_jit_athrow_bci(),
+                                    );
+                                    crate::jit::helpers::clear_jit_athrow_bci();
+                                    if let Some(result) = run_jit_callee_handler(
+                                        shared, thread, &cached, throw_pc, exc, args,
+                                    ) {
+                                        return result;
+                                    }
+                                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                                }
                                 drop_own_exceptional_frame(
                                     &class_name_str,
                                     method_name,
                                     method_descriptor,
                                 );
-                                // Stash the exception in a variable visible to the interpreter
-                                // loop that runs below (after frame push).
                                 jit_early_exception = Some(exc);
                             } else {
                                 let result = match jit_result {
@@ -11969,28 +12049,37 @@ fn find_exception_handler_impl(
         // in the lazy-load branch just below.
         let catch_class_name_owned = catch_class_name.to_string();
 
-        // Try to find the catch type class on the held lock — `&str`,
-        // no allocation.
-        let catch_class_id =
-            match cm_guard.find_class_by_name_for_class(catch_class_name, frame.class_id) {
-                Some(id) => id,
-                None => {
-                    // Lazy load: must drop the read lock since
-                    // `load_class_concurrent` acquires the write lock.
-                    // Copy the name into an owned String only on this
-                    // (rare) slow path.
-                    let owned = catch_class_name.to_string();
-                    drop(cm_guard);
-                    let loaded = shared.load_class_concurrent(&owned);
-                    cm_guard = shared.classes.class_manager.read();
-                    match loaded {
-                        Ok(id) => id,
-                        Err(_) => continue, // Can't load catch type — skip handler
-                    }
-                }
-            };
+        // Try to find the catch type class on the held lock.
+        let mut catch_class_id =
+            cm_guard.find_class_by_name_for_class(&catch_class_name_owned, frame.class_id);
+        if catch_class_id.is_none() {
+            // A catch type that is not already loaded must NEVER be lazily
+            // loaded through the loader-blind global path when that path would
+            // fabricate a synthetic stub. `load_class_concurrent` searches only
+            // the bootstrap/application classpath, and a class visible solely
+            // through a custom loader (Quarkus's `RunnerClassLoader`, which owns
+            // every `lib/main/*.jar` of a fast-jar distribution) is not on it —
+            // so the "load" succeeded by MINTING a code-less stub and
+            // registering it globally under that name, permanently poisoning it
+            // for the loader that does own the real class. Observed on the
+            // Keycloak 26.6.1 boot: `io/quarkus/runtime/PreventFurtherStepsException`
+            // (in `io.quarkus.quarkus-core-*.jar`) was stubbed from this very
+            // site every time Quarkus's shutdown path unwound.
+            //
+            // Nothing is lost by skipping it: the by-name subclass test below
+            // walks the THROWN object's own superclass chain and needs no
+            // ClassId for the catch type at all.
+            if !cm_guard.would_fabricate_synthetic_stub(&catch_class_name_owned) {
+                // Lazy load: must drop the read lock since
+                // `load_class_concurrent` acquires the write lock.
+                drop(cm_guard);
+                let loaded = shared.load_class_concurrent(&catch_class_name_owned);
+                cm_guard = shared.classes.class_manager.read();
+                catch_class_id = loaded.ok();
+            }
+        }
 
-        if cm_guard.is_subclass_of(exc_class_id, catch_class_id)
+        if catch_class_id.is_some_and(|id| cm_guard.is_subclass_of(exc_class_id, id))
             || cm_guard.is_subclass_of_by_name(exc_class_id, &catch_class_name_owned)
         {
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -25020,6 +25109,14 @@ fn try_invoke_cached_lambda_impl(
 /// `invoke_or_native` fallback would mis-route to the abstract
 /// `java/lang/reflect/InvocationHandler.invoke` (which has no Code
 /// attribute).
+thread_local! {
+    static LAMBDA_DISPATCH_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn lambda_dispatch_active() -> bool {
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.get() != 0)
+}
+
 pub(crate) fn try_lambda_dispatch(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -25063,6 +25160,15 @@ pub(crate) fn try_lambda_dispatch(
         )));
     }
     let _lambda_depth_guard = LambdaDepthGuard;
+
+    struct LambdaDispatchGuard;
+    impl Drop for LambdaDispatchGuard {
+        fn drop(&mut self) {
+            LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+    LAMBDA_DISPATCH_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _lambda_dispatch_guard = LambdaDispatchGuard;
 
     // Look up the lambda proxy metadata for this ClassId.
     let call_site = {
@@ -27803,6 +27909,10 @@ pub(crate) fn is_forkjoin_native_override(
                 )
                 | ("execute", "(Ljava/lang/Runnable;)V")
                 | ("execute", "(Ljava/util/concurrent/ForkJoinTask;)V")
+                | (
+                    "awaitQuiescence",
+                    "(JLjava/util/concurrent/TimeUnit;)Z"
+                )
         )
     {
         return true;
@@ -28106,6 +28216,13 @@ pub(crate) fn is_stamped_lock_native_override(
                 | ("tryWriteLock", "()J")
                 | ("tryConvertToWriteLock", "(J)J")
                 | ("tryConvertToReadLock", "(J)J")
+                | ("tryConvertToOptimisticRead", "(J)J")
+                | ("unlock", "(J)V")
+                | ("readLockInterruptibly", "()J")
+                | ("writeLockInterruptibly", "()J")
+                | ("tryReadLock", "(JLjava/util/concurrent/TimeUnit;)J")
+                | ("tryWriteLock", "(JLjava/util/concurrent/TimeUnit;)J")
+                | ("isLocked", "()Z")
                 | ("isWriteLocked", "()Z")
                 | ("isReadLocked", "()Z")
                 | ("getReadLockCount", "()I")
@@ -28632,6 +28749,22 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Real-JDK constant-surface bridges. Keep in sync with vm_exec.rs.
+    if matches!(
+        (class_name, method_name, method_descriptor),
+        ("java/nio/charset/Charset", "contains", "(Ljava/nio/charset/Charset;)Z")
+            | ("java/nio/file/Files", "getOwner", "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/UserPrincipal;")
+            | ("java/lang/StackFrameInfo", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+            | ("java/net/DatagramSocket", "<init>", "()V")
+            | ("java/net/DatagramSocket", "<init>", "(I)V")
+            | ("java/net/DatagramSocket", "<init>", "(ILjava/net/InetAddress;)V")
+            | ("java/net/DatagramSocket", "connect", "(Ljava/net/InetAddress;I)V")
+            | ("java/net/DatagramSocket", "disconnect", "()V")
+            | ("java/lang/StackWalker$StackFrame", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+            | ("java/lang/StackWalker$StackFrame", "getDescriptor", "()Ljava/lang/String;")
+    ) {
+        return true;
+    }
     // JDK 25's public Class.getProtectionDomain() reads a VM-populated private
     // mirror field directly. CratonVM's mirrors retain class provenance in the
     // class store instead, so force the registered class-id-backed native.
@@ -28812,6 +28945,15 @@ fn force_native_over_real_jdk_bytecode(
     // mirror, so run the registered bridge which canonicalises through the VM
     // ClassId before delegating to JFR's String-keyed lookup.
     if is_jfr_metadata_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    // Reflective Method mirrors may expose stale physical returnType slots in
+    // the real JDK. The registered accessor derives the answer from the
+    // member descriptor, which is authoritative for JFR annotation metadata.
+    if class_name == "java/lang/reflect/Method"
+        && method_name == "getReturnType"
+        && method_descriptor == "()Ljava/lang/Class;"
+    {
         return true;
     }
     // The platform-server bridge returns a synthetic MBeanServer receiver.
@@ -29539,6 +29681,36 @@ fn force_native_over_real_jdk_bytecode(
                 | "implAddExportsNoSync"
                 | "implAddOpens"
                 | "implAddOpensToAllUnnamed"
+        )
+    {
+        return true;
+    }
+    // JavaLangAccess is implemented by the concrete System$1 singleton. The
+    // JDK module bootstrap calls these ordinary Java methods through that
+    // receiver, so native registrations must win over its real bytecode.
+    if class_name == "java/lang/System$1"
+        && matches!(
+            (method_name, method_descriptor),
+            ("addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")
+                | ("addReadsAllUnnamed", "(Ljava/lang/Module;)V")
+                | ("addExports", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                | (
+                    "addExports",
+                    "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V"
+                )
+                | (
+                    "addExportsToAllUnnamed",
+                    "(Ljava/lang/Module;Ljava/lang/String;)V"
+                )
+                | (
+                    "addOpens",
+                    "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V"
+                )
+                | (
+                    "addOpensToAllUnnamed",
+                    "(Ljava/lang/Module;Ljava/lang/String;)V"
+                )
+                | ("addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
         )
     {
         return true;
@@ -30700,7 +30872,7 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL")
+            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL" | "close")
                 || (method_name == "<init>"
                     && matches!(
                         method_descriptor,
@@ -30967,7 +31139,21 @@ fn is_jfr_metadata_native_override(
             "getValidType",
             "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;"
         ) | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
+            | ("jdk/jfr/internal/instrument/JDKEvents", "initialize", "()V")
             | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
+            | ("jdk/jfr/Event", "begin", "()V")
+            | ("jdk/jfr/Event", "end", "()V")
+            | ("jdk/jfr/Event", "commit", "()V")
+            | ("jdk/jfr/Event", "isEnabled", "()Z")
+            | ("jdk/jfr/Event", "shouldCommit", "()Z")
+            | (
+                "jdk/jfr/AnnotationElement",
+                "checkType",
+                "(Ljava/lang/Class;)V"
+            )
+            | ("jdk/jfr/Recording", "start", "()V")
+            | ("jdk/jfr/Recording", "stop", "()Z")
+            | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
     )
 }
 
@@ -42084,6 +42270,165 @@ fn native_override_for_cached_reflect_invoke(
 /// Fast invokevirtual/invokeinterface/invokespecial using monomorphic inline cache
 /// (stackless dispatch). Returns FramePushed for bytecode cache hits,
 /// Handled for native, CacheMiss for fall-through.
+/// Execute the canonical instance-field accessor body without allocating an
+/// interpreter frame.
+///
+/// A substantial fraction of real workloads are made of generated getters
+/// (`aload_0; getfield; <x>return`).  They are semantically simple, but even
+/// with an already-warm virtual-call cache the normal interpreter path still
+/// builds a frame, executes three bytecodes, and tears the frame down.  That
+/// dominates `--nojit` graph-planning workloads, where the accessors are hot
+/// enough that compiling them would normally hide the cost.
+///
+/// This deliberately accepts only the exact five-byte verifier-safe shape,
+/// uses an *already resolved* field entry (a cold symbolic reference falls
+/// through to ordinary bytecode), and stays out of every JVMTI/redefinition
+/// mode that needs to observe the callee frame or field access.  It therefore
+/// has the same field value and exception behaviour as the bytecode body while
+/// retaining the normal path for all observable instrumentation cases.
+fn try_execute_cached_trivial_instance_getter(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    cached: &CachedBytecodeMethod,
+    args: &[Value],
+) -> Result<Option<CachedCallResult>, MethodCallFailed> {
+    if cached.is_static
+        || cached.is_synchronized
+        || cached.num_params != 0
+        || args.len() != 1
+        || crate::classloading::any_class_redefined()
+        || crate::runtime::jvmti::any_method_entry_listener_active()
+        || crate::runtime::jvmti::any_method_exit_listener_active()
+        || crate::runtime::jvmti::any_field_watchpoint_active()
+    {
+        return Ok(None);
+    }
+
+    // Cached bytecode carries two speculative-read padding bytes.
+    let code_len = cached.code.len().saturating_sub(2);
+    let code = &cached.code[..code_len];
+    if code.len() != 5 || code[0] != 0x2a || code[1] != 0xb4 {
+        return Ok(None);
+    }
+    let return_opcode = code[4];
+    if !matches!(return_opcode, 0xac | 0xad | 0xae | 0xaf | 0xb0) {
+        return Ok(None);
+    }
+    let field_cp_index = u16::from_be_bytes([code[2], code[3]]);
+
+    // Do not resolve here: resolving a first-use symbolic reference may load
+    // classes and collect, while the decoded argument is intentionally a
+    // short-lived Rust local.  The ordinary first invocation resolves it and
+    // all later invocations can use this pure cache hit.
+    let field = match shared
+        .classes
+        .resolution_cache
+        .read()
+        .get_field(cached.declaring_class_id, field_cp_index)
+    {
+        Some(field) if !field.is_static && !field.is_volatile => field.clone(),
+        _ => return Ok(None),
+    };
+
+    // Validate that the field descriptor is precisely this method's return
+    // descriptor, not just the broad return opcode category.
+    let descriptor_matches = {
+        let cm = shared.classes.class_manager.read();
+        let Some(class) = cm.get_class(cached.declaring_class_id) else {
+            return Ok(None);
+        };
+        let Some(ConstantPoolEntry::FieldReference {
+            name_and_type_index,
+            ..
+        }) = class.constant_pool.get(field_cp_index)
+        else {
+            return Ok(None);
+        };
+        let Some((_, field_descriptor)) =
+            class.constant_pool.get_name_and_type(*name_and_type_index)
+        else {
+            return Ok(None);
+        };
+        cached
+            .method_descriptor
+            .strip_prefix("()")
+            .is_some_and(|return_descriptor| return_descriptor == field_descriptor)
+    };
+    if !descriptor_matches {
+        return Ok(None);
+    }
+
+    let return_matches_field = matches!(
+        (field.desc_byte, return_opcode),
+        (b'J', 0xad)
+            | (b'F', 0xae)
+            | (b'D', 0xaf)
+            | (b'L' | b'[', 0xb0)
+            | (b'Z' | b'B' | b'C' | b'S' | b'I', 0xac)
+    );
+    if !return_matches_field {
+        return Ok(None);
+    }
+
+    let Value::Object(Some(receiver)) = args[0] else {
+        // The normal invokevirtual null check remains responsible for the
+        // precisely constructed NPE and its stack trace.
+        return Ok(None);
+    };
+    let receiver = shared.mem.heap.load_and_forward(receiver);
+    let mut value = shared.mem.heap.get_field(receiver, field.field_index);
+    match field.desc_byte {
+        b'J' => {
+            let bits = match value {
+                Value::Long(x) => x,
+                Value::Double(x) => x.to_bits() as i64,
+                Value::Int(x) => x as i64,
+                Value::Object(None) | Value::Uninitialized => 0,
+                Value::Object(Some(raw)) => raw.as_ptr() as usize as i64,
+                Value::Float(x) => x.to_bits() as i64,
+                Value::ReturnAddress(pc) => pc as i64,
+            };
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_long_checked(CompactValue::long(bits))?;
+        }
+        b'D' => {
+            let number = match value {
+                Value::Double(x) => x,
+                Value::Long(x) => f64::from_bits(x as u64),
+                Value::Int(x) => x as f64,
+                Value::Object(None) | Value::Uninitialized => 0.0,
+                Value::Object(Some(raw)) => f64::from_bits(raw.as_ptr() as usize as u64),
+                Value::Float(x) => x as f64,
+                Value::ReturnAddress(pc) => pc as f64,
+            };
+            thread.frames[frame_idx]
+                .stack
+                .push_compact_double_checked(CompactValue::double(number))?;
+        }
+        _ => {
+            if field.is_reference {
+                if matches!(value, Value::Int(0) | Value::Long(0)) {
+                    value = Value::Object(None);
+                }
+            } else {
+                value = match value {
+                    Value::Object(None) => Value::Int(0),
+                    Value::Object(Some(raw)) => Value::Int(raw.as_ptr() as usize as i32),
+                    other => other,
+                };
+                value = narrow_int_to_field_type(value, field.desc_byte);
+            }
+            if let Value::Object(Some(object)) = value {
+                value = Value::Object(Some(shared.mem.heap.load_and_forward(object)));
+            }
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+        }
+    }
+    Ok(Some(CachedCallResult::Handled))
+}
+
 fn execute_invokevirtual_cached(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -42696,6 +43041,12 @@ fn execute_invokevirtual_cached(
                         shared, thread, frame_idx, &cached, args_slice,
                     ) {
                         return res;
+                    }
+
+                    if let Some(result) = try_execute_cached_trivial_instance_getter(
+                        shared, thread, frame_idx, &cached, args_slice,
+                    )? {
+                        return Ok(result);
                     }
 
                     // (bug-03 layer B, default-ON; off-switch CRATONVM_JIT_VIRTUAL_TIERUP=0)
@@ -46428,6 +46779,13 @@ mod tests {
             ("tryWriteLock", "()J"),
             ("tryConvertToWriteLock", "(J)J"),
             ("tryConvertToReadLock", "(J)J"),
+            ("tryConvertToOptimisticRead", "(J)J"),
+            ("unlock", "(J)V"),
+            ("readLockInterruptibly", "()J"),
+            ("writeLockInterruptibly", "()J"),
+            ("tryReadLock", "(JLjava/util/concurrent/TimeUnit;)J"),
+            ("tryWriteLock", "(JLjava/util/concurrent/TimeUnit;)J"),
+            ("isLocked", "()Z"),
             ("isWriteLocked", "()Z"),
             ("isReadLocked", "()Z"),
             ("getReadLockCount", "()I"),

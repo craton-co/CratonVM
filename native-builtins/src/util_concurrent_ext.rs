@@ -4623,6 +4623,39 @@ pub(crate) fn register_executor_natives(registry: &mut NativeMethodRegistry) {
 /// `ForkJoinTask.fork/invoke/submit(ForkJoinTask)` compute path stays
 /// eager-inline (CPU-bound, must not spawn threads). If the pool can't be
 /// created we fall back to inline so the completion contract still holds.
+static ASYNC_FUTURE_ROOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn track_async_future(ctx: &mut dyn NativeContext, future: ObjectRef) {
+    let handle = ctx.add_global_root(future);
+    if handle != 0 {
+        ASYNC_FUTURE_ROOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(handle);
+    }
+}
+
+pub(crate) fn async_tasks_quiescent(ctx: &mut dyn NativeContext) -> bool {
+    let mut roots = ASYNC_FUTURE_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = false;
+    roots.retain(|handle| {
+        let done = ctx.resolve_global_root(*handle).and_then(|future| {
+            match ctx.invoke_virtual(future, "isDone", "()Z", &[]) {
+                Ok(Some(Value::Int(done))) => Some(done != 0),
+                _ => None,
+            }
+        });
+        if done == Some(true) {
+            ctx.remove_global_root(*handle);
+            false
+        } else {
+            pending = true;
+            true
+        }
+    });
+    !pending
+}
+
 pub(crate) fn spawn_runnable_on_real_thread(
     ctx: &mut dyn NativeContext,
     runnable: ObjectRef,
@@ -4640,14 +4673,29 @@ pub(crate) fn spawn_runnable_on_real_thread(
         // execute() is the ForkJoinPool.execute contract we are emulating here;
         // avoid wrapping every CompletableFuture async task in a FutureTask.
         let runnable_cur = ctx.read_native_pin(pin, runnable);
+        let future = match ctx.new_object_initialized(
+            "java/util/concurrent/FutureTask",
+            "(Ljava/lang/Runnable;Ljava/lang/Object;)V",
+            &[Value::Object(Some(runnable_cur)), Value::Object(None)],
+        )? {
+            Some(Value::Object(Some(future))) => future,
+            _ => {
+                ctx.unpin_native_roots(pin);
+                return ctx.invoke_virtual(runnable_cur, "run", "()V", &[]);
+            }
+        };
+        let future_pin = ctx.pin_native_root(future);
         let submitted = ctx.invoke_virtual(
             pool,
             "execute",
             "(Ljava/lang/Runnable;)V",
-            &[Value::Object(Some(runnable_cur))],
+            &[Value::Object(Some(ctx.read_native_pin(future_pin, future)))],
         );
+        let future = ctx.read_native_pin(future_pin, future);
+        ctx.unpin_native_roots(future_pin);
         ctx.unpin_native_roots(pin);
         submitted?;
+        track_async_future(ctx, future);
         let grace = async_submit_handoff_grace();
         if grace.is_zero() {
             std::thread::yield_now();
@@ -5149,7 +5197,8 @@ pub(crate) fn transition_real_executor_to_shutdown(
         // worker in the middle of a task must be allowed to finish it. See
         // `interrupt_executor_workers_filtered`.
         let executor = ctx.read_native_pin(executor_pin, executor);
-        let _ = crate::interrupt_executor_workers_filtered(ctx, executor, /* only_idle */ true);
+        let _ =
+            crate::interrupt_executor_workers_filtered(ctx, executor, /* only_idle */ true);
         // A ScheduledThreadPoolExecutor owns delayed tasks in its work queue.
         // Its real `onShutdown()` removes cancelled delayed tasks (including
         // JUnit's cancelled timeout watchdog); without it, the queue stays
@@ -5307,8 +5356,7 @@ fn native_sr_generate_seed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // algorithm intact while placing that one scalar state word in an AtomicI64.
 // The side table is keyed with the same moving-GC-stable identity protocol as
 // the other native lock state tables.
-fn aqls_state_table(
-) -> &'static parking_lot::Mutex<
+fn aqls_state_table() -> &'static parking_lot::Mutex<
     std::collections::HashMap<usize, std::sync::Arc<std::sync::atomic::AtomicI64>>,
 > {
     static TABLE: std::sync::OnceLock<
@@ -5338,8 +5386,7 @@ fn native_aqls_get_state(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let Some(Value::Object(Some(synchronizer))) = args.first() else {
         return Ok(Some(Value::Long(0)));
     };
-    let state = aqls_state_slot(ctx, *synchronizer)
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let state = aqls_state_slot(ctx, *synchronizer).load(std::sync::atomic::Ordering::SeqCst);
     Ok(Some(Value::Long(state)))
 }
 
@@ -5658,6 +5705,45 @@ pub fn register_stamped_lock_natives(registry: &mut NativeMethodRegistry) {
         "(J)J",
         native_stamped_try_convert_to_read,
     );
+    // The release path Agroal's `StampedCopyOnWriteArrayList` uses INSTEAD of
+    // `unlockWrite` -- see `stamped_lock::stamped_try_convert_to_optimistic`.
+    // While this was missing the call ran real JDK bytecode over a `state`
+    // field this backend does not drive, released nothing, and deadlocked the
+    // Keycloak boot.
+    registry.register(
+        sl,
+        "tryConvertToOptimisticRead",
+        "(J)J",
+        native_stamped_try_convert_to_optimistic,
+    );
+    // The rest of the blocking surface. Leaving ANY of these to real JDK
+    // bytecode reintroduces exactly the same class of bug: the bytecode spins
+    // on a `state` word nothing maintains.
+    registry.register(
+        sl,
+        "readLockInterruptibly",
+        "()J",
+        native_stamped_read_lock_interruptibly,
+    );
+    registry.register(
+        sl,
+        "writeLockInterruptibly",
+        "()J",
+        native_stamped_write_lock_interruptibly,
+    );
+    registry.register(
+        sl,
+        "tryReadLock",
+        "(JLjava/util/concurrent/TimeUnit;)J",
+        native_stamped_try_read_lock_timed,
+    );
+    registry.register(
+        sl,
+        "tryWriteLock",
+        "(JLjava/util/concurrent/TimeUnit;)J",
+        native_stamped_try_write_lock_timed,
+    );
+    registry.register(sl, "isLocked", "()Z", native_stamped_is_locked);
     registry.register(sl, "isWriteLocked", "()Z", native_stamped_is_write_locked);
     registry.register(sl, "isReadLocked", "()Z", native_stamped_is_read_locked);
     registry.register(
@@ -5975,10 +6061,7 @@ fn native_stamped_unlock_write(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 /// stamp (`STAMPED_ORIGIN` is even), so an odd stamp is a write stamp and
 /// an even non-zero stamp is a read stamp — mirroring the JDK's own
 /// `WBIT` test without depending on the JDK's exact bit layout.
-fn native_stamped_unlock_by_stamp(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
+fn native_stamped_unlock_by_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let Some(obj) = stamped_obj(args) else {
         return Ok(None);
     };
@@ -6000,8 +6083,12 @@ fn native_stamped_unlock_by_stamp(
         false
     } else if stamp & 1 != 0 {
         crate::stamped_lock::stamped_try_unstamped_unlock_write(addr)
-    } else {
+    } else if stamp & 2 != 0 {
         crate::stamped_lock::stamped_try_unstamped_unlock_read(addr)
+    } else {
+        // Neither mode bit set: an OPTIMISTIC observation stamp, which holds
+        // nothing. The JDK throws IllegalMonitorStateException for it too.
+        false
     };
     if !released {
         return Err(RuntimeError::IllegalMonitorStateException {
@@ -6092,14 +6179,123 @@ fn native_stamped_try_convert_to_read(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    let stamp = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => return Ok(Some(Value::Long(0))),
+    };
     let obj = match stamped_obj(args) {
         Some(o) => o,
         None => return Ok(Some(Value::Long(0))),
     };
     let addr = stamped_addr_for_obj(ctx, obj);
-    let converted = crate::stamped_lock::stamped_try_convert_to_read(addr);
+    let converted = crate::stamped_lock::stamped_try_convert_to_read(addr, stamp);
     mirror_stamped_state(ctx, obj, addr);
     Ok(Some(Value::Long(converted)))
+}
+
+/// `tryConvertToOptimisticRead(long stamp)` -- releases the hold `stamp`
+/// names and returns an observation stamp (0 when the stamp is stale).
+fn native_stamped_try_convert_to_optimistic(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let stamp = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => return Ok(Some(Value::Long(0))),
+    };
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let addr = stamped_addr_for_obj(ctx, obj);
+    let converted = crate::stamped_lock::stamped_try_convert_to_optimistic(addr, stamp);
+    mirror_stamped_state(ctx, obj, addr);
+    if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_STAMPED").is_some() {
+        eprintln!("[SL-DBG] tryConvertToOptimisticRead addr={addr:#x} stamp={stamp} -> {converted}");
+    }
+    Ok(Some(Value::Long(converted)))
+}
+
+/// `readLockInterruptibly()` / `writeLockInterruptibly()`.
+///
+/// This backend parks on a `parking_lot::Condvar`, which has no interrupt
+/// channel, so these behave as the uninterruptible acquire. That is a
+/// liveness-preserving approximation; leaving them to real JDK bytecode is
+/// not, because that bytecode queues on a `state` word this backend never
+/// writes and would never be released.
+fn native_stamped_read_lock_interruptibly(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_stamped_read_lock(ctx, args)
+}
+
+fn native_stamped_write_lock_interruptibly(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_stamped_write_lock(ctx, args)
+}
+
+/// Convert a `(long time, TimeUnit unit)` argument pair to nanoseconds by
+/// asking the unit itself, so any TimeUnit constant works without a table.
+fn stamped_timeout_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -> i64 {
+    let time = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => return 0,
+    };
+    let unit = match args.get(2) {
+        Some(Value::Object(Some(u))) => *u,
+        _ => return 0,
+    };
+    match ctx.invoke_virtual(unit, "toNanos", "(J)J", &[Value::Long(time)]) {
+        Ok(Some(Value::Long(n))) => n,
+        _ => 0,
+    }
+}
+
+fn native_stamped_try_read_lock_timed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let nanos = stamped_timeout_nanos(ctx, args);
+    let addr = stamped_addr_for_obj(ctx, obj);
+    ctx.begin_blocking_region();
+    let stamp = crate::stamped_lock::stamped_try_read_lock_timed(addr, nanos);
+    ctx.end_blocking_region();
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(stamp)))
+}
+
+fn native_stamped_try_write_lock_timed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let obj = match stamped_obj(args) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Long(0))),
+    };
+    let nanos = stamped_timeout_nanos(ctx, args);
+    let addr = stamped_addr_for_obj(ctx, obj);
+    ctx.begin_blocking_region();
+    let stamp = crate::stamped_lock::stamped_try_write_lock_timed(addr, nanos);
+    ctx.end_blocking_region();
+    mirror_stamped_state(ctx, obj, addr);
+    Ok(Some(Value::Long(stamp)))
+}
+
+fn native_stamped_is_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let addr = match stamped_addr(ctx, args) {
+        Some(a) => a,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(i32::from(
+        crate::stamped_lock::stamped_is_locked(addr),
+    ))))
 }
 
 fn native_stamped_is_write_locked(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -7901,10 +8097,13 @@ pub(crate) fn register_pd_structured_concurrency(r: &mut NativeMethodRegistry) {
 
 #[cfg(test)]
 mod concurrency_tests {
-    #[allow(unused_imports)]
-    use cratonvm_native_api::{NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess, NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess};
     use super::*;
     use crate::test_utils::MockNativeContext;
+    #[allow(unused_imports)]
+    use cratonvm_native_api::{
+        NativeClassAccess, NativeExceptionAccess, NativeGpuAccess, NativeHeapAccess,
+        NativeInvokeAccess, NativeSystemAccess, NativeThreadAccess,
+    };
 
     fn make_ctx() -> MockNativeContext {
         MockNativeContext::new()
@@ -8809,10 +9008,19 @@ mod concurrency_tests {
         let sl = ctx.alloc_object(ClassId::new(0), 1);
         native_stamped_init(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
 
-        native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))]).unwrap();
+        // `tryConvertToReadLock` is stamp-checked: it must be handed the stamp
+        // `writeLock()` actually returned (stamp 0 is the JDK's "no hold"
+        // sentinel and correctly converts to nothing).
+        let write_stamp = match native_stamped_write_lock(&mut ctx, &[Value::Object(Some(sl))])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Long(v) => v,
+            other => panic!("expected Long write stamp, got {other:?}"),
+        };
         let read_stamp = native_stamped_try_convert_to_read(
             &mut ctx,
-            &[Value::Object(Some(sl)), Value::Long(0)],
+            &[Value::Object(Some(sl)), Value::Long(write_stamp)],
         )
         .unwrap()
         .unwrap();

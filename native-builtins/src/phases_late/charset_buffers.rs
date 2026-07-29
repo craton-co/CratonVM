@@ -59,6 +59,52 @@ fn charset_contains(this: &str, other: &str) -> bool {
     }
 }
 
+/// Register the one Charset bridge that a real JDK cannot supply itself:
+/// `Charset.contains` is abstract, while the concrete `sun.nio.cs.*` classes
+/// do not expose Code attributes to CratonVM.  Keep this separate from the
+/// synthetic Charset registrar: its slot-based object constructors are not
+/// valid for a real JDK receiver.
+pub fn register_real_jdk_charset_contains(r: &mut NativeMethodRegistry) {
+    r.register(
+        "java/nio/charset/Charset",
+        "contains",
+        "(Ljava/nio/charset/Charset;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("Charset.contains: null charset".to_string()),
+                    }
+                    .into())
+                }
+            };
+            // `name()` is ordinary real-JDK bytecode and reads the real
+            // Charset.name field, unlike the synthetic-only slot helper.
+            let read_name = |ctx: &mut dyn NativeContext, value: ObjectRef| -> String {
+                match ctx.invoke_virtual(value, "name", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(name)))) => {
+                        ctx.read_string(name).unwrap_or_default()
+                    }
+                    _ => String::new(),
+                }
+            };
+            let this_name = read_name(ctx, this);
+            let other_name = read_name(ctx, other);
+            let canonical = |name: String| {
+                cratonvm_native_api::charset::canonical_charset_name(&name)
+                    .map(str::to_string)
+                    .unwrap_or(name)
+            };
+            Ok(Some(Value::Int(i32::from(charset_contains(
+                &canonical(this_name),
+                &canonical(other_name),
+            )))))
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // java.nio.charset — Charset, StandardCharsets
 // ---------------------------------------------------------------------------

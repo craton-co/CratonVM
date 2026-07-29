@@ -18,6 +18,23 @@
 > snapshot/parking-blocker code this doc describes, not a re-derivation from
 > the original symptom). Flagging as a confirmed root-cause/status
 > discrepancy rather than re-filing a duplicate doc.
+>
+> **Confirmed still failing 2026-07-28 (craton-rerun-20260728)** — identical
+> symptom to the 2026-07-23 note above: `dumpThreadsAsText()` still fails
+> the exact same regex match, the `"Awaiting CountDownLatch"` thread's block
+> still has no `"\t- parking to wait for <addr> (a
+> java.util.concurrent.CountDownLatch$Sync)"` line (shows `WAITING` state
+> and a frame, but no parking-blocker annotation):
+> ```
+> to contain pattern:
+>   "	- parking to wait for <[0-9a-z]+> \(a java\.util\.concurrent\.CountDownLatch\$Sync\)"
+>        org.springframework.boot.actuate.management.ThreadDumpEndpointTests.dumpThreadsAsText(ThreadDumpEndpointTests.java:102)
+> ```
+> Log: `apps/spring-boot-suite-runner/.suite/results/craton-rerun-20260728/shard2/logs/module_spring-boot-actuator.org.springframework.boot.actuate.management.ThreadDumpEndpointTests.out.log`.
+> Not re-investigated further this session (log-analysis/triage only, no
+> build or test execution performed) — the same fresh trace of the JMX
+> snapshot/parking-blocker code this doc's 2026-07-23 note called for is
+> still the needed next step.
 
 ## Boundary
 

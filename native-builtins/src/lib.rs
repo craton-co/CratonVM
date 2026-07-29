@@ -17467,127 +17467,156 @@ pub fn register_essential_natives_with_shims(
     // (`is_fabricated_blank_instance`: a fixup-allocated object that never ran
     // a constructor, so every slot is still null/zero) and hand any genuinely
     // constructed handler to its real bytecode.
-    for handler_class in &[
-        "org/jboss/logmanager/ExtHandler",
-        "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
-    ] {
-        registry.register(handler_class, "close", "()V", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if !is_fabricated_blank_instance(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(this, "close", "()V", &[]);
-            }
-            Ok(None)
-        });
-        registry.register(handler_class, "flush", "()V", |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            if !is_fabricated_blank_instance(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(this, "flush", "()V", &[]);
-            }
-            Ok(None)
-        });
-        registry.register(
-            handler_class,
-            "publish",
-            "(Ljava/util/logging/LogRecord;)V",
-            |ctx, args| {
+    //
+    // W5 FIX: every one of these hands the call back to real bytecode via
+    // `delegate_to_real_bytecode`, NOT `invoke_virtual_bytecode_only`. The
+    // latter re-dispatches on the RECEIVER, so a subclass that overrides the
+    // method and super-calls it (`QuarkusDelayedHandler.setHandlers` is
+    // exactly `super.setHandlers(...); activate();`) bounces straight back
+    // into the native forever — the 8192-frame ceiling then throws a
+    // `StackOverflowError` with no diagnostic at all. `setHandlers`/`addHandler`
+    // were fixed when that killed the Keycloak 26.6.1 boot; the siblings here
+    // carried the identical latent hazard.
+    //
+    // This cannot be a `for handler_class in [...]` loop any more:
+    // `registry.register` takes a plain `fn` pointer, so the closure bodies
+    // cannot capture a loop variable, and each body needs its OWNER class to
+    // pass to `delegate_to_real_bytecode`. A macro expands the owner in as a
+    // literal while still naming the two classes in exactly one place.
+    macro_rules! register_ext_handler_shims {
+        ($owner:literal) => {
+            registry.register($owner, "close", "()V", |ctx, args| {
                 let this = obj_arg(args, 0)?;
                 if !is_fabricated_blank_instance(ctx, this) {
-                    return ctx.invoke_virtual_bytecode_only(
-                        this,
-                        "publish",
-                        "(Ljava/util/logging/LogRecord;)V",
-                        args.get(1..).unwrap_or(&[]),
-                    );
+                    return delegate_to_real_bytecode(ctx, $owner, this, "close", "()V", &[]);
                 }
                 Ok(None)
-            },
-        );
-        registry.register(
-            handler_class,
-            "setLevel",
-            "(Ljava/util/logging/Level;)V",
-            |ctx, args| {
+            });
+            registry.register($owner, "flush", "()V", |ctx, args| {
                 let this = obj_arg(args, 0)?;
                 if !is_fabricated_blank_instance(ctx, this) {
-                    return ctx.invoke_virtual_bytecode_only(
-                        this,
-                        "setLevel",
-                        "(Ljava/util/logging/Level;)V",
-                        args.get(1..).unwrap_or(&[]),
-                    );
+                    return delegate_to_real_bytecode(ctx, $owner, this, "flush", "()V", &[]);
                 }
                 Ok(None)
-            },
-        );
-        registry.register(
-            handler_class,
-            "getLevel",
-            "()Ljava/util/logging/Level;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                if !is_fabricated_blank_instance(ctx, this) {
-                    return ctx.invoke_virtual_bytecode_only(
-                        this,
-                        "getLevel",
-                        "()Ljava/util/logging/Level;",
-                        &[],
-                    );
-                }
-                Ok(Some(Value::Object(None)))
-            },
-        );
-        registry.register(
-            handler_class,
-            "setFormatter",
-            "(Ljava/util/logging/Formatter;)V",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                if !is_fabricated_blank_instance(ctx, this) {
-                    return ctx.invoke_virtual_bytecode_only(
-                        this,
-                        "setFormatter",
-                        "(Ljava/util/logging/Formatter;)V",
-                        args.get(1..).unwrap_or(&[]),
-                    );
-                }
-                Ok(None)
-            },
-        );
-        registry.register(
-            handler_class,
-            "getFormatter",
-            "()Ljava/util/logging/Formatter;",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                if !is_fabricated_blank_instance(ctx, this) {
-                    return ctx.invoke_virtual_bytecode_only(
-                        this,
-                        "getFormatter",
-                        "()Ljava/util/logging/Formatter;",
-                        &[],
-                    );
-                }
-                Ok(Some(Value::Object(None)))
-            },
-        );
-        registry.register(
-            handler_class,
-            "isLoggable",
-            "(Ljava/util/logging/LogRecord;)Z",
-            |ctx, args| {
-                let this = obj_arg(args, 0)?;
-                if !is_fabricated_blank_instance(ctx, this) {
-                    return ctx.invoke_virtual_bytecode_only(
-                        this,
-                        "isLoggable",
-                        "(Ljava/util/logging/LogRecord;)Z",
-                        args.get(1..).unwrap_or(&[]),
-                    );
-                }
-                Ok(Some(Value::Int(0)))
-            },
-        );
+            });
+            registry.register(
+                $owner,
+                "publish",
+                "(Ljava/util/logging/LogRecord;)V",
+                |ctx, args| {
+                    let this = obj_arg(args, 0)?;
+                    if !is_fabricated_blank_instance(ctx, this) {
+                        return delegate_to_real_bytecode(
+                            ctx,
+                            $owner,
+                            this,
+                            "publish",
+                            "(Ljava/util/logging/LogRecord;)V",
+                            args.get(1..).unwrap_or(&[]),
+                        );
+                    }
+                    Ok(None)
+                },
+            );
+            registry.register(
+                $owner,
+                "setLevel",
+                "(Ljava/util/logging/Level;)V",
+                |ctx, args| {
+                    let this = obj_arg(args, 0)?;
+                    if !is_fabricated_blank_instance(ctx, this) {
+                        return delegate_to_real_bytecode(
+                            ctx,
+                            $owner,
+                            this,
+                            "setLevel",
+                            "(Ljava/util/logging/Level;)V",
+                            args.get(1..).unwrap_or(&[]),
+                        );
+                    }
+                    Ok(None)
+                },
+            );
+            registry.register(
+                $owner,
+                "getLevel",
+                "()Ljava/util/logging/Level;",
+                |ctx, args| {
+                    let this = obj_arg(args, 0)?;
+                    if !is_fabricated_blank_instance(ctx, this) {
+                        return delegate_to_real_bytecode(
+                            ctx,
+                            $owner,
+                            this,
+                            "getLevel",
+                            "()Ljava/util/logging/Level;",
+                            &[],
+                        );
+                    }
+                    Ok(Some(Value::Object(None)))
+                },
+            );
+            registry.register(
+                $owner,
+                "setFormatter",
+                "(Ljava/util/logging/Formatter;)V",
+                |ctx, args| {
+                    let this = obj_arg(args, 0)?;
+                    if !is_fabricated_blank_instance(ctx, this) {
+                        return delegate_to_real_bytecode(
+                            ctx,
+                            $owner,
+                            this,
+                            "setFormatter",
+                            "(Ljava/util/logging/Formatter;)V",
+                            args.get(1..).unwrap_or(&[]),
+                        );
+                    }
+                    Ok(None)
+                },
+            );
+            registry.register(
+                $owner,
+                "getFormatter",
+                "()Ljava/util/logging/Formatter;",
+                |ctx, args| {
+                    let this = obj_arg(args, 0)?;
+                    if !is_fabricated_blank_instance(ctx, this) {
+                        return delegate_to_real_bytecode(
+                            ctx,
+                            $owner,
+                            this,
+                            "getFormatter",
+                            "()Ljava/util/logging/Formatter;",
+                            &[],
+                        );
+                    }
+                    Ok(Some(Value::Object(None)))
+                },
+            );
+            registry.register(
+                $owner,
+                "isLoggable",
+                "(Ljava/util/logging/LogRecord;)Z",
+                |ctx, args| {
+                    let this = obj_arg(args, 0)?;
+                    if !is_fabricated_blank_instance(ctx, this) {
+                        return delegate_to_real_bytecode(
+                            ctx,
+                            $owner,
+                            this,
+                            "isLoggable",
+                            "(Ljava/util/logging/LogRecord;)Z",
+                            args.get(1..).unwrap_or(&[]),
+                        );
+                    }
+                    Ok(Some(Value::Int(0)))
+                },
+            );
+        };
     }
+    register_ext_handler_shims!("org/jboss/logmanager/ExtHandler");
+    register_ext_handler_shims!("io/quarkus/bootstrap/logging/QuarkusDelayedHandler");
     // Same W3 guard as the block above: the nested-handler mutators are the
     // ones that actually wire a ConsoleHandler/FileHandler under a delegating
     // handler, so a blanket no-op on the `ExtHandler` base class dropped the
@@ -17599,7 +17628,9 @@ pub fn register_essential_natives_with_shims(
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if !is_fabricated_blank_instance(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(
+                return delegate_to_real_bytecode(
+                    ctx,
+                    "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
                     this,
                     "addHandler",
                     "(Ljava/util/logging/Handler;)V",
@@ -17616,7 +17647,9 @@ pub fn register_essential_natives_with_shims(
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             if !is_fabricated_blank_instance(ctx, this) {
-                return ctx.invoke_virtual_bytecode_only(
+                return delegate_to_real_bytecode(
+                    ctx,
+                    "io/quarkus/bootstrap/logging/QuarkusDelayedHandler",
                     this,
                     "setHandlers",
                     "([Ljava/util/logging/Handler;)V",
@@ -17912,6 +17945,12 @@ pub fn register_essential_natives_with_shims(
     // phases. See `native-builtins/src/net_phase_e.rs`.
     net_phase_e::register_phase_e_networking(registry);
 
+    // Real-JDK JDBC metadata and StackFrame descriptor consumers are not part
+    // of the synthetic phase overlay; register their compatible bridges here.
+    crate::phases_late::jdbc::register_p68_jdbc(registry);
+    crate::phases_late::reflect_invoke::register_real_jdk_stackwalker_frame_method_type(registry);
+    crate::phases_late::charset_buffers::register_real_jdk_charset_contains(registry);
+    crate::phases_late::nio_file::register_real_jdk_files_owner(registry);
     // CGLIB / Spring `ConfigurationClassEnhancer.enhance` minimal bytecode
     // emitter. Registered AFTER `net_phase_e::register_phase_e_networking`
     // so the real emitter at `cglib_enhancer.rs` overrides the older
@@ -18121,6 +18160,14 @@ pub fn register_essential_natives_with_shims(
         "getURLs",
         "()[Ljava/net/URL;",
         classloader::ucl_get_urls,
+    );
+    // Real URLClassLoader.close() must set the same receiver-local state
+    // consulted by findClass/findResource/findResources.
+    registry.register(
+        "java/net/URLClassLoader",
+        "close",
+        "()V",
+        classloader::ucl_close,
     );
     // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
     // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
@@ -23295,6 +23342,10 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Phase 72: Preferences, Beans, JNDI, Datagram, HttpServer, ServerSocket extras ---
     register_phase72_natives(registry);
+    // Phase 72's raw-slot DatagramSocket overlay is synthetic-only. Reassert
+    // the moving-GC-safe side-table implementation afterwards so it is the
+    // final owner of every overlapping native key.
+    net_phase_e::register_re7_datagram_socket(registry);
 
     // --- NEW-15: Virtual threads / Loom (JEP 444 / 491) ---
     // Continuation, ContinuationScope, ForkJoinPool.commonPool.

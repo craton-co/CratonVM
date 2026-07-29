@@ -3316,6 +3316,12 @@ impl ClassManager {
         if name.contains("$$") || is_jboss_logging_locale_lookup(name) {
             return false;
         }
+        // Must mirror `load_class`'s `package-info` gate below, or callers that
+        // pre-check this predicate would believe a stub is coming when the load
+        // will in fact raise ClassNotFound.
+        if name == "package-info" || name.ends_with("/package-info") {
+            return false;
+        }
         if is_standard_jdk_namespace(name)
             && self.has_real_boot_classes()
             && !is_native_backed_jdk_stub(name)
@@ -3493,6 +3499,21 @@ impl ClassManager {
                 // non-generated class name essentially never contains "$$", so
                 // this can't misclassify a genuine missing-jar case.
                 if name.contains("$$") {
+                    return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                        class_name: name.to_string(),
+                    }));
+                }
+                // `package-info` is a compiler-generated annotation carrier that
+                // exists ONLY when the package actually declares annotations.
+                // `java.lang.Package.getPackageInfo()` probes for it with
+                // `Class.forName(pkg + ".package-info", false, loader)` inside a
+                // `catch (ClassNotFoundException)`, so an absent one is the
+                // normal case, not a missing jar. Fabricating a stub answers
+                // that probe with a bogus non-null `Class` (HotSpot throws), and
+                // it accounted for most of the enterprise-prefix stub fallbacks
+                // on the Keycloak 26.6.1 boot (`io/quarkus/arc/impl/package-info`,
+                // `io/agroal/narayana/package-info`, four `org/infinispan/**`).
+                if name == "package-info" || name.ends_with("/package-info") {
                     return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
                         class_name: name.to_string(),
                     }));
@@ -11321,7 +11342,7 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         // `phases_late::p59_sw_walk` already allocates 0-field stubs for
         // walker objects; the 6-field layout here upgrades that path.
         "java/lang/StackWalker" => instance_fields(6),
-        "java/lang/StackWalker$StackFrame" => instance_fields(6),
+        "java/lang/StackWalker$StackFrame" => instance_fields(8),
 
         "java/lang/StackWalker$Option" => {
             let mk = |n: &'static str| ClassFileField {
@@ -11367,6 +11388,32 @@ fn synthetic_stub_fields(name: &str) -> Vec<cratonvm_reader::field::ClassFileFie
         "com/sun/jmx/mbeanserver/MappedMXBeanType" => instance_fields(4),
 
         _ => vec![],
+    }
+}
+
+
+#[cfg(test)]
+#[test]
+fn native_constant_surface_raw_slot_layout_audit() {
+    // These issue-surface classes are constructed through bytecode `new` and
+    // handled through positional native fields. Explicit
+    // `alloc_concurrent_synthetic(..., n)` call sites reserve their own
+    // capacity. Keep this manifest beside the fallback allocator so a short
+    // layout cannot silently reappear while these native surfaces evolve.
+    for (class, minimum_slots) in [
+        ("java/net/DatagramSocket", 4),
+        ("java/net/DatagramPacket", 5),
+        ("java/util/prefs/Preferences", 5),
+        ("com/sun/net/httpserver/HttpServer", 6),
+        ("com/sun/net/httpserver/HttpServerImpl", 6),
+        ("sun/net/httpserver/HttpServerImpl", 6),
+        ("com/sun/net/httpserver/HttpExchange", 11),
+        ("java/lang/StackWalker$StackFrame", 8),
+    ] {
+        assert!(
+            synthetic_stub_fields(class).len() >= minimum_slots,
+            "{class} needs at least {minimum_slots} synthetic fields for its native raw-slot surface",
+        );
     }
 }
 

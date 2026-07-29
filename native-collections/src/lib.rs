@@ -18555,6 +18555,69 @@ fn collect_via_collector_protocol(
         == Some("java/lang/Object")
         && collector_tag_of(ctx, Value::Object(Some(collector))).is_none()
     {
+        // A real JDK `Collectors$CollectorImpl` can survive a loader/GC
+        // boundary with its object header collapsed to Object while retaining
+        // its five instance fields. The old list fallback avoided a
+        // NoSuchMethodError, but changed the result type: Spring's
+        // `MergedAnnotationCollectors.toMultiValueMap` then reached
+        // `AnnotatedTypeMetadata.getAllAnnotationAttributes` as ArrayList and
+        // failed its required MultiValueMap checkcast. CollectorImpl's stable
+        // JDK layout is supplier, accumulator, combiner, finisher,
+        // characteristics. Drive those preserved function objects directly.
+        if ctx.object_num_fields(collector) >= 5 {
+            let supplier = ctx.get_field(collector, 0);
+            let accumulator = ctx.get_field(collector, 1);
+            let finisher = ctx.get_field(collector, 3);
+            if let (
+                Value::Object(Some(supplier)),
+                Value::Object(Some(accumulator)),
+                Value::Object(Some(finisher)),
+            ) = (supplier, accumulator, finisher)
+            {
+                let supplier_pin = ctx.pin_native_root(supplier);
+                let accumulator_pin = ctx.pin_native_root(accumulator);
+                let finisher_pin = ctx.pin_native_root(finisher);
+                let container = match ctx.invoke_virtual(
+                    ctx.read_native_pin(supplier_pin, supplier),
+                    "get",
+                    "()Ljava/lang/Object;",
+                    &[],
+                ) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => Value::Object(None),
+                    Err(error) => {
+                        ctx.unpin_native_roots(supplier_pin);
+                        return Err(error);
+                    }
+                };
+                let container_pin = pin_value(ctx, container);
+                for element in elements {
+                    let container = read_pinned_elem(ctx, container_pin, container);
+                    let element_pin = pin_value(ctx, *element);
+                    let element = read_pinned_elem(ctx, element_pin, *element);
+                    let result = ctx.invoke_virtual(
+                        ctx.read_native_pin(accumulator_pin, accumulator),
+                        "accept",
+                        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+                        &[container, element],
+                    );
+                    ctx.unpin_native_roots(element_pin);
+                    if let Err(error) = result {
+                        ctx.unpin_native_roots(supplier_pin);
+                        return Err(error);
+                    }
+                }
+                let container = read_pinned_elem(ctx, container_pin, container);
+                let result = ctx.invoke_virtual(
+                    ctx.read_native_pin(finisher_pin, finisher),
+                    "apply",
+                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                    &[container],
+                );
+                ctx.unpin_native_roots(supplier_pin);
+                return result;
+            }
+        }
         return make_list_of(ctx, elements);
     }
     let supplier = match ctx.invoke_virtual_declared(
@@ -18763,7 +18826,22 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                     }
                 }
             }
-            COLLECTOR_TAG_COUNTING => Ok(Some(Value::Long(elements.len() as i64))),
+            COLLECTOR_TAG_COUNTING => {
+                // MUST be a boxed `java.lang.Long`: `collect` is declared
+                // `(Ljava/util/stream/Collector;)Ljava/lang/Object;`, so a bare
+                // primitive `Value` here is coerced away and the caller reads
+                // back NULL. That is what made Keycloak 26.6.1's master-realm
+                // bootstrap die with `NullPointerException: Cannot invoke
+                // "java.lang.Long.longValue()"` -- Keycloak's
+                // `UPConfigUtils.validateAttributeGroups` is
+                // `getGroups().stream().filter(..).collect(Collectors.counting())`
+                // followed immediately by `checkcast Long; longValue()`. The
+                // finisher arm and every groupingBy-downstream COUNTING arm
+                // already box for exactly this reason; this one did not.
+                let long_obj = alloc_synthetic(ctx, "java/lang/Long", 1);
+                ctx.set_field(long_obj, 0, Value::Long(elements.len() as i64));
+                Ok(Some(Value::Object(Some(long_obj))))
+            }
             COLLECTOR_TAG_JOINING => {
                 let mut parts = Vec::with_capacity(elements.len());
                 // cceres3: pin across GC-capable call (stream stale-at-store wave)
@@ -45313,39 +45391,12 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_cf_exceptionally,
     );
 
-    // --- ForkJoinPool.awaitQuiescence ---
-    //
-    // ESCALATED (W4) — this constant is NOT safe, and the W2 justification it
-    // replaces was factually wrong. That note claimed every ForkJoinPool entry
-    // point runs its task INLINE on the calling thread, so nothing can be
-    // outstanding. `fork`/`invoke`/`submit`/`join` do, but `execute` does not:
-    // in BOTH run modes it hands the Runnable to a real worker thread —
-    // native-builtins `lib.rs` (inside `register_essential_natives_with_shims`,
-    // i.e. the default real-JDK build) and `concurrent_extras.rs`
-    // (`--synthetic-jdk`) both route `ForkJoinPool.execute(Runnable)` through
-    // `spawn_runnable_on_real_thread`. So a task CAN still be running when
-    // `awaitQuiescence` is called, and `true` then lies about it.
-    //
-    // Left as `true` deliberately rather than flipped: `false` means "timed
-    // out", and callers loop on that, so guessing the other way turns a stale
-    // answer into a hang. The real fix needs the pending/active task count of
-    // native-builtins' async worker pool (`async_worker_pool` /
-    // `note_async_runnable_submitted` in `native-builtins/src/lib.rs`), which
-    // this crate cannot see — `cratonvm-native-builtins` depends on
-    // `cratonvm-native-collections`, not the other way round. Either expose
-    // that count on `NativeContext` (e.g. `fn pending_async_tasks(&self) ->
-    // usize`) so the poll can happen here, or move this registration into
-    // native-builtins next to the pool it must observe. This registration is
-    // the LAST one for the triple tree-wide, so it is what runs.
-    let pool = "java/util/concurrent/ForkJoinPool";
-    r.register(
-        pool,
-        "awaitQuiescence",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
+    // ForkJoinPool.awaitQuiescence is registered by native-builtins after it
+    // establishes the real async-worker completion tracker. Keeping a local
+    // constant here would overwrite that stateful implementation.
 
     // --- ThreadPoolExecutor stat methods ---
+    let pool = "java/util/concurrent/ForkJoinPool";
     let tp = "java/util/concurrent/ThreadPoolExecutor";
     r.register(tp, "getPoolSize", "()I", |ctx, args| {
         let this = tp_arg0(args);

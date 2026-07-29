@@ -1549,7 +1549,9 @@ fn execute_string_concat<S: AsRef<str>>(
     // `StringConcatFactory` (the `"a" + b` bytecode shape) produces a brand
     // new String per the JVM spec — it must NOT be interned, otherwise `==`
     // wrongly reports identity with an equal literal.
-    let str_ref = create_java_string_uninterned(shared, &result);
+    // `"a" + b` on a full heap must raise a catchable OutOfMemoryError, not
+    // abort the VM -- see `interpreter::create_string_or_oom`.
+    let str_ref = crate::runtime::interpreter::create_string_or_oom(shared, thread, &result)?;
     thread.frames[frame_idx]
         .stack
         .push(Value::Object(Some(str_ref)))?;

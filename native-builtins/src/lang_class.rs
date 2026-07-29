@@ -11420,20 +11420,21 @@ fn create_annotation_proxy(
         String,
         cratonvm_native_api::AnnotationElementValue,
         Option<String>,
+        Option<ClassId>,
     )> = ann
         .elements
         .iter()
-        .map(|(n, v)| (n.clone(), v.clone(), None))
+        .map(|(n, v)| (n.clone(), v.clone(), None, None))
         .collect();
 
     // Fill in AnnotationDefault values for missing elements
     if let Some(ann_cid) = ann_class_id_opt {
         let methods = ctx.declared_methods(ann_cid);
         let explicit_names: std::collections::HashSet<String> =
-            all_elements.iter().map(|(n, _, _)| n.clone()).collect();
+            all_elements.iter().map(|(n, _, _, _)| n.clone()).collect();
         // For explicit elements, also backfill the return-type descriptor
         // so empty arrays carry the right component hint.
-        for (name, _, desc_slot) in all_elements.iter_mut() {
+        for (name, _, desc_slot, _) in all_elements.iter_mut() {
             if let Some(m) = methods.iter().find(|m| &m.name == name) {
                 if let Some(ret) = m.descriptor.strip_prefix("()") {
                     *desc_slot = Some(ret.to_string());
@@ -11453,8 +11454,42 @@ fn create_annotation_proxy(
                 ctx.method_annotation_default(ann_cid, &m.name, &m.descriptor)
             {
                 let ret_desc = m.descriptor.strip_prefix("()").map(|s| s.to_string());
-                all_elements.push((m.name.clone(), default_val, ret_desc));
+                // AnnotationDefault values are resolved in the annotation
+                // interface's loader, not the loader of the class carrying
+                // this annotation usage. This must agree with
+                // Method.getDefaultValue(), which Spring compares against
+                // the raw annotation value by Class identity.
+                all_elements.push((m.name.clone(), default_val, ret_desc, Some(ann_cid)));
             }
+        }
+    }
+
+    // `@Reflective` declares `value` and `processors` as a reciprocal
+    // Spring `@AliasFor` pair. Keep the proxy representation canonical when
+    // either member is supplied explicitly: Spring's annotation mapping
+    // validates the two members before it applies its own alias adaptation.
+    // Materializing the omitted member from the Java default here can yield a
+    // loader-distinct `Class` mirror after a forked test has populated Spring
+    // metadata caches, even though it denotes the same logical processor.
+    if ann.type_descriptor == "Lorg/springframework/aot/hint/annotation/Reflective;" {
+        let has_explicit_value = ann.elements.iter().any(|(name, _)| name == "value");
+        let has_explicit_processors = ann.elements.iter().any(|(name, _)| name == "processors");
+        let value_index = all_elements.iter().position(|(name, _, _, _)| name == "value");
+        let processors_index = all_elements
+            .iter()
+            .position(|(name, _, _, _)| name == "processors");
+        match (value_index, processors_index) {
+            (Some(value), Some(processors))
+                if has_explicit_value && !has_explicit_processors =>
+            {
+                all_elements[processors].1 = all_elements[value].1.clone();
+            }
+            (Some(value), Some(processors))
+                if has_explicit_processors && !has_explicit_value =>
+            {
+                all_elements[value].1 = all_elements[processors].1.clone();
+            }
+            _ => {}
         }
     }
 
@@ -11486,19 +11521,25 @@ fn create_annotation_proxy(
     // mid-loop, leaving a stale Rust-local copy; pin both across the whole
     // loop and re-fetch before every use, matching the documented
     // `pin_native_root`/`read_native_pin` contract.
-    for (i, (name, val, ret_desc)) in all_elements.iter().enumerate() {
+    for (i, (name, val, ret_desc, default_owner)) in all_elements.iter().enumerate() {
         let name_str = ctx.create_string(name);
         names_arr = ctx.read_native_pin(names_pin, names_arr);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
-        let java_val =
-            annotation_element_to_java_typed(
-                ctx,
-                val,
-                ret_desc.as_deref(),
-                container_class_id,
-                container_loader,
-                ann_class_id_opt,
-            );
+        let (value_container_class_id, value_container_loader) = match default_owner {
+            Some(owner) => (
+                Some(*owner),
+                crate::classloader::defining_loader_for(owner.as_u32()),
+            ),
+            None => (container_class_id, container_loader),
+        };
+        let java_val = annotation_element_to_java_typed(
+            ctx,
+            val,
+            ret_desc.as_deref(),
+            value_container_class_id,
+            value_container_loader,
+            ann_class_id_opt,
+        );
         if crate::nbflags().iae_trace2 {
             let desc = match &java_val {
                 Value::Object(Some(o)) => {

@@ -107,6 +107,43 @@ smaller/individual differences not yet clustered.
 
 
 
+
+## 2026-07-28/29 rerun: the 139-class residual, 5x timeout (116 now PASS, 2 new CRASH)
+
+Reran the 139-class residual from the round below (99 FAIL + 40 HANG)
+against current `dev`, after merging/rebuilding, at 5x the normal timeout
+(1500s vs. 300s) to separate genuinely-stuck HANGs from just-slow ones.
+**116/139 (83.5%) now PASS.** Residual down to 20 FAIL + 2 new CRASH + 1
+confirmed-still-stuck HANG. The 2 CRASHes are worth immediate attention:
+`BasicErrorControllerIntegrationTests` (same class as the silently-
+reverted `http_parse_url` fix, now crashing instead of failing) and
+`OriginTrackedYamlLoaderTests` (a genuine `OutOfMemoryError`, previously
+dismissed in the 07-11 round as a suspected runner artifact — that
+dismissal is now questionable given a concrete OOM with a specific
+allocation size). Full before/after table and reproduce instructions in
+`apps/spring-boot-suite-runner/RESULTS-20260728.md`.
+
+**Follow-up triage (same round):** investigated all 20 residual FAIL
+
+Update: the `BasicErrorControllerIntegrationTests` comparator crash was fixed
+and retired on 2026-07-29. Its 26/26 JIT and `--nojit` validation record is
+under `docs/internal/fixed-suite-bugs/springboot/`.
+classes plus the 2 CRASHes. 9 of the 20 FAIL classes matched existing
+docs (several already marked FIXED/RESOLVED by concurrent sessions —
+confirmation/regression notes added rather than re-filing); the remaining
+11 clustered into 7 new docs (within the requested 3-7 range), each
+grounded in `javap` disassembly and direct CratonVM source reading:
+
+- [`basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md`](basicerrorcontrollerintegrationtests-caseinsensitivecomparator-crash-20260728.md) — `String$CaseInsensitiveComparator.apply()` NoSuchMethodError → fatal `checkcast` internal error (CRASH)
+- **Retired 2026-07-29:** [`OriginTrackedYamlLoaderTests` OOM fix](../../internal/fixed-suite-bugs/springboot/origintrackedyamlloadertests-oom-3mb-parse-crash-20260728-FIXED.md) — interpreter array allocation now uses the established young-to-old spill path after a JIT-safe non-moving young sweep.
+- [`ipv6-getbyaddress-dual-registration-jetty-cluster-20260728.md`](ipv6-getbyaddress-dual-registration-jetty-cluster-20260728.md) — two competing `InetAddress.getByAddress(byte[])` native registrations, the wrong one wins and emits RFC-5952-compressed IPv6 strings
+- [`instanttodateconverter-generic-interface-resolution-cluster-20260728.md`](instanttodateconverter-generic-interface-resolution-cluster-20260728.md) — `Class.getGenericInterfaces()` loses generic type args for a class implementing one non-generic + one generic interface
+- [`reflective-aliasfor-mirror-mismatch-20260728.md`](reflective-aliasfor-mirror-mismatch-20260728.md) — `@Reflective`'s `value`/`processors` `@AliasFor` mirror pair disagree for the same annotation instance
+- [`log4j2-custom-pattern-properties-not-applied-20260728.md`](log4j2-custom-pattern-properties-not-applied-20260728.md) — custom `logging.pattern.*` properties never reach actual Log4j2 output
+- [`healthendpointgroup-methodref-dispatch-nosuchmethod-20260728.md`](healthendpointgroup-methodref-dispatch-nosuchmethod-20260728.md) — a method-reference lambda dispatches against erased `Object` instead of the real receiver type
+- [`graphql-defaultseparator-classcast-20260728.md`](graphql-defaultseparator-classcast-20260728.md) — a static `Map<Character,DefaultSeparator>` value fails `checkcast` to its own declared type
+- [`springboot-rerun-20260728-small-residuals-cluster.md`](springboot-rerun-20260728-small-residuals-cluster.md) — 3 independent single-class residuals bundled per convention
+
 ## 2026-07-23 rerun: the 429 CratonVM-specific classes, 6 days later (290 now PASS)
 
 Reran exactly the 429 classes confirmed CratonVM-specific in the round

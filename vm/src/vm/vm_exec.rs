@@ -1453,6 +1453,13 @@ pub(crate) fn monitor_enter_blocking(
         .monitors
         .enter_or_contend(obj, thread.thread_id)
     else {
+        // The uncontended and re-entrant fast paths already acquired the
+        // monitor. JMX must publish them too; restricting ownership to the
+        // blocking branch makes getLockedMonitors() silently partial.
+        shared
+            .threads
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
     let tid = thread.thread_id;
@@ -1557,6 +1564,12 @@ pub(crate) fn monitor_enter_synchronized_method(
         .monitors
         .enter_or_contend(obj, thread.thread_id)
     else {
+        // See the uncontended branch in `monitor_enter_blocking`: synchronized
+        // methods own their monitor even when no contender forced inflation.
+        shared
+            .threads
+            .thread_registry
+            .complete_jmx_monitor_enter(thread.thread_id, obj);
         return obj;
     };
 
@@ -5573,6 +5586,13 @@ impl<'a> NativeClassAccess for NativeContextImpl<'a> {
             .extend_bootstrap_classpath(paths);
     }
 
+    fn reset_thread_jmx_contention_stats(&mut self) {
+        self.shared
+            .threads
+            .thread_registry
+            .reset_jmx_contention_stats();
+    }
+
     fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
         let mut cm = self.shared.classes.class_manager_write();
@@ -8878,6 +8898,13 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // `wait_condvar.wait_for`. See `vm_init::dump_wait_site_thread_local`.
         crate::vm::vm_init::set_wait_site_snapshot(&*self.thread);
         let wait_start = std::time::Instant::now();
+        // Object.wait releases the monitor while parked. Publish that state so
+        // ThreadInfo sees WAITING/TIMED_WAITING on the actual monitor, then
+        // clear it unconditionally once Monitor::wait has reacquired or failed.
+        self.shared
+            .threads
+            .thread_registry
+            .set_jmx_waiting_monitor(self.thread.thread_id, obj);
         // T19.H1 — mark this thread GC-blocked for the duration of the
         // park so a stop-the-world GC excludes it from `wait_for_all`.
         // The `BlockedGuard`'s `Drop` clears the mark unconditionally —
@@ -8931,6 +8958,10 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             drop(blk);
             r
         };
+        self.shared
+            .threads
+            .thread_registry
+            .take_jmx_waiting_monitor(self.thread.thread_id);
         crate::vm::vm_init::clear_wait_site_snapshot();
         let wait_dur = wait_start.elapsed();
         // Check if GC happened while we were blocked. Finding 1(a) hygiene:
@@ -8947,7 +8978,11 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            let timeout_ns = timeout_ms.map(|ms| ms as i64 * 1_000_000).unwrap_or(0);
+            // JFR's periodic recorder uses a sentinel-sized timeout. Preserve
+            // that as a saturated JFR duration instead of overflowing i64.
+            let timeout_ns = timeout_ms
+                .map(|ms| ms.saturating_mul(1_000_000).min(i64::MAX as u64) as i64)
+                .unwrap_or(0);
             let mut jfr = self.shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_monitor_wait_event(
                 &mut jfr,
@@ -9925,12 +9960,21 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
         // builds its wait-for graph from `lock_owner_id`), and
         // `isObjectMonitorUsageSupported` / `isSynchronizerUsageSupported`
         // were correct to answer false only because of this gap.
-        let (contended, waiting, locked_monitors, locked_synchronizers) = self
+        let (
+            contended,
+            waiting,
+            locked_monitors,
+            locked_synchronizers,
+            blocked_time_ms,
+            blocked_count,
+            waited_time_ms,
+            waited_count,
+        ) = self
             .shared
             .threads
             .thread_registry
             .jmx_lock_snapshot(registry_tid)
-            .unwrap_or((None, None, Vec::new(), Vec::new()));
+            .unwrap_or((None, None, Vec::new(), Vec::new(), 0, 0, 0, 0));
         // A thread blocks on the monitor it is contending for, or waits on the
         // one it called `wait()` on — never both, so prefer the contended one.
         let lock = contended.or(waiting);
@@ -9961,6 +10005,10 @@ impl<'a> NativeThreadAccess for NativeContextImpl<'a> {
             lock_owner_name,
             locked_monitors,
             locked_synchronizers,
+            blocked_time_ms,
+            blocked_count,
+            waited_time_ms,
+            waited_count,
             ..Default::default()
         })
     }
@@ -11451,6 +11499,90 @@ impl<'a> NativeSystemAccess for NativeContextImpl<'a> {
             .threads
             .monitors
             .holds(obj, self.thread.thread_id)
+    }
+
+    fn jfr_begin_java_recording(&mut self) {
+        let mut active = self.shared.debug.jfr_java_recording.lock();
+        if active.is_some() {
+            return;
+        }
+        let mut recorder = self.shared.debug.flight_recorder.lock();
+        let id = recorder.new_recording(cratonvm_jfr::RecordingSettings::new("jdk.jfr"));
+        recorder.start_recording(id);
+        *active = Some(id);
+        self.shared
+            .debug
+            .jfr_java_recording_running
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn jfr_end_java_recording(&mut self) {
+        let id = *self.shared.debug.jfr_java_recording.lock();
+        let Some(id) = id else {
+            return;
+        };
+        self.shared
+            .debug
+            .jfr_java_recording_running
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.shared.debug.flight_recorder.lock().stop_recording(id);
+    }
+
+    fn jfr_java_recording_active(&self) -> bool {
+        self.shared
+            .debug
+            .jfr_java_recording_running
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn jfr_emit_java_event(&mut self, event_class: &str, start_ns: u64, duration_ns: u64) {
+        let event_name = format!("jdk.JavaEvent.{}", event_class.replace('/', "."));
+        let mut recorder = self.shared.debug.flight_recorder.lock();
+        let type_id = recorder.type_registry.register(cratonvm_jfr::EventType {
+            id: cratonvm_jfr::EventTypeId::INVALID,
+            name: event_name,
+            category: vec!["Java Application".to_owned()],
+            description: "Event committed through the real-JDK jdk.jfr.Event bridge".to_owned(),
+            fields: Vec::new(),
+            has_thread: true,
+            has_stacktrace: false,
+            period: cratonvm_jfr::EventPeriod::BeginEnd,
+            threshold: None,
+        });
+        if type_id.is_invalid() {
+            return;
+        }
+        recorder.record_event(cratonvm_jfr::EventInstance {
+            type_id,
+            start_time: start_ns,
+            end_time: start_ns.saturating_add(duration_ns),
+            thread_id: self.thread.thread_id.0,
+            fields: cratonvm_jfr::EventFields::new(),
+        });
+    }
+
+    fn jfr_set_java_output(&mut self, path: &str) {
+        *self.shared.debug.jfr_java_output.lock() = Some(path.to_owned());
+    }
+
+    fn jfr_dump_java_recording(&mut self, path: &str) {
+        let id = self.shared.debug.jfr_java_recording.lock().take();
+        let Some(id) = id else {
+            return;
+        };
+        self.shared
+            .debug
+            .jfr_java_recording_running
+            .store(false, std::sync::atomic::Ordering::Release);
+        if let Err(error) = self
+            .shared
+            .debug
+            .flight_recorder
+            .lock()
+            .dump_recording(id, std::path::Path::new(path))
+        {
+            tracing::warn!(path = %path, %error, "failed to dump Java JFR recording");
+        }
     }
 
     fn emit_virtual_thread_pinned_jfr(&mut self, reason: &'static str) {
@@ -16443,7 +16575,6 @@ fn invoke_on_class_shared_inner(
     let mut rooted_args = args.to_vec();
     let args_roots = PinnedDispatchArgs::new(thread, &rooted_args);
     let args = &mut rooted_args;
-
     dbg_dispatch_tally("invoke_on_class_shared_inner", "", method_name, descriptor);
     if method_name != "<init>" && method_name != "<clinit>" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
@@ -16917,6 +17048,42 @@ fn invoke_on_class_shared_inner(
                             && method_name == "newFileChannel"
                             && descriptor
                                 == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;")
+                        || matches!(
+                            (class_name, method_name, descriptor),
+                            ("java/nio/charset/Charset", "contains", "(Ljava/nio/charset/Charset;)Z")
+                                | ("java/nio/file/Files", "getOwner", "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/UserPrincipal;")
+                                | ("java/lang/StackFrameInfo", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+                                | ("java/net/DatagramSocket", "<init>", "()V")
+                                | ("java/net/DatagramSocket", "<init>", "(I)V")
+                                | ("java/net/DatagramSocket", "<init>", "(ILjava/net/InetAddress;)V")
+                                | ("java/net/DatagramSocket", "connect", "(Ljava/net/InetAddress;I)V")
+                                | ("java/net/DatagramSocket", "disconnect", "()V")
+                                | ("java/lang/StackWalker$StackFrame", "getMethodType", "()Ljava/lang/invoke/MethodType;")
+                                | ("java/lang/StackWalker$StackFrame", "getDescriptor", "()Ljava/lang/String;")
+                                | ("java/lang/System$1", "addReads", "(Ljava/lang/Module;Ljava/lang/Module;)V")
+                                | ("java/lang/System$1", "addReadsAllUnnamed", "(Ljava/lang/Module;)V")
+                                | ("java/lang/System$1", "addExports", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$1", "addExports", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$1", "addExportsToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$1", "addOpens", "(Ljava/lang/Module;Ljava/lang/String;Ljava/lang/Module;)V")
+                                | ("java/lang/System$1", "addOpensToAllUnnamed", "(Ljava/lang/Module;Ljava/lang/String;)V")
+                                | ("java/lang/System$1", "addUses", "(Ljava/lang/Module;Ljava/lang/Class;)V")
+                                | ("jdk/jfr/internal/Type", "getKnownType", "(Ljava/lang/Class;)Ljdk/jfr/internal/Type;")
+                                | ("jdk/jfr/internal/util/Utils", "getValidType", "(Ljava/lang/Class;Ljava/lang/String;)Ljdk/jfr/internal/Type;")
+                                | ("jdk/jfr/internal/JDKEvents", "initialize", "()V")
+                                | ("jdk/jfr/internal/instrument/JDKEvents", "initialize", "()V")
+                                | ("jdk/jfr/consumer/RecordingStream", "startAsync", "()V")
+                                | ("jdk/jfr/Event", "begin", "()V")
+                                | ("jdk/jfr/Event", "end", "()V")
+                                | ("jdk/jfr/Event", "commit", "()V")
+                                | ("jdk/jfr/Event", "isEnabled", "()Z")
+                                | ("jdk/jfr/Event", "shouldCommit", "()Z")
+                                | ("jdk/jfr/AnnotationElement", "checkType", "(Ljava/lang/Class;)V")
+                                | ("jdk/jfr/Recording", "start", "()V")
+                                | ("jdk/jfr/Recording", "stop", "()Z")
+                                | ("jdk/jfr/Recording", "dump", "(Ljava/nio/file/Path;)V")
+                                | ("java/lang/reflect/Method", "getReturnType", "()Ljava/lang/Class;")
+                        )
                         // Legacy Mockito selector override (off by default —
                         // see `flags::mockito_legacy_selectors`): forced the
                         // reflection fallback instead of letting the real
@@ -17326,6 +17493,8 @@ fn invoke_on_class_shared_inner(
                                         == "(Ljava/lang/String;)Ljava/util/Enumeration;")
                                 || (method_name == "addURL"
                                     && descriptor == "(Ljava/net/URL;)V")
+                                || (method_name == "close"
+                                    && descriptor == "()V")
                                 // `URLClassLoader` declares its OWN
                                 // `getResourceAsStream` override (real OpenJDK
                                 // wraps the stream for `closeables` tracking),
